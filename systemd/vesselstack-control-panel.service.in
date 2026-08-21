@@ -1,0 +1,29 @@
+[Unit]
+Description=VesselStack administration control panel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@VESSELSTACK_ROOT@
+EnvironmentFile=@VESSELSTACK_ROOT@/config/vesselstack.env
+EnvironmentFile=@VESSELSTACK_ROOT@/config/control-panel.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 @VESSELSTACK_ROOT@/control-panel/app.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -9,6 +9,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh"
+python3 -m py_compile "$ROOT/control-panel/app.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
@@ -18,6 +19,8 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
 grep -q 'GENERATE' "$ROOT/vesselstack.example.env"
 grep -q 'INFLUXDB_HISTORY_BUCKET' "$ROOT/vesselstack.example.env"
 grep -q 'verify-backup' "$ROOT/scripts/vesselstackctl"
+grep -q 'CONTROL_PANEL_TOKEN' "$ROOT/control-panel/app.py"
+test -s "$ROOT/systemd/vesselstack-control-panel.service.in"
 grep -q 'VesselStack InfluxDB' "$ROOT/templates/grafana/provisioning/datasources/vesselstack.yml"
 python3 -m json.tool "$ROOT/templates/grafana/dashboards/system-health.json" >/dev/null
 grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}' "$ROOT/templates/compose.yml"

@@ -3,6 +3,24 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- Added a loopback-first, token-authenticated Control Panel for component
+  status and lifecycle, redacted configuration, installer preflight/apply,
+  history provisioning, backups, and reviewed release updates.
+- Added a bundled installer snapshot so panel operations do not depend on a
+  persistent Git checkout.
+
+### Security
+
+- Control Panel commands use fixed argument allowlists and serialized
+  operations; arbitrary shell execution is not exposed.
+- Secret settings are write-only through the API, configuration writes are
+  atomic and mode 600, and privileged installation paths remain read-only in
+  the browser UI.
+
 ## 1.0.1 - 2026-08-21
 
 ### Privacy

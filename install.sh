@@ -46,6 +46,8 @@ source "$CONFIG_FILE"
 : "${AIS_DEVICE:=/dev/bus/usb}"
 : "${AIS_CATCHER_ARGS:=-q -N 8100 -S 5011}"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
+: "${CONTROL_PANEL_HOST:=127.0.0.1}"
+: "${CONTROL_PANEL_PORT:=8780}"
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -141,13 +143,29 @@ generate_secret() {
     fi
 }
 
+# Preserve generated administration tokens across re-renders when the installed
+# configuration, rather than the original example file, is used as input.
+if [ "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE}" = GENERATE ] && \
+    [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
+    BOAT_CHAT_SETTINGS_TOKEN=$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' \
+        "$VESSELSTACK_ROOT/config/boat-chat.env" | tail -n 1)
+fi
+if [ "${CONTROL_PANEL_TOKEN:-GENERATE}" = GENERATE ] && \
+    [ -r "$VESSELSTACK_ROOT/config/control-panel.env" ]; then
+    CONTROL_PANEL_TOKEN=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' \
+        "$VESSELSTACK_ROOT/config/control-panel.env" | tail -n 1)
+fi
+
 INFLUXDB_PASSWORD=$(generate_secret "${INFLUXDB_PASSWORD:-GENERATE}")
 INFLUXDB_TOKEN=$(generate_secret "${INFLUXDB_TOKEN:-GENERATE}")
 GRAFANA_ADMIN_PASSWORD=$(generate_secret "${GRAFANA_ADMIN_PASSWORD:-GENERATE}")
 BOAT_CHAT_SETTINGS_TOKEN=$(generate_secret "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE}")
+CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 
-install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" "$VESSELSTACK_ROOT/boat-chat"
+install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
+    "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
+    "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
 # Official images run their data processes as these fixed container users.
@@ -158,6 +176,15 @@ tar -C "$SOURCE_ROOT/boat-chat" \
     --exclude=boat-chat.env --exclude=.venv --exclude=memory --exclude=data \
     --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/boat-chat" -xf -
+tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
+    | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
+# Keep a bundled, reviewed installer so the control panel can run preflight and
+# apply operations without depending on a source checkout that may be removed.
+if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
+    tar -C "$SOURCE_ROOT" --exclude='__pycache__' --exclude='*.pyc' \
+        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel \
+        | tar --no-same-owner -C "$VESSELSTACK_ROOT/installer" -xf -
+fi
 # The source application keeps legacy defaults for compatibility. Installed
 # branding is vessel-specific; the generated facts file remains authoritative.
 sed -i "s/VesselStack/$BOAT_NAME/g" \
@@ -224,6 +251,8 @@ AIS_DEVICE
 AIS_CATCHER_ARGS
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
+CONTROL_PANEL_HOST
+CONTROL_PANEL_PORT
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
@@ -240,13 +269,34 @@ MQTT_USERNAME
 MQTT_PASSWORD
 EOF
 
-install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/boat-chat.env"
+# Retain provider credentials and optional Boat Chat settings across installer
+# re-renders while replacing the integration values owned by VesselStack.
+boat_chat_temp=$(mktemp)
+if [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
+    cp "$VESSELSTACK_ROOT/config/boat-chat.env" "$boat_chat_temp"
+fi
+for key in BOAT_NAME VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN \
+    SIGNALK_URL HOME_ASSISTANT_URL \
+    HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
+    INFLUXDB_RAW_BUCKET INFLUXDB_HISTORY_BUCKET \
+    INFLUXDB_HOME_ASSISTANT_BUCKET INFLUXDB_AIS_BUCKET; do
+    sed -i "/^${key}=/d" "$boat_chat_temp"
+done
+for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
+    if [ -n "${!key+x}" ]; then
+        sed -i "/^${key}=/d" "$boat_chat_temp"
+        printf '%s=%q\n' "$key" "${!key}" >> "$boat_chat_temp"
+    elif ! grep -q "^${key}=" "$boat_chat_temp"; then
+        case "$key" in
+            BOAT_CHAT_PROVIDER) printf '%s=%q\n' "$key" local >> "$boat_chat_temp" ;;
+            BOAT_CHAT_HOST) printf '%s=%q\n' "$key" 0.0.0.0 >> "$boat_chat_temp" ;;
+            BOAT_CHAT_PORT) printf '%s=%q\n' "$key" 8765 >> "$boat_chat_temp" ;;
+        esac
+    fi
+done
 {
     printf 'BOAT_NAME=%q\n' "$BOAT_NAME"
     printf 'VESSELSTACK_VERSION=%q\n' "$(<"$SCRIPT_DIR/VERSION")"
-    printf 'BOAT_CHAT_PROVIDER=%q\n' "${BOAT_CHAT_PROVIDER:-local}"
-    printf 'BOAT_CHAT_HOST=%q\n' "${BOAT_CHAT_HOST:-0.0.0.0}"
-    printf 'BOAT_CHAT_PORT=%q\n' "${BOAT_CHAT_PORT:-8765}"
     printf 'BOAT_CHAT_SETTINGS_TOKEN=%q\n' "$BOAT_CHAT_SETTINGS_TOKEN"
     printf 'SIGNALK_URL=%q\n' "$SIGNALK_URL"
     printf 'HOME_ASSISTANT_URL=%q\n' "$HOME_ASSISTANT_URL"
@@ -258,8 +308,17 @@ install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/boat-chat.env"
     printf 'INFLUXDB_HISTORY_BUCKET=%q\n' "$INFLUXDB_HISTORY_BUCKET"
     printf 'INFLUXDB_HOME_ASSISTANT_BUCKET=%q\n' "$INFLUXDB_HOME_ASSISTANT_BUCKET"
     printf 'INFLUXDB_AIS_BUCKET=%q\n' "$INFLUXDB_AIS_BUCKET"
-} >> "$VESSELSTACK_ROOT/config/boat-chat.env"
+} >> "$boat_chat_temp"
+install -m 0600 "$boat_chat_temp" "$VESSELSTACK_ROOT/config/boat-chat.env"
+rm -f -- "$boat_chat_temp"
 chown "$VESSELSTACK_USER:$VESSELSTACK_USER" "$VESSELSTACK_ROOT/config/boat-chat.env"
+
+install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/control-panel.env"
+{
+    printf 'CONTROL_PANEL_HOST=%q\n' "$CONTROL_PANEL_HOST"
+    printf 'CONTROL_PANEL_PORT=%q\n' "$CONTROL_PANEL_PORT"
+    printf 'CONTROL_PANEL_TOKEN=%q\n' "$CONTROL_PANEL_TOKEN"
+} >> "$VESSELSTACK_ROOT/config/control-panel.env"
 
 "$SCRIPT_DIR/scripts/migrate.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" \
     "$(<"$SCRIPT_DIR/VERSION")"
@@ -280,6 +339,12 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
+sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    "$SCRIPT_DIR/systemd/vesselstack-control-panel.service.in" \
+    > "$SYSTEMD_DIR/vesselstack-control-panel.service"
+chmod 0644 "$SYSTEMD_DIR/vesselstack-control-panel.service"
+systemctl daemon-reload
+systemctl enable vesselstack-control-panel.service
 
 compose config --quiet
 
@@ -301,6 +366,9 @@ if [ "$START" -eq 1 ]; then
     compose up -d
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service
+    if [ "${VESSELSTACK_SKIP_PANEL_RESTART:-false}" != true ]; then
+        systemctl restart vesselstack-control-panel.service
+    fi
     if [ "$SIGNALK_MODE" = native ]; then
         systemctl restart vesselstack-signalk.service
     fi
@@ -308,3 +376,4 @@ fi
 
 echo "VesselStack rendered successfully at $VESSELSTACK_ROOT"
 echo "Secrets are stored in mode-600 config files and were not printed."
+echo "Control panel: http://$CONTROL_PANEL_HOST:$CONTROL_PANEL_PORT"

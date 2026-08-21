@@ -21,12 +21,16 @@ infrastructure monitoring, and a local diagnostic assistant.
 | Mosquitto | Authenticated MQTT broker | `HOST:1883` |
 | Heimdall | Local service launcher | `http://HOST` |
 | Boat Chat | Telemetry-backed diagnostic assistant | `http://HOST:8765` |
+| Control Panel | Component installation, configuration, and lifecycle | `http://127.0.0.1:8780` |
 
 The installer generates credentials, renders a pinned Docker Compose stack,
 creates a confined systemd service for Boat Chat, creates configurable InfluxDB
 buckets, provisions the one-minute downsample task expected by Boat Chat,
 provisions Grafana datasources and a system-health dashboard, and installs the
-`vesselstackctl` lifecycle command.
+`vesselstackctl` lifecycle command. It also installs a local-first, token-
+authenticated Control Panel that can inspect and operate every managed
+container and host service, edit redacted configuration, run preflight, apply
+configuration, create backups, and apply a reviewed release update.
 
 All container tags are release-pinned and checked for Linux ARM64 availability;
 VesselStack does not rely on floating `latest` tags.
@@ -54,8 +58,8 @@ internet access is required.
 ## Before installation
 
 1. Back up existing Home Assistant, InfluxDB, Grafana, MQTT, and SignalK data.
-2. Confirm ports `80`, `443`, `1883`, `8086`, `8123`, `8765`, `9090`, and
-   `43000` are free.
+2. Confirm ports `80`, `443`, `1883`, `8086`, `8123`, `8765`, `8780`, `9090`,
+   and `43000` are free. Port `8780` binds to loopback by default.
 3. If using `SIGNALK_MODE=existing`, confirm SignalK responds:
 
    ```bash
@@ -148,6 +152,7 @@ nano vesselstack.env
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
+| `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
 under `/opt/vesselstack/config/` and are not printed.
@@ -185,6 +190,7 @@ sudo docker compose \
   -f /opt/vesselstack/compose.yml config
 
 sudo systemd-analyze verify /etc/systemd/system/vesselstack-chat.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-control-panel.service
 ```
 
 ## 7. Start VesselStack
@@ -205,7 +211,9 @@ sudo docker compose \
   -f /opt/vesselstack/compose.yml ps
 
 sudo systemctl status vesselstack-chat.service --no-pager
+sudo systemctl status vesselstack-control-panel.service --no-pager
 curl -fsS http://127.0.0.1:8765/health | jq
+curl -fsS http://127.0.0.1:8780/health | jq
 curl -fsS http://127.0.0.1:8086/health | jq
 curl -fsS http://127.0.0.1:43000/api/health | jq
 curl -fsS http://127.0.0.1:8123/manifest.json >/dev/null
@@ -298,6 +306,71 @@ sudo grep '^BOAT_CHAT_SETTINGS_TOKEN=' \
   /opt/vesselstack/config/boat-chat.env
 ```
 
+### Control Panel
+
+The Control Panel is the browser administration surface for VesselStack. It
+shows container and systemd state, starts/stops/restarts individual components,
+edits settings by component, runs installer preflight, renders or installs the
+saved configuration, provisions InfluxDB history, creates consistent backups,
+and applies an already downloaded and reviewed release directory.
+
+It deliberately stays available when the managed stack is stopped. The
+`vesselstackctl` command remains the recovery path if the panel is unavailable.
+
+The default listener is loopback-only. From an administrator workstation, use
+an SSH tunnel or a trusted VPN rather than exposing the panel publicly:
+
+```bash
+ssh -L 8780:127.0.0.1:8780 boat-admin@HOST
+```
+
+Then open `http://127.0.0.1:8780`. Retrieve the generated token locally and
+enter it on the unlock screen:
+
+```bash
+sudo grep '^CONTROL_PANEL_TOKEN=' \
+  /opt/vesselstack/config/control-panel.env
+```
+
+The token is stored by the browser in local storage and sent only in the
+`X-VesselStack-Token` request header. Configuration APIs never return secret
+values: they report only whether a secret is configured, and a blank submitted
+secret preserves its current value. Use the explicit **Clear stored value**
+checkbox to remove one. Operation commands are fixed allowlisted argument
+arrays; the panel does not expose an arbitrary shell.
+
+Clearing an optional integration token disables that credential. Clearing a
+required installer-managed password or token causes the installer to generate
+a replacement the next time configuration is applied; dependent clients must
+then be updated with the new credential.
+
+Saving settings writes mode-600 configuration atomically but does not restart
+services. Review changes, run **Preflight**, then use **Apply configuration** or
+**Install & start**. Hardware probes and the existing SignalK connectivity
+check still gate installer actions. Listener changes require a shell restart:
+
+```bash
+sudo systemctl restart vesselstack-control-panel.service
+```
+
+The panel intentionally skips restarting itself while an operation request is
+in flight. After applying a release that changes Control Panel code, run the
+same restart command to load the new backend.
+
+The service runs as root because Docker, systemd, installation, backup, and
+hardware operations require host privileges. Keep the token private, retain
+loopback binding unless a trusted authenticated access layer is in place, and
+never expose port `8780` directly to the internet. To disable the panel without
+affecting telemetry services:
+
+```bash
+sudo systemctl disable --now vesselstack-control-panel.service
+```
+
+Re-enable it with `sudo systemctl enable --now
+vesselstack-control-panel.service`. CLI configuration and lifecycle commands
+continue to work while it is disabled.
+
 ### Heimdall
 
 Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
@@ -311,6 +384,8 @@ Compose publishes several ports on every host interface. At minimum:
   to trusted management networks;
 - keep Home Assistant, SignalK, and Boat Chat off the public internet unless
   protected by an authenticated reverse proxy;
+- keep the root-privileged Control Panel loopback-only or behind a trusted VPN
+  and authenticated proxy;
 - use ZeroTier, Tailscale, or WireGuard for remote access; and
 - keep `/opt/vesselstack/config/*.env` readable only by root or the required
   service account.
@@ -408,6 +483,7 @@ Stop services without deleting persistent data:
 
 ```bash
 sudo systemctl stop vesselstack-chat.service
+sudo systemctl stop vesselstack-control-panel.service
 sudo docker compose \
   --env-file /opt/vesselstack/config/vesselstack.env \
   -f /opt/vesselstack/compose.yml down
@@ -476,6 +552,7 @@ tests/test-service-integration.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_boat_chat.py' -v
+python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
 ```
 
 Build a sanitized release:
@@ -529,6 +606,9 @@ material. This is a safety net, not a substitute for reviewing staged changes.
 7. **Complete:** CI exercises clean rendering, service startup/provisioning,
    migration, packaging, and recovery. The same non-invasive install and
    recovery gates pass on a Linux ARM64 host running 64-bit Debian.
+8. **Complete:** A loopback-first authenticated Control Panel manages component
+   status, configuration, installation, updates, backups, and lifecycle while
+   preserving CLI recovery access.
 
 See `CHANGELOG.md` for release notes and `VALIDATION.md` for the full evidence
 and hardware-dependent commissioning limits.
