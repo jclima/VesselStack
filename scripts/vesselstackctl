@@ -44,6 +44,7 @@ load_config() {
 start_stack() {
     "${COMPOSE[@]}" up -d
     systemctl start vesselstack-chat.service
+    systemctl start vesselstack-control-panel.service
 }
 
 stop_stack() {
@@ -56,7 +57,8 @@ status_stack() {
     systemctl --no-pager --full status vesselstack-chat.service || true
     local failed=0 endpoint
     for endpoint in http://127.0.0.1:8765/health \
-        http://127.0.0.1:8086/health http://127.0.0.1:43000/api/health; do
+        "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" http://127.0.0.1:8086/health \
+        http://127.0.0.1:43000/api/health; do
         if curl --connect-timeout 3 --max-time 10 --fail --silent --show-error "$endpoint" >/dev/null; then
             printf 'healthy %s\n' "$endpoint"
         else
@@ -144,11 +146,13 @@ uninstall_stack() {
     done
     stop_stack
     systemctl disable vesselstack-chat.service || true
+    systemctl disable --now vesselstack-control-panel.service || true
     if [ -x /usr/local/sbin/vesselstack-firewall ]; then
         /usr/local/sbin/vesselstack-firewall remove || true
     fi
     systemctl disable vesselstack-firewall.service || true
-    rm -f -- /etc/systemd/system/vesselstack-chat.service /usr/local/sbin/vesselstackctl
+    rm -f -- /etc/systemd/system/vesselstack-chat.service \
+        /etc/systemd/system/vesselstack-control-panel.service /usr/local/sbin/vesselstackctl
     rm -f -- /etc/systemd/system/vesselstack-firewall.service /usr/local/sbin/vesselstack-firewall
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then

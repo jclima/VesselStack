@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>VesselStack Control Panel</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">VS</span>
+      <div><strong>VesselStack</strong><span>Control Panel</span></div>
+    </div>
+    <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Locked</span></div>
+  </header>
+
+  <main>
+    <section id="login" class="login card">
+      <p class="eyebrow">LOCAL ADMINISTRATION</p>
+      <h1>Bring the whole stack into view.</h1>
+      <p>Enter the control-panel token stored on the VesselStack host. It stays in this browser only.</p>
+      <form id="login-form">
+        <label for="token">Control-panel token</label>
+        <div class="token-row"><input id="token" type="password" autocomplete="current-password" required><button class="primary" type="submit">Unlock</button></div>
+      </form>
+      <code>sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env</code>
+      <p id="login-error" class="error" role="alert"></p>
+    </section>
+
+    <div id="app" hidden>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">SYSTEM OVERVIEW</p>
+          <h1>Your boat computer,<br>from bridge to bilge.</h1>
+          <p id="summary">Loading component state…</p>
+        </div>
+        <div class="hero-actions">
+          <button class="primary" data-action="install">Install &amp; start</button>
+          <button data-action="preflight">Run preflight</button>
+          <button data-action="backup">Create backup</button>
+        </div>
+      </section>
+
+      <nav class="tabs" aria-label="Control panel sections">
+        <button class="active" data-tab="components">Components</button>
+        <button data-tab="configuration">Configuration</button>
+        <button data-tab="maintenance">Maintenance</button>
+      </nav>
+
+      <section id="components" class="tab-panel">
+        <div class="section-heading"><div><p class="eyebrow">RUNTIME</p><h2>Components</h2></div><button id="refresh">Refresh status</button></div>
+        <div id="component-grid" class="component-grid"></div>
+      </section>
+
+      <section id="configuration" class="tab-panel" hidden>
+        <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>Configuration</h2></div><div class="inline-actions"><button id="discard-config">Discard edits</button><button id="save-config" class="primary">Save configuration</button></div></div>
+        <div class="notice">Secrets are write-only. Leave a secret field blank to keep its current value. Saving does not restart services; use <strong>Apply configuration</strong> after review.</div>
+        <form id="config-form"></form>
+      </section>
+
+      <section id="maintenance" class="tab-panel" hidden>
+        <div class="section-heading"><div><p class="eyebrow">LIFECYCLE</p><h2>Maintenance</h2></div></div>
+        <div class="maintenance-grid">
+          <article class="card action-card"><h3>Configuration</h3><p>Validate, render, and apply the saved configuration without starting stopped services.</p><button data-action="apply">Apply configuration</button></article>
+          <article class="card action-card"><h3>History storage</h3><p>Create configured InfluxDB buckets and the idempotent one-minute downsample task.</p><button data-action="bootstrap-history">Provision history</button></article>
+          <article class="card action-card"><h3>Stack lifecycle</h3><p>Start, stop, or restart the managed stack. The control panel remains available.</p><div class="inline-actions"><button data-action="start">Start</button><button data-action="restart">Restart</button><button class="danger" data-action="stop">Stop</button></div></article>
+          <article class="card action-card"><h3>Reviewed update</h3><p>Back up and apply an already downloaded VesselStack release directory.</p><label for="update-source">Absolute release directory</label><input id="update-source" placeholder="/path/to/VesselStack-release"><button id="run-update">Back up &amp; update</button></article>
+        </div>
+      </section>
+
+      <section class="operation card">
+        <div class="section-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Operation log</h2></div><span id="operation-state" class="pill">Idle</span></div>
+        <pre id="operation-output">No operation has run in this session.</pre>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

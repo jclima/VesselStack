@@ -21,3 +21,12 @@ suggested mitigation. You should receive an acknowledgement within seven days.
 VesselStack is not certified navigation, collision-avoidance, engine-control,
 alarm, or life-safety equipment. Operators must retain independent marine
 instruments, alarms, and safe operating procedures.
+
+## Administrative surface
+
+The VesselStack Control Panel runs as root so it can coordinate Docker,
+systemd, installation, backup, and hardware operations. Its default listener is
+loopback-only and every API except `/health` requires the generated control-
+panel token. Do not publish it directly to the internet. Use an SSH tunnel or a
+trusted encrypted VPN, protect the token as a root credential, and keep the
+`vesselstackctl` CLI available as the recovery path.
