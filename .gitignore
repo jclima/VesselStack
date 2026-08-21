@@ -1,0 +1,6 @@
+vesselstack.env
+generated/*
+!generated/.gitkeep
+__pycache__/
+*.py[cod]
+.venv/

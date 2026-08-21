@@ -1,0 +1,30 @@
+blueprint:
+  name: VesselStack shore power lost alert
+  description: Notify when a selected shore-power sensor remains disconnected.
+  domain: automation
+  input:
+    shore_power_sensor:
+      name: Shore-power binary sensor
+      selector:
+        entity:
+          filter:
+            domain: binary_sensor
+    hold_time:
+      name: Required duration
+      default:
+        minutes: 2
+      selector:
+        duration: {}
+    notification_actions:
+      name: Notification actions
+      selector:
+        action: {}
+
+mode: single
+max_exceeded: silent
+trigger:
+  - platform: state
+    entity_id: !input shore_power_sensor
+    to: "off"
+    for: !input hold_time
+action: !input notification_actions

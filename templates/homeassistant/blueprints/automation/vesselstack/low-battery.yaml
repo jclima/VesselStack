@@ -1,0 +1,39 @@
+blueprint:
+  name: VesselStack low battery alert
+  description: Notify when a selected battery voltage remains below a safe threshold.
+  domain: automation
+  input:
+    voltage_sensor:
+      name: Battery voltage sensor
+      selector:
+        entity:
+          filter:
+            domain: sensor
+    low_voltage:
+      name: Low-voltage threshold
+      default: 12.0
+      selector:
+        number:
+          min: 8
+          max: 60
+          step: 0.1
+          unit_of_measurement: V
+    hold_time:
+      name: Required duration
+      default:
+        minutes: 5
+      selector:
+        duration: {}
+    notification_actions:
+      name: Notification actions
+      selector:
+        action: {}
+
+mode: single
+max_exceeded: silent
+trigger:
+  - platform: numeric_state
+    entity_id: !input voltage_sensor
+    below: !input low_voltage
+    for: !input hold_time
+action: !input notification_actions

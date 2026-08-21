@@ -1,0 +1,186 @@
+#!/bin/bash
+# Lifecycle management for an installed VesselStack system.
+
+set -euo pipefail
+umask 077
+
+ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
+ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
+
+usage() {
+    cat <<'EOF'
+Usage: vesselstackctl COMMAND [ARGUMENTS]
+
+Commands:
+  status                       Show containers, Boat Chat, and HTTP health
+  start                        Start the stack
+  stop                         Stop the stack
+  restart                      Restart the stack
+  backup [DIRECTORY]           Create a checksummed, consistent backup
+  verify-backup ARCHIVE        Verify an archive and its checksum
+  restore ARCHIVE --yes        Replace config/data from a verified backup
+  update SOURCE_DIRECTORY      Back up and apply a reviewed release
+  uninstall [--purge-data --yes]
+                               Remove services; preserve data by default
+EOF
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || { echo "This command requires root" >&2; exit 1; }
+}
+
+load_config() {
+    [ -r "$ENV_FILE" ] || { echo "Missing installed config: $ENV_FILE" >&2; exit 1; }
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    : "${VESSELSTACK_ROOT:?Missing VESSELSTACK_ROOT}"
+    : "${VESSELSTACK_DATA:?Missing VESSELSTACK_DATA}"
+    COMPOSE=(docker compose)
+    [ "${SIGNALK_MODE:-existing}" = docker ] && COMPOSE+=(--profile signalk)
+    [ "${AIS_ENABLE:-false}" = true ] && COMPOSE+=(--profile ais)
+    COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
+}
+
+start_stack() {
+    "${COMPOSE[@]}" up -d
+    systemctl start vesselstack-chat.service
+}
+
+stop_stack() {
+    systemctl stop vesselstack-chat.service || true
+    "${COMPOSE[@]}" down
+}
+
+status_stack() {
+    "${COMPOSE[@]}" ps --all
+    systemctl --no-pager --full status vesselstack-chat.service || true
+    local failed=0 endpoint
+    for endpoint in http://127.0.0.1:8765/health \
+        http://127.0.0.1:8086/health http://127.0.0.1:43000/api/health; do
+        if curl --connect-timeout 3 --max-time 10 --fail --silent --show-error "$endpoint" >/dev/null; then
+            printf 'healthy %s\n' "$endpoint"
+        else
+            printf 'unhealthy %s\n' "$endpoint" >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+backup_stack() {
+    local destination=${1:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
+    local stamp archive manifest was_active=0
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    archive="$destination/vesselstack-$stamp.tar.gz"
+    manifest="$archive.sha256"
+    install -d -m 0700 "$destination"
+    if "${COMPOSE[@]}" ps --status running --quiet | grep -q .; then
+        was_active=1
+    fi
+    cleanup_backup() {
+        if [ "$was_active" -eq 1 ]; then start_stack; fi
+    }
+    trap cleanup_backup EXIT
+    stop_stack
+    tar --numeric-owner -czf "$archive" \
+        --transform 's,^,vesselstack-backup/,' \
+        "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA"
+    sha256sum "$archive" > "$manifest"
+    tar -tzf "$archive" >/dev/null
+    chmod 0600 "$archive" "$manifest"
+    trap - EXIT
+    cleanup_backup
+    printf '%s\n' "$archive"
+}
+
+verify_backup() {
+    local archive=$1 root_path data_path entry invalid=0
+    [ -f "$archive" ] || { echo "Backup not found: $archive" >&2; exit 1; }
+    [ -f "$archive.sha256" ] || { echo "Checksum not found: $archive.sha256" >&2; exit 1; }
+    (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$archive").sha256")
+    root_path=${VESSELSTACK_ROOT#/}
+    data_path=${VESSELSTACK_DATA#/}
+    while IFS= read -r entry; do
+        case "$entry" in
+            "vesselstack-backup/$root_path"|"vesselstack-backup/$root_path/"*|\
+            "vesselstack-backup/$data_path"|"vesselstack-backup/$data_path/"*) ;;
+            *) invalid=1 ;;
+        esac
+    done < <(tar -tzf "$archive")
+    if [ "$invalid" -ne 0 ]; then
+        echo "Backup contains paths outside this VesselStack installation" >&2
+        exit 1
+    fi
+    echo "Backup verified"
+}
+
+restore_stack() {
+    local archive=$1 confirmation=${2:-}
+    [ "$confirmation" = --yes ] || { echo "restore requires --yes" >&2; exit 2; }
+    verify_backup "$archive"
+    stop_stack
+    tar -xzf "$archive" -C / --strip-components=1
+    systemctl daemon-reload
+    start_stack
+    echo "Restore completed"
+}
+
+update_stack() {
+    local source=$1
+    [ -x "$source/install.sh" ] || { echo "Not a VesselStack release directory: $source" >&2; exit 1; }
+    "$source/install.sh" --config "$ENV_FILE" --dry-run
+    backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}"
+    "$source/install.sh" --config "$ENV_FILE" --start
+}
+
+uninstall_stack() {
+    local purge=0 confirmed=0 argument
+    for argument in "$@"; do
+        case "$argument" in
+            --purge-data) purge=1 ;;
+            --yes) confirmed=1 ;;
+            *) echo "Unknown uninstall option: $argument" >&2; exit 2 ;;
+        esac
+    done
+    stop_stack
+    systemctl disable vesselstack-chat.service || true
+    if [ -x /usr/local/sbin/vesselstack-firewall ]; then
+        /usr/local/sbin/vesselstack-firewall remove || true
+    fi
+    systemctl disable vesselstack-firewall.service || true
+    rm -f -- /etc/systemd/system/vesselstack-chat.service /usr/local/sbin/vesselstackctl
+    rm -f -- /etc/systemd/system/vesselstack-firewall.service /usr/local/sbin/vesselstack-firewall
+    systemctl daemon-reload
+    if [ "$purge" -eq 1 ]; then
+        [ "$confirmed" -eq 1 ] || { echo "--purge-data requires --yes" >&2; exit 2; }
+        case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
+            /opt/vesselstack:/opt/vesselstack-data) ;;
+            *) echo "Refusing to purge non-default paths automatically" >&2; exit 1 ;;
+        esac
+        rm -rf -- /opt/vesselstack /opt/vesselstack-data
+        echo "VesselStack services, configuration, and data removed"
+    else
+        echo "VesselStack services removed; data preserved at $VESSELSTACK_DATA"
+    fi
+}
+
+[ $# -gt 0 ] || { usage; exit 2; }
+command=$1
+shift
+case "$command" in
+    help|-h|--help) usage; exit 0 ;;
+esac
+require_root
+load_config
+case "$command" in
+    status) status_stack ;;
+    start) start_stack ;;
+    stop) stop_stack ;;
+    restart) stop_stack; start_stack ;;
+    backup) backup_stack "$@" ;;
+    verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
+    restore) [ $# -ge 1 ] || { usage; exit 2; }; restore_stack "$@" ;;
+    update) [ $# -eq 1 ] || { usage; exit 2; }; update_stack "$1" ;;
+    uninstall) uninstall_stack "$@" ;;
+    *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
+esac

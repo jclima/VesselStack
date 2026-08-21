@@ -1,0 +1,64 @@
+#!/bin/bash
+# Restrict administrative ports on one explicitly untrusted interface.
+
+set -euo pipefail
+
+ENV_FILE=${VESSELSTACK_ENV:-/opt/vesselstack/config/vesselstack.env}
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+interface=${VESSELSTACK_UNTRUSTED_INTERFACE:-wlan0}
+action=${1:-apply}
+
+[ "$(id -u)" -eq 0 ] || { echo "Firewall changes require root" >&2; exit 1; }
+case "$interface" in
+    ''|*[!A-Za-z0-9_.:-]*) echo "Invalid untrusted interface: $interface" >&2; exit 1 ;;
+    *) ;;
+esac
+
+ensure_jump() {
+    local command=$1 parent=$2 child=$3
+    "$command" -C "$parent" -j "$child" 2>/dev/null || \
+        "$command" -I "$parent" 1 -j "$child"
+}
+
+remove_chain() {
+    local command=$1 parent=$2 child=$3
+    while "$command" -C "$parent" -j "$child" 2>/dev/null; do
+        "$command" -D "$parent" -j "$child"
+    done
+    "$command" -F "$child" 2>/dev/null || true
+    "$command" -X "$child" 2>/dev/null || true
+}
+
+configure_host() {
+    local command=$1
+    "$command" -N VESSELSTACK-INPUT 2>/dev/null || true
+    "$command" -F VESSELSTACK-INPUT
+    "$command" -A VESSELSTACK-INPUT -i "$interface" -p tcp \
+        -m multiport --dports 1883,8086,9090,43000 -j DROP
+    "$command" -A VESSELSTACK-INPUT -j RETURN
+    ensure_jump "$command" INPUT VESSELSTACK-INPUT
+}
+
+case "$action" in
+    apply)
+        [ -e "/sys/class/net/$interface" ] || {
+            echo "Untrusted interface not detected: $interface" >&2
+            exit 1
+        }
+        configure_host /usr/sbin/iptables
+        configure_host /usr/sbin/ip6tables
+        /usr/sbin/iptables -N VESSELSTACK-DOCKER 2>/dev/null || true
+        /usr/sbin/iptables -F VESSELSTACK-DOCKER
+        /usr/sbin/iptables -A VESSELSTACK-DOCKER -i "$interface" -p tcp \
+            -m multiport --dports 1883,3000,8086,9090 -j DROP
+        /usr/sbin/iptables -A VESSELSTACK-DOCKER -j RETURN
+        ensure_jump /usr/sbin/iptables DOCKER-USER VESSELSTACK-DOCKER
+        ;;
+    remove)
+        remove_chain /usr/sbin/iptables INPUT VESSELSTACK-INPUT
+        remove_chain /usr/sbin/ip6tables INPUT VESSELSTACK-INPUT
+        remove_chain /usr/sbin/iptables DOCKER-USER VESSELSTACK-DOCKER
+        ;;
+    *) echo "Usage: vesselstack-firewall [apply|remove]" >&2; exit 2 ;;
+esac

@@ -1,0 +1,13 @@
+[Unit]
+Description=VesselStack SocketCAN interface
+After=systemd-modules-load.service
+Before=vesselstack-signalk.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ip link set @CAN_INTERFACE@ up type can bitrate @CAN_BITRATE@ restart-ms 100
+ExecStop=/usr/sbin/ip link set @CAN_INTERFACE@ down
+
+[Install]
+WantedBy=multi-user.target

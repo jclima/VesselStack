@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  readme-policy:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require README update
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "$changed"
+          grep -qx 'README.md' <<<"$changed" || {
+            echo "Every pull request must update README.md." >&2
+            exit 1
+          }
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: Static distribution checks
+        run: tests/test-distribution.sh
+      - name: Lifecycle backup and restore checks
+        run: sudo tests/test-lifecycle.sh
+      - name: Versioned migration checks
+        run: tests/test-migrations.sh
+      - name: Clean installation checks
+        run: sudo tests/test-clean-install.sh
+      - name: Validate Compose configuration
+        run: docker compose --env-file vesselstack.example.env -f templates/compose.yml config --quiet
+      - name: Validate optional Compose profiles
+        run: docker compose --profile signalk --profile ais --env-file vesselstack.example.env -f templates/compose.yml config --quiet
+      - name: Validate Linux ARM64 image manifests
+        run: tests/test-image-manifests.sh
+      - name: Run Boat Chat tests
+        run: python3 -m unittest discover -s tests -p 'test_boat_chat.py' -v
+      - name: Build and verify release archive
+        run: |
+          ./build-package.sh
+          (cd generated && sha256sum -c vesselstack-$(cat ../VERSION).tar.gz.sha256)
+          test "$(awk '{print $2}' generated/vesselstack-$(cat VERSION).tar.gz.sha256)" = "vesselstack-$(cat VERSION).tar.gz"
+
+  service-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start and verify observability services
+        run: tests/test-service-integration.sh

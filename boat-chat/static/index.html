@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f8f9" />
+    <title>VesselStack Boat Chat</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="chat">
+        <header class="app-header">
+          <div>
+            <h1>VesselStack Boat Chat</h1>
+            <p>Telemetry-backed assistant for VesselStack.</p>
+          </div>
+          <div class="header-actions">
+            <div class="status-stack" aria-live="polite">
+              <div id="status" class="status">Starting</div>
+              <div id="route-status" class="status status-secondary">Local</div>
+            </div>
+            <button id="settings-open" type="button">Settings</button>
+          </div>
+        </header>
+
+        <div class="examples" aria-label="Example questions">
+          <button data-prompt="How much fuel did I use this weekend?">Fuel this weekend</button>
+          <button data-prompt="Battery voltage over the past 2 weeks">Battery 2 weeks</button>
+          <button data-prompt="When did shore power turn off?">Shore power</button>
+          <button data-prompt="Is the boat healthy right now?">Health check</button>
+        </div>
+
+        <section id="messages" class="messages" aria-live="polite"></section>
+
+        <details class="context-drawer">
+          <summary>
+            <span>Tool context</span>
+            <span id="context-summary">No request yet</span>
+          </summary>
+          <pre id="context-json">No request yet.</pre>
+        </details>
+
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="message">Boat question</label>
+          <textarea
+            id="message"
+            rows="2"
+            placeholder="Ask a boat-specific question..."
+            autocomplete="off"
+            spellcheck="true"
+          ></textarea>
+          <div class="composer-actions">
+            <button id="clear-chat" class="secondary-button" type="button">Clear</button>
+            <button id="send-button" type="submit">Ask</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <dialog id="settings-dialog">
+      <form id="settings-form" method="dialog">
+        <header class="dialog-header">
+          <h2>Settings</h2>
+          <button id="settings-close" type="button" aria-label="Close settings">Close</button>
+        </header>
+
+        <section class="settings-grid">
+          <fieldset class="settings-section">
+            <legend>Routing</legend>
+            <div class="setting-fields">
+              <label>
+                Primary provider
+                <select name="BOAT_CHAT_PROVIDER" id="setting-provider"></select>
+              </label>
+              <label>
+                Primary model
+                <select id="setting-model-select" data-role="primary"></select>
+              </label>
+              <label id="setting-model-custom-wrap" hidden>
+                Custom primary model
+                <input id="setting-model-custom" autocomplete="off" placeholder="exact model id" />
+              </label>
+              <label>
+                Fallback provider
+                <select name="BOAT_CHAT_FALLBACK_PROVIDER" id="setting-fallback-provider"></select>
+              </label>
+              <label>
+                Fallback model
+                <select id="setting-fallback-model-select" data-role="fallback"></select>
+              </label>
+              <label id="setting-fallback-model-custom-wrap" hidden>
+                Custom fallback model
+                <input id="setting-fallback-model-custom" autocomplete="off" placeholder="exact model id" />
+              </label>
+              <div class="route-summary">
+                <span id="primary-provider-note"></span>
+                <span id="fallback-provider-note"></span>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section">
+            <legend>Budgets</legend>
+            <div class="setting-fields">
+              <label>
+                Max tokens
+                <input name="BOAT_CHAT_MAX_TOKENS" id="setting-max-tokens" inputmode="numeric" />
+              </label>
+              <label>
+                Context chars
+                <input name="BOAT_CHAT_CONTEXT_CHARS" id="setting-context-chars" inputmode="numeric" />
+              </label>
+              <label>
+                CLI timeout
+                <input name="BOAT_CHAT_CLI_TIMEOUT" id="setting-cli-timeout" inputmode="numeric" placeholder="120" />
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="codex_cli">
+            <legend>Codex CLI</legend>
+            <div class="setting-fields">
+              <label>
+                Codex effort
+                <select name="BOAT_CHAT_CODEX_EFFORT" id="setting-codex-effort">
+                  <option value=""></option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+              <label>
+                Codex binary
+                <input name="BOAT_CHAT_CODEX_BIN" id="setting-codex-bin" autocomplete="off" placeholder="codex" />
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="claude_cli">
+            <legend>Claude CLI</legend>
+            <div class="setting-fields">
+              <label>
+                Claude effort
+                <select name="BOAT_CHAT_CLAUDE_EFFORT" id="setting-claude-effort">
+                  <option value=""></option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                  <option value="max">max</option>
+                </select>
+              </label>
+              <label>
+                Claude binary
+                <input name="BOAT_CHAT_CLAUDE_BIN" id="setting-claude-bin" autocomplete="off" placeholder="claude" />
+              </label>
+              <label>
+                Max budget USD
+                <input name="BOAT_CHAT_CLAUDE_MAX_BUDGET_USD" id="setting-claude-max-budget" inputmode="decimal" placeholder="0.25" />
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="ollama">
+            <legend>Ollama</legend>
+            <div class="setting-fields">
+              <label>
+                Ollama host
+                <input name="OLLAMA_HOST" id="setting-ollama-host" autocomplete="off" />
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="openai">
+            <legend>OpenAI</legend>
+            <div class="setting-fields">
+              <label>
+                OpenAI key
+                <input name="OPENAI_API_KEY" id="setting-openai-key" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="OPENAI_API_KEY"></span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="vercel">
+            <legend>Vercel AI Gateway</legend>
+            <div class="setting-fields">
+              <label>
+                Gateway key
+                <input name="AI_GATEWAY_API_KEY" id="setting-vercel-key" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="AI_GATEWAY_API_KEY"></span>
+              </label>
+              <label>
+                OIDC token
+                <input name="VERCEL_OIDC_TOKEN" id="setting-vercel-oidc-token" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="VERCEL_OIDC_TOKEN"></span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="openai_compatible">
+            <legend>OpenAI Compatible</legend>
+            <div class="setting-fields">
+              <label>
+                Base URL
+                <input name="BOAT_CHAT_BASE_URL" id="setting-compatible-base-url" autocomplete="off" />
+              </label>
+              <label>
+                API key
+                <input name="BOAT_CHAT_API_KEY" id="setting-api-key" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="BOAT_CHAT_API_KEY"></span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="bedrock">
+            <legend>AWS Bedrock</legend>
+            <div class="setting-fields">
+              <label>
+                AWS region
+                <input name="AWS_REGION" id="setting-aws-region" autocomplete="off" />
+              </label>
+              <label>
+                AWS default region
+                <input name="AWS_DEFAULT_REGION" id="setting-aws-default-region" autocomplete="off" />
+              </label>
+              <label>
+                AWS access key
+                <input name="AWS_ACCESS_KEY_ID" id="setting-aws-access" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="AWS_ACCESS_KEY_ID"></span>
+              </label>
+              <label>
+                AWS secret key
+                <input name="AWS_SECRET_ACCESS_KEY" id="setting-aws-secret" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="AWS_SECRET_ACCESS_KEY"></span>
+              </label>
+              <label>
+                AWS session token
+                <input name="AWS_SESSION_TOKEN" id="setting-aws-session-token" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="AWS_SESSION_TOKEN"></span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section" data-provider-config="google">
+            <legend>Google</legend>
+            <div class="setting-fields">
+              <label>
+                Google API key
+                <input name="GOOGLE_API_KEY" id="setting-google-key" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="GOOGLE_API_KEY"></span>
+              </label>
+              <label>
+                Gemini API key
+                <input name="GEMINI_API_KEY" id="setting-gemini-key" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="GEMINI_API_KEY"></span>
+              </label>
+              <label>
+                Google Cloud project
+                <input name="GOOGLE_CLOUD_PROJECT" id="setting-google-project" autocomplete="off" />
+              </label>
+              <label>
+                Google Cloud location
+                <input name="GOOGLE_CLOUD_LOCATION" id="setting-google-location" autocomplete="off" />
+              </label>
+              <label>
+                Google Cloud token
+                <input name="GOOGLE_CLOUD_ACCESS_TOKEN" id="setting-google-cloud-token" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="GOOGLE_CLOUD_ACCESS_TOKEN"></span>
+              </label>
+              <label>
+                Google OAuth token
+                <input name="GOOGLE_OAUTH_ACCESS_TOKEN" id="setting-google-oauth-token" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="GOOGLE_OAUTH_ACCESS_TOKEN"></span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section">
+            <legend>Telegram</legend>
+            <div class="setting-fields">
+              <label>
+                Boat Chat URL
+                <input name="BOAT_CHAT_URL" id="setting-boat-chat-url" autocomplete="off" placeholder="http://127.0.0.1:8765" />
+              </label>
+              <label>
+                Telegram token
+                <input name="TELEGRAM_BOT_TOKEN" id="setting-telegram-token" type="password" autocomplete="off" />
+                <span class="secret-state" data-secret="TELEGRAM_BOT_TOKEN"></span>
+              </label>
+              <label>
+                Telegram chat IDs
+                <input name="TELEGRAM_ALLOWED_CHAT_IDS" id="setting-telegram-chat-ids" autocomplete="off" placeholder="123456789,-1001234567890" />
+              </label>
+              <label>
+                Telegram poll timeout
+                <input name="TELEGRAM_POLL_TIMEOUT" id="setting-telegram-poll-timeout" inputmode="numeric" placeholder="25" />
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-section">
+            <legend>Server</legend>
+            <div class="setting-fields">
+              <label>
+                Host
+                <input name="BOAT_CHAT_HOST" id="setting-host" autocomplete="off" />
+              </label>
+              <label>
+                Port
+                <input name="BOAT_CHAT_PORT" id="setting-port" inputmode="numeric" />
+              </label>
+              <label>
+                Settings token
+                <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional write protection" />
+                <span class="secret-state" data-secret="BOAT_CHAT_SETTINGS_TOKEN"></span>
+              </label>
+            </div>
+          </fieldset>
+        </section>
+
+        <footer class="dialog-footer">
+          <span id="settings-message"></span>
+          <button type="submit">Save</button>
+        </footer>
+      </form>
+    </dialog>
+    <script src="/app.js"></script>
+  </body>
+</html>

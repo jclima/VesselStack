@@ -1,0 +1,26 @@
+{
+  "vessel": {
+    "name": "VesselStack",
+    "type": "Motor vessel",
+    "mmsi": "000000000",
+    "callsign": "UNSET",
+    "length_overall_m": 0,
+    "beam_m": 0
+  },
+  "host": {
+    "platform": "Linux",
+    "hostname": "vesselstack",
+    "lan_ip": "127.0.0.1",
+    "zerotier_ip": "127.0.0.1"
+  },
+  "telemetry": {
+    "primary_bus": "Configure during installation",
+    "marine_hub": "SignalK",
+    "automation": "Home Assistant",
+    "history": "InfluxDB"
+  },
+  "engines": {
+    "layout": "Configure during installation",
+    "sides": ["port", "starboard"]
+  }
+}

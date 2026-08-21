@@ -1,0 +1,106 @@
+name: vesselstack
+
+services:
+  signalk:
+    profiles: ["signalk"]
+    image: cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}
+    container_name: vesselstack-signalk
+    init: true
+    restart: unless-stopped
+    # Host networking lets SignalK consume SocketCAN interfaces and local NMEA
+    # feeds without granting the container broad Docker privileges.
+    network_mode: host
+    volumes:
+      - ${VESSELSTACK_DATA}/signalk:/home/node/.signalk
+
+  ais-catcher:
+    profiles: ["ais"]
+    image: ${AIS_IMAGE}
+    container_name: vesselstack-ais-catcher
+    restart: unless-stopped
+    command: ${AIS_CATCHER_ARGS}
+    devices:
+      - ${AIS_DEVICE}:${AIS_DEVICE}
+    ports:
+      - "8100:8100"
+      - "5011:5011"
+
+  homeassistant:
+    image: homeassistant/home-assistant:2026.6.4
+    container_name: vesselstack-homeassistant
+    restart: unless-stopped
+    network_mode: host
+    stop_grace_period: 60s
+    environment:
+      TZ: ${BOAT_TIMEZONE}
+    volumes:
+      - ${VESSELSTACK_DATA}/homeassistant:/config
+
+  influxdb:
+    image: influxdb:2.9.1
+    container_name: vesselstack-influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USERNAME}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_RAW_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      - ${VESSELSTACK_DATA}/influxdb:/var/lib/influxdb2
+
+  grafana:
+    image: grafana/grafana:13.0.1
+    container_name: vesselstack-grafana
+    restart: unless-stopped
+    ports:
+      - "43000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: boatadmin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_HISTORY_BUCKET: ${INFLUXDB_HISTORY_BUCKET}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      - ${VESSELSTACK_DATA}/grafana:/var/lib/grafana
+      - ${VESSELSTACK_ROOT}/config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${VESSELSTACK_ROOT}/config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: vesselstack-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${VESSELSTACK_ROOT}/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  mosquitto:
+    image: eclipse-mosquitto:2.1.2-alpine
+    container_name: vesselstack-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ${VESSELSTACK_ROOT}/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ${VESSELSTACK_DATA}/mosquitto:/mosquitto/data
+
+  heimdall:
+    image: lscr.io/linuxserver/heimdall:v2.8.1-ls357
+    container_name: vesselstack-heimdall
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PUID: ${VESSELSTACK_UID}
+      PGID: ${VESSELSTACK_GID}
+      TZ: ${BOAT_TIMEZONE}
+    volumes:
+      - ${VESSELSTACK_DATA}/heimdall:/config

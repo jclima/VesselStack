@@ -1,0 +1,14 @@
+[Unit]
+Description=VesselStack untrusted-interface firewall
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=VESSELSTACK_ENV=@VESSELSTACK_ROOT@/config/vesselstack.env
+ExecStart=/usr/local/sbin/vesselstack-firewall apply
+ExecStop=/usr/local/sbin/vesselstack-firewall remove
+
+[Install]
+WantedBy=multi-user.target

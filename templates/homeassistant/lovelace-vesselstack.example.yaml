@@ -1,0 +1,38 @@
+title: VesselStack
+views:
+  - title: Vessel
+    path: vessel
+    icon: mdi:ferry
+    cards:
+      - type: markdown
+        title: VesselStack dashboard template
+        content: >-
+          Replace the example entity IDs below with validated entities from
+          your SignalK/Home Assistant integration before relying on this view.
+      - type: entities
+        title: Electrical
+        entities:
+          - entity: sensor.vesselstack_battery_voltage
+            name: Battery voltage
+          - entity: sensor.vesselstack_battery_state_of_charge
+            name: Battery state of charge
+          - entity: binary_sensor.vesselstack_shore_power
+            name: Shore power
+      - type: entities
+        title: Safety
+        entities:
+          - entity: binary_sensor.vesselstack_bilge_pump
+            name: Bilge pump
+          - entity: binary_sensor.vesselstack_high_water
+            name: High water
+          - entity: sensor.vesselstack_engine_alarm
+            name: Engine alarm
+      - type: entities
+        title: Navigation context
+        entities:
+          - entity: sensor.vesselstack_depth
+            name: Depth
+          - entity: sensor.vesselstack_speed_over_ground
+            name: Speed over ground
+          - entity: sensor.vesselstack_nearby_ais_targets
+            name: Nearby AIS targets

@@ -1,0 +1,22 @@
+[Unit]
+Description=VesselStack SignalK server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@VESSELSTACK_USER@
+Group=@VESSELSTACK_USER@
+Environment=HOME=@SIGNALK_DATA@
+WorkingDirectory=@SIGNALK_ROOT@
+ExecStart=@SIGNALK_ROOT@/node_modules/.bin/signalk-server --settings @SIGNALK_DATA@
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@SIGNALK_DATA@
+
+[Install]
+WantedBy=multi-user.target

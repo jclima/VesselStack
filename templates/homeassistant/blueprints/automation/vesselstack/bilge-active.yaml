@@ -1,0 +1,30 @@
+blueprint:
+  name: VesselStack bilge activity alert
+  description: Notify when a selected bilge-pump or high-water sensor remains active.
+  domain: automation
+  input:
+    bilge_sensor:
+      name: Bilge or high-water binary sensor
+      selector:
+        entity:
+          filter:
+            domain: binary_sensor
+    hold_time:
+      name: Required duration
+      default:
+        seconds: 30
+      selector:
+        duration: {}
+    notification_actions:
+      name: Notification actions
+      selector:
+        action: {}
+
+mode: single
+max_exceeded: silent
+trigger:
+  - platform: state
+    entity_id: !input bilge_sensor
+    to: "on"
+    for: !input hold_time
+action: !input notification_actions

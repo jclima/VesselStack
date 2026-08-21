@@ -1,0 +1,28 @@
+apiVersion: 1
+
+deleteDatasources:
+  - name: VesselStack InfluxDB
+    orgId: 1
+  - name: VesselStack Prometheus
+    orgId: 1
+
+datasources:
+  - name: VesselStack InfluxDB
+    uid: vesselstack-influx
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: $INFLUXDB_ORG
+      defaultBucket: $INFLUXDB_HISTORY_BUCKET
+      tlsSkipVerify: false
+    secureJsonData:
+      token: $INFLUXDB_TOKEN
+  - name: VesselStack Prometheus
+    uid: vesselstack-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
