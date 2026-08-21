@@ -93,6 +93,9 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
 
 test -x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-control-panel.service"
+test -s "$APP_ROOT/control-panel/app.py"
+test -s "$APP_ROOT/installer/install.sh"
 test -s "$APP_ROOT/config/grafana/dashboards/system-health.json"
 test -s "$DATA_ROOT/homeassistant/blueprints/automation/vesselstack/low-battery.yaml"
 test -s "$DATA_ROOT/homeassistant/vesselstack-dashboard.example.yaml"
@@ -105,6 +108,20 @@ if grep -R 'GENERATE' "$APP_ROOT/config"; then
     exit 1
 fi
 test "$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")" = 600
+test "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" = 600
+grep -Eq '^CONTROL_PANEL_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/control-panel.env"
 grep -qx '1.0.1' "$APP_ROOT/config/installed-version"
+
+panel_token_before=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")
+sed -i '/^BOAT_CHAT_PROVIDER=/d' "$APP_ROOT/config/boat-chat.env"
+printf '%s\n' 'BOAT_CHAT_PROVIDER=ollama' 'OPENAI_API_KEY=preserve-test-secret' \
+    >> "$APP_ROOT/config/boat-chat.env"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$APP_ROOT/installer/install.sh" \
+    --config "$APP_ROOT/config/vesselstack.env" >/dev/null
+grep -qx 'BOAT_CHAT_PROVIDER=ollama' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
+test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
+    "$panel_token_before"
 
 echo "clean installation checks passed"

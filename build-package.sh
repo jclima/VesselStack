@@ -19,7 +19,7 @@ trap cleanup EXIT
 
 install -d "$STAGE/$PACKAGE_NAME" "$STAGE/$PACKAGE_NAME/boat-chat"
 tar -C "$SCRIPT_DIR" --exclude=.git --exclude=generated --exclude=boat-chat \
-    --exclude=vesselstack.env -cf - . \
+    --exclude=vesselstack.env --exclude='*/__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$STAGE/$PACKAGE_NAME" -xf -
 tar -C "$SOURCE_ROOT/boat-chat" \
     --exclude=boat-chat.env --exclude=.venv --exclude=memory --exclude=data \
