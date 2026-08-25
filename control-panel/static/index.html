@@ -13,7 +13,7 @@
       <span class="brand-mark" aria-hidden="true">VS</span>
       <div><strong>VesselStack</strong><span>Control Panel</span></div>
     </div>
-    <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Locked</span></div>
+    <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Locked</span><button id="lock" type="button" hidden>Lock</button></div>
   </header>
 
   <main>
@@ -66,7 +66,7 @@
           <article class="card action-card"><h3>Configuration</h3><p>Validate, render, and apply the saved configuration without starting stopped services.</p><button data-action="apply">Apply configuration</button></article>
           <article class="card action-card"><h3>History storage</h3><p>Create configured InfluxDB buckets and the idempotent one-minute downsample task.</p><button data-action="bootstrap-history">Provision history</button></article>
           <article class="card action-card"><h3>Stack lifecycle</h3><p>Start, stop, or restart the managed stack. The control panel remains available.</p><div class="inline-actions"><button data-action="start">Start</button><button data-action="restart">Restart</button><button class="danger" data-action="stop">Stop</button></div></article>
-          <article class="card action-card"><h3>Reviewed update</h3><p>Back up and apply an already downloaded VesselStack release directory.</p><label for="update-source">Absolute release directory</label><input id="update-source" placeholder="/path/to/VesselStack-release"><button id="run-update">Back up &amp; update</button></article>
+          <article class="card action-card"><h3>Reviewed update</h3><p>Back up and apply a root-controlled release staged under /var/lib/vesselstack/releases.</p><label for="update-source">Staged release directory</label><input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z"><button id="run-update">Back up &amp; update</button></article>
         </div>
       </section>
 

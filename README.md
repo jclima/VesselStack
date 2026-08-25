@@ -331,7 +331,7 @@ The Control Panel is the browser administration surface for VesselStack. It
 shows container and systemd state, starts/stops/restarts individual components,
 edits settings by component, runs installer preflight, renders or installs the
 saved configuration, provisions InfluxDB history, creates consistent backups,
-and applies an already downloaded and reviewed release directory.
+and applies an already downloaded, reviewed, and root-controlled release.
 
 It deliberately stays available when the managed stack is stopped. The
 `vesselstackctl` command remains the recovery path if the panel is unavailable.
@@ -351,12 +351,14 @@ sudo grep '^CONTROL_PANEL_TOKEN=' \
   /opt/vesselstack/config/control-panel.env
 ```
 
-The token is stored by the browser in local storage and sent only in the
-`X-VesselStack-Token` request header. Configuration APIs never return secret
-values: they report only whether a secret is configured, and a blank submitted
-secret preserves its current value. Use the explicit **Clear stored value**
-checkbox to remove one. Operation commands are fixed allowlisted argument
-arrays; the panel does not expose an arbitrary shell.
+The token is stored in browser session storage, cleared by the **Lock** button
+or when the tab closes, and sent only in the `X-VesselStack-Token` request
+header. Configuration APIs never return secret values: they report only whether
+a secret is configured, and a blank submitted secret preserves its current
+value. Use the explicit **Clear stored value** checkbox to remove one. Every
+configuration save creates mode-600 rollback copies under
+`/opt/vesselstack-data/control-panel/config-backups/`. Operation commands are
+fixed allowlisted argument arrays; the panel does not expose an arbitrary shell.
 
 Clearing an optional integration token disables that credential. Clearing a
 required installer-managed password or token causes the installer to generate
@@ -495,6 +497,21 @@ perform preflight, a verified pre-update backup, installation, and startup:
 ```bash
 sudo vesselstackctl update /path/to/VesselStack-release
 ```
+
+For Control Panel updates, stage the reviewed release beneath its restricted
+root first. The panel rejects symlinks, missing release metadata, paths outside
+this directory, files owned by another user, and group/world-writable content:
+
+```bash
+sudo install -d -m 0755 /var/lib/vesselstack/releases
+sudo cp -a /path/to/vesselstack-x.y.z /var/lib/vesselstack/releases/
+sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-x.y.z
+sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-x.y.z
+```
+
+Then enter `/var/lib/vesselstack/releases/vesselstack-x.y.z` in the panel.
+Shell-initiated `vesselstackctl update` remains available for a trusted operator
+and is not limited to the panel staging directory.
 
 The installer records the configuration schema in
 `/opt/vesselstack/config/installed-version` and accepts only explicit migration

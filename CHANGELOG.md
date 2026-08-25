@@ -40,6 +40,9 @@ Semantic Versioning.
   existing VesselStack installations.
 - Hardened backup verification against traversal, escaping links, device nodes,
   and FIFOs before restore.
+- Made Control Panel tokens tab-scoped with an explicit Lock action, added
+  rollback copies and all published-port settings to its configuration UI, and
+  restricted web-triggered updates to root-controlled staged releases.
 
 ## 1.0.0 - 2026-08-21
 

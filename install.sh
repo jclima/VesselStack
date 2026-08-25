@@ -10,6 +10,7 @@ CONFIG_FILE="$SCRIPT_DIR/vesselstack.env"
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
+RELEASES_DIR="$SYSTEM_ROOT/var/lib/vesselstack/releases"
 START=0
 DRY_RUN=0
 
@@ -192,6 +193,7 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
     "$VESSELSTACK_ROOT/installer"
+install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
 # Official images run their data processes as these fixed container users.

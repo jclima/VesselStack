@@ -1,5 +1,5 @@
 const state = {
-  token: localStorage.getItem("vesselstack_control_token") || "",
+  token: sessionStorage.getItem("vesselstack_control_token") || "",
   config: null,
   poller: null,
 };
@@ -39,16 +39,17 @@ async function unlock() {
   try {
     const config = await api("/api/config");
     state.config = config;
-    localStorage.setItem("vesselstack_control_token", state.token);
+    sessionStorage.setItem("vesselstack_control_token", state.token);
     $("#login").hidden = true;
     $("#app").hidden = false;
+    $("#lock").hidden = false;
     setConnected(true);
     renderConfiguration(config);
     await refreshStatus();
   } catch (error) {
     setConnected(false);
     $("#login-error").textContent = error.message;
-    localStorage.removeItem("vesselstack_control_token");
+    sessionStorage.removeItem("vesselstack_control_token");
   }
 }
 
@@ -57,6 +58,18 @@ function statusClass(value) {
   if (["active", "running", "succeeded"].some((word) => text.includes(word))) return "active";
   if (["failed", "error", "exited"].some((word) => text.includes(word))) return "failed";
   return "";
+}
+
+function lock() {
+  clearTimeout(state.poller);
+  state.token = "";
+  state.config = null;
+  sessionStorage.removeItem("vesselstack_control_token");
+  $("#token").value = "";
+  $("#app").hidden = true;
+  $("#lock").hidden = true;
+  $("#login").hidden = false;
+  setConnected(false);
 }
 
 function renderComponents(components) {
@@ -123,10 +136,11 @@ function fieldMarkup(spec, value) {
   } else if (spec.kind === "boolean") {
     input = `<select id="${id}" name="${spec.key}" ${spec.read_only ? "disabled" : ""}><option value="false" ${value !== "true" ? "selected" : ""}>Disabled</option><option value="true" ${value === "true" ? "selected" : ""}>Enabled</option></select>`;
   } else {
-    const type = spec.kind === "secret" ? "password" : spec.kind === "number" ? "number" : "text";
+    const type = spec.kind === "secret" ? "password" : ["number", "port"].includes(spec.kind) ? "number" : "text";
     const shown = spec.kind === "secret" ? "" : escapeHtml(value || "");
     const placeholder = spec.kind === "secret" && value?.configured ? "Configured — leave blank to keep" : "";
-    input = `<input id="${id}" name="${spec.key}" type="${type}" value="${shown}" placeholder="${placeholder}" ${spec.kind === "number" ? 'step="any"' : ""} ${spec.read_only ? "disabled" : ""}>`;
+    const numeric = spec.kind === "number" ? 'step="any"' : spec.kind === "port" ? 'step="1" min="1" max="65535"' : "";
+    input = `<input id="${id}" name="${spec.key}" type="${type}" value="${shown}" placeholder="${placeholder}" ${numeric} ${spec.read_only ? "disabled" : ""}>`;
   }
   const clear = spec.kind === "secret" && value?.configured
     ? `<label class="clear-secret"><input type="checkbox" data-clear-secret="${spec.key}"> Clear stored value</label>`
@@ -149,7 +163,7 @@ async function saveConfiguration() {
     const result = await api("/api/config", { method: "POST", body: JSON.stringify({ settings }) });
     state.config = result.configuration;
     renderConfiguration(state.config);
-    toast("Configuration saved. Apply it when ready.");
+    toast(`Configuration saved. Rollback copy: ${result.backup}`);
   } catch (error) {
     toast(error.message, true);
   }
@@ -193,6 +207,7 @@ $$('[data-tab]').forEach((button) => button.addEventListener("click", () => {
 }));
 $$('[data-action]').forEach((button) => button.addEventListener("click", () => runAction(button.dataset.action)));
 $("#refresh").addEventListener("click", refreshStatus);
+$("#lock").addEventListener("click", lock);
 $("#save-config").addEventListener("click", saveConfiguration);
 $("#discard-config").addEventListener("click", () => renderConfiguration(state.config));
 $("#run-update").addEventListener("click", () => runAction("update", { source_directory: $("#update-source").value.trim() }));
