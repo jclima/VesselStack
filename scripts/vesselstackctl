@@ -6,6 +6,9 @@ umask 077
 
 ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
+SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
+SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
+SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
 
 usage() {
     cat <<'EOF'
@@ -350,6 +353,13 @@ uninstall_stack() {
             *) echo "Unknown uninstall option: $argument" >&2; exit 2 ;;
         esac
     done
+    if [ "$purge" -eq 1 ]; then
+        [ "$confirmed" -eq 1 ] || { echo "--purge-data requires --yes" >&2; exit 2; }
+        case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
+            /opt/vesselstack:/opt/vesselstack-data) ;;
+            *) echo "Refusing to purge non-default paths automatically" >&2; exit 1 ;;
+        esac
+    fi
     stop_stack
     systemctl disable vesselstack-chat.service || true
     systemctl disable --now vesselstack-chat-telegram.service || true
@@ -357,25 +367,20 @@ uninstall_stack() {
     systemctl disable --now vesselstack-signalk.service || true
     systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
-    if [ -x /usr/local/sbin/vesselstack-firewall ]; then
-        /usr/local/sbin/vesselstack-firewall remove || true
+    if [ -x "$SBIN_DIR/vesselstack-firewall" ]; then
+        "$SBIN_DIR/vesselstack-firewall" remove || true
     fi
     systemctl disable vesselstack-firewall.service || true
-    rm -f -- /etc/systemd/system/vesselstack-chat.service \
-        /etc/systemd/system/vesselstack-chat-telegram.service \
-        /etc/systemd/system/vesselstack-telemetry-indexer.service \
-        /etc/systemd/system/vesselstack-telemetry-indexer.timer \
-        /etc/systemd/system/vesselstack-signalk.service \
-        /etc/systemd/system/vesselstack-socketcan.service \
-        /etc/systemd/system/vesselstack-control-panel.service /usr/local/sbin/vesselstackctl
-    rm -f -- /etc/systemd/system/vesselstack-firewall.service /usr/local/sbin/vesselstack-firewall
+    rm -f -- "$SYSTEMD_DIR/vesselstack-chat.service" \
+        "$SYSTEMD_DIR/vesselstack-chat-telegram.service" \
+        "$SYSTEMD_DIR/vesselstack-telemetry-indexer.service" \
+        "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer" \
+        "$SYSTEMD_DIR/vesselstack-signalk.service" \
+        "$SYSTEMD_DIR/vesselstack-socketcan.service" \
+        "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
+    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall"
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
-        [ "$confirmed" -eq 1 ] || { echo "--purge-data requires --yes" >&2; exit 2; }
-        case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
-            /opt/vesselstack:/opt/vesselstack-data) ;;
-            *) echo "Refusing to purge non-default paths automatically" >&2; exit 1 ;;
-        esac
         rm -rf -- /opt/vesselstack /opt/vesselstack-data
         echo "VesselStack services, configuration, and data removed"
     else
@@ -392,17 +397,17 @@ esac
 require_root
 load_config
 case "$command" in
-    status) status_stack ;;
-    doctor) doctor_stack ;;
-    urls) show_urls ;;
-    version) show_version ;;
+    status) [ $# -eq 0 ] || { usage; exit 2; }; status_stack ;;
+    doctor) [ $# -eq 0 ] || { usage; exit 2; }; doctor_stack ;;
+    urls) [ $# -eq 0 ] || { usage; exit 2; }; show_urls ;;
+    version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
-    start) start_stack ;;
-    stop) stop_stack ;;
-    restart) stop_stack; start_stack ;;
-    backup) backup_stack "$@" ;;
+    start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
+    stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
+    restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
+    backup) [ $# -le 1 ] || { usage; exit 2; }; backup_stack "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
-    restore) [ $# -ge 1 ] || { usage; exit 2; }; restore_stack "$@" ;;
+    restore) [ $# -eq 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
     update) [ $# -eq 1 ] || { usage; exit 2; }; update_stack "$1" ;;
     uninstall) uninstall_stack "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;

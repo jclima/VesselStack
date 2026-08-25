@@ -10,7 +10,9 @@ APP_ROOT="$TEST_ROOT/opt/vesselstack"
 DATA_ROOT="$TEST_ROOT/opt/vesselstack-data"
 BACKUP_ROOT="$TEST_ROOT/backups"
 FAKE_BIN="$TEST_ROOT/bin"
-install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_BIN"
+SYSTEM_ROOT="$TEST_ROOT/system-root"
+install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_BIN" \
+    "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin"
 
 cat > "$APP_ROOT/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$APP_ROOT
@@ -63,6 +65,7 @@ done
 
 run_ctl() {
     env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+        VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
         VESSELSTACK_ENV="$APP_ROOT/config/vesselstack.env" \
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
@@ -115,5 +118,20 @@ fi
 printf 'changed\n' > "$DATA_ROOT/state.txt"
 run_ctl restore "$archive" --yes >/dev/null
 grep -qx 'version one' "$DATA_ROOT/state.txt"
+
+touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+if run_ctl uninstall --purge-data >/dev/null 2>&1; then
+    echo 'Purge uninstall accepted missing --yes confirmation' >&2
+    exit 1
+fi
+test -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+run_ctl uninstall >/dev/null
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+test -e "$DATA_ROOT/state.txt"
+
+if run_ctl status unexpected >/dev/null 2>&1; then
+    echo 'Lifecycle command silently ignored an extra argument' >&2
+    exit 1
+fi
 
 echo "lifecycle backup and restore checks passed"

@@ -61,6 +61,8 @@ Semantic Versioning.
   hardware/firewall setup, MQTT credentials, and InfluxDB history provisioning.
 - Updated CI checkout to the Node.js 24-based v6 action and its safer external
   credential storage.
+- Made uninstall validate purge confirmation and safe paths before any mutation,
+  reject surplus lifecycle arguments, and added preserve-data regression coverage.
 
 ## 1.0.0 - 2026-08-21
 

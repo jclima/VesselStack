@@ -577,7 +577,9 @@ sudo vesselstackctl uninstall
 ```
 
 After verifying an off-boat backup, default-path installations can also remove
-all configuration and data with the explicit destructive confirmation:
+all configuration and data with the explicit destructive confirmation. Purge
+confirmation and default-path safety checks run before any service is stopped
+or file is removed:
 
 ```bash
 sudo vesselstackctl uninstall --purge-data --yes
