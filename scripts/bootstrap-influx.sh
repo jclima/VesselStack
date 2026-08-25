@@ -6,9 +6,10 @@ set -euo pipefail
 ENV_FILE=${1:-/opt/vesselstack/config/vesselstack.env}
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+: "${INFLUXDB_CONTAINER_NAME:=vesselstack-influxdb}"
 
 influx() {
-    docker exec vesselstack-influxdb influx "$@" --org "$INFLUXDB_ORG" --token "$INFLUXDB_TOKEN"
+    docker exec "$INFLUXDB_CONTAINER_NAME" influx "$@" --org "$INFLUXDB_ORG" --token "$INFLUXDB_TOKEN"
 }
 
 ensure_bucket() {
@@ -38,8 +39,8 @@ from(bucket: "$INFLUXDB_RAW_BUCKET")
     |> to(bucket: "$INFLUXDB_HISTORY_BUCKET", org: "$INFLUXDB_ORG")
 EOF
     container_task_file=/tmp/vesselstack-downsample.flux
-    docker cp "$task_file" "vesselstack-influxdb:$container_task_file"
+    docker cp "$task_file" "$INFLUXDB_CONTAINER_NAME:$container_task_file"
     influx task create --file "$container_task_file" >/dev/null
-    docker exec vesselstack-influxdb rm -f -- "$container_task_file"
+    docker exec "$INFLUXDB_CONTAINER_NAME" rm -f -- "$container_task_file"
     printf 'Created task %s\n' "$task_name"
 fi

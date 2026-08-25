@@ -130,6 +130,8 @@ nano vesselstack.env
 | `BOAT_NAME` | Name displayed by Boat Chat |
 | `BOAT_TYPE` | Vessel make/model or general type |
 | `BOAT_MMSI`, `BOAT_CALLSIGN` | Optional identity fields |
+| `*_PORT` | Host ports for Grafana, Heimdall HTTP/HTTPS, InfluxDB, Prometheus, MQTT, and AIS |
+| `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
 | `BOAT_UNITS` | `us_customary` or `metric` |
 | `VESSELSTACK_USER` | Existing non-root service account |
@@ -204,6 +206,23 @@ configured InfluxDB buckets and one-minute downsample task, and starts Boat
 Chat. Allow several minutes for initial image downloads and Home Assistant.
 
 ## 8. Verify the installation
+
+Start with the operator commands; they use the URLs and ports in your rendered
+configuration:
+
+```bash
+sudo vesselstackctl status
+sudo vesselstackctl doctor
+sudo vesselstackctl urls
+```
+
+`status` exits nonzero when a required service or endpoint is unhealthy.
+`doctor` adds dependency, Compose, free-space, service, and endpoint checks and
+finishes with either `RESULT healthy` or `RESULT attention required`. Use
+`vesselstackctl logs chat`, `logs containers`, or `logs all` for recent
+diagnostic output without remembering systemd or Compose commands.
+
+For direct checks:
 
 ```bash
 sudo docker compose \
@@ -421,8 +440,14 @@ sudo vesselstackctl backup
 sudo vesselstackctl verify-backup /path/to/vesselstack-TIMESTAMP.tar.gz
 ```
 
+Backup creation runs the same checksum, path, link, and special-file verifier
+automatically. Rebuildable Boat Chat virtual-environment and bytecode files are
+excluded; application source, configuration, memory, and data remain included.
+
 Restore only during a maintenance window. This replaces installed config and
-data after checksum and archive-path validation:
+data after checksum and archive validation. Verification rejects path
+traversal, absolute or escaping links, device nodes, and FIFOs before anything
+is extracted:
 
 ```bash
 sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes

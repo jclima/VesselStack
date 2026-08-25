@@ -34,6 +34,15 @@ source "$CONFIG_FILE"
 # Existing 0.x installations did not define configurable bucket names.
 : "${INFLUXDB_RAW_BUCKET:=vesselstack_raw}"
 : "${INFLUXDB_HISTORY_BUCKET:=vesselstack_1m}"
+: "${GRAFANA_PORT:=43000}"
+: "${HEIMDALL_PORT:=80}"
+: "${HEIMDALL_HTTPS_PORT:=443}"
+: "${INFLUXDB_PORT:=8086}"
+: "${INFLUXDB_CONTAINER_NAME:=vesselstack-influxdb}"
+: "${PROMETHEUS_PORT:=9090}"
+: "${MQTT_PORT:=1883}"
+: "${AIS_WEB_PORT:=8100}"
+: "${AIS_TCP_PORT:=5011}"
 : "${INFLUXDB_HOME_ASSISTANT_BUCKET:=homeassistant}"
 : "${INFLUXDB_AIS_BUCKET:=ais}"
 : "${SIGNALK_MODE:=existing}"
@@ -65,11 +74,28 @@ case "$SIGNALK_MODE" in
     existing|docker|native) ;;
     *) echo "SIGNALK_MODE must be existing, docker, or native" >&2; exit 1 ;;
 esac
+case "$INFLUXDB_CONTAINER_NAME" in
+    ''|*[!A-Za-z0-9_.-]*)
+        echo 'INFLUXDB_CONTAINER_NAME may contain letters, numbers, dot, underscore, and hyphen' >&2
+        exit 1
+        ;;
+esac
 case "$SOCKETCAN_ENABLE:$AIS_ENABLE:$VESSELSTACK_FIREWALL_ENABLE" in
     true:true:true|true:true:false|true:false:true|true:false:false|\
     false:true:true|false:true:false|false:false:true|false:false:false) ;;
     *) echo "Hardware and firewall enable settings must be true or false" >&2; exit 1 ;;
 esac
+for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
+    PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT; do
+    port_value=${!key}
+    case "$port_value" in
+        ''|*[!0-9]*) echo "$key must be a numeric TCP port" >&2; exit 1 ;;
+    esac
+    if [ "$port_value" -lt 1 ] || [ "$port_value" -gt 65535 ]; then
+        echo "$key must be between 1 and 65535" >&2
+        exit 1
+    fi
+done
 
 COMPOSE_PROFILES=()
 [ "$SIGNALK_MODE" = docker ] && COMPOSE_PROFILES+=(--profile signalk)
@@ -249,6 +275,8 @@ AIS_ENABLE
 AIS_IMAGE
 AIS_DEVICE
 AIS_CATCHER_ARGS
+AIS_WEB_PORT
+AIS_TCP_PORT
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
 CONTROL_PANEL_HOST
@@ -256,6 +284,8 @@ CONTROL_PANEL_PORT
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
+INFLUXDB_PORT
+INFLUXDB_CONTAINER_NAME
 INFLUXDB_ORG
 INFLUXDB_USERNAME
 INFLUXDB_RAW_BUCKET
@@ -265,8 +295,13 @@ INFLUXDB_AIS_BUCKET
 INFLUXDB_PASSWORD
 INFLUXDB_TOKEN
 GRAFANA_ADMIN_PASSWORD
+GRAFANA_PORT
+HEIMDALL_PORT
+HEIMDALL_HTTPS_PORT
+PROMETHEUS_PORT
 MQTT_USERNAME
 MQTT_PASSWORD
+MQTT_PORT
 EOF
 
 # Retain provider credentials and optional Boat Chat settings across installer
@@ -302,6 +337,7 @@ done
     printf 'HOME_ASSISTANT_URL=%q\n' "$HOME_ASSISTANT_URL"
     printf 'HOME_ASSISTANT_TOKEN=%q\n' "${HOME_ASSISTANT_TOKEN:-}"
     printf 'INFLUXDB_URL=%q\n' "$INFLUXDB_URL"
+    # shellcheck disable=SC2153  # Required and validated through the key list.
     printf 'INFLUXDB_ORG=%q\n' "$INFLUXDB_ORG"
     printf 'INFLUXDB_TOKEN=%q\n' "$INFLUXDB_TOKEN"
     printf 'INFLUXDB_RAW_BUCKET=%q\n' "$INFLUXDB_RAW_BUCKET"

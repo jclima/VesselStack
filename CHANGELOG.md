@@ -31,6 +31,16 @@ Semantic Versioning.
 - Added distribution checks and publishing guidance to reduce the chance of
   committing vessel identity, credentials, or private key material.
 
+### Improved
+
+- Added intuitive `doctor`, `urls`, `version`, and scoped `logs` commands.
+- Made status checks honor configured service URLs and ports and report a
+  concise component summary.
+- Made every Docker-published port configurable and isolated service tests from
+  existing VesselStack installations.
+- Hardened backup verification against traversal, escaping links, device nodes,
+  and FIFOs before restore.
+
 ## 1.0.0 - 2026-08-21
 
 ### Added

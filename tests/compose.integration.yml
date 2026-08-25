@@ -1,0 +1,7 @@
+services:
+  influxdb:
+    container_name: vesselstack-test-influxdb
+  grafana:
+    container_name: vesselstack-test-grafana
+  prometheus:
+    container_name: vesselstack-test-prometheus
