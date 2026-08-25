@@ -14,10 +14,11 @@ current_version=0.1.0
 
 case "$current_version:$TARGET_VERSION" in
     "$TARGET_VERSION:$TARGET_VERSION") ;;
-    0.1.0:1.0.0|0.1.0:1.0.1)
+    0.1.0:1.0.0|0.1.0:1.0.1|0.1.0:1.1.0|\
+    1.0.0:1.1.0|1.0.1:1.1.0)
         # The 1.0 installer renders new bucket, integration, hardware, and
-        # firewall defaults before this migration runs. This explicit edge
-        # records that the old layout was accepted and upgraded.
+        # firewall and optional-worker defaults before this migration runs.
+        # These explicit edges record accepted upgrades without hidden jumps.
         ;;
     *)
         echo "No supported migration path from $current_version to $TARGET_VERSION" >&2

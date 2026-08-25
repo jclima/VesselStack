@@ -114,7 +114,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.0.1
+git checkout v1.1.0
 ```
 
 ## 4. Configure the vessel
@@ -645,7 +645,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.0.1.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-1.1.0.tar.gz.sha256)
 ```
 
 The checksum records only the archive basename, so the archive and `.sha256`

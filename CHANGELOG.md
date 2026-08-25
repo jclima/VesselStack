@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.1.0 - 2026-08-25
+
 ### Added
 
 - Added a loopback-first, token-authenticated Control Panel for component
@@ -20,16 +22,6 @@ Semantic Versioning.
 - Secret settings are write-only through the API, configuration writes are
   atomic and mode 600, and privileged installation paths remain read-only in
   the browser UI.
-
-## 1.0.1 - 2026-08-21
-
-### Privacy
-
-- Replaced reference-vessel names, identifiers, network addresses, paths,
-  hardware facts, engine details, AIS examples, and local entity prefixes with
-  neutral placeholders.
-- Added distribution checks and publishing guidance to reduce the chance of
-  committing vessel identity, credentials, or private key material.
 
 ### Improved
 
@@ -63,6 +55,18 @@ Semantic Versioning.
   credential storage.
 - Made uninstall validate purge confirmation and safe paths before any mutation,
   reject surplus lifecycle arguments, and added preserve-data regression coverage.
+- Added explicit migration edges from legacy 0.1 and both 1.0 patch releases to
+  the 1.1 configuration schema.
+
+## 1.0.1 - 2026-08-21
+
+### Privacy
+
+- Replaced reference-vessel names, identifiers, network addresses, paths,
+  hardware facts, engine details, AIS examples, and local entity prefixes with
+  neutral placeholders.
+- Added distribution checks and publishing guidance to reduce the chance of
+  committing vessel identity, credentials, or private key material.
 
 ## 1.0.0 - 2026-08-21
 
