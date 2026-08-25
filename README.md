@@ -623,6 +623,9 @@ ownership: containers use different internal user IDs.
 
 ## Developer validation
 
+GitHub Actions uses `actions/checkout@v6`, which runs on Node.js 24 and keeps
+persisted checkout credentials outside the repository Git configuration.
+
 ```bash
 tests/test-distribution.sh
 sudo tests/test-lifecycle.sh

@@ -59,6 +59,8 @@ Semantic Versioning.
   required and enabled Compose component.
 - Made `vesselstackctl start` perform all first-start prerequisites, including
   hardware/firewall setup, MQTT credentials, and InfluxDB history provisioning.
+- Updated CI checkout to the Node.js 24-based v6 action and its safer external
+  credential storage.
 
 ## 1.0.0 - 2026-08-21
 
