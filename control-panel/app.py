@@ -116,6 +116,7 @@ FIELDS = [
     field("BOAT_CHAT_FALLBACK_MODEL", "Fallback model", "Boat Chat", source="chat"),
     field("BOAT_CHAT_HOST", "Boat Chat host", "Boat Chat", source="chat"),
     field("BOAT_CHAT_PORT", "Boat Chat port", "Boat Chat", source="chat", kind="port"),
+    field("TELEMETRY_INDEXER_ENABLE", "Refresh telemetry memory", "Boat Chat", kind="boolean"),
     field("OLLAMA_HOST", "Ollama URL", "Boat Chat", source="chat", kind="url"),
     field("BOAT_CHAT_BASE_URL", "Compatible API base URL", "Boat Chat", source="chat", kind="url"),
     field("OPENAI_API_KEY", "OpenAI API key", "Boat Chat", source="chat", kind="secret"),
@@ -128,6 +129,7 @@ FIELDS = [
     field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", "Boat Chat", source="chat"),
     field("TELEGRAM_BOT_TOKEN", "Telegram bot token", "Telegram", source="chat", kind="secret"),
     field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chat IDs", "Telegram", source="chat", kind="secret"),
+    field("TELEGRAM_ENABLE", "Run Telegram worker", "Telegram", kind="boolean"),
 ]
 FIELD_BY_KEY = {item["key"]: item for item in FIELDS}
 
@@ -143,6 +145,8 @@ COMPOSE_COMPONENTS = {
 }
 SYSTEMD_COMPONENTS = {
     "boat-chat": "vesselstack-chat.service",
+    "telegram": "vesselstack-chat-telegram.service",
+    "telemetry-indexer": "vesselstack-telemetry-indexer.timer",
     "signalk-native": "vesselstack-signalk.service",
     "socketcan": "vesselstack-socketcan.service",
     "firewall": "vesselstack-firewall.service",

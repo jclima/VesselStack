@@ -58,6 +58,8 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
+: "${TELEGRAM_ENABLE:=false}"
+: "${TELEMETRY_INDEXER_ENABLE:=true}"
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -81,11 +83,13 @@ case "$INFLUXDB_CONTAINER_NAME" in
         exit 1
         ;;
 esac
-case "$SOCKETCAN_ENABLE:$AIS_ENABLE:$VESSELSTACK_FIREWALL_ENABLE" in
-    true:true:true|true:true:false|true:false:true|true:false:false|\
-    false:true:true|false:true:false|false:false:true|false:false:false) ;;
-    *) echo "Hardware and firewall enable settings must be true or false" >&2; exit 1 ;;
-esac
+for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
+    case "${!key}" in
+        true|false) ;;
+        *) echo "$key must be true or false" >&2; exit 1 ;;
+    esac
+done
 for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT; do
     port_value=${!key}
@@ -283,6 +287,8 @@ VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
 CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
+TELEGRAM_ENABLE
+TELEMETRY_INDEXER_ENABLE
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
@@ -313,6 +319,7 @@ if [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
     cp "$VESSELSTACK_ROOT/config/boat-chat.env" "$boat_chat_temp"
 fi
 for key in BOAT_NAME VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN \
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE \
     SIGNALK_URL HOME_ASSISTANT_URL \
     HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
     INFLUXDB_RAW_BUCKET INFLUXDB_HISTORY_BUCKET \
@@ -335,6 +342,8 @@ done
     printf 'BOAT_NAME=%q\n' "$BOAT_NAME"
     printf 'VESSELSTACK_VERSION=%q\n' "$(<"$SCRIPT_DIR/VERSION")"
     printf 'BOAT_CHAT_SETTINGS_TOKEN=%q\n' "$BOAT_CHAT_SETTINGS_TOKEN"
+    printf 'TELEGRAM_ENABLE=%q\n' "$TELEGRAM_ENABLE"
+    printf 'TELEMETRY_INDEXER_ENABLE=%q\n' "$TELEMETRY_INDEXER_ENABLE"
     printf 'SIGNALK_URL=%q\n' "$SIGNALK_URL"
     printf 'HOME_ASSISTANT_URL=%q\n' "$HOME_ASSISTANT_URL"
     printf 'HOME_ASSISTANT_TOKEN=%q\n' "${HOME_ASSISTANT_TOKEN:-}"
@@ -377,12 +386,30 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
+for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service; do
+    sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
+        -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+        "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
+    chmod 0644 "$SYSTEMD_DIR/$unit"
+done
+install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-telemetry-indexer.timer" \
+    "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-control-panel.service.in" \
     > "$SYSTEMD_DIR/vesselstack-control-panel.service"
 chmod 0644 "$SYSTEMD_DIR/vesselstack-control-panel.service"
 systemctl daemon-reload
 systemctl enable vesselstack-control-panel.service
+if [ "$TELEGRAM_ENABLE" = true ]; then
+    systemctl enable vesselstack-chat-telegram.service
+else
+    systemctl disable vesselstack-chat-telegram.service 2>/dev/null || true
+fi
+if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
+    systemctl enable vesselstack-telemetry-indexer.timer
+else
+    systemctl disable vesselstack-telemetry-indexer.timer 2>/dev/null || true
+fi
 
 compose config --quiet
 
@@ -404,6 +431,16 @@ if [ "$START" -eq 1 ]; then
     compose up -d
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service
+    if [ "$TELEGRAM_ENABLE" = true ]; then
+        systemctl restart vesselstack-chat-telegram.service
+    else
+        systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
+    fi
+    if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
+        systemctl start vesselstack-telemetry-indexer.timer
+    else
+        systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
+    fi
     if [ "${VESSELSTACK_SKIP_PANEL_RESTART:-false}" != true ]; then
         systemctl restart vesselstack-control-panel.service
     fi

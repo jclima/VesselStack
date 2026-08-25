@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh VesselStack telemetry memory
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=vesselstack-telemetry-indexer.service
+
+[Install]
+WantedBy=timers.target

@@ -154,6 +154,8 @@ nano vesselstack.env
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
+| `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
+| `TELEMETRY_INDEXER_ENABLE` | Refresh Boat Chat's telemetry memory every five minutes |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
@@ -182,7 +184,9 @@ sudo ./install.sh --config vesselstack.env
 
 This copies the application to `/opt/vesselstack`, creates persistent paths,
 generates credentials, creates Boat Chat's Python environment, installs and
-enables (but does not start) `vesselstack-chat.service`, and validates Compose.
+enables (but does not start) Boat Chat and the configured optional workers, and
+validates Compose. Telegram is disabled by default; the telemetry indexer is
+enabled by default so recent boat data can be recalled in chat.
 
 Review the rendered files:
 
@@ -192,6 +196,9 @@ sudo docker compose \
   -f /opt/vesselstack/compose.yml config
 
 sudo systemd-analyze verify /etc/systemd/system/vesselstack-chat.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-chat-telegram.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-telemetry-indexer.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-telemetry-indexer.timer
 sudo systemd-analyze verify /etc/systemd/system/vesselstack-control-panel.service
 ```
 
@@ -203,7 +210,8 @@ sudo ./install.sh --config vesselstack.env --start
 
 This creates the Mosquitto password file, starts Docker services, creates the
 configured InfluxDB buckets and one-minute downsample task, and starts Boat
-Chat. Allow several minutes for initial image downloads and Home Assistant.
+Chat plus each enabled worker. Allow several minutes for initial image downloads
+and Home Assistant.
 
 ## 8. Verify the installation
 
@@ -377,6 +385,17 @@ sudo systemctl restart vesselstack-control-panel.service
 The panel intentionally skips restarting itself while an operation request is
 in flight. After applying a release that changes Control Panel code, run the
 same restart command to load the new backend.
+
+The Telegram and telemetry-indexer toggles take effect after **Install &
+start** (or another installer run). Configure the Telegram bot token and allowed
+chat IDs in the Telegram section before enabling its worker. Operators can
+inspect these workers with:
+
+```bash
+sudo vesselstackctl logs telegram
+sudo vesselstackctl logs indexer
+systemctl list-timers vesselstack-telemetry-indexer.timer
+```
 
 The service runs as root because Docker, systemd, installation, backup, and
 hardware operations require host privileges. Keep the token private, retain

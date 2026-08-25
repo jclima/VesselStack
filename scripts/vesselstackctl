@@ -16,7 +16,7 @@ Commands:
   doctor                       Validate config, dependencies, disk, and health
   urls                         Print the configured service URLs
   version                      Print installed and command versions
-  logs [chat|control|containers|all]
+  logs [chat|telegram|indexer|control|containers|all]
                                Show recent diagnostic logs (default: all)
   start                        Start the stack
   stop                         Stop the stack
@@ -47,14 +47,46 @@ load_config() {
 }
 
 start_stack() {
+    if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
+        systemctl start vesselstack-socketcan.service
+    fi
     "${COMPOSE[@]}" up -d
+    if [ "${SIGNALK_MODE:-existing}" = native ]; then
+        systemctl start vesselstack-signalk.service
+    fi
     systemctl start vesselstack-chat.service
+    if [ "${TELEGRAM_ENABLE:-false}" = true ]; then
+        systemctl start vesselstack-chat-telegram.service
+    fi
+    if [ "${TELEMETRY_INDEXER_ENABLE:-true}" = true ]; then
+        systemctl start vesselstack-telemetry-indexer.timer
+    fi
     systemctl start vesselstack-control-panel.service
 }
 
 stop_stack() {
+    systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
+    systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
     systemctl stop vesselstack-chat.service || true
+    if [ "${SIGNALK_MODE:-existing}" = native ]; then
+        systemctl stop vesselstack-signalk.service || true
+    fi
     "${COMPOSE[@]}" down
+    if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
+        systemctl stop vesselstack-socketcan.service || true
+    fi
+}
+
+status_unit() {
+    local label=$1 unit=$2 enabled=${3:-true}
+    if [ "$enabled" != true ]; then
+        printf '%-20s %s\n' "$label" disabled
+    elif systemctl is-active --quiet "$unit"; then
+        printf '%-20s %s\n' "$label" healthy
+    else
+        printf '%-20s %s\n' "$label" unhealthy
+        return 1
+    fi
 }
 
 check_endpoint() {
@@ -71,18 +103,16 @@ status_stack() {
     local failed=0
     printf '%-20s %s\n' COMPONENT STATE
     printf '%-20s %s\n' -------------------- --------------------
-    if systemctl is-active --quiet vesselstack-chat.service; then
-        printf '%-20s %s\n' 'Boat Chat service' healthy
-    else
-        printf '%-20s %s\n' 'Boat Chat service' unhealthy
-        failed=1
-    fi
-    if systemctl is-active --quiet vesselstack-control-panel.service; then
-        printf '%-20s %s\n' 'Control Panel' healthy
-    else
-        printf '%-20s %s\n' 'Control Panel' unhealthy
-        failed=1
-    fi
+    status_unit 'Boat Chat service' vesselstack-chat.service || failed=1
+    status_unit 'Telegram worker' vesselstack-chat-telegram.service \
+        "${TELEGRAM_ENABLE:-false}" || failed=1
+    status_unit 'Telemetry indexer' vesselstack-telemetry-indexer.timer \
+        "${TELEMETRY_INDEXER_ENABLE:-true}" || failed=1
+    status_unit 'Native SignalK' vesselstack-signalk.service \
+        "$([ "${SIGNALK_MODE:-existing}" = native ] && echo true || echo false)" || failed=1
+    status_unit 'SocketCAN' vesselstack-socketcan.service \
+        "${SOCKETCAN_ENABLE:-false}" || failed=1
+    status_unit 'Control Panel' vesselstack-control-panel.service || failed=1
     if "${COMPOSE[@]}" ps --status running --quiet | grep -q .; then
         printf '%-20s %s\n' Containers running
     else
@@ -121,14 +151,18 @@ show_logs() {
     local target=${1:-all}
     case "$target" in
         chat) journalctl -u vesselstack-chat.service -n 100 --no-pager ;;
+        telegram) journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager ;;
+        indexer) journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager ;;
         control) journalctl -u vesselstack-control-panel.service -n 100 --no-pager ;;
         containers) "${COMPOSE[@]}" logs --tail 100 ;;
         all)
             journalctl -u vesselstack-chat.service -n 100 --no-pager
+            journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager
+            journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager
             journalctl -u vesselstack-control-panel.service -n 100 --no-pager
             "${COMPOSE[@]}" logs --tail 100
             ;;
-        *) echo 'logs target must be chat, control, containers, or all' >&2; exit 2 ;;
+        *) echo 'logs target must be chat, telegram, indexer, control, containers, or all' >&2; exit 2 ;;
     esac
 }
 
@@ -277,12 +311,21 @@ uninstall_stack() {
     done
     stop_stack
     systemctl disable vesselstack-chat.service || true
+    systemctl disable --now vesselstack-chat-telegram.service || true
+    systemctl disable --now vesselstack-telemetry-indexer.timer || true
+    systemctl disable --now vesselstack-signalk.service || true
+    systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
     if [ -x /usr/local/sbin/vesselstack-firewall ]; then
         /usr/local/sbin/vesselstack-firewall remove || true
     fi
     systemctl disable vesselstack-firewall.service || true
     rm -f -- /etc/systemd/system/vesselstack-chat.service \
+        /etc/systemd/system/vesselstack-chat-telegram.service \
+        /etc/systemd/system/vesselstack-telemetry-indexer.service \
+        /etc/systemd/system/vesselstack-telemetry-indexer.timer \
+        /etc/systemd/system/vesselstack-signalk.service \
+        /etc/systemd/system/vesselstack-socketcan.service \
         /etc/systemd/system/vesselstack-control-panel.service /usr/local/sbin/vesselstackctl
     rm -f -- /etc/systemd/system/vesselstack-firewall.service /usr/local/sbin/vesselstack-firewall
     systemctl daemon-reload
