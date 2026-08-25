@@ -627,6 +627,8 @@ ownership: containers use different internal user IDs.
 
 GitHub Actions uses `actions/checkout@v6`, which runs on Node.js 24 and keeps
 persisted checkout credentials outside the repository Git configuration.
+External registry manifest checks retry short transport failures three times;
+missing Linux ARM64 support still fails the release gate.
 
 ```bash
 tests/test-distribution.sh

@@ -15,7 +15,8 @@ VesselStack into certified marine safety equipment.
 - Explicit 0.1/1.0-to-1.1 migration and rejection of unknown future schemas.
 - Checksummed backup verification and actual restoration of changed state.
 - Docker Compose rendering with default, SignalK, and AIS profiles.
-- Registry-manifest verification that every pinned image publishes Linux ARM64.
+- Registry-manifest verification that every pinned image publishes Linux ARM64,
+  with bounded retries for transient registry transport failures.
 - Disposable InfluxDB, Prometheus, and Grafana startup; health queries; bucket
   creation; idempotent Flux task creation; datasource lookup; and dashboard
   lookup.

@@ -57,6 +57,8 @@ Semantic Versioning.
   reject surplus lifecycle arguments, and added preserve-data regression coverage.
 - Added explicit migration edges from legacy 0.1 and both 1.0 patch releases to
   the 1.1 configuration schema.
+- Added bounded retries to external registry manifest checks so transient resets
+  do not mask actual Linux ARM64 compatibility results.
 
 ## 1.0.1 - 2026-08-21
 
