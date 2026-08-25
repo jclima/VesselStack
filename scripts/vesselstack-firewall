@@ -32,10 +32,11 @@ remove_chain() {
 
 configure_host() {
     local command=$1
+    local host_ports="${MQTT_PORT:-1883},${INFLUXDB_PORT:-8086},${PROMETHEUS_PORT:-9090},${GRAFANA_PORT:-43000}"
     "$command" -N VESSELSTACK-INPUT 2>/dev/null || true
     "$command" -F VESSELSTACK-INPUT
     "$command" -A VESSELSTACK-INPUT -i "$interface" -p tcp \
-        -m multiport --dports 1883,8086,9090,43000 -j DROP
+        -m multiport --dports "$host_ports" -j DROP
     "$command" -A VESSELSTACK-INPUT -j RETURN
     ensure_jump "$command" INPUT VESSELSTACK-INPUT
 }

@@ -84,6 +84,8 @@ BOAT_CHAT_PORT="8765"
 BOAT_CHAT_SETTINGS_TOKEN="GENERATE"
 VESSELSTACK_UNTRUSTED_INTERFACE="wlan0"
 VESSELSTACK_FIREWALL_ENABLE="false"
+TELEGRAM_ENABLE="false"
+TELEMETRY_INDEXER_ENABLE="true"
 EOF
 
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
@@ -94,6 +96,9 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
 test -x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-control-panel.service"
+test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat-telegram.service"
+test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.service"
+test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.timer"
 test -s "$APP_ROOT/control-panel/app.py"
 test -s "$APP_ROOT/installer/install.sh"
 test -s "$APP_ROOT/config/grafana/dashboards/system-health.json"
@@ -103,6 +108,8 @@ test "$(stat -c '%u:%g' "$DATA_ROOT/influxdb")" = "1000:1000"
 test "$(stat -c '%u:%g' "$DATA_ROOT/grafana")" = "472:0"
 grep -q 'Test Vessel Boat Chat' "$APP_ROOT/boat-chat/static/index.html"
 grep -q '^INFLUXDB_HISTORY_BUCKET=signalk_1m$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^TELEGRAM_ENABLE=false$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^TELEMETRY_INDEXER_ENABLE=true$' "$APP_ROOT/config/boat-chat.env"
 if grep -R 'GENERATE' "$APP_ROOT/config"; then
     echo "Rendered configuration contains an ungenerated secret" >&2
     exit 1

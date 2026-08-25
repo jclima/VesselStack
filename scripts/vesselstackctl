@@ -12,7 +12,12 @@ usage() {
 Usage: vesselstackctl COMMAND [ARGUMENTS]
 
 Commands:
-  status                       Show containers, Boat Chat, and HTTP health
+  status                       Show a concise service and endpoint summary
+  doctor                       Validate config, dependencies, disk, and health
+  urls                         Print the configured service URLs
+  version                      Print installed and command versions
+  logs [chat|telegram|indexer|control|containers|all]
+                               Show recent diagnostic logs (default: all)
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
@@ -42,30 +47,155 @@ load_config() {
 }
 
 start_stack() {
+    if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
+        systemctl start vesselstack-socketcan.service
+    fi
     "${COMPOSE[@]}" up -d
+    if [ "${SIGNALK_MODE:-existing}" = native ]; then
+        systemctl start vesselstack-signalk.service
+    fi
     systemctl start vesselstack-chat.service
+    if [ "${TELEGRAM_ENABLE:-false}" = true ]; then
+        systemctl start vesselstack-chat-telegram.service
+    fi
+    if [ "${TELEMETRY_INDEXER_ENABLE:-true}" = true ]; then
+        systemctl start vesselstack-telemetry-indexer.timer
+    fi
     systemctl start vesselstack-control-panel.service
 }
 
 stop_stack() {
+    systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
+    systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
     systemctl stop vesselstack-chat.service || true
+    if [ "${SIGNALK_MODE:-existing}" = native ]; then
+        systemctl stop vesselstack-signalk.service || true
+    fi
     "${COMPOSE[@]}" down
+    if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
+        systemctl stop vesselstack-socketcan.service || true
+    fi
+}
+
+status_unit() {
+    local label=$1 unit=$2 enabled=${3:-true}
+    if [ "$enabled" != true ]; then
+        printf '%-20s %s\n' "$label" disabled
+    elif systemctl is-active --quiet "$unit"; then
+        printf '%-20s %s\n' "$label" healthy
+    else
+        printf '%-20s %s\n' "$label" unhealthy
+        return 1
+    fi
+}
+
+check_endpoint() {
+    local label=$1 endpoint=$2
+    if curl --connect-timeout 3 --max-time 10 --fail --silent --show-error "$endpoint" >/dev/null; then
+        printf '%-20s %s\n' "$label" healthy
+    else
+        printf '%-20s %s\n' "$label" "unreachable ($endpoint)" >&2
+        return 1
+    fi
 }
 
 status_stack() {
-    "${COMPOSE[@]}" ps --all
-    systemctl --no-pager --full status vesselstack-chat.service || true
-    local failed=0 endpoint
-    for endpoint in http://127.0.0.1:8765/health \
-        "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" http://127.0.0.1:8086/health \
-        http://127.0.0.1:43000/api/health; do
-        if curl --connect-timeout 3 --max-time 10 --fail --silent --show-error "$endpoint" >/dev/null; then
-            printf 'healthy %s\n' "$endpoint"
+    local failed=0
+    printf '%-20s %s\n' COMPONENT STATE
+    printf '%-20s %s\n' -------------------- --------------------
+    status_unit 'Boat Chat service' vesselstack-chat.service || failed=1
+    status_unit 'Telegram worker' vesselstack-chat-telegram.service \
+        "${TELEGRAM_ENABLE:-false}" || failed=1
+    status_unit 'Telemetry indexer' vesselstack-telemetry-indexer.timer \
+        "${TELEMETRY_INDEXER_ENABLE:-true}" || failed=1
+    status_unit 'Native SignalK' vesselstack-signalk.service \
+        "$([ "${SIGNALK_MODE:-existing}" = native ] && echo true || echo false)" || failed=1
+    status_unit 'SocketCAN' vesselstack-socketcan.service \
+        "${SOCKETCAN_ENABLE:-false}" || failed=1
+    status_unit 'Control Panel' vesselstack-control-panel.service || failed=1
+    if "${COMPOSE[@]}" ps --status running --quiet | grep -q .; then
+        printf '%-20s %s\n' Containers running
+    else
+        printf '%-20s %s\n' Containers 'none running'
+        failed=1
+    fi
+    check_endpoint 'Boat Chat' "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
+    check_endpoint 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" || failed=1
+    check_endpoint SignalK "${SIGNALK_URL%/}/signalk" || failed=1
+    check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1
+    check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1
+    check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1
+    printf '\nRun vesselstackctl doctor for configuration and dependency checks.\n'
+    return "$failed"
+}
+
+show_urls() {
+    printf '%-20s %s\n' 'Boat Chat' "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}"
+    printf '%-20s %s\n' 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}"
+    printf '%-20s %s\n' SignalK "$SIGNALK_URL"
+    printf '%-20s %s\n' 'Home Assistant' "$HOME_ASSISTANT_URL"
+    printf '%-20s %s\n' InfluxDB "$INFLUXDB_URL"
+    printf '%-20s %s\n' Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}"
+    printf '%-20s %s\n' Heimdall "http://127.0.0.1:${HEIMDALL_PORT:-80}"
+    printf '%-20s %s\n' Prometheus "http://127.0.0.1:${PROMETHEUS_PORT:-9090}"
+}
+
+show_version() {
+    local installed=unknown
+    [ -r "$ROOT/config/installed-version" ] && installed=$(<"$ROOT/config/installed-version")
+    printf 'VesselStack installed: %s\n' "$installed"
+    printf 'vesselstackctl source: %s\n' "${VESSELSTACK_VERSION:-$installed}"
+}
+
+show_logs() {
+    local target=${1:-all}
+    case "$target" in
+        chat) journalctl -u vesselstack-chat.service -n 100 --no-pager ;;
+        telegram) journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager ;;
+        indexer) journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager ;;
+        control) journalctl -u vesselstack-control-panel.service -n 100 --no-pager ;;
+        containers) "${COMPOSE[@]}" logs --tail 100 ;;
+        all)
+            journalctl -u vesselstack-chat.service -n 100 --no-pager
+            journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager
+            journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager
+            journalctl -u vesselstack-control-panel.service -n 100 --no-pager
+            "${COMPOSE[@]}" logs --tail 100
+            ;;
+        *) echo 'logs target must be chat, telegram, indexer, control, containers, or all' >&2; exit 2 ;;
+    esac
+}
+
+doctor_stack() {
+    local failed=0 command free_kib
+    printf 'VesselStack diagnostics\n\n'
+    for command in docker curl tar sha256sum python3 systemctl; do
+        if command -v "$command" >/dev/null 2>&1; then
+            printf 'OK   command available: %s\n' "$command"
         else
-            printf 'unhealthy %s\n' "$endpoint" >&2
+            printf 'FAIL command missing: %s\n' "$command" >&2
             failed=1
         fi
     done
+    if "${COMPOSE[@]}" config --quiet; then
+        echo 'OK   Compose configuration is valid'
+    else
+        echo 'FAIL Compose configuration is invalid' >&2
+        failed=1
+    fi
+    free_kib=$(df -Pk "$VESSELSTACK_DATA" | awk 'NR==2 {print $4}')
+    if [ "${free_kib:-0}" -ge 1048576 ]; then
+        printf 'OK   data filesystem free: %s MiB\n' "$((free_kib / 1024))"
+    else
+        echo 'FAIL data filesystem has less than 1 GiB free' >&2
+        failed=1
+    fi
+    status_stack || failed=1
+    if [ "$failed" -eq 0 ]; then
+        echo 'RESULT healthy'
+    else
+        echo 'RESULT attention required' >&2
+    fi
     return "$failed"
 }
 
@@ -85,10 +215,12 @@ backup_stack() {
     trap cleanup_backup EXIT
     stop_stack
     tar --numeric-owner -czf "$archive" \
+        --exclude="${VESSELSTACK_ROOT#/}/boat-chat/.venv" \
+        --exclude="${VESSELSTACK_ROOT#/}/boat-chat/__pycache__" \
         --transform 's,^,vesselstack-backup/,' \
         "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA"
     sha256sum "$archive" > "$manifest"
-    tar -tzf "$archive" >/dev/null
+    verify_backup "$archive" >/dev/null
     chmod 0600 "$archive" "$manifest"
     trap - EXIT
     cleanup_backup
@@ -100,6 +232,39 @@ verify_backup() {
     [ -f "$archive" ] || { echo "Backup not found: $archive" >&2; exit 1; }
     [ -f "$archive.sha256" ] || { echo "Checksum not found: $archive.sha256" >&2; exit 1; }
     (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$archive").sha256")
+    python3 - "$archive" "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive, root, data = sys.argv[1:]
+prefix = pathlib.PurePosixPath("vesselstack-backup")
+allowed = [prefix / root.lstrip("/"), prefix / data.lstrip("/")]
+
+def contained(path):
+    return any(path == base or base in path.parents for base in allowed)
+
+with tarfile.open(archive, "r:gz") as bundle:
+    for member in bundle.getmembers():
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or not contained(path):
+            raise SystemExit(f"Unsafe backup member: {member.name}")
+        if member.isdev() or member.isfifo():
+            raise SystemExit(f"Unsupported special file: {member.name}")
+        if member.issym() or member.islnk():
+            target = pathlib.PurePosixPath(member.linkname)
+            if target.is_absolute():
+                raise SystemExit(f"Unsafe absolute link: {member.name}")
+            parts = []
+            for part in (path.parent / target).parts:
+                if part == "..":
+                    if parts:
+                        parts.pop()
+                elif part != ".":
+                    parts.append(part)
+            if not contained(pathlib.PurePosixPath(*parts)):
+                raise SystemExit(f"Unsafe link target: {member.name}")
+PY
     root_path=${VESSELSTACK_ROOT#/}
     data_path=${VESSELSTACK_DATA#/}
     while IFS= read -r entry; do
@@ -113,7 +278,7 @@ verify_backup() {
         echo "Backup contains paths outside this VesselStack installation" >&2
         exit 1
     fi
-    echo "Backup verified"
+    echo "Backup verified (checksum, paths, links, and file types)"
 }
 
 restore_stack() {
@@ -146,12 +311,21 @@ uninstall_stack() {
     done
     stop_stack
     systemctl disable vesselstack-chat.service || true
+    systemctl disable --now vesselstack-chat-telegram.service || true
+    systemctl disable --now vesselstack-telemetry-indexer.timer || true
+    systemctl disable --now vesselstack-signalk.service || true
+    systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
     if [ -x /usr/local/sbin/vesselstack-firewall ]; then
         /usr/local/sbin/vesselstack-firewall remove || true
     fi
     systemctl disable vesselstack-firewall.service || true
     rm -f -- /etc/systemd/system/vesselstack-chat.service \
+        /etc/systemd/system/vesselstack-chat-telegram.service \
+        /etc/systemd/system/vesselstack-telemetry-indexer.service \
+        /etc/systemd/system/vesselstack-telemetry-indexer.timer \
+        /etc/systemd/system/vesselstack-signalk.service \
+        /etc/systemd/system/vesselstack-socketcan.service \
         /etc/systemd/system/vesselstack-control-panel.service /usr/local/sbin/vesselstackctl
     rm -f -- /etc/systemd/system/vesselstack-firewall.service /usr/local/sbin/vesselstack-firewall
     systemctl daemon-reload
@@ -178,6 +352,10 @@ require_root
 load_config
 case "$command" in
     status) status_stack ;;
+    doctor) doctor_stack ;;
+    urls) show_urls ;;
+    version) show_version ;;
+    logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
     start) start_stack ;;
     stop) stop_stack ;;
     restart) stop_stack; start_stack ;;

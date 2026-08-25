@@ -10,6 +10,7 @@ CONFIG_FILE="$SCRIPT_DIR/vesselstack.env"
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
+RELEASES_DIR="$SYSTEM_ROOT/var/lib/vesselstack/releases"
 START=0
 DRY_RUN=0
 
@@ -34,6 +35,15 @@ source "$CONFIG_FILE"
 # Existing 0.x installations did not define configurable bucket names.
 : "${INFLUXDB_RAW_BUCKET:=vesselstack_raw}"
 : "${INFLUXDB_HISTORY_BUCKET:=vesselstack_1m}"
+: "${GRAFANA_PORT:=43000}"
+: "${HEIMDALL_PORT:=80}"
+: "${HEIMDALL_HTTPS_PORT:=443}"
+: "${INFLUXDB_PORT:=8086}"
+: "${INFLUXDB_CONTAINER_NAME:=vesselstack-influxdb}"
+: "${PROMETHEUS_PORT:=9090}"
+: "${MQTT_PORT:=1883}"
+: "${AIS_WEB_PORT:=8100}"
+: "${AIS_TCP_PORT:=5011}"
 : "${INFLUXDB_HOME_ASSISTANT_BUCKET:=homeassistant}"
 : "${INFLUXDB_AIS_BUCKET:=ais}"
 : "${SIGNALK_MODE:=existing}"
@@ -48,6 +58,8 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
+: "${TELEGRAM_ENABLE:=false}"
+: "${TELEMETRY_INDEXER_ENABLE:=true}"
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -65,11 +77,30 @@ case "$SIGNALK_MODE" in
     existing|docker|native) ;;
     *) echo "SIGNALK_MODE must be existing, docker, or native" >&2; exit 1 ;;
 esac
-case "$SOCKETCAN_ENABLE:$AIS_ENABLE:$VESSELSTACK_FIREWALL_ENABLE" in
-    true:true:true|true:true:false|true:false:true|true:false:false|\
-    false:true:true|false:true:false|false:false:true|false:false:false) ;;
-    *) echo "Hardware and firewall enable settings must be true or false" >&2; exit 1 ;;
+case "$INFLUXDB_CONTAINER_NAME" in
+    ''|*[!A-Za-z0-9_.-]*)
+        echo 'INFLUXDB_CONTAINER_NAME may contain letters, numbers, dot, underscore, and hyphen' >&2
+        exit 1
+        ;;
 esac
+for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
+    case "${!key}" in
+        true|false) ;;
+        *) echo "$key must be true or false" >&2; exit 1 ;;
+    esac
+done
+for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
+    PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT; do
+    port_value=${!key}
+    case "$port_value" in
+        ''|*[!0-9]*) echo "$key must be a numeric TCP port" >&2; exit 1 ;;
+    esac
+    if [ "$port_value" -lt 1 ] || [ "$port_value" -gt 65535 ]; then
+        echo "$key must be between 1 and 65535" >&2
+        exit 1
+    fi
+done
 
 COMPOSE_PROFILES=()
 [ "$SIGNALK_MODE" = docker ] && COMPOSE_PROFILES+=(--profile signalk)
@@ -166,6 +197,7 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
     "$VESSELSTACK_ROOT/installer"
+install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
 # Official images run their data processes as these fixed container users.
@@ -249,13 +281,19 @@ AIS_ENABLE
 AIS_IMAGE
 AIS_DEVICE
 AIS_CATCHER_ARGS
+AIS_WEB_PORT
+AIS_TCP_PORT
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
 CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
+TELEGRAM_ENABLE
+TELEMETRY_INDEXER_ENABLE
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
+INFLUXDB_PORT
+INFLUXDB_CONTAINER_NAME
 INFLUXDB_ORG
 INFLUXDB_USERNAME
 INFLUXDB_RAW_BUCKET
@@ -265,8 +303,13 @@ INFLUXDB_AIS_BUCKET
 INFLUXDB_PASSWORD
 INFLUXDB_TOKEN
 GRAFANA_ADMIN_PASSWORD
+GRAFANA_PORT
+HEIMDALL_PORT
+HEIMDALL_HTTPS_PORT
+PROMETHEUS_PORT
 MQTT_USERNAME
 MQTT_PASSWORD
+MQTT_PORT
 EOF
 
 # Retain provider credentials and optional Boat Chat settings across installer
@@ -276,6 +319,7 @@ if [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
     cp "$VESSELSTACK_ROOT/config/boat-chat.env" "$boat_chat_temp"
 fi
 for key in BOAT_NAME VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN \
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE \
     SIGNALK_URL HOME_ASSISTANT_URL \
     HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
     INFLUXDB_RAW_BUCKET INFLUXDB_HISTORY_BUCKET \
@@ -298,10 +342,13 @@ done
     printf 'BOAT_NAME=%q\n' "$BOAT_NAME"
     printf 'VESSELSTACK_VERSION=%q\n' "$(<"$SCRIPT_DIR/VERSION")"
     printf 'BOAT_CHAT_SETTINGS_TOKEN=%q\n' "$BOAT_CHAT_SETTINGS_TOKEN"
+    printf 'TELEGRAM_ENABLE=%q\n' "$TELEGRAM_ENABLE"
+    printf 'TELEMETRY_INDEXER_ENABLE=%q\n' "$TELEMETRY_INDEXER_ENABLE"
     printf 'SIGNALK_URL=%q\n' "$SIGNALK_URL"
     printf 'HOME_ASSISTANT_URL=%q\n' "$HOME_ASSISTANT_URL"
     printf 'HOME_ASSISTANT_TOKEN=%q\n' "${HOME_ASSISTANT_TOKEN:-}"
     printf 'INFLUXDB_URL=%q\n' "$INFLUXDB_URL"
+    # shellcheck disable=SC2153  # Required and validated through the key list.
     printf 'INFLUXDB_ORG=%q\n' "$INFLUXDB_ORG"
     printf 'INFLUXDB_TOKEN=%q\n' "$INFLUXDB_TOKEN"
     printf 'INFLUXDB_RAW_BUCKET=%q\n' "$INFLUXDB_RAW_BUCKET"
@@ -339,12 +386,30 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
+for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service; do
+    sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
+        -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+        "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
+    chmod 0644 "$SYSTEMD_DIR/$unit"
+done
+install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-telemetry-indexer.timer" \
+    "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-control-panel.service.in" \
     > "$SYSTEMD_DIR/vesselstack-control-panel.service"
 chmod 0644 "$SYSTEMD_DIR/vesselstack-control-panel.service"
 systemctl daemon-reload
 systemctl enable vesselstack-control-panel.service
+if [ "$TELEGRAM_ENABLE" = true ]; then
+    systemctl enable vesselstack-chat-telegram.service
+else
+    systemctl disable vesselstack-chat-telegram.service 2>/dev/null || true
+fi
+if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
+    systemctl enable vesselstack-telemetry-indexer.timer
+else
+    systemctl disable vesselstack-telemetry-indexer.timer 2>/dev/null || true
+fi
 
 compose config --quiet
 
@@ -366,6 +431,16 @@ if [ "$START" -eq 1 ]; then
     compose up -d
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service
+    if [ "$TELEGRAM_ENABLE" = true ]; then
+        systemctl restart vesselstack-chat-telegram.service
+    else
+        systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
+    fi
+    if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
+        systemctl start vesselstack-telemetry-indexer.timer
+    else
+        systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
+    fi
     if [ "${VESSELSTACK_SKIP_PANEL_RESTART:-false}" != true ]; then
         systemctl restart vesselstack-control-panel.service
     fi

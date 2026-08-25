@@ -52,11 +52,12 @@ class EnvironmentFileTests(unittest.TestCase):
             panel.write_env(vessel, {"BOAT_NAME": "Old", "INFLUXDB_TOKEN": "keep-me"}, [])
             panel.write_env(chat, {}, [])
             panel.write_env(control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
-            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control):
-                panel.update_configuration({"BOAT_NAME": "New Boat", "INFLUXDB_TOKEN": ""})
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control, CONFIG_BACKUP_ROOT=root / "backups"):
+                backup = panel.update_configuration({"BOAT_NAME": "New Boat", "INFLUXDB_TOKEN": ""})
             values = panel.parse_env(vessel)
             self.assertEqual(values["BOAT_NAME"], "New Boat")
             self.assertEqual(values["INFLUXDB_TOKEN"], "keep-me")
+            self.assertEqual((Path(backup) / "vessel.env").stat().st_mode & 0o777, 0o600)
 
     def test_null_secret_update_clears_existing_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -67,9 +68,34 @@ class EnvironmentFileTests(unittest.TestCase):
             panel.write_env(vessel, {"INFLUXDB_TOKEN": "remove-me"}, [])
             panel.write_env(chat, {}, [])
             panel.write_env(control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
-            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control):
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control, CONFIG_BACKUP_ROOT=root / "backups"):
                 panel.update_configuration({"INFLUXDB_TOKEN": None})
             self.assertEqual(panel.parse_env(vessel)["INFLUXDB_TOKEN"], "")
+
+    def test_partial_write_failure_restores_all_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vessel = root / "vessel.env"
+            chat = root / "chat.env"
+            control = root / "control.env"
+            panel.write_env(vessel, {"BOAT_NAME": "Original"}, [])
+            panel.write_env(chat, {"BOAT_CHAT_MODEL": "original-model"}, [])
+            panel.write_env(control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
+            original_write = panel.write_env
+            calls = 0
+
+            def fail_second_write(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated write failure")
+                return original_write(*args, **kwargs)
+
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control, CONFIG_BACKUP_ROOT=root / "backups"), mock.patch.object(panel, "write_env", side_effect=fail_second_write):
+                with self.assertRaisesRegex(OSError, "simulated"):
+                    panel.update_configuration({"BOAT_NAME": "Changed", "BOAT_CHAT_MODEL": "changed-model"})
+            self.assertEqual(panel.parse_env(vessel)["BOAT_NAME"], "Original")
+            self.assertEqual(panel.parse_env(chat)["BOAT_CHAT_MODEL"], "original-model")
 
 
 class CommandAllowlistTests(unittest.TestCase):
@@ -86,11 +112,19 @@ class CommandAllowlistTests(unittest.TestCase):
 
     def test_update_requires_reviewed_release_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "vesselstack-test"
+            release.mkdir()
             with self.assertRaises(ValueError):
-                panel.action_command("update", {"source_directory": directory})
-            (Path(directory) / "install.sh").write_text("#!/bin/bash\n")
-            command = panel.action_command("update", {"source_directory": directory})
-            self.assertEqual(command[-2:], ["update", directory])
+                panel.action_command("update", {"source_directory": release})
+            (release / "install.sh").write_text("#!/bin/bash\n")
+            (release / "VERSION").write_text("1.0.1\n")
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root):
+                command = panel.action_command("update", {"source_directory": release})
+            self.assertEqual(command[-2:], ["update", str(release)])
+            (release / "install.sh").chmod(0o777)
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root), self.assertRaises(ValueError):
+                panel.action_command("update", {"source_directory": release})
 
 
 class ValidationTests(unittest.TestCase):
@@ -110,6 +144,9 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             panel.validate_value(panel.FIELD_BY_KEY["CONTROL_PANEL_HOST"], "public.example")
         self.assertEqual(panel.validate_value(panel.FIELD_BY_KEY["CONTROL_PANEL_HOST"], "127.0.0.1"), "127.0.0.1")
+        with self.assertRaises(ValueError):
+            panel.validate_value(panel.FIELD_BY_KEY["INFLUXDB_PORT"], "0")
+        self.assertEqual(panel.validate_value(panel.FIELD_BY_KEY["INFLUXDB_PORT"], "8086"), "8086")
 
 
 class HttpApiTests(unittest.TestCase):

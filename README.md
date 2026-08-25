@@ -130,6 +130,8 @@ nano vesselstack.env
 | `BOAT_NAME` | Name displayed by Boat Chat |
 | `BOAT_TYPE` | Vessel make/model or general type |
 | `BOAT_MMSI`, `BOAT_CALLSIGN` | Optional identity fields |
+| `*_PORT` | Host ports for Grafana, Heimdall HTTP/HTTPS, InfluxDB, Prometheus, MQTT, and AIS |
+| `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
 | `BOAT_UNITS` | `us_customary` or `metric` |
 | `VESSELSTACK_USER` | Existing non-root service account |
@@ -152,6 +154,8 @@ nano vesselstack.env
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
+| `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
+| `TELEMETRY_INDEXER_ENABLE` | Refresh Boat Chat's telemetry memory every five minutes |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
@@ -180,7 +184,9 @@ sudo ./install.sh --config vesselstack.env
 
 This copies the application to `/opt/vesselstack`, creates persistent paths,
 generates credentials, creates Boat Chat's Python environment, installs and
-enables (but does not start) `vesselstack-chat.service`, and validates Compose.
+enables (but does not start) Boat Chat and the configured optional workers, and
+validates Compose. Telegram is disabled by default; the telemetry indexer is
+enabled by default so recent boat data can be recalled in chat.
 
 Review the rendered files:
 
@@ -190,6 +196,9 @@ sudo docker compose \
   -f /opt/vesselstack/compose.yml config
 
 sudo systemd-analyze verify /etc/systemd/system/vesselstack-chat.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-chat-telegram.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-telemetry-indexer.service
+sudo systemd-analyze verify /etc/systemd/system/vesselstack-telemetry-indexer.timer
 sudo systemd-analyze verify /etc/systemd/system/vesselstack-control-panel.service
 ```
 
@@ -201,9 +210,27 @@ sudo ./install.sh --config vesselstack.env --start
 
 This creates the Mosquitto password file, starts Docker services, creates the
 configured InfluxDB buckets and one-minute downsample task, and starts Boat
-Chat. Allow several minutes for initial image downloads and Home Assistant.
+Chat plus each enabled worker. Allow several minutes for initial image downloads
+and Home Assistant.
 
 ## 8. Verify the installation
+
+Start with the operator commands; they use the URLs and ports in your rendered
+configuration:
+
+```bash
+sudo vesselstackctl status
+sudo vesselstackctl doctor
+sudo vesselstackctl urls
+```
+
+`status` exits nonzero when a required service or endpoint is unhealthy.
+`doctor` adds dependency, Compose, free-space, service, and endpoint checks and
+finishes with either `RESULT healthy` or `RESULT attention required`. Use
+`vesselstackctl logs chat`, `logs containers`, or `logs all` for recent
+diagnostic output without remembering systemd or Compose commands.
+
+For direct checks:
 
 ```bash
 sudo docker compose \
@@ -312,7 +339,7 @@ The Control Panel is the browser administration surface for VesselStack. It
 shows container and systemd state, starts/stops/restarts individual components,
 edits settings by component, runs installer preflight, renders or installs the
 saved configuration, provisions InfluxDB history, creates consistent backups,
-and applies an already downloaded and reviewed release directory.
+and applies an already downloaded, reviewed, and root-controlled release.
 
 It deliberately stays available when the managed stack is stopped. The
 `vesselstackctl` command remains the recovery path if the panel is unavailable.
@@ -332,12 +359,14 @@ sudo grep '^CONTROL_PANEL_TOKEN=' \
   /opt/vesselstack/config/control-panel.env
 ```
 
-The token is stored by the browser in local storage and sent only in the
-`X-VesselStack-Token` request header. Configuration APIs never return secret
-values: they report only whether a secret is configured, and a blank submitted
-secret preserves its current value. Use the explicit **Clear stored value**
-checkbox to remove one. Operation commands are fixed allowlisted argument
-arrays; the panel does not expose an arbitrary shell.
+The token is stored in browser session storage, cleared by the **Lock** button
+or when the tab closes, and sent only in the `X-VesselStack-Token` request
+header. Configuration APIs never return secret values: they report only whether
+a secret is configured, and a blank submitted secret preserves its current
+value. Use the explicit **Clear stored value** checkbox to remove one. Every
+configuration save creates mode-600 rollback copies under
+`/opt/vesselstack-data/control-panel/config-backups/`. Operation commands are
+fixed allowlisted argument arrays; the panel does not expose an arbitrary shell.
 
 Clearing an optional integration token disables that credential. Clearing a
 required installer-managed password or token causes the installer to generate
@@ -356,6 +385,17 @@ sudo systemctl restart vesselstack-control-panel.service
 The panel intentionally skips restarting itself while an operation request is
 in flight. After applying a release that changes Control Panel code, run the
 same restart command to load the new backend.
+
+The Telegram and telemetry-indexer toggles take effect after **Install &
+start** (or another installer run). Configure the Telegram bot token and allowed
+chat IDs in the Telegram section before enabling its worker. Operators can
+inspect these workers with:
+
+```bash
+sudo vesselstackctl logs telegram
+sudo vesselstackctl logs indexer
+systemctl list-timers vesselstack-telemetry-indexer.timer
+```
 
 The service runs as root because Docker, systemd, installation, backup, and
 hardware operations require host privileges. Keep the token private, retain
@@ -421,8 +461,14 @@ sudo vesselstackctl backup
 sudo vesselstackctl verify-backup /path/to/vesselstack-TIMESTAMP.tar.gz
 ```
 
+Backup creation runs the same checksum, path, link, and special-file verifier
+automatically. Rebuildable Boat Chat virtual-environment and bytecode files are
+excluded; application source, configuration, memory, and data remain included.
+
 Restore only during a maintenance window. This replaces installed config and
-data after checksum and archive-path validation:
+data after checksum and archive validation. Verification rejects path
+traversal, absolute or escaping links, device nodes, and FIFOs before anything
+is extracted:
 
 ```bash
 sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
@@ -470,6 +516,21 @@ perform preflight, a verified pre-update backup, installation, and startup:
 ```bash
 sudo vesselstackctl update /path/to/VesselStack-release
 ```
+
+For Control Panel updates, stage the reviewed release beneath its restricted
+root first. The panel rejects symlinks, missing release metadata, paths outside
+this directory, files owned by another user, and group/world-writable content:
+
+```bash
+sudo install -d -m 0755 /var/lib/vesselstack/releases
+sudo cp -a /path/to/vesselstack-x.y.z /var/lib/vesselstack/releases/
+sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-x.y.z
+sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-x.y.z
+```
+
+Then enter `/var/lib/vesselstack/releases/vesselstack-x.y.z` in the panel.
+Shell-initiated `vesselstackctl update` remains available for a trusted operator
+and is not limited to the panel staging directory.
 
 The installer records the configuration schema in
 `/opt/vesselstack/config/installed-version` and accepts only explicit migration

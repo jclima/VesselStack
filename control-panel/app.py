@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -27,8 +28,14 @@ CHAT_ENV = ROOT / "config/boat-chat.env"
 PANEL_ENV = ROOT / "config/control-panel.env"
 INSTALLER = ROOT / "installer/install.sh"
 CTL = Path(os.environ.get("VESSELSTACK_CTL", "/usr/local/sbin/vesselstackctl"))
+REVIEWED_RELEASE_ROOT = Path(
+    os.environ.get("VESSELSTACK_REVIEWED_RELEASES", "/var/lib/vesselstack/releases")
+)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8780
+CONFIG_BACKUP_ROOT = Path(
+    os.environ.get("CONTROL_PANEL_CONFIG_BACKUPS", "/opt/vesselstack-data/control-panel/config-backups")
+)
 
 
 def field(
@@ -76,9 +83,13 @@ FIELDS = [
     field("AIS_IMAGE", "AIS image", "AIS"),
     field("AIS_DEVICE", "AIS device", "AIS", kind="path"),
     field("AIS_CATCHER_ARGS", "AIS-catcher arguments", "AIS"),
+    field("AIS_WEB_PORT", "AIS web port", "AIS", kind="port"),
+    field("AIS_TCP_PORT", "AIS TCP output port", "AIS", kind="port"),
     field("HOME_ASSISTANT_URL", "Home Assistant URL", "Home Assistant", kind="url"),
     field("HOME_ASSISTANT_TOKEN", "Home Assistant token", "Home Assistant", kind="secret"),
     field("INFLUXDB_URL", "InfluxDB URL", "InfluxDB", kind="url"),
+    field("INFLUXDB_PORT", "Published port", "InfluxDB", kind="port"),
+    field("INFLUXDB_CONTAINER_NAME", "Container name", "InfluxDB"),
     field("INFLUXDB_ORG", "Organization", "InfluxDB"),
     field("INFLUXDB_USERNAME", "Admin username", "InfluxDB"),
     field("INFLUXDB_RAW_BUCKET", "Raw bucket", "InfluxDB"),
@@ -88,18 +99,24 @@ FIELDS = [
     field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret"),
     field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret"),
     field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret"),
+    field("GRAFANA_PORT", "Published port", "Grafana", kind="port"),
+    field("HEIMDALL_PORT", "HTTP port", "Heimdall", kind="port"),
+    field("HEIMDALL_HTTPS_PORT", "HTTPS port", "Heimdall", kind="port"),
+    field("PROMETHEUS_PORT", "Published port", "Prometheus", kind="port"),
     field("MQTT_USERNAME", "MQTT username", "MQTT"),
     field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret"),
+    field("MQTT_PORT", "Published port", "MQTT", kind="port"),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
     field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 unless access is protected by a trusted VPN or proxy."),
-    field("CONTROL_PANEL_PORT", "Control panel port", "Control Panel", kind="number"),
+    field("CONTROL_PANEL_PORT", "Control panel port", "Control Panel", kind="port"),
     field("BOAT_CHAT_PROVIDER", "Primary provider", "Boat Chat", source="chat", kind="select", choices=["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
     field("BOAT_CHAT_MODEL", "Primary model", "Boat Chat", source="chat"),
     field("BOAT_CHAT_FALLBACK_PROVIDER", "Fallback provider", "Boat Chat", source="chat", kind="select", choices=["", "local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
     field("BOAT_CHAT_FALLBACK_MODEL", "Fallback model", "Boat Chat", source="chat"),
     field("BOAT_CHAT_HOST", "Boat Chat host", "Boat Chat", source="chat"),
-    field("BOAT_CHAT_PORT", "Boat Chat port", "Boat Chat", source="chat", kind="number"),
+    field("BOAT_CHAT_PORT", "Boat Chat port", "Boat Chat", source="chat", kind="port"),
+    field("TELEMETRY_INDEXER_ENABLE", "Refresh telemetry memory", "Boat Chat", kind="boolean"),
     field("OLLAMA_HOST", "Ollama URL", "Boat Chat", source="chat", kind="url"),
     field("BOAT_CHAT_BASE_URL", "Compatible API base URL", "Boat Chat", source="chat", kind="url"),
     field("OPENAI_API_KEY", "OpenAI API key", "Boat Chat", source="chat", kind="secret"),
@@ -112,6 +129,7 @@ FIELDS = [
     field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", "Boat Chat", source="chat"),
     field("TELEGRAM_BOT_TOKEN", "Telegram bot token", "Telegram", source="chat", kind="secret"),
     field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chat IDs", "Telegram", source="chat", kind="secret"),
+    field("TELEGRAM_ENABLE", "Run Telegram worker", "Telegram", kind="boolean"),
 ]
 FIELD_BY_KEY = {item["key"]: item for item in FIELDS}
 
@@ -127,6 +145,8 @@ COMPOSE_COMPONENTS = {
 }
 SYSTEMD_COMPONENTS = {
     "boat-chat": "vesselstack-chat.service",
+    "telegram": "vesselstack-chat-telegram.service",
+    "telemetry-indexer": "vesselstack-telemetry-indexer.timer",
     "signalk-native": "vesselstack-signalk.service",
     "socketcan": "vesselstack-socketcan.service",
     "firewall": "vesselstack-firewall.service",
@@ -187,12 +207,12 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         return text.lower()
     if kind == "select" and text not in spec["choices"]:
         raise ValueError(f"Invalid value for {spec['label']}")
-    if kind == "number" and text:
+    if kind in {"number", "port"} and text:
         try:
             float(text)
         except ValueError as exc:
             raise ValueError(f"{spec['label']} must be numeric") from exc
-    if spec["key"] in {"CONTROL_PANEL_PORT", "BOAT_CHAT_PORT"} and text:
+    if kind == "port" and text:
         if not text.isdigit() or not 1 <= int(text) <= 65535:
             raise ValueError(f"{spec['label']} must be an integer from 1 to 65535")
     if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST"} and text:
@@ -225,7 +245,7 @@ def public_configuration() -> dict[str, Any]:
     return {"fields": FIELDS, "values": result}
 
 
-def update_configuration(updates: dict[str, Any]) -> None:
+def update_configuration(updates: dict[str, Any]) -> str:
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
     panel = parse_env(PANEL_ENV)
@@ -245,14 +265,36 @@ def update_configuration(updates: dict[str, Any]) -> None:
         target[key] = value
         if key in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             panel[key] = value
-    write_env(VESSEL_ENV, vessel, [item["key"] for item in FIELDS if item["source"] == "vessel"])
-    write_env(CHAT_ENV, chat, [item["key"] for item in FIELDS if item["source"] == "chat"])
-    uid = vessel.get("VESSELSTACK_UID", "")
-    gid = vessel.get("VESSELSTACK_GID", "")
-    if uid.isdigit() and gid.isdigit():
-        os.chown(CHAT_ENV, int(uid), int(gid))
-    if panel:
-        write_env(PANEL_ENV, panel, ["CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT", "CONTROL_PANEL_TOKEN"])
+    paths = [VESSEL_ENV, CHAT_ENV, PANEL_ENV]
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
+    backup = CONFIG_BACKUP_ROOT / stamp
+    backup.mkdir(parents=True, mode=0o700)
+    originals: dict[Path, Path | None] = {}
+    for path in paths:
+        snapshot = backup / path.name
+        if path.is_file():
+            shutil.copy2(path, snapshot)
+            os.chmod(snapshot, 0o600)
+            originals[path] = snapshot
+        else:
+            originals[path] = None
+    try:
+        write_env(VESSEL_ENV, vessel, [item["key"] for item in FIELDS if item["source"] == "vessel"])
+        write_env(CHAT_ENV, chat, [item["key"] for item in FIELDS if item["source"] == "chat"])
+        uid = vessel.get("VESSELSTACK_UID", "")
+        gid = vessel.get("VESSELSTACK_GID", "")
+        if uid.isdigit() and gid.isdigit():
+            os.chown(CHAT_ENV, int(uid), int(gid))
+        if panel:
+            write_env(PANEL_ENV, panel, ["CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT", "CONTROL_PANEL_TOKEN"])
+    except Exception:
+        for path, snapshot in originals.items():
+            if snapshot is None:
+                path.unlink(missing_ok=True)
+            else:
+                shutil.copy2(snapshot, path)
+        raise
+    return str(backup)
 
 
 def compose_base() -> list[str]:
@@ -306,9 +348,22 @@ def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
         return [str(ROOT / "installer/scripts/bootstrap-influx.sh"), str(VESSEL_ENV)]
     if action == "update":
         source = Path(str(parameters.get("source_directory", ""))).expanduser()
-        if not source.is_absolute() or not (source / "install.sh").is_file():
+        if not source.is_absolute():
             raise ValueError("Update source must be an absolute reviewed VesselStack release directory")
-        return [str(CTL), "update", str(source)]
+        try:
+            reviewed_root = REVIEWED_RELEASE_ROOT.resolve(strict=True)
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(reviewed_root)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(f"Update source must be inside {REVIEWED_RELEASE_ROOT}") from exc
+        candidates = [reviewed_root, resolved, resolved / "install.sh", resolved / "VERSION"]
+        if source.is_symlink() or not candidates[-2].is_file() or not candidates[-1].is_file():
+            raise ValueError("Reviewed release must contain regular install.sh and VERSION files")
+        for candidate in candidates:
+            stat = candidate.stat()
+            if stat.st_uid != os.geteuid() or stat.st_mode & 0o022:
+                raise ValueError("Reviewed release paths must be panel-owner controlled and not group/world writable")
+        return [str(CTL), "update", str(resolved)]
     raise ValueError("Unsupported action")
 
 
@@ -514,8 +569,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 updates = payload.get("settings", payload)
                 if not isinstance(updates, dict):
                     raise ValueError("settings object required")
-                update_configuration(updates)
-                self.send_json(200, {"ok": True, "configuration": public_configuration(), "restart_note": "Apply configuration to render service changes. Restart the panel from the recovery shell after changing its listener."})
+                backup = update_configuration(updates)
+                self.send_json(200, {"ok": True, "backup": backup, "configuration": public_configuration(), "restart_note": "Apply configuration to render service changes. Restart the panel from the recovery shell after changing its listener."})
                 return
             if path == "/api/action":
                 action = str(payload.get("action", ""))

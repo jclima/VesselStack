@@ -22,8 +22,8 @@ services:
     devices:
       - ${AIS_DEVICE}:${AIS_DEVICE}
     ports:
-      - "8100:8100"
-      - "5011:5011"
+      - "${AIS_WEB_PORT:-8100}:8100"
+      - "${AIS_TCP_PORT:-5011}:5011"
 
   homeassistant:
     image: homeassistant/home-assistant:2026.6.4
@@ -38,10 +38,10 @@ services:
 
   influxdb:
     image: influxdb:2.9.1
-    container_name: vesselstack-influxdb
+    container_name: ${INFLUXDB_CONTAINER_NAME:-vesselstack-influxdb}
     restart: unless-stopped
     ports:
-      - "8086:8086"
+      - "${INFLUXDB_PORT:-8086}:8086"
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USERNAME}
@@ -57,7 +57,7 @@ services:
     container_name: vesselstack-grafana
     restart: unless-stopped
     ports:
-      - "43000:3000"
+      - "${GRAFANA_PORT:-43000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: boatadmin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
@@ -75,7 +75,7 @@ services:
     container_name: vesselstack-prometheus
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "${PROMETHEUS_PORT:-9090}:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -86,7 +86,7 @@ services:
     container_name: vesselstack-mosquitto
     restart: unless-stopped
     ports:
-      - "1883:1883"
+      - "${MQTT_PORT:-1883}:1883"
     volumes:
       - ${VESSELSTACK_ROOT}/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ${VESSELSTACK_DATA}/mosquitto:/mosquitto/data
@@ -96,8 +96,8 @@ services:
     container_name: vesselstack-heimdall
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HEIMDALL_PORT:-80}:80"
+      - "${HEIMDALL_HTTPS_PORT:-443}:443"
     environment:
       PUID: ${VESSELSTACK_UID}
       PGID: ${VESSELSTACK_GID}
