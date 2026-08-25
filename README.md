@@ -138,6 +138,7 @@ nano vesselstack.env
 | `VESSELSTACK_UID`, `VESSELSTACK_GID` | Derived from the service account by the installer |
 | `VESSELSTACK_ROOT` | Application path; default `/opt/vesselstack` |
 | `VESSELSTACK_DATA` | Persistent container-data path |
+| `VESSELSTACK_BACKUP` | Backup destination; must be outside the application and data trees |
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
 | `SIGNALK_VERSION` | Pinned SignalK release used by managed modes |
 | `SIGNALK_URL` | Existing SignalK endpoint |
@@ -164,7 +165,9 @@ under `/opt/vesselstack/config/` and are not printed.
 ## 5. Run preflight
 
 The dry run checks commands, Docker Compose, configuration, paths, and the
-service account without writing system configuration:
+service account without writing system configuration. It also rejects invalid
+listener addresses, out-of-range ports, and duplicate ports among enabled
+components before Docker or systemd encounters a harder-to-diagnose bind error:
 
 ```bash
 sudo ./install.sh --config vesselstack.env --dry-run
@@ -224,7 +227,12 @@ sudo vesselstackctl doctor
 sudo vesselstackctl urls
 ```
 
-`status` exits nonzero when a required service or endpoint is unhealthy.
+`status` reports every required and enabled Compose service separately and
+exits nonzero when a required service or endpoint is unhealthy, so one running
+container cannot hide another that failed or stopped.
+`vesselstackctl start` is also a complete first-start path: it configures
+enabled hardware and firewall policy, creates the MQTT password file when
+missing, starts services, and idempotently provisions InfluxDB history.
 `doctor` adds dependency, Compose, free-space, service, and endpoint checks and
 finishes with either `RESULT healthy` or `RESULT attention required`. Use
 `vesselstackctl logs chat`, `logs containers`, or `logs all` for recent
@@ -333,6 +341,12 @@ sudo grep '^BOAT_CHAT_SETTINGS_TOKEN=' \
   /opt/vesselstack/config/boat-chat.env
 ```
 
+Boat Chat retains this settings credential only for the current browser tab;
+closing the tab clears it.
+
+Boat Chat rejects oversized or malformed API requests and sends defensive
+browser headers while remaining embeddable in the Home Assistant dashboard.
+
 ### Control Panel
 
 The Control Panel is the browser administration surface for VesselStack. It
@@ -367,6 +381,8 @@ value. Use the explicit **Clear stored value** checkbox to remove one. Every
 configuration save creates mode-600 rollback copies under
 `/opt/vesselstack-data/control-panel/config-backups/`. Operation commands are
 fixed allowlisted argument arrays; the panel does not expose an arbitrary shell.
+While one operation is running, other operation and component controls are
+disabled to prevent overlapping lifecycle changes.
 
 Clearing an optional integration token disables that credential. Clearing a
 required installer-managed password or token causes the installer to generate
@@ -388,7 +404,9 @@ same restart command to load the new backend.
 
 The Telegram and telemetry-indexer toggles take effect after **Install &
 start** (or another installer run). Configure the Telegram bot token and allowed
-chat IDs in the Telegram section before enabling its worker. Operators can
+chat IDs in the Telegram section before enabling its worker. Disabled workers
+are shown as disabled and cannot be started accidentally from the component
+controls. Operators can
 inspect these workers with:
 
 ```bash
@@ -464,6 +482,8 @@ sudo vesselstackctl verify-backup /path/to/vesselstack-TIMESTAMP.tar.gz
 Backup creation runs the same checksum, path, link, and special-file verifier
 automatically. Rebuildable Boat Chat virtual-environment and bytecode files are
 excluded; application source, configuration, memory, and data remain included.
+The destination is resolved before writing and is rejected if it falls inside
+the application or data tree, including through a symlink.
 
 Restore only during a maintenance window. This replaces installed config and
 data after checksum and archive validation. Verification rejects path

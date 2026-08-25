@@ -40,6 +40,7 @@ BOAT_CHAT_AGENT = ROOT / "BOAT_CHAT_AGENT.md"
 KNOWLEDGE_ROOT = ROOT / "knowledge"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
+MAX_REQUEST_BODY = 1024 * 1024
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
 DEFAULT_GOOGLE_MODEL = "gemini-2.5-flash"
 DEFAULT_VERCEL_MODEL = "alibaba/qwen3.5-flash"
@@ -428,8 +429,9 @@ def normalize_http_url(value: str, default_scheme: str = "http") -> str:
 
 
 def write_env_config(settings: dict[str, str]) -> None:
+    service_name = os.environ.get("BOAT_CHAT_SERVICE_NAME", "boat-chat.service")
     lines = [
-        "# Local runtime settings for boat-chat.service.",
+        f"# Local runtime settings for {service_name}.",
         "# This file is ignored by Git; keep provider credentials here if needed.",
         "",
     ]
@@ -441,7 +443,7 @@ def write_env_config(settings: dict[str, str]) -> None:
             "",
             "# Provider values: local, codex_cli, claude_cli, openai, vercel, bedrock, google, ollama, openai_compatible",
             "# Optional fallback provider values use the same provider names.",
-            "# Host/port changes require: sudo systemctl restart boat-chat.service",
+            f"# Host/port changes require: sudo systemctl restart {service_name}",
         ]
     )
     ENV_CONFIG.write_text("\n".join(lines) + "\n")
@@ -4636,6 +4638,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -4655,6 +4659,18 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(provided, token):
                 return False, "invalid or missing X-Boat-Chat-Token header"
         return True, ""
+
+    def read_json_body(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > MAX_REQUEST_BODY:
+            raise ValueError(f"request body must be at most {MAX_REQUEST_BODY} bytes")
+        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object is required")
+        return payload
 
     def static_target(self, path: str) -> Path | None:
         if path == "/":
@@ -4685,6 +4701,9 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", self.static_content_type(target))
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'")
         self.end_headers()
         if include_body:
             self.wfile.write(content)
@@ -4730,16 +4749,14 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 if not allowed:
                     self.send_json(403, {"error": reason})
                     return
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                if not isinstance(payload, dict):
-                    self.send_json(400, {"error": "JSON object is required"})
-                    return
+                payload = self.read_json_body()
                 settings = payload.get("settings", payload)
                 if not isinstance(settings, dict):
                     self.send_json(400, {"error": "settings object is required"})
                     return
                 self.send_json(200, update_settings(settings))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json(400, {"error": str(exc)})
             except Exception as exc:
                 self.send_json(500, {"error": str(exc)})
             return
@@ -4747,8 +4764,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = self.read_json_body()
             message = str(payload.get("message", "")).strip()
             if not message:
                 self.send_json(400, {"error": "message is required"})
@@ -4774,6 +4790,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 or call_model(message, context)
             )
             self.send_json(200, {"answer": answer, "context": context})
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"error": str(exc)})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
 

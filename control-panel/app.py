@@ -322,6 +322,8 @@ def component_command(component: str, verb: str) -> list[str]:
             raise ValueError("Use systemctl from the recovery shell to restart the control panel")
         settings = parse_env(VESSEL_ENV)
         enabled = {
+            "telegram": settings.get("TELEGRAM_ENABLE", "false") == "true",
+            "telemetry-indexer": settings.get("TELEMETRY_INDEXER_ENABLE", "true") == "true",
             "signalk-native": settings.get("SIGNALK_MODE") == "native",
             "socketcan": settings.get("SOCKETCAN_ENABLE", "false") == "true",
             "firewall": settings.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true",
@@ -406,6 +408,10 @@ def component_status() -> list[dict[str, Any]]:
         enabled = True
         if name == "signalk-native":
             enabled = vessel.get("SIGNALK_MODE") == "native"
+        elif name == "telegram":
+            enabled = vessel.get("TELEGRAM_ENABLE", "false") == "true"
+        elif name == "telemetry-indexer":
+            enabled = vessel.get("TELEMETRY_INDEXER_ENABLE", "true") == "true"
         elif name == "socketcan":
             enabled = vessel.get("SOCKETCAN_ENABLE", "false") == "true"
         elif name == "firewall":

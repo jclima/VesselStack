@@ -326,7 +326,7 @@ async function loadSettings() {
 function settingsToken() {
   const field = settingsForm.elements.BOAT_CHAT_SETTINGS_TOKEN;
   const typed = field ? String(field.value).trim() : "";
-  return typed || localStorage.getItem("boatChatSettingsToken") || "";
+  return typed || sessionStorage.getItem("boatChatSettingsToken") || "";
 }
 
 async function saveSettings(event) {
@@ -367,9 +367,9 @@ async function saveSettings(event) {
       throw new Error(data.error || `HTTP ${response.status}`);
     }
     if (settings.BOAT_CHAT_SETTINGS_TOKEN) {
-      localStorage.setItem("boatChatSettingsToken", settings.BOAT_CHAT_SETTINGS_TOKEN);
+      sessionStorage.setItem("boatChatSettingsToken", settings.BOAT_CHAT_SETTINGS_TOKEN);
     } else if (token) {
-      localStorage.setItem("boatChatSettingsToken", token);
+      sessionStorage.setItem("boatChatSettingsToken", token);
     }
     settingsMessage.textContent = "Saved";
     await loadModelCatalog();

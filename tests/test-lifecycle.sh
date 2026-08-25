@@ -10,7 +10,7 @@ APP_ROOT="$TEST_ROOT/opt/vesselstack"
 DATA_ROOT="$TEST_ROOT/opt/vesselstack-data"
 BACKUP_ROOT="$TEST_ROOT/backups"
 FAKE_BIN="$TEST_ROOT/bin"
-install -d "$APP_ROOT/config" "$DATA_ROOT" "$FAKE_BIN"
+install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_BIN"
 
 cat > "$APP_ROOT/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$APP_ROOT
@@ -22,6 +22,8 @@ INFLUXDB_URL=http://127.0.0.1:8086
 BOAT_CHAT_PORT=9876
 GRAFANA_PORT=9877
 HEIMDALL_PORT=9878
+MQTT_USERNAME=test-user
+MQTT_PASSWORD=test-password
 EOF
 printf 'version one\n' > "$DATA_ROOT/state.txt"
 ln -s state.txt "$DATA_ROOT/current-state"
@@ -29,12 +31,30 @@ install -d "$APP_ROOT/boat-chat/.venv/bin"
 ln -s /usr/bin/python3 "$APP_ROOT/boat-chat/.venv/bin/python3"
 printf 'services: {}\n' > "$APP_ROOT/compose.yml"
 printf '1.0.1\n' > "$APP_ROOT/config/installed-version"
+for helper in configure-hardware.sh bootstrap-influx.sh; do
+    printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
+    chmod +x "$APP_ROOT/installer/scripts/$helper"
+done
 
 for command in docker systemctl curl; do
-    cat > "$FAKE_BIN/$command" <<'EOF'
+cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
+if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --services "* ]]; then
+    printf '%s\n' homeassistant influxdb grafana prometheus mosquitto heimdall
+fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --quiet "* ]]; then
     echo fake-container-id
+fi
+if [ "${1:-}" = run ]; then
+    for argument in "$@"; do
+        case "$argument" in
+            *:/mosquitto/data)
+                host_path=${argument%:/mosquitto/data}
+                install -d "$host_path"
+                printf 'test-password-file\n' > "$host_path/passwords"
+                ;;
+        esac
+    done
 fi
 exit 0
 EOF
@@ -51,6 +71,10 @@ archive=$(run_ctl backup "$BACKUP_ROOT" | tail -n 1)
 [ -s "$archive" ]
 [ -s "$archive.sha256" ]
 run_ctl verify-backup "$archive" | grep -q 'Backup verified'
+if run_ctl backup "$DATA_ROOT/recursive-backups" >/dev/null 2>&1; then
+    echo 'Backup accepted a destination inside the data tree' >&2
+    exit 1
+fi
 if tar -tzf "$archive" | grep -q '/boat-chat/.venv'; then
     echo 'Rebuildable virtual environment was included in backup' >&2
     exit 1
@@ -62,6 +86,12 @@ doctor_output=$(run_ctl doctor)
 grep -q '127.0.0.1:9876' <<<"$urls_output"
 grep -q 'installed: 1.0.1' <<<"$version_output"
 grep -q 'Boat Chat service' <<<"$status_output"
+grep -q '^prometheus[[:space:]]\+healthy$' <<<"$status_output"
+run_ctl start
+test -s "$DATA_ROOT/mosquitto/passwords" || {
+    echo 'Lifecycle start did not create the MQTT password file' >&2
+    exit 1
+}
 grep -q 'RESULT healthy' <<<"$doctor_output"
 
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"

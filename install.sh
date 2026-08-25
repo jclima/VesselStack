@@ -58,6 +58,9 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
+: "${BOAT_CHAT_HOST:=0.0.0.0}"
+: "${BOAT_CHAT_PORT:=8765}"
+: "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
 
@@ -91,7 +94,8 @@ for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
     esac
 done
 for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
-    PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT; do
+    PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
+    CONTROL_PANEL_PORT; do
     port_value=${!key}
     case "$port_value" in
         ''|*[!0-9]*) echo "$key must be a numeric TCP port" >&2; exit 1 ;;
@@ -101,6 +105,43 @@ for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
         exit 1
     fi
 done
+for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST; do
+    python3 - "${!key}" <<'PY' || { echo "$key must be an IPv4 address" >&2; exit 1; }
+import ipaddress
+import sys
+address = ipaddress.ip_address(sys.argv[1])
+if address.version != 4:
+    raise SystemExit(1)
+PY
+done
+
+# Fail before installation when two enabled listeners would contend for the
+# same host port. Host-networked Home Assistant and managed SignalK count too.
+declare -A port_owner=()
+register_port() {
+    local owner=$1 value=$2
+    if [ -n "${port_owner[$value]:-}" ]; then
+        echo "Port $value is assigned to both ${port_owner[$value]} and $owner" >&2
+        exit 1
+    fi
+    port_owner[$value]=$owner
+}
+register_port HomeAssistant 8123
+register_port InfluxDB "$INFLUXDB_PORT"
+register_port Grafana "$GRAFANA_PORT"
+register_port Prometheus "$PROMETHEUS_PORT"
+register_port MQTT "$MQTT_PORT"
+register_port HeimdallHTTP "$HEIMDALL_PORT"
+register_port HeimdallHTTPS "$HEIMDALL_HTTPS_PORT"
+register_port BoatChat "$BOAT_CHAT_PORT"
+register_port ControlPanel "$CONTROL_PANEL_PORT"
+if [ "$AIS_ENABLE" = true ]; then
+    register_port AISWeb "$AIS_WEB_PORT"
+    register_port AISTCP "$AIS_TCP_PORT"
+fi
+if [ "$SIGNALK_MODE" != existing ]; then
+    register_port SignalK 3000
+fi
 
 COMPOSE_PROFILES=()
 [ "$SIGNALK_MODE" = docker ] && COMPOSE_PROFILES+=(--profile signalk)
@@ -116,6 +157,19 @@ for command in curl docker jq openssl python3 sed sha256sum install tar systemct
 done
 docker compose version >/dev/null || { echo "Docker Compose v2 is required" >&2; exit 1; }
 id "$VESSELSTACK_USER" >/dev/null 2>&1 || { echo "User does not exist: $VESSELSTACK_USER" >&2; exit 1; }
+python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$VESSELSTACK_BACKUP" <<'PY'
+import pathlib
+import sys
+
+root, data, backup = (pathlib.Path(value).resolve(strict=False) for value in sys.argv[1:])
+for label, path in (("VESSELSTACK_ROOT", root), ("VESSELSTACK_DATA", data), ("VESSELSTACK_BACKUP", backup)):
+    if not path.is_absolute() or path == pathlib.Path("/"):
+        raise SystemExit(f"{label} must be a specific absolute path, not {path}")
+if root == data or root in data.parents or data in root.parents:
+    raise SystemExit("VESSELSTACK_ROOT and VESSELSTACK_DATA must be separate, non-nested paths")
+if backup == root or root in backup.parents or backup == data or data in backup.parents:
+    raise SystemExit("VESSELSTACK_BACKUP must be outside VESSELSTACK_ROOT and VESSELSTACK_DATA")
+PY
 # Written through the indirect configuration loop below.
 # shellcheck disable=SC2034
 VESSELSTACK_UID=$(id -u "$VESSELSTACK_USER")

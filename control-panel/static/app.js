@@ -2,6 +2,7 @@ const state = {
   token: sessionStorage.getItem("vesselstack_control_token") || "",
   config: null,
   poller: null,
+  operationRunning: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -74,7 +75,7 @@ function lock() {
 
 function renderComponents(components) {
   $("#component-grid").innerHTML = components.map((component) => {
-    const disabled = !component.enabled;
+    const disabled = !component.enabled || state.operationRunning;
     const stateLabel = escapeHtml(disabled ? "disabled by config" : component.state);
     const componentId = escapeHtml(component.id);
     const componentLabel = escapeHtml(component.label);
@@ -99,6 +100,9 @@ function renderOperation(operation) {
   badge.className = `pill ${statusClass(label)} ${label}`;
   const output = (operation.output || []).join("\n");
   $("#operation-output").textContent = output || "No operation has run in this session.";
+  state.operationRunning = label === "running";
+  $$('[data-action]').forEach((button) => { button.disabled = state.operationRunning; });
+  $("#run-update").disabled = state.operationRunning;
   if (label === "running") {
     clearTimeout(state.poller);
     state.poller = setTimeout(refreshStatus, 1200);
@@ -108,8 +112,8 @@ function renderOperation(operation) {
 async function refreshStatus() {
   try {
     const data = await api("/api/status");
-    renderComponents(data.components);
     renderOperation(data.operation);
+    renderComponents(data.components);
     const active = data.components.filter((item) => item.enabled && statusClass(item.state) === "active").length;
     const enabled = data.components.filter((item) => item.enabled).length;
     $("#summary").textContent = `${active} of ${enabled} enabled components are active.`;
@@ -181,6 +185,10 @@ async function startOperation(payload) {
 }
 
 function runAction(action, extra = {}) {
+  if (state.operationRunning) {
+    toast("Wait for the current operation to finish.", true);
+    return;
+  }
   const confirmations = {
     install: "Install and start the configured VesselStack components?",
     apply: "Apply the saved configuration to the installed system?",
@@ -192,6 +200,10 @@ function runAction(action, extra = {}) {
 }
 
 function runComponent(component, action) {
+  if (state.operationRunning) {
+    toast("Wait for the current operation to finish.", true);
+    return;
+  }
   if (action === "stop" && !window.confirm(`Stop ${component}?`)) return;
   startOperation({ component, action });
 }

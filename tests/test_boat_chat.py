@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import os
 import sys
 import tempfile
@@ -409,6 +410,20 @@ class PowerTrackingTests(unittest.TestCase):
         self.assertIn("installed SignalK Victron BLE plugin", answer)
         self.assertIn("Simarine PICO", answer)
         self.assertIn("Voc", answer)
+
+
+class RequestBodyTests(unittest.TestCase):
+    def test_json_body_is_bounded_and_must_be_an_object(self) -> None:
+        handler = object.__new__(app.BoatChatHandler)
+        handler.headers = {"Content-Length": str(app.MAX_REQUEST_BODY + 1)}
+        handler.rfile = io.BytesIO(b"")
+        with self.assertRaisesRegex(ValueError, "at most"):
+            handler.read_json_body()
+        payload = b'["not", "an", "object"]'
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            handler.read_json_body()
 
 
 if __name__ == "__main__":

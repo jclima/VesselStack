@@ -110,6 +110,24 @@ class CommandAllowlistTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             panel.component_command("grafana", "delete")
 
+    def test_disabled_optional_workers_cannot_be_started(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vessel = Path(directory) / "vessel.env"
+            panel.write_env(vessel, {"TELEGRAM_ENABLE": "false", "TELEMETRY_INDEXER_ENABLE": "false"}, [])
+            with mock.patch.object(panel, "VESSEL_ENV", vessel):
+                with self.assertRaisesRegex(ValueError, "disabled"):
+                    panel.component_command("telegram", "start")
+                with self.assertRaisesRegex(ValueError, "disabled"):
+                    panel.component_command("telemetry-indexer", "restart")
+
+    def test_enabled_optional_workers_use_fixed_units(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vessel = Path(directory) / "vessel.env"
+            panel.write_env(vessel, {"TELEGRAM_ENABLE": "true", "TELEMETRY_INDEXER_ENABLE": "true"}, [])
+            with mock.patch.object(panel, "VESSEL_ENV", vessel):
+                self.assertEqual(panel.component_command("telegram", "start"), ["systemctl", "start", "vesselstack-chat-telegram.service"])
+                self.assertEqual(panel.component_command("telemetry-indexer", "restart"), ["systemctl", "restart", "vesselstack-telemetry-indexer.timer"])
+
     def test_update_requires_reviewed_release_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

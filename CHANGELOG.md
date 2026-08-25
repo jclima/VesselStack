@@ -45,6 +45,20 @@ Semantic Versioning.
   restricted web-triggered updates to root-controlled staged releases.
 - Added packaged, hardened Telegram and telemetry-indexer units with explicit
   enable settings and complete lifecycle/status/log handling.
+- Made Control Panel component state/actions honor the optional-worker toggles
+  and corrected installed Boat Chat service guidance.
+- Added installer preflight validation for Boat Chat/Control Panel listeners
+  and duplicate host ports across enabled services.
+- Limited the Boat Chat settings credential to browser session storage so it is
+  cleared when the tab closes.
+- Bounded Boat Chat request bodies, returned client errors for malformed JSON,
+  and added no-store/nosniff/CSP response headers without breaking dashboard embedding.
+- Rejected nested or symlink-aliased backup destinations that could make an
+  archive recursively include itself.
+- Replaced the aggregate container status with per-service state for every
+  required and enabled Compose component.
+- Made `vesselstackctl start` perform all first-start prerequisites, including
+  hardware/firewall setup, MQTT credentials, and InfluxDB history provisioning.
 
 ## 1.0.0 - 2026-08-21
 

@@ -47,10 +47,31 @@ load_config() {
 }
 
 start_stack() {
+    local installer_scripts="$VESSELSTACK_ROOT/installer/scripts"
     if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
-        systemctl start vesselstack-socketcan.service
+        [ -x "$installer_scripts/configure-hardware.sh" ] || {
+            echo "Missing bundled hardware configurator: $installer_scripts/configure-hardware.sh" >&2
+            return 1
+        }
+        "$installer_scripts/configure-hardware.sh" "$ENV_FILE"
+    fi
+    if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
+        systemctl enable --now vesselstack-firewall.service
+    fi
+    if [ ! -s "$VESSELSTACK_DATA/mosquitto/passwords" ]; then
+        : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
+        : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
+        install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
+        docker run --rm -v "$VESSELSTACK_DATA/mosquitto:/mosquitto/data" \
+            eclipse-mosquitto:2.1.2-alpine mosquitto_passwd -b -c \
+            /mosquitto/data/passwords "$MQTT_USERNAME" "$MQTT_PASSWORD"
     fi
     "${COMPOSE[@]}" up -d
+    [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
+        echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
+        return 1
+    }
+    "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
     fi
@@ -100,7 +121,10 @@ check_endpoint() {
 }
 
 status_stack() {
-    local failed=0
+    local failed=0 service running_services
+    local services=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+    [ "${SIGNALK_MODE:-existing}" = docker ] && services+=(signalk)
+    [ "${AIS_ENABLE:-false}" = true ] && services+=(ais-catcher)
     printf '%-20s %s\n' COMPONENT STATE
     printf '%-20s %s\n' -------------------- --------------------
     status_unit 'Boat Chat service' vesselstack-chat.service || failed=1
@@ -113,12 +137,19 @@ status_stack() {
     status_unit 'SocketCAN' vesselstack-socketcan.service \
         "${SOCKETCAN_ENABLE:-false}" || failed=1
     status_unit 'Control Panel' vesselstack-control-panel.service || failed=1
-    if "${COMPOSE[@]}" ps --status running --quiet | grep -q .; then
-        printf '%-20s %s\n' Containers running
-    else
-        printf '%-20s %s\n' Containers 'none running'
+    if ! running_services=$("${COMPOSE[@]}" ps --status running --services); then
+        printf '%-20s %s\n' 'Compose state' unavailable
         failed=1
+        running_services=''
     fi
+    for service in "${services[@]}"; do
+        if grep -Fxq "$service" <<<"$running_services"; then
+            printf '%-20s %s\n' "$service" healthy
+        else
+            printf '%-20s %s\n' "$service" 'not running'
+            failed=1
+        fi
+    done
     check_endpoint 'Boat Chat' "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
     check_endpoint 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" || failed=1
     check_endpoint SignalK "${SIGNALK_URL%/}/signalk" || failed=1
@@ -202,6 +233,16 @@ doctor_stack() {
 backup_stack() {
     local destination=${1:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
     local stamp archive manifest was_active=0
+    python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$destination" <<'PY'
+import pathlib
+import sys
+
+root, data, backup = (pathlib.Path(value).resolve(strict=False) for value in sys.argv[1:])
+if backup == pathlib.Path("/"):
+    raise SystemExit("Backup destination must be a specific directory, not /")
+if backup == root or root in backup.parents or backup == data or data in backup.parents:
+    raise SystemExit("Backup destination must be outside the VesselStack application and data trees")
+PY
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     archive="$destination/vesselstack-$stamp.tar.gz"
     manifest="$archive.sha256"

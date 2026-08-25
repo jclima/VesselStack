@@ -90,6 +90,22 @@ EOF
 
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" --dry-run | grep -q 'Preflight passed'
+COLLISION_CONFIG="$TEST_ROOT/port-collision.env"
+cp "$CONFIG" "$COLLISION_CONFIG"
+printf '\nGRAFANA_PORT="8086"\nINFLUXDB_PORT="8086"\n' >> "$COLLISION_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$COLLISION_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted conflicting published ports" >&2
+    exit 1
+fi
+NESTED_BACKUP_CONFIG="$TEST_ROOT/nested-backup.env"
+cp "$CONFIG" "$NESTED_BACKUP_CONFIG"
+printf '\nVESSELSTACK_BACKUP="%s/backups"\n' "$DATA_ROOT" >> "$NESTED_BACKUP_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$NESTED_BACKUP_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted a backup directory inside the data tree" >&2
+    exit 1
+fi
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 

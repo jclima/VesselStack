@@ -10,6 +10,7 @@ Group=@VESSELSTACK_USER@
 WorkingDirectory=@VESSELSTACK_ROOT@
 EnvironmentFile=@VESSELSTACK_ROOT@/config/boat-chat.env
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=BOAT_CHAT_SERVICE_NAME=vesselstack-chat.service
 ExecStart=@VESSELSTACK_ROOT@/boat-chat/.venv/bin/python @VESSELSTACK_ROOT@/boat-chat/app.py
 Restart=on-failure
 RestartSec=10

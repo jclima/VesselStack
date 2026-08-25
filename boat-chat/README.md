@@ -7,8 +7,8 @@ Local read-only diagnostic chatbot for VesselStack.
 Boat Chat is installed as a systemd service:
 
 ```bash
-sudo systemctl status boat-chat.service
-sudo systemctl restart boat-chat.service
+sudo systemctl status vesselstack-chat.service
+sudo systemctl restart vesselstack-chat.service
 ```
 
 It starts on boot and reads runtime settings from `/opt/vesselstack/config/boat-chat.env`.
@@ -75,12 +75,12 @@ Use the `Settings` button in the web app to configure:
 Settings are saved to `/opt/vesselstack/config/boat-chat.env`. Provider, model, token, and credential changes are read dynamically by the next chat request. Host/port changes require:
 
 ```bash
-sudo systemctl restart boat-chat.service
+sudo systemctl restart vesselstack-chat.service
 ```
 
 Secrets are not shown back in the browser; blank password fields keep the existing saved value.
 
-Settings writes (`POST /api/settings`) are only accepted from loopback or RFC1918 private addresses. Configure `BOAT_CHAT_SETTINGS_TOKEN` whenever the listener is reachable from a shared LAN; private addressing alone is not authentication. The matching `X-Boat-Chat-Token` header is then required, and the web UI remembers the token in browser localStorage after you enter it once in the Server section. Keep the app off the public internet.
+Settings writes (`POST /api/settings`) are only accepted from loopback or RFC1918 private addresses. Configure `BOAT_CHAT_SETTINGS_TOKEN` whenever the listener is reachable from a shared LAN; private addressing alone is not authentication. The matching `X-Boat-Chat-Token` header is then required, and the web UI remembers the token only in browser session storage after you enter it in the Server section. Closing the tab clears it. Keep the app off the public internet.
 
 ## Telemetry Cache
 
