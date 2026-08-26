@@ -14,8 +14,8 @@ current_version=0.1.0
 
 case "$current_version:$TARGET_VERSION" in
     "$TARGET_VERSION:$TARGET_VERSION") ;;
-    0.1.0:1.0.0|0.1.0:1.0.1|0.1.0:1.1.0|\
-    1.0.0:1.1.0|1.0.1:1.1.0)
+    0.1.0:1.0.0|0.1.0:1.0.1|0.1.0:1.1.0|0.1.0:1.2.0|\
+    1.0.0:1.1.0|1.0.1:1.1.0|1.0.0:1.2.0|1.0.1:1.2.0|1.1.0:1.2.0)
         # The 1.0 installer renders new bucket, integration, hardware, and
         # firewall and optional-worker defaults before this migration runs.
         # These explicit edges record accepted upgrades without hidden jumps.

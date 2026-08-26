@@ -5,12 +5,33 @@ VesselStack targets Raspberry Pi OS and Debian-family boat computers and
 combines Home Assistant, SignalK-compatible history, Grafana, MQTT,
 infrastructure monitoring, and a local diagnostic assistant.
 
+New build? Start with the [hardware bill of materials](docs/BOM.md), then follow
+the illustrated [end-to-end installation and commissioning guide](docs/INSTALLATION.md).
+It covers Raspberry Pi 5 assembly, marine power, isolated NMEA 2000/SocketCAN,
+backbone connection, acceptance tests, backup, and rollback.
+
+## Guided first installation
+
+After installing the OS and Docker prerequisites from the end-to-end guide:
+
+```bash
+git clone https://github.com/jclima/VesselStack.git
+cd VesselStack
+git checkout v1.2.0
+python3 vesselstack-wizard.py
+```
+
+Open `http://127.0.0.1:8088`, or use the SSH tunnel documented in the guide.
+The dependency-free wizard binds only to loopback, shows relevant host
+prerequisites, and writes a complete private `vesselstack.env`. It does not
+change boot firmware, firewall rules, marine wiring, or start services.
+
 > [!WARNING]
 > VesselStack is not certified navigation, collision-avoidance, engine-control,
 > alarm, or life-safety equipment. Maintain independent marine instruments and
 > alarms. Never depend on this software as the sole source of safety data.
 
-## What version 1.0 installs
+## What VesselStack installs
 
 | Component | Purpose | Default address |
 |---|---|---|
@@ -35,7 +56,7 @@ configuration, create backups, and apply a reviewed release update.
 All container tags are release-pinned and checked for Linux ARM64 availability;
 VesselStack does not rely on floating `latest` tags.
 
-The 1.0 installer supports an existing SignalK server, an opt-in
+The installer supports an existing SignalK server, an opt-in
 pinned SignalK container, or an opt-in pinned native SignalK installation. It
 also provides hardware-probed SocketCAN and AIS-catcher modules. Hardware
 modules remain disabled unless explicitly configured. It also includes generic
@@ -114,7 +135,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.1.0
+git checkout v1.2.0
 ```
 
 ## 4. Configure the vessel
@@ -647,7 +668,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.1.0.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-1.2.0.tar.gz.sha256)
 ```
 
 The checksum records only the archive basename, so the archive and `.sha256`

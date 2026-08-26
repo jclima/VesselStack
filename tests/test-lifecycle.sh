@@ -32,7 +32,7 @@ ln -s state.txt "$DATA_ROOT/current-state"
 install -d "$APP_ROOT/boat-chat/.venv/bin"
 ln -s /usr/bin/python3 "$APP_ROOT/boat-chat/.venv/bin/python3"
 printf 'services: {}\n' > "$APP_ROOT/compose.yml"
-printf '1.1.0\n' > "$APP_ROOT/config/installed-version"
+printf '1.2.0\n' > "$APP_ROOT/config/installed-version"
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
     chmod +x "$APP_ROOT/installer/scripts/$helper"
@@ -87,7 +87,7 @@ version_output=$(run_ctl version)
 status_output=$(run_ctl status)
 doctor_output=$(run_ctl doctor)
 grep -q '127.0.0.1:9876' <<<"$urls_output"
-grep -q 'installed: 1.1.0' <<<"$version_output"
+grep -q 'installed: 1.2.0' <<<"$version_output"
 grep -q 'Boat Chat service' <<<"$status_output"
 grep -q '^prometheus[[:space:]]\+healthy$' <<<"$status_output"
 run_ctl start

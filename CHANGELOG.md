@@ -5,6 +5,20 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.2.0 - 2026-08-25
+
+### Added
+
+- Added a loopback-only, dependency-free first-run wizard that inventories the
+  host and writes a complete mode-600 installer configuration.
+- Added an end-to-end Raspberry Pi 5 installation and commissioning runbook,
+  illustrated wizard walkthrough, and marine power/NMEA 2000 bill of materials.
+
+### Safety
+
+- Documented galvanic isolation, single-source Pi power, GPIO HAT stacking,
+  backbone termination, powered-down connection, and CAN error-counter checks.
+
 ## 1.1.0 - 2026-08-25
 
 ### Added

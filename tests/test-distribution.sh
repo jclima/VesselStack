@@ -10,6 +10,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
+python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
@@ -24,6 +25,11 @@ test -s "$ROOT/systemd/vesselstack-control-panel.service.in"
 test -s "$ROOT/systemd/vesselstack-chat-telegram.service.in"
 test -s "$ROOT/systemd/vesselstack-telemetry-indexer.service.in"
 test -s "$ROOT/systemd/vesselstack-telemetry-indexer.timer"
+test -s "$ROOT/docs/INSTALLATION.md"
+test -s "$ROOT/docs/BOM.md"
+test -s "$ROOT/wizard/index.html"
+test -s "$ROOT/docs/images/wizard-preflight.png"
+test -s "$ROOT/docs/images/wizard-nmea.png"
 grep -q 'VesselStack InfluxDB' "$ROOT/templates/grafana/provisioning/datasources/vesselstack.yml"
 python3 -m json.tool "$ROOT/templates/grafana/dashboards/system-health.json" >/dev/null
 grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}' "$ROOT/templates/compose.yml"

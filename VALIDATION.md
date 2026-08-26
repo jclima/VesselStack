@@ -1,6 +1,6 @@
-# VesselStack 1.1 validation
+# VesselStack 1.2 validation
 
-This record describes the evidence used to release 1.1.0. It does not convert
+This record describes the evidence used to release 1.2.0. It does not convert
 VesselStack into certified marine safety equipment.
 
 ## Automated release gates
@@ -12,7 +12,7 @@ VesselStack into certified marine safety equipment.
 - Clean installer render into an isolated filesystem, including permissions,
   generated credentials, branding, systemd units, Grafana assets, Home
   Assistant assets, and installed schema version.
-- Explicit 0.1/1.0-to-1.1 migration and rejection of unknown future schemas.
+- Explicit 0.1/1.0/1.1-to-1.2 migration and rejection of unknown future schemas.
 - Checksummed backup verification and actual restoration of changed state.
 - Docker Compose rendering with default, SignalK, and AIS profiles.
 - Registry-manifest verification that every pinned image publishes Linux ARM64,
@@ -27,6 +27,11 @@ VesselStack into certified marine safety equipment.
   backup rejection, verified restore, preserve-data uninstall, and pre-mutation
   purge guards.
 - Sanitized release archive construction and SHA-256 verification.
+- Five wizard tests for complete configuration generation, input allowlisting,
+  enum validation, private file permissions, and topology filtering.
+- Automated browser walkthrough of all seven wizard steps, configuration save,
+  content and overlay checks, browser error inspection, and two reviewed
+  documentation screenshots.
 
 ## Raspberry Pi validation host
 
@@ -34,8 +39,8 @@ VesselStack into certified marine safety equipment.
 - Linux `aarch64`, 64-bit
 - Debian GNU/Linux 12 (bookworm)
 - Clean render, migration, package, checksum, backup, and recovery tests passed
-  on 2026-08-25. The local Boat Chat and Control Panel hardening was then loaded
-  with targeted service restarts and both health endpoints were verified.
+  on 2026-08-25. Wizard rendering, navigation, private configuration output,
+  screenshots, and package inclusion were also verified on that host.
 
 Hardware-dependent SocketCAN, SDR/AIS reception, and vessel-specific Home
 Assistant thresholds must still be commissioned on each vessel. The installer
