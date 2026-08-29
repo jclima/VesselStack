@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#f6f8f9" />
     <title>VesselStack Boat Chat</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
@@ -12,15 +12,17 @@
     <main class="app">
       <section class="chat">
         <header class="app-header">
-          <div>
-            <h1>VesselStack Boat Chat</h1>
-            <p>Telemetry-backed assistant for VesselStack.</p>
+          <div class="header-brand">
+            <h1><span class="brand-vessel">VesselStack </span>Boat Chat</h1>
+            <p>Telemetry-backed assistant for your vessel.</p>
           </div>
           <div class="header-actions">
             <div class="status-stack" aria-live="polite">
               <div id="status" class="status">Starting</div>
               <div id="route-status" class="status status-secondary">Local</div>
             </div>
+            <button id="insights-open" type="button">Hub</button>
+            <button id="capabilities-open" type="button">Prompts</button>
             <button id="settings-open" type="button">Settings</button>
           </div>
         </header>
@@ -32,27 +34,32 @@
           <button data-prompt="Is the boat healthy right now?">Health check</button>
         </div>
 
+        <section id="boat-status-strip" class="boat-status-strip" aria-label="Live boat status" hidden></section>
+
         <section id="messages" class="messages" aria-live="polite"></section>
 
-        <details class="context-drawer">
+        <details class="context-drawer" hidden>
           <summary>
-            <span>Tool context</span>
+            <span>Answer details</span>
             <span id="context-summary">No request yet</span>
           </summary>
-          <pre id="context-json">No request yet.</pre>
+          <div id="context-json" class="answer-details">No request yet.</div>
         </details>
 
         <form id="chat-form" class="composer">
           <label class="sr-only" for="message">Boat question</label>
           <textarea
             id="message"
-            rows="2"
+            rows="1"
             placeholder="Ask a boat-specific question..."
             autocomplete="off"
+            enterkeyhint="send"
             spellcheck="true"
           ></textarea>
           <div class="composer-actions">
+            <label class="mode-control">Answer<select id="answer-mode"><option value="concise">Concise</option><option value="explain">Explain</option><option value="diagnose">Diagnose</option><option value="checklist">Checklist</option></select></label>
             <button id="clear-chat" class="secondary-button" type="button">Clear</button>
+            <button id="cancel-button" class="secondary-button" type="button" hidden>Cancel</button>
             <button id="send-button" type="submit">Ask</button>
           </div>
         </form>
@@ -318,6 +325,11 @@
                 <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional write protection" />
                 <span class="secret-state" data-secret="BOAT_CHAT_SETTINGS_TOKEN"></span>
               </label>
+              <label>
+                Chat access token
+                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="optional chat protection" />
+                <span class="secret-state" data-secret="BOAT_CHAT_ACCESS_TOKEN"></span>
+              </label>
             </div>
           </fieldset>
         </section>
@@ -327,6 +339,18 @@
           <button type="submit">Save</button>
         </footer>
       </form>
+    </dialog>
+    <dialog id="capabilities-dialog">
+      <section class="capabilities-panel">
+        <header class="dialog-header"><h2>What Boat Chat can do</h2><button id="capabilities-close" type="button">Close</button></header>
+        <div id="capabilities-content">Loading capabilities…</div>
+      </section>
+    </dialog>
+    <dialog id="insights-dialog">
+      <section class="insights-panel">
+        <header class="dialog-header"><div><h2>Boat Hub</h2><p>Safety, trip, position, and maintenance at a glance.</p></div><button id="insights-close" type="button">Close</button></header>
+        <div id="insights-content" class="insights-content">Loading boat insights…</div>
+      </section>
     </dialog>
     <script src="/app.js"></script>
   </body>

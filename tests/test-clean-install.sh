@@ -133,7 +133,7 @@ fi
 test "$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")" = 600
 test "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" = 600
 grep -Eq '^CONTROL_PANEL_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/control-panel.env"
-grep -qx '1.2.0' "$APP_ROOT/config/installed-version"
+grep -qx '1.3.0' "$APP_ROOT/config/installed-version"
 
 panel_token_before=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")
 sed -i '/^BOAT_CHAT_PROVIDER=/d' "$APP_ROOT/config/boat-chat.env"

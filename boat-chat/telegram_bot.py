@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_CONFIG = ROOT / "boat-chat.env"
 STATE_DIR = ROOT / "memory"
 OFFSET_FILE = STATE_DIR / "telegram-offset.json"
+CONVERSATIONS_FILE = STATE_DIR / "telegram-conversations.json"
 DEFAULT_BOAT_CHAT_URL = "http://127.0.0.1:8765"
 TELEGRAM_MAX_MESSAGE = 3900
 CONVERSATIONS: dict[str, list[dict[str, str]]] = {}
@@ -26,6 +27,7 @@ CONVERSATIONS: dict[str, list[dict[str, str]]] = {}
 SETTING_KEYS = {
     "BOAT_CHAT_URL",
     "BOAT_CHAT_PORT",
+    "BOAT_CHAT_ACCESS_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_ALLOWED_CHAT_IDS",
     "TELEGRAM_POLL_TIMEOUT",
@@ -81,15 +83,15 @@ def allowed_chat_ids(settings: dict[str, str]) -> set[str]:
     return {item.strip() for item in raw.replace(";", ",").split(",") if item.strip()}
 
 
-def http_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 30) -> Any:
+def http_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 30, headers: dict[str, str] | None = None) -> Any:
     data = None
     method = "GET"
-    headers = {}
+    request_headers = dict(headers or {})
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         method = "POST"
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        request_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -111,6 +113,22 @@ def load_offset() -> int | None:
 def save_offset(offset: int) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     OFFSET_FILE.write_text(json.dumps({"offset": offset}) + "\n")
+
+
+def load_conversations() -> None:
+    try:
+        payload = json.loads(CONVERSATIONS_FILE.read_text())
+        if isinstance(payload, dict):
+            CONVERSATIONS.update({str(key): value[-8:] for key, value in payload.items() if isinstance(value, list)})
+    except Exception:
+        return
+
+
+def save_conversations() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = CONVERSATIONS_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(CONVERSATIONS))
+    temporary.replace(CONVERSATIONS_FILE)
 
 
 def split_message(text: str) -> list[str]:
@@ -152,7 +170,8 @@ def send_action(token: str, chat_id: int | str, action: str = "typing", message_
 
 def chat_with_boat(settings: dict[str, str], message: str, history: list[dict[str, str]] | None = None) -> str:
     url = boat_chat_url(settings) + "/api/chat"
-    response = http_json(url, payload={"message": message, "history": history or []}, timeout=240)
+    headers = {"X-Boat-Chat-Token": settings["BOAT_CHAT_ACCESS_TOKEN"]} if settings.get("BOAT_CHAT_ACCESS_TOKEN") else {}
+    response = http_json(url, payload={"message": message, "history": history or [], "session_id": settings.get("_SESSION_ID", "")}, timeout=240, headers=headers)
     if not isinstance(response, dict):
         return str(response)
     if response.get("answer"):
@@ -216,6 +235,12 @@ def handle_message(token: str, settings: dict[str, str], message: dict[str, Any]
     conversation_key = f"{chat_id}:{message_thread_id or 0}"
     if command == "/clear":
         CONVERSATIONS.pop(conversation_key, None)
+        save_conversations()
+        try:
+            headers = {"X-Boat-Chat-Token": settings["BOAT_CHAT_ACCESS_TOKEN"]} if settings.get("BOAT_CHAT_ACCESS_TOKEN") else {}
+            http_json(boat_chat_url(settings) + "/api/session/clear", payload={"session_id": f"telegram:{conversation_key}"}, timeout=10, headers=headers)
+        except Exception as exc:
+            log(f"server-side conversation clear failed: {exc}")
         send_message(token, chat_id, "Conversation context cleared.", message_thread_id)
         return
     if not authorized:
@@ -232,7 +257,8 @@ def handle_message(token: str, settings: dict[str, str], message: dict[str, Any]
     try:
         send_message(token, chat_id, "Gathering boat telemetry...", message_thread_id)
         history = CONVERSATIONS.get(conversation_key, [])
-        answer = chat_with_boat(settings, text, history=history)
+        request_settings = {**settings, "_SESSION_ID": f"telegram:{conversation_key}"}
+        answer = chat_with_boat(request_settings, text, history=history)
         CONVERSATIONS[conversation_key] = (
             history
             + [
@@ -240,6 +266,7 @@ def handle_message(token: str, settings: dict[str, str], message: dict[str, Any]
                 {"role": "assistant", "content": answer},
             ]
         )[-8:]
+        save_conversations()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
         answer = f"Request failed: HTTP {exc.code}\n{body[:2000]}"
@@ -276,6 +303,7 @@ def poll_once(token: str, settings: dict[str, str], offset: int | None) -> int |
 
 def main() -> None:
     offset = load_offset()
+    load_conversations()
     log("Boat Chat Telegram bot starting")
     while True:
         settings = parse_env_config()

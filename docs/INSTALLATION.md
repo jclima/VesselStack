@@ -73,7 +73,7 @@ not enable `SOCKETCAN_ENABLE` until this succeeds.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.2.0
+git checkout v1.3.0
 python3 vesselstack-wizard.py
 ```
 

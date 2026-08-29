@@ -219,7 +219,7 @@ def refresh_all() -> dict[str, Any]:
 
 def refresh_latest_context() -> dict[str, Any]:
     current_telemetry = app.current_telemetry_snapshot(
-        "solar battery power current voltage state of charge both engine RPM alternator"
+        "solar battery power current voltage state of charge both engine RPM alternator position latitude longitude"
     )
     ha_states = app.get_ha_states(HEALTH_ENTITY_IDS)
     solar_inference = refresh_solar_inference(current_telemetry, ha_states)
@@ -228,6 +228,7 @@ def refresh_latest_context() -> dict[str, Any]:
         "current_telemetry": current_telemetry,
         "ha_states": ha_states,
         "solar_inference": solar_inference,
+        "ais": app.current_ais_context(limit=12),
     }
     telemetry_cache.put_summary("latest_context", "boat_status", payload, source="telemetry_indexer")
     return payload

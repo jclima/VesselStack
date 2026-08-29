@@ -17,7 +17,7 @@ After installing the OS and Docker prerequisites from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.2.0
+git checkout v1.3.0
 python3 vesselstack-wizard.py
 ```
 
@@ -135,7 +135,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.2.0
+git checkout v1.3.0
 ```
 
 ## 4. Configure the vessel
@@ -367,6 +367,23 @@ closing the tab clears it.
 
 Boat Chat rejects oversized or malformed API requests and sends defensive
 browser headers while remaining embeddable in the Home Assistant dashboard.
+It also provides deterministic time-window and signal planning, durable local
+sessions, answer feedback, selectable response modes, chart-ready evidence,
+relative AIS context, recent-trip insights, and a local maintenance tracker.
+The interface rate-limits each client and runs at most two chat requests at a
+time so slow model calls cannot exhaust the Raspberry Pi.
+
+Set `BOAT_CHAT_ACCESS_TOKEN` in Boat Chat Settings to protect chat, live status,
+insights, feedback, and maintenance data. The browser keeps the entered token
+only in session storage. Without an access token, ordinary chat remains
+available but live status, insights, and maintenance endpoints stay locked.
+
+`BOAT_CHAT_WEB_SEARCH=true` enables the OpenAI Responses API web-search tool
+when the OpenAI provider is selected. This can send the question and grounded
+context to an external service and may incur provider charges; it is disabled
+by default. Boat Chat sessions, audits, feedback, and maintenance tasks stay in
+the private SQLite memory database under the configured data directory and are
+excluded from release packages.
 
 ### Control Panel
 
@@ -660,7 +677,7 @@ tests/test-image-manifests.sh
 tests/test-service-integration.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
-python3 -m unittest discover -s tests -p 'test_boat_chat.py' -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
 ```
 
@@ -668,7 +685,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.2.0.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-1.3.0.tar.gz.sha256)
 ```
 
 The checksum records only the archive basename, so the archive and `.sha256`

@@ -5,6 +5,29 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.3.0 - 2026-08-28
+
+### Added
+
+- Added deterministic query planning for exact time windows, signal selection,
+  extrema, event counts, and port/starboard RPM-band comparisons.
+- Added durable per-client chat sessions, request audit metadata, answer
+  feedback, and a local maintenance-task tracker in the existing private Boat
+  Chat SQLite database.
+- Added authenticated status and insights surfaces with vessel cards, relative
+  AIS bearing, overdue maintenance, recent-trip context, chart-ready evidence,
+  follow-up actions, and selectable concise/explain/diagnose/checklist modes.
+- Added optional OpenAI Responses web search and regression coverage for the
+  query planner, session store, and HTTP API flow.
+
+### Improved
+
+- Redesigned Boat Chat for responsive dashboard use with navigation tabs,
+  proactive browser alerts, trip-report export, richer evidence display, and
+  session-aware Telegram follow-ups.
+- Added per-client request throttling and a two-request concurrency bound.
+- Made Boat Chat time-window planning honor the configured vessel timezone.
+
 ## 1.2.0 - 2026-08-25
 
 ### Added

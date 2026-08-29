@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +28,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import memory_index
+import query_planner
+import session_store
 import telemetry_cache
 
 
@@ -72,6 +75,8 @@ SETTING_KEYS = [
     "BOAT_CHAT_CONTEXT_CHARS",
     "BOAT_CHAT_OLLAMA_NUM_CTX",
     "BOAT_CHAT_SETTINGS_TOKEN",
+    "BOAT_CHAT_ACCESS_TOKEN",
+    "BOAT_CHAT_WEB_SEARCH",
     "BOAT_CHAT_CLI_TIMEOUT",
     "BOAT_CHAT_CODEX_MODEL",
     "BOAT_CHAT_CODEX_EFFORT",
@@ -106,6 +111,7 @@ SETTING_KEYS = [
 ]
 SECRET_SETTING_KEYS = {
     "BOAT_CHAT_SETTINGS_TOKEN",
+    "BOAT_CHAT_ACCESS_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "OPENAI_API_KEY",
     "AI_GATEWAY_API_KEY",
@@ -120,10 +126,23 @@ SECRET_SETTING_KEYS = {
     "BOAT_CHAT_API_KEY",
 }
 PROVIDER_OPTIONS = ["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]
+CHAT_SEMAPHORE = threading.BoundedSemaphore(2)
+RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_REQUESTS: dict[str, list[float]] = {}
+RATE_LIMIT_MAX_REQUESTS = 20
+RATE_LIMIT_WINDOW_SECONDS = 60
 
 
 class ModelCallError(RuntimeError):
     """Raised when a configured LLM provider cannot return an answer."""
+
+
+def json_default(value: Any) -> str:
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 def load_system_prompt() -> str:
     try:
@@ -336,7 +355,7 @@ TELEMETRY_MEASUREMENT_TERMS = {
     "trip": ["trip", "underway"],
     "weather": ["weather", "forecast", "wind", "storm"],
 }
-LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+LOCAL_TZ = ZoneInfo(os.environ.get("BOAT_TIMEZONE", "UTC"))
 ENGINE_RUNNING_RPM = 200.0
 US_GALLONS_PER_LITER = 0.2641720524
 TELEMETRY_CACHE_FRESH_SECONDS = 15 * 60
@@ -592,6 +611,17 @@ def distance_nm(left: dict[str, Any], right: dict[str, Any]) -> float | None:
     return 3440.065 * 2 * math.asin(min(1.0, math.sqrt(haversine)))
 
 
+def bearing_deg(left: dict[str, Any], right: dict[str, Any]) -> float | None:
+    try:
+        lat1 = math.radians(float(left["latitude"])); lat2 = math.radians(float(right["latitude"]))
+        delta_lon = math.radians(float(right["longitude"]) - float(left["longitude"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    y = math.sin(delta_lon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
 def current_ais_context(limit: int = 20) -> dict[str, Any]:
     vessels = get_signalk_vessels()
     if "error" in vessels:
@@ -630,6 +660,9 @@ def current_ais_context(limit: int = 20) -> dict[str, Any]:
             "distance_nm": round(distance_nm(own_position, position), 2)
             if isinstance(own_position, dict) and isinstance(position, dict) and distance_nm(own_position, position) is not None
             else None,
+            "bearing_deg": round(bearing_deg(own_position, position), 1)
+            if isinstance(own_position, dict) and isinstance(position, dict) and bearing_deg(own_position, position) is not None
+            else None,
             "speed_kn": round(sog * 1.94384449, 2) if sog is not None else None,
             "course_deg": round(cog * 180.0 / math.pi, 1) if cog is not None else None,
             "navigation_state": signalk_node_value(vessel, "navigation.state"),
@@ -650,11 +683,10 @@ def current_ais_context(limit: int = 20) -> dict[str, Any]:
 
 def get_ha_states(entity_ids: list[str]) -> dict[str, Any]:
     headers = load_auth_headers("ha")
-    base_url = service_url("HOME_ASSISTANT_URL", "http://127.0.0.1:8123")
     states: dict[str, Any] = {}
     for entity_id in entity_ids:
         try:
-            states[entity_id] = http_get_json(f"{base_url}/api/states/{entity_id}", headers=headers, timeout=5)
+            states[entity_id] = http_get_json(f"{service_url('HOME_ASSISTANT_URL', 'http://127.0.0.1:8123')}/api/states/{entity_id}", headers=headers, timeout=5)
         except Exception as exc:
             states[entity_id] = {"error": str(exc)}
     return states
@@ -787,6 +819,7 @@ def telemetry_concepts(message: str) -> set[str]:
         concepts.discard("pressure")
     if concepts.intersection({"fuel_level", "fuel_rate"}):
         concepts.discard("fuel")
+    concepts.update(query_planner.detect_signals(message))
     return concepts
 
 
@@ -843,6 +876,8 @@ def semantic_match_score(name: str, message: str) -> int:
 
 
 def history_requested(message: str) -> bool:
+    if query_planner.build_query_plan(message)["historical"]:
+        return True
     lower = message.lower()
     return bool(
         re.search(r"\b(?:last|past)\s+\d+\s*(?:hours?|hrs?|days?|weeks?|months?|years?)\b", lower)
@@ -934,11 +969,12 @@ def effective_question(message: str, history: list[dict[str, str]] | None = None
     if not previous_user:
         return message
     concepts = telemetry_concepts(message)
+    followup_terms = ("and ", "what about ", "how about ", "same ", "for ", "why", "was that", "at that time", "while ", "compare it", "port", "starboard")
     followup = (
         len(message) <= 100
         and (
             (history_requested(message) and not concepts)
-            or message.lower().startswith(("and ", "what about ", "how about ", "same ", "for "))
+            or message.lower().startswith(followup_terms)
         )
     )
     if not followup:
@@ -1293,7 +1329,7 @@ def ha_telemetry_context(message: str, limit: int = 24) -> dict[str, Any]:
 
 
 def ha_event_history_context(message: str, limit: int = 8) -> dict[str, Any]:
-    window = resolve_fuel_usage_window(message)
+    window = query_planner.build_query_plan(message).get("window") or resolve_fuel_usage_window(message)
     lookback_days = max(1, math.ceil((dt.datetime.now(LOCAL_TZ) - window["start"]).total_seconds() / 86400))
     states = get_ha_all_states()
     candidates: list[tuple[int, dict[str, Any]]] = []
@@ -1605,11 +1641,12 @@ def resolve_history_days(message: str, default_days: int = 7) -> int:
 
 def generic_influx_history_summary(message: str, limit: int = 24, include_numeric: bool | None = None) -> dict[str, Any]:
     tokens = message_tokens(message)
-    concepts = telemetry_concepts(message)
+    plan = query_planner.build_query_plan(message)
+    concepts = telemetry_concepts(message) | set(plan["signals"])
     overview = telemetry_overview_requested(message)
     if include_numeric is None:
         include_numeric = not overview
-    window = resolve_fuel_usage_window(message)
+    window = plan.get("window") or resolve_fuel_usage_window(message)
     interval, interval_minutes = history_interval_for_window(window)
     buckets: dict[str, Any] = {}
     for bucket in INFLUX_HISTORY_BUCKETS:
@@ -1647,7 +1684,7 @@ def generic_influx_history_summary(message: str, limit: int = 24, include_numeri
             "truncated": len(matched) > limit,
         }
         ha_numeric_needed = bool(
-            concepts.intersection({"alarm", "bilge", "freshness", "fuel_level", "humidity", "position", "service", "shore_power", "tide", "trip", "weather"})
+            concepts.intersection({"alarm", "bilge", "freshness", "fuel_level", "generator", "humidity", "position", "service", "shore_power", "tank", "tide", "trip", "weather"})
         )
         if selected and include_numeric and (bucket != INFLUX_HOME_ASSISTANT_BUCKET or ha_numeric_needed or not buckets.get(INFLUX_HISTORY_BUCKET, {}).get("matched_count")):
             measurement_filter = " or ".join([f'r._measurement == "{item}"' for item in selected])
@@ -1664,6 +1701,17 @@ from(bucket: "{bucket}")
 '''
             try:
                 rows = convert_generic_rows(query_influx(flux))
+                chart_series = []
+                for measurement in selected[:3]:
+                    points = [
+                        {"time": row.get("_time"), "value": safe_float(row.get("_value"))}
+                        for row in rows
+                        if row.get("_measurement") == measurement and safe_float(row.get("_value")) is not None
+                    ]
+                    if points:
+                        stride = max(1, math.ceil(len(points) / 80))
+                        chart_series.append({"label": display_measurement_name(measurement), "unit": unit_for_measurement(measurement, {}), "points": points[::stride][-80:]})
+                bucket_payload["chart_series"] = chart_series
                 bucket_payload["sample_interval"] = f"{interval} mean"
                 bucket_payload["numeric_summary"] = summarize_numeric_rows(rows)
                 bucket_payload["units"] = {
@@ -2708,6 +2756,7 @@ def search_local_docs(query: str, limit: int = 8) -> list[dict[str, str]]:
 
 def classify_question(message: str) -> dict[str, Any]:
     lower = message.lower()
+    query_plan = query_planner.build_query_plan(message)
     # Word-boundary regexes: plain substring checks made "loa" match "load"
     # and "beam" match "beaming", routing engine questions to the identity answer.
     identity_patterns = [
@@ -2721,6 +2770,7 @@ def classify_question(message: str) -> dict[str, Any]:
         r"\bcall ?sign\b",
         r"\bloa\b",
         r"\bbeam\b",
+        r"\bcutwater\b",
     ]
     engine_terms = any(word in lower for word in ["motor", "motors", "engine", "engines", "rpm"])
     running_terms = any(word in lower for word in ["running", "run", "ran", "started", "start", "stopped", "stop"])
@@ -2853,7 +2903,7 @@ def classify_question(message: str) -> dict[str, Any]:
         term in lower for term in ["below", "under", "above", "low voltage", "voltage drop"]
     )
     battery_voltage_history = battery_terms and battery_history_terms
-    concepts = telemetry_concepts(message)
+    concepts = telemetry_concepts(message) | set(query_plan["signals"])
     solar_hardware = "solar" in concepts and any(
         term in lower
         for term in [
@@ -2916,8 +2966,8 @@ def classify_question(message: str) -> dict[str, Any]:
             "wind",
         ]
     )
-    generic_history = telemetry_terms and history_requested(message)
-    complex_history = generic_history and complex_history_requested(f" {lower} ")
+    generic_history = telemetry_terms and (history_requested(message) or bool(query_plan["historical"]))
+    complex_history = generic_history and (complex_history_requested(f" {lower} ") or bool(query_plan["complex"]))
     fuel_balance_complex = fuel_balance and (
         complex_history
         or bool(concepts.intersection({"alarm", "boost", "load", "oil_pressure", "temperature", "torque", "trip"}))
@@ -2952,6 +3002,7 @@ def classify_question(message: str) -> dict[str, Any]:
         "current_request": current_request,
         "generic_telemetry": telemetry_terms or telemetry_overview,
         "concepts": sorted(concepts),
+        "query_plan": query_plan,
     }
 
 
@@ -3243,7 +3294,7 @@ def answer_from_facts(message: str, facts: dict[str, Any]) -> str | None:
             f"{telemetry.get('marine_hub', 'SignalK')} -> {telemetry.get('automation', 'Home Assistant')} -> {telemetry.get('history', 'InfluxDB')}."
         )
     if engines:
-        lines.append(f"Engines: {engines.get('layout', 'configured by the operator')}.")
+        lines.append(f"Engines: {engines.get('layout', 'Twin Volvo IPS')}.")
     return "\n".join(lines)
 
 
@@ -3252,31 +3303,27 @@ def answer_from_health_state(message: str, context: dict[str, Any]) -> str | Non
     if not kind.get("health") or kind.get("fuel_balance"):
         return None
     lower = message.lower()
-    if not any(
-        term in lower
-        for term in [
-            "is the boat ok",
-            "is the boat okay",
-            "boat ok",
-            "boat okay",
-            "boat health",
-            "boat status",
-            "overall health",
-            "overall status",
-            "status of the boat",
-        ]
-    ):
+    if not any(term in lower for term in ["is the boat ok","is the boat okay","boat ok","boat okay","boat health","boat status","overall health","overall status","status of the boat"]):
         return None
-    states = context.get("ha_states", {})
-    summary = states.get("sensor.boat_health_summary", {})
-    boat_ok = states.get("binary_sensor.boat_ok", {})
-    watch = states.get("sensor.boat_watch_summary", {})
-    status = str(summary.get("state", "unknown"))
-    ok_state = str(boat_ok.get("state", "unknown"))
-    watch_state = str(watch.get("state", "unknown"))
+    states=context.get("ha_states",{}); summary=states.get("sensor.boat_health_summary",{}); boat_ok=states.get("binary_sensor.boat_ok",{}); watch=states.get("sensor.boat_watch_summary",{})
+    status=str(summary.get("state","unknown")); ok_state=str(boat_ok.get("state","unknown")); watch_state=str(watch.get("state","unknown"))
     if status == "OK" or ok_state == "on":
         return f"Yes. {context.get('boat_facts', {}).get('vessel', {}).get('name', BOAT_NAME)} is OK right now. Boat Health Summary is {status}; Boat OK is {ok_state}; watch summary is {watch_state}."
     return f"No clear OK state right now. Boat Health Summary is {status}; Boat OK is {ok_state}; watch summary is {watch_state}."
+
+
+def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
+    if "brief" not in message.lower():
+        return None
+    values=(context.get("current_telemetry") or {}).get("values",{}); states=context.get("ha_states") or {}
+    state=lambda entity,default="unknown":str((states.get(entity) or {}).get("state",default))
+    soc=safe_float(values.get("electrical.batteries.shunt.capacity.stateOfCharge")); voltage=safe_float(values.get("electrical.batteries.shunt.voltage")); port=safe_float(values.get("propulsion.port.revolutions")) or 0; starboard=safe_float(values.get("propulsion.starboard.revolutions")) or 0
+    lines=[f"Boat briefing: {state('sensor.boat_health_summary','health unknown')}; {state('sensor.boat_watch_summary','watch state unavailable')}."]
+    if soc is not None or voltage is not None: lines.append(f"Battery: {f'{soc:g}%' if soc is not None else 'SOC unavailable'}, {f'{voltage:.2f} V' if voltage is not None else 'voltage unavailable'}.")
+    lines.append(f"Engines: port {port:.0f} RPM, starboard {starboard:.0f} RPM. Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
+    alarms=(context.get("current_telemetry") or {}).get("alarm_summary")
+    if alarms: lines.append(str(alarms))
+    return "\n".join(lines)
 
 
 def answer_from_engine_history(context: dict[str, Any]) -> str | None:
@@ -3687,13 +3734,45 @@ def answer_from_generic_history(context: dict[str, Any]) -> str | None:
     return "\n".join(lines)
 
 
-def collect_context(message: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
+def answer_from_event_history(context: dict[str, Any]) -> str | None:
+    plan = context.get("query_plan", {})
+    if plan.get("operation") not in {"event_count", "transition", "duration"}:
+        return None
+    payload = context.get("ha_event_history")
+    entities = payload.get("entities", {}) if isinstance(payload, dict) else {}
+    usable = [(entity_id, item) for entity_id, item in entities.items() if isinstance(item, dict) and item.get("transitions")]
+    if not usable:
+        return None
+    entity_id, item = usable[0]
+    name = item.get("friendly_name") or entity_id
+    transitions = item.get("transitions", [])
+    on_events = [event for event in transitions if str(event.get("state", "")).lower() in {"on", "running", "active", "open"}]
+    label = payload.get("label", "the requested window")
+    if plan.get("operation") == "event_count":
+        return f"{name} activated {len(on_events)} time{'s' if len(on_events) != 1 else ''} during {label}, based on retained Home Assistant transitions."
+    if plan.get("operation") == "transition":
+        event = transitions[-1]
+        return f"The last retained {name} transition during {label} was to {event.get('state')} at {event.get('time_local')}."
+    total_seconds = 0.0
+    stop = parse_influx_time((plan.get("window") or {}).get("stop_utc")) or dt.datetime.now(dt.timezone.utc)
+    for index, event in enumerate(transitions):
+        if str(event.get("state", "")).lower() not in {"on", "running", "active", "open"}:
+            continue
+        started = parse_influx_time(event.get("time_utc"))
+        ended = parse_influx_time(transitions[index + 1].get("time_utc")) if index + 1 < len(transitions) else stop
+        if started and ended and ended >= started:
+            total_seconds += (ended - started).total_seconds()
+    return f"{name} was active for approximately {total_seconds / 3600:.2f} hours during {label}, based on retained Home Assistant transitions."
+
+
+def collect_context(message: str, history: list[dict[str, str]] | None = None, prior_query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.monotonic()
     conversation = sanitize_conversation_history(history)
     query = effective_question(message, conversation)
     kind = classify_question(query)
     context: dict[str, Any] = {
         "question_type": kind,
+        "query_plan": kind.get("query_plan", {}),
         "match_tokens": sorted(message_tokens(query)),
         "boat_facts": load_boat_facts(),
         "context_strategy": {
@@ -3703,6 +3782,8 @@ def collect_context(message: str, history: list[dict[str, str]] | None = None) -
             "tier_3": "local docs for support/runbook context",
         },
     }
+    if prior_query_plan:
+        context["prior_query_plan"] = prior_query_plan
     if conversation:
         context["conversation"] = conversation
     if query != message:
@@ -3812,8 +3893,9 @@ def collect_context(message: str, history: list[dict[str, str]] | None = None) -
                 context["answer_focus"] = focus
         except Exception as exc:
             context["influx_history_error"] = str(exc)
-    if kind.get("complex_history") and not kind.get("solar") and set(kind.get("concepts", [])).intersection(
-        {"alarm", "bilge", "service", "shore_power", "trip"}
+    event_operation = kind.get("query_plan", {}).get("operation") in {"event_count", "transition", "duration"}
+    if (kind.get("complex_history") or event_operation) and not kind.get("solar") and set(kind.get("concepts", [])).intersection(
+        {"alarm", "bilge", "generator", "service", "shore_power", "trip"}
     ):
         try:
             context["ha_event_history"] = ha_event_history_context(query)
@@ -3932,6 +4014,132 @@ def active_models() -> dict[str, str]:
     }
 
 
+def readiness_status() -> dict[str, Any]:
+    memory = memory_index.status()
+    cache = telemetry_cache.status()
+    indexer = next((item for item in cache.get("items", []) if item.get("category") == "indexer" and item.get("key") == "last_run"), None)
+    cache_age = indexer.get("age_seconds") if indexer else None
+    provider = configured_provider()
+    layers = {
+        "process": {"ready": True},
+        "memory": {"ready": bool(memory.get("exists") and memory.get("chunks", 0) > 0), "chunks": memory.get("chunks", 0)},
+        "telemetry_cache": {"ready": cache_age is not None and int(cache_age) <= 15 * 60, "age_seconds": cache_age},
+        "answer_provider": {"ready": provider in PROVIDER_OPTIONS, "provider": provider},
+    }
+    return {"ready": all(layer["ready"] for layer in layers.values()), "layers": layers}
+
+
+def experience_status() -> dict[str, Any]:
+    cached = telemetry_cache.get_summary("latest_context", "boat_status", max_age_seconds=30 * 60) or {}
+    values = (cached.get("current_telemetry") or {}).get("values", {})
+    ha = cached.get("ha_states") or {}
+    state = lambda entity, default="unknown": str((ha.get(entity) or {}).get("state", default))
+    port_rpm = safe_float(values.get("propulsion.port.revolutions")) or 0.0
+    starboard_rpm = safe_float(values.get("propulsion.starboard.revolutions")) or 0.0
+    underway = state("input_boolean.underway_mode", "off") == "on"
+    mode = "Underway" if underway else "Engines running" if max(port_rpm, starboard_rpm) >= ENGINE_RUNNING_RPM else "Docked"
+    cards = [
+        {"id":"health","label":"Boat","value":state("sensor.boat_health_summary","Unknown"),"tone":"ok" if state("binary_sensor.boat_ok","off")=="on" else "danger","prompt":"Is the boat healthy right now?"},
+        {"id":"mode","label":"Mode","value":mode,"tone":"normal","prompt":"Give me a current boat status briefing"},
+        {"id":"shore","label":"Shore","value":"Charging" if state("binary_sensor.shore_power_connected","off")=="on" else "Off","tone":"ok" if state("binary_sensor.shore_power_connected","off")=="on" else "warning","prompt":"What is the current shore power status?"},
+        {"id":"battery","label":"Battery","value":f"{safe_float(values.get('electrical.batteries.shunt.capacity.stateOfCharge')) or 0:g}% · {safe_float(values.get('electrical.batteries.shunt.voltage')) or 0:.2f} V","tone":"ok","prompt":"Tell me about the battery right now"},
+        {"id":"engines","label":"Engines","value":f"{port_rpm:.0f} / {starboard_rpm:.0f} RPM","tone":"normal","prompt":"Compare both engines right now"},
+        {"id":"fuel","label":"Fuel","value":f"{safe_float(values.get('tanks.fuel.0.currentLevel')) or 0:g}% / {safe_float(values.get('tanks.fuel.1.currentLevel')) or 0:g}%","tone":"normal","prompt":"How much fuel is left?"},
+    ]
+    cache = cached.get("cache") or {}
+    return {"cards":cards,"watch_summary":state("sensor.boat_watch_summary","Unavailable"),"age_seconds":cache.get("age_seconds"),"source":"cached live boat status"}
+
+
+def experience_insights() -> dict[str, Any]:
+    cached = telemetry_cache.get_summary("latest_context", "boat_status", max_age_seconds=30 * 60) or {}
+    values = (cached.get("current_telemetry") or {}).get("values", {})
+    ha = cached.get("ha_states") or {}
+    state = lambda entity, default="unknown": str((ha.get(entity) or {}).get("state", default))
+    alerts = []
+    alert_sources = [
+        ("Boat health", state("sensor.boat_health_summary", "Unknown")),
+        ("Boat watch", state("sensor.boat_watch_summary", "Unavailable")),
+        ("Engine alarms", state("sensor.engine_alarm_status", "Unknown")),
+        ("Weather risk", state("sensor.weather_risk_level", "Unknown")),
+        ("System audit", state("sensor.audit_health_summary", "Unknown")),
+    ]
+    normal = {"ok", "clear", "normal", "none", "off", "healthy", "unavailable", "unknown"}
+    for label, value in alert_sources:
+        severity = "ok" if value.strip().lower() in normal else "warning"
+        alerts.append({"label": label, "value": value, "severity": severity})
+    latitude = safe_float(values.get("navigation.position.latitude"))
+    longitude = safe_float(values.get("navigation.position.longitude"))
+    position = None
+    if latitude is not None and longitude is not None:
+        position = {"latitude": latitude, "longitude": longitude, "label": f"{latitude:.5f}, {longitude:.5f}"}
+    trip = last_trip_window()
+    trip_payload = None
+    if trip:
+        duration_minutes = int((trip["stop"] - trip["start"]).total_seconds() / 60) if isinstance(trip.get("start"), dt.datetime) and isinstance(trip.get("stop"), dt.datetime) else None
+        trip_payload = {key: trip.get(key) for key in ("label", "start_local", "stop_local", "trip_summary")}
+        trip_payload["duration_minutes"] = duration_minutes
+    ais = cached.get("ais") if isinstance(cached.get("ais"), dict) else current_ais_context(limit=12)
+    nearby = []
+    for target in ais.get("targets", []):
+        nearby.append({key: target.get(key) for key in ("id", "name", "distance_nm", "bearing_deg", "speed_kn", "course_deg", "position_age_minutes", "position_stale") if target.get(key) is not None})
+    maintenance = session_store.list_maintenance()
+    today = dt.datetime.now(LOCAL_TZ).date()
+    for task in maintenance:
+        task["due_status"] = "complete" if task.get("completed") else "none"
+        try:
+            due = dt.date.fromisoformat(str(task.get("due_date") or ""))
+            if not task.get("completed"):
+                task["due_status"] = "overdue" if due < today else "soon" if (due - today).days <= 14 else "scheduled"
+        except ValueError:
+            pass
+    return {
+        "alerts": alerts,
+        "alert_count": sum(item["severity"] != "ok" for item in alerts),
+        "trip": trip_payload,
+        "position": position,
+        "ais": {"targets": nearby, "target_count": ais.get("target_count", 0), "error": ais.get("error")},
+        "maintenance": maintenance,
+        "maintenance_counts": {"open": sum(not item.get("completed") for item in maintenance), "overdue": sum(item.get("due_status") == "overdue" for item in maintenance)},
+        "generated_at": dt.datetime.now(LOCAL_TZ).isoformat(),
+    }
+
+
+def capabilities_payload() -> dict[str, Any]:
+    return {"groups":[
+        {"name":"Current status","prompts":["Give me a current boat status briefing","Where is the boat?","Is anything stale?"]},
+        {"name":"Engines & fuel","prompts":["Compare both engines right now","How much fuel did I use this weekend?","Graph engine temperatures during the last trip"]},
+        {"name":"Electrical","prompts":["Battery voltage over the past 2 weeks","When did shore power turn off?","How much did solar contribute last week?"]},
+        {"name":"Safety & history","prompts":["Did the bilge pump run last night?","What happened during the last trip?","Show active warnings"]},
+    ],"limitations":["Solar production is inferred until a dedicated controller is connected.","Mechanical diagnoses require inspection; telemetry shows observations, not certainty."]}
+
+
+def answer_experience(context: dict[str, Any]) -> dict[str, Any]:
+    plan=context.get("query_plan") or {}; profile=context.get("context_profile") or {}; window=plan.get("window") or {}; evidence=[]
+    if profile.get("live_telemetry"): evidence.append({"label":"Live telemetry","detail":"SignalK current vessel state"})
+    if profile.get("ha_entities"): evidence.append({"label":"Home Assistant","detail":f"{profile['ha_entities']} selected entities"})
+    if profile.get("history"): evidence.append({"label":"Retained history","detail":window.get("label") or "historical telemetry"})
+    if window: evidence.append({"label":"Time window","detail":f"{window.get('start_local')} to {window.get('stop_local')}"})
+    if plan.get("filters"): evidence.append({"label":"Filters","detail":", ".join(f"{key.replace('_',' ')} {value}" for key,value in plan["filters"].items())})
+    signals=set(plan.get("signals") or []); followups=[]
+    if signals.intersection({"engine","rpm","temperature","fuel_rate"}): followups.extend(["Compare port and starboard","Show the last trip"])
+    if "battery" in signals: followups.extend(["Graph battery voltage","What happened at the lowest voltage?"])
+    if "ais" in signals: followups.append("Which vessel is closest?")
+    if plan.get("historical"): followups.append("Compare it with the previous period")
+    if not followups: followups=["Give me a current boat status briefing","What can you help me with?"]
+    metrics=[]; charts=[]
+    battery=context.get("battery_voltage") or {}
+    if battery.get("voltage"):
+        stats=battery["voltage"]; metrics.append({"label":"Battery voltage","unit":"V","min":stats.get("min"),"avg":stats.get("avg"),"max":stats.get("max"),"latest":stats.get("latest")})
+    history=context.get("influx_history") or {}
+    for bucket in (history.get("buckets") or {}).values():
+        if not isinstance(bucket,dict): continue
+        charts.extend(bucket.get("chart_series") or [])
+        units=bucket.get("units") or {}
+        for measurement,stats in list((bucket.get("numeric_summary") or {}).items())[:3]:
+            metrics.append({"label":display_measurement_name(measurement),"unit":units.get(measurement) or unit_for_measurement(measurement,context),"min":stats.get("min"),"avg":stats.get("avg"),"max":stats.get("max"),"latest":stats.get("latest")})
+    return {"evidence":evidence,"followups":list(dict.fromkeys(followups))[:3],"metrics":metrics[:4],"charts":charts[:3],"calculation":{"operation":plan.get("operation"),"signals":plan.get("signals",[])},"elapsed_ms":profile.get("elapsed_ms")}
+
+
 def model_catalog() -> dict[str, Any]:
     suggestions = {key: list(values) for key, values in STATIC_MODEL_SUGGESTIONS.items()}
     installed = ollama_installed_models()
@@ -3957,27 +4165,9 @@ def model_call_error(message: str, context: dict[str, Any], reason: str, raise_o
 
 
 def fallback_answer(message: str, context: dict[str, Any], reason: str | None = None) -> str:
-    parts = [
-        reason or "No model provider is configured, so I gathered boat context but did not run the LLM.",
-        "",
-        "Boat facts:",
-        json.dumps(context.get("boat_facts", {}), indent=2, sort_keys=True)[:2000],
-        "",
-        "Telemetry context:",
-        json.dumps(context.get("current_telemetry", {}), indent=2, sort_keys=True)[:4000],
-    ]
-    if "propulsion_24h" in context:
-        parts.extend(["", "Propulsion summary, last 24h:", json.dumps(context["propulsion_24h"], indent=2, sort_keys=True)[:6000]])
-    if "ha_telemetry" in context:
-        parts.extend(["", "Home Assistant telemetry:", json.dumps(context["ha_telemetry"], indent=2, sort_keys=True)[:6000]])
-    if "influx_history" in context:
-        parts.extend(["", "InfluxDB history:", json.dumps(context["influx_history"], indent=2, sort_keys=True)[:8000]])
-    if context.get("local_docs"):
-        parts.append("")
-        parts.append("Relevant local docs:")
-        for item in context["local_docs"][:4]:
-            parts.append(f"- {item['path']}:{item['line']}: {item['excerpt'].splitlines()[0][:160]}")
-    return "\n".join(parts)
+    if reason:
+        return "I gathered the available boat data, but the answer model is temporarily unavailable. Please try again shortly."
+    return "I gathered the available boat data, but no answer model is configured."
 
 
 def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, Any]:
@@ -3987,6 +4177,8 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
         "boat_facts": context.get("boat_facts"),
         "conversation": context.get("conversation"),
         "interpreted_question": context.get("interpreted_question"),
+        "query_plan": context.get("query_plan"),
+        "prior_query_plan": context.get("prior_query_plan"),
     }
     question_type = context.get("question_type", {})
     current_first = bool(question_type.get("current_request")) and "freshness" not in set(question_type.get("concepts", []))
@@ -4048,8 +4240,39 @@ def build_prompt(message: str, context: dict[str, Any], max_chars: int = 50000) 
     # front makes repeat questions much faster. Compact separators cut ~25% of
     # the JSON tokens versus indent=2.
     prompt_context = compact_context(context)
-    context_json = json.dumps(prompt_context, separators=(",", ":"))[:max_chars]
-    return "Boat context JSON:\n" + context_json + "\n\nQuestion:\n" + message
+    context_json = serialize_context_with_budget(prompt_context, max_chars)
+    mode=context.get("answer_mode","concise")
+    instruction={"concise":"Keep the answer concise.","explain":"Explain the evidence and calculation clearly.","diagnose":"Organize the answer as observations, likely causes, and checks.","checklist":"Return a short actionable checklist."}.get(mode,"Keep the answer concise.")
+    return "Boat context JSON:\n" + context_json + f"\n\nResponse mode: {mode}. {instruction}" + "\n\nQuestion:\n" + message
+
+
+def serialize_context_with_budget(context: dict[str, Any], max_chars: int) -> str:
+    """Return valid JSON while dropping low-value evidence as whole records."""
+    working = json.loads(json.dumps(context, default=str))
+    encoded = json.dumps(working, separators=(",", ":"))
+    if len(encoded) <= max_chars:
+        return encoded
+    working["conversation"] = (working.get("conversation") or [])[-2:]
+    working["local_docs"] = (working.get("local_docs") or [])[:2]
+    for _ in range(20):
+        encoded = json.dumps(working, separators=(",", ":"))
+        if len(encoded) <= max_chars:
+            return encoded
+        lists: list[tuple[int, dict[str, Any], str]] = []
+        def find_lists(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if isinstance(value, list) and len(value) > 1:
+                        lists.append((len(json.dumps(value, default=str)), node, key))
+                    else:
+                        find_lists(value)
+        find_lists(working)
+        if not lists:
+            break
+        _, parent, key = max(lists, key=lambda item: item[0])
+        parent[key] = parent[key][:max(1, len(parent[key]) // 2)]
+    minimal = {key: working.get(key) for key in ("boat_facts", "interpreted_question", "query_plan", "answer_focus") if working.get(key) is not None}
+    return json.dumps(minimal, separators=(",", ":"))
 
 
 def context_char_budget(context: dict[str, Any]) -> int:
@@ -4133,8 +4356,9 @@ def call_openai(
             {"role": "system", "content": system_prompt()},
             {"role": "user", "content": build_prompt(message, context)},
         ],
-        "tools": [{"type": "web_search"}],
     }
+    if (setting_value("BOAT_CHAT_WEB_SEARCH", "false") or "false").lower() in {"1", "true", "yes", "on"}:
+        payload["tools"] = [{"type": "web_search"}]
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
         response = http_post_json("https://api.openai.com/v1/responses", payload, headers=headers, timeout=90)
@@ -4627,13 +4851,13 @@ def call_model(message: str, context: dict[str, Any]) -> str:
 
 
 class BoatChatHandler(BaseHTTPRequestHandler):
-    server_version = f"BoatChat/{os.environ.get('VESSELSTACK_VERSION', 'development')}"
+    server_version = "BoatChat/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), fmt % args))
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, default=json_default).encode("utf-8")
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -4659,6 +4883,38 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(provided, token):
                 return False, "invalid or missing X-Boat-Chat-Token header"
         return True, ""
+
+    def access_allowed(self) -> bool:
+        token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
+        if not token:
+            return True
+        provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
+        return hmac.compare_digest(provided, token)
+
+    def sensitive_access_allowed(self) -> bool:
+        token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
+        provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
+        return bool(token) and hmac.compare_digest(provided, token)
+
+    def rate_limit_allowed(self) -> bool:
+        now = time.monotonic()
+        address = str(self.client_address[0])
+        with RATE_LIMIT_LOCK:
+            recent = [stamp for stamp in RATE_LIMIT_REQUESTS.get(address, []) if now - stamp < RATE_LIMIT_WINDOW_SECONDS]
+            if len(recent) >= RATE_LIMIT_MAX_REQUESTS:
+                RATE_LIMIT_REQUESTS[address] = recent
+                return False
+            recent.append(now)
+            RATE_LIMIT_REQUESTS[address] = recent
+            return True
+
+    def safe_context(self, context: dict[str, Any]) -> dict[str, Any]:
+        debug = (self.headers.get("X-Boat-Chat-Debug") or "").lower() == "true"
+        configured = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
+        provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
+        if debug and configured and hmac.compare_digest(provided, configured):
+            return context
+        return {"query_plan": context.get("query_plan", {}), "context_profile": context.get("context_profile", {})}
 
     def read_json_body(self) -> dict[str, Any]:
         try:
@@ -4711,16 +4967,20 @@ class BoatChatHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
+            readiness = readiness_status()
             self.send_json(
                 200,
                 {
                     "ok": True,
+                    "ready": readiness["ready"],
+                    "readiness": readiness,
                     "provider": configured_provider(),
                     "fallback_provider": configured_fallback_provider(),
                     "models": active_models(),
                     "settings_token_required": bool((setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()),
-                    "memory": memory_index.status(),
-                    "telemetry_cache": telemetry_cache.status(),
+                    "memory": memory_index.status() if self.access_allowed() else {"available": memory_index.db_path().exists()},
+                    "telemetry_cache": telemetry_cache.status() if self.access_allowed() else {"available": True},
+                    "sessions": session_store.status() if self.access_allowed() else {"available": True},
                 },
             )
             return
@@ -4730,6 +4990,16 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         elif path == "/api/models":
             self.send_json(200, model_catalog())
             return
+        elif path == "/api/status":
+            if not self.sensitive_access_allowed():
+                self.send_json(401, {"error":"live status requires BOAT_CHAT_ACCESS_TOKEN"}); return
+            self.send_json(200, experience_status()); return
+        elif path == "/api/insights":
+            if not self.sensitive_access_allowed():
+                self.send_json(401, {"error":"insights require BOAT_CHAT_ACCESS_TOKEN"}); return
+            self.send_json(200, experience_insights()); return
+        elif path == "/api/capabilities":
+            self.send_json(200, capabilities_payload()); return
         else:
             self.send_static(self.static_target(path))
 
@@ -4760,22 +5030,63 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json(500, {"error": str(exc)})
             return
+        if path == "/api/maintenance":
+            if not self.sensitive_access_allowed():
+                self.send_json(401, {"error":"maintenance requires BOAT_CHAT_ACCESS_TOKEN"}); return
+            if not self.rate_limit_allowed():
+                self.send_json(429, {"error":"Too many requests; try again in a minute"}); return
+            try:
+                self.send_json(200, {"task": session_store.save_maintenance(self.read_json_body())})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json(400, {"error": str(exc)})
+            return
+        if path in {"/api/feedback", "/api/session/clear"}:
+            if not self.access_allowed():
+                self.send_json(401, {"error": "invalid or missing X-Boat-Chat-Token header"}); return
+            if not self.rate_limit_allowed():
+                self.send_json(429, {"error": "Too many requests; try again in a minute"}); return
+            try:
+                payload = self.read_json_body()
+                if path == "/api/feedback":
+                    session_store.record_feedback(str(payload.get("request_id", "")), str(payload.get("session_id", "")), str(payload.get("rating", "")), str(payload.get("note", "")))
+                else:
+                    session_store.clear_session(str(payload.get("session_id", "")))
+                self.send_json(200, {"ok": True})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json(400, {"error": str(exc)})
+            return
         if path != "/api/chat":
             self.send_error(404)
             return
+        if not self.access_allowed():
+            self.send_json(401, {"error": "invalid or missing X-Boat-Chat-Token header"})
+            return
+        if not self.rate_limit_allowed():
+            self.send_json(429, {"error": "Too many requests; try again in a minute"})
+            return
+        if not CHAT_SEMAPHORE.acquire(blocking=False):
+            self.send_json(429, {"error": "Boat Chat is busy; try again shortly"})
+            return
+        started = time.monotonic()
+        request_id = hashlib.sha256(f"{time.time_ns()}:{self.client_address[0]}".encode()).hexdigest()[:12]
         try:
             payload = self.read_json_body()
             message = str(payload.get("message", "")).strip()
             if not message:
                 self.send_json(400, {"error": "message is required"})
                 return
-            history = sanitize_conversation_history(payload.get("history"))
-            context = collect_context(message, history=history)
+            session_id = session_store.normalize_session_id(payload.get("session_id"))
+            stored = session_store.get_session(session_id) if session_id else {"turns": [], "query_plan": {}}
+            history = sanitize_conversation_history(payload.get("history")) or sanitize_conversation_history(stored.get("turns"))
+            context = collect_context(message, history=history, prior_query_plan=stored.get("query_plan"))
+            answer_mode=str(payload.get("answer_mode","concise")).lower()
+            context["answer_mode"] = answer_mode if answer_mode in {"concise","explain","diagnose","checklist"} else "concise"
             answer = (
                 answer_from_clarification(context)
                 or answer_from_ais_freshness(context)
                 or answer_from_freshness(context)
                 or answer_from_facts(message, context.get("boat_facts", {}))
+                or answer_from_briefing(message, context)
                 or answer_from_health_state(message, context)
                 or answer_from_engine_history(context)
                 or answer_from_fuel_usage(context)
@@ -4786,14 +5097,21 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 or answer_from_battery_voltage(context)
                 or answer_from_fuel_balance(context)
                 or answer_from_telemetry_overview(context)
+                or answer_from_event_history(context)
                 or answer_from_generic_history(context)
                 or call_model(message, context)
             )
-            self.send_json(200, {"answer": answer, "context": context})
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            session_store.append_exchange(session_id, message, answer, context.get("query_plan", {}))
+            session_store.record_request(request_id, session_id, hashlib.sha256(message.encode()).hexdigest(), context.get("query_plan", {}), context.get("context_profile", {}), elapsed_ms, "answered")
+            self.log_message("request_id=%s elapsed_ms=%s signals=%s history=%s", request_id, elapsed_ms, context.get("query_plan", {}).get("signals"), context.get("query_plan", {}).get("historical"))
+            self.send_json(200, {"answer":answer,"context":self.safe_context(context),"experience":answer_experience(context),"request_id":request_id})
         except (ValueError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
+        finally:
+            CHAT_SEMAPHORE.release()
 
 
 def main() -> None:

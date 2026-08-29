@@ -28,6 +28,9 @@ CHUNK_TARGET_CHARS = 1400
 CHUNK_OVERLAP_LINES = 3
 
 DEFAULT_DOC_PATHS = [
+    REPO_ROOT / "BOAT_AGENT.md",
+    REPO_ROOT / "STACK_OVERVIEW.md",
+    REPO_ROOT / "RESTORE.md",
     REPO_ROOT / "boat-chat" / "boat_facts.json",
     REPO_ROOT / "boat-chat" / "BOAT_CHAT_AGENT.md",
     REPO_ROOT / "boat-chat" / "README.md",
@@ -35,6 +38,7 @@ DEFAULT_DOC_PATHS = [
     REPO_ROOT / "boat-chat" / "knowledge" / "telemetry.md",
     REPO_ROOT / "boat-chat" / "knowledge" / "answering.md",
 ]
+_SEMANTIC_MODEL: dict[str, Any] = {"name": None, "model": None, "failed": False}
 
 
 def db_path() -> Path:
@@ -97,7 +101,32 @@ def tokenize(text: str) -> list[str]:
     return [token.lower() for token in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_./:-]{1,}", text)]
 
 
+def embedding_backend() -> str:
+    model = os.environ.get("BOAT_CHAT_EMBEDDING_MODEL")
+    return f"sentence-transformers:{model}" if model and not _SEMANTIC_MODEL["failed"] else "hashed-token"
+
+
+def semantic_embed_text(text: str, dim: int) -> list[float] | None:
+    model_name = os.environ.get("BOAT_CHAT_EMBEDDING_MODEL", "").strip()
+    if not model_name or _SEMANTIC_MODEL["failed"]:
+        return None
+    try:
+        if _SEMANTIC_MODEL["model"] is None or _SEMANTIC_MODEL["name"] != model_name:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            _SEMANTIC_MODEL.update(name=model_name, model=SentenceTransformer(model_name), failed=False)
+        values = [float(value) for value in _SEMANTIC_MODEL["model"].encode(text, normalize_embeddings=True).tolist()]
+        values = (values + [0.0] * dim)[:dim]
+        norm = math.sqrt(sum(value * value for value in values))
+        return [value / norm for value in values] if norm else values
+    except Exception:
+        _SEMANTIC_MODEL["failed"] = True
+        return None
+
+
 def embed_text(text: str, dim: int = VECTOR_DIM) -> list[float]:
+    semantic = semantic_embed_text(text, dim)
+    if semantic is not None:
+        return semantic
     vector = [0.0] * dim
     for token in tokenize(text):
         digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
@@ -241,10 +270,10 @@ def rebuild(paths: list[Path] | None = None, path: Path | None = None) -> dict[s
                 )
         conn.execute(
             "insert or replace into index_meta (key, value) values (?, ?)",
-            ("last_rebuild", json.dumps({"time": now, "chunks": len(chunks), "sqlite_vec": has_vec})),
+            ("last_rebuild", json.dumps({"time": now, "chunks": len(chunks), "sqlite_vec": has_vec, "embedding_backend": embedding_backend()})),
         )
     conn.close()
-    return {"chunks": len(chunks), "sqlite_vec": has_vec, "path": str(path or db_path())}
+    return {"chunks": len(chunks), "sqlite_vec": has_vec, "embedding_backend": embedding_backend(), "path": str(path or db_path())}
 
 
 def fts_query(query: str) -> str:
