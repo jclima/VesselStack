@@ -13,7 +13,7 @@ shore-input sensor. It is a delayed charging proxy derived from SmartShunt
 voltage and current, so sufficient solar charging can turn it on.
 
 Boat Chat records a sample every five minutes in
-`boat-chat/data/power_tracking.sqlite`. It attributes positive SmartShunt power
+`$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`. It attributes positive SmartShunt power
 to `inferred net solar or another uninstrumented source` only when:
 
 - The boat is underway, is beyond the configured dock radius, or the charging

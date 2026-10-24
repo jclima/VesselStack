@@ -144,6 +144,14 @@ class SettingsTests(ServerCase):
         self.assertNotIn("BOAT_CHAT_PORT", saved)
         self.assertEqual("ollama", saved["BOAT_CHAT_PROVIDER"])
 
+    def test_newline_cr_nul_values_are_rejected_without_writing(self):
+        for bad in ("ollama\nBOAT_CHAT_ALLOW_OPEN=true", "a\rb", "a\x00b"):
+            with self.assertRaises(ValueError):
+                app.update_settings({"BOAT_CHAT_PROVIDER": bad})
+        with self.assertRaises(ValueError):
+            app.update_settings({"BOAT_CHAT_PORT": "8765", "BOAT_CHAT_PROVIDER": "x\ny"})
+        self.assertFalse(self.env_file.exists() and "8765" in self.env_file.read_text())
+
 
 class PrecedenceTests(unittest.TestCase):
     def test_single_env_variable_selects_the_file_for_both_services(self):

@@ -5,6 +5,12 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Security: the control panel no longer follows symlinks or predictable temp names when clearing Settings overrides in the service-writable state directory (`O_NOFOLLOW`, `mkstemp`, fd-based chmod/chown); the installer refuses symlinked managed entries under the data directory before root creates, chowns or writes there.
+- Security: `vesselstackctl restore` stages and verifies the archive, rejects setuid/setgid/sticky members, swaps trees by rename and keeps `*.pre-restore-STAMP` copies instead of extracting over the live tree, then runs the restored bundled installer. Backups also include unit files, `vesselstackctl`, `vesselstack-firewall` and `update.env`, refuse unmounted `/media` and `/mnt` destinations (`--allow-unmounted`), and warn on same-filesystem destinations.
+- Security: firewall rules load atomically (`iptables-restore --noflush`), the service waits for/creates `DOCKER-USER`, a missing interface no longer skips the policy, `vesselstack-firewall print` renders rules, and opt-in `VESSELSTACK_FIREWALL_STRICT` with `VESSELSTACK_FIREWALL_ALLOW_TCP/UDP` blocks everything else on the untrusted interface.
+- Security: the setup wizard requires `application/json`, a loopback `Host`/`Origin` and a per-run `X-Wizard-Token` (CSRF and DNS-rebinding defence).
+- Fixed: Boat Chat settings reject newline/CR/NUL values; README SQLite paths corrected; `vesselstackctl urls` shows effective bind addresses; CI no longer runs the control-panel and wizard suites twice.
+
 - Security: install.sh quarantines legacy Boat Chat state it cannot migrate into a root-only `boat-chat-legacy-<timestamp>` directory instead of leaving it in the code tree (never deletes data).
 - Security: `scripts/deploy-chat.py` verifies signatures with a fixed git config (hooks off, no repo-local overrides, system/global config ignored) against a root-controlled `VERIFY_GNUPGHOME` / `VERIFY_ALLOWED_SIGNERS`; checker, tests and deployed bytes come from the verified commit object exported to a private tree, with HEAD/clean-tree/tree re-checks after tests and before apply.
 - Fixed: every generated secret (InfluxDB, Grafana, MQTT, tokens) is preserved from the installed config when the input says GENERATE; Mosquitto credentials are updated in place only when changed instead of `-c` resetting the file; init-only secrets are read-only in the control panel.

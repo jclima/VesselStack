@@ -22,7 +22,13 @@ python3 vesselstack-wizard.py
 ```
 
 Open `http://127.0.0.1:8088`, or use the SSH tunnel documented in the guide.
-The dependency-free wizard binds only to loopback, shows relevant host
+The wizard prints a per-run token on start; the page it serves sends that token
+(`X-Wizard-Token`) with every API call. Requests are refused unless the `Host`
+header is `127.0.0.1`/`localhost`/`[::1]` on the bound port, any `Origin` is the
+same loopback origin, the token matches, and saves use `Content-Type:
+application/json` (this blocks cross-site form posts and DNS rebinding). Open the
+printed URL itself; a bookmarked older page needs a reload after restarting the
+wizard. The dependency-free wizard binds only to loopback, shows relevant host
 prerequisites, and writes a complete private `vesselstack.env`. It does not
 change boot firmware, firewall rules, marine wiring, or start services.
 
@@ -402,7 +408,9 @@ reusable versions in the repository so reinstallations remain reproducible.
 
 ### Boat Chat
 
-Open `http://HOST:8765`. The `local` provider returns gathered context without
+Open `http://HOST:8765`. Chat requires the access token
+(`BOAT_CHAT_ACCESS_TOKEN` in `config/boat-chat.env`) and refuses requests without
+it unless `BOAT_CHAT_ALLOW_OPEN=true` is set. The `local` provider returns gathered context without
 sending it to an external model. Configure an optional provider in Settings.
 Retrieve the settings token locally when needed:
 
@@ -462,7 +470,23 @@ secret setting and is never returned by `GET /api/settings`.
 when the OpenAI provider is selected. This can send the question and grounded
 context to an external service and may incur provider charges; it is disabled
 by default. Boat Chat sessions, audits, feedback, and maintenance tasks stay in
-the private SQLite memory database and are excluded from release packages.
+the private SQLite memory database
+(`$VESSELSTACK_DATA/boat-chat/memory/boat_memory.sqlite`, power observations in
+`$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`) and are excluded from
+release packages. Settings values containing a newline, carriage return or NUL
+byte are rejected (HTTP 400, nothing written), matching the control panel.
+
+`vesselstackctl urls` prints the effective bind address of each service (read
+from `config/boat-chat.env`, `config/control-panel.env` and the Compose bind
+variables, never by sourcing service-writable files), e.g. whether Boat Chat is
+reachable on all interfaces or only this device.
+
+Hardening of service-writable paths: the control panel clears stale Settings
+overrides without following symlinks (it refuses a symlinked override file,
+writes through a random `O_EXCL` temporary file and sets mode/owner on the open
+descriptor). The installer refuses to proceed if any managed entry under the
+service-writable data directory (`influxdb`, `grafana`, `boat-chat`,
+`homeassistant/...`) is a symlink: remove the symlink and rerun.
 
 Security layout (1.3.x hardening): the installed application code, its Python
 virtualenv and the generated `boat_facts.json` are owned by `root` and are not
@@ -609,8 +633,41 @@ Preflight requires that interface to exist. The policy blocks MQTT, InfluxDB,
 Prometheus, and Grafana administrative/data ports arriving on that interface,
 including Docker-forwarded traffic, while leaving Home Assistant, SignalK,
 Boat Chat, AIS viewer, HTTP/HTTPS, loopback, VPN, and outbound traffic intact.
-Review the rendered policy in `scripts/vesselstack-firewall` against the boat's
-network design before enabling it. Disable and remove its chains with:
+Review the policy without root or any change using
+`vesselstack-firewall print` (renders the exact `iptables-restore` payloads).
+Chain contents are replaced atomically (`iptables-restore --noflush`), so an
+existing chain is never briefly empty. The host (INPUT) rules are applied first;
+`DOCKER-USER` only exists once Docker is running, so the service waits up to 60 s
+for it (`TimeoutStartSec=180`) and, if Docker is still absent, creates the chain
+itself. Until Docker starts no container ports are published, so that window
+exposes nothing. A missing untrusted interface no longer aborts: rules are
+installed anyway (with a warning) and take effect when the interface appears.
+
+Strict mode (opt-in, default off) is for boats where nothing should be reachable
+over Wi-Fi except what you list:
+
+```bash
+VESSELSTACK_FIREWALL_STRICT="true"
+VESSELSTACK_FIREWALL_ALLOW_TCP="22"        # comma-separated ports or LOW:HIGH ranges
+VESSELSTACK_FIREWALL_ALLOW_UDP=""
+```
+
+On the untrusted interface strict mode drops everything except replies to
+connections the boat started, ICMP/ICMPv6, DHCP client replies and the
+allow-lists. That covers host-networked SignalK `3000`, AIS, Boat Chat `8765`
+(INPUT) and published container ports such as Heimdall `80/443` and Grafana
+(`DOCKER-USER`, matched on the published port). The allow-list therefore opens
+ports on both paths; the default `22` only lets SSH in. Keep Ethernet, a VPN or
+console access before enabling it: a wrong interface name or allow-list can lock
+you out of Wi-Fi access, and remote `ssh` on that interface needs `22` listed.
+Rollback: set `VESSELSTACK_FIREWALL_STRICT="false"` and
+`sudo systemctl restart vesselstack-firewall.service` (or `vesselstack-firewall
+remove`). IPv6 is restricted only for INPUT; Docker's IPv6 forwarding is not
+managed. The rules were rendered and tested but not loaded into a live kernel
+in the development environment; confirm with `sudo iptables -S
+VESSELSTACK-INPUT` on the Pi.
+
+Disable and remove its chains with:
 
 ```bash
 sudo systemctl disable --now vesselstack-firewall.service
@@ -631,16 +688,55 @@ Backup creation runs the same checksum, path, link, and special-file verifier
 automatically. Rebuildable Boat Chat virtual-environment and bytecode files are
 excluded; application source, configuration, memory, and data remain included.
 The destination is resolved before writing and is rejected if it falls inside
-the application or data tree, including through a symlink.
+the application or data tree, including through a symlink. Destinations under
+`/media` or `/mnt` must be a mounted filesystem (`mountpoint -q`), so a missing
+USB drive can no longer silently fill the SD card; pass
+`vesselstackctl backup --allow-unmounted DIR` (or set
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true`, which also applies to
+`vesselstackctl update`) to override. A warning is printed when the destination
+is on the same filesystem as the data. Besides the application and data trees the
+archive now includes `/etc/systemd/system/vesselstack-*`,
+`/usr/local/sbin/vesselstack{ctl,-firewall}` and `/etc/vesselstack/update.env`
+when they exist, so a restore across versions is complete.
 
-Restore only during a maintenance window. This replaces installed config and
-data after checksum and archive validation. Verification rejects path
-traversal, absolute or escaping links, device nodes, and FIFOs before anything
-is extracted:
+The whole stack, including Home Assistant, stays stopped for the copy. Home
+Assistant, Grafana, InfluxDB and Boat Chat all keep SQLite or write-ahead-log
+state in the data tree, and a file copy of a running database is not
+crash-consistent, so partial stops were rejected in favour of a consistent
+archive.
+
+Restore only during a maintenance window. Verification rejects path traversal,
+absolute or escaping links, device nodes, FIFOs and any setuid, setgid or sticky
+member (a legitimate backup never contains one) before anything is extracted:
 
 ```bash
 sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 ```
+
+Restore no longer extracts over the live tree. It (1) verifies the archive,
+(2) checks free space (staging holds a second full copy next to the live trees;
+the previous trees are kept too, so you need room for old + new), (3) extracts
+as root with the recorded numeric owners into a private `.vesselstack-restore.*`
+directory beside the data directory, (4) stops the stack, (5) renames the live
+trees to `/opt/vesselstack.pre-restore-STAMP` and
+`/opt/vesselstack-data.pre-restore-STAMP` and moves the staged trees in (so
+InfluxDB WAL/shard files created after the backup cannot mix with the restored
+ones), (6) restores the unit files, control scripts and `update.env` by rename,
+and (7) runs the restored bundled installer
+(`/opt/vesselstack/installer/install.sh --config ... --start`) to rebuild the
+Boat Chat virtualenv (not part of the backup), re-render units and start the
+stack. This step needs network access for `pip`; use `--skip-installer` to
+only start services and run the printed installer command later. If the swap
+fails the previous trees are put back. `/opt/vesselstack` and
+`/opt/vesselstack-data` must be plain directories on one filesystem with their
+parent; restore refuses a mount point (restore manually in that case).
+
+The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
+pre-restore config, secrets and databases, and are not covered by `uninstall
+--purge-data`). Verify the system first, then
+`sudo rm -rf -- /opt/vesselstack.pre-restore-STAMP /opt/vesselstack-data.pre-restore-STAMP`.
+Rollback of a restore: stop the stack, move the current trees aside and rename
+the `.pre-restore-STAMP` trees back.
 
 Back up at least:
 

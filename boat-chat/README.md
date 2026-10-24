@@ -37,7 +37,7 @@ Boat Chat keeps context in tiers so common questions stay fast and small local m
 
 The same SQLite database also stores materialized telemetry summaries in `telemetry_summaries`. These are derived facts such as latest engine run, common fuel-usage windows, shore-power timing, inferred solar contribution, and a latest boat-status context snapshot. They are refreshed by `boat-chat-telemetry-indexer.timer` every five minutes. InfluxDB and Home Assistant remain the source of truth; the cache is only a fast summary layer.
 
-Forward-looking power observations are stored separately in `boat-chat/data/power_tracking.sqlite`. Boat Chat integrates positive SmartShunt power only across adjacent samples where the boat is underway, beyond the dock radius, or not charging, and both engines are below 200 RPM. It reports that result as inferred net solar-to-battery energy, not gross panel output. The Home Assistant shore-power entity is only a charging proxy, so dockside source attribution remains ambiguous until a physical AC-input meter is installed. Observations are retained for 400 days; gaps longer than 15 minutes are excluded. See `POWER_MONITORING.md` for instrumentation and interpretation.
+Forward-looking power observations are stored separately in `$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`. Boat Chat integrates positive SmartShunt power only across adjacent samples where the boat is underway, beyond the dock radius, or not charging, and both engines are below 200 RPM. It reports that result as inferred net solar-to-battery energy, not gross panel output. The Home Assistant shore-power entity is only a charging proxy, so dockside source attribution remains ambiguous until a physical AC-input meter is installed. Observations are retained for 400 days; gaps longer than 15 minutes are excluded. See `POWER_MONITORING.md` for instrumentation and interpretation.
 
 Runtime behavior is governed by `boat-chat/BOAT_CHAT_AGENT.md`. It is optimized for mobile chat: concise answers first, no internal implementation details, and one short clarification question instead of guessing when a time window or required boat data is ambiguous.
 
@@ -326,11 +326,11 @@ Operator/runbook files such as root `BOAT_AGENT.md`, `STACK_OVERVIEW.md`, `AGENT
 
 Boat Chat uses a local SQLite memory index when present:
 
-- Default path: `/opt/vesselstack/data/boat-chat/memory/boat_memory.sqlite`
+- Default path: `$VESSELSTACK_DATA/boat-chat/memory/boat_memory.sqlite` (default `/opt/vesselstack-data/boat-chat/memory/boat_memory.sqlite`; `$BOAT_CHAT_STATE_DIR/memory/` when that is set)
 - `FTS5` keyword retrieval works with the Python standard library.
 - `sqlite-vec` vector retrieval turns on automatically when the Python package is installed.
 - Embeddings are deterministic hashed text vectors, so indexing does not require a local transformer model or cloud API call.
-- The generated `boat-chat/memory/` directory is ignored by Git.
+- The runtime `memory/` directory lives in the state directory (not the code tree) and is never part of the release.
 
 Build or refresh the index after changing docs/runbooks:
 

@@ -497,6 +497,12 @@ def public_settings() -> dict[str, Any]:
 
 
 def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
+    # Reject the whole request before writing anything: a newline/CR/NUL in a value
+    # would inject extra KEY=VALUE lines into the env file read by the services.
+    for key, value in updates.items():
+        if key in SETTING_KEYS and value is not None:
+            if any(char in str(value).strip() for char in ("\n", "\r", "\x00")):
+                raise ValueError(f"{key} contains unsupported characters")
     current = parse_env_config()
     for key, value in updates.items():
         if key not in SETTING_KEYS:

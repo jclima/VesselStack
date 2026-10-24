@@ -37,7 +37,7 @@ grep -q 'ghcr.io/jvde-github/ais-catcher:v0.70' "$ROOT/vesselstack.example.env"
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"
-"$ROOT/scripts/vesselstackctl" --help | grep -q 'backup \[DIRECTORY\]'
+"$ROOT/scripts/vesselstackctl" --help | grep -q 'backup \[--allow-unmounted\] \[DIRECTORY\]'
 if grep -RInE --exclude=test-distribution.sh \
     --exclude-dir=.git --exclude-dir=generated \
     '(BOAT_MMSI="[1-9][0-9]+"|BOAT_CALLSIGN="[A-Z0-9]+"|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' "$ROOT"; then

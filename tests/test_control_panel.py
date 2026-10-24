@@ -99,6 +99,58 @@ class EnvironmentFileTests(unittest.TestCase):
             self.assertEqual(panel.parse_env(chat)["BOAT_CHAT_MODEL"], "original-model")
 
 
+class OverrideFileSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.override = self.root / "boat-chat.env"
+        patcher = mock.patch.dict(os.environ, {"BOAT_CHAT_ENV": str(self.override)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_clears_only_stale_keys_and_preserves_mode(self) -> None:
+        self.override.write_text("KEEP=1\nDROP=2\n")
+        os.chmod(self.override, 0o640)
+        panel.clear_chat_overrides({"DROP", "ABSENT"}, {})
+        self.assertEqual(self.override.read_text(), "KEEP=1\n")
+        self.assertEqual(self.override.stat().st_mode & 0o777, 0o640)
+        self.assertEqual([p.name for p in self.root.iterdir()], ["boat-chat.env"])
+
+    def test_symlinked_override_is_neither_read_nor_replaced(self) -> None:
+        target = self.root / "victim"
+        target.write_text("DROP=secret\n")
+        self.override.symlink_to(target)
+        panel.clear_chat_overrides({"DROP"}, {})
+        self.assertTrue(self.override.is_symlink())
+        self.assertEqual(target.read_text(), "DROP=secret\n")
+        self.assertEqual(panel.chat_overrides({}), set())
+
+    def test_replace_refuses_symlink_and_cleans_temp_on_failure(self) -> None:
+        target = self.root / "victim"
+        target.write_text("x")
+        self.override.symlink_to(target)
+        with self.assertRaises(OSError):
+            panel.replace_in_service_dir(self.override, "y\n")
+        self.assertEqual(target.read_text(), "x")
+        self.override.unlink()
+        self.override.write_text("a=1\n")
+        with mock.patch.object(panel.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                panel.replace_in_service_dir(self.override, "b=2\n")
+        self.assertEqual(self.override.read_text(), "a=1\n")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["boat-chat.env", "victim"])
+
+    def test_predictable_tmp_symlink_is_not_followed(self) -> None:
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        (self.root / "boat-chat.env.tmp").symlink_to(victim)
+        self.override.write_text("DROP=1\nKEEP=1\n")
+        panel.clear_chat_overrides({"DROP"}, {})
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertEqual(self.override.read_text(), "KEEP=1\n")
+
+
 class CommandAllowlistTests(unittest.TestCase):
     def test_component_commands_are_argument_arrays(self) -> None:
         command = panel.component_command("grafana", "start")

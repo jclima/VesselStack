@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -118,6 +119,9 @@ FIELDS = [
     field("MQTT_PORT", "Published port", "MQTT", kind="port"),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
+    field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),
+    field("VESSELSTACK_FIREWALL_ALLOW_TCP", "Strict mode allowed TCP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default 22."),
+    field("VESSELSTACK_FIREWALL_ALLOW_UDP", "Strict mode allowed UDP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default none."),
     field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 unless access is protected by a trusted VPN or proxy."),
     field("CONTROL_PANEL_PORT", "Control panel port", "Control Panel", kind="port"),
     field("BOAT_CHAT_PROVIDER", "Primary provider", "Boat Chat", source="chat", kind="select", choices=["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
@@ -166,11 +170,16 @@ SYSTEMD_COMPONENTS = {
 
 
 def parse_env(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
     try:
-        lines = path.read_text().splitlines()
+        text = path.read_text()
     except OSError:
-        return values
+        return {}
+    return parse_env_text(text)
+
+
+def parse_env_text(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    lines = text.splitlines()
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -233,6 +242,9 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
             raise ValueError(f"{spec['label']} must be an IPv4 address") from exc
         if address.version != 4:
             raise ValueError(f"{spec['label']} must be an IPv4 address")
+    if spec["key"] in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
+        if not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*", text):
+            raise ValueError(f"{spec['label']} must be comma-separated ports or LOW:HIGH ranges")
     if spec["key"] == "INFLUXDB_RAW_RETENTION" and text and not re.fullmatch(r"0|[1-9][0-9]{0,4}[hdw]", text):
         raise ValueError(f"{spec['label']} must be 0, or a duration such as 720h, 30d or 8w")
     if kind == "path" and text and not text.startswith("/"):
@@ -255,7 +267,67 @@ def chat_override_path(vessel: dict[str, str] | None = None) -> Path | None:
 
 def chat_overrides(vessel: dict[str, str] | None = None) -> set[str]:
     path = chat_override_path(vessel)
-    return set(parse_env(path)) if path else set()
+    if not path:
+        return set()
+    try:
+        return set(parse_env_text(_read_nofollow(path)[0]))
+    except OSError:
+        return set()
+
+
+def _read_nofollow(path: Path) -> tuple[str, os.stat_result]:
+    """Read a regular file without following a final symlink; return text and fstat."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path} is not a regular file")
+        with os.fdopen(fd, "r", closefd=False) as handle:
+            return handle.read(), info
+    finally:
+        os.close(fd)
+
+
+def replace_in_service_dir(path: Path, content: str) -> None:
+    """Atomically replace a file in a directory the service user can write.
+
+    The panel may run as root while the directory belongs to the service user, so
+    nothing here may follow a path the service user could have swapped for a
+    symlink: refuse symlinks, use an O_EXCL random temporary name, and apply
+    mode/ownership through the open descriptor rather than by path.
+    """
+    if stat.S_ISLNK(os.lstat(path).st_mode):
+        raise OSError(f"Refusing to rewrite symlink {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"{path} is not a regular file")
+    temp_fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        try:
+            with os.fdopen(temp_fd, "w", closefd=False) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(temp_fd)
+            os.fchmod(temp_fd, stat.S_IMODE(info.st_mode))
+            try:
+                os.fchown(temp_fd, info.st_uid, info.st_gid)
+            except OSError:
+                pass  # not running as root; ownership already matches the caller
+        finally:
+            os.close(temp_fd)
+        if stat.S_ISLNK(os.lstat(temporary).st_mode):
+            raise OSError(f"Refusing symlinked temporary file {temporary}")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def clear_chat_overrides(keys: set[str], vessel: dict[str, str]) -> None:
@@ -263,28 +335,26 @@ def clear_chat_overrides(keys: set[str], vessel: dict[str, str]) -> None:
 
     The override file wins over config/boat-chat.env, so without this a value
     saved in the control panel would be silently shadowed by a stale UI value.
+    The file lives in the service-user-writable state directory, so it is never
+    read or written through a symlink.
     """
     path = chat_override_path(vessel)
-    if not path or not path.is_file():
+    if not path:
         return
-    stale = {key for key in keys if key in parse_env(path)}
+    try:
+        text, _ = _read_nofollow(path)
+    except OSError:
+        return  # absent, a symlink, or not a regular file: leave it alone
+    stale = {key for key in keys if key in parse_env_text(text)}
     if not stale:
         return
     kept = []
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         name = line.split("=", 1)[0].strip()
         if "=" in line and not line.lstrip().startswith("#") and name in stale:
             continue
         kept.append(line)
-    info = path.stat()
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text("\n".join(kept) + "\n")
-    os.chmod(temp, info.st_mode & 0o777)
-    try:
-        os.chown(temp, info.st_uid, info.st_gid)
-    except OSError:
-        pass
-    os.replace(temp, path)
+    replace_in_service_dir(path, "\n".join(kept) + "\n")
 
 
 def public_configuration() -> dict[str, Any]:

@@ -1,4 +1,8 @@
+import http.client
 import importlib.util
+import json
+import threading
+from http.server import ThreadingHTTPServer
 import os
 import stat
 import tempfile
@@ -40,5 +44,96 @@ class WizardTests(unittest.TestCase):
     def test_system_report_omits_virtual_topology(self):
         report = wizard.system_report()
         self.assertTrue(all(name.startswith(("eth", "en", "wlan", "wl", "can")) for name in report["interfaces"]))
+
+class WizardHttpTests(unittest.TestCase):
+    TOKEN = "test-token-123"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name) / "vesselstack.env"
+        wizard.OUTPUT = self.output
+        wizard.Handler.token = self.TOKEN
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), wizard.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def request(self, method, path, body=None, headers=None, host="default"):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        merged = {} if headers is None else dict(headers)
+        if host == "default":
+            host = f"127.0.0.1:{self.port}"
+        if host is not None:
+            merged["Host"] = host
+        connection.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        for key, value in merged.items():
+            connection.putheader(key, value)
+        payload = body if body is None or isinstance(body, bytes) else json.dumps(body).encode()
+        if payload is not None:
+            connection.putheader("Content-Length", str(len(payload)))
+        connection.endheaders(payload)
+        response = connection.getresponse()
+        data = response.read()
+        connection.close()
+        return response.status, data
+
+    def good(self, **extra):
+        headers = {"Content-Type": "application/json", "X-Wizard-Token": self.TOKEN}
+        headers.update(extra)
+        return headers
+
+    def test_save_succeeds_with_token_json_and_local_host(self):
+        status, _ = self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Test"}}, self.good())
+        self.assertEqual(status, 200)
+        self.assertIn("BOAT_NAME=Test", self.output.read_text())
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+
+    def test_missing_or_wrong_token_is_rejected(self):
+        for token in (None, "wrong"):
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["X-Wizard-Token"] = token
+            self.assertEqual(self.request("POST", "/api/save", {"values": {}}, headers)[0], 403)
+        self.assertFalse(self.output.exists())
+
+    def test_non_json_content_type_is_rejected(self):
+        for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
+            headers = self.good(**{"Content-Type": content_type})
+            self.assertEqual(self.request("POST", "/api/save", b'{"values":{}}', headers)[0], 415)
+        self.assertFalse(self.output.exists())
+
+    def test_dns_rebinding_host_is_rejected(self):
+        self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good(), host=f"evil.example:{self.port}")[0], 403)
+        self.assertEqual(self.request("GET", "/api/system", None, {"X-Wizard-Token": self.TOKEN}, host="evil.example")[0], 403)
+        self.assertEqual(self.request("GET", "/", None, {}, host=f"rebind.test:{self.port}")[0], 403)
+        self.assertEqual(self.request("GET", "/", None, {}, host="127.0.0.1:1")[0], 403)
+
+    def test_cross_origin_post_is_rejected_and_same_origin_allowed(self):
+        self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good(Origin="https://evil.example"))[0], 403)
+        self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good(Origin="null"))[0], 403)
+        self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good(Origin=f"http://localhost:{self.port}"), host=f"localhost:{self.port}")[0], 200)
+
+    def test_page_embeds_token_and_api_system_requires_it(self):
+        status, page = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(f'content="{self.TOKEN}"'.encode(), page)
+        self.assertEqual(self.request("GET", "/api/system")[0], 403)
+        self.assertEqual(self.request("GET", "/api/system", None, {"X-Wizard-Token": self.TOKEN})[0], 200)
+
+    def test_unset_token_refuses_everything(self):
+        wizard.Handler.token = None
+        self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good())[0], 403)
+
+    def test_app_js_sends_the_token(self):
+        source = (ROOT / "wizard" / "app.js").read_text()
+        self.assertEqual(source.count("X-Wizard-Token"), 2)
+        self.assertIn('name="wizard-token"', (ROOT / "wizard" / "index.html").read_text())
+
+    def test_firewall_strict_settings_validated(self):
+        self.assertIn("VESSELSTACK_FIREWALL_ALLOW_TCP=22", wizard.render({}))
+        with self.assertRaises(ValueError): wizard.render({"VESSELSTACK_FIREWALL_STRICT": "maybe"})
+        with self.assertRaises(ValueError): wizard.render({"VESSELSTACK_FIREWALL_ALLOW_TCP": "22,abc"})
 
 if __name__ == "__main__": unittest.main()

@@ -56,6 +56,9 @@ source "$CONFIG_FILE"
 : "${AIS_DEVICE:=/dev/bus/usb}"
 : "${AIS_CATCHER_ARGS:=-q -N 8100 -S 5011}"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
+: "${VESSELSTACK_FIREWALL_STRICT:=false}"
+: "${VESSELSTACK_FIREWALL_ALLOW_TCP=22}"
+: "${VESSELSTACK_FIREWALL_ALLOW_UDP=}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
 : "${BOAT_CHAT_HOST:=0.0.0.0}"
@@ -101,12 +104,18 @@ if [ -n "$INFLUXDB_RAW_RETENTION" ] && \
     echo "INFLUXDB_RAW_RETENTION must be empty, 0 (keep forever), or a duration such as 720h, 30d or 8w" >&2
     exit 1
 fi
-for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
+for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
     TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
     esac
+done
+for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
+    [[ "${!key}" =~ ^([0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*)?$ ]] || {
+        echo "$key must be comma-separated ports or LOW:HIGH ranges, e.g. 22,5000:5100" >&2
+        exit 1
+    }
 done
 for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
@@ -297,6 +306,22 @@ BOAT_CHAT_ACCESS_TOKEN=$(generate_secret "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}")
 CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 
+# VESSELSTACK_DATA belongs to the service user, who could replace any entry in it
+# with a symlink. Root must never create, chown or write through such a path.
+refuse_symlinked_path() {
+    local path=$1 current=$VESSELSTACK_DATA part
+    local rest=${path#"$VESSELSTACK_DATA"}
+    [ ! -L "$VESSELSTACK_DATA" ] || { echo "ERROR: $VESSELSTACK_DATA is a symlink" >&2; exit 1; }
+    IFS=/ read -ra parts <<<"${rest#/}"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        current=$current/$part
+        if [ -L "$current" ]; then
+            echo "ERROR: $current is a symlink in the service-writable data directory; remove it and rerun" >&2
+            exit 1
+        fi
+    done
+}
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
     "$VESSELSTACK_ROOT/installer"
@@ -305,11 +330,14 @@ install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
 # Official images run their data processes as these fixed container users.
 # Change only the mount root itself; never recursively rewrite existing data.
+refuse_symlinked_path "$VESSELSTACK_DATA/influxdb"
+refuse_symlinked_path "$VESSELSTACK_DATA/grafana"
 install -d -m 0750 -o 1000 -g 1000 "$VESSELSTACK_DATA/influxdb"
 install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
 # Code and the Python virtualenv are root-owned; the service user may only write
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
+refuse_symlinked_path "$BOAT_CHAT_STATE"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
 LEGACY_QUARANTINE=
 quarantine_legacy() {
@@ -319,8 +347,7 @@ quarantine_legacy() {
     local old=$1
     if [ -z "$LEGACY_QUARANTINE" ]; then
         LEGACY_QUARANTINE=$(mktemp -d "$VESSELSTACK_DATA/boat-chat-legacy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
-        chown root:root "$LEGACY_QUARANTINE"
-        chmod 0700 "$LEGACY_QUARANTINE"
+        chown -h root:root "$LEGACY_QUARANTINE"
     fi
     mv -- "$old" "$LEGACY_QUARANTINE/"
     echo "WARNING: moved legacy $old to $LEGACY_QUARANTINE (root-only); review and merge manually, then remove it" >&2
@@ -386,6 +413,8 @@ install -m 0644 "$SCRIPT_DIR/templates/grafana/provisioning/dashboards/vesselsta
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards/vesselstack.yml"
 install -m 0644 "$SCRIPT_DIR/templates/grafana/dashboards/system-health.json" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards/system-health.json"
+refuse_symlinked_path "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
+refuse_symlinked_path "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml"
 install -d -m 0755 "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
 for blueprint in "$SCRIPT_DIR"/templates/homeassistant/blueprints/automation/vesselstack/*.yaml; do
     install -m 0644 "$blueprint" \
@@ -436,6 +465,9 @@ AIS_WEB_PORT
 AIS_TCP_PORT
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
+VESSELSTACK_FIREWALL_STRICT
+VESSELSTACK_FIREWALL_ALLOW_TCP
+VESSELSTACK_FIREWALL_ALLOW_UDP
 CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE

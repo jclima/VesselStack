@@ -52,10 +52,6 @@ jobs:
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Run control panel tests
-        run: python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
-      - name: Run installation wizard tests
-        run: python3 -m unittest discover -s tests -p 'test_wizard.py' -v
       - name: Build and verify release archive
         run: |
           ./build-package.sh
