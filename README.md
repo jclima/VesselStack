@@ -774,3 +774,33 @@ application-only helper offers preview, tests, per-file backup and guarded rollb
 without touching infrastructure. Dependencies and database migrations remain
 separate reviewed work. Source facts now live in `boat_facts.example.json`; actual
 `boat_facts.json` and other operational data are ignored, not published.
+
+### One-command application updates
+
+Install the stable launcher and a private per-machine configuration once:
+
+```bash
+sudo install -m 0755 scripts/vesselstack-update /usr/local/sbin/vesselstack-update
+sudo install -d -m 0755 /etc/vesselstack
+sudo install -m 0600 templates/update.env.example /etc/vesselstack/update.env
+sudoedit /etc/vesselstack/update.env
+```
+
+Set the separate source/live paths and actual chat/Telegram unit names. After
+pushing changes to the source checkout's upstream branch, run on the boat:
+
+```bash
+sudo vesselstack-update          # pull, test, preview; no service restart
+sudo vesselstack-update --apply  # pull, test, back up, apply and verify
+```
+
+If Telegram code changes, an already-active configured worker also restarts;
+a stopped worker remains stopped. Restart units are saved in the backup receipt
+and used during rollback. Restore a printed backup directory with
+`sudo vesselstack-update --rollback /path/to/backup-directory`.
+
+These commands update Boat Chat Python/static assets. Dependencies, migrations,
+service definitions, dashboards and container/infrastructure changes require the
+separate reviewed release workflow. The launcher/config stay installed locally
+across Git pulls; reinstall the launcher deliberately when its interface changes.
+See [development/update details](docs/DEVELOPMENT.md).

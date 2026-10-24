@@ -56,7 +56,7 @@ def atomic_write(target,data,uid,gid,mode):
         if os.path.exists(name):os.unlink(name)
 
 
-def apply(source,target,files,backup):
+def apply(source,target,files,backup,unit_plan=None):
     backup.mkdir(parents=True,mode=0o700,exist_ok=False)
     records=[]
     for name in files:
@@ -71,6 +71,8 @@ def apply(source,target,files,backup):
             saved=backup/'files'/name;saved.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(current,saved)
         records.append(record)
     receipt=dict(target=str(target),source_commit=git(source,'rev-parse','HEAD'),files=records)
+    if unit_plan is not None:
+        receipt['restart_units'] = unit_plan
     (backup/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
     try:
         for record in records:
@@ -109,6 +111,20 @@ def ready(url):
     return False
 
 
+def restart_units(units):
+    for unit in units:
+        subprocess.run(['systemctl', 'restart', unit], check=True)
+
+
+def update_units(args, changed):
+    units = [args.service]
+    if args.telegram_service and 'boat-chat/telegram_bot.py' in changed:
+        state = subprocess.run(['systemctl', 'is-active', '--quiet', args.telegram_service], check=False)
+        if state.returncode == 0:
+            units.append(args.telegram_service)
+    return units
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source',type=Path,default=Path(__file__).resolve().parents[1])
@@ -117,6 +133,7 @@ def main():
     parser.add_argument('--apply',action='store_true')
     parser.add_argument('--restart-chat',action='store_true')
     parser.add_argument('--service',choices=['boat-chat.service','vesselstack-chat.service'],default='vesselstack-chat.service')
+    parser.add_argument('--telegram-service', choices=['boat-chat-telegram.service', 'vesselstack-chat-telegram.service'])
     parser.add_argument('--health-url',default='http://127.0.0.1:8765/health')
     parser.add_argument('--rollback',type=Path)
     args=parser.parse_args();source=args.source.resolve();target=args.target.resolve()
@@ -128,8 +145,12 @@ def main():
             if not args.apply:parser.error('Rollback requires --apply --restart-chat')
             receipt=json.loads((args.rollback/'receipt.json').read_text())
             if Path(receipt['target']).resolve()!=target:parser.error('Rollback target does not match receipt')
+            units = receipt.get('restart_units', [args.service])
+            allowed = {args.service, args.telegram_service} - {None}
+            if not units or units[0] != args.service or not set(units) <= allowed:
+                raise RuntimeError('Rollback service list does not match local update configuration')
             rollback(args.rollback)
-            subprocess.run(['systemctl','restart',args.service],check=True)
+            restart_units(units)
             if not ready(args.health_url):raise RuntimeError('Rollback restored files, but readiness failed; inspect service logs')
             print('Rollback complete');return
         if git(source,'status','--porcelain','--untracked-files=normal'):raise RuntimeError('Source checkout is dirty; commit or resolve changes first')
@@ -147,14 +168,15 @@ def main():
         print(f'{len(changed)} changed code/static files; local configuration/data/infrastructure excluded')
         if not args.apply or not changed:return
         backup=target/'pre-change-backups'/('chat-update-'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
-        apply(source,target,changed,backup)
+        units = update_units(args, changed)
+        apply(source,target,changed,backup,unit_plan=units)
         print('Rollback receipt:',backup/'receipt.json')
         try:
-            subprocess.run(['systemctl','restart',args.service],check=True)
+            restart_units(units)
             if not ready(args.health_url):raise RuntimeError('Application readiness check failed')
         except Exception:
             rollback(backup)
-            subprocess.run(['systemctl','restart',args.service],check=True)
+            restart_units(units)
             if not ready(args.health_url):raise RuntimeError('Deployment failed; rollback also failed readiness; inspect service logs')
             raise RuntimeError('Deployment failed; previous files restored and readiness verified')
         print('Deployment ready at source commit',git(source,'rev-parse','HEAD'))

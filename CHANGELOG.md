@@ -5,6 +5,9 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Add a configured one-command application update/preview/rollback launcher.
+- Restart an active Telegram worker when its code changes and retain the restart plan for rollback.
+
 ### Added
 
 - Trustworthy owner overview, observation timestamps and connection recovery.

@@ -44,4 +44,6 @@ if grep -RInE --exclude=test-distribution.sh \
     echo "Distribution contains populated vessel identity or private key data" >&2
     exit 1
 fi
+bash -n "$ROOT/scripts/vesselstack-update"
+shellcheck "$ROOT/scripts/vesselstack-update"
 echo "distribution static checks passed"

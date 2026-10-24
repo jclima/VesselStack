@@ -1,0 +1,57 @@
+#!/bin/bash
+# Repeatable, preview-first application updates using private local paths.
+
+set -euo pipefail
+
+CONFIG_FILE="${VESSELSTACK_UPDATE_CONFIG:-/etc/vesselstack/update.env}"
+MODE=preview
+BACKUP=""
+
+usage() {
+    cat <<'HELP'
+Usage: sudo vesselstack-update [--apply | --rollback BACKUP_DIRECTORY]
+
+  (no arguments)   Pull clean source fast-forward, run tests, preview code changes
+  --apply          Pull, test, back up and apply application code; verify readiness
+  --rollback PATH  Restore a printed backup directory and verify readiness
+
+Local configuration: /etc/vesselstack/update.env
+Application updates exclude credentials, facts, databases and infrastructure.
+HELP
+}
+
+case "${1:-}" in
+    "") ;;
+    --apply) MODE=apply; shift ;;
+    --rollback)
+        [ $# -eq 2 ] || { usage >&2; exit 2; }
+        MODE=rollback
+        BACKUP=$2
+        shift 2
+        ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+[ $# -eq 0 ] || { usage >&2; exit 2; }
+[ -r "$CONFIG_FILE" ] || { echo "Missing readable update configuration: $CONFIG_FILE" >&2; exit 1; }
+# Operator-owned configuration contains paths and unit names, not credentials.
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+: "${SOURCE_DIRECTORY:?Set SOURCE_DIRECTORY in the update configuration}"
+: "${TARGET_DIRECTORY:?Set TARGET_DIRECTORY in the update configuration}"
+: "${CHAT_SERVICE:?Set CHAT_SERVICE in the update configuration}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8765/health}"
+
+HELPER="$SOURCE_DIRECTORY/scripts/deploy-chat.py"
+[ -f "$HELPER" ] || { echo "Missing deployment helper: $HELPER" >&2; exit 1; }
+ARGS=(--source "$SOURCE_DIRECTORY" --target "$TARGET_DIRECTORY"
+      --service "$CHAT_SERVICE" --health-url "$HEALTH_URL")
+if [ -n "${TELEGRAM_SERVICE:-}" ]; then
+    ARGS+=(--telegram-service "$TELEGRAM_SERVICE")
+fi
+case "$MODE" in
+    preview) ARGS+=(--pull) ;;
+    apply) ARGS+=(--pull --apply --restart-chat) ;;
+    rollback) ARGS+=(--rollback "$BACKUP" --apply --restart-chat) ;;
+esac
+exec python3 "$HELPER" "${ARGS[@]}"

@@ -102,3 +102,18 @@ sudo python3 /path/to/source/scripts/deploy-chat.py \
 Backup hashes are verified; later file edits block rollback. Retain receipts and
 backups privately. This development helper is not a replacement for release
 updates and cannot make database migrations reversible or prove navigation safety.
+
+## Daily update shortcut
+
+The README's one-time launcher installation exposes `sudo vesselstack-update`.
+Its private `/etc/vesselstack/update.env` sets source/live paths, unit names and
+health URL. It contains no API credentials and must remain root-owned/mode 600.
+Use preview after pushing from the development machine; add `--apply` when ready.
+The command performs a clean fast-forward pull and the helper's complete tests,
+backup and readiness workflow. A rollback takes the printed backup directory
+and never pulls new source. The active Telegram worker restarts only if its
+Python file changed, and the same restart plan is recorded for rollback.
+
+No scheduler or webhook automatically deploys changes. Git pulls alone cannot
+activate arbitrary infrastructure edits. Routine application updates are one
+command; release/schema/dependency changes still need separate review.
