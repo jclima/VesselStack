@@ -478,6 +478,11 @@ def main():
     parser.add_argument('--health-url',default='http://127.0.0.1:8765/health')
     parser.add_argument('--rollback',type=Path)
     args=parser.parse_args();source=args.source.resolve();target=args.target.resolve()
+    if os.geteuid()==0:
+        # Defence in depth behind the vesselstack-update launcher: root never runs a
+        # helper that an unprivileged account could have modified.
+        try:require_root_controlled(Path(__file__))
+        except RuntimeError as error:raise RuntimeError('Refusing to run as root from a location an unprivileged user controls ('+str(error)+'); run the root-owned copy installed by install.sh (/usr/local/libexec/vesselstack/deploy-chat.py)') from None
     if source==target or target.is_relative_to(source):parser.error('Source and live target must be separate; target cannot be inside source')
     if args.apply and not args.restart_chat:parser.error('--apply requires --restart-chat for readiness verification')
     if args.pull and not args.expected_remote:parser.error('--pull requires --expected-remote (or VESSELSTACK_UPDATE_REMOTE_URL)')

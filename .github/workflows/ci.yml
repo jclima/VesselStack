@@ -46,6 +46,8 @@ jobs:
         run: sudo tests/test-clean-install.sh
       - name: Offline and transactional install checks
         run: sudo tests/test-offline-install.sh
+      - name: Update launcher root-trust checks
+        run: sudo tests/test-update-launcher.sh
       - name: SocketCAN unit rendering checks
         run: tests/test-socketcan.sh
       - name: Release package content checks

@@ -33,7 +33,9 @@ Commands:
   restore ARCHIVE --yes [--skip-installer]
                                Stage and verify a backup, then swap it in; the
                                previous trees are kept as *.pre-restore-STAMP
-  update SOURCE_DIRECTORY      Back up and apply a reviewed release
+  update [--offline] SOURCE_DIRECTORY
+                               Back up and apply a reviewed release; --offline (or
+                               VESSELSTACK_OFFLINE=true) installs without network
   uninstall [--purge-data --yes]
                                Remove services; preserve data by default
 EOF
@@ -575,11 +577,25 @@ PY
 }
 
 update_stack() {
-    local source=$1
+    local source='' offline=${VESSELSTACK_OFFLINE:-false} argument
+    for argument in "$@"; do
+        case "$argument" in
+            --offline) offline=true ;;
+            -*) usage >&2; exit 2 ;;
+            *) [ -z "$source" ] || { usage >&2; exit 2; }; source=$argument ;;
+        esac
+    done
+    [ -n "$source" ] || { usage >&2; exit 2; }
+    case "$offline" in
+        true|false) ;;
+        *) echo "VESSELSTACK_OFFLINE must be true or false" >&2; exit 1 ;;
+    esac
+    local install_args=(--config "$ENV_FILE")
+    [ "$offline" != true ] || install_args+=(--offline)
     [ -x "$source/install.sh" ] || { echo "Not a VesselStack release directory: $source" >&2; exit 1; }
-    "$source/install.sh" --config "$ENV_FILE" --dry-run
+    "$source/install.sh" "${install_args[@]}" --dry-run
     backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}"
-    "$source/install.sh" --config "$ENV_FILE" --start
+    "$source/install.sh" "${install_args[@]}" --start
 }
 
 uninstall_stack() {
@@ -646,7 +662,7 @@ case "$command" in
     backup) backup_stack "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
     restore) [ $# -ge 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
-    update) [ $# -eq 1 ] || { usage; exit 2; }; update_stack "$1" ;;
+    update) [ $# -ge 1 ] || { usage; exit 2; }; update_stack "$@" ;;
     uninstall) uninstall_stack "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
 esac

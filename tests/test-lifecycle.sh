@@ -97,6 +97,34 @@ archive=$(run_ctl backup "$BACKUP_ROOT" | tail -n 1)
 [ -s "$archive" ]
 [ -s "$archive.sha256" ]
 run_ctl verify-backup "$archive" | grep -q 'Backup verified'
+
+# `update` passes offline mode through to the release's install.sh (flag or env).
+UPDATE_SOURCE="$TEST_ROOT/update-source"
+install -d "$UPDATE_SOURCE"
+printf '#!/bin/bash\necho "$*" >> "%s/update-args"\n' "$TEST_ROOT" > "$UPDATE_SOURCE/install.sh"
+chmod +x "$UPDATE_SOURCE/install.sh"
+run_ctl update "$UPDATE_SOURCE" >/dev/null
+test "$(wc -l < "$TEST_ROOT/update-args")" -eq 2
+if grep -q -- '--offline' "$TEST_ROOT/update-args"; then
+    echo 'update passed --offline without being asked' >&2
+    exit 1
+fi
+grep -q -- '--dry-run' "$TEST_ROOT/update-args"
+grep -q -- '--start' "$TEST_ROOT/update-args"
+: > "$TEST_ROOT/update-args"
+run_ctl update --offline "$UPDATE_SOURCE" >/dev/null
+test "$(grep -c -- '--offline' "$TEST_ROOT/update-args")" -eq 2
+: > "$TEST_ROOT/update-args"
+VESSELSTACK_OFFLINE=true run_ctl update "$UPDATE_SOURCE" >/dev/null
+test "$(grep -c -- '--offline' "$TEST_ROOT/update-args")" -eq 2
+if VESSELSTACK_OFFLINE=maybe run_ctl update "$UPDATE_SOURCE" >/dev/null 2>&1; then
+    echo 'update accepted an invalid VESSELSTACK_OFFLINE' >&2
+    exit 1
+fi
+if run_ctl update --bogus "$UPDATE_SOURCE" >/dev/null 2>&1; then
+    echo 'update accepted an unknown option' >&2
+    exit 1
+fi
 if run_ctl backup "$DATA_ROOT/recursive-backups" >/dev/null 2>&1; then
     echo 'Backup accepted a destination inside the data tree' >&2
     exit 1

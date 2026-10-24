@@ -111,6 +111,12 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 
 test -x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
+# The update launcher and the helper root executes are installed root-owned (0755)
+# in a root-owned directory chain, never run from a source checkout.
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update")" = "0:755"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py")" = "0:755"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack")" = "0:755"
+cmp "$REPO_ROOT/scripts/deploy-chat.py" "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-control-panel.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat-telegram.service"
@@ -121,6 +127,9 @@ test -s "$APP_ROOT/installer/install.sh"
 test -s "$APP_ROOT/config/grafana/dashboards/system-health.json"
 test -s "$DATA_ROOT/homeassistant/blueprints/automation/vesselstack/low-battery.yaml"
 test -s "$DATA_ROOT/homeassistant/vesselstack-dashboard.example.yaml"
+# The data root is root-owned (service group, 0750); only leaf mount roots belong to
+# the accounts that write them.
+test "$(stat -c '%u:%a' "$DATA_ROOT")" = "0:750"
 test "$(stat -c '%u:%g' "$DATA_ROOT/influxdb")" = "1000:1000"
 test "$(stat -c '%u:%g' "$DATA_ROOT/grafana")" = "472:0"
 # Code, venv and generated facts are not writable by the service user; the
@@ -218,13 +227,100 @@ grep -q 'moved legacy' "$TEST_ROOT/quarantine.stderr"
 test ! -e "$APP_ROOT/boat-chat/memory"
 test ! -e "$APP_ROOT/boat-chat/data"
 test ! -e "$APP_ROOT/boat-chat/boat-chat.env"
-quarantine=$(find "$DATA_ROOT" -maxdepth 1 -type d -name 'boat-chat-legacy-*' | head -n 1)
+QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
+quarantine=$(find "$QUARANTINE_ROOT" -maxdepth 1 -type d -name 'boat-chat-legacy-*' | head -n 1)
 test -n "$quarantine"
+test "$(stat -c '%u:%a' "$QUARANTINE_ROOT")" = "0:700"
 test "$(stat -c '%u:%a' "$quarantine")" = "0:700"
+# Never inside the service-writable data tree.
+test -z "$(find "$DATA_ROOT" -maxdepth 1 -name 'boat-chat-legacy-*' -print -quit)"
 grep -qx 'legacy-memory' "$quarantine/memory/legacy.txt"
 grep -qx 'legacy-data' "$quarantine/data/legacy.txt"
 grep -qx 'OPENAI_API_KEY=legacy-secret' "$quarantine/boat-chat.env"
 grep -qx 'current' "$DATA_ROOT/boat-chat/memory/current.txt"
 test -z "$(find "$APP_ROOT/boat-chat" -not -type l \( -perm -g=w -o -perm -o=w \) -print -quit)"
+
+# Non-root service user: ownership model, symlink refusal and quarantine relocation.
+# Needs a real second account, so it only runs as root where useradd exists.
+if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
+    svc="vsstest$$"
+    useradd --system --no-create-home --user-group --shell /usr/sbin/nologin "$svc"
+    trap 'rm -rf -- "$TEST_ROOT"; userdel "$svc" 2>/dev/null || true' EXIT
+    chmod 0755 "$TEST_ROOT"
+    svc_gid=$(id -g "$svc")
+    APP2="$TEST_ROOT/opt2/vesselstack"
+    DATA2="$TEST_ROOT/opt2/vesselstack-data"
+    CONFIG2="$TEST_ROOT/service-user.env"
+    VICTIM="$TEST_ROOT/victim"
+    install -d -m 0755 "$TEST_ROOT/opt2"
+    sed -e "s|^VESSELSTACK_USER=.*|VESSELSTACK_USER=\"$svc\"|" \
+        -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$APP2\"|" \
+        -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$DATA2\"|" "$CONFIG" > "$CONFIG2"
+    # shellcheck disable=SC2120  # Optional extra installer arguments.
+    install_two() {
+        env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+            "$REPO_ROOT/install.sh" --config "$CONFIG2" "$@"
+    }
+    # An upgrade from a release where the service user owned the data root and had
+    # planted a symlink: root must refuse before chowning through it.
+    install -d -m 0750 -o "$svc" -g "$svc" "$DATA2" "$VICTIM"
+    chown root:root "$VICTIM"
+    ln -s "$VICTIM" "$DATA2/grafana"
+    chown -h "$svc:$svc" "$DATA2/grafana"
+    if install_two >/dev/null 2>"$TEST_ROOT/symlink.stderr"; then
+        echo "Installer followed a service-planted symlink" >&2
+        exit 1
+    fi
+    grep -q 'is a symlink' "$TEST_ROOT/symlink.stderr"
+    test "$(stat -c '%u:%g' "$VICTIM")" = "0:0"
+    rm -f -- "$DATA2/grafana"
+    install_two >/dev/null
+    test "$(stat -c '%u:%g:%a' "$DATA2")" = "0:$svc_gid:750"
+    test "$(stat -c '%u:%g' "$DATA2/influxdb")" = "1000:1000"
+    test "$(stat -c '%u:%g' "$DATA2/grafana")" = "472:0"
+    test "$(stat -c '%U' "$DATA2/boat-chat")" = "$svc"
+    test "$(stat -c '%u' "$DATA2/homeassistant")" = 0
+    # The service user can write its state directory but cannot create, rename or
+    # replace anything directly under the data root.
+    runuser -u "$svc" -- touch "$DATA2/boat-chat/state-write-test"
+    if runuser -u "$svc" -- touch "$DATA2/planted" 2>/dev/null; then
+        echo "Service user can create entries in the data root" >&2
+        exit 1
+    fi
+    if runuser -u "$svc" -- mv "$DATA2/boat-chat" "$DATA2/boat-chat.moved" 2>/dev/null; then
+        echo "Service user can rename a managed data entry" >&2
+        exit 1
+    fi
+    # A managed intermediate directory that is not root-owned is refused, not followed.
+    chown "$svc:$svc" "$DATA2/homeassistant"
+    if install_two >/dev/null 2>"$TEST_ROOT/owner.stderr"; then
+        echo "Installer wrote through a service-owned intermediate directory" >&2
+        exit 1
+    fi
+    grep -q 'must be owned by root' "$TEST_ROOT/owner.stderr"
+    chown root:root "$DATA2/homeassistant"
+    # Quarantine directories created in the data tree by earlier builds move out of it.
+    install -d -m 0700 "$DATA2/boat-chat-legacy-earlier.ABC123"
+    printf 'old\n' > "$DATA2/boat-chat-legacy-earlier.ABC123/file"
+    # A dangling symlink planted at a migration destination is never followed.
+    install -d "$APP2/boat-chat/memory"
+    printf 'legacy\n' > "$APP2/boat-chat/memory/legacy.txt"
+    ln -s "$TEST_ROOT/not-created" "$DATA2/boat-chat/memory"
+    install_two >/dev/null 2>"$TEST_ROOT/relocate.stderr"
+    test ! -e "$DATA2/boat-chat-legacy-earlier.ABC123"
+    test -f "$QUARANTINE_ROOT/boat-chat-legacy-earlier.ABC123/file"
+    test ! -e "$TEST_ROOT/not-created"
+    test ! -e "$APP2/boat-chat/memory"
+    grep -q 'moved legacy' "$TEST_ROOT/relocate.stderr"
+    # A symlinked quarantine root is refused.
+    rm -rf -- "$QUARANTINE_ROOT"
+    ln -s "$VICTIM" "$QUARANTINE_ROOT"
+    install -d "$APP2/boat-chat/memory"
+    if install_two >/dev/null 2>&1; then
+        echo "Installer accepted a symlinked quarantine root" >&2
+        exit 1
+    fi
+    rm -f -- "$QUARANTINE_ROOT"
+fi
 
 echo "clean installation checks passed"

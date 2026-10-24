@@ -78,7 +78,7 @@ without applying them. An advisory lock file is created in the live directory.
 Apply a reviewed preview explicitly:
 
 ```bash
-sudo python3 /path/to/source/scripts/deploy-chat.py \
+sudo python3 /usr/local/libexec/vesselstack/deploy-chat.py \
   --source /path/to/source --target /path/to/installed/app --apply --restart-chat
 ```
 
@@ -97,7 +97,7 @@ A failed restart/readiness check restores previous code and restarts it. If that
 recovery fails, inspect logs and use the printed receipt. Manual code rollback is:
 
 ```bash
-sudo python3 /path/to/source/scripts/deploy-chat.py \
+sudo python3 /usr/local/libexec/vesselstack/deploy-chat.py \
   --target /path/to/installed/app --rollback /path/to/backup-directory \
   --apply --restart-chat
 ```
@@ -108,7 +108,9 @@ updates and cannot make database migrations reversible or prove navigation safet
 
 ## Daily update shortcut
 
-The README's one-time launcher installation exposes `sudo vesselstack-update`.
+The installer places `sudo vesselstack-update` and its root-owned helper
+(`/usr/local/libexec/vesselstack/deploy-chat.py`); as root the launcher never runs
+the checkout's copy. Non-root development runs fall back to the checkout helper.
 Its private `/etc/vesselstack/update.env` sets source/live paths, unit names and
 health URL. It contains no API credentials and must remain root-owned/mode 600.
 Use preview after pushing from the development machine; add `--apply` when ready.

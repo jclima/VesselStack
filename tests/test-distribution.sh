@@ -9,7 +9,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
-    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh"
+    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
@@ -18,7 +18,7 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
-    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh"
+    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh"
 grep -q 'GENERATE' "$ROOT/vesselstack.example.env"
 grep -q 'INFLUXDB_HISTORY_BUCKET' "$ROOT/vesselstack.example.env"
 grep -q 'verify-backup' "$ROOT/scripts/vesselstackctl"
@@ -78,6 +78,15 @@ grep -qF '@CAN_LINK_ARGS@' "$ROOT/systemd/vesselstack-socketcan.service.in"
 grep -q 'VESSELSTACK_CAN_CREATE_VCAN' "$ROOT/vesselstack.example.env"
 test -x "$ROOT/scripts/prepare-offline-bundle.sh"
 python3 -m unittest "$ROOT/tests/test_access_security.py"
+# Quarantined legacy state must live outside the service-writable data tree, and
+# root must never execute the update helper from a source checkout.
+# shellcheck disable=SC2016  # Literal pattern, not an expansion.
+if grep -n 'mktemp -d "\$VESSELSTACK_DATA/boat-chat-legacy' "$ROOT/install.sh"; then
+    echo "install.sh must not create the legacy quarantine inside VESSELSTACK_DATA" >&2
+    exit 1
+fi
+grep -qF '$LIBEXEC_DIR/deploy-chat.py' "$ROOT/install.sh"
+grep -qF 'exec python3 -I "$HELPER"' "$ROOT/scripts/vesselstack-update"
 bash -n "$ROOT/scripts/vesselstack-update"
 shellcheck "$ROOT/scripts/vesselstack-update"
 echo "distribution static checks passed"

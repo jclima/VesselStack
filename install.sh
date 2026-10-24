@@ -10,6 +10,8 @@ CONFIG_FILE="$SCRIPT_DIR/vesselstack.env"
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
+LIBEXEC_PARENT="$SYSTEM_ROOT/usr/local/libexec"
+LIBEXEC_DIR="$LIBEXEC_PARENT/vesselstack"
 RELEASES_DIR="$SYSTEM_ROOT/var/lib/vesselstack/releases"
 START=0
 DRY_RUN=0
@@ -387,19 +389,39 @@ BOAT_CHAT_ACCESS_TOKEN=$(generate_secret "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}")
 CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 
-# VESSELSTACK_DATA belongs to the service user, who could replace any entry in it
-# with a symlink. Root must never create, chown or write through such a path.
-refuse_symlinked_path() {
-    local path=$1 current=$VESSELSTACK_DATA part
+# Ownership model for VESSELSTACK_DATA: the directory itself and every managed
+# intermediate component is ROOT-owned and not writable by the service user, so the
+# service user can never rename, replace or symlink an entry that root later
+# creates, chowns or writes through (no check-then-use race). Only the leaf mount
+# roots are owned by the account that must write them (InfluxDB uid 1000, Grafana
+# uid 472, the service user for boat-chat and native SignalK state).
+fail_data_path() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+safe_data_path() {
+    # $1: path under VESSELSTACK_DATA. Every existing component must be a real
+    # directory/file (never a symlink) and, except an optional leaf, root-owned and
+    # not group/world-writable. Mode "leaf" lets the final component exist with any
+    # owner (a service-owned mount root) but still never as a symlink.
+    local path=$1 mode=${2:-strict} current=$VESSELSTACK_DATA part owner perms index=0 count
     local rest=${path#"$VESSELSTACK_DATA"}
-    [ ! -L "$VESSELSTACK_DATA" ] || { echo "ERROR: $VESSELSTACK_DATA is a symlink" >&2; exit 1; }
+    local -a parts
     IFS=/ read -ra parts <<<"${rest#/}"
+    count=${#parts[@]}
     for part in "${parts[@]}"; do
+        index=$((index + 1))
         [ -n "$part" ] || continue
         current=$current/$part
-        if [ -L "$current" ]; then
-            echo "ERROR: $current is a symlink in the service-writable data directory; remove it and rerun" >&2
-            exit 1
+        [ -e "$current" ] || [ -L "$current" ] || return 0
+        [ ! -L "$current" ] || fail_data_path "$current is a symlink inside the data directory; remove it and rerun"
+        if [ "$index" -eq "$count" ] && [ "$mode" = leaf ]; then
+            continue
+        fi
+        owner=$(stat -c %u "$current")
+        perms=$(stat -c %a "$current")
+        if [ "$owner" != 0 ] || [ $((8#$perms & 8#022)) -ne 0 ]; then
+            fail_data_path "$current must be owned by root and not group/world-writable (found uid $owner mode $perms); fix with: chown root:root '$current' && chmod go-w '$current'"
         fi
     done
 }
@@ -408,45 +430,82 @@ install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
-install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
+[ ! -L "$VESSELSTACK_DATA" ] || fail_data_path "$VESSELSTACK_DATA is a symlink"
+# Take the data root away from the service user FIRST (upgrades from releases where
+# it was service-owned): it stays traversable by the service group but is not
+# writable. Entries planted before this point are rejected by the checks below.
+install -d -m 0750 -o root -g "$VESSELSTACK_GID" "$VESSELSTACK_DATA"
+for managed in influxdb grafana boat-chat signalk mosquitto; do
+    safe_data_path "$VESSELSTACK_DATA/$managed" leaf
+done
 # Official images run their data processes as these fixed container users.
 # Change only the mount root itself; never recursively rewrite existing data.
-refuse_symlinked_path "$VESSELSTACK_DATA/influxdb"
-refuse_symlinked_path "$VESSELSTACK_DATA/grafana"
 install -d -m 0750 -o 1000 -g 1000 "$VESSELSTACK_DATA/influxdb"
 install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
 # Code and the Python virtualenv are root-owned; the service user may only write
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
-refuse_symlinked_path "$BOAT_CHAT_STATE"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
+# Quarantined legacy state lives OUTSIDE every service-writable tree.
+QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
+ensure_quarantine_root() {
+    [ ! -L "$QUARANTINE_ROOT" ] || fail_data_path "$QUARANTINE_ROOT is a symlink"
+    install -d -m 0700 -o root -g root "$QUARANTINE_ROOT"
+    python3 - "$QUARANTINE_ROOT" <<'PY' || fail_data_path "$QUARANTINE_ROOT must be a root-owned directory with mode 0700 (not a symlink)"
+import os
+import stat
+import sys
+
+info = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+    raise SystemExit(1)
+PY
+}
 LEGACY_QUARANTINE=
 quarantine_legacy() {
     # Legacy runtime state that cannot be migrated is moved (never deleted) into a
-    # root-only directory outside the code tree, so the recursive chown/chmod of
-    # the code tree below cannot expose it and nothing sensitive stays readable.
+    # root-only directory outside the code tree and outside the service-writable
+    # data tree, so nothing sensitive stays readable or replaceable by the service user.
     local old=$1
     if [ -z "$LEGACY_QUARANTINE" ]; then
-        LEGACY_QUARANTINE=$(mktemp -d "$VESSELSTACK_DATA/boat-chat-legacy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
-        chown -h root:root "$LEGACY_QUARANTINE"
+        ensure_quarantine_root
+        LEGACY_QUARANTINE=$(mktemp -d "$QUARANTINE_ROOT/boat-chat-legacy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+        chmod 0700 "$LEGACY_QUARANTINE"
     fi
     mv -- "$old" "$LEGACY_QUARANTINE/"
     echo "WARNING: moved legacy $old to $LEGACY_QUARANTINE (root-only); review and merge manually, then remove it" >&2
 }
+# Earlier 1.4.0 builds created quarantine directories inside the data tree.
+for earlier_quarantine in "$VESSELSTACK_DATA"/boat-chat-legacy-*; do
+    if [ -d "$earlier_quarantine" ] && [ ! -L "$earlier_quarantine" ]; then
+        ensure_quarantine_root
+        mv -- "$earlier_quarantine" "$QUARANTINE_ROOT/"
+        echo "WARNING: moved earlier quarantine $earlier_quarantine to $QUARANTINE_ROOT/ (it sat in a service-writable tree; treat its contents as untrusted)" >&2
+    fi
+done
 migrate_runtime_path() {
-    local old="$VESSELSTACK_ROOT/boat-chat/$1" new="$BOAT_CHAT_STATE/$1"
+    local name=$1 old="$VESSELSTACK_ROOT/boat-chat/$1" new="$BOAT_CHAT_STATE/$1" stage
     if [ -L "$old" ]; then
         rm -f -- "$old"
         return 0
     fi
     [ -e "$old" ] || return 0
-    if [ -e "$new" ]; then
+    if [ -e "$new" ] || [ -L "$new" ]; then
         quarantine_legacy "$old"
         return 0
     fi
-    cp -a -- "$old" "$new"
-    chown -hR "$VESSELSTACK_USER:$VESSELSTACK_USER" "$new"
-    rm -rf -- "$old"
+    # The state directory is writable by the service user, so copy and chown in a
+    # root-only staging directory and publish with rename(2), which never follows a
+    # symlink planted at the destination.
+    stage=$(mktemp -d "$VESSELSTACK_DATA/.migrate.XXXXXX")
+    cp -a -- "$old" "$stage/$name"
+    chown -hR "$VESSELSTACK_USER:$VESSELSTACK_USER" "$stage/$name"
+    if mv -T -- "$stage/$name" "$new" 2>/dev/null; then
+        rm -rf -- "$stage" "$old"
+    else
+        rm -rf -- "$stage"
+        quarantine_legacy "$old"
+    fi
 }
 if [ -e "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -e "$VESSELSTACK_ROOT/boat-chat/data" ] \
     || [ -e "$VESSELSTACK_ROOT/boat-chat/boat-chat.env" ] \
@@ -502,8 +561,8 @@ install -m 0644 "$SCRIPT_DIR/templates/grafana/provisioning/dashboards/vesselsta
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards/vesselstack.yml"
 install -m 0644 "$SCRIPT_DIR/templates/grafana/dashboards/system-health.json" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards/system-health.json"
-refuse_symlinked_path "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
-refuse_symlinked_path "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml"
+safe_data_path "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
+safe_data_path "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml" leaf
 install -d -m 0755 "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
 for blueprint in "$SCRIPT_DIR"/templates/homeassistant/blueprints/automation/vesselstack/*.yaml; do
     install -m 0644 "$blueprint" \
@@ -513,6 +572,12 @@ install -m 0644 "$SCRIPT_DIR/templates/homeassistant/lovelace-vesselstack.exampl
     "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml"
 install -m 0755 "$SCRIPT_DIR/scripts/vesselstackctl" "$SBIN_DIR/vesselstackctl"
 install -m 0755 "$SCRIPT_DIR/scripts/vesselstack-firewall" "$SBIN_DIR/vesselstack-firewall"
+# The update launcher and the helper it runs as root are installed root-owned and
+# never executed from a source checkout. A new helper version only arrives through
+# this installer (i.e. from a reviewed/verified release tree).
+install -d -m 0755 -o root -g root "$LIBEXEC_PARENT" "$LIBEXEC_DIR"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-update" "$SBIN_DIR/vesselstack-update"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"

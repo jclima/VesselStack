@@ -517,9 +517,30 @@ reachable on all interfaces or only this device.
 Hardening of service-writable paths: the control panel clears stale Settings
 overrides without following symlinks (it refuses a symlinked override file,
 writes through a random `O_EXCL` temporary file and sets mode/owner on the open
-descriptor). The installer refuses to proceed if any managed entry under the
-service-writable data directory (`influxdb`, `grafana`, `boat-chat`,
-`homeassistant/...`) is a symlink: remove the symlink and rerun.
+descriptor).
+
+**Data-directory ownership (no check-then-use race).** `VESSELSTACK_DATA` is
+`root:<service group>` mode 0750: the service user can traverse it but cannot
+create, rename, replace or symlink anything directly in it. Only the leaf mount
+roots belong to the accounts that must write them: `influxdb` (uid/gid 1000),
+`grafana` (uid 472, gid 0) and `boat-chat` (service user; native SignalK state
+`signalk` likewise). Intermediate directories the installer writes through
+(`homeassistant`, `homeassistant/blueprints/...`) must be root-owned and not
+group/world-writable. Before touching anything the installer refuses, with a
+message naming the path, a symlink at any managed entry (`influxdb`, `grafana`,
+`boat-chat`, `signalk`, `mosquitto`, `homeassistant/...`) or a managed
+intermediate directory that is not root-owned; fix it as the message says and
+rerun. Because the service user cannot alter the parent, a symlink cannot be
+swapped in between the check and the `install -d`/`chown`. Legacy runtime
+state is copied and chowned in a root-only staging directory and published with
+`rename(2)` (which never follows a symlink at the destination); a destination
+that already exists or is a symlink sends the legacy copy to quarantine instead.
+Upgrade: installs from earlier 1.4.0 builds had a service-owned data root; the
+first run of this installer takes ownership of the data root (not recursive:
+existing database files keep their owners) and moves old quarantine directories
+out of it. Rollback: `chown -R` is not needed; reinstalling the previous release
+makes the data root service-owned again, and restoring a backup keeps recorded
+owners.
 
 Security layout (1.3.x hardening): the installed application code, its Python
 virtualenv and the generated `boat_facts.json` are owned by `root` and are not
@@ -815,6 +836,7 @@ perform preflight, a verified pre-update backup, installation, and startup:
 
 ```bash
 sudo vesselstackctl update /path/to/VesselStack-release
+sudo vesselstackctl update --offline /path/to/VesselStack-release   # no network
 ```
 
 For Control Panel updates, stage the reviewed release beneath its restricted
@@ -894,8 +916,12 @@ containers with `docker compose up -d --pull never`. If an image is missing the
 installer lists it with the `docker load` hint: `--start` fails before changing
 anything, while a plain render only warns. Offline mode never contacts a
 registry or PyPI; SignalK/InfluxDB version bumps still need a new bundle.
-`vesselstackctl update` does not yet pass `--offline` through; run `install.sh`
-directly for offline releases. Rollback: restore the pre-update backup.
+`sudo vesselstackctl update --offline /path/to/release` (or
+`VESSELSTACK_OFFLINE=true sudo -E vesselstackctl update /path/to/release`) passes
+`--offline` to both the preflight and the install of that release; any value other
+than `true`/`false` in `VESSELSTACK_OFFLINE` is rejected. Without the flag or
+variable the behaviour is unchanged (network installs). Rollback: restore the
+pre-update backup.
 
 ## Stopping or removing services
 
@@ -979,6 +1005,7 @@ tests/test-service-integration.sh
 tests/test-build-package.sh
 tests/test-socketcan.sh
 sudo tests/test-offline-install.sh
+sudo tests/test-update-launcher.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -1126,13 +1153,23 @@ separate reviewed work. Source facts now live in `boat_facts.example.json`; actu
   owner's keyring is no longer consulted).
 - Legacy `boat-chat/{memory,data,boat-chat.env}` left under the code tree
   because the new location already existed are moved to a root-only
-  `$VESSELSTACK_DATA/boat-chat-legacy-<timestamp>` directory with a warning;
-  nothing is deleted. Review, merge what you need and remove it.
+  `/var/lib/vesselstack/quarantine/boat-chat-legacy-<timestamp>.XXXXXX` directory
+  (see below) with a warning; nothing is deleted. Review, merge what you need and remove it.
 
 **Verification.** `python3 -m unittest discover -s tests -p 'test_*.py'`,
-`tests/test-distribution.sh`, `tests/test-clean-install.sh` (as root, on Linux),
+`tests/test-distribution.sh`, `tests/test-clean-install.sh` and
+`tests/test-update-launcher.sh` (as root, on Linux),
 `vesselstackctl doctor` (disk line), and
 `docker exec vesselstack-influxdb influx bucket list` after `restart`.
+
+- The legacy quarantine moved out of the data tree: it is now
+  `/var/lib/vesselstack/quarantine/boat-chat-legacy-<timestamp>.XXXXXX` (root
+  0700, verified not to be a symlink), outside every service-writable path.
+  Quarantine directories that earlier 1.4.0 builds created in
+  `$VESSELSTACK_DATA` are moved there on the next install.
+- The installer now installs `vesselstack-update` (`/usr/local/sbin`) and its
+  helper (`/usr/local/libexec/vesselstack/deploy-chat.py`) root-owned; see
+  "One-command application updates" for the new root-only rules.
 
 **Rollback.** Install the previous release's scripts and re-run the installer;
 secrets are preserved either way. Unset `INFLUXDB_RAW_RETENTION` (deleted raw data
@@ -1143,14 +1180,36 @@ deleted once reviewed.
 
 ### One-command application updates
 
-Install the stable launcher and a private per-machine configuration once:
+`install.sh` installs the launcher (`/usr/local/sbin/vesselstack-update`) and the
+helper it runs (`/usr/local/libexec/vesselstack/deploy-chat.py`), both
+`root:root` mode 0755 in root-owned directories. **Bootstrap:** the first copy of
+the helper comes from running the installer once (`sudo ./install.sh --config ...`);
+until then the launcher refuses to run as root. New helper versions only arrive
+the same way, i.e. through a reviewed release installed by `install.sh` /
+`vesselstackctl update`, never from the update flow itself. Then create the
+private per-machine configuration once:
 
 ```bash
-sudo install -m 0755 scripts/vesselstack-update /usr/local/sbin/vesselstack-update
 sudo install -d -m 0755 /etc/vesselstack
 sudo install -m 0600 templates/update.env.example /etc/vesselstack/update.env
 sudoedit /etc/vesselstack/update.env
 ```
+
+As root the launcher enforces: (1) `update.env` and every parent directory up to
+`/` must be root-owned and not group/world-writable (the file is sourced as
+root), and it must not live inside `SOURCE_DIRECTORY`; (2) it executes **only**
+the installed helper, never `scripts/deploy-chat.py` from the checkout, and
+only if that file and its whole path chain are root-owned and not
+group/world-writable; (3) the helper itself also refuses to run as root from a
+location an unprivileged user controls (this includes calling a source-checkout
+copy directly with `sudo python3 .../scripts/deploy-chat.py`; use the installed
+copy). Home-lab development as a normal user (non-root) still works: the
+launcher then prefers `scripts/deploy-chat.py` from the checkout (falling back to
+the installed copy) and applies none of the root-ownership checks; the helper's
+own pull/verify/test logic is unchanged. Upgrade: run the installer once; the
+old manually installed launcher keeps working only after the helper exists.
+Rollback: reinstall the previous release (its installer places the previous
+launcher/helper); nothing else changes.
 
 Set the separate source/live paths and actual chat/Telegram unit names. After
 pushing changes to the source checkout's upstream branch, run on the boat:
@@ -1205,6 +1264,7 @@ and used during rollback. Restore a printed backup directory with
 
 These commands update Boat Chat Python/static assets. Dependencies, migrations,
 service definitions, dashboards and container/infrastructure changes require the
-separate reviewed release workflow. The launcher/config stay installed locally
-across Git pulls; reinstall the launcher deliberately when its interface changes.
+separate reviewed release workflow. The launcher, helper and config stay installed
+locally across Git pulls; they change only when you run a reviewed release's
+`install.sh` (the update flow never replaces its own helper).
 See [development/update details](docs/DEVELOPMENT.md).

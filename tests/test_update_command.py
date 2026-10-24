@@ -59,6 +59,22 @@ class UpdateCommandTests(unittest.TestCase):
         self.assertNotIn('--pull',argv)
         self.assertEqual(argv[argv.index('--rollback')+1],'/example/backup with spaces')
 
+    def test_non_root_prefers_checkout_helper_for_development(self):
+        result=self.run_command();argv=json.loads(result.stdout)
+        self.assertEqual(argv[0],'-I');self.assertEqual(argv[1],str(self.source/'scripts/deploy-chat.py'))
+
+    def test_non_root_falls_back_to_installed_helper(self):
+        (self.source/'scripts/deploy-chat.py').unlink()
+        system=self.root/'system';helper=system/'usr/local/libexec/vesselstack/deploy-chat.py'
+        helper.parent.mkdir(parents=True);helper.touch()
+        self.env['VESSELSTACK_SYSTEM_ROOT']=str(system)
+        argv=json.loads(self.run_command().stdout);self.assertEqual(argv[1],str(helper))
+
+    def test_missing_helper_everywhere_fails(self):
+        (self.source/'scripts/deploy-chat.py').unlink()
+        self.env['VESSELSTACK_SYSTEM_ROOT']=str(self.root/'empty')
+        result=self.run_command();self.assertNotEqual(result.returncode,0);self.assertIn('Missing deployment helper',result.stderr)
+
     def test_unknown_or_extra_arguments_fail(self):
         for args in [('--unknown',),('--apply','extra'),('--rollback',)]:
             self.assertEqual(self.run_command(*args).returncode,2)
