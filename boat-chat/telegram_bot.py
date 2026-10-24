@@ -16,8 +16,11 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
-ENV_CONFIG = ROOT / "boat-chat.env"
-STATE_DIR = ROOT / "memory"
+# Runtime-written files live under BOAT_CHAT_STATE_DIR (VESSELSTACK_DATA/boat-chat
+# when installed); the code directory is root-owned. Defaults to ROOT for development.
+RUNTIME_DIR = Path(os.environ.get("BOAT_CHAT_STATE_DIR") or ROOT)
+ENV_CONFIG = RUNTIME_DIR / "boat-chat.env"
+STATE_DIR = RUNTIME_DIR / "memory"
 OFFSET_FILE = STATE_DIR / "telegram-offset.json"
 CONVERSATIONS_FILE = STATE_DIR / "telegram-conversations.json"
 DEFAULT_BOAT_CHAT_URL = "http://127.0.0.1:8765"

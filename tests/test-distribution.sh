@@ -44,6 +44,19 @@ if grep -RInE --exclude=test-distribution.sh \
     echo "Distribution contains populated vessel identity or private key data" >&2
     exit 1
 fi
+for unit in vesselstack-chat vesselstack-chat-telegram vesselstack-telemetry-indexer; do
+    for directive in ProtectSystem=strict ProtectHome=true NoNewPrivileges=true PrivateTmp=true \
+        'ReadWritePaths=@VESSELSTACK_DATA@/boat-chat' 'BOAT_CHAT_STATE_DIR=@VESSELSTACK_DATA@/boat-chat'; do
+        grep -qxF "$directive" "$ROOT/systemd/$unit.service.in" \
+            || grep -qxF "Environment=$directive" "$ROOT/systemd/$unit.service.in" \
+            || { echo "$unit.service.in is missing $directive" >&2; exit 1; }
+    done
+done
+# shellcheck disable=SC2016  # Literal pattern, not an expansion.
+if grep -n 'chown -R "\$VESSELSTACK_USER:\$VESSELSTACK_USER" "\$VESSELSTACK_ROOT/boat-chat"' "$ROOT/install.sh"; then
+    echo "install.sh must not make application code/venv writable by the service user" >&2
+    exit 1
+fi
 bash -n "$ROOT/scripts/vesselstack-update"
 shellcheck "$ROOT/scripts/vesselstack-update"
 echo "distribution static checks passed"

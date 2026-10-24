@@ -334,6 +334,26 @@ def component_command(component: str, verb: str) -> list[str]:
     raise ValueError("Unknown component")
 
 
+def verify_release_path(path: Path) -> None:
+    stat = path.lstat()
+    if stat.st_uid not in {0, os.geteuid()} or stat.st_mode & 0o022:
+        raise ValueError("Reviewed release paths must be root/panel-owner controlled and not group/world writable")
+
+
+def verify_release_tree(release: Path) -> None:
+    """Reject any symlink, foreign owner or group/world-writable entry in the release.
+
+    install.sh runs as root and executes/copies scripts/, boat-chat/, templates/
+    and systemd/, so the whole tree must be tamper-resistant, not just its top.
+    """
+    for directory, subdirectories, filenames in os.walk(release, followlinks=False):
+        for name in [*subdirectories, *filenames]:
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise ValueError("Reviewed release must not contain symbolic links")
+            verify_release_path(path)
+
+
 def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
     if action in {"preflight", "apply", "install"}:
         if not INSTALLER.is_file():
@@ -358,13 +378,11 @@ def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
             resolved.relative_to(reviewed_root)
         except (FileNotFoundError, ValueError) as exc:
             raise ValueError(f"Update source must be inside {REVIEWED_RELEASE_ROOT}") from exc
-        candidates = [reviewed_root, resolved, resolved / "install.sh", resolved / "VERSION"]
-        if source.is_symlink() or not candidates[-2].is_file() or not candidates[-1].is_file():
+        if source.is_symlink() or not (resolved / "install.sh").is_file() or not (resolved / "VERSION").is_file():
             raise ValueError("Reviewed release must contain regular install.sh and VERSION files")
-        for candidate in candidates:
-            stat = candidate.stat()
-            if stat.st_uid != os.geteuid() or stat.st_mode & 0o022:
-                raise ValueError("Reviewed release paths must be panel-owner controlled and not group/world writable")
+        for candidate in (reviewed_root, resolved):
+            verify_release_path(candidate)
+        verify_release_tree(resolved)
         return [str(CTL), "update", str(resolved)]
     raise ValueError("Unsupported action")
 

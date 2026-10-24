@@ -81,7 +81,7 @@ class DeploymentTests(unittest.TestCase):
         for name in self.names:self.assertEqual((self.target/name).read_text(),'old\n')
 
     def test_failed_readiness_automatically_restores_old_files(self):
-        argv=['deploy-chat.py','--source',str(self.source),'--target',str(self.target),'--apply','--restart-chat']
+        argv=['deploy-chat.py','--source',str(self.source),'--target',str(self.target),'--apply','--restart-chat','--allow-unsigned']
         with mock.patch('sys.argv',argv),mock.patch.object(deploy,'git',side_effect=self.git),mock.patch.object(deploy.subprocess,'run'),mock.patch.object(deploy,'ready',side_effect=[False,True]):
             with self.assertRaisesRegex(RuntimeError,'previous files restored'):deploy.main()
         for name in self.names:self.assertEqual((self.target/name).read_text(),'old\n')
@@ -94,6 +94,71 @@ class DeploymentTests(unittest.TestCase):
     def test_target_symlink_is_rejected(self):
         p=self.target/'boat-chat/app.py';p.unlink();p.symlink_to(self.target/'boat-chat/cruise_efficiency.py')
         with self.assertRaisesRegex(RuntimeError,'symlink'):self.apply()
+
+
+class SourceTrustTests(unittest.TestCase):
+    """Pulled source must be verified and must never execute as root."""
+    def source(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        return Path(self.temp.name)
+
+    def test_source_code_runs_as_checkout_owner_not_root(self):
+        source=self.source();entry=mock.Mock(pw_uid=1000,pw_dir='/home/dev');entry.pw_name='dev'
+        with mock.patch.object(deploy.os,'geteuid',return_value=0),mock.patch.object(deploy,'owner_name',return_value=entry):
+            command=deploy.unprivileged_command(source,['python3','-m','unittest'])
+        self.assertEqual(command[:4],['runuser','-u','dev','--']);self.assertIn('HOME=/home/dev',command)
+        self.assertEqual(command[-3:],['python3','-m','unittest'])
+
+    def test_root_owned_checkout_is_refused_when_running_as_root(self):
+        source=self.source();entry=mock.Mock(pw_uid=0,pw_dir='/root');entry.pw_name='root'
+        with mock.patch.object(deploy.os,'geteuid',return_value=0),mock.patch.object(deploy,'owner_name',return_value=entry):
+            with self.assertRaisesRegex(RuntimeError,'as root'):deploy.unprivileged_command(source,['true'])
+
+    def test_unprivileged_invocation_is_not_wrapped(self):
+        with mock.patch.object(deploy.os,'geteuid',return_value=1000):
+            self.assertEqual(deploy.unprivileged_command(Path('/x'),['git','status']),['git','status'])
+
+    def test_tests_and_checker_never_run_directly_as_root(self):
+        source=self.source();entry=mock.Mock(pw_uid=1000,pw_dir='/home/dev');entry.pw_name='dev'
+        with mock.patch.object(deploy.os,'geteuid',return_value=0),mock.patch.object(deploy,'owner_name',return_value=entry),mock.patch.object(deploy.subprocess,'run') as run:
+            deploy.run_unprivileged(source,['python3','scripts/check-public-tree.py'],{'PYTHONPATH':'x'})
+        self.assertEqual(run.call_args.args[0][:4],['runuser','-u','dev','--'])
+
+    def test_origin_must_match_pinned_remote(self):
+        with mock.patch.object(deploy,'git',return_value='https://evil.example/VesselStack.git'):
+            with self.assertRaisesRegex(RuntimeError,'pinned'):deploy.check_remote(Path('/x'),'https://github.com/jclima/VesselStack.git')
+        with mock.patch.object(deploy,'git',return_value='https://github.com/jclima/VesselStack.git'):
+            deploy.check_remote(Path('/x'),'https://github.com/jclima/VesselStack.git')
+
+    def test_unverified_source_is_refused_unless_home_lab_opt_in(self):
+        with mock.patch.object(deploy,'commit_is_verified',return_value=False):
+            with self.assertRaisesRegex(RuntimeError,'unverified'):deploy.require_verified(Path('/x'),'HEAD',False)
+            deploy.require_verified(Path('/x'),'HEAD',True)
+        with mock.patch.object(deploy,'commit_is_verified',return_value=True):
+            deploy.require_verified(Path('/x'),'HEAD',False)
+
+    def test_signed_tag_is_accepted_when_commit_unsigned(self):
+        def git_ok(source,*args):return args==('verify-tag','v1.3.1')
+        with mock.patch.object(deploy,'git',side_effect=lambda source,*a:'abc123' if a[0]=='rev-parse' else 'v1.3.0\nv1.3.1'),mock.patch.object(deploy,'git_ok',side_effect=git_ok):
+            self.assertTrue(deploy.commit_is_verified(Path('/x'),'HEAD'))
+        with mock.patch.object(deploy,'git',side_effect=lambda source,*a:'abc123' if a[0]=='rev-parse' else ''),mock.patch.object(deploy,'git_ok',return_value=False):
+            self.assertFalse(deploy.commit_is_verified(Path('/x'),'HEAD'))
+
+    def test_pull_verifies_before_merging_and_never_merges_unverified(self):
+        calls=[]
+        def git(source,*args):
+            calls.append(args[0]);return 'abc123' if args[0]=='rev-parse' else ''
+        with mock.patch.object(deploy,'git',side_effect=git),mock.patch.object(deploy,'commit_is_verified',side_effect=lambda *a:calls.append('verify') or False):
+            with self.assertRaisesRegex(RuntimeError,'unverified'):deploy.pull_verified(Path('/x'),'',False)
+        self.assertNotIn('merge',calls)
+        calls.clear()
+        with mock.patch.object(deploy,'git',side_effect=git),mock.patch.object(deploy,'commit_is_verified',side_effect=lambda *a:calls.append('verify') or True):
+            deploy.pull_verified(Path('/x'),'',False)
+        self.assertLess(calls.index('verify'),calls.index('merge'));self.assertNotIn('pull',calls)
+
+    def test_pull_requires_pinned_remote_argument(self):
+        argv=['deploy-chat.py','--target','/tmp/x','--pull']
+        with mock.patch('sys.argv',argv),self.assertRaises(SystemExit):deploy.main()
 
 
 class PrivacyTests(unittest.TestCase):

@@ -122,6 +122,16 @@ test -s "$DATA_ROOT/homeassistant/blueprints/automation/vesselstack/low-battery.
 test -s "$DATA_ROOT/homeassistant/vesselstack-dashboard.example.yaml"
 test "$(stat -c '%u:%g' "$DATA_ROOT/influxdb")" = "1000:1000"
 test "$(stat -c '%u:%g' "$DATA_ROOT/grafana")" = "472:0"
+# Code, venv and generated facts are not writable by the service user; the
+# service user may write only under the state directory in the data tree.
+test "$(stat -c '%u' "$APP_ROOT/boat-chat")" = 0
+test "$(stat -c '%u' "$APP_ROOT/boat-chat/.venv")" = 0
+test "$(stat -c '%u:%a' "$APP_ROOT/boat-chat/boat_facts.json")" = "0:640"
+test -z "$(find "$APP_ROOT/boat-chat" -not -type l \( -perm -g=w -o -perm -o=w \) -print -quit)"
+test -d "$DATA_ROOT/boat-chat"
+grep -qx 'ProtectSystem=strict' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+grep -qx "ReadWritePaths=$DATA_ROOT/boat-chat" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+grep -qx "Environment=BOAT_CHAT_STATE_DIR=$DATA_ROOT/boat-chat" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.service"
 grep -q 'Test Vessel Boat Chat' "$APP_ROOT/boat-chat/static/index.html"
 grep -q '^INFLUXDB_HISTORY_BUCKET=signalk_1m$' "$APP_ROOT/config/vesselstack.env"
 grep -q '^TELEGRAM_ENABLE=false$' "$APP_ROOT/config/vesselstack.env"

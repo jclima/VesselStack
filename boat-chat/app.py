@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 STATIC_ROOT = ROOT / "static"
 MCP_CONFIG = REPO_ROOT / ".mcp.json"
-ENV_CONFIG = ROOT / "boat-chat.env"
+ENV_CONFIG = memory_index.STATE_DIR / "boat-chat.env"
 BOAT_FACTS = Path(os.environ.get("BOAT_CHAT_FACTS_FILE", str(ROOT / "boat_facts.json")))
 BOAT_CHAT_AGENT = ROOT / "BOAT_CHAT_AGENT.md"
 KNOWLEDGE_ROOT = ROOT / "knowledge"
@@ -83,10 +83,8 @@ SETTING_KEYS = [
     "BOAT_CHAT_CLI_TIMEOUT",
     "BOAT_CHAT_CODEX_MODEL",
     "BOAT_CHAT_CODEX_EFFORT",
-    "BOAT_CHAT_CODEX_BIN",
     "BOAT_CHAT_CLAUDE_MODEL",
     "BOAT_CHAT_CLAUDE_EFFORT",
-    "BOAT_CHAT_CLAUDE_BIN",
     "BOAT_CHAT_CLAUDE_MAX_BUDGET_USD",
     "BOAT_CHAT_HOST",
     "BOAT_CHAT_PORT",
@@ -485,6 +483,7 @@ def write_env_config(settings: dict[str, str]) -> None:
                     passthrough.append(raw_line)
         if passthrough:
             lines.extend(["", "# Deployment-managed integration settings", *passthrough])
+    ENV_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     ENV_CONFIG.write_text("\n".join(lines) + "\n")
     try:
         ENV_CONFIG.chmod(0o600)
@@ -4829,7 +4828,8 @@ def call_codex_cli(
     model: str | None = None,
     raise_on_error: bool = False,
 ) -> str:
-    codex_bin = setting_value("BOAT_CHAT_CODEX_BIN", "codex") or "codex"
+    # Executable paths are deployment-only (process environment), never HTTP/settings-file settable.
+    codex_bin = os.environ.get("BOAT_CHAT_CODEX_BIN", "codex") or "codex"
     selected_model = model or setting_value("BOAT_CHAT_CODEX_MODEL") or DEFAULT_CODEX_MODEL
     if selected_model and ("/" in selected_model or ":" in selected_model):
         selected_model = DEFAULT_CODEX_MODEL
@@ -4901,7 +4901,8 @@ def call_claude_cli(
     model: str | None = None,
     raise_on_error: bool = False,
 ) -> str:
-    claude_bin = setting_value("BOAT_CHAT_CLAUDE_BIN", "claude") or "claude"
+    # Executable paths are deployment-only (process environment), never HTTP/settings-file settable.
+    claude_bin = os.environ.get("BOAT_CHAT_CLAUDE_BIN", "claude") or "claude"
     selected_model = model or setting_value("BOAT_CHAT_CLAUDE_MODEL") or ""
     effort = (setting_value("BOAT_CHAT_CLAUDE_EFFORT", DEFAULT_CLAUDE_EFFORT) or DEFAULT_CLAUDE_EFFORT).strip().lower()
     if effort not in {"low", "medium", "high", "xhigh", "max"}:

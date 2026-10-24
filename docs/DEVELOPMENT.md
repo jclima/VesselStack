@@ -109,8 +109,11 @@ The README's one-time launcher installation exposes `sudo vesselstack-update`.
 Its private `/etc/vesselstack/update.env` sets source/live paths, unit names and
 health URL. It contains no API credentials and must remain root-owned/mode 600.
 Use preview after pushing from the development machine; add `--apply` when ready.
-The command performs a clean fast-forward pull and the helper's complete tests,
-backup and readiness workflow. A rollback takes the printed backup directory
+The command fetches, verifies the commit/tag signature against the pinned
+`EXPECTED_REMOTE_URL`, fast-forwards, and runs the helper's complete tests as the
+checkout owner (never root), then performs the
+backup and readiness workflow. Unsigned source is accepted only with the
+home-lab opt-in `ALLOW_UNSIGNED_SOURCE=true`. A rollback takes the printed backup directory
 and never pulls new source. The active Telegram worker restarts only if its
 Python file changed, and the same restart plan is recorded for rollback.
 

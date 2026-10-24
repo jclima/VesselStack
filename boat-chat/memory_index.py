@@ -22,7 +22,11 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
-DEFAULT_DB_PATH = ROOT / "memory" / "boat_memory.sqlite"
+# Code (ROOT) is root-owned in an installation; every runtime-written file lives
+# under STATE_DIR (VESSELSTACK_DATA/boat-chat when installed). Defaults to ROOT
+# for source checkouts and development.
+STATE_DIR = Path(os.environ.get("BOAT_CHAT_STATE_DIR") or ROOT)
+DEFAULT_DB_PATH = STATE_DIR / "memory" / "boat_memory.sqlite"
 VECTOR_DIM = 384
 CHUNK_TARGET_CHARS = 1400
 CHUNK_OVERLAP_LINES = 3

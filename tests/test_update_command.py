@@ -42,6 +42,17 @@ class UpdateCommandTests(unittest.TestCase):
         argv=json.loads(result.stdout)
         for flag in ['--pull','--apply','--restart-chat','--telegram-service']:self.assertIn(flag,argv)
 
+    def test_remote_is_pinned_and_unsigned_is_off_by_default(self):
+        argv=json.loads(self.run_command('--apply').stdout)
+        self.assertEqual(argv[argv.index('--expected-remote')+1],'https://github.com/jclima/VesselStack.git')
+        self.assertNotIn('--allow-unsigned',argv)
+
+    def test_home_lab_opt_in_and_custom_remote_are_passed(self):
+        with self.config.open('a') as handle:handle.write('EXPECTED_REMOTE_URL="https://example.test/fork.git"\nALLOW_UNSIGNED_SOURCE=true\n')
+        argv=json.loads(self.run_command().stdout)
+        self.assertIn('--allow-unsigned',argv)
+        self.assertEqual(argv[argv.index('--expected-remote')+1],'https://example.test/fork.git')
+
     def test_rollback_does_not_pull(self):
         result=self.run_command('--rollback','/example/backup with spaces')
         self.assertEqual(result.returncode,0,result.stderr);argv=json.loads(result.stdout)

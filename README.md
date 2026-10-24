@@ -382,8 +382,31 @@ available but live status, insights, and maintenance endpoints stay locked.
 when the OpenAI provider is selected. This can send the question and grounded
 context to an external service and may incur provider charges; it is disabled
 by default. Boat Chat sessions, audits, feedback, and maintenance tasks stay in
-the private SQLite memory database under the configured data directory and are
-excluded from release packages.
+the private SQLite memory database and are excluded from release packages.
+
+Security layout (1.3.x hardening): the installed application code, its Python
+virtualenv and the generated `boat_facts.json` are owned by `root` and are not
+writable by the service account (`boat_facts.json` is `root:SERVICE 0640`).
+Everything Boat Chat writes at runtime (memory/session database, power database,
+Telegram state and the Settings-page `boat-chat.env`) lives under
+`$VESSELSTACK_DATA/boat-chat` (default `/opt/vesselstack-data/boat-chat`,
+selected by `BOAT_CHAT_STATE_DIR`). The chat, Telegram and telemetry-indexer
+units run with `ProtectSystem=strict`, `ProtectHome=true`, `NoNewPrivileges=true`,
+`PrivateTmp=true` and `ReadWritePaths=$VESSELSTACK_DATA/boat-chat`. Consequences:
+`VESSELSTACK_ROOT`/`VESSELSTACK_DATA` may not be under `/home` or `/root`, and the
+`codex_cli`/`claude_cli` providers cannot use binaries or credentials kept in a
+home directory (install them system-wide and set `BOAT_CHAT_CODEX_BIN` /
+`BOAT_CHAT_CLAUDE_BIN` in the root-owned `config/boat-chat.env`; these two
+settings are no longer accepted from the web Settings page or the Settings
+`boat-chat.env`). On the first install/upgrade the installer stops the chat
+workers, moves any legacy `boat-chat/memory`, `boat-chat/data` and
+`boat-chat/boat-chat.env` into the new state directory (refusing symlinks),
+recreates the virtualenv as root and restarts the services only with `--start`.
+Rollback: restore the pre-update backup (`vesselstackctl restore`) or reinstall the
+previous release; the legacy files are moved, not copied, so keep the backup
+taken by `vesselstackctl update`. `systemd-analyze verify` was not run in the
+development environment; run it on the Pi after upgrading
+(`systemd-analyze verify /etc/systemd/system/vesselstack-chat*.service`).
 
 ### Control Panel
 
@@ -577,7 +600,9 @@ sudo vesselstackctl update /path/to/VesselStack-release
 
 For Control Panel updates, stage the reviewed release beneath its restricted
 root first. The panel rejects symlinks, missing release metadata, paths outside
-this directory, files owned by another user, and group/world-writable content:
+this directory, and any entry anywhere in the release tree (`scripts/`,
+`boat-chat/`, `templates/`, `systemd/`, ...) that is a symlink, owned by a user
+other than root/the panel account, or group/world-writable:
 
 ```bash
 sudo install -d -m 0755 /var/lib/vesselstack/releases
@@ -790,9 +815,24 @@ Set the separate source/live paths and actual chat/Telegram unit names. After
 pushing changes to the source checkout's upstream branch, run on the boat:
 
 ```bash
-sudo vesselstack-update          # pull, test, preview; no service restart
-sudo vesselstack-update --apply  # pull, test, back up, apply and verify
+sudo vesselstack-update          # fetch, verify, test, preview; no service restart
+sudo vesselstack-update --apply  # same, then back up, apply and verify
 ```
+
+Trust model: pulled source is untrusted until verified. The launcher refuses to
+fetch unless the checkout's `origin` equals `EXPECTED_REMOTE_URL` (default
+`https://github.com/jclima/VesselStack.git`), fetches without merging, requires
+the fetched commit to have a valid signature (`git verify-commit`) or a validly
+signed tag (`git verify-tag`) under the checkout owner's GPG/SSH trust
+configuration, and only then fast-forwards. `scripts/check-public-tree.py` and
+the unit tests run as the checkout owner via `runuser`, never as root; a
+root-owned checkout is refused. Import the maintainer signing key for the checkout
+owner before first use. Home-lab only: set `ALLOW_UNSIGNED_SOURCE="true"` in
+`/etc/vesselstack/update.env` to accept unsigned source (a warning is printed);
+do not enable it on a vessel others can push code to. The checkout owner remains
+trusted: code that passed tests is copied by root from that checkout. Roll back
+by restoring a printed backup (below) or by setting `ALLOW_UNSIGNED_SOURCE`
+back to `false`.
 
 If Telegram code changes, an already-active configured worker also restarts;
 a stopped worker remains stopped. Restart units are saved in the backup receipt

@@ -13,6 +13,10 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=@VESSELSTACK_ROOT@/boat-chat/.venv/bin/python @VESSELSTACK_ROOT@/boat-chat/telemetry_indexer.py run
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+Environment=BOAT_CHAT_STATE_DIR=@VESSELSTACK_DATA@/boat-chat
+ReadWritePaths=@VESSELSTACK_DATA@/boat-chat
 CapabilityBoundingSet=
 LockPersonality=true
 ProtectControlGroups=true

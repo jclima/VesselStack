@@ -73,6 +73,11 @@ done
 case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
     *" "*) echo "Install paths cannot contain spaces" >&2; exit 1 ;;
 esac
+case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
+    /home/*|*:/home/*|/root/*|*:/root/*)
+        echo "VESSELSTACK_ROOT and VESSELSTACK_DATA cannot be under /home or /root (services use ProtectHome=true)" >&2
+        exit 1 ;;
+esac
 case "$BOAT_NAME" in
     *[!A-Za-z0-9_.\ -]*) echo "BOAT_NAME may contain letters, numbers, spaces, dot, underscore, and hyphen" >&2; exit 1 ;;
 esac
@@ -258,10 +263,44 @@ install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_D
 # Change only the mount root itself; never recursively rewrite existing data.
 install -d -m 0750 -o 1000 -g 1000 "$VESSELSTACK_DATA/influxdb"
 install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
+# Code and the Python virtualenv are root-owned; the service user may only write
+# under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
+BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
+install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
+migrate_runtime_path() {
+    local old="$VESSELSTACK_ROOT/boat-chat/$1" new="$BOAT_CHAT_STATE/$1"
+    if [ -L "$old" ]; then
+        rm -f -- "$old"
+        return 0
+    fi
+    [ -e "$old" ] || return 0
+    if [ -e "$new" ]; then
+        echo "WARNING: $new already exists; leaving legacy $old in place" >&2
+        return 0
+    fi
+    cp -a -- "$old" "$new"
+    chown -hR "$VESSELSTACK_USER:$VESSELSTACK_USER" "$new"
+    rm -rf -- "$old"
+}
+if [ -e "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -e "$VESSELSTACK_ROOT/boat-chat/data" ] \
+    || [ -e "$VESSELSTACK_ROOT/boat-chat/boat-chat.env" ] \
+    || [ -L "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -L "$VESSELSTACK_ROOT/boat-chat/data" ]; then
+    # Quiesce writers so SQLite files are not copied mid-write.
+    systemctl stop vesselstack-chat.service vesselstack-chat-telegram.service \
+        vesselstack-telemetry-indexer.service 2>/dev/null || true
+    for runtime_name in memory data boat-chat.env; do
+        migrate_runtime_path "$runtime_name"
+    done
+fi
 tar -C "$SOURCE_ROOT/boat-chat" \
     --exclude=boat-chat.env --exclude=.venv --exclude=memory --exclude=data \
     --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/boat-chat" -xf -
+# Discard any previously service-writable virtualenv and take ownership of all
+# application code before root ever executes anything from it.
+rm -rf -- "$VESSELSTACK_ROOT/boat-chat/.venv"
+chown -hR root:root "$VESSELSTACK_ROOT/boat-chat"
+chmod -R go-w,go+rX "$VESSELSTACK_ROOT/boat-chat"
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
 # Keep a bundled, reviewed installer so the control panel can run preflight and
@@ -425,25 +464,35 @@ install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/control-panel.env"
 "$SCRIPT_DIR/scripts/migrate.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" \
     "$(<"$SCRIPT_DIR/VERSION")"
 
+# Vessel identity is generated into a root-owned temporary file in the (root-owned)
+# application directory and renamed into place; the service user can only read it.
+facts_temp=$(mktemp "$VESSELSTACK_ROOT/boat-chat/.boat_facts.XXXXXX")
 jq -n \
     --arg name "$BOAT_NAME" --arg type "${BOAT_TYPE:-}" \
     --arg mmsi "${BOAT_MMSI:-}" --arg callsign "${BOAT_CALLSIGN:-}" \
     --arg loa "${BOAT_LOA_M:-}" --arg beam "${BOAT_BEAM_M:-}" \
     '{vessel:{name:$name,type:$type,mmsi:$mmsi,callsign:$callsign,loa_m:$loa,beam_m:$beam}}' \
-    > "$VESSELSTACK_ROOT/boat-chat/boat_facts.json"
+    > "$facts_temp"
+chown "root:$VESSELSTACK_USER" "$facts_temp"
+chmod 0640 "$facts_temp"
+mv -f -- "$facts_temp" "$VESSELSTACK_ROOT/boat-chat/boat_facts.json"
 
 python3 -m venv "$VESSELSTACK_ROOT/boat-chat/.venv"
 "$VESSELSTACK_ROOT/boat-chat/.venv/bin/pip" install -r "$VESSELSTACK_ROOT/boat-chat/requirements.txt"
-chown -R "$VESSELSTACK_USER:$VESSELSTACK_USER" "$VESSELSTACK_ROOT/boat-chat"
+# Root-owned and not writable by the service user: root later runs this pip.
+chown -hR root:root "$VESSELSTACK_ROOT/boat-chat/.venv"
+chmod -R go-w "$VESSELSTACK_ROOT/boat-chat/.venv"
 
 sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
 for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service; do
     sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
         -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+        -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
         "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
     chmod 0644 "$SYSTEMD_DIR/$unit"
 done

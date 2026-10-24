@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -139,10 +140,47 @@ class CommandAllowlistTests(unittest.TestCase):
             (release / "VERSION").write_text("1.0.1\n")
             with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root):
                 command = panel.action_command("update", {"source_directory": release})
-            self.assertEqual(command[-2:], ["update", str(release)])
+            self.assertEqual(command[-2:], ["update", str(release.resolve())])
             (release / "install.sh").chmod(0o777)
             with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root), self.assertRaises(ValueError):
                 panel.action_command("update", {"source_directory": release})
+
+    def test_update_rejects_unsafe_entries_anywhere_in_release_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "vesselstack-test"
+            for name in ("scripts", "boat-chat", "templates", "systemd"):
+                (release / name).mkdir(parents=True)
+            (release / "install.sh").write_text("#!/bin/bash\n")
+            (release / "VERSION").write_text("1.0.1\n")
+            (release / "systemd/unit.in").write_text("x\n")
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root):
+                panel.action_command("update", {"source_directory": release})
+                (release / "systemd/unit.in").chmod(0o666)
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
+                (release / "systemd/unit.in").chmod(0o644)
+                (release / "scripts").chmod(0o775)
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
+                (release / "scripts").chmod(0o755)
+                (release / "templates/link").symlink_to("/etc/passwd")
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
+                (release / "templates/link").unlink()
+                panel.action_command("update", {"source_directory": release})
+
+    @unittest.skipIf(os.getuid() == 0, "root-owned files are always accepted")
+    def test_update_rejects_foreign_owner_in_release_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "vesselstack-test"
+            (release / "scripts").mkdir(parents=True)
+            (release / "install.sh").write_text("#!/bin/bash\n")
+            (release / "VERSION").write_text("1.0.1\n")
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root), mock.patch.object(panel.os, "geteuid", return_value=os.getuid() + 12345):
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
 
 
 class ValidationTests(unittest.TestCase):

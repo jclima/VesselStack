@@ -11,12 +11,15 @@ usage() {
     cat <<'HELP'
 Usage: sudo vesselstack-update [--apply | --rollback BACKUP_DIRECTORY]
 
-  (no arguments)   Pull clean source fast-forward, run tests, preview code changes
-  --apply          Pull, test, back up and apply application code; verify readiness
+  (no arguments)   Fetch+verify clean source, fast-forward, test as the checkout
+                   owner (never root), preview code changes
+  --apply          Same, then back up and apply application code; verify readiness
   --rollback PATH  Restore a printed backup directory and verify readiness
 
 Local configuration: /etc/vesselstack/update.env
 Application updates exclude credentials, facts, databases and infrastructure.
+Source must carry a valid commit/tag signature unless the home-lab opt-in
+ALLOW_UNSIGNED_SOURCE=true is set in the update configuration.
 HELP
 }
 
@@ -41,11 +44,18 @@ source "$CONFIG_FILE"
 : "${TARGET_DIRECTORY:?Set TARGET_DIRECTORY in the update configuration}"
 : "${CHAT_SERVICE:?Set CHAT_SERVICE in the update configuration}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8765/health}"
+# Pinned origin: the helper refuses to fetch when the checkout's origin differs.
+EXPECTED_REMOTE_URL="${EXPECTED_REMOTE_URL:-https://github.com/jclima/VesselStack.git}"
+ALLOW_UNSIGNED_SOURCE="${ALLOW_UNSIGNED_SOURCE:-false}"
 
 HELPER="$SOURCE_DIRECTORY/scripts/deploy-chat.py"
 [ -f "$HELPER" ] || { echo "Missing deployment helper: $HELPER" >&2; exit 1; }
 ARGS=(--source "$SOURCE_DIRECTORY" --target "$TARGET_DIRECTORY"
-      --service "$CHAT_SERVICE" --health-url "$HEALTH_URL")
+      --service "$CHAT_SERVICE" --health-url "$HEALTH_URL"
+      --expected-remote "$EXPECTED_REMOTE_URL")
+if [ "$ALLOW_UNSIGNED_SOURCE" = true ]; then
+    ARGS+=(--allow-unsigned)
+fi
 if [ -n "${TELEGRAM_SERVICE:-}" ]; then
     ARGS+=(--telegram-service "$TELEGRAM_SERVICE")
 fi

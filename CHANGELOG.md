@@ -5,6 +5,10 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Security: update helper verifies source signatures, pins origin and runs tests/checker as the checkout owner instead of root; home-lab opt-in `ALLOW_UNSIGNED_SOURCE`.
+- Security: control-panel release apply validates ownership/permissions/symlinks over the whole release tree.
+- Security: application code, virtualenv and facts are root-owned; runtime state moves to `$VESSELSTACK_DATA/boat-chat` (`BOAT_CHAT_STATE_DIR`); chat/Telegram/indexer units gain `ProtectSystem=strict`, `ProtectHome=true` and `ReadWritePaths`; CLI binary paths are no longer web-settable.
+
 - Add a configured one-command application update/preview/rollback launcher.
 - Restart an active Telegram worker when its code changes and retain the restart plan for rollback.
 
