@@ -51,7 +51,7 @@ explicitly; never discard local changes to make a pull succeed.
 
 Use the existing installer and lifecycle workflow in the README. Keep the
 installed private `config/vesselstack.env`, including generated credentials;
-never substitute the example with GENERATE values during an update.
+the installer preserves installed secrets even when the input still says GENERATE, but prefer the installed config as input during an update.
 
 `sudo vesselstackctl update /path/to/reviewed/source` runs preflight, a verified
 full backup and installation/startup. Plan a maintenance window: this can affect

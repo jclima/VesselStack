@@ -61,19 +61,18 @@ start_stack() {
     if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
         systemctl enable --now vesselstack-firewall.service
     fi
-    if [ ! -s "$VESSELSTACK_DATA/mosquitto/passwords" ]; then
-        : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
-        : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
-        install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
-        docker run --rm -v "$VESSELSTACK_DATA/mosquitto:/mosquitto/data" \
-            eclipse-mosquitto:2.1.2-alpine mosquitto_passwd -b -c \
-            /mosquitto/data/passwords "$MQTT_USERNAME" "$MQTT_PASSWORD"
-    fi
+    [ -x "$installer_scripts/mosquitto-credentials.sh" ] || {
+        echo "Missing bundled Mosquitto helper: $installer_scripts/mosquitto-credentials.sh" >&2
+        return 1
+    }
+    "$installer_scripts/mosquitto-credentials.sh" "$ENV_FILE"
     "${COMPOSE[@]}" up -d
     [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
         echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
         return 1
     }
+    # bootstrap-influx.sh first waits (bounded) for InfluxDB /health, so start,
+    # restart and the backup restart trap never provision against a booting server.
     "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
@@ -217,6 +216,20 @@ show_logs() {
     esac
 }
 
+# Warn (never fail) when the data filesystem is more than 80% full. Time-series
+# data grows without bound unless INFLUXDB_RAW_RETENTION is set.
+disk_usage_warning() {
+    local threshold=${VESSELSTACK_DISK_WARN_PERCENT:-80} used data_size
+    used=$(df -Pk "$VESSELSTACK_DATA" | awk 'NR==2 {gsub("%", "", $5); print $5}')
+    data_size=$(du -sk "$VESSELSTACK_DATA" 2>/dev/null | awk '{printf "%d", $1 / 1024}')
+    if [ -n "$used" ] && [ "$used" -gt "$threshold" ]; then
+        printf 'WARN data filesystem is %s%% full (threshold %s%%); %s MiB used by %s. Consider INFLUXDB_RAW_RETENTION, pruning old backups or a larger disk\n' \
+            "$used" "$threshold" "${data_size:-?}" "$VESSELSTACK_DATA" >&2
+    else
+        printf 'OK   data filesystem usage: %s%% (%s MiB in data directory)\n' "${used:-?}" "${data_size:-?}"
+    fi
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -241,6 +254,7 @@ doctor_stack() {
         echo 'FAIL data filesystem has less than 1 GiB free' >&2
         failed=1
     fi
+    disk_usage_warning
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'

@@ -19,7 +19,10 @@ Usage: sudo vesselstack-update [--apply | --rollback BACKUP_DIRECTORY]
 Local configuration: /etc/vesselstack/update.env
 Application updates exclude credentials, facts, databases and infrastructure.
 Source must carry a valid commit/tag signature unless the home-lab opt-in
-ALLOW_UNSIGNED_SOURCE=true is set in the update configuration.
+ALLOW_UNSIGNED_SOURCE=true is set in the update configuration. Signatures are
+checked with a fixed git/gpg configuration against a root-controlled keyring
+(VERIFY_GNUPGHOME) or allowed-signers file (VERIFY_ALLOWED_SIGNERS), and the
+tests and deployed files come from the verified commit, not the working tree.
 HELP
 }
 
@@ -47,6 +50,9 @@ HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8765/health}"
 # Pinned origin: the helper refuses to fetch when the checkout's origin differs.
 EXPECTED_REMOTE_URL="${EXPECTED_REMOTE_URL:-https://github.com/jclima/VesselStack.git}"
 ALLOW_UNSIGNED_SOURCE="${ALLOW_UNSIGNED_SOURCE:-false}"
+# Root-controlled trust anchors for signature verification (optional).
+VERIFY_GNUPGHOME="${VERIFY_GNUPGHOME:-}"
+VERIFY_ALLOWED_SIGNERS="${VERIFY_ALLOWED_SIGNERS:-}"
 
 HELPER="$SOURCE_DIRECTORY/scripts/deploy-chat.py"
 [ -f "$HELPER" ] || { echo "Missing deployment helper: $HELPER" >&2; exit 1; }
@@ -55,6 +61,12 @@ ARGS=(--source "$SOURCE_DIRECTORY" --target "$TARGET_DIRECTORY"
       --expected-remote "$EXPECTED_REMOTE_URL")
 if [ "$ALLOW_UNSIGNED_SOURCE" = true ]; then
     ARGS+=(--allow-unsigned)
+fi
+if [ -n "$VERIFY_GNUPGHOME" ]; then
+    ARGS+=(--gnupg-home "$VERIFY_GNUPGHOME")
+fi
+if [ -n "$VERIFY_ALLOWED_SIGNERS" ]; then
+    ARGS+=(--allowed-signers "$VERIFY_ALLOWED_SIGNERS")
 fi
 if [ -n "${TELEGRAM_SERVICE:-}" ]; then
     ARGS+=(--telegram-service "$TELEGRAM_SERVICE")

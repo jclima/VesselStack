@@ -49,6 +49,10 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
       DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_RAW_BUCKET}
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+      # First-run setup only (ignored once the volume is initialised). Empty or
+      # unset means 30d; 0 means keep forever. Existing buckets are changed only
+      # by scripts/bootstrap-influx.sh when INFLUXDB_RAW_RETENTION is set.
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUXDB_RAW_RETENTION:-30d}
     volumes:
       - ${VESSELSTACK_DATA}/influxdb:/var/lib/influxdb2
 

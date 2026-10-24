@@ -33,6 +33,8 @@ install -d "$APP_ROOT/boat-chat/.venv/bin"
 ln -s /usr/bin/python3 "$APP_ROOT/boat-chat/.venv/bin/python3"
 printf 'services: {}\n' > "$APP_ROOT/compose.yml"
 printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
+# The real credential helper runs against the fake docker below.
+cp "$REPO_ROOT/scripts/mosquitto-credentials.sh" "$APP_ROOT/installer/scripts/mosquitto-credentials.sh"
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
     chmod +x "$APP_ROOT/installer/scripts/$helper"

@@ -5,6 +5,13 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Security: install.sh quarantines legacy Boat Chat state it cannot migrate into a root-only `boat-chat-legacy-<timestamp>` directory instead of leaving it in the code tree (never deletes data).
+- Security: `scripts/deploy-chat.py` verifies signatures with a fixed git config (hooks off, no repo-local overrides, system/global config ignored) against a root-controlled `VERIFY_GNUPGHOME` / `VERIFY_ALLOWED_SIGNERS`; checker, tests and deployed bytes come from the verified commit object exported to a private tree, with HEAD/clean-tree/tree re-checks after tests and before apply.
+- Fixed: every generated secret (InfluxDB, Grafana, MQTT, tokens) is preserved from the installed config when the input says GENERATE; Mosquitto credentials are updated in place only when changed instead of `-c` resetting the file; init-only secrets are read-only in the control panel.
+- Fixed: InfluxDB bootstrap waits (bounded) for `/health`, treats `bucket list` errors as errors (retry, then fail) instead of creating buckets, passes the token via `INFLUX_TOKEN` not argv, and the downsample task averages numeric fields only (existing task updated).
+- Added: `INFLUXDB_RAW_RETENTION` (default 30d on new installs; existing buckets only change when set explicitly) and a `vesselstackctl doctor` data-disk usage warning above 80%.
+- Changed: scoped read-only Influx token deferred (see README).
+
 - Security: update helper verifies source signatures, pins origin and runs tests/checker as the checkout owner instead of root; home-lab opt-in `ALLOW_UNSIGNED_SOURCE`.
 - Security: control-panel release apply validates ownership/permissions/symlinks over the whole release tree.
 - Security: application code, virtualenv and facts are root-owned; runtime state moves to `$VESSELSTACK_DATA/boat-chat` (`BOAT_CHAT_STATE_DIR`); chat/Telegram/indexer units gain `ProtectSystem=strict`, `ProtectHome=true` and `ReadWritePaths`; CLI binary paths are no longer web-settable.

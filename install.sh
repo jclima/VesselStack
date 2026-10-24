@@ -65,6 +65,9 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
+# Empty = unset: fresh InfluxDB setups get 30d on the raw bucket; existing buckets
+# are never changed unless a value is set explicitly (see README).
+: "${INFLUXDB_RAW_RETENTION:=}"
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -93,6 +96,11 @@ case "$INFLUXDB_CONTAINER_NAME" in
         exit 1
         ;;
 esac
+if [ -n "$INFLUXDB_RAW_RETENTION" ] && \
+    ! [[ "$INFLUXDB_RAW_RETENTION" =~ ^(0|[1-9][0-9]{0,4}[hdw])$ ]]; then
+    echo "INFLUXDB_RAW_RETENTION must be empty, 0 (keep forever), or a duration such as 720h, 30d or 8w" >&2
+    exit 1
+fi
 for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
     TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
     case "${!key}" in
@@ -236,23 +244,50 @@ generate_secret() {
     fi
 }
 
-# Preserve generated administration tokens across re-renders when the installed
-# configuration, rather than the original example file, is used as input.
-if [ "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE}" = GENERATE ] && \
-    [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
-    BOAT_CHAT_SETTINGS_TOKEN=$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' \
-        "$VESSELSTACK_ROOT/config/boat-chat.env" | tail -n 1)
-fi
-if [ "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}" = GENERATE ] && \
-    [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
-    BOAT_CHAT_ACCESS_TOKEN=$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' \
-        "$VESSELSTACK_ROOT/config/boat-chat.env" | tail -n 1)
-fi
-if [ "${CONTROL_PANEL_TOKEN:-GENERATE}" = GENERATE ] && \
-    [ -r "$VESSELSTACK_ROOT/config/control-panel.env" ]; then
-    CONTROL_PANEL_TOKEN=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' \
-        "$VESSELSTACK_ROOT/config/control-panel.env" | tail -n 1)
-fi
+# Preserve EVERY generated secret across re-renders. When the input config says
+# GENERATE (or leaves a secret empty, e.g. a fresh copy of the example file used
+# to upgrade an installed system) the value already installed wins. InfluxDB and
+# Grafana only read their initial credentials on first start and Mosquitto's
+# password file is keyed to MQTT_PASSWORD, so regenerating any of them would
+# silently desynchronise the config from the running services.
+installed_env="$VESSELSTACK_ROOT/config/vesselstack.env"
+installed_value() {
+    # Prints the installed value of $1 from the root-owned, mode-600 config.
+    [ -r "$installed_env" ] || return 0
+    (
+        set +u
+        unset "$1"
+        # shellcheck disable=SC1090
+        source "$installed_env" >/dev/null 2>&1 || exit 0
+        value=${!1:-}
+        [ "$value" = GENERATE ] || printf '%s' "$value"
+    )
+}
+preserve_secret() {
+    # $2 optionally names a fallback app env file. Those files are writable by
+    # the service user, so only plain hex-like values are accepted from them and
+    # they are never evaluated.
+    local key=$1 file=${2:-} current=${!1:-GENERATE} kept=
+    if [ -n "$current" ] && [ "$current" != GENERATE ]; then
+        return 0
+    fi
+    kept=$(installed_value "$key")
+    if [ -z "$kept" ] && [ -n "$file" ] && [ -r "$file" ]; then
+        kept=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
+        [[ "$kept" =~ ^[A-Za-z0-9._-]+$ ]] || kept=
+        [ "$kept" != GENERATE ] || kept=
+    fi
+    if [ -n "$kept" ]; then
+        printf -v "$key" '%s' "$kept"
+    fi
+}
+preserve_secret INFLUXDB_PASSWORD
+preserve_secret INFLUXDB_TOKEN
+preserve_secret GRAFANA_ADMIN_PASSWORD
+preserve_secret MQTT_PASSWORD
+preserve_secret BOAT_CHAT_SETTINGS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
+preserve_secret BOAT_CHAT_ACCESS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
+preserve_secret CONTROL_PANEL_TOKEN "$VESSELSTACK_ROOT/config/control-panel.env"
 
 INFLUXDB_PASSWORD=$(generate_secret "${INFLUXDB_PASSWORD:-GENERATE}")
 INFLUXDB_TOKEN=$(generate_secret "${INFLUXDB_TOKEN:-GENERATE}")
@@ -276,6 +311,20 @@ install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
+LEGACY_QUARANTINE=
+quarantine_legacy() {
+    # Legacy runtime state that cannot be migrated is moved (never deleted) into a
+    # root-only directory outside the code tree, so the recursive chown/chmod of
+    # the code tree below cannot expose it and nothing sensitive stays readable.
+    local old=$1
+    if [ -z "$LEGACY_QUARANTINE" ]; then
+        LEGACY_QUARANTINE=$(mktemp -d "$VESSELSTACK_DATA/boat-chat-legacy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+        chown root:root "$LEGACY_QUARANTINE"
+        chmod 0700 "$LEGACY_QUARANTINE"
+    fi
+    mv -- "$old" "$LEGACY_QUARANTINE/"
+    echo "WARNING: moved legacy $old to $LEGACY_QUARANTINE (root-only); review and merge manually, then remove it" >&2
+}
 migrate_runtime_path() {
     local old="$VESSELSTACK_ROOT/boat-chat/$1" new="$BOAT_CHAT_STATE/$1"
     if [ -L "$old" ]; then
@@ -284,7 +333,7 @@ migrate_runtime_path() {
     fi
     [ -e "$old" ] || return 0
     if [ -e "$new" ]; then
-        echo "WARNING: $new already exists; leaving legacy $old in place" >&2
+        quarantine_legacy "$old"
         return 0
     fi
     cp -a -- "$old" "$new"
@@ -402,6 +451,7 @@ INFLUXDB_RAW_BUCKET
 INFLUXDB_HISTORY_BUCKET
 INFLUXDB_HOME_ASSISTANT_BUCKET
 INFLUXDB_AIS_BUCKET
+INFLUXDB_RAW_RETENTION
 INFLUXDB_PASSWORD
 INFLUXDB_TOKEN
 GRAFANA_ADMIN_PASSWORD
@@ -540,10 +590,7 @@ if [ "$START" -eq 1 ]; then
     else
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
-    install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
-    docker run --rm -v "$VESSELSTACK_DATA/mosquitto:/mosquitto/data" \
-        eclipse-mosquitto:2.1.2-alpine mosquitto_passwd -b -c \
-        /mosquitto/data/passwords "$MQTT_USERNAME" "$MQTT_PASSWORD"
+    "$SCRIPT_DIR/scripts/mosquitto-credentials.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     compose up -d
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service

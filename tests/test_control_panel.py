@@ -66,12 +66,12 @@ class EnvironmentFileTests(unittest.TestCase):
             vessel = root / "vessel.env"
             chat = root / "chat.env"
             control = root / "control.env"
-            panel.write_env(vessel, {"INFLUXDB_TOKEN": "remove-me"}, [])
+            panel.write_env(vessel, {"MQTT_PASSWORD": "remove-me"}, [])
             panel.write_env(chat, {}, [])
             panel.write_env(control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
             with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control, CONFIG_BACKUP_ROOT=root / "backups"):
-                panel.update_configuration({"INFLUXDB_TOKEN": None})
-            self.assertEqual(panel.parse_env(vessel)["INFLUXDB_TOKEN"], "")
+                panel.update_configuration({"MQTT_PASSWORD": None})
+            self.assertEqual(panel.parse_env(vessel)["MQTT_PASSWORD"], "")
 
     def test_partial_write_failure_restores_all_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +203,55 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             panel.validate_value(panel.FIELD_BY_KEY["INFLUXDB_PORT"], "0")
         self.assertEqual(panel.validate_value(panel.FIELD_BY_KEY["INFLUXDB_PORT"], "8086"), "8086")
+
+
+class InitOnlySecretTests(unittest.TestCase):
+    KEYS = ["INFLUXDB_PASSWORD", "INFLUXDB_TOKEN", "GRAFANA_ADMIN_PASSWORD"]
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        root = Path(self.directory.name)
+        self.vessel, self.chat, self.control = root / "vessel.env", root / "chat.env", root / "control.env"
+        panel.write_env(self.vessel, {key: "original" for key in self.KEYS}, [])
+        panel.write_env(self.chat, {}, [])
+        panel.write_env(self.control, {"CONTROL_PANEL_TOKEN": "t"}, [])
+        patcher = mock.patch.multiple(panel, VESSEL_ENV=self.vessel, CHAT_ENV=self.chat, PANEL_ENV=self.control, CONFIG_BACKUP_ROOT=root / "backups")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.directory.cleanup)
+
+    def test_init_only_secrets_are_read_only_with_a_clear_message(self) -> None:
+        for key in self.KEYS:
+            spec = panel.FIELD_BY_KEY[key]
+            self.assertTrue(spec["read_only"])
+            self.assertIn("Read-only", spec["description"])
+            self.assertIn("first created", spec["description"])
+        self.assertFalse(panel.FIELD_BY_KEY["MQTT_PASSWORD"]["read_only"])
+
+    def test_changing_or_clearing_them_is_rejected_and_nothing_is_written(self) -> None:
+        for key in self.KEYS:
+            for value in ("new-secret", None):
+                with self.assertRaisesRegex(ValueError, "read-only"):
+                    panel.update_configuration({key: value})
+        self.assertEqual({key: panel.parse_env(self.vessel)[key] for key in self.KEYS}, {key: "original" for key in self.KEYS})
+
+    def test_blank_value_is_a_no_op_not_an_error(self) -> None:
+        panel.update_configuration({"INFLUXDB_TOKEN": "", "BOAT_NAME": "Renamed"})
+        self.assertEqual(panel.parse_env(self.vessel)["INFLUXDB_TOKEN"], "original")
+        self.assertEqual(panel.parse_env(self.vessel)["BOAT_NAME"], "Renamed")
+
+
+class RetentionSettingTests(unittest.TestCase):
+    def test_valid_and_invalid_raw_retention(self) -> None:
+        spec = panel.FIELD_BY_KEY["INFLUXDB_RAW_RETENTION"]
+        for good in ("", "0", "720h", "30d", "8w"):
+            self.assertEqual(panel.validate_value(spec, good), good)
+        for bad in ("30", "-1d", "30 days", "0d", "1y", "30d;rm", "100000d"):
+            with self.assertRaises(ValueError):
+                panel.validate_value(spec, bad)
+
+    def test_description_warns_about_deletion(self) -> None:
+        self.assertIn("deletes", panel.FIELD_BY_KEY["INFLUXDB_RAW_RETENTION"]["description"])
 
 
 class HttpApiTests(unittest.TestCase):

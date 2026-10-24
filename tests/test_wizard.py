@@ -25,6 +25,12 @@ class WizardTests(unittest.TestCase):
         with self.assertRaises(ValueError): wizard.render({"SIGNALK_MODE": "surprise"})
         with self.assertRaises(ValueError): wizard.render({"AIS_ENABLE": "yes"})
 
+    def test_raw_retention_defaults_empty_and_is_validated(self):
+        self.assertIn("INFLUXDB_RAW_RETENTION=''", wizard.render({}))
+        self.assertIn("INFLUXDB_RAW_RETENTION=30d", wizard.render({"INFLUXDB_RAW_RETENTION": "30d"}))
+        for bad in ("30", "1y", "0d", "-5h"):
+            with self.assertRaises(ValueError): wizard.render({"INFLUXDB_RAW_RETENTION": bad})
+
     def test_generated_file_permissions_can_be_private(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "vesselstack.env"

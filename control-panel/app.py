@@ -60,6 +60,13 @@ def field(
     }
 
 
+INIT_ONLY_NOTE = (
+    "Read-only: {service} reads this only when its data volume is first created, so "
+    "changing it here would desynchronise the config from the running service. "
+    "Rotate it from the recovery shell (change it inside {service} first, then update "
+    "config/vesselstack.env and re-apply the configuration); see the README, Rotating secrets."
+)
+
 FIELDS = [
     field("BOAT_NAME", "Boat name", "Vessel", description="Display name used across VesselStack."),
     field("BOAT_TYPE", "Boat type", "Vessel"),
@@ -98,15 +105,16 @@ FIELDS = [
     field("INFLUXDB_HISTORY_BUCKET", "History bucket", "InfluxDB"),
     field("INFLUXDB_HOME_ASSISTANT_BUCKET", "Home Assistant bucket", "InfluxDB"),
     field("INFLUXDB_AIS_BUCKET", "AIS bucket", "InfluxDB"),
-    field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret"),
-    field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret"),
-    field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret"),
+    field("INFLUXDB_RAW_RETENTION", "Raw bucket retention", "InfluxDB", description="Duration such as 720h, 30d or 8w, or 0 to keep forever. Empty = 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply/start and permanently deletes raw data older than the window."),
+    field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB")),
+    field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB") + " Boat Chat and Grafana also use this token."),
+    field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="Grafana")),
     field("GRAFANA_PORT", "Published port", "Grafana", kind="port"),
     field("HEIMDALL_PORT", "HTTP port", "Heimdall", kind="port"),
     field("HEIMDALL_HTTPS_PORT", "HTTPS port", "Heimdall", kind="port"),
     field("PROMETHEUS_PORT", "Published port", "Prometheus", kind="port"),
     field("MQTT_USERNAME", "MQTT username", "MQTT"),
-    field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret"),
+    field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret", description="Applied to the Mosquitto password file on the next apply/start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "Published port", "MQTT", kind="port"),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
@@ -225,6 +233,8 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
             raise ValueError(f"{spec['label']} must be an IPv4 address") from exc
         if address.version != 4:
             raise ValueError(f"{spec['label']} must be an IPv4 address")
+    if spec["key"] == "INFLUXDB_RAW_RETENTION" and text and not re.fullmatch(r"0|[1-9][0-9]{0,4}[hdw]", text):
+        raise ValueError(f"{spec['label']} must be 0, or a duration such as 720h, 30d or 8w")
     if kind == "path" and text and not text.startswith("/"):
         raise ValueError(f"{spec['label']} must be an absolute path")
     if kind == "url" and text:
@@ -310,6 +320,8 @@ def update_configuration(updates: dict[str, Any]) -> str:
         spec = FIELD_BY_KEY.get(key)
         if not spec:
             raise ValueError(f"Unsupported setting: {key}")
+        if spec["read_only"] and spec["kind"] == "secret" and raw == "":
+            continue  # a blank secret means "keep the stored value"
         if spec["read_only"]:
             raise ValueError(f"{spec['label']} is read-only in the control panel")
         if spec["kind"] == "secret" and str(raw or "") == "":

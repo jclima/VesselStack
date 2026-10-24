@@ -177,7 +177,8 @@ nano vesselstack.env
 | `INFLUXDB_HISTORY_BUCKET` | One-minute retained history; default `signalk_1m` |
 | `INFLUXDB_HOME_ASSISTANT_BUCKET` | Home Assistant history bucket |
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
-| `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values |
+| `INFLUXDB_RAW_RETENTION` | Raw-bucket retention: `720h`, `30d`, `8w`, or `0` (forever). Empty (default) = `30d` on a new install and **no change** to an existing bucket; see "Raw data retention" |
+| `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
 | `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
 | `TELEMETRY_INDEXER_ENABLE` | Refresh Boat Chat's telemetry memory every five minutes |
@@ -338,6 +339,51 @@ sudo docker exec vesselstack-influxdb influx task list \
 
 Upgrades from 0.x retain any previously configured InfluxDB bucket names
 when those settings are absent, so existing history remains accessible.
+
+Start, restart and the backup restart path all run `scripts/bootstrap-influx.sh`,
+which first waits (up to 120 s, `INFLUXDB_READY_TIMEOUT`) for InfluxDB to report
+healthy. A failed `bucket list` is retried and then reported as an error; a
+bucket is created only when a *successful* listing lacks it. The admin token is
+handed to the `influx` CLI through the environment, never as a command-line
+argument. The one-minute downsample task averages **numeric fields only**
+(string and boolean fields such as navigation state or relay status are dropped
+before `mean()`, which would otherwise fail the whole run); an existing task from
+an older release is updated in place to this version.
+
+#### Raw data retention
+
+The full-resolution bucket (`INFLUXDB_RAW_BUCKET`) used to keep data forever,
+which eventually fills the boat's disk. New installs now create it with a 30-day
+retention (`INFLUXDB_RAW_RETENTION`, default `30d`); the one-minute history
+bucket keeps one year as before. **Upgrades never change an existing bucket
+implicitly**, because shortening retention permanently deletes older raw data.
+To apply a window to an existing install, set `INFLUXDB_RAW_RETENTION` (for
+example `90d`, or `0` to keep forever) in `vesselstack.env` or the control panel
+and run `sudo vesselstackctl restart` (or the installer with `--start`); the
+bootstrap step then runs `influx bucket update`. Back up first. Removing the
+value later does not restore deleted data and leaves the bucket's current
+retention as is. `vesselstackctl doctor` warns when the data filesystem is more
+than 80 % full (`VESSELSTACK_DISK_WARN_PERCENT` overrides the threshold) and
+prints the size of the data directory.
+
+#### Rotating secrets
+
+`INFLUXDB_PASSWORD`, `INFLUXDB_TOKEN` and `GRAFANA_ADMIN_PASSWORD` are read by
+InfluxDB and Grafana only when their data volumes are first created, so they are
+**read-only in the control panel**: editing the file alone would make the config
+disagree with the running service. To rotate one deliberately, change it inside
+the service first, then update `config/vesselstack.env`, then re-apply:
+
+- Grafana: `docker exec vesselstack-grafana grafana cli admin reset-admin-password NEW`
+- InfluxDB password: `docker exec -e INFLUX_TOKEN=... vesselstack-influxdb influx user password -n boatadmin -p NEW`
+- InfluxDB admin token: create a new all-access token with `influx auth create`,
+  put it in `INFLUXDB_TOKEN`, run `sudo ./install.sh --config /opt/vesselstack/config/vesselstack.env --start`
+  (updates Boat Chat and Grafana), then delete the old token with `influx auth delete`.
+
+`MQTT_PASSWORD` is editable: the Mosquitto password file is created only when
+missing and otherwise updated in place (other users are kept) when the
+username/password changed since the last run, so re-running the installer no
+longer resets MQTT credentials. Update Home Assistant's MQTT integration to match.
 
 ### Grafana
 
@@ -628,9 +674,12 @@ sudo ./install.sh \
   --config /opt/vesselstack/config/vesselstack.env
 ```
 
-Review Compose and release notes before applying container changes. Never
-upgrade with the original example containing `GENERATE`; use the installed
-configuration so credentials remain stable.
+Review Compose and release notes before applying container changes. Prefer the
+installed configuration as input. If you do re-run with a file that still says
+`GENERATE` (for example a fresh copy of the example), the installer now keeps
+the already-installed InfluxDB, Grafana, MQTT, Boat Chat and control-panel
+secrets instead of generating new ones. A non-`GENERATE` value you set
+explicitly still wins.
 
 Once a reviewed release directory is downloaded, the lifecycle command can
 perform preflight, a verified pre-update backup, installation, and startup:
@@ -815,7 +864,9 @@ publishes InfluxDB, Prometheus and MQTT on loopback. Reconnect each browser with
 InfluxDB over the LAN stop working until `VESSELSTACK_DATA_BIND_ADDRESS` is set
 to a trusted address. Settings writes lose the old private-LAN trust (use the
 settings token). Scoped read-only Influx tokens for Boat Chat and Grafana are
-not part of this change; both still use the admin token.
+not implemented (deferred: InfluxDB cannot be given a chosen token value, so a
+scoped token must be created after start and written back into the config and
+two services, which is fragile); both still use the admin token.
 
 **Verification.** `python3 -m unittest discover -s tests -p 'test_*.py'`,
 `tests/test-distribution.sh`, `curl -i -X POST http://127.0.0.1:8765/api/chat`
@@ -862,6 +913,36 @@ without touching infrastructure. Dependencies and database migrations remain
 separate reviewed work. Source facts now live in `boat_facts.example.json`; actual
 `boat_facts.json` and other operational data are ignored, not published.
 
+**Upgrade notes (secrets, readiness, retention, update trust).**
+
+- Re-running the installer no longer regenerates InfluxDB/Grafana/MQTT secrets;
+  the control panel shows the init-only ones as read-only (see "Rotating
+  secrets"). The Mosquitto password file is no longer truncated on every start.
+- `bootstrap-influx.sh` waits for InfluxDB health and treats list errors as
+  errors. The downsample task is updated once to the numeric-only version.
+- New installs keep 30 days of raw data. Existing buckets are unchanged unless
+  you set `INFLUXDB_RAW_RETENTION` (deletes older raw data; back up first).
+- `vesselstack-update` now verifies signatures with a root-controlled keyring
+  (`VERIFY_GNUPGHOME` / `VERIFY_ALLOWED_SIGNERS`). **Before the next update,
+  import the maintainer key there**, or verification fails (the checkout
+  owner's keyring is no longer consulted).
+- Legacy `boat-chat/{memory,data,boat-chat.env}` left under the code tree
+  because the new location already existed are moved to a root-only
+  `$VESSELSTACK_DATA/boat-chat-legacy-<timestamp>` directory with a warning;
+  nothing is deleted. Review, merge what you need and remove it.
+
+**Verification.** `python3 -m unittest discover -s tests -p 'test_*.py'`,
+`tests/test-distribution.sh`, `tests/test-clean-install.sh` (as root, on Linux),
+`vesselstackctl doctor` (disk line), and
+`docker exec vesselstack-influxdb influx bucket list` after `restart`.
+
+**Rollback.** Install the previous release's scripts and re-run the installer;
+secrets are preserved either way. Unset `INFLUXDB_RAW_RETENTION` (deleted raw data
+is not recoverable; restore from backup if needed). A pre-existing downsample task
+can be left as is. For the update trust change set `ALLOW_UNSIGNED_SOURCE="true"`
+temporarily (home lab only) or import the key. The quarantine directory can be
+deleted once reviewed.
+
 ### One-command application updates
 
 Install the stable launcher and a private per-machine configuration once:
@@ -885,14 +966,25 @@ Trust model: pulled source is untrusted until verified. The launcher refuses to
 fetch unless the checkout's `origin` equals `EXPECTED_REMOTE_URL` (default
 `https://github.com/jclima/VesselStack.git`), fetches without merging, requires
 the fetched commit to have a valid signature (`git verify-commit`) or a validly
-signed tag (`git verify-tag`) under the checkout owner's GPG/SSH trust
-configuration, and only then fast-forwards. `scripts/check-public-tree.py` and
+signed tag (`git verify-tag`), and only then fast-forwards. Verification runs
+with a fixed configuration (`git -c core.hooksPath=/dev/null -c gpg.program=gpg`,
+system and global git config ignored, no repository-local overrides) against a
+**root-controlled** trust anchor, not the checkout owner's keyring:
+`VERIFY_GNUPGHOME` (a GNUPGHOME holding only the maintainer public key) or
+`VERIFY_ALLOWED_SIGNERS` (an SSH allowed-signers file) in `update.env`. When
+running as root, that path and its parents must be root-owned and not
+group/world-writable. After verification the tests and the deployed bytes both
+come from the verified commit object (`git archive <sha>` into a private tree the
+test user cannot write), not the working tree; HEAD, the clean state and the tree
+are re-checked after the tests and again just before apply, and any change aborts. `scripts/check-public-tree.py` and
 the unit tests run as the checkout owner via `runuser`, never as root; a
-root-owned checkout is refused. Import the maintainer signing key for the checkout
-owner before first use. Home-lab only: set `ALLOW_UNSIGNED_SOURCE="true"` in
+root-owned checkout is refused. Import the maintainer signing key into that root-controlled keyring before first
+use, e.g. `sudo install -d -m 700 /etc/vesselstack/gnupg` then
+`sudo GNUPGHOME=/etc/vesselstack/gnupg gpg --import maintainer.asc`. Home-lab only: set `ALLOW_UNSIGNED_SOURCE="true"` in
 `/etc/vesselstack/update.env` to accept unsigned source (a warning is printed);
-do not enable it on a vessel others can push code to. The checkout owner remains
-trusted: code that passed tests is copied by root from that checkout. Roll back
+do not enable it on a vessel others can push code to. The checkout owner can no longer
+change what root deploys after verification, because root deploys the verified
+commit's content. Roll back
 by restoring a printed backup (below) or by setting `ALLOW_UNSIGNED_SOURCE`
 back to `false`.
 

@@ -164,4 +164,67 @@ test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env"
 test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = \
     "$access_token_before"
 
+# Every generated secret survives a re-render from the ORIGINAL example-style
+# config (which still says GENERATE): InfluxDB/Grafana/MQTT ignore changed
+# credentials after first start, so regenerating would desynchronise them.
+secret_keys=(INFLUXDB_PASSWORD INFLUXDB_TOKEN GRAFANA_ADMIN_PASSWORD MQTT_PASSWORD)
+declare -A secret_before=()
+for key in "${secret_keys[@]}"; do
+    secret_before[$key]=$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")
+    [[ "${secret_before[$key]}" =~ ^[a-f0-9]{64}$ ]] || { echo "$key was not generated" >&2; exit 1; }
+done
+influx_token_chat_before=$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
+settings_token_before=$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+for key in "${secret_keys[@]}"; do
+    test "$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")" = "${secret_before[$key]}"
+done
+test "$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$influx_token_chat_before"
+test "$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$settings_token_before"
+test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$access_token_before"
+test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = "$panel_token_before"
+if grep -R 'GENERATE' "$APP_ROOT/config"; then
+    echo "Re-render produced an ungenerated secret" >&2
+    exit 1
+fi
+
+# Retention: empty by default (no implicit change to existing buckets), validated.
+grep -q "^INFLUXDB_RAW_RETENTION=''\?$" "$APP_ROOT/config/vesselstack.env"
+BAD_RETENTION_CONFIG="$TEST_ROOT/bad-retention.env"
+cp "$CONFIG" "$BAD_RETENTION_CONFIG"
+printf '\nINFLUXDB_RAW_RETENTION="1y"\n' >> "$BAD_RETENTION_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$BAD_RETENTION_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted an invalid INFLUXDB_RAW_RETENTION" >&2
+    exit 1
+fi
+
+# Legacy runtime state that cannot be migrated (new path already exists) is moved
+# into a root-only quarantine outside the code tree, never left in place and
+# never deleted.
+install -d "$DATA_ROOT/boat-chat/memory" "$DATA_ROOT/boat-chat/data" \
+    "$APP_ROOT/boat-chat/memory" "$APP_ROOT/boat-chat/data"
+printf 'current\n' > "$DATA_ROOT/boat-chat/memory/current.txt"
+printf 'current\n' > "$DATA_ROOT/boat-chat/data/current.txt"
+printf 'OPENAI_API_KEY=current\n' > "$DATA_ROOT/boat-chat/boat-chat.env"
+printf 'legacy-memory\n' > "$APP_ROOT/boat-chat/memory/legacy.txt"
+printf 'legacy-data\n' > "$APP_ROOT/boat-chat/data/legacy.txt"
+printf 'OPENAI_API_KEY=legacy-secret\n' > "$APP_ROOT/boat-chat/boat-chat.env"
+chmod 0666 "$APP_ROOT/boat-chat/boat-chat.env"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null 2>"$TEST_ROOT/quarantine.stderr"
+grep -q 'moved legacy' "$TEST_ROOT/quarantine.stderr"
+test ! -e "$APP_ROOT/boat-chat/memory"
+test ! -e "$APP_ROOT/boat-chat/data"
+test ! -e "$APP_ROOT/boat-chat/boat-chat.env"
+quarantine=$(find "$DATA_ROOT" -maxdepth 1 -type d -name 'boat-chat-legacy-*' | head -n 1)
+test -n "$quarantine"
+test "$(stat -c '%u:%a' "$quarantine")" = "0:700"
+grep -qx 'legacy-memory' "$quarantine/memory/legacy.txt"
+grep -qx 'legacy-data' "$quarantine/data/legacy.txt"
+grep -qx 'OPENAI_API_KEY=legacy-secret' "$quarantine/boat-chat.env"
+grep -qx 'current' "$DATA_ROOT/boat-chat/memory/current.txt"
+test -z "$(find "$APP_ROOT/boat-chat" -not -type l \( -perm -g=w -o -perm -o=w \) -print -quit)"
+
 echo "clean installation checks passed"

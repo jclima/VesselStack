@@ -146,7 +146,7 @@ function fieldMarkup(spec, value) {
     const numeric = spec.kind === "number" ? 'step="any"' : spec.kind === "port" ? 'step="1" min="1" max="65535"' : "";
     input = `<input id="${id}" name="${spec.key}" type="${type}" value="${shown}" placeholder="${placeholder}" ${numeric} ${spec.read_only ? "disabled" : ""}>`;
   }
-  const clear = spec.kind === "secret" && value?.configured
+  const clear = spec.kind === "secret" && value?.configured && !spec.read_only
     ? `<label class="clear-secret"><input type="checkbox" data-clear-secret="${spec.key}"> Clear stored value</label>`
     : "";
   return `<div class="field ${spec.kind}"><label for="${id}">${spec.label}</label>${input}${clear}${help}</div>`;
