@@ -155,10 +155,10 @@ verify_bundle() {
         exit 1
     }
     bundle_lock=$(sed -n 's/^lock_sha256=//p' "$BUNDLE/BUNDLE_INFO")
-    [ -n "$bundle_lock" ] && [ "$bundle_lock" = "$(sha256_only "$LOCK")" ] || {
+    if ! { [ -n "$bundle_lock" ] && [ "$bundle_lock" = "$(sha256_only "$LOCK")" ]; }; then
         echo "Bundle was built from a different requirements.lock than this release's; rebuild the bundle" >&2
         exit 1
-    }
+    fi
     check_wheels_against_lock "$BUNDLE/wheelhouse"
 }
 

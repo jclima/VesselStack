@@ -260,7 +260,7 @@ fresh_case
 chown 1000:1000 "$TEST_ROOT/case/images/"*.tar
 if prepare --load "$TEST_ROOT/case" >/dev/null 2>"$TEST_ROOT/err"; then fail "--load accepted non-root-owned image tarballs"; fi
 grep -q 'root-owned' "$TEST_ROOT/err"
-grep -q '^load ' "$TEST_ROOT/docker.log" && fail "docker load ran for a refused bundle" || true
+if grep -q '^load ' "$TEST_ROOT/docker.log"; then fail "docker load ran for a refused bundle"; fi
 rm -rf "$TEST_ROOT/case"
 
 export VESSELSTACK_WHEELHOUSE="$WHEELHOUSE"
@@ -325,7 +325,7 @@ installer >/dev/null 2>&1
 grep -qx "$VERSION" "$APP_ROOT/config/installed-version"
 # Online installs use the same hash-pinned, wheels-only lock.
 grep -q -- "--only-binary=:all: --require-hashes -r .*boat-chat/requirements.lock" "$TEST_ROOT/pip.log" || fail "online install must use the hash-pinned lock"
-tail -n 1 "$TEST_ROOT/pip.log" | grep -q -- '--no-index' && fail "online install must not be offline" || true
+if tail -n 1 "$TEST_ROOT/pip.log" | grep -q -- '--no-index'; then fail "online install must not be offline"; fi
 
 # --- Offline bundle tooling -------------------------------------------------------
 : > "$TEST_ROOT/pip.log"
@@ -356,6 +356,6 @@ env PATH="$FAKE_BIN:$PATH" "$RELEASE/scripts/prepare-offline-bundle.sh" --output
 env PATH="$FAKE_BIN:$PATH" "$RELEASE/scripts/prepare-offline-bundle.sh" --load "$TEST_ROOT/bundle4" >/dev/null
 grep -qxF 'influxdb:2.9.1' "$IMAGES_PRESENT"
 installer --offline --dry-run >/dev/null 2>"$TEST_ROOT/err"
-grep -q 'not present locally' "$TEST_ROOT/err" && fail "images still missing after load" || true
+if grep -q 'not present locally' "$TEST_ROOT/err"; then fail "images still missing after load"; fi
 
 echo "offline install checks passed"

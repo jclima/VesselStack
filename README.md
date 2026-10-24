@@ -1029,6 +1029,11 @@ persisted checkout credentials outside the repository Git configuration.
 External registry manifest checks retry short transport failures three times;
 missing Linux ARM64 support still fails the release gate.
 
+`tests/test-distribution.sh` runs `shellcheck` at full severity (including
+info-level findings) on the shell scripts it lists, and they currently pass
+with no findings. The style `A && B || handler` is avoided (SC2015); use
+`if ! { A && B; }; then ... fi` instead.
+
 ```bash
 tests/test-distribution.sh
 sudo tests/test-lifecycle.sh

@@ -56,10 +56,10 @@ else
         done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -type f -name '*.sh' | sort -V)
     fi
     for script in ${steps[@]+"${steps[@]}"}; do
-        [ -x "$script" ] && [ ! -L "$script" ] || {
+        if ! { [ -x "$script" ] && [ ! -L "$script" ]; }; then
             echo "Migration step is not an executable regular file: $script" >&2
             exit 1
-        }
+        fi
     done
 fi
 
