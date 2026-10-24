@@ -2,8 +2,8 @@
   "vessel": {
     "name": "VesselStack",
     "type": "Motor vessel",
-    "mmsi": "000000000",
-    "callsign": "UNSET",
+    "mmsi": "",
+    "callsign": "",
     "length_overall_m": 0,
     "beam_m": 0
   },
@@ -21,6 +21,12 @@
   },
   "engines": {
     "layout": "Configure during installation",
-    "sides": ["port", "starboard"]
+    "sides": [
+      "port",
+      "starboard"
+    ]
+  },
+  "navigation": {
+    "location_note": "Set the operating area and whether tides apply."
   }
 }

@@ -18,6 +18,7 @@ HEALTH_ENTITY_IDS = [
     "sensor.boat_watch_summary",
     "binary_sensor.shore_power_connected",
     "input_boolean.underway_mode",
+    "input_select.boat_watch_mode",
     "sensor.distance_from_dock",
     "input_number.dock_radius",
     "sensor.signalk_api_up",

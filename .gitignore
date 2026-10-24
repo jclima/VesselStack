@@ -4,3 +4,23 @@ generated/*
 __pycache__/
 *.py[cod]
 .venv/
+
+# Per-deployment configuration, observations, and operational records
+.mcp.json
+*.env
+!*.example.env
+*.secret
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.jsonl
+*.log
+boat-chat/boat_facts.json
+boat-chat/memory/
+boat-chat/data/
+control-panel/data/
+pre-change-backups/
+backups/
+reviews/
+.local/

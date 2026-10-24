@@ -66,22 +66,92 @@ const modelControls = {
 };
 let modelCatalog = { suggestions: {}, model_setting_key: {}, active: {} };
 let loadedSettings = {};
-let conversation = JSON.parse(sessionStorage.getItem("boatChatConversation") || "[]");
-const sessionId = sessionStorage.getItem("boatChatSessionId") || crypto.randomUUID();
+function readConversation() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("boatChatConversation") || "[]");
+    return Array.isArray(saved) ? saved.filter(item => item && ["user", "assistant"].includes(item.role) && typeof item.content === "string").slice(-8) : [];
+  } catch { return []; }
+}
+let conversation = readConversation();
+
+function createSessionId() {
+  if (typeof crypto?.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  const random = new Uint32Array(4);
+  if (typeof crypto?.getRandomValues === "function") {
+    crypto.getRandomValues(random);
+  } else {
+    for (let index = 0; index < random.length; index += 1) {
+      random[index] = Math.floor(Math.random() * 0x100000000);
+    }
+  }
+  return `browser-${Date.now().toString(36)}-${Array.from(random, (value) => value.toString(36)).join("")}`;
+}
+
+let sessionId = sessionStorage.getItem("boatChatSessionId") || createSessionId();
 sessionStorage.setItem("boatChatSessionId", sessionId);
 answerMode.value = localStorage.getItem("boatChatAnswerMode") || "concise";
 answerMode.addEventListener("change",()=>localStorage.setItem("boatChatAnswerMode",answerMode.value));
 let activeController = null;
 let progressTimer = null;
 
+function appendInline(parent, text) {
+  // Deliberately small text-only markup parser. Never interpret model HTML.
+  const parts = String(text).split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g);
+  parts.forEach(part => {
+    const bold = part.startsWith("**") && part.endsWith("**");
+    const code = part.startsWith("`") && part.endsWith("`");
+    if (bold || code) { const node = document.createElement(bold ? "strong" : "code"); node.textContent = part.slice(bold ? 2 : 1, bold ? -2 : -1); parent.appendChild(node); }
+    else parent.appendChild(document.createTextNode(part));
+  });
+}
+function renderAnswer(parent, text) {
+  const body = document.createElement("div"); body.className = "answer-body";
+  let list = null;
+  String(text).split("\n").forEach(line => {
+    const bullet = line.match(/^\s*([-*]|\d+\.)\s+(.+)$/);
+    if (bullet) {
+      const type = /\d/.test(bullet[1]) ? "ol" : "ul";
+      if (!list || list.tagName.toLowerCase() !== type) { list = document.createElement(type); body.appendChild(list); }
+      const item = document.createElement("li"); appendInline(item, bullet[2]); list.appendChild(item); return;
+    }
+    list = null;
+    if (!line.trim()) return;
+    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    const row = document.createElement(heading ? "h3" : "p"); appendInline(row, heading ? heading[1] : line); body.appendChild(row);
+  });
+  parent.appendChild(body);
+}
 function addMessage(role, text) {
   const item = document.createElement("article");
   item.className = `message ${role}`;
   item.setAttribute("aria-label", role === "user" ? "Your question" : "Boat Chat answer");
-  item.textContent = text;
+  if (role === "assistant") renderAnswer(item, text); else item.textContent = text;
   messages.appendChild(item);
   messages.scrollTop = messages.scrollHeight;
   return item;
+}
+function addAnswerEvidence(item, experience, answeredAt) {
+  const evidence = Array.isArray(experience?.evidence) ? experience.evidence : [];
+  if (!evidence.length && !answeredAt) return;
+  const details = document.createElement("details"); details.className = "message-evidence";
+  const summary = document.createElement("summary"); summary.textContent = "Sources & answer time"; details.appendChild(summary);
+  if (answeredAt) { const stamp = document.createElement("p"); stamp.textContent = `Answered ${new Date(answeredAt).toLocaleString()}. This answer is a snapshot, not live status.`; details.appendChild(stamp); }
+  const list = document.createElement("ul");
+  evidence.forEach(source => { const row = document.createElement("li"); const label = document.createElement("strong"); label.textContent = `${source.label}: `; row.append(label, document.createTextNode(source.detail || "")); list.appendChild(row); });
+  details.appendChild(list); item.appendChild(details);
+}
+function decorateAnswer(item, turn, question) {
+  addMetricCards(item, turn.experience?.metrics);
+  addCharts(item, turn.experience?.charts);
+  addAnswerEvidence(item, turn.experience, turn.answered_at);
+  addFollowups(item, turn.experience?.followups);
+  addFeedbackControls(item, turn.request_id, question, turn.session_id || sessionId);
+}
+function persistConversation() {
+  try { sessionStorage.setItem("boatChatConversation", JSON.stringify(conversation)); return true; }
+  catch { return false; }
 }
 
 function setStatus(text, state = "ready") {
@@ -147,25 +217,93 @@ function addFollowups(messageElement, prompts) {
   messageElement.appendChild(wrap);
 }
 
-async function loadBoatStatus() {
-  const token = sessionStorage.getItem("boatChatAccessToken") || "";
-  if (!token) {
-    boatStatusStrip.hidden = true;
-    boatStatusStrip.replaceChildren();
-    return;
-  }
-  try {
-    const response = await fetch("/api/status", {headers:{"X-Boat-Chat-Token":token}});
-    if (!response.ok) {
-      boatStatusStrip.hidden = true;
-      return;
-    }
-    const data = await response.json(); boatStatusStrip.replaceChildren(); boatStatusStrip.hidden = false;
-    data.cards.forEach((card) => { const button=document.createElement("button"); button.type="button"; button.className="status-card"; button.dataset.tone=card.tone; button.innerHTML=`<span></span><strong></strong>`; button.querySelector("span").textContent=card.label; button.querySelector("strong").textContent=card.value; button.addEventListener("click",()=>ask(card.prompt)); boatStatusStrip.appendChild(button); });
-  } catch (error) {
-    boatStatusStrip.hidden = true;
-  }
+let statusBusy = false;
+let lastBoatStatus = null;
+let lastStatusReceived = 0;
+let connectionState = "disconnected";
+let accessTokenRequired = false;
+const connectDialog = document.querySelector("#connect-dialog");
+function showView(view) { document.body.dataset.view = view; }
+function updateAccessControls() {
+  const connectButton = document.querySelector("#connect-open");
+  connectButton.hidden = !accessTokenRequired;
+  if (!accessTokenRequired && connectDialog.open) connectDialog.close();
 }
+function ageText() {
+  const output = document.querySelector("#observation-age");
+  if (!lastBoatStatus) return;
+  const age = lastBoatStatus.age_seconds;
+  const elapsed = Math.floor((Date.now() - lastStatusReceived) / 1000);
+  const seconds = age == null ? null : age + elapsed;
+  const outdated = seconds == null || seconds > 600 || connectionState !== "connected";
+  output.textContent = `${connectionState === "offline" ? "Connection lost — retained observations. " : ""}${seconds == null ? "Observation time unavailable" : `Snapshot collected ${Math.floor(seconds / 60)} min ago`}. ${outdated ? "Outdated or incomplete — refresh before relying on it." : "Individual sensors may report less often."}`;
+  document.querySelector("#owner-overview").dataset.outdated = String(outdated);
+  if (outdated) document.querySelector("#boat-condition").textContent = "Status needs refreshing";
+}
+function renderBoatStatus(data) {
+  lastBoatStatus = data; lastStatusReceived = Date.now();
+  document.querySelector("#boat-condition").textContent = data.condition;
+  boatStatusStrip.replaceChildren(); boatStatusStrip.hidden = false;
+  data.cards.forEach((card) => {
+    const button=document.createElement("button"); button.type="button"; button.className="status-card"; button.dataset.tone=card.tone;
+    const label=document.createElement("span"); label.textContent=card.label;
+    const value=document.createElement("strong"); value.textContent=card.value;
+    button.append(label,value); button.addEventListener("click",()=>ask(card.prompt)); boatStatusStrip.appendChild(button);
+  });
+  const attention=document.querySelector("#owner-attention"); attention.replaceChildren();
+  if (!data.attention.length) attention.textContent="No issues reported by the available status checks.";
+  data.attention.forEach((item)=>{
+    const row=document.createElement("div"); row.className="owner-issue"; row.dataset.severity=item.severity;
+    const text=document.createElement("p"); text.textContent=`${item.label}: ${item.reason}`;
+    const button=document.createElement("button"); button.type="button"; button.textContent="Explain"; button.addEventListener("click",()=>ask(item.prompt || `Explain this boat status: ${item.label}: ${item.reason}`)); row.append(text,button);
+    if(item.path) { const link=document.createElement("a"); link.textContent="Open boat controls"; link.href=`http://${window.location.hostname}:8123${item.path}`; link.target="_blank"; link.rel="noopener"; row.appendChild(link); }
+    attention.appendChild(row);
+  });
+  document.querySelector("#owner-system").textContent=data.system_status;
+  document.querySelector("#connect-open").textContent="Connected";
+  updateAccessControls();
+  ageText();
+}
+function clearDeviceStatus(message) {
+  lastBoatStatus=null; boatStatusStrip.replaceChildren(); boatStatusStrip.hidden=true;
+  document.querySelector("#boat-condition").textContent="Connect to your boat";
+  document.querySelector("#observation-age").textContent=message;
+  document.querySelector("#owner-attention").textContent="Boat status has not been checked.";
+  document.querySelector("#owner-system").textContent="Connect to check system status.";
+  insightsContent.replaceChildren(); document.querySelector("#connect-open").textContent="Connect"; updateAccessControls();
+}
+async function loadBoatStatus() {
+  if(statusBusy) return;
+  const token=sessionStorage.getItem("boatChatAccessToken") || "";
+  if(accessTokenRequired && !token) { connectionState="disconnected"; clearDeviceStatus("Connect this device to view boat observations."); return; }
+  statusBusy=true;
+  try {
+    const response=await fetch("/api/status",{headers:{"X-Boat-Chat-Token":token},signal:AbortSignal.timeout(10000)});
+    if(response.status===401) { accessTokenRequired=true; updateAccessControls(); connectionState="disconnected"; clearDeviceStatus("Access token rejected. Choose Connect to sign in again."); return; }
+    if(!response.ok) throw new Error(`HTTP ${response.status}`);
+    connectionState="connected"; renderBoatStatus(await response.json());
+  } catch(error) {
+    connectionState="offline";
+    if(lastBoatStatus) ageText();
+    else { clearDeviceStatus("Cannot reach the boat. Check your boat Wi-Fi or ZeroTier connection, then refresh."); document.querySelector("#boat-condition").textContent="Boat connection unavailable"; }
+  } finally { statusBusy=false; }
+}
+document.querySelector("#overview-open").addEventListener("click",()=>{showView("overview");loadBoatStatus();});
+document.querySelector("#chat-open").addEventListener("click",()=>{showView("chat");input.focus();});
+document.querySelector("#refresh-status").addEventListener("click",loadBoatStatus);
+document.querySelector("#connect-open").addEventListener("click",()=>connectDialog.showModal());
+document.querySelector("#connect-close").addEventListener("click",()=>connectDialog.close());
+document.querySelector("#disconnect-device").addEventListener("click",()=>{sessionStorage.removeItem("boatChatAccessToken");connectionState="disconnected";clearDeviceStatus("Device disconnected.");connectDialog.close();});
+document.querySelector("#connect-form").addEventListener("submit",async(event)=>{
+  event.preventDefault(); const field=document.querySelector("#connect-token"); const token=field.value.trim(); const message=document.querySelector("#connect-message"); message.textContent="Checking access…";
+  try { const response=await fetch("/api/status",{headers:{"X-Boat-Chat-Token":token},signal:AbortSignal.timeout(10000)});
+    if(!response.ok) throw new Error(response.status===401 ? "Token not accepted. Check the Boat Chat access token and try again." : "Boat status is unavailable. Try again.");
+    const data=await response.json(); sessionStorage.setItem("boatChatAccessToken",token); field.value=""; connectionState="connected";renderBoatStatus(data);message.textContent="";connectDialog.close();
+  } catch(error) { message.textContent=error.message; }
+});
+setInterval(()=>{if(!document.hidden) {ageText();loadBoatStatus();}},30000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)loadBoatStatus();});
+window.addEventListener("online",loadBoatStatus);
 
 function savedQuestions() { try { return JSON.parse(localStorage.getItem("boatChatSavedQuestions") || "[]"); } catch { return []; } }
 function saveQuestion(question) { const saved=[question,...savedQuestions().filter((item)=>item!==question)].slice(0,8); localStorage.setItem("boatChatSavedQuestions",JSON.stringify(saved)); renderSavedQuestions(); }
@@ -215,17 +353,17 @@ function addAisRadar(card, ais) {
 
 function downloadTripReport(trip) {
   const lines=["VesselStack trip report",`Window: ${trip.start_local} to ${trip.stop_local}`,`Duration: ${trip.duration_minutes ?? "unknown"} minutes`,"",trip.trip_summary || "No summary recorded."];
-  const blob=new Blob([`${lines.join("\n")}\n`],{type:"text/plain"}); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download=`vesselstack-trip-${(trip.start_local || "report").slice(0,10)}.txt`; link.click(); URL.revokeObjectURL(url);
+  const blob=new Blob([`${lines.join("\n")}\n`],{type:"text/plain"}); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download=`theoffice-trip-${(trip.start_local || "report").slice(0,10)}.txt`; link.click(); URL.revokeObjectURL(url);
 }
 
 async function loadInsights() {
   const token=sessionStorage.getItem("boatChatAccessToken") || "";
   insightsContent.textContent="Loading boat insights…";
-  if (!token) { insightsContent.textContent="Add the Boat Chat access token in Settings to view vessel insights."; return; }
+  if (accessTokenRequired && !token) { insightsContent.textContent="Choose Connect to sign in to this device and view your trips and maintenance."; return; }
   try {
     const response=await fetch("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); const data=await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); insightsContent.replaceChildren();
-    const alerts=hubCard(`Safety · ${data.alert_count ? `${data.alert_count} to review` : "all clear"}`); const alertList=document.createElement("ul"); alertList.className="alert-list";
+    const alerts=hubCard(`Boat · ${data.status.condition}`); const alertList=document.createElement("ul"); alertList.className="alert-list";
     data.alerts.forEach((item)=>{const row=document.createElement("li"); row.className="alert-row"; row.dataset.severity=item.severity; const label=document.createElement("span"); label.className="alert-label"; const dot=document.createElement("i"); dot.className="alert-dot"; const name=document.createElement("span"); name.textContent=item.label; label.append(dot,name); const value=document.createElement("strong"); value.textContent=item.value; row.append(label,value); alertList.appendChild(row);}); alerts.appendChild(alertList); const enableAlerts=document.createElement("button"); enableAlerts.type="button"; enableAlerts.className="alert-opt-in"; enableAlerts.textContent=localStorage.getItem("boatChatBrowserAlerts")==="on" ? "Browser alerts enabled" : "Enable browser alerts"; enableAlerts.addEventListener("click",()=>enableBrowserAlerts(enableAlerts)); alerts.appendChild(enableAlerts); processProactiveAlerts(data);
     const trip=hubCard("Last recorded trip");
     if (data.trip) { const summary=document.createElement("p"); summary.textContent=data.trip.trip_summary || `${data.trip.start_local} to ${data.trip.stop_local}`; const actions=document.createElement("div"); actions.className="trip-actions"; const askTrip=document.createElement("button"); askTrip.type="button"; askTrip.textContent="Analyze trip"; askTrip.addEventListener("click",()=>{insightsDialog.close();ask("Give me a detailed report for the last trip");}); const download=document.createElement("button"); download.type="button"; download.textContent="Download report"; download.addEventListener("click",()=>downloadTripReport(data.trip)); actions.append(askTrip,download); trip.append(summary,actions); } else { const empty=document.createElement("p"); empty.className="empty-state"; empty.textContent="No recorded trip window is available yet."; trip.appendChild(empty); }
@@ -240,7 +378,7 @@ async function loadInsights() {
   } catch(error) { insightsContent.textContent=`Boat Hub unavailable: ${error.message}`; }
 }
 
-function addFeedbackControls(messageElement, requestId, question) {
+function addFeedbackControls(messageElement, requestId, question, feedbackSessionId = sessionId) {
   if (!requestId) return;
   const controls = document.createElement("div");
   controls.className = "feedback-controls";
@@ -252,8 +390,15 @@ function addFeedbackControls(messageElement, requestId, question) {
       const headers = {"Content-Type":"application/json"};
       if (token) headers["X-Boat-Chat-Token"] = token;
       const note = rating === "helpful" ? "" : (window.prompt("What could be improved? (optional)", "") || "");
-      const response = await fetch("/api/feedback", {method:"POST", headers, body:JSON.stringify({request_id:requestId, session_id:sessionId, rating, note})});
-      if (response.ok) { controls.textContent = "Feedback saved"; }
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/feedback", {method:"POST", headers, body:JSON.stringify({request_id:requestId, session_id:feedbackSessionId, rating, note})});
+        if (!response.ok) throw new Error("Feedback could not be saved");
+        controls.textContent = "Feedback saved";
+      } catch {
+        button.disabled = false;
+        button.textContent = "Retry feedback";
+      }
     });
     controls.appendChild(button);
   });
@@ -287,52 +432,53 @@ function resizeInput() {
 }
 
 async function ask(message) {
-  const history = conversation.slice(-8);
+  message = String(message || "").trim();
+  if (!message || activeController) return;
+  showView("chat");
+  const history = conversation.slice(-8).map(({role, content}) => ({role, content}));
+  const requestSession = sessionId;
   addMessage("user", message);
-  const pending = addMessage("assistant", "Checking telemetry...");
+  const pending = addMessage("assistant", "Waiting for your boat's answer…");
   pending.classList.add("is-pending");
-  setStatus("Working", "busy");
-  setBusy(true);
-  activeController = new AbortController();
-  const stages = ["Reading boat state…", "Checking retained history…", "Preparing answer…"];
-  let stage = 0; progressTimer = setInterval(() => { if (stage < stages.length) pending.firstChild ? pending.firstChild.textContent = stages[stage++] : pending.textContent = stages[stage++]; }, 2500);
-
+  setStatus("Working", "busy"); setBusy(true);
+  const controller = new AbortController(); activeController = controller;
+  const began = Date.now();
+  progressTimer = setInterval(() => { pending.textContent = `Waiting for your boat's answer… ${Math.floor((Date.now() - began) / 1000)}s`; }, 1000);
   try {
     const token = sessionStorage.getItem("boatChatAccessToken") || "";
-    const headers = { "Content-Type": "application/json" };
+    const headers = {"Content-Type": "application/json"};
     if (token) headers["X-Boat-Chat-Token"] = token;
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers,
-      signal: activeController.signal,
-      body: JSON.stringify({ message, history, session_id: sessionId, answer_mode: answerMode.value }),
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
-    }
-    pending.classList.remove("is-pending");
-    pending.textContent = data.answer || "(No answer returned)";
-    addMetricCards(pending, data.experience?.metrics);
-    addCharts(pending, data.experience?.charts);
-    addFollowups(pending, data.experience?.followups);
-    addFeedbackControls(pending, data.request_id, message);
-    conversation.push(
-      { role: "user", content: message },
-      { role: "assistant", content: data.answer || "(No answer returned)" }
-    );
-    conversation = conversation.slice(-8);
-    sessionStorage.setItem("boatChatConversation", JSON.stringify(conversation));
-    setContext(data.experience || {});
-    setStatus("Ready");
+    const response = await fetch("/api/chat", {method:"POST", headers, signal:controller.signal,
+      body:JSON.stringify({message, history, session_id:requestSession, answer_mode:answerMode.value})});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) { const error = new Error(data.error || `HTTP ${response.status}`); error.status = response.status; throw error; }
+    if (typeof data.answer !== "string" || !data.answer.trim()) throw new Error("The boat returned an empty answer.");
+    clearInterval(progressTimer);
+    pending.classList.remove("is-pending"); pending.replaceChildren(); renderAnswer(pending, data.answer);
+    const turn = {role:"assistant", content:data.answer, experience:data.experience || {}, request_id:data.request_id,
+      answered_at:new Date().toISOString(), session_id:requestSession};
+    decorateAnswer(pending, turn, message);
+    conversation.push({role:"user", content:message}, turn); conversation = conversation.slice(-8);
+    setContext(null);
+    setStatus(persistConversation() ? "Answer ready" : "Answer ready · history not saved");
+    messages.scrollTop = messages.scrollHeight;
   } catch (error) {
-    pending.classList.remove("is-pending");
-    pending.textContent = error.name === "AbortError" ? "Request cancelled." : `Request failed: ${error.message}`;
-    setStatus("Error", "error");
+    clearInterval(progressTimer); pending.classList.remove("is-pending"); pending.replaceChildren();
+    const cancelled = error.name === "AbortError";
+    const explanation = cancelled ? "Stopped waiting. The boat may still finish processing this question." :
+      error.status === 401 ? "Connect this device to ask questions. Your question is kept below." :
+      error.status === 429 ? "Boat Chat is busy. Wait a moment, then retry." : "Couldn't get an answer. Check your connection and try again.";
+    renderAnswer(pending, explanation);
+    // A cancelled/failed request can still finish on the server. Isolate its session
+    // so that an unseen answer cannot contaminate the next conversational turn.
+    sessionId = createSessionId(); sessionStorage.setItem("boatChatSessionId", sessionId);
+    const actions = document.createElement("div"); actions.className = "followups";
+    if(error.status === 401) { const connect=document.createElement("button"); connect.type="button"; connect.textContent="Connect"; connect.addEventListener("click",()=>connectDialog.showModal()); actions.appendChild(connect); }
+    const retry=document.createElement("button"); retry.type="button"; retry.textContent="Retry question"; retry.addEventListener("click",()=>ask(message));
+    const edit=document.createElement("button"); edit.type="button"; edit.textContent="Edit question"; edit.addEventListener("click",()=>{input.value=message;resizeInput();input.focus();}); actions.append(retry,edit); pending.appendChild(actions);
+    setStatus(cancelled ? "Stopped waiting" : error.status === 401 ? "Sign-in needed" : "Try again", cancelled ? "ready" : "error");
   } finally {
-    clearInterval(progressTimer); progressTimer = null; activeController = null;
-    setBusy(false);
-    input.focus();
+    clearInterval(progressTimer); progressTimer = null; activeController = null; setBusy(false);
   }
 }
 
@@ -342,7 +488,9 @@ async function loadHealth() {
   try {
     const response = await fetch("/health");
     const data = await response.json();
-    setStatus("Ready");
+    accessTokenRequired = data.access_token_required === true;
+    updateAccessControls();
+    setStatus(data.ready ? "Connected" : "Limited data", data.ready ? "ready" : "error");
     setRoute(data.provider || "local", data.fallback_provider || "", data.models || {});
   } catch (error) {
     setStatus("Offline", "error");
@@ -353,7 +501,11 @@ async function loadHealth() {
 function setSettingValue(name, value) {
   const field = settingsForm.elements[name];
   if (field) {
-    field.value = value || "";
+    if (field.type === "checkbox") {
+      field.checked = ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
+    } else {
+      field.value = value || "";
+    }
   }
 }
 
@@ -496,6 +648,7 @@ async function loadSettings() {
   const provider = populateProviderSelect("#setting-provider", false);
   const fallbackProvider = populateProviderSelect("#setting-fallback-provider", true);
 
+  setSettingValue("BOAT_CHAT_REQUIRE_ACCESS_TOKEN", loadedSettings.BOAT_CHAT_REQUIRE_ACCESS_TOKEN || "false");
   Object.entries(loadedSettings).forEach(([key, value]) => setSettingValue(key, value));
   if (!provider.value && data.active_provider) {
     provider.value = data.active_provider;
@@ -529,6 +682,7 @@ async function saveSettings(event) {
     if (secretKeys.has(key) && !text) continue;
     settings[key] = text;
   }
+  settings.BOAT_CHAT_REQUIRE_ACCESS_TOKEN = settingsForm.elements.BOAT_CHAT_REQUIRE_ACCESS_TOKEN.checked ? "true" : "false";
 
   const primaryProvider = settings.BOAT_CHAT_PROVIDER || "";
   const primaryModel = selectedModel("primary");
@@ -609,12 +763,15 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
 });
 
 clearButton.addEventListener("click", () => {
+  const clearedSession = sessionId;
+  sessionId = createSessionId();
+  sessionStorage.setItem("boatChatSessionId", sessionId);
   conversation = [];
   sessionStorage.removeItem("boatChatConversation");
   const token = sessionStorage.getItem("boatChatAccessToken") || "";
   const headers = {"Content-Type":"application/json"};
   if (token) headers["X-Boat-Chat-Token"] = token;
-  fetch("/api/session/clear", {method:"POST", headers, body:JSON.stringify({session_id:sessionId})}).catch(() => {});
+  fetch("/api/session/clear", {method:"POST", headers, body:JSON.stringify({session_id:clearedSession})}).catch(() => {});
   messages.replaceChildren();
   setContext(null);
   addWelcomeMessage();
@@ -627,9 +784,10 @@ document.querySelector("#capabilities-open").addEventListener("click", async () 
 });
 document.querySelector("#capabilities-close").addEventListener("click",()=>capabilitiesDialog.close());
 document.querySelector("#insights-open").addEventListener("click",()=>{insightsDialog.showModal();loadInsights();});
+document.querySelector("#maintenance-open").addEventListener("click",()=>{insightsDialog.showModal();loadInsights();});
 document.querySelector("#insights-close").addEventListener("click",()=>insightsDialog.close());
 
-setInterval(async()=>{if(localStorage.getItem("boatChatBrowserAlerts")!=="on") return; const token=sessionStorage.getItem("boatChatAccessToken")||""; if(!token) return; try {const response=await fetch("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); if(response.ok) processProactiveAlerts(await response.json());} catch(error) { /* Retry on the next interval. */ }},60000);
+setInterval(async()=>{if(localStorage.getItem("boatChatBrowserAlerts")!=="on") return; const token=sessionStorage.getItem("boatChatAccessToken")||""; if(accessTokenRequired && !token) return; try {const response=await fetch("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); if(response.ok) processProactiveAlerts(await response.json());} catch(error) { /* Retry on the next interval. */ }},60000);
 
 document.querySelector("#settings-open").addEventListener("click", async () => {
   settingsMessage.textContent = "";
@@ -666,12 +824,15 @@ settingsForm.addEventListener("submit", saveSettings);
 
 function addWelcomeMessage() {
   if (conversation.length) {
-    conversation.forEach((item) => addMessage(item.role, item.content));
+    conversation.forEach((item, index) => {
+      const message = addMessage(item.role, item.content);
+      if(item.role === "assistant") decorateAnswer(message, item, conversation[index - 1]?.content || "");
+    });
     return;
   }
   addMessage(
     "assistant",
-    "What would you like to know about your vessel?"
+    "Ask about the boat now, investigate a change, or review a trip. I’ll show the evidence with each answer."
   );
 }
 

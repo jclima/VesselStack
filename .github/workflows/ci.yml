@@ -34,6 +34,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install validation tools
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: Public-source privacy check
+        run: python3 scripts/check-public-tree.py
       - name: Static distribution checks
         run: tests/test-distribution.sh
       - name: Lifecycle backup and restore checks
@@ -48,8 +50,8 @@ jobs:
         run: docker compose --profile signalk --profile ais --env-file vesselstack.example.env -f templates/compose.yml config --quiet
       - name: Validate Linux ARM64 image manifests
         run: tests/test-image-manifests.sh
-      - name: Run Boat Chat tests
-        run: python3 -m unittest discover -s tests -p 'test_boat_chat.py' -v
+      - name: Run all Python regressions
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Run control panel tests
         run: python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
       - name: Run installation wizard tests

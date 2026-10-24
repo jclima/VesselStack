@@ -41,6 +41,9 @@ done
 for command in docker systemctl curl; do
 cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
+if [ "$(basename "$0")" = curl ]; then
+    printf '%s\n' '{"ok":true,"ready":true}'
+fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --services "* ]]; then
     printf '%s\n' homeassistant influxdb grafana prometheus mosquitto heimdall
 fi

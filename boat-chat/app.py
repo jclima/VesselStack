@@ -31,6 +31,8 @@ import memory_index
 import query_planner
 import session_store
 import telemetry_cache
+import status_model
+from cruise_efficiency import matched_sample
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,9 +40,10 @@ REPO_ROOT = ROOT.parent
 STATIC_ROOT = ROOT / "static"
 MCP_CONFIG = REPO_ROOT / ".mcp.json"
 ENV_CONFIG = ROOT / "boat-chat.env"
-BOAT_FACTS = ROOT / "boat_facts.json"
+BOAT_FACTS = Path(os.environ.get("BOAT_CHAT_FACTS_FILE", str(ROOT / "boat_facts.json")))
 BOAT_CHAT_AGENT = ROOT / "BOAT_CHAT_AGENT.md"
 KNOWLEDGE_ROOT = ROOT / "knowledge"
+BOAT_NAME = os.environ.get("BOAT_NAME", "VesselStack")
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 MAX_REQUEST_BODY = 1024 * 1024
@@ -54,7 +57,6 @@ DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 DEFAULT_CODEX_EFFORT = "low"
 DEFAULT_CLAUDE_EFFORT = "low"
 DEFAULT_CLI_TIMEOUT_SECONDS = 120
-BOAT_NAME = os.environ.get("BOAT_NAME", "VesselStack")
 DEFAULT_SYSTEM_PROMPT = (
     f"You are the Boat Diagnostic Agent for {BOAT_NAME}. Answer boat-specific questions by grounding every assessment "
     "in the provided local telemetry, Home Assistant state, Influx summaries, and local docs. Use public "
@@ -76,6 +78,7 @@ SETTING_KEYS = [
     "BOAT_CHAT_OLLAMA_NUM_CTX",
     "BOAT_CHAT_SETTINGS_TOKEN",
     "BOAT_CHAT_ACCESS_TOKEN",
+    "BOAT_CHAT_REQUIRE_ACCESS_TOKEN",
     "BOAT_CHAT_WEB_SEARCH",
     "BOAT_CHAT_CLI_TIMEOUT",
     "BOAT_CHAT_CODEX_MODEL",
@@ -209,8 +212,6 @@ TRIP_CORE_PATHS = [
     "tanks.fuel.0.currentLevel",
     "tanks.fuel.1.currentLevel",
 ]
-# Legacy defaults preserve existing installations; new installs inject the
-# vessel-neutral names from vesselstack.env.
 INFLUX_RAW_BUCKET = os.environ.get("INFLUXDB_RAW_BUCKET", "vesselstack_raw")
 INFLUX_HISTORY_BUCKET = os.environ.get("INFLUXDB_HISTORY_BUCKET", "vesselstack_1m")
 INFLUX_HOME_ASSISTANT_BUCKET = os.environ.get("INFLUXDB_HOME_ASSISTANT_BUCKET", "homeassistant")
@@ -430,6 +431,16 @@ def setting_value(key: str, default: str | None = None) -> str | None:
     return os.environ.get(key, default)
 
 
+def setting_enabled(key: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    return (setting_value(key, fallback) or fallback).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def access_token_required() -> bool:
+    """Return whether browser/API access should require the configured token."""
+    return setting_enabled("BOAT_CHAT_REQUIRE_ACCESS_TOKEN", True)
+
+
 def quote_env_value(value: str) -> str:
     if value == "":
         return '""'
@@ -465,6 +476,15 @@ def write_env_config(settings: dict[str, str]) -> None:
             f"# Host/port changes require: sudo systemctl restart {service_name}",
         ]
     )
+    if ENV_CONFIG.exists():
+        passthrough = []
+        for raw_line in ENV_CONFIG.read_text().splitlines():
+            if "=" in raw_line and not raw_line.lstrip().startswith("#"):
+                key = raw_line.split("=", 1)[0].strip()
+                if key not in SETTING_KEYS:
+                    passthrough.append(raw_line)
+        if passthrough:
+            lines.extend(["", "# Deployment-managed integration settings", *passthrough])
     ENV_CONFIG.write_text("\n".join(lines) + "\n")
     try:
         ENV_CONFIG.chmod(0o600)
@@ -501,12 +521,24 @@ def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
             current.pop(key, None)
             continue
         text = str(value).strip()
+        if key == "BOAT_CHAT_REQUIRE_ACCESS_TOKEN":
+            normalized = text.lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                text = "true"
+            elif normalized in {"", "0", "false", "no", "off"}:
+                text = "false"
+            else:
+                raise ValueError("BOAT_CHAT_REQUIRE_ACCESS_TOKEN must be true or false")
         if key in SECRET_SETTING_KEYS and text == "":
             continue
         if text == "":
             current.pop(key, None)
         else:
             current[key] = text
+    if current.get("BOAT_CHAT_REQUIRE_ACCESS_TOKEN") == "true":
+        configured_token = current.get("BOAT_CHAT_ACCESS_TOKEN", os.environ.get("BOAT_CHAT_ACCESS_TOKEN", "")).strip()
+        if not configured_token:
+            raise ValueError("Set an access code before requiring it")
     write_env_config(current)
     return public_settings()
 
@@ -1195,7 +1227,7 @@ def ha_state_matches(state: dict[str, Any], tokens: set[str]) -> bool:
 
 def freshness_candidate(state: dict[str, Any]) -> bool:
     entity_id = str(state.get("entity_id", ""))
-    if any(marker in entity_id for marker in ("iphone", "ipad", "phone_battery", "mobile_device")):
+    if any(term in entity_id for term in ("_phone_", "_iphone_", "_ipad_")):
         return False
     if "automatic_backup" in entity_id:
         return False
@@ -2304,9 +2336,11 @@ def fuel_economy_summary(
     cache_key = fuel_usage_cache_key(window, rpm_threshold) if window else fuel_economy_cache_key(days, rpm_threshold)
     if rpm_band:
         cache_key += f":{rpm_band[0]:g}-{rpm_band[1]:g}rpm:{'both' if require_both_engines else 'either'}"
+    if require_both_engines:
+        cache_key += ":both"
     if use_cache:
         cached = telemetry_cache.get_summary("fuel_economy", cache_key, max_age_seconds=TELEMETRY_CACHE_FRESH_SECONDS)
-        if cached:
+        if cached and cached.get("calculation_version") == 2:
             return cached
     bucket = INFLUX_HISTORY_BUCKET
     if window:
@@ -2332,6 +2366,7 @@ from(bucket: "{bucket}")
     fuel_liters = 0.0
     distance_nm = 0.0
     distance_samples = 0
+    matched_minutes = 0
     first_running: str | None = None
     last_running: str | None = None
     for row in rows:
@@ -2342,6 +2377,8 @@ from(bucket: "{bucket}")
         speed_mps = safe_float(row.get("navigation.speedOverGround"))
         port_rpm = port_rpm_raw * 60.0 if port_rpm_raw is not None else None
         stbd_rpm = stbd_rpm_raw * 60.0 if stbd_rpm_raw is not None else None
+        if require_both_engines and (port_rpm is None or stbd_rpm is None or min(port_rpm, stbd_rpm) < rpm_threshold):
+            continue
         if rpm_band:
             low, high = rpm_band
             port_in_band = port_rpm is not None and low <= port_rpm <= high
@@ -2355,17 +2392,18 @@ from(bucket: "{bucket}")
         running_minutes += 1
         first_running = first_running or row.get("_time")
         last_running = row.get("_time")
-        if port_fuel_raw is not None:
-            fuel_liters += (port_fuel_raw * 3600000.0) / 60.0
-        if stbd_fuel_raw is not None:
-            fuel_liters += (stbd_fuel_raw * 3600000.0) / 60.0
-        if speed_mps is not None and speed_mps >= 0:
-            distance_nm += speed_mps * 60.0 / 1852.0
-            distance_samples += 1
+        sample = matched_sample(row, rpm_threshold)
+        if sample is None:
+            continue
+        matched_minutes += 1
+        fuel_liters += (port_fuel_raw + stbd_fuel_raw) * 60000.0
+        distance_nm += speed_mps * 60.0 / 1852.0
+        distance_samples += 1
 
     fuel_gallons = fuel_liters * US_GALLONS_PER_LITER
-    running_hours = running_minutes / 60.0
+    running_hours = matched_minutes / 60.0
     summary = {
+        "calculation_version": 2,
         "label": label,
         "source_bucket": bucket,
         "rpm_threshold": rpm_threshold,
@@ -2397,9 +2435,12 @@ from(bucket: "{bucket}")
         "sample_counts": {
             "running_minutes": running_minutes,
             "distance_samples": distance_samples,
+            "matched_minutes": matched_minutes,
+            "excluded_running_minutes": running_minutes - matched_minutes,
+            "coverage_percent": round(100 * matched_minutes / running_minutes, 1) if running_minutes else None,
         },
         "notes": [
-            "Fuel economy integrates fuel-rate and speed-over-ground samples only while either engine RPM exceeds threshold.",
+            "Fuel economy uses only aligned minutes with finite, nonnegative speed, both RPMs and both fuel rates; either engine must meet the RPM threshold.",
             "Distance is estimated from navigation.speedOverGround, so current/tide and GPS noise can affect the result.",
         ],
     }
@@ -2668,6 +2709,17 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         if unit:
             units[key] = unit
 
+    timestamps = {}
+    for key in values:
+        node = signalk
+        for part in key.split("."):
+            if not isinstance(node, dict):
+                node = {}
+                break
+            node = node.get(part, {})
+        if isinstance(node, dict) and node.get("timestamp"):
+            timestamps[key] = node["timestamp"]
+
     active_notifications: dict[str, Any] = {}
     normal_notification_count = 0
     for key, value in flat.items():
@@ -2700,6 +2752,7 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         "available_path_count": len(flat),
         "matched_path_count": len(matched),
         "values": values,
+        "timestamps": timestamps,
         "units": units,
         "active_notifications": active_notifications,
         "alarm_summary": (
@@ -2974,6 +3027,12 @@ def classify_question(message: str) -> dict[str, Any]:
     )
     complex_history = complex_history or fuel_balance_complex
     telemetry_overview = telemetry_overview_requested(message)
+    outing_terms = ["go out", "going out", "take the boat", "boat outing", "day on the lake", "day trip"]
+    outing_briefing = (
+        "full brief" in lower
+        or "full briefing" in lower
+        or ("brief" in lower and any(term in lower for term in outing_terms))
+    )
     current_request = any(
         term in lower
         for term in ["right now", "currently", "current ", "now?", "at the moment", "remains", "remaining", "fuel left"]
@@ -3000,6 +3059,7 @@ def classify_question(message: str) -> dict[str, Any]:
         "generic_history": generic_history,
         "complex_history": complex_history,
         "current_request": current_request,
+        "outing_briefing": outing_briefing,
         "generic_telemetry": telemetry_terms or telemetry_overview,
         "concepts": sorted(concepts),
         "query_plan": query_plan,
@@ -3024,11 +3084,24 @@ def ha_entity_ids_for_question(kind: dict[str, Any]) -> list[str]:
         "binary_sensor.boat_ok",
         "sensor.boat_watch_summary",
     ]
+    if kind.get("outing_briefing"):
+        ids.extend(
+            [
+                "sensor.marine_forecast", "sensor.forecast_summary_12h", "sensor.forecast_max_wind_12h",
+                "sensor.weather_risk_level", "sensor.weather_risk_score", "sensor.wind_speed", "sensor.wind_direction",
+                "sensor.air_temperature", "sensor.barometric_pressure", "sensor.fuel_tank_1_level",
+                "sensor.fuel_tank_2_level", "sensor.fuel_range_estimate", "sensor.engine_alarm_status",
+                "sensor.port_hours_until_service", "sensor.starboard_hours_until_service",
+                "binary_sensor.shore_power_connected", "sensor.signalk_api_up", "sensor.audit_health_summary",
+            ]
+        )
     if kind.get("battery") or kind.get("solar") or kind.get("health"):
         ids.extend(
             [
                 "binary_sensor.shore_power_connected",
                 "sensor.signalk_api_up",
+                "input_select.boat_watch_mode",
+                "input_boolean.underway_mode",
                 "sensor.engine_alarm_status",
                 "sensor.weather_risk_level",
                 "sensor.audit_health_summary",
@@ -3305,15 +3378,18 @@ def answer_from_health_state(message: str, context: dict[str, Any]) -> str | Non
     lower = message.lower()
     if not any(term in lower for term in ["is the boat ok","is the boat okay","boat ok","boat okay","boat health","boat status","overall health","overall status","status of the boat"]):
         return None
-    states=context.get("ha_states",{}); summary=states.get("sensor.boat_health_summary",{}); boat_ok=states.get("binary_sensor.boat_ok",{}); watch=states.get("sensor.boat_watch_summary",{})
-    status=str(summary.get("state","unknown")); ok_state=str(boat_ok.get("state","unknown")); watch_state=str(watch.get("state","unknown"))
-    if status == "OK" or ok_state == "on":
-        return f"Yes. {context.get('boat_facts', {}).get('vessel', {}).get('name', BOAT_NAME)} is OK right now. Boat Health Summary is {status}; Boat OK is {ok_state}; watch summary is {watch_state}."
-    return f"No clear OK state right now. Boat Health Summary is {status}; Boat OK is {ok_state}; watch summary is {watch_state}."
+    normalized = status_model.normalize({**context, "cache": {"age_seconds": 0}})
+    issues = normalized["attention"]
+    if issues:
+        details = "; ".join(f"{item['label']}: {item['reason']}" for item in issues[:3])
+        return f"{normalized['condition']}. {details}."
+    return f"No issues reported by the current status checks. {normalized['watch_summary']}."
 
 
 def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
     if "brief" not in message.lower():
+        return None
+    if context.get("question_type", {}).get("outing_briefing"):
         return None
     values=(context.get("current_telemetry") or {}).get("values",{}); states=context.get("ha_states") or {}
     state=lambda entity,default="unknown":str((states.get(entity) or {}).get("state",default))
@@ -3324,6 +3400,86 @@ def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
     alarms=(context.get("current_telemetry") or {}).get("alarm_summary")
     if alarms: lines.append(str(alarms))
     return "\n".join(lines)
+
+
+def requested_outing_date(message: str, now: dt.datetime | None = None) -> dt.date | None:
+    now = now or dt.datetime.now(LOCAL_TZ)
+    lower = message.lower()
+    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    for weekday, name in enumerate(weekdays):
+        if re.search(rf"\b{name}\b", lower):
+            days = (weekday - now.weekday()) % 7
+            return (now + dt.timedelta(days=days)).date()
+    if re.search(r"\btomorrow\b", lower):
+        return (now + dt.timedelta(days=1)).date()
+    if re.search(r"\btoday\b", lower):
+        return now.date()
+    return None
+
+
+def outing_brief_context(message: str, states: dict[str, Any], now: dt.datetime | None = None) -> dict[str, Any]:
+    target_date = requested_outing_date(message, now=now)
+    forecast_state = states.get("sensor.marine_forecast") or {}
+    attributes = forecast_state.get("attributes") if isinstance(forecast_state.get("attributes"), dict) else {}
+    slots = attributes.get("list") if isinstance(attributes.get("list"), list) else []
+    selected: list[dict[str, Any]] = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        try:
+            if slot.get("dt") is not None:
+                stamp = dt.datetime.fromtimestamp(float(slot["dt"]), tz=dt.timezone.utc).astimezone(LOCAL_TZ)
+            elif slot.get("dt_txt"):
+                stamp = dt.datetime.strptime(str(slot["dt_txt"]), "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).astimezone(LOCAL_TZ)
+            else:
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if target_date and stamp.date() != target_date:
+            continue
+        weather = (slot.get("weather") or [{}])[0] if isinstance(slot.get("weather"), list) else {}
+        main = slot.get("main") if isinstance(slot.get("main"), dict) else {}
+        wind = slot.get("wind") if isinstance(slot.get("wind"), dict) else {}
+        selected.append(
+            {
+                "time_local": stamp.strftime("%Y-%m-%d %H:%M %Z"),
+                "condition": weather.get("description") or weather.get("main"),
+                "temperature_f": main.get("temp"), "feels_like_f": main.get("feels_like"),
+                "precip_probability_pct": round(float(slot.get("pop", 0)) * 100) if slot.get("pop") is not None else None,
+                "wind_kn": round(float(wind.get("speed")) * 0.868976, 1) if wind.get("speed") is not None else None,
+                "wind_gust_kn": round(float(wind.get("gust")) * 0.868976, 1) if wind.get("gust") is not None else None,
+                "wind_direction_deg": wind.get("deg"),
+            }
+        )
+    readiness_entities = [
+        "sensor.boat_health_summary", "binary_sensor.boat_ok", "sensor.boat_watch_summary",
+        "sensor.weather_risk_level", "sensor.weather_risk_score", "sensor.wind_speed", "sensor.wind_direction",
+        "sensor.forecast_summary_12h", "sensor.forecast_max_wind_12h", "sensor.barometric_pressure",
+        "sensor.fuel_tank_1_level", "sensor.fuel_tank_2_level", "sensor.fuel_range_estimate",
+        "sensor.engine_alarm_status", "sensor.port_hours_until_service", "sensor.starboard_hours_until_service",
+        "binary_sensor.shore_power_connected", "sensor.signalk_api_up", "sensor.audit_health_summary",
+    ]
+    readiness: dict[str, Any] = {}
+    for entity_id in readiness_entities:
+        state = states.get(entity_id)
+        if not isinstance(state, dict) or "state" not in state:
+            continue
+        attrs = state.get("attributes") if isinstance(state.get("attributes"), dict) else {}
+        readiness[entity_id] = {"state": state.get("state"), "unit": attrs.get("unit_of_measurement"), "friendly_name": attrs.get("friendly_name")}
+    return {
+        "requested_date": target_date.isoformat() if target_date else None,
+        "forecast_source": "OpenWeatherMap 5-day / 3-hour forecast via Home Assistant",
+        "forecast_slots": selected, "forecast_available_for_requested_date": bool(selected),
+        "current_readiness": readiness,
+        "location_note": load_boat_facts().get("navigation", {}).get("location_note", "Operating area and tidal relevance are not configured; do not infer them."),
+        "answer_requirements": [
+            "Give an explicit go / caution / no-go assessment, with the basis and uncertainty.",
+            "Cover requested-day weather by time of day, wind and gusts, precipitation, temperature, fuel and range, battery/shore charging, engines/service, alarms, telemetry health, and a practical departure checklist.",
+            "Distinguish requested-day forecast from current boat state and flag unavailable or stale inputs instead of inventing values.",
+            "Use the configured operating-area note; never infer whether tides apply when location data is absent.",
+            "Be thorough even when the UI answer mode is concise.",
+        ],
+    }
 
 
 def answer_from_engine_history(context: dict[str, Any]) -> str | None:
@@ -3399,6 +3555,8 @@ def answer_from_fuel_economy(context: dict[str, Any]) -> str | None:
             f"I do not have enough retained running fuel/speed samples to compute fuel economy for "
             f"{summary.get('label', 'the requested period')}."
         )
+    matched_minutes = summary.get("sample_counts", {}).get("matched_minutes", running_minutes)
+    coverage_text = f" Matched fuel/speed coverage: {matched_minutes} of {running_minutes} retained running minutes."
     rpm_filter = summary.get("rpm_filter")
     filter_text = ""
     if isinstance(rpm_filter, dict):
@@ -3411,9 +3569,10 @@ def answer_from_fuel_economy(context: dict[str, Any]) -> str | None:
         f"Average fuel economy over {summary.get('label', 'the retained period')}: "
         f"{economy.get('nm_per_gallon')} NM/gal "
         f"({economy.get('gallons_per_nm')} gal/NM){filter_text}. "
-        f"That is based on {round(running_minutes / 60.0, 1)} engine-running hours, "
+        f"That is based on {round(matched_minutes / 60.0, 1)} matched engine-running hours, "
         f"{totals.get('distance_nm')} NM, and {totals.get('fuel_gallons')} gal from "
         f"{summary.get('first_running_sample_local')} to {summary.get('last_running_sample_local')}."
+        f"{coverage_text}"
     )
 
 
@@ -3793,6 +3952,12 @@ def collect_context(message: str, history: list[dict[str, str]] | None = None, p
     entity_ids = ha_entity_ids_for_question(kind)
     if entity_ids:
         context["ha_states"] = get_ha_states(entity_ids)
+    if kind.get("outing_briefing"):
+        context["outing_brief"] = outing_brief_context(query, context.get("ha_states", {}))
+        context["answer_focus"] = {
+            "kind": "future_outing_readiness",
+            "sections": ["Bottom line", "Weather timeline", "Boat readiness", "Fuel and range", "Navigation considerations", "Departure checklist", "Unknowns"],
+        }
     if should_search_docs(kind, query):
         context["local_docs"] = search_local_docs(query, limit=4)
     if kind["engine_run_history"]:
@@ -4030,43 +4195,15 @@ def readiness_status() -> dict[str, Any]:
 
 
 def experience_status() -> dict[str, Any]:
-    cached = telemetry_cache.get_summary("latest_context", "boat_status", max_age_seconds=30 * 60) or {}
-    values = (cached.get("current_telemetry") or {}).get("values", {})
-    ha = cached.get("ha_states") or {}
-    state = lambda entity, default="unknown": str((ha.get(entity) or {}).get("state", default))
-    port_rpm = safe_float(values.get("propulsion.port.revolutions")) or 0.0
-    starboard_rpm = safe_float(values.get("propulsion.starboard.revolutions")) or 0.0
-    underway = state("input_boolean.underway_mode", "off") == "on"
-    mode = "Underway" if underway else "Engines running" if max(port_rpm, starboard_rpm) >= ENGINE_RUNNING_RPM else "Docked"
-    cards = [
-        {"id":"health","label":"Boat","value":state("sensor.boat_health_summary","Unknown"),"tone":"ok" if state("binary_sensor.boat_ok","off")=="on" else "danger","prompt":"Is the boat healthy right now?"},
-        {"id":"mode","label":"Mode","value":mode,"tone":"normal","prompt":"Give me a current boat status briefing"},
-        {"id":"shore","label":"Shore","value":"Charging" if state("binary_sensor.shore_power_connected","off")=="on" else "Off","tone":"ok" if state("binary_sensor.shore_power_connected","off")=="on" else "warning","prompt":"What is the current shore power status?"},
-        {"id":"battery","label":"Battery","value":f"{safe_float(values.get('electrical.batteries.shunt.capacity.stateOfCharge')) or 0:g}% · {safe_float(values.get('electrical.batteries.shunt.voltage')) or 0:.2f} V","tone":"ok","prompt":"Tell me about the battery right now"},
-        {"id":"engines","label":"Engines","value":f"{port_rpm:.0f} / {starboard_rpm:.0f} RPM","tone":"normal","prompt":"Compare both engines right now"},
-        {"id":"fuel","label":"Fuel","value":f"{safe_float(values.get('tanks.fuel.0.currentLevel')) or 0:g}% / {safe_float(values.get('tanks.fuel.1.currentLevel')) or 0:g}%","tone":"normal","prompt":"How much fuel is left?"},
-    ]
-    cache = cached.get("cache") or {}
-    return {"cards":cards,"watch_summary":state("sensor.boat_watch_summary","Unavailable"),"age_seconds":cache.get("age_seconds"),"source":"cached live boat status"}
+    cached = telemetry_cache.get_summary("latest_context", "boat_status") or {}
+    return status_model.normalize(cached)
 
 
 def experience_insights() -> dict[str, Any]:
-    cached = telemetry_cache.get_summary("latest_context", "boat_status", max_age_seconds=30 * 60) or {}
+    cached = telemetry_cache.get_summary("latest_context", "boat_status") or {}
     values = (cached.get("current_telemetry") or {}).get("values", {})
-    ha = cached.get("ha_states") or {}
-    state = lambda entity, default="unknown": str((ha.get(entity) or {}).get("state", default))
-    alerts = []
-    alert_sources = [
-        ("Boat health", state("sensor.boat_health_summary", "Unknown")),
-        ("Boat watch", state("sensor.boat_watch_summary", "Unavailable")),
-        ("Engine alarms", state("sensor.engine_alarm_status", "Unknown")),
-        ("Weather risk", state("sensor.weather_risk_level", "Unknown")),
-        ("System audit", state("sensor.audit_health_summary", "Unknown")),
-    ]
-    normal = {"ok", "clear", "normal", "none", "off", "healthy", "unavailable", "unknown"}
-    for label, value in alert_sources:
-        severity = "ok" if value.strip().lower() in normal else "warning"
-        alerts.append({"label": label, "value": value, "severity": severity})
+    status = status_model.normalize(cached)
+    alerts = status["alerts"]
     latitude = safe_float(values.get("navigation.position.latitude"))
     longitude = safe_float(values.get("navigation.position.longitude"))
     position = None
@@ -4093,6 +4230,7 @@ def experience_insights() -> dict[str, Any]:
         except ValueError:
             pass
     return {
+        "status": status,
         "alerts": alerts,
         "alert_count": sum(item["severity"] != "ok" for item in alerts),
         "trip": trip_payload,
@@ -4107,6 +4245,7 @@ def experience_insights() -> dict[str, Any]:
 def capabilities_payload() -> dict[str, Any]:
     return {"groups":[
         {"name":"Current status","prompts":["Give me a current boat status briefing","Where is the boat?","Is anything stale?"]},
+        {"name":"Trip planning","prompts":["Give me a full brief for going out on Sunday","Give me a full departure readiness briefing for tomorrow"]},
         {"name":"Engines & fuel","prompts":["Compare both engines right now","How much fuel did I use this weekend?","Graph engine temperatures during the last trip"]},
         {"name":"Electrical","prompts":["Battery voltage over the past 2 weeks","When did shore power turn off?","How much did solar contribute last week?"]},
         {"name":"Safety & history","prompts":["Did the bilge pump run last night?","What happened during the last trip?","Show active warnings"]},
@@ -4170,6 +4309,48 @@ def fallback_answer(message: str, context: dict[str, Any], reason: str | None = 
     return "I gathered the available boat data, but no answer model is configured."
 
 
+def generate_answer(message: str, context: dict[str, Any]) -> str:
+    """Keep exact calculations while honoring requests for richer answers."""
+    clarification = answer_from_clarification(context)
+    if clarification:
+        return clarification
+    deterministic = (
+        answer_from_clarification(context)
+        or answer_from_ais_freshness(context)
+        or answer_from_freshness(context)
+        or answer_from_facts(message, context.get("boat_facts", {}))
+        or answer_from_briefing(message, context)
+        or answer_from_health_state(message, context)
+        or answer_from_engine_history(context)
+        or answer_from_fuel_usage(context)
+        or answer_from_fuel_economy(context)
+        or answer_from_solar_hardware(context)
+        or answer_from_solar_inference(context)
+        or answer_from_shore_power_history(context)
+        or answer_from_battery_voltage(context)
+        or answer_from_fuel_balance(context)
+        or answer_from_telemetry_overview(context)
+        or answer_from_event_history(context)
+        or answer_from_generic_history(context)
+    )
+    plan = context.get("query_plan") or {}
+    rich_answer = (
+        context.get("answer_mode", "concise") != "concise"
+        or bool(plan.get("complex"))
+        or bool(context.get("question_type", {}).get("complex_history"))
+        or context.get("interpreted_question") is not None
+        or bool(re.search(r"\b(why|explain|diagnose|troubleshoot|caused|should|recommend)\b", message, re.I))
+    )
+    if deterministic and not rich_answer:
+        return deterministic
+    if deterministic:
+        context["computed_answer"] = deterministic
+    answer = call_model(message, context)
+    if deterministic and answer.startswith("I gathered the available boat data, but"):
+        return deterministic
+    return answer
+
+
 def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, Any]:
     # question_type and context_strategy are routing metadata, not evidence;
     # excluding them saves prompt tokens without changing answers.
@@ -4179,6 +4360,7 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
         "interpreted_question": context.get("interpreted_question"),
         "query_plan": context.get("query_plan"),
         "prior_query_plan": context.get("prior_query_plan"),
+        "computed_answer": context.get("computed_answer"),
     }
     question_type = context.get("question_type", {})
     current_first = bool(question_type.get("current_request")) and "freshness" not in set(question_type.get("concepts", []))
@@ -4214,6 +4396,7 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
         "fuel_balance_24h",
         "fuel_balance_7d",
         "fuel_balance_error",
+        "outing_brief",
     ]:
         if key in context:
             compact[key] = context[key]
@@ -4242,7 +4425,10 @@ def build_prompt(message: str, context: dict[str, Any], max_chars: int = 50000) 
     prompt_context = compact_context(context)
     context_json = serialize_context_with_budget(prompt_context, max_chars)
     mode=context.get("answer_mode","concise")
-    instruction={"concise":"Keep the answer concise.","explain":"Explain the evidence and calculation clearly.","diagnose":"Organize the answer as observations, likely causes, and checks.","checklist":"Return a short actionable checklist."}.get(mode,"Keep the answer concise.")
+    if context.get("question_type", {}).get("outing_briefing"):
+        instruction = "Give a thorough, structured outing briefing that satisfies every answer requirement in the supplied context; do not shorten it merely because the UI mode is concise."
+    else:
+        instruction={"concise":"Answer every part of the question; keep simple answers concise and give complex questions enough explanation.","explain":"Explain the evidence and calculation clearly.","diagnose":"Organize the answer as observations, likely causes, and checks.","checklist":"Return a short actionable checklist."}.get(mode,"Answer every part of the question; keep simple answers concise and give complex questions enough explanation.")
     return "Boat context JSON:\n" + context_json + f"\n\nResponse mode: {mode}. {instruction}" + "\n\nQuestion:\n" + message
 
 
@@ -4252,32 +4438,55 @@ def serialize_context_with_budget(context: dict[str, Any], max_chars: int) -> st
     encoded = json.dumps(working, separators=(",", ":"))
     if len(encoded) <= max_chars:
         return encoded
-    working["conversation"] = (working.get("conversation") or [])[-2:]
-    working["local_docs"] = (working.get("local_docs") or [])[:2]
-    for _ in range(20):
-        encoded = json.dumps(working, separators=(",", ":"))
-        if len(encoded) <= max_chars:
-            return encoded
-        lists: list[tuple[int, dict[str, Any], str]] = []
-        def find_lists(node: Any) -> None:
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if isinstance(value, list) and len(value) > 1:
-                        lists.append((len(json.dumps(value, default=str)), node, key))
-                    else:
-                        find_lists(value)
-        find_lists(working)
-        if not lists:
+    omitted: list[str] = []
+    # Drop supporting documents and bulk sample arrays before summary evidence.
+    for key in ("local_docs", "prior_query_plan", "boat_facts"):
+        if key in working:
+            working.pop(key)
+            omitted.append(key)
+        if len(json.dumps(working, separators=(",", ":"))) <= max_chars - 150:
             break
-        _, parent, key = max(lists, key=lambda item: item[0])
-        parent[key] = parent[key][:max(1, len(parent[key]) // 2)]
-    minimal = {key: working.get(key) for key in ("boat_facts", "interpreted_question", "query_plan", "answer_focus") if working.get(key) is not None}
-    return json.dumps(minimal, separators=(",", ":"))
+    def trim_samples(node: Any, path: str = "") -> None:
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                location = f"{path}.{key}" if path else key
+                if key in {"samples", "rows", "records", "points", "raw_samples"} and isinstance(value, list):
+                    node.pop(key)
+                    omitted.append(location)
+                else:
+                    trim_samples(value, location)
+    if len(json.dumps(working, separators=(",", ":"))) > max_chars - 150:
+        trim_samples(working)
+    # Preserve complete summary records; never silently halve chronological data.
+    priority = ("computed_answer", "answer_focus", "query_plan", "interpreted_question",
+                "conversation", "outing_brief", "fuel_usage", "fuel_economy",
+                "engine_run_history", "battery_voltage", "solar_inference",
+                "shore_power_history", "ha_event_history", "influx_history",
+                "ha_telemetry", "ha_states", "current_telemetry")
+    selected: dict[str, Any] = {}
+    for key in list(priority) + [key for key in working if key not in priority]:
+        if key not in working:
+            continue
+        candidate = dict(selected, **{key: working[key]})
+        if len(json.dumps(candidate, separators=(",", ":"))) <= max_chars - 150:
+            selected = candidate
+        else:
+            omitted.append(key)
+    selected["context_trimming"] = {
+        "incomplete": True,
+        "instruction": "Some evidence was omitted; do not interpret missing evidence as zero or normal.",
+    }
+    encoded = json.dumps(selected, separators=(",", ":"))
+    if len(encoded) > max_chars:
+        return json.dumps({"context_trimming": {"incomplete": True}}, separators=(",", ":"))
+    return encoded
 
 
 def context_char_budget(context: dict[str, Any]) -> int:
     configured = int(setting_value("BOAT_CHAT_CONTEXT_CHARS", "12000") or "12000")
     if context.get("question_type", {}).get("complex_history"):
+        return max(configured, 18000)
+    if context.get("question_type", {}).get("outing_briefing"):
         return max(configured, 18000)
     return configured
 
@@ -4885,6 +5094,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         return True, ""
 
     def access_allowed(self) -> bool:
+        if not access_token_required():
+            return True
         token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
         if not token:
             return True
@@ -4892,6 +5103,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(provided, token)
 
     def sensitive_access_allowed(self) -> bool:
+        if not access_token_required():
+            return True
         token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
         return bool(token) and hmac.compare_digest(provided, token)
@@ -4978,6 +5191,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                     "fallback_provider": configured_fallback_provider(),
                     "models": active_models(),
                     "settings_token_required": bool((setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()),
+                    "access_token_required": access_token_required(),
                     "memory": memory_index.status() if self.access_allowed() else {"available": memory_index.db_path().exists()},
                     "telemetry_cache": telemetry_cache.status() if self.access_allowed() else {"available": True},
                     "sessions": session_store.status() if self.access_allowed() else {"available": True},
@@ -5081,26 +5295,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             context = collect_context(message, history=history, prior_query_plan=stored.get("query_plan"))
             answer_mode=str(payload.get("answer_mode","concise")).lower()
             context["answer_mode"] = answer_mode if answer_mode in {"concise","explain","diagnose","checklist"} else "concise"
-            answer = (
-                answer_from_clarification(context)
-                or answer_from_ais_freshness(context)
-                or answer_from_freshness(context)
-                or answer_from_facts(message, context.get("boat_facts", {}))
-                or answer_from_briefing(message, context)
-                or answer_from_health_state(message, context)
-                or answer_from_engine_history(context)
-                or answer_from_fuel_usage(context)
-                or answer_from_fuel_economy(context)
-                or answer_from_solar_hardware(context)
-                or answer_from_solar_inference(context)
-                or answer_from_shore_power_history(context)
-                or answer_from_battery_voltage(context)
-                or answer_from_fuel_balance(context)
-                or answer_from_telemetry_overview(context)
-                or answer_from_event_history(context)
-                or answer_from_generic_history(context)
-                or call_model(message, context)
-            )
+            answer = generate_answer(message, context)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             session_store.append_exchange(session_id, message, answer, context.get("query_plan", {}))
             session_store.record_request(request_id, session_id, hashlib.sha256(message.encode()).hexdigest(), context.get("query_plan", {}), context.get("context_profile", {}), elapsed_ms, "answered")

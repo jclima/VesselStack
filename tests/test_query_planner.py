@@ -49,7 +49,7 @@ class QueryPlannerTests(unittest.TestCase):
     def test_per_client_rate_limit(self):
         app.RATE_LIMIT_REQUESTS.clear()
         handler = object.__new__(app.BoatChatHandler)
-        handler.client_address = ("10.0.0.20", 1234)
+        handler.client_address = ("192.0.2.20", 1234)
         self.assertTrue(all(handler.rate_limit_allowed() for _ in range(app.RATE_LIMIT_MAX_REQUESTS)))
         self.assertFalse(handler.rate_limit_allowed())
 

@@ -738,3 +738,39 @@ material. This is a safety net, not a substitute for reviewing staged changes.
 
 See `CHANGELOG.md` for release notes and `VALIDATION.md` for the full evidence
 and hardware-dependent commissioning limits.
+
+## Current development improvements
+
+The owner overview now distinguishes missing/stale readings and contradictory
+health indicators, displays observation age, refreshes periodically and retains
+explicitly outdated information during connection loss. Chat preserves per-answer
+evidence and feedback, renders responses as text, and handles cancellation and
+conversation restoration. Complex explanations keep computed evidence intact.
+VesselStack's configured URLs, buckets, timezone and branding remain supported.
+
+Live status remains protected by a dedicated access token by default. Configure
+`BOAT_CHAT_ACCESS_TOKEN` in private Boat Chat settings before connecting the owner
+UI. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN=false` is an explicit opt-out for a reviewed,
+trusted installation; it is not the public default. Settings writes retain their
+separate protection. Integration settings survive provider-settings saves.
+
+Fuel economy now uses complete, finite, nonnegative fuel/RPM/speed observations
+from the same minute and states matched coverage. A reusable comparison is:
+
+```bash
+python3 scripts/cruise-efficiency.py --days 90 --minimum 15 --maximum 40 --step 2.5
+```
+
+The command requires the deployment's private Influx settings and configured
+history bucket. It reports combined US gal/h, nm/gal, gal/100 nm, mean RPM and
+sample support; SOG/current effects and transitions remain. `--json` is supported.
+`vesselstackctl status`/`doctor` now require Boat Chat's `ok` and `ready` flags,
+rather than accepting any successful HTTP response.
+
+For development from another machine, use a clean source checkout and follow
+[Development and safe updates](docs/DEVELOPMENT.md). Git pulls update source only.
+The existing lifecycle updater remains the release-update path; an optional
+application-only helper offers preview, tests, per-file backup and guarded rollback
+without touching infrastructure. Dependencies and database migrations remain
+separate reviewed work. Source facts now live in `boat_facts.example.json`; actual
+`boat_facts.json` and other operational data are ignored, not published.

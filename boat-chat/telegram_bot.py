@@ -146,8 +146,16 @@ def split_message(text: str) -> list[str]:
     return chunks
 
 
-def send_message(token: str, chat_id: int | str, text: str, message_thread_id: int | None = None) -> None:
-    for chunk in split_message(text):
+def send_message(
+    token: str,
+    chat_id: int | str,
+    text: str,
+    message_thread_id: int | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    result: dict[str, Any] | None = None
+    chunks = split_message(text)
+    for index, chunk in enumerate(chunks):
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": chunk,
@@ -155,7 +163,40 @@ def send_message(token: str, chat_id: int | str, text: str, message_thread_id: i
         }
         if message_thread_id is not None:
             payload["message_thread_id"] = message_thread_id
-        telegram_api(token, "sendMessage", payload)
+        if reply_markup and index == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        response = telegram_api(token, "sendMessage", payload)
+        if isinstance(response, dict) and isinstance(response.get("result"), dict):
+            result = response["result"]
+    return result
+
+
+def edit_message(
+    token: str,
+    chat_id: int | str,
+    message_id: int,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+    message_thread_id: int | None = None,
+) -> None:
+    chunks = split_message(text)
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": chunks[0],
+        "disable_web_page_preview": True,
+    }
+    if reply_markup and len(chunks) == 1:
+        payload["reply_markup"] = reply_markup
+    telegram_api(token, "editMessageText", payload)
+    for index, chunk in enumerate(chunks[1:], start=1):
+        send_message(
+            token,
+            chat_id,
+            chunk,
+            message_thread_id,
+            reply_markup if index == len(chunks) - 1 else None,
+        )
 
 
 def send_action(token: str, chat_id: int | str, action: str = "typing", message_thread_id: int | None = None) -> None:
@@ -168,17 +209,30 @@ def send_action(token: str, chat_id: int | str, action: str = "typing", message_
         log(f"sendChatAction failed: {exc}")
 
 
-def chat_with_boat(settings: dict[str, str], message: str, history: list[dict[str, str]] | None = None) -> str:
+def chat_with_boat(settings: dict[str, str], message: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
     url = boat_chat_url(settings) + "/api/chat"
     headers = {"X-Boat-Chat-Token": settings["BOAT_CHAT_ACCESS_TOKEN"]} if settings.get("BOAT_CHAT_ACCESS_TOKEN") else {}
     response = http_json(url, payload={"message": message, "history": history or [], "session_id": settings.get("_SESSION_ID", "")}, timeout=240, headers=headers)
     if not isinstance(response, dict):
-        return str(response)
+        return {"answer": str(response), "experience": {}}
     if response.get("answer"):
-        return str(response["answer"])
+        return response
     if response.get("error"):
-        return f"Boat Chat error: {response['error']}"
-    return json.dumps(response, indent=2)[:12000]
+        return {"answer": f"Boat Chat error: {response['error']}", "experience": {}}
+    return {"answer": json.dumps(response, indent=2)[:12000], "experience": {}}
+
+
+def followup_keyboard(response: dict[str, Any]) -> dict[str, Any] | None:
+    followups = (response.get("experience") or {}).get("followups") or []
+    rows = []
+    for prompt in followups[:3]:
+        prompt = str(prompt).strip()
+        callback_data = f"q:{prompt}"
+        if not prompt or len(callback_data.encode("utf-8")) > 64:
+            continue
+        label = prompt if len(prompt) <= 42 else prompt[:39].rstrip() + "..."
+        rows.append([{"text": label, "callback_data": callback_data}])
+    return {"inline_keyboard": rows} if rows else None
 
 
 def status_text(settings: dict[str, str]) -> str:
@@ -202,6 +256,11 @@ def help_text(chat_id: int | str, authorized: bool) -> str:
         "Send a boat-specific question and I will answer using the local Boat Chat service.\n\n"
         "Commands:\n"
         "/status - Boat Chat service status\n"
+        "/brief - current boat status briefing\n"
+        "/alerts - active warnings and alarms\n"
+        "/engines - compare both engines now\n"
+        "/battery - current battery and charging status\n"
+        "/nearby - closest AIS vessel\n"
         "/clear - clear this conversation's context\n"
         "/id - show this Telegram chat ID\n"
         "/help - show this help\n\n"
@@ -210,11 +269,20 @@ def help_text(chat_id: int | str, authorized: bool) -> str:
     )
 
 
-def handle_message(token: str, settings: dict[str, str], message: dict[str, Any]) -> None:
+SHORTCUTS = {
+    "/brief": "Give me a current boat status briefing",
+    "/alerts": "Show active warnings",
+    "/engines": "Compare both engines right now",
+    "/battery": "What is the current battery and charging status?",
+    "/nearby": "Which vessel is closest?",
+}
+
+
+def handle_message(token: str, settings: dict[str, str], message: dict[str, Any], override_text: str | None = None) -> None:
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     message_thread_id = message.get("message_thread_id")
-    text = str(message.get("text") or "").strip()
+    text = str(override_text if override_text is not None else message.get("text") or "").strip()
     if chat_id is None or not text:
         return
 
@@ -253,12 +321,16 @@ def handle_message(token: str, settings: dict[str, str], message: dict[str, Any]
         )
         return
 
+    text = SHORTCUTS.get(command, text)
+
     send_action(token, chat_id, message_thread_id=message_thread_id)
+    progress: dict[str, Any] | None = None
     try:
-        send_message(token, chat_id, "Gathering boat telemetry...", message_thread_id)
+        progress = send_message(token, chat_id, "Gathering boat telemetry...", message_thread_id)
         history = CONVERSATIONS.get(conversation_key, [])
         request_settings = {**settings, "_SESSION_ID": f"telegram:{conversation_key}"}
-        answer = chat_with_boat(request_settings, text, history=history)
+        response = chat_with_boat(request_settings, text, history=history)
+        answer = str(response["answer"])
         CONVERSATIONS[conversation_key] = (
             history
             + [
@@ -273,16 +345,37 @@ def handle_message(token: str, settings: dict[str, str], message: dict[str, Any]
     except Exception as exc:
         answer = f"Request failed: {exc}"
     try:
-        send_message(token, chat_id, answer, message_thread_id)
+        keyboard = followup_keyboard(response) if "response" in locals() else None
+        message_id = progress.get("message_id") if progress else None
+        if isinstance(message_id, int):
+            edit_message(token, chat_id, message_id, answer, keyboard, message_thread_id)
+        else:
+            send_message(token, chat_id, answer, message_thread_id, keyboard)
     except Exception as exc:
         log(f"sendMessage failed for chat_id={chat_id}: {exc}")
+
+
+def handle_callback_query(token: str, settings: dict[str, str], callback: dict[str, Any]) -> None:
+    callback_id = callback.get("id")
+    data = str(callback.get("data") or "")
+    message = callback.get("message") or {}
+    if callback_id:
+        try:
+            telegram_api(token, "answerCallbackQuery", {"callback_query_id": callback_id})
+        except Exception as exc:
+            log(f"answerCallbackQuery failed: {exc}")
+    if not data.startswith("q:") or not isinstance(message, dict):
+        return
+    prompt = data[2:].strip()
+    if prompt:
+        handle_message(token, settings, message, override_text=prompt)
 
 
 def poll_once(token: str, settings: dict[str, str], offset: int | None) -> int | None:
     timeout = int(settings.get("TELEGRAM_POLL_TIMEOUT", "25") or "25")
     payload: dict[str, Any] = {
         "timeout": timeout,
-        "allowed_updates": ["message"],
+        "allowed_updates": ["message", "callback_query"],
     }
     if offset is not None:
         payload["offset"] = offset
@@ -295,6 +388,9 @@ def poll_once(token: str, settings: dict[str, str], offset: int | None) -> int |
             message = update.get("message")
             if isinstance(message, dict):
                 handle_message(token, settings, message)
+            callback = update.get("callback_query")
+            if isinstance(callback, dict):
+                handle_callback_query(token, settings, callback)
         finally:
             save_offset(next_offset)
             offset = next_offset

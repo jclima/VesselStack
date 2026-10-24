@@ -3,24 +3,27 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
-    <meta name="theme-color" content="#f6f8f9" />
+    <meta name="theme-color" content="#f3f6f7" />
     <title>VesselStack Boat Chat</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260928-chat-polish" />
   </head>
-  <body>
+  <body data-view="overview">
     <main class="app">
       <section class="chat">
         <header class="app-header">
           <div class="header-brand">
             <h1><span class="brand-vessel">VesselStack </span>Boat Chat</h1>
-            <p>Telemetry-backed assistant for your vessel.</p>
+            <p>Telemetry-backed assistant for VesselStack.</p>
           </div>
           <div class="header-actions">
             <div class="status-stack" aria-live="polite">
               <div id="status" class="status">Starting</div>
-              <div id="route-status" class="status status-secondary">Local</div>
+              <div id="route-status" class="status status-secondary" hidden>Local</div>
             </div>
+            <button id="overview-open" type="button">Overview</button>
+            <button id="chat-open" type="button">Chat</button>
+            <button id="connect-open" type="button" hidden>Connect</button>
             <button id="insights-open" type="button">Hub</button>
             <button id="capabilities-open" type="button">Prompts</button>
             <button id="settings-open" type="button">Settings</button>
@@ -34,7 +37,19 @@
           <button data-prompt="Is the boat healthy right now?">Health check</button>
         </div>
 
-        <section id="boat-status-strip" class="boat-status-strip" aria-label="Live boat status" hidden></section>
+        <section id="owner-overview" class="owner-overview" aria-label="Boat overview">
+          <div class="overview-heading"><div><p class="eyebrow">THEOFFICE · YOUR BOAT</p><h2 id="boat-condition">Connect to your boat</h2></div><button id="refresh-status" type="button">Refresh</button></div>
+          <p id="observation-age" role="status">Connect this device to view boat observations.</p>
+          <section id="boat-status-strip" class="boat-status-strip" aria-label="Boat observations" hidden></section>
+          <h3>Needs attention</h3><div id="owner-attention"><p>Boat status has not been checked.</p></div>
+          <h3>What would you like to do?</h3>
+          <div class="owner-actions">
+            <button data-prompt="Give me a full departure readiness briefing for today">Prepare for an outing</button>
+            <button data-prompt="Give me a detailed report for the last trip">Review my last trip</button>
+            <button id="maintenance-open" type="button">Trips &amp; maintenance</button>
+          </div>
+          <details><summary>System status</summary><p id="owner-system">Connect to check system status.</p></details>
+        </section>
 
         <section id="messages" class="messages" aria-live="polite"></section>
 
@@ -66,6 +81,15 @@
       </section>
     </main>
 
+    <dialog id="connect-dialog">
+      <form id="connect-form">
+        <header class="dialog-header"><h2>Connect this device</h2><button id="connect-close" type="button">Close</button></header>
+        <p>Enter your Boat Chat access token. It stays in this tab and is cleared when you disconnect.</p>
+        <label>Access token <input id="connect-token" type="password" required autocomplete="off" /></label>
+        <p id="connect-message" role="status"></p>
+        <footer class="dialog-footer"><button id="disconnect-device" type="button">Disconnect</button><button type="submit">Connect</button></footer>
+      </form>
+    </dialog>
     <dialog id="settings-dialog">
       <form id="settings-form" method="dialog">
         <header class="dialog-header">
@@ -325,9 +349,13 @@
                 <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional write protection" />
                 <span class="secret-state" data-secret="BOAT_CHAT_SETTINGS_TOKEN"></span>
               </label>
+              <label class="toggle-setting">
+                <input name="BOAT_CHAT_REQUIRE_ACCESS_TOKEN" id="setting-require-access-token" type="checkbox" value="true" />
+                <span>Require access code<small>Off by default. When enabled, protects boat status, Chat, and the Hub.</small></span>
+              </label>
               <label>
-                Chat access token
-                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="optional chat protection" />
+                Access code
+                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="used when access code is required" />
                 <span class="secret-state" data-secret="BOAT_CHAT_ACCESS_TOKEN"></span>
               </label>
             </div>
@@ -352,6 +380,6 @@
         <div id="insights-content" class="insights-content">Loading boat insights…</div>
       </section>
     </dialog>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260928-chat-polish"></script>
   </body>
 </html>

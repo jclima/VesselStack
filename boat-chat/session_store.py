@@ -41,6 +41,14 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
         completed integer not null default 0,
         updated_at integer not null
     );
+    create table if not exists maintenance_tasks (
+        id integer primary key autoincrement,
+        title text not null,
+        due_date text,
+        notes text not null default '',
+        completed integer not null default 0,
+        updated_at integer not null
+    );
     create index if not exists chat_feedback_request on chat_feedback(request_id);
     """)
     conn.commit()
@@ -92,6 +100,34 @@ def status(path: Path | None = None) -> dict[str, int]:
     result={name:int(conn.execute(f"select count(*) from {name}").fetchone()[0]) for name in ("chat_sessions","chat_requests","chat_feedback")}
     conn.close(); return result
 
+def list_maintenance(path: Path | None = None) -> list[dict[str, Any]]:
+    conn = connect(path)
+    rows = conn.execute("select id,title,due_date,notes,completed,updated_at from maintenance_tasks order by completed,due_date is null,due_date,id").fetchall()
+    conn.close()
+    return [{**dict(row), "completed": bool(row["completed"])} for row in rows]
+
+def save_maintenance(payload: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    title = str(payload.get("title", "")).strip()[:160]
+    if not title:
+        raise ValueError("maintenance title is required")
+    due_date = str(payload.get("due_date", "")).strip()[:10] or None
+    if due_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date):
+        raise ValueError("due_date must use YYYY-MM-DD")
+    notes = str(payload.get("notes", "")).strip()[:1000]
+    completed = 1 if payload.get("completed") is True else 0
+    task_id = int(payload.get("id") or 0)
+    now = int(time.time())
+    conn = connect(path)
+    with conn:
+        if task_id:
+            result = conn.execute("update maintenance_tasks set title=?,due_date=?,notes=?,completed=?,updated_at=? where id=?", (title,due_date,notes,completed,now,task_id))
+            if not result.rowcount:
+                conn.close(); raise ValueError("unknown maintenance task")
+        else:
+            task_id = int(conn.execute("insert into maintenance_tasks(title,due_date,notes,completed,updated_at) values(?,?,?,?,?)", (title,due_date,notes,completed,now)).lastrowid)
+    row = conn.execute("select id,title,due_date,notes,completed,updated_at from maintenance_tasks where id=?", (task_id,)).fetchone()
+    conn.close()
+    return {**dict(row), "completed": bool(row["completed"])}
 
 def list_maintenance(path: Path | None = None) -> list[dict[str, Any]]:
     conn = connect(path)

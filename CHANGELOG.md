@@ -5,6 +5,21 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- Trustworthy owner overview, observation timestamps and connection recovery.
+- Per-answer evidence, safe text rendering, conversation restoration and Telegram follow-ups.
+- Speed-band fuel/RPM report with matched sample support and configurable history bucket.
+- Public-tree privacy checks, ignored runtime facts and a separate-checkout development runbook.
+- Optional application-only deployment preview, backup, readiness verification and guarded rollback.
+
+### Fixed
+
+- Match fuel, RPM and SOG minutes; reject invalid inputs, disclose coverage and bypass old cached calculations.
+- Enforce both-engine filtering without an RPM band and preserve integration settings during provider-settings saves.
+- Honor lifecycle readiness flags while retaining configured service URLs, schemas, timezone and default access protection.
+- Keep computed evidence for complex explanations and distinguish missing/stale status from normal state.
+
 ## 1.3.0 - 2026-08-28
 
 ### Added

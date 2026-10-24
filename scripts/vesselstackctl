@@ -123,6 +123,23 @@ check_endpoint() {
     fi
 }
 
+check_chat_endpoint() {
+    local endpoint=$1
+    if curl --connect-timeout 3 --max-time 10 --fail --silent --show-error "$endpoint" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (ValueError, TypeError):
+    raise SystemExit(1)
+raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 1)
+'; then
+        printf '%-20s %s\n' 'Boat Chat' ready
+    else
+        printf '%-20s %s\n' 'Boat Chat' 'unavailable or not ready' >&2
+        return 1
+    fi
+}
+
 status_stack() {
     local failed=0 service running_services
     local services=(homeassistant influxdb grafana prometheus mosquitto heimdall)
@@ -153,7 +170,7 @@ status_stack() {
             failed=1
         fi
     done
-    check_endpoint 'Boat Chat' "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
+    check_chat_endpoint "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
     check_endpoint 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" || failed=1
     check_endpoint SignalK "${SIGNALK_URL%/}/signalk" || failed=1
     check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1
