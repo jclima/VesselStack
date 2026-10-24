@@ -9,7 +9,8 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
-    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh"
+    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
+    "$ROOT/scripts/update-requirements-lock.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
@@ -18,7 +19,10 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
-    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh"
+    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
+    "$ROOT/scripts/update-requirements-lock.sh"
+test -s "$ROOT/boat-chat/requirements.lock"
+grep -q -- '--hash=sha256:' "$ROOT/boat-chat/requirements.lock"
 grep -q 'GENERATE' "$ROOT/vesselstack.example.env"
 grep -q 'INFLUXDB_HISTORY_BUCKET' "$ROOT/vesselstack.example.env"
 grep -q 'verify-backup' "$ROOT/scripts/vesselstackctl"

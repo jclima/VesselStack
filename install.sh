@@ -270,10 +270,29 @@ compose_template config --quiet 2>/dev/null || {
     compose_template config --quiet >&2 || true
     exit 1
 }
+# Python packages are only ever installed from the hash-pinned lock shipped in the
+# release (pip --require-hashes, wheels only), online and offline.
+PIP_LOCK="$SOURCE_ROOT/boat-chat/requirements.lock"
+[ -s "$PIP_LOCK" ] || {
+    echo "Missing $PIP_LOCK: the hash-pinned requirements lock must ship with the release (maintainers: scripts/update-requirements-lock.sh). Nothing was changed." >&2
+    exit 1
+}
 if [ "$OFFLINE" = true ]; then
-    [ -n "$(find "$VESSELSTACK_WHEELHOUSE" -maxdepth 1 \( -name '*.whl' -o -name '*.tar.gz' \) -print -quit 2>/dev/null)" ] || {
-        echo "Offline install: no Python packages found in VESSELSTACK_WHEELHOUSE=$VESSELSTACK_WHEELHOUSE" >&2
+    [ -n "$(find "$VESSELSTACK_WHEELHOUSE" -maxdepth 1 -name '*.whl' -print -quit 2>/dev/null)" ] || {
+        echo "Offline install: no Python wheels found in VESSELSTACK_WHEELHOUSE=$VESSELSTACK_WHEELHOUSE" >&2
         echo "Build the bundle on a connected machine with scripts/prepare-offline-bundle.sh and copy it here." >&2
+        exit 1
+    }
+    # The wheelhouse must be <bundle>/wheelhouse of a bundle that verifies against this
+    # release (manifest, lock hash, wheel hashes, no unlisted files; root-owned when
+    # running as root). pip then reads exactly the verified directory.
+    VESSELSTACK_WHEELHOUSE=$(readlink -f -- "$VESSELSTACK_WHEELHOUSE")
+    [ "$(basename -- "$VESSELSTACK_WHEELHOUSE")" = wheelhouse ] || {
+        echo "Offline install: VESSELSTACK_WHEELHOUSE must be the wheelhouse/ directory of an offline bundle" >&2
+        exit 1
+    }
+    "$SCRIPT_DIR/scripts/prepare-offline-bundle.sh" --verify "$(dirname -- "$VESSELSTACK_WHEELHOUSE")" >/dev/null || {
+        echo "Offline install: the offline bundle did not verify; refusing to install from it. Nothing was changed." >&2
         exit 1
     }
     mapfile -t required_images < <(
@@ -316,13 +335,13 @@ install -d -m 0755 "$VESSELSTACK_ROOT"
 STAGING_DIR=$(mktemp -d "$VESSELSTACK_ROOT/.venv-staging.XXXXXX")
 trap 'rm -rf -- "$STAGING_DIR"' EXIT
 STAGING_VENV="$STAGING_DIR/venv"
-pip_args=(install --disable-pip-version-check)
+pip_args=(install --disable-pip-version-check --only-binary=:all: --require-hashes)
 if [ "$OFFLINE" = true ]; then
     pip_args+=(--no-index --find-links "$VESSELSTACK_WHEELHOUSE")
 fi
 if ! python3 -m venv "$STAGING_VENV" \
-    || ! "$STAGING_VENV/bin/pip" "${pip_args[@]}" -r "$SOURCE_ROOT/boat-chat/requirements.txt"; then
-    echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable? use --offline with a prepared bundle)")." >&2
+    || ! "$STAGING_VENV/bin/pip" "${pip_args[@]}" -r "$PIP_LOCK"; then
+    echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable, and is there a wheel in boat-chat/requirements.lock for this platform? use --offline with a prepared bundle)")." >&2
     echo "Nothing was changed on this system." >&2
     exit 1
 fi

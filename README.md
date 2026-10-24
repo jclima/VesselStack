@@ -896,32 +896,66 @@ scripts/prepare-offline-bundle.sh --output ./offline-bundle
 #   see the image list without downloading: --list
 
 # Copy ./offline-bundle (wheelhouse/, images/, MANIFEST.sha256, BUNDLE_INFO) and
-# a copy of this release to the boat, then on the boat:
-sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle   # verifies sha256, docker load
+# a copy of this release to the boat. As root the bundle must be root-owned and
+# not group/world-writable along its whole path, so make it so first:
+sudo chown -R root:root /path/to/offline-bundle && sudo chmod -R go-w /path/to/offline-bundle
+sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle   # verifies the bundle, docker load
 sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
   ./install.sh --config /opt/vesselstack/config/vesselstack.env --offline --dry-run
 sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
   ./install.sh --config /opt/vesselstack/config/vesselstack.env --offline --start
 ```
 
-The bundle contains a wheelhouse (`pip download` of `boat-chat/requirements.txt`
-for the chosen platform; only prebuilt wheels can be fetched for another
-platform), a `docker save` tarball for every image in `templates/compose.yml`
-(all profiles) plus the Mosquitto helper image, `BUNDLE_INFO` (release, platform,
-image list) and `MANIFEST.sha256`. `--verify DIR` checks it, and a bundle built
-for a different release is refused. It holds no configuration, credentials or
-vessel data. `--offline` (or `VESSELSTACK_OFFLINE=true`) installs packages with
-`pip install --no-index --find-links $VESSELSTACK_WHEELHOUSE` and starts
-containers with `docker compose up -d --pull never`. If an image is missing the
-installer lists it with the `docker load` hint: `--start` fails before changing
-anything, while a plain render only warns. Offline mode never contacts a
-registry or PyPI; SignalK/InfluxDB version bumps still need a new bundle.
+The bundle contains a wheelhouse (`pip download --require-hashes
+--only-binary=:all:` of the release's hash-pinned `boat-chat/requirements.lock`
+for the chosen platform, so only wheels whose sha256 the lock lists are fetched
+and no source distribution is ever built), a `docker save` tarball for every
+image in `templates/compose.yml` (all profiles) plus the Mosquitto helper image,
+`BUNDLE_INFO` (release, platform, image list, `lock_sha256`) and
+`MANIFEST.sha256`. It holds no configuration, credentials or vessel data.
+
+Before installing or loading anything, `--verify DIR`, `--load DIR` and
+`install.sh --offline` refuse the bundle unless: the manifest lists exactly the
+files present (no extra, unlisted or missing files, no symlinks) and every
+checksum matches; `BUNDLE_INFO` names this release and the sha256 of **this
+release's** `requirements.lock` (the manifest is anchored to the release content,
+not only to itself); every wheelhouse file is a `.whl` whose sha256 is in the
+lock; and, when running as root, the bundle path chain and every file in it are
+root-owned and not group/world-writable. `install.sh --offline` also requires
+`VESSELSTACK_WHEELHOUSE` to be the `wheelhouse/` directory of such a bundle, then
+runs `pip install --no-index --find-links $VESSELSTACK_WHEELHOUSE
+--only-binary=:all: --require-hashes -r boat-chat/requirements.lock`, so even a
+bundle forged consistently cannot install a wheel the signed release did not
+pin. Containers start with `docker compose up -d --pull never`. If an image is
+missing the installer lists it with the `docker load` hint: `--start` fails
+before changing anything, while a plain render only warns. Offline mode never
+contacts a registry or PyPI; SignalK/InfluxDB version bumps still need a new
+bundle. Image tarballs are covered by the manifest and the root-controlled path
+check but, unlike wheels, are not pinned by digest in the release (Compose images
+are tag-pinned).
+
+Online installs use the same lock (`--only-binary=:all: --require-hashes`), so
+the Python environment is the same hash-verified set either way. The lock lists
+Linux aarch64 and x86_64 wheels for Python 3.11-3.13; on another platform or
+architecture the install fails with a clear message instead of building from
+source. A release without `boat-chat/requirements.lock`, or a lock missing for
+an offline bundle build, is refused before anything changes.
+
+Maintainers: when `boat-chat/requirements.txt` changes, run
+`scripts/update-requirements-lock.sh` (needs network; `--python-version` and
+`--platform` select targets) and commit the regenerated lock. It is generated
+trust-on-first-use from PyPI: review the diff and compare the hashes with the
+digests PyPI publishes. `tests/test_requirements_lock.py` fails when the lock is
+stale. `scripts/deploy-chat.py` treats a changed `requirements.lock` like a
+changed `requirements.txt` and refuses the code-only deploy.
+
 `sudo vesselstackctl update --offline /path/to/release` (or
 `VESSELSTACK_OFFLINE=true sudo -E vesselstackctl update /path/to/release`) passes
 `--offline` to both the preflight and the install of that release; any value other
 than `true`/`false` in `VESSELSTACK_OFFLINE` is rejected. Without the flag or
-variable the behaviour is unchanged (network installs). Rollback: restore the
-pre-update backup.
+variable the behaviour is unchanged apart from the hash-pinned lock. Rollback:
+restore the pre-update backup; to return to the previous behaviour revert this
+change (the lock file is inert for older releases).
 
 ## Stopping or removing services
 

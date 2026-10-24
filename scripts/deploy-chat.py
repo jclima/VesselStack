@@ -514,7 +514,10 @@ def main():
             manifest=tree_manifest(tree)
             # Source code is untrusted until verified: checker and tests never run as root.
             run_unprivileged(source,['python3',str(tree/'scripts/check-public-tree.py'),'--directory',str(tree)],cwd=tree)
-            if (tree/'boat-chat/requirements.txt').read_bytes()!=(target/'boat-chat/requirements.txt').read_bytes():
+            def dependency_bytes(base,name):
+                path=base/'boat-chat'/name
+                return path.read_bytes() if path.exists() else b''
+            if any(dependency_bytes(tree,name)!=dependency_bytes(target,name) for name in ('requirements.txt','requirements.lock')):
                 raise RuntimeError('Dependencies changed; review and provision them separately before deployment')
             run_unprivileged(source,['python3','-m','unittest','discover','-s','tests','-p','test_*.py'],{'PYTHONPATH':str(tree/'boat-chat')},cwd=tree)
             assert_unchanged(source,sha,trust,tree,manifest)
