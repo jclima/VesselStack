@@ -16,6 +16,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 Environment=BOAT_CHAT_STATE_DIR=@VESSELSTACK_DATA@/boat-chat
+Environment=BOAT_CHAT_ENV=@VESSELSTACK_DATA@/boat-chat/boat-chat.env
 ReadWritePaths=@VESSELSTACK_DATA@/boat-chat
 CapabilityBoundingSet=
 LockPersonality=true

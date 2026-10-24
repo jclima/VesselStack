@@ -152,6 +152,9 @@ nano vesselstack.env
 | `BOAT_TYPE` | Vessel make/model or general type |
 | `BOAT_MMSI`, `BOAT_CALLSIGN` | Optional identity fields |
 | `*_PORT` | Host ports for Grafana, Heimdall HTTP/HTTPS, InfluxDB, Prometheus, MQTT, and AIS |
+| `VESSELSTACK_DATA_BIND_ADDRESS` | IPv4 address InfluxDB, Prometheus and MQTT publish on; default `127.0.0.1` (this device only) |
+| `VESSELSTACK_WEB_BIND_ADDRESS` | IPv4 address Grafana and Heimdall publish on; default `0.0.0.0` (LAN dashboards), `127.0.0.1` to restrict |
+| `BOAT_CHAT_ACCESS_TOKEN` | `GENERATE` (default) creates a random token, preserved on re-install; required for chat, status and data APIs |
 | `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
 | `BOAT_UNITS` | `us_customary` or `metric` |
@@ -373,10 +376,41 @@ relative AIS context, recent-trip insights, and a local maintenance tracker.
 The interface rate-limits each client and runs at most two chat requests at a
 time so slow model calls cannot exhaust the Raspberry Pi.
 
-Set `BOAT_CHAT_ACCESS_TOKEN` in Boat Chat Settings to protect chat, live status,
-insights, feedback, and maintenance data. The browser keeps the entered token
-only in session storage. Without an access token, ordinary chat remains
-available but live status, insights, and maintenance endpoints stay locked.
+The installer generates `BOAT_CHAT_ACCESS_TOKEN` (random, preserved on
+re-install) and writes it to `config/boat-chat.env`. Chat, feedback, session,
+live status, insights, and maintenance endpoints all require it in the
+`X-Boat-Chat-Token` header; the web UI asks for it through **Connect** and keeps
+it only in session storage, and the Telegram bridge sends it automatically. Find
+it with:
+
+```bash
+sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' /opt/vesselstack/config/boat-chat.env
+```
+
+An empty token **fails closed**: all of those endpoints return 401. A reviewed,
+trusted installation can opt out by adding `BOAT_CHAT_ALLOW_OPEN=true` to
+`config/boat-chat.env`; this key is deliberately not editable from the Settings
+page. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN` is retired and no longer disables
+protection.
+
+#### Settings and configuration precedence
+
+Boat Chat reads two files; both Boat Chat and the Telegram bridge resolve them
+the same way (`boat-chat/env_config.py`):
+
+1. **Settings-page overrides** (highest): `$VESSELSTACK_DATA/boat-chat/boat-chat.env`,
+   selected by `BOAT_CHAT_ENV`. This is the only settings file the service user
+   can write.
+2. **Base configuration**: `config/boat-chat.env`, written by the installer and
+   control panel and loaded by systemd into the environment.
+
+Saving a value on the Settings page that equals the base value stores no
+override. Saving a Boat Chat field in the control panel removes that key from
+the override file so the new value takes effect, and the panel marks any field
+that is currently overridden. Settings writes require `BOAT_CHAT_SETTINGS_TOKEN`
+from any address; with no settings token they are accepted from loopback only
+(private-LAN addresses are no longer trusted). `TELEGRAM_ALLOWED_CHAT_IDS` is a
+secret setting and is never returned by `GET /api/settings`.
 
 `BOAT_CHAT_WEB_SEARCH=true` enables the OpenAI Responses API web-search tool
 when the OpenAI provider is selected. This can send the question and grounded
@@ -497,10 +531,17 @@ SignalK, Boat Chat, InfluxDB, and Prometheus.
 
 ## Network security
 
-Compose publishes several ports on every host interface. At minimum:
+Compose now publishes InfluxDB `8086`, Prometheus `9090`, and MQTT `1883` on
+`127.0.0.1` by default (`VESSELSTACK_DATA_BIND_ADDRESS`). Grafana `43000` and
+Heimdall `80/443` remain reachable on every interface by default
+(`VESSELSTACK_WEB_BIND_ADDRESS=0.0.0.0`) because the documented dashboards are
+used over the boat LAN; set it to `127.0.0.1` to keep them local. Grafana still
+reaches InfluxDB and Prometheus by service name, and host-networked Home
+Assistant reaches MQTT on loopback. AIS ports are unchanged. At minimum:
 
-- restrict InfluxDB `8086`, Grafana `43000`, Prometheus `9090`, and MQTT `1883`
-  to trusted management networks;
+- restrict Grafana `43000` and Heimdall to trusted management networks, and set
+  `VESSELSTACK_DATA_BIND_ADDRESS` to a trusted LAN/VPN IPv4 address only if
+  external devices must publish to MQTT or InfluxDB;
 - keep Home Assistant, SignalK, and Boat Chat off the public internet unless
   protected by an authenticated reverse proxy;
 - keep the root-privileged Control Panel loopback-only or behind a trusted VPN
@@ -766,6 +807,27 @@ and hardware-dependent commissioning limits.
 
 ## Current development improvements
 
+**Upgrade notes (secure defaults).** After upgrading, re-run the installer so it
+generates `BOAT_CHAT_ACCESS_TOKEN` and renders the new bind variables. Until it
+does, Boat Chat answers 401 to chat, status and data requests, and Compose
+publishes InfluxDB, Prometheus and MQTT on loopback. Reconnect each browser with
+**Connect** using the new token. External devices that publish to MQTT or
+InfluxDB over the LAN stop working until `VESSELSTACK_DATA_BIND_ADDRESS` is set
+to a trusted address. Settings writes lose the old private-LAN trust (use the
+settings token). Scoped read-only Influx tokens for Boat Chat and Grafana are
+not part of this change; both still use the admin token.
+
+**Verification.** `python3 -m unittest discover -s tests -p 'test_*.py'`,
+`tests/test-distribution.sh`, `curl -i -X POST http://127.0.0.1:8765/api/chat`
+(expect 401 without the token) and
+`docker compose --env-file /opt/vesselstack/config/vesselstack.env -f /opt/vesselstack/compose.yml config`
+(ports show `127.0.0.1:` for InfluxDB, Prometheus and MQTT).
+
+**Rollback.** Restore the previous release with the `vesselstack-update`
+rollback; to temporarily restore the old network exposure set
+`VESSELSTACK_DATA_BIND_ADDRESS="0.0.0.0"` and re-run the installer. The generated
+`BOAT_CHAT_ACCESS_TOKEN` line is harmless to older releases.
+
 The owner overview now distinguishes missing/stale readings and contradictory
 health indicators, displays observation age, refreshes periodically and retains
 explicitly outdated information during connection loss. Chat preserves per-answer
@@ -775,8 +837,8 @@ VesselStack's configured URLs, buckets, timezone and branding remain supported.
 
 Live status remains protected by a dedicated access token by default. Configure
 `BOAT_CHAT_ACCESS_TOKEN` in private Boat Chat settings before connecting the owner
-UI. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN=false` is an explicit opt-out for a reviewed,
-trusted installation; it is not the public default. Settings writes retain their
+UI. `BOAT_CHAT_ALLOW_OPEN=true` is an explicit opt-out for a reviewed, trusted
+installation; it is not the public default. Settings writes retain their
 separate protection. Integration settings survive provider-settings saves.
 
 Fuel economy now uses complete, finite, nonnegative fuel/RPM/speed observations

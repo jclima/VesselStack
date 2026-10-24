@@ -9,6 +9,9 @@ Semantic Versioning.
 - Security: control-panel release apply validates ownership/permissions/symlinks over the whole release tree.
 - Security: application code, virtualenv and facts are root-owned; runtime state moves to `$VESSELSTACK_DATA/boat-chat` (`BOAT_CHAT_STATE_DIR`); chat/Telegram/indexer units gain `ProtectSystem=strict`, `ProtectHome=true` and `ReadWritePaths`; CLI binary paths are no longer web-settable.
 
+- Security: Boat Chat fails closed without `BOAT_CHAT_ACCESS_TOKEN` (installer now generates and preserves it; `BOAT_CHAT_ALLOW_OPEN=true` is the explicit opt-out; `BOAT_CHAT_REQUIRE_ACCESS_TOKEN` retired); settings writes no longer trust private-LAN addresses; `TELEGRAM_ALLOWED_CHAT_IDS` is a secret setting.
+- Security: Compose publishes InfluxDB, Prometheus and MQTT on `127.0.0.1` by default (`VESSELSTACK_DATA_BIND_ADDRESS`); Grafana/Heimdall bind is configurable (`VESSELSTACK_WEB_BIND_ADDRESS`, default unchanged).
+- Changed: one `BOAT_CHAT_ENV` settings-override file shared by Boat Chat and Telegram, with documented precedence over `config/boat-chat.env`; control-panel saves clear stale overrides.
 - Add a configured one-command application update/preview/rollback launcher.
 - Restart an active Telegram worker when its code changes and retain the restart plan for rollback.
 

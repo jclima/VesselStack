@@ -46,7 +46,8 @@ if grep -RInE --exclude=test-distribution.sh \
 fi
 for unit in vesselstack-chat vesselstack-chat-telegram vesselstack-telemetry-indexer; do
     for directive in ProtectSystem=strict ProtectHome=true NoNewPrivileges=true PrivateTmp=true \
-        'ReadWritePaths=@VESSELSTACK_DATA@/boat-chat' 'BOAT_CHAT_STATE_DIR=@VESSELSTACK_DATA@/boat-chat'; do
+        'ReadWritePaths=@VESSELSTACK_DATA@/boat-chat' 'BOAT_CHAT_STATE_DIR=@VESSELSTACK_DATA@/boat-chat' \
+        'BOAT_CHAT_ENV=@VESSELSTACK_DATA@/boat-chat/boat-chat.env'; do
         grep -qxF "$directive" "$ROOT/systemd/$unit.service.in" \
             || grep -qxF "Environment=$directive" "$ROOT/systemd/$unit.service.in" \
             || { echo "$unit.service.in is missing $directive" >&2; exit 1; }
@@ -57,6 +58,14 @@ if grep -n 'chown -R "\$VESSELSTACK_USER:\$VESSELSTACK_USER" "\$VESSELSTACK_ROOT
     echo "install.sh must not make application code/venv writable by the service user" >&2
     exit 1
 fi
+grep -q 'BOAT_CHAT_ACCESS_TOKEN="GENERATE"' "$ROOT/vesselstack.example.env"
+for pattern in '${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${INFLUXDB_PORT:-8086}:8086' \
+    '${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090' \
+    '${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${MQTT_PORT:-1883}:1883'; do
+    grep -qF "$pattern" "$ROOT/templates/compose.yml" \
+        || { echo "compose.yml must publish $pattern on the data bind address" >&2; exit 1; }
+done
+python3 -m unittest "$ROOT/tests/test_access_security.py"
 bash -n "$ROOT/scripts/vesselstack-update"
 shellcheck "$ROOT/scripts/vesselstack-update"
 echo "distribution static checks passed"

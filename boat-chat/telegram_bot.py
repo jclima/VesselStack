@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import sys
 import time
 import urllib.error
@@ -14,12 +13,16 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import env_config
+
 
 ROOT = Path(__file__).resolve().parent
 # Runtime-written files live under BOAT_CHAT_STATE_DIR (VESSELSTACK_DATA/boat-chat
 # when installed); the code directory is root-owned. Defaults to ROOT for development.
 RUNTIME_DIR = Path(os.environ.get("BOAT_CHAT_STATE_DIR") or ROOT)
-ENV_CONFIG = RUNTIME_DIR / "boat-chat.env"
+# Same settings-page override file as app.py (BOAT_CHAT_ENV); it takes
+# precedence over the systemd-provided base environment.
+ENV_CONFIG = env_config.env_path()
 STATE_DIR = RUNTIME_DIR / "memory"
 OFFSET_FILE = STATE_DIR / "telegram-offset.json"
 CONVERSATIONS_FILE = STATE_DIR / "telegram-conversations.json"
@@ -43,24 +46,8 @@ def log(message: str) -> None:
 
 
 def parse_env_config() -> dict[str, str]:
-    settings: dict[str, str] = {}
-    if ENV_CONFIG.exists():
-        for raw_line in ENV_CONFIG.read_text(errors="ignore").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if key not in SETTING_KEYS:
-                continue
-            try:
-                parsed = shlex.split(value, comments=False, posix=True)
-                settings[key] = parsed[0] if parsed else ""
-            except ValueError:
-                settings[key] = value.strip().strip("'\"")
-    for key in SETTING_KEYS:
-        if key in os.environ:
-            settings[key] = os.environ[key]
+    settings = {key: os.environ[key] for key in SETTING_KEYS if key in os.environ}
+    settings.update(env_config.parse_env_file(ENV_CONFIG, SETTING_KEYS))
     return settings
 
 

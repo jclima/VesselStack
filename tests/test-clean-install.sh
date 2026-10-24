@@ -82,6 +82,7 @@ BOAT_CHAT_PROVIDER="local"
 BOAT_CHAT_HOST="0.0.0.0"
 BOAT_CHAT_PORT="8765"
 BOAT_CHAT_SETTINGS_TOKEN="GENERATE"
+BOAT_CHAT_ACCESS_TOKEN="GENERATE"
 VESSELSTACK_UNTRUSTED_INTERFACE="wlan0"
 VESSELSTACK_FIREWALL_ENABLE="false"
 TELEGRAM_ENABLE="false"
@@ -143,8 +144,12 @@ fi
 test "$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")" = 600
 test "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" = 600
 grep -Eq '^CONTROL_PANEL_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/control-panel.env"
+grep -Eq '^BOAT_CHAT_ACCESS_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/boat-chat.env"
+grep -q '^VESSELSTACK_DATA_BIND_ADDRESS=127.0.0.1$' "$APP_ROOT/config/vesselstack.env"
+grep -qx "Environment=BOAT_CHAT_ENV=$DATA_ROOT/boat-chat/boat-chat.env" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 grep -qx '1.3.0' "$APP_ROOT/config/installed-version"
 
+access_token_before=$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
 panel_token_before=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")
 sed -i '/^BOAT_CHAT_PROVIDER=/d' "$APP_ROOT/config/boat-chat.env"
 printf '%s\n' 'BOAT_CHAT_PROVIDER=ollama' 'OPENAI_API_KEY=preserve-test-secret' \
@@ -156,5 +161,7 @@ grep -qx 'BOAT_CHAT_PROVIDER=ollama' "$APP_ROOT/config/boat-chat.env"
 grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
     "$panel_token_before"
+test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = \
+    "$access_token_before"
 
 echo "clean installation checks passed"

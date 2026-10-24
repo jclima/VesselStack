@@ -88,6 +88,8 @@ FIELDS = [
     field("HOME_ASSISTANT_URL", "Home Assistant URL", "Home Assistant", kind="url"),
     field("HOME_ASSISTANT_TOKEN", "Home Assistant token", "Home Assistant", kind="secret"),
     field("INFLUXDB_URL", "InfluxDB URL", "InfluxDB", kind="url"),
+    field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services bind address", "Network", description="InfluxDB, Prometheus and MQTT publish on this IPv4 address. Keep 127.0.0.1 unless external devices must connect over a trusted network."),
+    field("VESSELSTACK_WEB_BIND_ADDRESS", "Web UI bind address", "Network", description="Grafana and Heimdall publish on this IPv4 address (0.0.0.0 = every interface, 127.0.0.1 = this device only)."),
     field("INFLUXDB_PORT", "Published port", "InfluxDB", kind="port"),
     field("INFLUXDB_CONTAINER_NAME", "Container name", "InfluxDB"),
     field("INFLUXDB_ORG", "Organization", "InfluxDB"),
@@ -127,6 +129,7 @@ FIELDS = [
     field("AWS_SECRET_ACCESS_KEY", "AWS secret key", "Boat Chat", source="chat", kind="secret"),
     field("GOOGLE_API_KEY", "Google API key", "Boat Chat", source="chat", kind="secret"),
     field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", "Boat Chat", source="chat"),
+    field("BOAT_CHAT_ACCESS_TOKEN", "Boat Chat access token", "Boat Chat", source="chat", kind="secret", description="Required by chat, status and data APIs and the Telegram bridge."),
     field("TELEGRAM_BOT_TOKEN", "Telegram bot token", "Telegram", source="chat", kind="secret"),
     field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chat IDs", "Telegram", source="chat", kind="secret"),
     field("TELEGRAM_ENABLE", "Run Telegram worker", "Telegram", kind="boolean"),
@@ -215,7 +218,7 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     if kind == "port" and text:
         if not text.isdigit() or not 1 <= int(text) <= 65535:
             raise ValueError(f"{spec['label']} must be an integer from 1 to 65535")
-    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST"} and text:
+    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
         except ValueError as exc:
@@ -231,6 +234,49 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     return text
 
 
+def chat_override_path(vessel: dict[str, str] | None = None) -> Path | None:
+    """Boat Chat Settings-page override file (BOAT_CHAT_ENV), if locatable."""
+    explicit = os.environ.get("BOAT_CHAT_ENV")
+    if explicit:
+        return Path(explicit)
+    data = (vessel if vessel is not None else parse_env(VESSEL_ENV)).get("VESSELSTACK_DATA", "")
+    return Path(data) / "boat-chat" / "boat-chat.env" if data else None
+
+
+def chat_overrides(vessel: dict[str, str] | None = None) -> set[str]:
+    path = chat_override_path(vessel)
+    return set(parse_env(path)) if path else set()
+
+
+def clear_chat_overrides(keys: set[str], vessel: dict[str, str]) -> None:
+    """Drop keys saved here from the Settings-page override file.
+
+    The override file wins over config/boat-chat.env, so without this a value
+    saved in the control panel would be silently shadowed by a stale UI value.
+    """
+    path = chat_override_path(vessel)
+    if not path or not path.is_file():
+        return
+    stale = {key for key in keys if key in parse_env(path)}
+    if not stale:
+        return
+    kept = []
+    for line in path.read_text().splitlines():
+        name = line.split("=", 1)[0].strip()
+        if "=" in line and not line.lstrip().startswith("#") and name in stale:
+            continue
+        kept.append(line)
+    info = path.stat()
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text("\n".join(kept) + "\n")
+    os.chmod(temp, info.st_mode & 0o777)
+    try:
+        os.chown(temp, info.st_uid, info.st_gid)
+    except OSError:
+        pass
+    os.replace(temp, path)
+
+
 def public_configuration() -> dict[str, Any]:
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
@@ -242,10 +288,21 @@ def public_configuration() -> dict[str, Any]:
         if spec["key"] in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             value = panel.get(spec["key"], value)
         result[spec["key"]] = {"configured": bool(value)} if spec["kind"] == "secret" else value
-    return {"fields": FIELDS, "values": result}
+    overridden = chat_overrides(vessel)
+    fields = []
+    for spec in FIELDS:
+        spec = dict(spec)
+        if spec["source"] == "chat" and spec["key"] in overridden:
+            spec["description"] = (spec["description"] + " " if spec["description"] else "") + (
+                "Overridden by the Boat Chat Settings page; the value shown here is not in effect. "
+                "Saving this field replaces the override."
+            )
+        fields.append(spec)
+    return {"fields": fields, "values": result, "overridden": sorted(overridden & {s["key"] for s in FIELDS if s["source"] == "chat"})}
 
 
 def update_configuration(updates: dict[str, Any]) -> str:
+    saved_chat_keys: set[str] = set()
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
     panel = parse_env(PANEL_ENV)
@@ -263,6 +320,8 @@ def update_configuration(updates: dict[str, Any]) -> str:
             value = validate_value(spec, raw)
         target = chat if spec["source"] == "chat" else vessel
         target[key] = value
+        if spec["source"] == "chat":
+            saved_chat_keys.add(key)
         if key in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             panel[key] = value
     paths = [VESSEL_ENV, CHAT_ENV, PANEL_ENV]
@@ -294,6 +353,7 @@ def update_configuration(updates: dict[str, Any]) -> str:
             else:
                 shutil.copy2(snapshot, path)
         raise
+    clear_chat_overrides(saved_chat_keys, vessel)
     return str(backup)
 
 
