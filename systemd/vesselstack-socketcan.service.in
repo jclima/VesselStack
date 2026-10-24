@@ -6,7 +6,12 @@ Before=vesselstack-signalk.service docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/ip link set @CAN_INTERFACE@ up type can bitrate @CAN_BITRATE@ restart-ms 100
+# Rendered by scripts/configure-hardware.sh. Physical can* interfaces get the
+# bitrate and restart-ms below; virtual vcan* interfaces (home-lab replay) accept
+# neither, so they are only created (opt-in) and brought up.
+ExecStartPre=@CAN_PRE_MODPROBE@
+ExecStartPre=@CAN_PRE_CREATE@
+ExecStart=/usr/sbin/ip link set @CAN_INTERFACE@ up@CAN_LINK_ARGS@
 ExecStop=/usr/sbin/ip link set @CAN_INTERFACE@ down
 
 [Install]

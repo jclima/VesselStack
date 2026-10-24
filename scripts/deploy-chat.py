@@ -8,16 +8,18 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shutil
+import stat
 import subprocess
-import tarfile
 import tempfile
 import time
 import urllib.request
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 # Applied to every git invocation: repository-local hooks and fsmonitor commands
 # are attacker-controlled once an upstream commit has been pulled.
+DEFAULT_MIRROR = Path('/var/lib/vesselstack/update-mirror')
 GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.pager=cat']
 
 
@@ -76,15 +78,20 @@ def require_root_controlled(path):
 
 
 def make_trust(gnupg_home=None, allowed_signers=None):
-    """Fixed signature-verification configuration.
+    """Fixed git configuration for everything root runs against objects.
 
     Command-line `-c` values beat repository-local config, so a pulled commit
-    cannot redirect gpg.program, the signer list or hooks; the system and global
-    git configs are ignored too.  The keyring / allowed-signers file is meant to
-    be root-controlled (see update.env.example).
+    cannot redirect gpg.program, the signer list, hooks, attributes or filters;
+    the system and global git configs and every inherited GIT_* variable are
+    ignored too.  The keyring / allowed-signers file is meant to be
+    root-controlled (see update.env.example).
     """
-    config = [*GIT_HARDENING, '-c', 'gpg.program=gpg']
-    env = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'}
+    config = [*GIT_HARDENING, '-c', 'gpg.program=gpg',
+              '-c', 'core.attributesFile=' + os.devnull,
+              '-c', 'transfer.fsckObjects=true', '-c', 'fetch.fsckObjects=true',
+              '-c', 'protocol.ext.allow=never']
+    env = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0',
+           'GIT_ATTR_NOSYSTEM': '1', 'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_OPTIONAL_LOCKS': '0'}
     if allowed_signers:
         require_root_controlled(allowed_signers)
         config += ['-c', 'gpg.format=ssh', '-c', 'gpg.ssh.program=ssh-keygen',
@@ -97,23 +104,42 @@ def make_trust(gnupg_home=None, allowed_signers=None):
     return {'config': config, 'env': env}
 
 
-def trusted_command(source, trust, *args):
-    # Runs in this process (root when invoked via sudo) against a checkout owned
-    # by someone else, so the directory is marked safe on the command line only.
-    return ['git', *trust['config'], '-c', 'safe.directory=' + str(source), '-C', str(source), *args]
+def trusted_env(trust):
+    inherited = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    return {**inherited, **trust['env']}
 
 
-def tgit(source, trust, *args):
-    return subprocess.check_output(trusted_command(source, trust, *args), env={**os.environ, **trust['env']}, text=True).strip()
+def trusted_command(repo, trust, *args, safe=None):
+    """git against the root-owned mirror (explicit --git-dir; never the checkout's worktree)."""
+    command = ['git', *trust['config']]
+    if safe:
+        # Only for fetching from a checkout owned by someone else.
+        command += ['-c', 'safe.directory=' + str(safe)]
+    return [*command, '--git-dir=' + str(repo), *args]
 
 
-def tgit_ok(source, trust, *args):
-    return subprocess.run(trusted_command(source, trust, *args), env={**os.environ, **trust['env']},
+def tgit(repo, trust, *args):
+    return subprocess.check_output(trusted_command(repo, trust, *args), env=trusted_env(trust), text=True).strip()
+
+
+def tgit_ok(repo, trust, *args):
+    return subprocess.run(trusted_command(repo, trust, *args), env=trusted_env(trust),
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
 
 
-def resolve_commit(source, rev, trust):
-    return tgit(source, trust, 'rev-parse', '--verify', rev + '^{commit}')
+OBJECT_ID = re.compile(r'^(?:[0-9a-f]{40}|[0-9a-f]{64})$')
+
+
+def resolve_commit(repo, rev, trust):
+    return tgit(repo, trust, 'rev-parse', '--verify', rev + '^{commit}')
+
+
+def head_commit(source):
+    """HEAD of the (untrusted) checkout; only ever used as an id to look up in the mirror."""
+    sha = git(source, 'rev-parse', '--verify', 'HEAD^{commit}')
+    if not OBJECT_ID.match(sha):
+        raise RuntimeError('Unexpected HEAD id from the source checkout')
+    return sha
 
 
 def check_remote(source, expected):
@@ -123,20 +149,58 @@ def check_remote(source, expected):
         raise RuntimeError('Source origin does not match the pinned update remote; refusing to fetch (set EXPECTED_REMOTE_URL in the update configuration only after reviewing the change)')
 
 
-def commit_is_verified(source, sha, trust):
+def default_mirror():
+    if os.geteuid() == 0:
+        return DEFAULT_MIRROR
+    cache = os.environ.get('XDG_CACHE_HOME') or str(Path.home() / '.cache')
+    return Path(cache) / 'vesselstack-update-mirror'
+
+
+def ensure_mirror(path, trust):
+    """Create/validate the private bare repository root uses for all git work.
+
+    It is owned by the invoking user (root under sudo), mode 0700, and root
+    requires the whole path to be root-controlled, so the checkout owner can
+    neither pre-populate it nor alter its config, attributes or objects.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if path.is_symlink():
+        raise RuntimeError('Update mirror must not be a symlink: ' + str(path))
+    if not path.exists():
+        path.mkdir(mode=0o700)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise RuntimeError('Update mirror must be a directory owned by the invoking user with mode 0700: ' + str(path))
+    if os.geteuid() == 0:
+        require_root_controlled(path)
+    if not (path / 'HEAD').exists():
+        subprocess.run(['git', *trust['config'], 'init', '--bare', '--quiet', str(path)], env=trusted_env(trust), check=True)
+    return path
+
+
+def mirror_fetch(mirror, trust, remote, namespace):
+    """Fetch branches and tags into the mirror; objects are fsck-checked on the way in."""
+    refspecs = ['+refs/heads/*:refs/remotes/' + namespace + '/*', '+refs/tags/*:refs/tags/*']
+    safe = remote if Path(str(remote)).is_dir() else None
+    subprocess.run(trusted_command(mirror, trust, 'fetch', '--quiet', '--no-tags', '--', str(remote), *refspecs, safe=safe),
+                   env=trusted_env(trust), check=True)
+
+
+def commit_is_verified(repo, sha, trust):
     """True when the commit has a valid signature or carries a validly signed tag."""
-    if tgit_ok(source, trust, 'verify-commit', sha):
+    if tgit_ok(repo, trust, 'verify-commit', sha):
         return True
-    for tag in tgit(source, trust, 'tag', '--points-at', sha).splitlines():
-        if tag and tgit_ok(source, trust, 'verify-tag', tag) and resolve_commit(source, tag, trust) == sha:
+    for tag in tgit(repo, trust, 'tag', '--points-at', sha).splitlines():
+        if tag and tgit_ok(repo, trust, 'verify-tag', tag) and resolve_commit(repo, tag, trust) == sha:
             return True
     return False
 
 
-def require_verified(source, rev, allow_unsigned, trust):
+def require_verified(repo, rev, allow_unsigned, trust):
     """Resolve `rev` to a commit id, verify that id, and return it."""
-    sha = resolve_commit(source, rev, trust)
-    if commit_is_verified(source, sha, trust):
+    sha = resolve_commit(repo, rev, trust)
+    if commit_is_verified(repo, sha, trust):
         return sha
     if allow_unsigned:
         print('WARNING: '+rev+' is not signature-verified; continuing only because VESSELSTACK_UPDATE_ALLOW_UNSIGNED=true (home-lab only)')
@@ -144,41 +208,116 @@ def require_verified(source, rev, allow_unsigned, trust):
     raise RuntimeError('Refusing unverified source: '+rev+' has no valid commit or tag signature. Import the maintainer signing key into the root-controlled keyring (VERIFY_GNUPGHOME) or allowed-signers file (VERIFY_ALLOWED_SIGNERS), or (home lab only) set VESSELSTACK_UPDATE_ALLOW_UNSIGNED=true')
 
 
-def pull_verified(source, expected_remote, allow_unsigned, trust):
-    """Fetch, verify the upstream commit, and only then fast-forward the checkout."""
+def upstream_branch(source):
+    name = git(source, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}')
+    if not re.fullmatch(r'origin/[A-Za-z0-9._/-]+', name) or '..' in name:
+        raise RuntimeError('The checkout must track a branch of origin; found: ' + name)
+    return name[len('origin/'):]
+
+
+def pull_verified(source, mirror, expected_remote, allow_unsigned, trust):
+    """Root fetches from the PINNED remote into its own mirror, verifies there,
+    and only then fast-forwards the checkout to the verified commit."""
     check_remote(source, expected_remote)
+    branch = upstream_branch(source)
+    mirror_fetch(mirror, trust, expected_remote, 'origin')
+    upstream = require_verified(mirror, 'refs/remotes/origin/' + branch, allow_unsigned, trust)
     git(source, 'fetch', '--tags', 'origin')
-    upstream = require_verified(source, '@{upstream}', allow_unsigned, trust)
     git(source, 'merge', '--ff-only', upstream)
-    if resolve_commit(source, 'HEAD', trust) != upstream:
+    if head_commit(source) != upstream:
         raise RuntimeError('Checkout HEAD is not the verified upstream commit after fast-forward')
     return upstream
 
 
-def extract_tar_stream(stream, destination):
-    """Extract regular files/directories only; refuse links, devices and traversal."""
+def verify_checkout_head(source, mirror, allow_unsigned, trust):
+    """Import the checkout's refs into the mirror, then verify its HEAD there."""
+    head = head_commit(source)
+    mirror_fetch(mirror, trust, source, 'checkout')
+    if not tgit_ok(mirror, trust, 'cat-file', '-e', head + '^{commit}'):
+        raise RuntimeError('Checkout HEAD ' + head + ' is not reachable from any branch or tag of the checkout; check out a branch or tag first')
+    return require_verified(mirror, head, allow_unsigned, trust)
+
+
+SAFE_MODES = {'100644': 0o644, '100755': 0o755}
+MAX_BLOB = 64 * 1024 * 1024
+MAX_TREE = 512 * 1024 * 1024
+
+
+def safe_relative_path(text):
+    parts = text.split('/')
+    if not text or text.startswith('/') or '\\' in text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise RuntimeError('Unsafe path in source tree: ' + repr(text))
+    for part in parts:
+        if part in ('', '.', '..') or part.lower() == '.git':
+            raise RuntimeError('Unsafe path in source tree: ' + repr(text))
+    return parts
+
+
+def parse_tree_listing(raw):
+    """Parse `git ls-tree -r -z`; accept only regular blobs (100644/100755)."""
+    entries = []
+    for record in raw.split(b'\0'):
+        if not record:
+            continue
+        meta, separator, path = record.partition(b'\t')
+        try:
+            if not separator:
+                raise ValueError
+            mode, kind, oid = meta.decode('ascii').split(' ')
+            name = path.decode('utf-8')
+        except ValueError:
+            raise RuntimeError('Malformed source tree listing') from None
+        if kind == 'commit':
+            raise RuntimeError('Source tree contains a submodule: ' + name)
+        if kind != 'blob' or mode not in SAFE_MODES:
+            raise RuntimeError('Source tree may contain only regular files (mode %s %s): %s' % (mode, kind, name))
+        if not OBJECT_ID.match(oid):
+            raise RuntimeError('Malformed object id in source tree listing')
+        safe_relative_path(name)
+        entries.append((mode, oid, name))
+    if not entries:
+        raise RuntimeError('Source tree is empty')
+    return entries
+
+
+def export_commit(repo, sha, trust, destination):
+    """Write the commit's files as RAW blobs: no archive, attributes, filters,
+    export-subst, textconv, symlinks, submodules or odd modes can alter bytes."""
     destination = Path(destination)
-    with tarfile.open(fileobj=stream, mode='r|') as archive:
-        for member in archive:
-            name = PurePosixPath(member.name)
-            if name.is_absolute() or '..' in name.parts:
-                raise RuntimeError('Unsafe path in source archive: ' + member.name)
-            target = destination.joinpath(*name.parts)
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-            elif member.isfile():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755 if member.mode & 0o111 else 0o644)
-                with os.fdopen(fd, 'wb') as handle:
-                    shutil.copyfileobj(archive.extractfile(member), handle)
-                os.chmod(target, 0o755 if member.mode & 0o111 else 0o644)
-            else:
-                raise RuntimeError('Source archive may contain only regular files and directories: ' + member.name)
+    env = trusted_env(trust)
+    entries = parse_tree_listing(subprocess.check_output(
+        trusted_command(repo, trust, 'ls-tree', '-r', '-z', '--full-tree', sha), env=env))
+    total = 0
+    with subprocess.Popen(trusted_command(repo, trust, 'cat-file', '--batch'),
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env) as proc:
+        for mode, oid, name in entries:
+            proc.stdin.write(oid.encode() + b'\n')
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            if len(header) != 3 or header[0].decode() != oid or header[1] != b'blob':
+                raise RuntimeError('git cat-file did not return blob ' + oid + ' for ' + name)
+            size = int(header[2])
+            total += size
+            if size > MAX_BLOB or total > MAX_TREE:
+                raise RuntimeError('Source tree is unreasonably large at ' + name)
+            data = proc.stdout.read(size)
+            if len(data) != size or proc.stdout.read(1) != b'\n':
+                raise RuntimeError('Truncated blob from git for ' + name)
+            target = destination.joinpath(*name.split('/'))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, SAFE_MODES[mode])
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(data)
+            os.chmod(target, SAFE_MODES[mode])
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError('git cat-file failed for commit ' + sha)
 
 
 @contextlib.contextmanager
-def exported_tree(source, sha, trust):
-    """Export the VERIFIED COMMIT OBJECT (never the working tree) to a temp tree.
+def exported_tree(repo, sha, trust):
+    """Export the VERIFIED COMMIT OBJECT from the root-owned mirror (never the
+    checkout or its working tree) to a temp tree.
 
     The tree is created by this process (root when run via sudo) and is not
     writable by the unprivileged user that runs the source's tests, so tests
@@ -189,12 +328,10 @@ def exported_tree(source, sha, trust):
         tree = Path(base) / 'tree'
         tree.mkdir()
         os.chmod(base, 0o755)
-        with subprocess.Popen(trusted_command(source, trust, 'archive', '--format=tar', sha),
-                              stdout=subprocess.PIPE, env={**os.environ, **trust['env']}) as proc:
-            extract_tar_stream(proc.stdout, tree)
-            proc.stdout.read()
-            if proc.wait() != 0:
-                raise RuntimeError('git archive failed for commit ' + sha)
+        export_commit(repo, sha, trust, tree)
+        for directory, names, _files in os.walk(tree):
+            for name in names:
+                os.chmod(Path(directory) / name, 0o755)
         os.chmod(tree, 0o755)
         yield tree
     finally:
@@ -214,7 +351,7 @@ def tree_manifest(tree):
 
 def assert_unchanged(source, sha, trust, tree, manifest):
     """Abort if the checkout moved, became dirty, or the exported tree changed."""
-    if resolve_commit(source, 'HEAD', trust) != sha:
+    if head_commit(source) != sha:
         raise RuntimeError('Source HEAD changed during the update; aborting')
     if git(source, 'status', '--porcelain', '--untracked-files=normal'):
         raise RuntimeError('Source checkout became dirty during the update; aborting')
@@ -333,6 +470,7 @@ def main():
     parser.add_argument('--allow-unsigned',action='store_true',default=os.environ.get('VESSELSTACK_UPDATE_ALLOW_UNSIGNED','false').strip().lower()=='true',help='Home-lab only: accept source without a verified commit/tag signature')
     parser.add_argument('--gnupg-home',type=Path,default=os.environ.get('VESSELSTACK_UPDATE_GNUPGHOME') or None,help='Root-controlled GNUPGHOME holding the maintainer public key(s) used for signature verification')
     parser.add_argument('--allowed-signers',type=Path,default=os.environ.get('VESSELSTACK_UPDATE_ALLOWED_SIGNERS') or None,help='Root-controlled SSH allowed-signers file (switches verification to SSH signatures)')
+    parser.add_argument('--mirror-dir',type=Path,default=os.environ.get('VESSELSTACK_UPDATE_MIRROR') or None,help='Root-owned bare repository (mode 0700) used for all verification and export; default /var/lib/vesselstack/update-mirror when root')
     parser.add_argument('--apply',action='store_true')
     parser.add_argument('--restart-chat',action='store_true')
     parser.add_argument('--service',choices=['boat-chat.service','vesselstack-chat.service'],default='vesselstack-chat.service')
@@ -360,11 +498,14 @@ def main():
         trust=make_trust(args.gnupg_home,args.allowed_signers)
         if git(source,'status','--porcelain','--untracked-files=normal'):raise RuntimeError('Source checkout is dirty; commit or resolve changes first')
         if args.expected_remote:check_remote(source,args.expected_remote)
-        if args.pull:sha=pull_verified(source,args.expected_remote,args.allow_unsigned,trust)
-        else:sha=require_verified(source,'HEAD',args.allow_unsigned,trust)
-        # Everything below uses the VERIFIED COMMIT OBJECT exported to a private
-        # tree, never the working tree: checker, tests and deployed bytes are the same.
-        with exported_tree(source,sha,trust) as tree:
+        # Root never runs `git archive`/verify inside the unprivileged-owned checkout:
+        # objects are fetched into a root-owned mirror and verified and exported there.
+        mirror=ensure_mirror(args.mirror_dir or default_mirror(),trust)
+        if args.pull:sha=pull_verified(source,mirror,args.expected_remote,args.allow_unsigned,trust)
+        else:sha=verify_checkout_head(source,mirror,args.allow_unsigned,trust)
+        # Everything below uses the VERIFIED COMMIT OBJECT exported as raw blobs to a
+        # private tree, never the working tree: checker, tests and deployed bytes are the same.
+        with exported_tree(mirror,sha,trust) as tree:
             manifest=tree_manifest(tree)
             # Source code is untrusted until verified: checker and tests never run as root.
             run_unprivileged(source,['python3',str(tree/'scripts/check-public-tree.py'),'--directory',str(tree)],cwd=tree)

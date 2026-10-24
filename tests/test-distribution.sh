@@ -8,7 +8,8 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
-    "$ROOT/tests/test-service-integration.sh"
+    "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
+    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
@@ -16,7 +17,8 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
-    "$ROOT/tests/test-service-integration.sh"
+    "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
+    "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh"
 grep -q 'GENERATE' "$ROOT/vesselstack.example.env"
 grep -q 'INFLUXDB_HISTORY_BUCKET' "$ROOT/vesselstack.example.env"
 grep -q 'verify-backup' "$ROOT/scripts/vesselstackctl"
@@ -72,6 +74,9 @@ if grep -nE -- '--token' "$ROOT/scripts/bootstrap-influx.sh"; then
     echo "bootstrap-influx.sh must pass the token via INFLUX_TOKEN, not argv" >&2
     exit 1
 fi
+grep -qF '@CAN_LINK_ARGS@' "$ROOT/systemd/vesselstack-socketcan.service.in"
+grep -q 'VESSELSTACK_CAN_CREATE_VCAN' "$ROOT/vesselstack.example.env"
+test -x "$ROOT/scripts/prepare-offline-bundle.sh"
 python3 -m unittest "$ROOT/tests/test_access_security.py"
 bash -n "$ROOT/scripts/vesselstack-update"
 shellcheck "$ROOT/scripts/vesselstack-update"

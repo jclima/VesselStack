@@ -17,7 +17,7 @@ After installing the OS and Docker prerequisites from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.3.0
+git checkout v1.4.0
 python3 vesselstack-wizard.py
 ```
 
@@ -141,7 +141,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.3.0
+git checkout v1.4.0
 ```
 
 ## 4. Configure the vessel
@@ -174,7 +174,8 @@ nano vesselstack.env
 | `SIGNALK_URL` | Existing SignalK endpoint |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
-| `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate |
+| `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
+| `VESSELSTACK_CAN_CREATE_VCAN` | `true` creates a missing `vcan*` interface at boot (home-lab replay only; default `false`) |
 | `AIS_ENABLE` | Opt in to the AIS-catcher Compose profile |
 | `AIS_DEVICE` | USB bus or receiver device mapped into AIS-catcher |
 | `AIS_CATCHER_ARGS` | Reviewed AIS-catcher receiver/output arguments |
@@ -203,6 +204,11 @@ components before Docker or systemd encounters a harder-to-diagnose bind error:
 ```bash
 sudo ./install.sh --config vesselstack.env --dry-run
 ```
+
+The dry run also validates the upgrade path from the installed version (so an
+unsupported upgrade or a downgrade is reported before anything is overwritten)
+and the Compose template. With `--offline` it also checks the wheelhouse and the
+locally loaded container images (see Offline install).
 
 Resolve every error before continuing.
 
@@ -390,6 +396,33 @@ the service first, then update `config/vesselstack.env`, then re-apply:
 missing and otherwise updated in place (other users are kept) when the
 username/password changed since the last run, so re-running the installer no
 longer resets MQTT credentials. Update Home Assistant's MQTT integration to match.
+
+#### Virtual CAN for home-lab replay
+
+On a lab machine without a CAN adapter you can replay a recorded log into a
+virtual CAN interface and let SignalK read it as if it were the boat bus. Set
+
+```bash
+SOCKETCAN_ENABLE="true"
+SOCKETCAN_INTERFACE="vcan0"
+VESSELSTACK_CAN_CREATE_VCAN="true"   # creates vcan0 (modprobe vcan + ip link add) at boot
+```
+
+For `vcan*` interfaces VesselStack renders `ip link set vcan0 up` only: virtual
+CAN has no bitrate and rejects `type can`/`restart-ms`, so `SOCKETCAN_BITRATE` is
+ignored. With the default `VESSELSTACK_CAN_CREATE_VCAN=false` the interface must
+already exist (`sudo ip link add dev vcan0 type vcan`). Physical `can*` interfaces
+are unchanged (bitrate 250000 by default, never auto-created). Then replay a
+log you recorded yourself with `candump -l can0` using `can-utils`:
+
+```bash
+sudo apt install can-utils
+canplayer -I /path/to/your-candump.log vcan0=can0   # add -l i to loop forever
+```
+
+Point the SignalK NMEA 2000/SocketCAN connection at `vcan0`. Recorded logs
+contain vessel identifiers and positions: keep them outside the repository (the
+public-tree check rejects `.log` files) and never commit or share them.
 
 ### Grafana
 
@@ -802,10 +835,67 @@ Shell-initiated `vesselstackctl update` remains available for a trusted operator
 and is not limited to the panel staging directory.
 
 The installer records the configuration schema in
-`/opt/vesselstack/config/installed-version` and accepts only explicit migration
-edges. It refuses unknown or future schemas instead of guessing. The 1.0
-migration supports 0.1 installations and retains legacy InfluxDB names when
-the new bucket settings are absent.
+`/opt/vesselstack/config/installed-version`. Any upgrade from 0.1.0 or newer to a
+newer release is accepted: when a release needs no data change only the version
+marker moves, and releases that do need one ship an executable
+`scripts/migrations/<version>.sh` that runs once, in version order. The 1.0
+migration supports 0.1 installations and retains legacy InfluxDB names when the
+new bucket settings are absent.
+
+**Downgrades are not supported.** Configuration and data may already use the
+newer schema, so `install.sh` (including `--dry-run`) and `migrate.sh` refuse to
+install an older release over a newer one and change nothing. To go back, restore
+a backup taken before the upgrade (`sudo vesselstackctl restore ...`, see
+Backups) or install the newer release again. Unknown or malformed version
+markers are refused instead of guessed at.
+
+Install order is transactional. Preflight (`--dry-run` runs the same checks)
+validates the upgrade path, the Compose template and, offline, the wheelhouse and
+local images **before** any installed file is touched. The Python environment is
+then built in a staging virtualenv next to the install; only if that succeeds are
+the environment, units and code rewritten, the staged virtualenv swapped in, and
+`installed-version` written last. A failed or offline-without-bundle run
+therefore leaves the previous installation, `vesselstack.env`, units and version
+marker exactly as they were (the installer says "Nothing was changed").
+Rollback of a completed upgrade is a restore of the pre-update backup that
+`vesselstackctl update` takes automatically.
+
+### Offline install (no internet on the boat)
+
+Prepare a bundle on the home lab or any connected machine, carry it to the
+boat, then install without any network access:
+
+```bash
+# Connected machine (needs docker and python3 with pip). Defaults target
+# Raspberry Pi OS 64-bit with Python 3.11 and linux/arm64 images.
+scripts/prepare-offline-bundle.sh --output ./offline-bundle
+#   other targets: --python-version 3.13  --platform manylinux_2_39_aarch64
+#   same architecture as this machine:     --native
+#   see the image list without downloading: --list
+
+# Copy ./offline-bundle (wheelhouse/, images/, MANIFEST.sha256, BUNDLE_INFO) and
+# a copy of this release to the boat, then on the boat:
+sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle   # verifies sha256, docker load
+sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+  ./install.sh --config /opt/vesselstack/config/vesselstack.env --offline --dry-run
+sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+  ./install.sh --config /opt/vesselstack/config/vesselstack.env --offline --start
+```
+
+The bundle contains a wheelhouse (`pip download` of `boat-chat/requirements.txt`
+for the chosen platform; only prebuilt wheels can be fetched for another
+platform), a `docker save` tarball for every image in `templates/compose.yml`
+(all profiles) plus the Mosquitto helper image, `BUNDLE_INFO` (release, platform,
+image list) and `MANIFEST.sha256`. `--verify DIR` checks it, and a bundle built
+for a different release is refused. It holds no configuration, credentials or
+vessel data. `--offline` (or `VESSELSTACK_OFFLINE=true`) installs packages with
+`pip install --no-index --find-links $VESSELSTACK_WHEELHOUSE` and starts
+containers with `docker compose up -d --pull never`. If an image is missing the
+installer lists it with the `docker load` hint: `--start` fails before changing
+anything, while a plain render only warns. Offline mode never contacts a
+registry or PyPI; SignalK/InfluxDB version bumps still need a new bundle.
+`vesselstackctl update` does not yet pass `--offline` through; run `install.sh`
+directly for offline releases. Rollback: restore the pre-update backup.
 
 ## Stopping or removing services
 
@@ -886,6 +976,9 @@ tests/test-migrations.sh
 sudo tests/test-clean-install.sh
 tests/test-image-manifests.sh
 tests/test-service-integration.sh
+tests/test-build-package.sh
+tests/test-socketcan.sh
+sudo tests/test-offline-install.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -896,8 +989,17 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.3.0.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-1.4.0.tar.gz.sha256)
 ```
+
+The package is produced by `git archive` of the committed `HEAD`, so untracked
+or ignored files (`.venv`, `boat-chat/boat_facts.json`, env files, memory/data,
+logs) can never enter it, and uncommitted edits to tracked files are excluded
+(with a warning; `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` makes that an error). The
+tarball contains `COMMIT` and `BUILD_INFO` naming the exact source commit, and
+the build prints the sha256 and that commit. `tests/test-build-package.sh`
+proves private and untracked files are not packaged. Building outside a git
+checkout is refused.
 
 The checksum records only the archive basename, so the archive and `.sha256`
 file can be downloaded and verified together from any directory.
@@ -1060,9 +1162,16 @@ sudo vesselstack-update --apply  # same, then back up, apply and verify
 
 Trust model: pulled source is untrusted until verified. The launcher refuses to
 fetch unless the checkout's `origin` equals `EXPECTED_REMOTE_URL` (default
-`https://github.com/jclima/VesselStack.git`), fetches without merging, requires
-the fetched commit to have a valid signature (`git verify-commit`) or a validly
-signed tag (`git verify-tag`), and only then fast-forwards. Verification runs
+`https://github.com/jclima/VesselStack.git`). **Root never runs `git archive` or
+`git verify-*` inside the checkout**, whose `.git/config` filters,
+`.git/info/attributes` and hooks the checkout owner controls. Instead root
+fetches the pinned remote's branches and tags into its **own root-owned bare
+mirror** (`UPDATE_MIRROR_DIR`, default `/var/lib/vesselstack/update-mirror`,
+mode 0700, fsck-checked fetch; without `--pull` the checkout's refs are imported
+into the mirror over file transport), requires the fetched commit there to have
+a valid signature (`git verify-commit`) or a validly signed tag
+(`git verify-tag`), and only then fast-forwards the checkout to that exact
+commit. Verification runs
 with a fixed configuration (`git -c core.hooksPath=/dev/null -c gpg.program=gpg`,
 system and global git config ignored, no repository-local overrides) against a
 **root-controlled** trust anchor, not the checkout owner's keyring:
@@ -1070,8 +1179,11 @@ system and global git config ignored, no repository-local overrides) against a
 `VERIFY_ALLOWED_SIGNERS` (an SSH allowed-signers file) in `update.env`. When
 running as root, that path and its parents must be root-owned and not
 group/world-writable. After verification the tests and the deployed bytes both
-come from the verified commit object (`git archive <sha>` into a private tree the
-test user cannot write), not the working tree; HEAD, the clean state and the tree
+come from the verified commit object, exported **as raw blobs** from the mirror
+(`git ls-tree -r -z` + `git cat-file blob`; no `git archive`, so attributes,
+`export-subst`, filters and textconv cannot change bytes; symlinks, submodules,
+unsafe paths and modes other than 100644/100755 are refused) into a private tree
+the test user cannot write, not the working tree; HEAD, the clean state and the tree
 are re-checked after the tests and again just before apply, and any change aborts. `scripts/check-public-tree.py` and
 the unit tests run as the checkout owner via `runuser`, never as root; a
 root-owned checkout is refused. Import the maintainer signing key into that root-controlled keyring before first
@@ -1080,7 +1192,9 @@ use, e.g. `sudo install -d -m 700 /etc/vesselstack/gnupg` then
 `/etc/vesselstack/update.env` to accept unsigned source (a warning is printed);
 do not enable it on a vessel others can push code to. The checkout owner can no longer
 change what root deploys after verification, because root deploys the verified
-commit's content. Roll back
+commit's content. Upgrade note: 1.4.0 adds the mirror;
+no action is required (it is created on first run) but a root-owned,
+non-writable `/var/lib/vesselstack` path is enforced. Roll back
 by restoring a printed backup (below) or by setting `ALLOW_UNSIGNED_SOURCE`
 back to `false`.
 

@@ -68,6 +68,9 @@ python3 /path/to/source/scripts/deploy-chat.py \
   --source /path/to/source --target /path/to/installed/app --pull
 ```
 
+Objects are fetched, signature-verified and exported (raw blobs, no `git archive`)
+through a root-owned mirror (`--mirror-dir`, default
+`/var/lib/vesselstack/update-mirror` as root), never from inside the checkout.
 This requires a clean source checkout, pulls fast-forward only, checks public
 source and runs all unit tests. It lists changed tracked Python/static files
 without applying them. An advisory lock file is created in the live directory.

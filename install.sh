@@ -13,9 +13,12 @@ SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
 RELEASES_DIR="$SYSTEM_ROOT/var/lib/vesselstack/releases"
 START=0
 DRY_RUN=0
+OFFLINE=${VESSELSTACK_OFFLINE:-false}
 
 usage() {
-    echo "Usage: sudo ./install.sh [--config FILE] [--dry-run] [--start]"
+    echo "Usage: sudo ./install.sh [--config FILE] [--dry-run] [--start] [--offline]"
+    echo "  --offline  No network: install Python packages from VESSELSTACK_WHEELHOUSE and"
+    echo "             require container images to be loaded already (see README, Offline install)"
 }
 
 while [ $# -gt 0 ]; do
@@ -23,6 +26,7 @@ while [ $# -gt 0 ]; do
         --config) CONFIG_FILE=$2; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --start) START=1; shift ;;
+        --offline) OFFLINE=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
     esac
@@ -51,6 +55,7 @@ source "$CONFIG_FILE"
 : "${SOCKETCAN_ENABLE:=false}"
 : "${SOCKETCAN_INTERFACE:=can0}"
 : "${SOCKETCAN_BITRATE:=250000}"
+: "${VESSELSTACK_CAN_CREATE_VCAN:=false}"
 : "${AIS_ENABLE:=false}"
 : "${AIS_IMAGE:=ghcr.io/jvde-github/ais-catcher:v0.70}"
 : "${AIS_DEVICE:=/dev/bus/usb}"
@@ -71,6 +76,12 @@ source "$CONFIG_FILE"
 # Empty = unset: fresh InfluxDB setups get 30d on the raw bucket; existing buckets
 # are never changed unless a value is set explicitly (see README).
 : "${INFLUXDB_RAW_RETENTION:=}"
+
+: "${VESSELSTACK_WHEELHOUSE:=$SCRIPT_DIR/offline/wheelhouse}"
+case "$OFFLINE" in
+    true|false) ;;
+    *) echo "VESSELSTACK_OFFLINE must be true or false" >&2; exit 1 ;;
+esac
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -104,7 +115,7 @@ if [ -n "$INFLUXDB_RAW_RETENTION" ] && \
     echo "INFLUXDB_RAW_RETENTION must be empty, 0 (keep forever), or a duration such as 720h, 30d or 8w" >&2
     exit 1
 fi
-for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
+for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
     TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
     case "${!key}" in
         true|false) ;;
@@ -210,10 +221,17 @@ if [ "$SIGNALK_MODE" = native ]; then
     }
 fi
 if [ "$SOCKETCAN_ENABLE" = true ]; then
-    [ -e "/sys/class/net/$SOCKETCAN_INTERFACE" ] || {
-        echo "SocketCAN interface not detected: $SOCKETCAN_INTERFACE" >&2
-        exit 1
-    }
+    case "$SOCKETCAN_INTERFACE" in
+        can[0-9]*|vcan[0-9]*) ;;
+        *) echo "SOCKETCAN_INTERFACE must look like can0 or vcan0" >&2; exit 1 ;;
+    esac
+    # A virtual interface may be created on demand (home-lab replay).
+    if ! { [ "$VESSELSTACK_CAN_CREATE_VCAN" = true ] && [[ "$SOCKETCAN_INTERFACE" == vcan* ]]; }; then
+        [ -e "${VESSELSTACK_SYS_CLASS_NET:-/sys/class/net}/$SOCKETCAN_INTERFACE" ] || {
+            echo "SocketCAN interface not detected: $SOCKETCAN_INTERFACE" >&2
+            exit 1
+        }
+    fi
 fi
 if [ "$AIS_ENABLE" = true ]; then
     [ -e "$AIS_DEVICE" ] || { echo "AIS device not detected: $AIS_DEVICE" >&2; exit 1; }
@@ -234,8 +252,52 @@ if [ "$SIGNALK_MODE" = existing ]; then
     }
 fi
 
+# Everything that can fail for lack of a network, an image, a wheel or a supported
+# upgrade path is checked here, before any installed file is touched.
+if ! "$SCRIPT_DIR/scripts/migrate.sh" --check "$CONFIG_FILE" "$(<"$SCRIPT_DIR/VERSION")"; then
+    echo "Preflight failed: this release cannot be installed over the current installation (see above). Nothing was changed." >&2
+    exit 1
+fi
+compose_template() {
+    SIGNALK_VERSION=$SIGNALK_VERSION AIS_IMAGE=$AIS_IMAGE \
+        docker compose "${COMPOSE_PROFILES[@]}" --env-file "$CONFIG_FILE" \
+        -f "$SCRIPT_DIR/templates/compose.yml" "$@"
+}
+compose_template config --quiet 2>/dev/null || {
+    echo "Compose template validation failed for this configuration:" >&2
+    compose_template config --quiet >&2 || true
+    exit 1
+}
+if [ "$OFFLINE" = true ]; then
+    [ -n "$(find "$VESSELSTACK_WHEELHOUSE" -maxdepth 1 \( -name '*.whl' -o -name '*.tar.gz' \) -print -quit 2>/dev/null)" ] || {
+        echo "Offline install: no Python packages found in VESSELSTACK_WHEELHOUSE=$VESSELSTACK_WHEELHOUSE" >&2
+        echo "Build the bundle on a connected machine with scripts/prepare-offline-bundle.sh and copy it here." >&2
+        exit 1
+    }
+    mapfile -t required_images < <(
+        { compose_template config --images; echo "${MOSQUITTO_IMAGE:-eclipse-mosquitto:2.1.2-alpine}"; } | sort -u
+    )
+    missing_images=()
+    for image in "${required_images[@]}"; do
+        docker image inspect "$image" >/dev/null 2>&1 || missing_images+=("$image")
+    done
+    if [ "${#missing_images[@]}" -gt 0 ]; then
+        {
+            echo "Offline install: these container images are not present locally:"
+            printf '  %s\n' "${missing_images[@]}"
+            echo "Load them from the offline bundle first, for example:"
+            echo "  sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle"
+            echo "(or: docker load -i <bundle>/images/<name>.tar for each image)"
+        } >&2
+        # Rendering configuration does not need images; starting services does.
+        if [ "$START" -eq 1 ]; then exit 1; fi
+        echo "WARNING: load the images before running with --start or starting services." >&2
+    fi
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "Preflight passed"
+    [ "$OFFLINE" = true ] && echo "Offline mode: Python packages from $VESSELSTACK_WHEELHOUSE, no image pulls"
     echo "Would install to $VESSELSTACK_ROOT with data in $VESSELSTACK_DATA"
     echo "SignalK mode: $SIGNALK_MODE ($SIGNALK_URL)"
     exit 0
@@ -243,6 +305,25 @@ fi
 
 [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
 install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
+
+# Transactional ordering: the network/package-dependent step runs FIRST, into a
+# staging virtualenv. Only when it succeeds is anything else rewritten, and the
+# staged venv is swapped in later. A failed (or offline) run therefore changes
+# nothing: no env, units, code or installed-version are touched.
+install -d -m 0755 "$VESSELSTACK_ROOT"
+STAGING_DIR=$(mktemp -d "$VESSELSTACK_ROOT/.venv-staging.XXXXXX")
+trap 'rm -rf -- "$STAGING_DIR"' EXIT
+STAGING_VENV="$STAGING_DIR/venv"
+pip_args=(install --disable-pip-version-check)
+if [ "$OFFLINE" = true ]; then
+    pip_args+=(--no-index --find-links "$VESSELSTACK_WHEELHOUSE")
+fi
+if ! python3 -m venv "$STAGING_VENV" \
+    || ! "$STAGING_VENV/bin/pip" "${pip_args[@]}" -r "$SOURCE_ROOT/boat-chat/requirements.txt"; then
+    echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable? use --offline with a prepared bundle)")." >&2
+    echo "Nothing was changed on this system." >&2
+    exit 1
+fi
 
 generate_secret() {
     local current=$1
@@ -381,10 +462,18 @@ tar -C "$SOURCE_ROOT/boat-chat" \
     --exclude=boat-chat.env --exclude=.venv --exclude=memory --exclude=data \
     --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/boat-chat" -xf -
-# Discard any previously service-writable virtualenv and take ownership of all
-# application code before root ever executes anything from it.
+# Discard any previously service-writable virtualenv, swap in the staged one
+# (built above, root-owned) and take ownership of all application code before
+# root ever executes anything from it. Same filesystem, so the move is a rename;
+# scripts that embedded the staging path are rewritten to the final path.
 rm -rf -- "$VESSELSTACK_ROOT/boat-chat/.venv"
+mv -- "$STAGING_VENV" "$VESSELSTACK_ROOT/boat-chat/.venv"
+grep -rlIF -- "$STAGING_VENV" "$VESSELSTACK_ROOT/boat-chat/.venv" 2>/dev/null \
+    | while IFS= read -r relocated; do
+        sed -i "s|$STAGING_VENV|$VESSELSTACK_ROOT/boat-chat/.venv|g" "$relocated"
+    done || true
 chown -hR root:root "$VESSELSTACK_ROOT/boat-chat"
+# The service user must be able to read and execute the venv but never write it.
 chmod -R go-w,go+rX "$VESSELSTACK_ROOT/boat-chat"
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
@@ -457,6 +546,7 @@ SIGNALK_URL
 SOCKETCAN_ENABLE
 SOCKETCAN_INTERFACE
 SOCKETCAN_BITRATE
+VESSELSTACK_CAN_CREATE_VCAN
 AIS_ENABLE
 AIS_IMAGE
 AIS_DEVICE
@@ -555,9 +645,6 @@ install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/control-panel.env"
     printf 'CONTROL_PANEL_TOKEN=%q\n' "$CONTROL_PANEL_TOKEN"
 } >> "$VESSELSTACK_ROOT/config/control-panel.env"
 
-"$SCRIPT_DIR/scripts/migrate.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" \
-    "$(<"$SCRIPT_DIR/VERSION")"
-
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)
 # application directory and renamed into place; the service user can only read it.
 facts_temp=$(mktemp "$VESSELSTACK_ROOT/boat-chat/.boat_facts.XXXXXX")
@@ -570,12 +657,6 @@ jq -n \
 chown "root:$VESSELSTACK_USER" "$facts_temp"
 chmod 0640 "$facts_temp"
 mv -f -- "$facts_temp" "$VESSELSTACK_ROOT/boat-chat/boat_facts.json"
-
-python3 -m venv "$VESSELSTACK_ROOT/boat-chat/.venv"
-"$VESSELSTACK_ROOT/boat-chat/.venv/bin/pip" install -r "$VESSELSTACK_ROOT/boat-chat/requirements.txt"
-# Root-owned and not writable by the service user: root later runs this pip.
-chown -hR root:root "$VESSELSTACK_ROOT/boat-chat/.venv"
-chmod -R go-w "$VESSELSTACK_ROOT/boat-chat/.venv"
 
 sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
@@ -611,6 +692,10 @@ fi
 
 compose config --quiet
 
+# Everything rendered and validated: record the new schema version last.
+"$SCRIPT_DIR/scripts/migrate.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" \
+    "$(<"$SCRIPT_DIR/VERSION")"
+
 if [ "$SIGNALK_MODE" = native ]; then
     "$SCRIPT_DIR/scripts/install-signalk-native.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
 fi
@@ -623,7 +708,11 @@ if [ "$START" -eq 1 ]; then
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
     "$SCRIPT_DIR/scripts/mosquitto-credentials.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
-    compose up -d
+    if [ "$OFFLINE" = true ]; then
+        compose up -d --pull never
+    else
+        compose up -d
+    fi
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then

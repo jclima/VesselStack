@@ -22,7 +22,8 @@ Source must carry a valid commit/tag signature unless the home-lab opt-in
 ALLOW_UNSIGNED_SOURCE=true is set in the update configuration. Signatures are
 checked with a fixed git/gpg configuration against a root-controlled keyring
 (VERIFY_GNUPGHOME) or allowed-signers file (VERIFY_ALLOWED_SIGNERS), and the
-tests and deployed files come from the verified commit, not the working tree.
+tests and deployed files come from the verified commit (fetched into a
+root-owned mirror and exported as raw blobs), not the working tree.
 HELP
 }
 
@@ -53,6 +54,9 @@ ALLOW_UNSIGNED_SOURCE="${ALLOW_UNSIGNED_SOURCE:-false}"
 # Root-controlled trust anchors for signature verification (optional).
 VERIFY_GNUPGHOME="${VERIFY_GNUPGHOME:-}"
 VERIFY_ALLOWED_SIGNERS="${VERIFY_ALLOWED_SIGNERS:-}"
+# Root-owned bare repository (mode 0700) where objects are fetched, verified and
+# exported; root never runs git archive/verify inside the checkout.
+UPDATE_MIRROR_DIR="${UPDATE_MIRROR_DIR:-/var/lib/vesselstack/update-mirror}"
 
 HELPER="$SOURCE_DIRECTORY/scripts/deploy-chat.py"
 [ -f "$HELPER" ] || { echo "Missing deployment helper: $HELPER" >&2; exit 1; }
@@ -62,6 +66,7 @@ ARGS=(--source "$SOURCE_DIRECTORY" --target "$TARGET_DIRECTORY"
 if [ "$ALLOW_UNSIGNED_SOURCE" = true ]; then
     ARGS+=(--allow-unsigned)
 fi
+ARGS+=(--mirror-dir "$UPDATE_MIRROR_DIR")
 if [ -n "$VERIFY_GNUPGHOME" ]; then
     ARGS+=(--gnupg-home "$VERIFY_GNUPGHOME")
 fi

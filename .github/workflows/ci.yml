@@ -44,6 +44,12 @@ jobs:
         run: tests/test-migrations.sh
       - name: Clean installation checks
         run: sudo tests/test-clean-install.sh
+      - name: Offline and transactional install checks
+        run: sudo tests/test-offline-install.sh
+      - name: SocketCAN unit rendering checks
+        run: tests/test-socketcan.sh
+      - name: Release package content checks
+        run: tests/test-build-package.sh
       - name: Validate Compose configuration
         run: docker compose --env-file vesselstack.example.env -f templates/compose.yml config --quiet
       - name: Validate optional Compose profiles

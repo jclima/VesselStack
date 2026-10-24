@@ -1,10 +1,9 @@
 import contextlib
 import importlib.util
-import io
 import json
 import os
+import shutil
 import subprocess
-import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,7 +94,8 @@ class DeploymentTests(unittest.TestCase):
         stack=contextlib.ExitStack()
         stack.enter_context(mock.patch('sys.argv',argv))
         stack.enter_context(mock.patch.object(deploy,'git',side_effect=self.git))
-        stack.enter_context(mock.patch.object(deploy,'require_verified',return_value='fixture-commit'))
+        stack.enter_context(mock.patch.object(deploy,'ensure_mirror',return_value=Path('/mirror')))
+        stack.enter_context(mock.patch.object(deploy,'verify_checkout_head',return_value='fixture-commit'))
         stack.enter_context(mock.patch.object(deploy,'exported_tree',tree))
         stack.enter_context(mock.patch.object(deploy,'run_unprivileged'))
         stack.enter_context(mock.patch.object(deploy.subprocess,'run'))
@@ -189,22 +189,35 @@ class SourceTrustTests(unittest.TestCase):
             deploy.commit_is_verified(Path('/x'),'abc123',deploy.make_trust())
         self.assertEqual(calls,[('verify-commit','abc123')])
 
-    def test_pull_verifies_before_merging_and_never_merges_unverified(self):
+    def pull_patches(self,calls,verified,heads=('abc123',)):
+        shas=iter(heads)
+        stack=contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(deploy,'git',side_effect=lambda source,*args:calls.append(args[0]) or ''))
+        stack.enter_context(mock.patch.object(deploy,'upstream_branch',return_value='main'))
+        stack.enter_context(mock.patch.object(deploy,'mirror_fetch',side_effect=lambda *a:calls.append('mirror-fetch')))
+        stack.enter_context(mock.patch.object(deploy,'resolve_commit',return_value='abc123'))
+        stack.enter_context(mock.patch.object(deploy,'commit_is_verified',side_effect=lambda *a:calls.append('verify') or verified))
+        stack.enter_context(mock.patch.object(deploy,'head_commit',side_effect=lambda *a:next(shas)))
+        return stack
+
+    def test_pull_fetches_into_mirror_and_verifies_before_merging(self):
         calls=[];trust=deploy.make_trust()
-        def git(source,*args):
-            calls.append(args[0]);return ''
-        with mock.patch.object(deploy,'git',side_effect=git),mock.patch.object(deploy,'resolve_commit',return_value='abc123'),mock.patch.object(deploy,'commit_is_verified',side_effect=lambda *a:calls.append('verify') or False):
-            with self.assertRaisesRegex(RuntimeError,'unverified'):deploy.pull_verified(Path('/x'),'',False,trust)
-        self.assertNotIn('merge',calls)
+        with self.pull_patches(calls,False):
+            with self.assertRaisesRegex(RuntimeError,'unverified'):deploy.pull_verified(Path('/x'),Path('/m'),'',False,trust)
+        self.assertNotIn('merge',calls);self.assertNotIn('fetch',calls)
         calls.clear()
-        with mock.patch.object(deploy,'git',side_effect=git),mock.patch.object(deploy,'resolve_commit',return_value='abc123'),mock.patch.object(deploy,'commit_is_verified',side_effect=lambda *a:calls.append('verify') or True):
-            self.assertEqual(deploy.pull_verified(Path('/x'),'',False,trust),'abc123')
-        self.assertLess(calls.index('verify'),calls.index('merge'));self.assertNotIn('pull',calls)
+        with self.pull_patches(calls,True):
+            self.assertEqual(deploy.pull_verified(Path('/x'),Path('/m'),'',False,trust),'abc123')
+        self.assertLess(calls.index('mirror-fetch'),calls.index('verify'));self.assertLess(calls.index('verify'),calls.index('merge'));self.assertNotIn('pull',calls)
 
     def test_pull_fails_if_head_is_not_the_verified_commit_after_merge(self):
-        shas=iter(['upstream','other'])
-        with mock.patch.object(deploy,'git',return_value=''),mock.patch.object(deploy,'resolve_commit',side_effect=lambda *a:next(shas)),mock.patch.object(deploy,'commit_is_verified',return_value=True):
-            with self.assertRaisesRegex(RuntimeError,'not the verified upstream'):deploy.pull_verified(Path('/x'),'',False,deploy.make_trust())
+        with self.pull_patches([],True,heads=('other',)):
+            with self.assertRaisesRegex(RuntimeError,'not the verified upstream'):deploy.pull_verified(Path('/x'),Path('/m'),'',False,deploy.make_trust())
+
+    def test_upstream_branch_must_be_an_origin_branch(self):
+        for name in ['evil/main','origin/../x','origin/a b']:
+            with mock.patch.object(deploy,'git',return_value=name),self.assertRaises(RuntimeError):deploy.upstream_branch(Path('/x'))
+        with mock.patch.object(deploy,'git',return_value='origin/release/1.x'):self.assertEqual(deploy.upstream_branch(Path('/x')),'release/1.x')
 
     def test_pull_requires_pinned_remote_argument(self):
         argv=['deploy-chat.py','--target','/tmp/x','--pull']
@@ -214,12 +227,21 @@ class SourceTrustTests(unittest.TestCase):
 class FixedVerificationConfigTests(unittest.TestCase):
     def test_fixed_config_overrides_repo_local_and_global_settings(self):
         trust=deploy.make_trust()
-        command=deploy.trusted_command(Path('/src'),trust,'verify-commit','abc')
-        for setting in ['core.hooksPath=/dev/null','gpg.program=gpg','gpg.format=openpgp','core.fsmonitor=false']:
+        command=deploy.trusted_command(Path('/mirror'),trust,'verify-commit','abc')
+        for setting in ['core.hooksPath=/dev/null','gpg.program=gpg','gpg.format=openpgp','core.fsmonitor=false','core.attributesFile='+os.devnull,'transfer.fsckObjects=true']:
             self.assertIn(setting,command)
-        self.assertLess(command.index('core.hooksPath=/dev/null'),command.index('-C'))
-        self.assertIn('safe.directory=/src',command)
+        self.assertLess(command.index('core.hooksPath=/dev/null'),command.index('--git-dir=/mirror'))
+        self.assertNotIn('-C',command)
+        self.assertNotIn('safe.directory=/mirror',command)
+        self.assertIn('safe.directory=/src',deploy.trusted_command(Path('/mirror'),trust,'fetch',safe='/src'))
         self.assertEqual(trust['env']['GIT_CONFIG_GLOBAL'],os.devnull);self.assertEqual(trust['env']['GIT_CONFIG_NOSYSTEM'],'1')
+        self.assertEqual(trust['env']['GIT_ATTR_NOSYSTEM'],'1')
+
+    def test_inherited_git_variables_are_dropped(self):
+        with mock.patch.dict(os.environ,{'GIT_DIR':'/evil','GIT_WORK_TREE':'/evil','GIT_EXTERNAL_DIFF':'x','KEEP_ME':'1'}):
+            env=deploy.trusted_env(deploy.make_trust())
+        for key in ['GIT_DIR','GIT_WORK_TREE','GIT_EXTERNAL_DIFF']:self.assertNotIn(key,env)
+        self.assertEqual(env['KEEP_ME'],'1');self.assertEqual(env['GIT_CONFIG_NOSYSTEM'],'1')
 
     def test_gnupg_home_and_allowed_signers_are_honored(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -241,49 +263,149 @@ class FixedVerificationConfigTests(unittest.TestCase):
             with mock.patch.object(deploy.os,'geteuid',return_value=1000):deploy.require_root_controlled(directory)
 
 
-def commit_repo(path):
-    env=dict(os.environ,GIT_AUTHOR_NAME='t',GIT_AUTHOR_EMAIL='t@example.invalid',GIT_COMMITTER_NAME='t',GIT_COMMITTER_EMAIL='t@example.invalid',GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_NOSYSTEM='1')
-    def run(*args):subprocess.run(['git','-C',str(path),*args],check=True,env=env,stdout=subprocess.DEVNULL)
-    run('init','-q');(path/'boat-chat').mkdir();(path/'boat-chat/app.py').write_text('committed\n')
-    run('add','-A');run('commit','-q','-m','c')
-    return subprocess.check_output(['git','-C',str(path),'rev-parse','HEAD'],text=True,env=env).strip()
+GIT_ENV=dict(os.environ,GIT_AUTHOR_NAME='t',GIT_AUTHOR_EMAIL='t@example.invalid',GIT_COMMITTER_NAME='t',GIT_COMMITTER_EMAIL='t@example.invalid',GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_NOSYSTEM='1')
+
+
+def run_git(path,*args):
+    return subprocess.run(['git','-C',str(path),*args],check=True,env=GIT_ENV,stdout=subprocess.PIPE,text=True).stdout.strip()
+
+
+def commit_repo(path,files=None):
+    run_git(path,'init','-q')
+    for name,data in (files or {'boat-chat/app.py':'committed\n'}).items():
+        (path/name).parent.mkdir(parents=True,exist_ok=True);(path/name).write_text(data)
+    run_git(path,'add','-A');run_git(path,'commit','-q','-m','c')
+    return run_git(path,'rev-parse','HEAD')
 
 
 class ExportedTreeTests(unittest.TestCase):
-    def test_tree_comes_from_the_commit_object_not_the_working_tree(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo=Path(directory)/'repo';repo.mkdir();sha=commit_repo(repo)
-            (repo/'boat-chat/app.py').write_text('tampered working tree\n');(repo/'untracked.py').write_text('x')
-            with deploy.exported_tree(repo,sha,deploy.make_trust()) as tree:
-                self.assertEqual((tree/'boat-chat/app.py').read_text(),'committed\n')
-                self.assertFalse((tree/'untracked.py').exists())
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.base=Path(self.temp.name);self.repo=self.base/'repo';self.repo.mkdir()
+        self.trust=deploy.make_trust()
 
-    def test_archive_extraction_refuses_links_and_traversal(self):
-        def archive(member,data=b''):
-            buffer=io.BytesIO()
-            with tarfile.open(fileobj=buffer,mode='w') as bundle:bundle.addfile(member,io.BytesIO(data) if data else None)
-            return io.BytesIO(buffer.getvalue())
-        link=tarfile.TarInfo('boat-chat/app.py');link.type=tarfile.SYMTYPE;link.linkname='/etc/passwd'
-        escape=tarfile.TarInfo('../escape');escape.size=1
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError,'regular files'):deploy.extract_tar_stream(archive(link),directory)
-            with self.assertRaisesRegex(RuntimeError,'Unsafe path'):deploy.extract_tar_stream(archive(escape,b'x'),directory)
+    def mirror(self):
+        mirror=deploy.ensure_mirror(self.base/'mirror',self.trust)
+        deploy.mirror_fetch(mirror,self.trust,self.repo,'checkout')
+        return mirror
+
+    def test_mirror_is_private_bare_repo_and_rejects_loose_modes_and_symlinks(self):
+        mirror=deploy.ensure_mirror(self.base/'mirror',self.trust)
+        self.assertEqual(mirror.stat().st_mode & 0o777,0o700);self.assertTrue((mirror/'HEAD').exists())
+        deploy.ensure_mirror(self.base/'mirror',self.trust)  # idempotent
+        mirror.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError,'0700'):deploy.ensure_mirror(self.base/'mirror',self.trust)
+        (self.base/'link').symlink_to(mirror)
+        with self.assertRaisesRegex(RuntimeError,'symlink'):deploy.ensure_mirror(self.base/'link',self.trust)
+
+    def test_tree_comes_from_the_commit_object_not_the_working_tree(self):
+        sha=commit_repo(self.repo)
+        (self.repo/'boat-chat/app.py').write_text('tampered working tree\n');(self.repo/'untracked.py').write_text('x')
+        mirror=self.mirror()
+        with deploy.exported_tree(mirror,sha,self.trust) as tree:
+            self.assertEqual((tree/'boat-chat/app.py').read_text(),'committed\n')
+            self.assertFalse((tree/'untracked.py').exists())
+
+    def test_repo_local_config_attributes_and_export_subst_cannot_change_bytes(self):
+        files={'boat-chat/app.py':'id: $Format:%H$\nident: $Id$\ncrlf\r\n','.gitattributes':'* export-subst ident\n'}
+        sha=commit_repo(self.repo,files)
+        marker=self.base/'filter-ran'
+        (self.repo/'.git/config').write_text((self.repo/'.git/config').read_text()+'[filter "evil"]\n\tsmudge = touch %s\n\tclean = touch %s\n[core]\n\tattributesFile = /nonexistent\n'%(marker,marker))
+        (self.repo/'.git/info').mkdir(exist_ok=True);(self.repo/'.git/info/attributes').write_text('* filter=evil export-ignore\n')
+        mirror=self.mirror()
+        with deploy.exported_tree(mirror,sha,self.trust) as tree:
+            self.assertEqual((tree/'boat-chat/app.py').read_bytes(),files['boat-chat/app.py'].encode())
+            self.assertEqual((tree/'.gitattributes').read_text(),files['.gitattributes'])
+        self.assertFalse(marker.exists())
+        self.assertNotIn('evil',(mirror/'config').read_text())
+
+    def test_executable_bit_is_preserved_and_other_bits_are_normalised(self):
+        (self.repo/'run.sh').parent.mkdir(exist_ok=True)
+        sha=commit_repo(self.repo,{'run.sh':'#!/bin/sh\n','plain.txt':'x\n'})
+        run_git(self.repo,'update-index','--chmod=+x','run.sh');run_git(self.repo,'commit','-q','-m','x','--amend')
+        sha=run_git(self.repo,'rev-parse','HEAD')
+        with deploy.exported_tree(self.mirror(),sha,self.trust) as tree:
+            self.assertEqual((tree/'run.sh').stat().st_mode & 0o777,0o755)
+            self.assertEqual((tree/'plain.txt').stat().st_mode & 0o777,0o644)
+
+    def test_symlink_and_submodule_commits_are_refused(self):
+        sha=commit_repo(self.repo)
+        (self.repo/'boat-chat/link.py').symlink_to('/etc/passwd')
+        run_git(self.repo,'add','-A');run_git(self.repo,'commit','-q','-m','link')
+        link=run_git(self.repo,'rev-parse','HEAD')
+        run_git(self.repo,'rm','-q','--cached','boat-chat/link.py')
+        run_git(self.repo,'update-index','--add','--cacheinfo','160000,'+sha+',vendor/sub');run_git(self.repo,'commit','-q','-m','sub')
+        submodule=run_git(self.repo,'rev-parse','HEAD')
+        mirror=self.mirror()
+        with self.assertRaisesRegex(RuntimeError,'regular files'):
+            with deploy.exported_tree(mirror,link,self.trust):pass
+        with self.assertRaisesRegex(RuntimeError,'submodule'):
+            with deploy.exported_tree(mirror,submodule,self.trust):pass
+
+    def test_tree_listing_rejects_odd_modes_and_unsafe_paths(self):
+        oid='a'*40
+        def entry(mode,kind,name):return ('%s %s %s\t%s\0'%(mode,kind,oid,name)).encode()
+        self.assertEqual(deploy.parse_tree_listing(entry('100644','blob','a/b.py')),[('100644',oid,'a/b.py')])
+        for raw in [entry('120000','blob','l'),entry('100664','blob','x'),entry('040000','tree','d'),entry('160000','commit','s'),
+                    entry('100644','blob','../x'),entry('100644','blob','a/../x'),entry('100644','blob','/abs'),entry('100644','blob','a//b'),
+                    entry('100644','blob','.git/config'),entry('100644','blob','a/.GIT/hooks/x'),entry('100644','blob','a\\b'),b'garbage\0',b'']:
+            with self.assertRaises(RuntimeError,msg=raw):deploy.parse_tree_listing(raw)
+
+    def test_checkout_head_must_be_reachable_and_unsigned_is_refused(self):
+        sha=commit_repo(self.repo)
+        mirror=deploy.ensure_mirror(self.base/'mirror',self.trust)
+        with mock.patch.object(deploy,'head_commit',return_value='1'*40),self.assertRaisesRegex(RuntimeError,'not reachable'):
+            deploy.verify_checkout_head(self.repo,mirror,False,self.trust)
+        with mock.patch.object(deploy,'head_commit',return_value=sha),self.assertRaisesRegex(RuntimeError,'unverified'):
+            deploy.verify_checkout_head(self.repo,mirror,False,self.trust)
+        with mock.patch.object(deploy,'head_commit',return_value=sha):
+            self.assertEqual(deploy.verify_checkout_head(self.repo,mirror,True,self.trust),sha)
+
+    def test_pull_path_fetches_from_pinned_remote_into_mirror(self):
+        sha=commit_repo(self.repo);branch=run_git(self.repo,'rev-parse','--abbrev-ref','HEAD')
+        mirror=deploy.ensure_mirror(self.base/'mirror',self.trust)
+        deploy.mirror_fetch(mirror,self.trust,self.repo,'origin')
+        self.assertEqual(deploy.require_verified(mirror,'refs/remotes/origin/'+branch,True,self.trust),sha)
 
     def test_manifest_detects_modification_during_tests(self):
         with tempfile.TemporaryDirectory() as directory:
             tree=Path(directory);(tree/'a.py').write_text('one')
             before=deploy.tree_manifest(tree);(tree/'a.py').write_text('two')
-            with mock.patch.object(deploy,'resolve_commit',return_value='sha'),mock.patch.object(deploy,'git',return_value=''):
+            with mock.patch.object(deploy,'head_commit',return_value='sha'),mock.patch.object(deploy,'git',return_value=''):
                 with self.assertRaisesRegex(RuntimeError,'tree changed'):deploy.assert_unchanged(Path('/x'),'sha',{},tree,before)
                 deploy.assert_unchanged(Path('/x'),'sha',{},tree,deploy.tree_manifest(tree))
 
     def test_head_move_or_dirty_checkout_aborts(self):
         with tempfile.TemporaryDirectory() as directory:
             tree=Path(directory);manifest=deploy.tree_manifest(tree)
-            with mock.patch.object(deploy,'resolve_commit',return_value='moved'),mock.patch.object(deploy,'git',return_value=''):
+            with mock.patch.object(deploy,'head_commit',return_value='moved'),mock.patch.object(deploy,'git',return_value=''):
                 with self.assertRaisesRegex(RuntimeError,'HEAD changed'):deploy.assert_unchanged(Path('/x'),'sha',{},tree,manifest)
-            with mock.patch.object(deploy,'resolve_commit',return_value='sha'),mock.patch.object(deploy,'git',return_value=' M boat-chat/app.py'):
+            with mock.patch.object(deploy,'head_commit',return_value='sha'),mock.patch.object(deploy,'git',return_value=' M boat-chat/app.py'):
                 with self.assertRaisesRegex(RuntimeError,'dirty'):deploy.assert_unchanged(Path('/x'),'sha',{},tree,manifest)
+
+
+@unittest.skipUnless(shutil.which('ssh-keygen'),'ssh-keygen required')
+class MirrorSignatureTests(unittest.TestCase):
+    """End-to-end: a real SSH signature is verified inside the root-owned mirror."""
+    def test_signed_commit_verifies_and_foreign_signer_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory);repo=base/'repo';repo.mkdir()
+            for name in ['good','other']:
+                subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-C','t','-f',str(base/name)],check=True)
+            (repo/'boat-chat').mkdir();(repo/'boat-chat/app.py').write_text('x\n')
+            run_git(repo,'init','-q');run_git(repo,'add','-A')
+            run_git(repo,'-c','gpg.format=ssh','-c','user.signingkey='+str(base/'good.pub'),'commit','-q','-S','-m','signed')
+            sha=run_git(repo,'rev-parse','HEAD')
+            def signers(name):
+                path=base/('signers-'+name);path.write_text('t@example.invalid namespaces="git" '+(base/(name+'.pub')).read_text());return path
+            mirror=base/'mirror'
+            trust=deploy.make_trust(allowed_signers=signers('good'))
+            deploy.ensure_mirror(mirror,trust);deploy.mirror_fetch(mirror,trust,repo,'checkout')
+            self.assertTrue(deploy.commit_is_verified(mirror,sha,trust))
+            self.assertEqual(deploy.require_verified(mirror,sha,False,trust),sha)
+            wrong=deploy.make_trust(allowed_signers=signers('other'))
+            self.assertFalse(deploy.commit_is_verified(mirror,sha,wrong))
+            with self.assertRaisesRegex(RuntimeError,'unverified'):deploy.require_verified(mirror,sha,False,wrong)
 
 
 class PrivacyTests(unittest.TestCase):
