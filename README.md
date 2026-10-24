@@ -1034,6 +1034,14 @@ info-level findings) on the shell scripts it lists, and they currently pass
 with no findings. The style `A && B || handler` is avoided (SC2015); use
 `if ! { A && B; }; then ... fi` instead.
 
+Root-controlled test fixtures (`tests/test-offline-install.sh`,
+`tests/test-update-launcher.sh`) are created under `/usr/local/share/vs-test`,
+not `/opt`: the product refuses root-used paths whose chain is not root-owned
+and group/world-writable-free, and GitHub runners ship `/opt` as mode 0777. The
+tests verify the whole base chain is root-controlled and fail clearly otherwise;
+the product check is unchanged. The directory is left empty after a run and can
+be removed with `sudo rmdir /usr/local/share/vs-test`.
+
 ```bash
 tests/test-distribution.sh
 sudo tests/test-lifecycle.sh

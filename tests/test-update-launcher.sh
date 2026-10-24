@@ -7,8 +7,21 @@ set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
-# /tmp is world-writable, so root-controlled fixtures need a root-owned base.
-TEST_ROOT=$(mktemp -d -p /opt vs-update-launcher.XXXXXX)
+# /tmp and (on GitHub runners) /opt are world-writable, so root-controlled
+# fixtures need a base whose whole chain is root-owned and not group/world-writable.
+TEST_BASE=/usr/local/share/vs-test
+install -d -m 0755 -o root -g root "$TEST_BASE"
+_chain=$(realpath "$TEST_BASE")
+while :; do
+    read -r _uid _mode < <(stat -c '%u %a' "$_chain")
+    if [ "$_uid" != 0 ] || [ $(( 0$_mode & 0022 )) -ne 0 ]; then
+        echo "test base $_chain is not root-controlled (uid $_uid, mode $_mode)" >&2
+        exit 1
+    fi
+    [ "$_chain" = / ] && break
+    _chain=$(dirname "$_chain")
+done
+TEST_ROOT=$(mktemp -d -p "$TEST_BASE" vs-update-launcher.XXXXXX)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 chmod 0755 "$TEST_ROOT"
 SYSTEM_ROOT="$TEST_ROOT/sys"
