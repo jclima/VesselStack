@@ -1445,7 +1445,14 @@ ownership: containers use different internal user IDs.
 
 The `displays-esphome-config` CI job pulls the image pinned in
 `displays/esphome/IMAGE` and runs `tests/test-displays-esphome-config.sh` on every
-push and pull request. GitHub Actions uses `actions/checkout@v6`, which runs on Node.js 24 and keeps
+push and pull request. That script runs the containers with the same hardening
+flags `displays/firmware.py` uses (`--cap-drop ALL`, `no-new-privileges`), once
+with the flash flags (project mounted read-only, tmpfs scratch), and fails if
+the pinned image's `esphome upload --help` no longer lists `--file`, which
+`display flash` depends on, so an image bump that drops it cannot go unnoticed.
+`tests/test_displays_render.py` also checks that the topics the generated YAML
+publishes and subscribes to are permitted by the display ACL and that nothing
+else can publish under its MQTT prefix. GitHub Actions uses `actions/checkout@v6`, which runs on Node.js 24 and keeps
 persisted checkout credentials outside the repository Git configuration.
 External registry manifest checks retry short transport failures three times;
 missing Linux ARM64 support still fails the release gate.

@@ -3,6 +3,8 @@
 # pages, both layouts, Home Assistant API, hostile labels and a Wi-Fi password full
 # of substitution syntax) and validates each with the pinned ESPHome image:
 #   docker run ... <pinned image> config /config/<id>.yaml
+# The containers run with the same hardening flags firmware.py uses (CONTAINER_FLAGS), and
+# one extra check runs the config with the flash flags (read-only project, tmpfs scratch).
 # Needs Docker and network access for the first image pull (about 1.2 GB).
 
 set -euo pipefail
@@ -16,6 +18,27 @@ case "$IMAGE" in
 esac
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
+
+# The flags firmware.py really passes, so a change there is exercised here.
+read_flags() {  # portable (no mapfile): one flag per line from firmware.py
+    python3 -I -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/displays")
+import firmware
+print("\n".join(getattr(firmware, sys.argv[2])))
+' "$REPO_ROOT" "$1"
+}
+CONTAINER_FLAGS=()
+while IFS= read -r flag; do CONTAINER_FLAGS+=("$flag"); done < <(read_flags CONTAINER_FLAGS)
+UPLOAD_SCRATCH_FLAGS=()
+while IFS= read -r flag; do UPLOAD_SCRATCH_FLAGS+=("$flag"); done < <(read_flags UPLOAD_SCRATCH_FLAGS)
+[ "${#CONTAINER_FLAGS[@]}" -ge 4 ] || { echo "could not read CONTAINER_FLAGS from displays/firmware.py" >&2; exit 1; }
+
+# flash relies on 'esphome upload --file'; fail here if an image bump drops it.
+if ! docker run --rm "${CONTAINER_FLAGS[@]}" "$IMAGE" upload --help | grep -q -- '--file'; then
+    echo "the pinned ESPHome image no longer supports 'esphome upload --file'" >&2
+    exit 1
+fi
 
 python3 -I - "$REPO_ROOT" "$WORK" <<'PY'
 import copy, json, sys
@@ -68,7 +91,7 @@ fail=0
 check() {
     local variant=$1 display=$2 dir="$WORK/$1/build/displays/$2/project"
     echo "== esphome config: $variant/$display"
-    if ! docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$dir":/config "$IMAGE" \
+    if ! docker run --rm "${CONTAINER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$dir":/config "$IMAGE" \
             config --show-secrets /config/"$display".yaml > "$WORK/$variant-$display.log" 2>&1; then
         sed -n '1,60p' "$WORK/$variant-$display.log" >&2
         fail=1
@@ -82,6 +105,16 @@ check() {
     fi
 }
 check example helm
+# The flash container's view: project read-only, scratch on tmpfs, same hardening flags.
+echo "== esphome config (flash flags): example/helm"
+if ! docker run --rm "${CONTAINER_FLAGS[@]}" "${UPLOAD_SCRATCH_FLAGS[@]}" \
+        -v "$WORK/example/build/displays/helm/project":/config:ro "$IMAGE" \
+        config /config/helm.yaml > "$WORK/flash-flags.log" 2>&1 \
+        || ! grep -q 'Configuration is valid' "$WORK/flash-flags.log"; then
+    cat "$WORK/flash-flags.log" >&2
+    echo "config failed with the flash container flags" >&2
+    fail=1
+fi
 check complex helm
 check complex aux
 

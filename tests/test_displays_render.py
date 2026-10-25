@@ -458,6 +458,95 @@ class BuildDirectory(Base):
             render.render(self.ctx(), "ghost", allow_missing_wifi=True)
 
 
+class AclConsistency(Base):
+    """What the generated firmware publishes and subscribes to must fit the display ACL."""
+
+    SECTIONS = ("birth_message", "will_message", "on_message", "on_json_message")
+
+    @staticmethod
+    def matches(pattern, topic):
+        """Mosquitto topic filter semantics for a concrete topic."""
+        p, t = pattern.split("/"), topic.split("/")
+        for index, part in enumerate(p):
+            if part == "#":
+                return True
+            if index >= len(t) or (part != "+" and part != t[index]):
+                return False
+        return len(p) == len(t)
+
+    def acl_rules(self, user):
+        accounts = [{"role": "display", "user": user, "password": "x"}]
+        rules = {"read": [], "write": []}
+        for line in mqtt_auth.render_acl(accounts).splitlines():
+            if line.startswith("topic "):
+                _t, mode, topic = line.split(" ", 2)
+                rules[mode].append(topic)
+        return rules
+
+    def project_texts(self, home_assistant_api=False):
+        def mutate(cfg):
+            multipage(cfg)
+            cfg["displays"]["helm"]["home_assistant_api"] = home_assistant_api
+        self.set_config(mutate)
+        rendered = self.collect()
+        package = REGISTRY["boards"][BOARD]["esphome_package"]
+        return [rendered.files["helm/helm.yaml"].decode(),
+                rendered.files["helm/app/vesselstack.yaml"].decode(),
+                rendered.files[f"helm/{package}"].decode()]
+
+    def topics(self, texts):
+        user = mqtt_auth.display_username("helm")
+        found, section = [], None
+        for text in texts:
+            text = text.replace("${mqtt_username}", user)
+            for line in text.splitlines():
+                stripped = line.strip().rstrip(":")
+                if stripped.split(":")[0] in self.SECTIONS:
+                    section = stripped.split(":")[0]
+                match = re.match(r"^\s*-?\s*topic:\s*(\S+)\s*$", line)
+                if match:
+                    found.append((section, match.group(1)))
+        return found
+
+    def test_published_and_subscribed_topics_are_permitted(self):
+        for api in (False, True):
+            texts = self.project_texts(api)
+            user = mqtt_auth.display_username("helm")
+            rules = self.acl_rules(user)
+            found = self.topics(texts)
+            published = {t for s, t in found if s in ("birth_message", "will_message")}
+            subscribed = {t for s, t in found if s in ("on_message", "on_json_message")}
+            # exactly one published topic: the display's own status (birth and will)
+            self.assertEqual(published, {f"vesselstack/v1/displays/{user}/status"})
+            self.assertEqual(len([1 for s, _ in found if s in ("birth_message", "will_message")]), 2)
+            for topic in published:
+                self.assertTrue(any(self.matches(r, topic) for r in rules["write"]), topic)
+            self.assertTrue(subscribed)
+            for topic in subscribed:
+                self.assertTrue(any(self.matches(r, topic) for r in rules["read"]), topic)
+                self.assertFalse(any(self.matches(r, topic) for r in rules["write"]), topic)
+            # the ACL grants nothing beyond what the firmware uses for writing
+            self.assertEqual(rules["write"], [f"vesselstack/v1/displays/{user}/status"])
+
+    def test_nothing_else_can_publish_under_the_prefix(self):
+        for api in (False, True):
+            joined = "\n".join(self.project_texts(api))
+            self.assertIn("log_topic: null", joined)
+            self.assertIn("discovery: false", joined)
+            self.assertIn("discover_ip: false", joined)
+            self.assertNotIn("mqtt.publish", joined)
+            self.assertNotIn("mqtt_subscribe", joined)
+            self.assertNotIn("shutdown_message", joined)
+            # entities that ESPHome would publish state for must not exist or must be internal
+            for key in re.findall(r"(?m)^([a-z_]+):", joined):
+                self.assertIn(key, {"substitutions", "esphome", "packages", "globals", "font",
+                                    "mqtt", "script", "interval", "lvgl", "wifi", "ota",
+                                    "logger", "psram", "spi", "display", "touchscreen",
+                                    "output", "light", "api"}, key)
+            for block in re.split(r"(?m)^light:", joined)[1:]:
+                self.assertIn("internal: true", block.split("\n\n")[0])
+
+
 class Export(Base):
     def archive(self, **kw):
         stream = io.BytesIO()

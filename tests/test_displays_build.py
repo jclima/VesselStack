@@ -264,6 +264,32 @@ class BuildTests(FirmwareBase):
             self.build()
         self.assertFalse((self.project() / "firmware").exists())
 
+    def test_fifo_planted_at_an_artifact_path_is_refused_without_hanging(self):
+        import signal
+        original = self.docker.stream
+
+        def stream(argv):
+            status = original(argv)
+            mount = next(a for a in argv if a.endswith(":/config")).rsplit(":", 1)[0]
+            target = Path(mount) / ".esphome" / "build" / "vs-helm" / "build" / "firmware.ota.bin"
+            target.unlink()
+            os.mkfifo(target)
+            return status
+        self.docker.stream = stream
+
+        def timed_out(*_):
+            raise AssertionError("build hung on a FIFO")
+        previous = signal.signal(signal.SIGALRM, timed_out)
+        signal.alarm(20)
+        try:
+            with self.assertRaises(render.RenderError) as caught:
+                self.build()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertFalse((self.project() / "firmware").exists())
+
     def test_pull_notice_only_when_image_missing(self):
         self.build()
         self.assertFalse(any("not present locally" in m for m in self.messages if isinstance(m, str)))
