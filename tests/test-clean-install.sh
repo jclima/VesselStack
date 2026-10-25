@@ -547,7 +547,7 @@ sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$X_APP\"|" \
     -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$X_DATA\"|" \
     -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/x-backups\"|" "$CONFIG" > "$X_CONFIG"
 printf 'DISPLAYS_ENABLE="true"\n' >> "$X_CONFIG"
-# A release-1.3.0 style install left a single-file mosquitto.conf behind.
+# A release-0.3.0 style install left a single-file mosquitto.conf behind.
 install -d -m 0755 "$X_APP/config"
 printf 'legacy-marker\n' > "$X_APP/config/mosquitto.conf"
 chmod 0640 "$X_APP/config/mosquitto.conf"

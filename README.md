@@ -728,7 +728,7 @@ out of it. Rollback: `chown -R` is not needed; reinstalling the previous release
 makes the data root service-owned again, and restoring a backup keeps recorded
 owners.
 
-Security layout (1.3.x hardening): the installed application code, its Python
+Security layout (0.3.x hardening): the installed application code, its Python
 virtualenv and the generated `boat_facts.json` are owned by `root` and are not
 writable by the service account (`boat_facts.json` is `root:SERVICE 0640`).
 Everything Boat Chat writes at runtime (memory/session database, power database,
@@ -1001,7 +1001,7 @@ Operational notes:
   "refusing to use ... symbolic link" or "group or world writable" means the
   auth directory was tampered with: inspect and remove it, then re-run.
 - Verify the upgrade path with `sudo tests/test-mosquitto-upgrade.sh`: a
-  release-1.3.0 broker (single-file conf, legacy passwords, no ACL) must
+  release-0.3.0 broker (single-file conf, legacy passwords, no ACL) must
   survive the new render plus `docker restart`, and only the container
   recreated from the real `compose.yml` mounts enforces the ACL.
 - `tests/test-displays-envfile-systemd.sh` boots systemd in a privileged

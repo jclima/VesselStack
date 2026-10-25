@@ -1,7 +1,7 @@
 #!/bin/bash
 # Upgrade-shaped Docker test for the Mosquitto configuration move.
 #
-# A release-1.3.0 broker (single-file bind mount of config/mosquitto.conf, no ACL,
+# A release-0.3.0 broker (single-file bind mount of config/mosquitto.conf, no ACL,
 # legacy passwords in the broker data directory) is running. The new release
 # renders its files WITHOUT recreating the container (what a Control Panel Apply
 # or "install.sh" without --start does). The old container must survive a
@@ -79,7 +79,7 @@ PY
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE" >/dev/null
 docker network create "$NETWORK" >/dev/null
 
-# --- 1. The release-1.3.0 broker -------------------------------------------------
+# --- 1. The release-0.3.0 broker -------------------------------------------------
 install -d -m 0755 "$ROOT/config"
 install -d -m 0750 "$DATA" "$PDIR"
 cat > "$ROOT/config/mosquitto.conf" <<'CONF'
@@ -90,7 +90,7 @@ allow_anonymous false
 password_file /mosquitto/data/passwords
 CONF
 chmod 0644 "$ROOT/config/mosquitto.conf"
-# Exactly how the 1.3.0 installer created the administrator account.
+# Exactly how the 0.3.0 installer created the administrator account.
 docker run --rm -v "$PDIR:/mosquitto/data" "$IMAGE" mosquitto_passwd -b -c \
     /mosquitto/data/passwords "$ADMIN_USER" "$ADMIN_PASS" >/dev/null 2>&1
 docker run --rm -v "$PDIR:/mosquitto/data" "$IMAGE" mosquitto_passwd -b \
