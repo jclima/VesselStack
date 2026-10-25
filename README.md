@@ -672,12 +672,14 @@ the MQTT topic/payload and freshness logic, the board registry, the MQTT
 account/ACL provisioning (`displayctl.py sync-mqtt`), the **device lifecycle
 commands** (`vesselstackctl display list|add|remove|rotate|wifi|status`), the
 **SignalK-to-MQTT bridge service** and the **ESPHome project generator**
-(`vesselstackctl display render|export`, see [Firmware: generate, build and
+(`vesselstackctl display render|export|build|flash`, see [Firmware: generate, build and
 flash](#firmware-generate-build-and-flash)) exist today (`displays/`). With
 `DISPLAYS_ENABLE=true` the bridge publishes your configured instruments to
 Mosquitto. The generated firmware config validates and compiles but has not yet
-run on real display hardware, and building or flashing on the Pi itself is not
-available (compile on a laptop). The always-on Mosquitto ACL does affect existing installations
+run on real display hardware. Building and flashing on the Pi is optional
+(`vesselstackctl display build|flash`, see [Building and flashing on the
+Pi](#building-and-flashing-on-the-pi)); building on a laptop remains the
+primary documented path. The always-on Mosquitto ACL does affect existing installations
 (see [MQTT access control](#mqtt-access-control)). `displays/` is copied to
 `$VESSELSTACK_ROOT/displays` by the installer.
 
@@ -823,6 +825,8 @@ sudo vesselstackctl display remove helm --yes
 | `remove ID --yes` | Deletes the display from `displays.json` and its entry from `displays.secrets.json`, then syncs: the broker reload disconnects the connected device and refuses it afterwards. Without `--yes` it refuses. Adding the same id again generates new credentials. The Wi-Fi block and other displays are untouched. |
 | `rotate ID` | Regenerates every generated secret of that display (the MQTT password, the OTA password and the Home Assistant API encryption key), then syncs. Other displays are untouched. The device is refused until it is **reflashed** (over USB) with the new credentials. |
 | `render ID`, `export ID` | Generate the ESPHome project for a display; see [Firmware: generate, build and flash](#firmware-generate-build-and-flash). Root. |
+| `build ID` | Optional. Renders, then compiles the firmware on this machine in a one-shot container of the pinned ESPHome image and stores it with a manifest; see [Building and flashing on the Pi](#building-and-flashing-on-the-pi). Root. |
+| `flash ID (--serial DEVICE \| --ota HOST) [--previous]` | Optional. Uploads the stored firmware (never compiles) over USB serial or Wi-Fi; `--previous` rolls back. Root. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it. Nothing is echoed. |
 | `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the SignalK link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
@@ -869,8 +873,10 @@ restore `config/displays.json` and `config/displays.secrets.json` from a
 `vesselstackctl display render ID` and `vesselstackctl display export ID`
 generate a complete, validated ESPHome project for one display from
 `displays.json`, the board registry and the stored secrets. Compiling and
-flashing happen on a laptop (building on the Pi is planned for a later release;
-nothing here adds a Docker Compose profile or a service).
+flashing are normally done on a laptop (below). `vesselstackctl display build`
+and `flash` can do both on the Pi instead ([Building and flashing on the
+Pi](#building-and-flashing-on-the-pi)); neither adds a Docker Compose profile
+or a service, so `compose up` can never start ESPHome.
 
 ```bash
 sudo vesselstackctl display wifi                       # once, shared by all displays
@@ -909,9 +915,12 @@ Where files live:
 | --- | --- | --- | --- |
 | `$VESSELSTACK_ROOT/build/` and `build/displays/` | `root:root` | `0700` | Deliberately **not** under `$VESSELSTACK_DATA` (service-user owned: root writing there is a symlink hazard). Created and swapped with directory-relative, no-follow operations; a symlink anywhere in the path is refused. |
 | `build/displays/ID/` | `root:root` | dirs `0700`, files `0600` | Self-contained project, including `secrets.yaml`. Rendering again keeps the previous project as `ID.prev` (one generation) for rollback. |
+| `build/displays/ID/firmware/` and `firmware.prev/` | `root:root` | dirs `0700`, files `0600` | Only after `display build`: `firmware.factory.bin`, `firmware.ota.bin` and `manifest.json` of the newest and the previous build. Rendering again carries both directories over into the new project. |
 
-The build tree is excluded from `vesselstackctl backup` (it is regenerable from
-`config/`, and contains secrets) and from the public tree, and
+The build tree, including any stored firmware, is excluded from `vesselstackctl
+backup` (it is regenerable from `config/`, and contains secrets; compiled
+firmware embeds the Wi-Fi, MQTT and OTA secrets, so it is as sensitive as the
+archive below) and from the public tree, and
 `uninstall --purge-data` removes it with `$VESSELSTACK_ROOT`. Treat an export
 archive like a password: it contains the Wi-Fi password and the display's MQTT,
 OTA and API secrets. `export` prints a warning to stderr; move archives over SSH
@@ -961,8 +970,99 @@ docker run --rm -v "$PWD":/config -v vesselstack-esphome-cache:/cache \
   `secrets.yaml`). `rotate` changes the OTA, MQTT and API secrets in the Pi's
   files while the display keeps the old ones: reflash over USB after a rotate.
 - **Rollback:** reflash a previous project (`ID.prev`, an older export, or a
-  firmware binary you kept). A display refused by the broker (after `rotate` or
+  firmware binary you kept), or on the Pi `display flash ID ... --previous`
+  (see [Building and flashing on the Pi](#building-and-flashing-on-the-pi)). A display refused by the broker (after `rotate` or
   `remove`) or on changed Wi-Fi credentials always needs a USB reflash.
+
+#### Building and flashing on the Pi
+
+Building on the Pi is **optional**. Prefer the laptop export when you have one:
+it is faster, needs no extra disk on the boat computer, and Docker Desktop on
+macOS or Windows is fine for compiling. Use the Pi when there is no laptop,
+when you want one-command rebuilds after editing `displays.json`, or to push
+OTA updates from the boat network.
+
+```bash
+sudo vesselstackctl display build helm                  # render + compile, prints elapsed time
+sudo vesselstackctl display flash helm --serial /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX-if00
+sudo vesselstackctl display flash helm --ota 192.0.2.50
+sudo vesselstackctl display flash helm --ota helm.local --previous   # roll back to the previous build
+```
+
+| Command | What it does |
+| --- | --- |
+| `build ID` | Root. Renders the project exactly like `render` (so it fails with the same message if Wi-Fi is not configured), checks free disk space, then runs **one** `docker run --rm` container of the pinned image (`displays/esphome/IMAGE`) with `esphome compile`. The project directory is mounted at `/config` and the named volume `vesselstack-esphome-cache` at `/cache` (toolchain cache). Compiler output streams to the terminal. On success it stores `firmware.factory.bin` and `firmware.ota.bin` plus `manifest.json` in `build/displays/ID/firmware/` (directory 0700, files 0600), moves the previous `firmware/` to `firmware.prev/` (exactly one previous build is kept), removes the roughly 600 MB scratch tree `.esphome/`, and prints the elapsed time. If the image is not present it is pulled first (about 250 MB download, 1.2 GB on disk; a note is printed). A failed compile leaves the stored firmware untouched. |
+| `flash ID --serial DEVICE` | Root. Verifies the stored `firmware.factory.bin` against `manifest.json` (sha256 and size), then runs a one-shot container with `--device DEVICE` and `esphome upload /config/ID.yaml --device DEVICE --file /config/firmware/firmware.factory.bin`. Does not compile and never pulls the image. |
+| `flash ID --ota HOST` | Root. Verifies the stored `firmware.ota.bin` the same way, then runs a one-shot container with `--network host` and `esphome upload ... --device HOST --file /config/firmware/firmware.ota.bin`. The OTA password is read by ESPHome from `secrets.yaml` inside the container; it is never on a command line. |
+| `flash ... --previous` | Flashes `firmware.prev/` instead (verified against its own manifest). Refused when there is no previous build. |
+
+How the flash is done, and why it flashes exactly the recorded bytes: ESPHome
+2026.10.0 `upload` accepts `--file` (`esphome/__main__.py`, parser option
+`--file`, "Manually specify the binary file to upload"). Over serial,
+`upload_using_esptool` then writes that file at offset `0x0` with `esptool
+write-flash`, so the **factory image** (bootloader, partition table and
+application) is written, which is what a first flash or a recovery needs. Over
+the air, `_upload_via_native_api` uploads `args.file` instead of the build
+output, so the **OTA image** (application only) is sent. In both cases ESPHome
+still loads `/config/ID.yaml` and `secrets.yaml` to validate the
+configuration (and, for OTA, to read the password and port), but it does not
+compile and does not look at `.esphome/`. Before starting the container,
+`flash` reads the image without following symbolic links and refuses to continue
+unless its sha256 and size match `manifest.json`.
+
+`manifest.json` records `image` and `image_digest` (the pinned ESPHome image),
+`esphome_version`, `vesselstack_version`, `device_name`, `source_sha256` (a hash
+of the rendered project without `secrets.yaml` and `README.txt`, so it changes
+when the configuration changes but never depends on a secret), the sha256 and
+size of both images and `built_at_utc`. It contains no secrets.
+
+Requirements and limits:
+
+- **Disk.** About 2 GB for the toolchain cache (the `vesselstack-esphome-cache`
+  volume, created by the first build), about 1.2 GB for the ESPHome image, and
+  about 600 MB of scratch space per build (removed afterwards; the stored
+  firmware is about 1.1 MB per image). `build` refuses to start unless the
+  filesystem holding Docker's data directory (`docker info` `DockerRootDir`, else
+  `/var/lib/docker`) has at least 3 GB free for a first build (cache volume
+  missing) or 1 GB otherwise.
+- **Time (estimates).** About 10-15 minutes for the first build on a Raspberry
+  Pi 5 (image pull, toolchain download, full compile) and 3-6 minutes with a warm
+  cache. These are estimates for a Pi 5, not measurements; the laptop figures
+  above (measured) are about 4 minutes cold and 2 minutes warm. A Pi 4 is
+  slower.
+- **Serial device.** DEVICE must be an absolute path under `/dev` that is a
+  character device named `/dev/tty*` (for example `/dev/ttyACM0`), or a symbolic
+  link under `/dev/serial/by-id/` that resolves to one (preferred: the name
+  survives re-plugging). Any other symbolic link is refused. No service account
+  or `dialout` group membership is needed: `vesselstackctl` runs as root and the
+  container gets only that one device (`--device`). If the board is not
+  detected, hold BOOT while tapping RESET to enter download mode.
+- **OTA.** HOST is an IP address or an RFC 1123 host name (no URL, port or
+  path). The display must be powered, on Wi-Fi and reachable from the Pi on the
+  LAN. OTA uses the OTA password in the *current* `secrets.yaml`, so after
+  `display rotate` or changed Wi-Fi credentials the running firmware no longer
+  matches: flash over USB.
+- **Rollback.** `flash ID ... --previous` re-sends the previous build. OTA
+  rollback works only while the OTA password in `secrets.yaml` is the one that
+  build was compiled with; serial always works. Anything older than one build
+  needs an earlier export or a rebuild.
+- **Security.** The container runs as root inside Docker (the image default) with
+  all capabilities dropped and `no-new-privileges`; the compile container has no
+  device and the default network (it downloads the toolchain), the serial
+  container has only the device, and the OTA container uses the host network to
+  reach the LAN. Stored firmware embeds the Wi-Fi, MQTT and OTA secrets, hence
+  mode 0600 in a 0700 root-owned tree, and it is **not included in
+  `vesselstackctl backup`** (`build/` is excluded; it is reproducible with
+  `display build`).
+- **Cleanup.** `docker volume rm vesselstack-esphome-cache` frees the toolchain
+  cache (the next build downloads it again); `docker image rm` of the pinned image
+  frees the rest. `vesselstackctl uninstall` leaves the volume and says so;
+  `uninstall --purge-data --yes` also removes it (best effort).
+- **Rollback of this feature.** Stop using `build` and `flash`: nothing runs
+  unless you call them. Delete `$VESSELSTACK_ROOT/build/` and the volume to
+  reclaim the space; installed displays keep running whatever firmware they have.
+- The image version is the single pin described below; after bumping it, run
+  `display build` again, and re-flash at your own pace.
 
 Security and behaviour decisions:
 
@@ -1095,7 +1195,7 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); hardware unverified (see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; flashing is untested without hardware); hardware unverified (see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 
@@ -1264,6 +1364,11 @@ or file is removed:
 ```bash
 sudo vesselstackctl uninstall --purge-data --yes
 ```
+
+The optional display firmware build keeps its toolchain cache (about 2 GB) in the
+Docker volume `vesselstack-esphome-cache`. A plain `uninstall` leaves it and
+prints how to remove it (`docker volume rm vesselstack-esphome-cache`);
+`--purge-data --yes` removes it as well (best effort).
 
 ## Troubleshooting
 

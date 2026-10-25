@@ -21,9 +21,12 @@ Commands:
   version                      Print installed and command versions
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
-  display list|add|remove|rotate|wifi|status|render|export|validate|sync-mqtt [ARGUMENTS]
-                               Manage instrument displays and generate their
-                               ESPHome projects; see "vesselstackctl display --help"
+  display list|add|remove|rotate|wifi|status|render|export|build|flash|validate|sync-mqtt [ARGUMENTS]
+                               Manage instrument displays, generate their ESPHome
+                               projects and optionally build/flash firmware on this
+                               host (display build ID; display flash ID --serial
+                               DEVICE | --ota HOST [--previous]); see
+                               "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
@@ -452,9 +455,18 @@ uninstall_stack() {
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
         rm -rf -- /opt/vesselstack /opt/vesselstack-data
+        # The optional on-host firmware build keeps its toolchain cache (about
+        # 2 GB) in a named Docker volume; remove it best-effort.
+        if docker volume rm vesselstack-esphome-cache >/dev/null 2>&1; then
+            echo "Removed Docker volume vesselstack-esphome-cache"
+        fi
         echo "VesselStack services, configuration, and data removed"
     else
         echo "VesselStack services removed; data preserved at $VESSELSTACK_DATA"
+        if docker volume inspect vesselstack-esphome-cache >/dev/null 2>&1; then
+            echo "The ESPHome toolchain cache (Docker volume vesselstack-esphome-cache, about 2 GB) was left in place;" \
+                "remove it with: docker volume rm vesselstack-esphome-cache"
+        fi
     fi
 }
 

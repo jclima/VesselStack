@@ -410,12 +410,12 @@ class FlashSerialTests(ServerFlashBase):
 
 class FlashOtaTests(ServerFlashBase):
     def test_ota_uses_host_network_and_the_stored_ota_image(self):
-        self.flash(ota="192.168.1.50")
+        self.flash(ota="192.0.2.50")
         argv = self.docker.streamed[0]
         self.assertEqual(argv[argv.index("--network") + 1], "host")
         self.assertNotIn("--device", argv[:argv.index(IMAGE)])
         self.assertEqual(argv[argv.index(IMAGE) + 1:],
-                         ["upload", "/config/helm.yaml", "--device", "192.168.1.50",
+                         ["upload", "/config/helm.yaml", "--device", "192.0.2.50",
                           "--file", "/config/firmware/firmware.ota.bin"])
         joined = " ".join(argv)
         secrets = json.loads(self.secrets_path.read_text())
@@ -424,10 +424,10 @@ class FlashOtaTests(ServerFlashBase):
         self.assertNotIn("-e", argv)
 
     def test_host_validation(self):
-        for good in ("192.168.1.50", "helm", "vs-helm.local", "display-1.example.com",
-                     "fe80::1", "10.0.0.1", "a" * 63 + ".example"):
+        for good in ("192.0.2.50", "helm", "vs-helm.local", "display-1.example.com",
+                     "fe80::1", "192.0.2.1", "a" * 63 + ".example"):
             self.assertEqual(firmware.validate_host(good), good)
-        for bad in ("", "http://192.168.1.50", "192.168.1.50:6053", "host/path", "-oops",
+        for bad in ("", "http://192.0.2.50", "192.0.2.50:6053", "host/path", "-oops",
                     "--file=x", "a b", "host\n", "bad_name", "1.2.3", "300.1.1.1.1", "a." + "b" * 64,
                     "/dev/ttyACM0", "COM3", "MQTT", "mqttip", "BOOTSEL", "x" * 254, "ex ample.com",
                     "host;rm", "$(id)", "über.example"):
@@ -435,32 +435,32 @@ class FlashOtaTests(ServerFlashBase):
                 firmware.validate_host(bad)
             self.assertEqual(caught.exception.code, 2)
         with self.assertRaises(render.RenderError):
-            self.flash(ota="http://192.168.1.50")
+            self.flash(ota="http://192.0.2.50")
         self.assertEqual(self.docker.streamed, [])
 
     def test_ota_refuses_a_modified_image(self):
         (self.project() / "firmware" / "firmware.ota.bin").write_bytes(b"tampered")
         with self.assertRaises(render.RenderError):
-            self.flash(ota="192.168.1.50")
+            self.flash(ota="192.0.2.50")
         self.assertEqual(self.docker.streamed, [])
 
     def test_exactly_one_target_required(self):
         with self.assertRaises(render.RenderError):
             self.flash()
         with self.assertRaises(render.RenderError):
-            self.flash(ota="192.168.1.50", serial="/dev/ttyACM0")
+            self.flash(ota="192.0.2.50", serial="/dev/ttyACM0")
 
 
 class FlashCommonTests(ServerFlashBase):
     def test_previous_flashes_firmware_prev(self):
         with self.assertRaises(render.RenderError) as caught:
-            self.flash(ota="192.168.1.50", previous=True)
+            self.flash(ota="192.0.2.50", previous=True)
         self.assertIn("no previous firmware", str(caught.exception))
         self.assertEqual(self.docker.streamed, [])
         self.docker.ota = b"NEWER-OTA" * 20
         self.build()
         self.docker.streamed.clear()
-        self.flash(ota="192.168.1.50", previous=True)
+        self.flash(ota="192.0.2.50", previous=True)
         argv = self.docker.streamed[0]
         self.assertEqual(argv[-1], "/config/firmware.prev/firmware.ota.bin")
         nodes, links = self.fake_serial()
@@ -471,13 +471,13 @@ class FlashCommonTests(ServerFlashBase):
         self.build()
         (self.project() / "firmware.prev" / "firmware.ota.bin").write_bytes(b"bad")
         with self.assertRaises(render.RenderError):
-            self.flash(ota="192.168.1.50", previous=True)
+            self.flash(ota="192.0.2.50", previous=True)
 
     def test_missing_firmware_says_run_build_first(self):
         import shutil
         shutil.rmtree(self.project() / "firmware")
         with self.assertRaises(render.RenderError) as caught:
-            self.flash(ota="192.168.1.50")
+            self.flash(ota="192.0.2.50")
         self.assertIn("display build helm", str(caught.exception))
         self.assertEqual(self.docker.streamed, [])
 
@@ -486,17 +486,17 @@ class FlashCommonTests(ServerFlashBase):
         import shutil
         shutil.rmtree(shutil_root)
         with self.assertRaises(render.RenderError) as caught:
-            self.flash(ota="192.168.1.50")
+            self.flash(ota="192.0.2.50")
         self.assertIn("display build helm", str(caught.exception))
 
     def test_flash_never_pulls_and_needs_the_image_locally(self):
         self.docker.image_present = False
         with self.assertRaises(render.RenderError) as caught:
-            self.flash(ota="192.168.1.50")
+            self.flash(ota="192.0.2.50")
         self.assertIn("never pulls", str(caught.exception))
         self.assertEqual(self.docker.streamed, [])
         self.docker.image_present = True
-        self.flash(ota="192.168.1.50")
+        self.flash(ota="192.0.2.50")
         argv = self.docker.streamed[0]
         self.assertEqual(argv[argv.index("--pull") + 1], "never")
         self.assertFalse([a for a in self.docker.captured if a[:2] == ["docker", "pull"]])
@@ -504,10 +504,10 @@ class FlashCommonTests(ServerFlashBase):
     def test_corrupt_manifest_is_an_error(self):
         (self.project() / "firmware" / "manifest.json").write_text("{not json")
         with self.assertRaises(render.RenderError):
-            self.flash(ota="192.168.1.50")
+            self.flash(ota="192.0.2.50")
         (self.project() / "firmware" / "manifest.json").write_text('{"files": {}}')
         with self.assertRaises(render.RenderError):
-            self.flash(ota="192.168.1.50")
+            self.flash(ota="192.0.2.50")
 
 
 class CommandLineTests(FirmwareBase):
@@ -517,8 +517,8 @@ class CommandLineTests(FirmwareBase):
             parser.parse_args(["flash", "helm"])
         with self.assertRaises(SystemExit):
             parser.parse_args(["flash", "helm", "--serial", "/dev/ttyACM0", "--ota", "h"])
-        args = parser.parse_args(["flash", "helm", "--ota", "10.0.0.2", "--previous"])
-        self.assertEqual((args.ota, args.serial, args.previous), ("10.0.0.2", None, True))
+        args = parser.parse_args(["flash", "helm", "--ota", "192.0.2.2", "--previous"])
+        self.assertEqual((args.ota, args.serial, args.previous), ("192.0.2.2", None, True))
         self.assertEqual(parser.parse_args(["build", "helm"]).id, "helm")
 
     def test_exit_codes_for_usage_errors(self):

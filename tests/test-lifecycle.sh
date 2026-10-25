@@ -38,6 +38,8 @@ printf 'rebuildable\n' > "$APP_ROOT/displays/.venv/bin/python"
 printf 'cache\n' > "$APP_ROOT/displays/__pycache__/x.pyc"
 install -d -m 0700 "$APP_ROOT/build/displays/helm"
 printf 'wifi_password: secret\n' > "$APP_ROOT/build/displays/helm/secrets.yaml"
+install -d -m 0700 "$APP_ROOT/build/displays/helm/firmware"
+printf 'firmware with embedded credentials\n' > "$APP_ROOT/build/displays/helm/firmware/firmware.factory.bin"
 printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
@@ -207,7 +209,12 @@ if run_ctl uninstall --purge-data >/dev/null 2>&1; then
     exit 1
 fi
 test -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
-run_ctl uninstall >/dev/null
+uninstall_output=$(run_ctl uninstall)
+grep -q 'docker volume rm vesselstack-esphome-cache' <<<"$uninstall_output"
+if grep -q 'volume rm' "$FAKE_BIN/calls.log"; then
+    echo 'Plain uninstall removed the ESPHome cache volume' >&2
+    exit 1
+fi
 test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
 test -e "$DATA_ROOT/state.txt"
