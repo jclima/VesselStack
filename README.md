@@ -953,9 +953,9 @@ docker run --rm -v "$PWD":/config -v vesselstack-esphome-cache:/cache \
   `esphome run helm/helm.yaml` (first flash over USB). Alternatively upload the
   `firmware.factory.bin` that `compile` creates with <https://web.esphome.io>
   (Chrome or Edge). The first compile downloads the ESP-IDF toolchain (about
-  2 GB into the cache volume; allow 5-10 minutes); each display's build adds
+  2 GB into the cache volume; measured on a laptop: about 4 minutes cold, 2 minutes with a warm cache); each display's build adds
   about 600 MB under `.esphome/` in its project directory, and the firmware is
-  about 1.2 MB.
+  about 1.1 MB (13% of flash).
 - **Later updates over Wi-Fi (OTA):** `esphome upload helm.yaml --device
   <display-ip>` from the project directory (it uses the OTA password in
   `secrets.yaml`). `rotate` changes the OTA, MQTT and API secrets in the Pi's
@@ -1331,7 +1331,7 @@ tests/test-service-integration.sh
 sudo tests/test-displays-mosquitto.sh
 sudo tests/test-displays-bridge.sh
 tests/test-displays-esphome-config.sh   # renders projects and runs the pinned ESPHome "config" (Docker, ~1.2 GB image)
-tests/compile-display-firmware.sh       # optional, not in CI: full "esphome compile" (~2 GB cache, 5-10 min)
+tests/compile-display-firmware.sh       # optional, not in CI: full "esphome compile" (~2 GB cache, 2-5 min)
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
