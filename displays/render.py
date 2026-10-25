@@ -571,11 +571,22 @@ def _open_dir(parent_fd: int, name: str, label: str) -> int:
     return fd
 
 
-def write_project(ctx, rendered: Rendered) -> Path:
-    """Write the project into $ROOT/build/displays/<id>/ and return that path.
+PROJECT_DIR = "project"
+PROJECT_NEW = "project.new"
+PROJECT_PREV = "project.prev"
+# Everything the per-display directory legitimately holds in the current layout.
+# firmware/, firmware.prev/ and firmware.new/ belong to firmware.py and are never touched here.
+DISPLAY_DIR_ENTRIES = (PROJECT_DIR, PROJECT_NEW, PROJECT_PREV, "firmware", "firmware.prev",
+                       "firmware.new")
 
-    The tree is first written next to its final place as ``<id>.new`` and then
-    swapped in; the previous build stays as ``<id>.prev`` for rollback.
+
+def write_project(ctx, rendered: Rendered) -> Path:
+    """Write the ESPHome project into ``$ROOT/build/displays/<id>/project/`` and return that path.
+
+    The caller must hold the build lock (``build_lock``). The tree is first written next
+    to its final place as ``project.new`` and then swapped in; the previous project stays
+    as ``project.prev``. ``firmware/`` and ``firmware.prev/`` live beside ``project/`` and
+    are never touched, so rendering again cannot discard a finished build.
     """
     display_id = rendered.display_id
     root = ctx.root
@@ -589,27 +600,25 @@ def write_project(ctx, rendered: Rendered) -> Path:
         fds.append(build_fd)
         parent_fd = _open_dir(build_fd, "displays", str(root / BUILD_DIR_NAME / "displays"))
         fds.append(parent_fd)
-        final = root / BUILD_DIR_NAME / "displays" / display_id
-        new_name, prev_name = display_id + ".new", display_id + ".prev"
-        for stale in (new_name,):
-            _remove_tree(parent_fd, stale)
+        container = root / BUILD_DIR_NAME / "displays" / display_id
+        display_fd = _open_dir(parent_fd, display_id, str(container))
+        fds.append(display_fd)
+        migrate_legacy_layout(parent_fd, display_fd, display_id)
+        _remove_tree(display_fd, PROJECT_NEW)
         owner = mqtt_auth._owner((0, 0))
-        top_fd = _open_dir(parent_fd, new_name, str(final) + ".new")
+        top_fd = _open_dir(display_fd, PROJECT_NEW, str(container / PROJECT_NEW))
         fds.append(top_fd)
         try:
             _write_files(top_fd, rendered.files, display_id, owner)
         except BaseException:
-            _remove_tree(parent_fd, new_name)
+            _remove_tree(display_fd, PROJECT_NEW)
             raise
-        for fd in reversed(fds[3:]):
-            os.close(fd)
-        fds[3:] = []
-        _remove_tree(parent_fd, prev_name)
-        _carry_over_firmware(parent_fd, display_id, new_name)
-        if _exists(parent_fd, display_id):
-            os.rename(display_id, prev_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        os.rename(new_name, display_id, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        return final
+        os.close(fds.pop())
+        _remove_tree(display_fd, PROJECT_PREV)
+        if _exists(display_fd, PROJECT_DIR):
+            os.rename(PROJECT_DIR, PROJECT_PREV, src_dir_fd=display_fd, dst_dir_fd=display_fd)
+        os.rename(PROJECT_NEW, PROJECT_DIR, src_dir_fd=display_fd, dst_dir_fd=display_fd)
+        return container / PROJECT_DIR
     finally:
         for fd in fds:
             try:
@@ -618,34 +627,31 @@ def write_project(ctx, rendered: Rendered) -> Path:
                 pass
 
 
-CARRIED_DIRS = ("firmware", "firmware.prev")
+def migrate_legacy_layout(parent_fd: int, display_fd: int, display_id: str) -> bool:
+    """Move an old-layout build directory to the current one; return True if it migrated.
 
-
-def _carry_over_firmware(parent_fd: int, display_id: str, new_name: str) -> None:
-    """Move finished firmware builds (display build) from the old project into the new one.
-
-    Rendering replaces the whole project directory; the compiled images and their
-    manifests are not part of it and must survive, so they are renamed across.
+    Before, the project files sat directly in ``build/displays/<id>/`` next to
+    ``firmware/`` and ``firmware.prev/``, with ``<id>.new`` and ``<id>.prev`` as siblings.
+    ``firmware/`` and ``firmware.prev/`` already are where they belong, so they stay put
+    (nothing is copied or renamed, so a crash cannot lose them). Everything else in the
+    old directory, and the old siblings, is the superseded project with its plaintext
+    secrets: it is deleted and the caller renders the project again. ``<id>.yaml`` goes
+    last, so an interrupted migration is recognised and finished by the next run.
+    The caller must hold the build lock.
     """
-    try:
-        info = os.lstat(display_id, dir_fd=parent_fd)
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        return  # the swap below deals with (and replaces) anything unexpected
-    old_fd = os.open(display_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-    new_fd = os.open(new_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-    try:
-        for name in CARRIED_DIRS:
-            try:
-                entry = os.lstat(name, dir_fd=old_fd)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
-                os.rename(name, name, src_dir_fd=old_fd, dst_dir_fd=new_fd)
-    finally:
-        os.close(old_fd)
-        os.close(new_fd)
+    migrated = False
+    for stale in (f"{display_id}.new", f"{display_id}.prev"):
+        if _exists(parent_fd, stale):
+            _remove_tree(parent_fd, stale)
+            migrated = True
+    marker = f"{display_id}.yaml"
+    if _exists(display_fd, marker):
+        for name in sorted(os.listdir(display_fd)):
+            if name not in DISPLAY_DIR_ENTRIES and name != marker:
+                _remove_tree(display_fd, name)
+        _remove_tree(display_fd, marker)
+        migrated = True
+    return migrated
 
 
 def _exists(parent_fd: int, name: str) -> bool:

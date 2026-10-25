@@ -33,6 +33,6 @@ render.render(ctx, "helm", allow_missing_wifi=True, warn=lambda text: None)
 PY
 
 start=$(date +%s)
-docker run --rm -v "$WORK/build/displays/helm":/config -v "$CACHE":/cache "$IMAGE" compile /config/helm.yaml
+docker run --rm -v "$WORK/build/displays/helm/project":/config -v "$CACHE":/cache "$IMAGE" compile /config/helm.yaml
 echo "compile finished in $(( $(date +%s) - start )) s"
-ls -l "$WORK/build/displays/helm/.esphome/build/vs-helm/build/"*.bin 2>/dev/null || true
+ls -l "$WORK/build/displays/helm/project/.esphome/build/vs-helm/build/"*.bin 2>/dev/null || true

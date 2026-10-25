@@ -54,6 +54,8 @@ class FakeDocker:
         self.captured: list = []
         self.streamed: list = []
         self.upload_status = 0
+        self.uploaded: list = []  # bytes of the file mounted at /fw.bin, read during the call
+        self.staged_paths: list = []
 
     def capture(self, argv):
         self.captured.append(argv)
@@ -76,6 +78,11 @@ class FakeDocker:
                 (out / "firmware.ota.bin").write_bytes(self.ota)
                 (out / "vs-helm.bin").write_bytes(self.ota)
             return self.compile_status
+        staged = next(a for a in argv if a.endswith(":/fw.bin:ro")).rsplit(":/fw.bin", 1)[0]
+        self.staged_paths.append(staged)
+        self.staged_modes = (stat.S_IMODE(os.stat(Path(staged).parent).st_mode),
+                             stat.S_IMODE(os.stat(staged).st_mode))
+        self.uploaded.append(Path(staged).read_bytes())
         return self.upload_status
 
 
@@ -99,6 +106,10 @@ class FirmwareBase(Base):
 
     def project(self, display="helm"):
         return self.root / "build" / "displays" / display
+
+    def project_files(self, display="helm"):
+        """The ESPHome project directory (the only one mounted into a container)."""
+        return self.project(display) / "project"
 
     def fake_serial(self, name="ttyACM0", by_id=None):
         """Replace lstat/realpath with a tiny virtual /dev."""
@@ -126,7 +137,7 @@ class BuildTests(FirmwareBase):
         self.build()
         self.assertEqual(len(self.docker.streamed), 1)
         argv = self.docker.streamed[0]
-        project = str(self.project())
+        project = str(self.project_files())
         self.assertEqual(argv[:4], ["docker", "run", "--rm", "--pull"])
         self.assertEqual(argv[4], "missing")
         self.assertIn(f"{project}:/config", argv)
@@ -341,9 +352,10 @@ class FlashSerialTests(ServerFlashBase):
         self.assertNotIn("--network", argv)
         self.assertEqual(argv[argv.index(IMAGE) + 1:],
                          ["upload", "/config/helm.yaml", "--device", "/dev/ttyACM0",
-                          "--file", "/config/firmware/firmware.factory.bin"])
+                          "--file", "/fw.bin"])
         self.assertNotIn("compile", argv)
-        self.assertIn(f"{self.project()}:/config", argv)
+        self.assertIn(f"{self.project_files()}:/config:ro", argv)
+        self.assertEqual(self.docker.uploaded, [FACTORY_BYTES])
         self.assertEqual(len(self.docker.streamed), 1)
 
     def test_by_id_symlink_resolved_to_the_real_device(self):
@@ -408,6 +420,49 @@ class FlashSerialTests(ServerFlashBase):
         self.assertIn("exit status 2", str(caught.exception))
 
 
+class FlashStagingTests(ServerFlashBase):
+    def test_upload_reads_a_private_copy_that_is_removed_afterwards(self):
+        self.flash(ota="192.0.2.50")
+        staged = Path(self.docker.staged_paths[0])
+        self.assertEqual(staged.parent.parent, self.root / "build")  # not a shared /tmp
+        self.assertEqual(self.docker.staged_modes, (0o700, 0o600))
+        self.assertFalse(staged.parent.exists())
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+    def test_temp_dir_removed_when_the_upload_fails(self):
+        self.docker.upload_status = 1
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50")
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+    def test_stored_bytes_that_change_after_verification_are_not_what_is_mounted(self):
+        # flash() reads and verifies the stored file once and mounts a copy of THOSE bytes.
+        original = firmware.load_firmware
+
+        def load_then_tamper(dd, directory, name):
+            result = original(dd, directory, name)
+            (self.project() / "firmware" / name).write_bytes(b"TAMPERED")
+            return result
+
+        firmware.load_firmware = load_then_tamper
+        self.addCleanup(setattr, firmware, "load_firmware", original)
+        self.flash(ota="192.0.2.50")
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+
+    def test_staged_copy_with_wrong_digest_is_refused(self):
+        with self.assertRaises(render.RenderError):
+            with firmware.staged_firmware(self.ctx(), b"abc", "0" * 64):
+                self.fail("must not be reached")
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+    def test_old_layout_asks_for_a_render_first(self):
+        (self.project() / "helm.yaml").write_text("legacy")
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50")
+        self.assertIn("display render helm", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+
+
 class FlashOtaTests(ServerFlashBase):
     def test_ota_uses_host_network_and_the_stored_ota_image(self):
         self.flash(ota="192.0.2.50")
@@ -416,12 +471,18 @@ class FlashOtaTests(ServerFlashBase):
         self.assertNotIn("--device", argv[:argv.index(IMAGE)])
         self.assertEqual(argv[argv.index(IMAGE) + 1:],
                          ["upload", "/config/helm.yaml", "--device", "192.0.2.50",
-                          "--file", "/config/firmware/firmware.ota.bin"])
+                          "--file", "/fw.bin"])
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+        # the project is read-only; ESPHome's scratch space is tmpfs
+        self.assertIn(f"{self.project_files()}:/config:ro", argv)
+        self.assertIn("--tmpfs", argv)
+        self.assertNotIn("firmware", " ".join(a for a in argv if a.startswith("/config")))
         joined = " ".join(argv)
         secrets = json.loads(self.secrets_path.read_text())
         for secret in (secrets["displays"]["helm"]["ota_password"], MQTT_PW, "wifi-pass-123"):
             self.assertNotIn(secret, joined)
-        self.assertNotIn("-e", argv)
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-e"],
+                         ["ESPHOME_DATA_DIR=/tmp/esphome-data"])
 
     def test_host_validation(self):
         for good in ("192.0.2.50", "helm", "vs-helm.local", "display-1.example.com",
@@ -461,11 +522,10 @@ class FlashCommonTests(ServerFlashBase):
         self.build()
         self.docker.streamed.clear()
         self.flash(ota="192.0.2.50", previous=True)
-        argv = self.docker.streamed[0]
-        self.assertEqual(argv[-1], "/config/firmware.prev/firmware.ota.bin")
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])  # the OLD build, not NEWER-OTA
         nodes, links = self.fake_serial()
         self.flash(serial="/dev/ttyACM0", previous=True, **self.seam(nodes, links))
-        self.assertEqual(self.docker.streamed[1][-1], "/config/firmware.prev/firmware.factory.bin")
+        self.assertEqual(self.docker.uploaded[1], FACTORY_BYTES)
 
     def test_previous_is_verified_against_its_own_manifest(self):
         self.build()

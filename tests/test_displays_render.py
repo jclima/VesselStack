@@ -353,7 +353,7 @@ class BuildDirectory(Base):
 
     def test_tree_modes_and_contents(self):
         path = render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
-        self.assertEqual(path, self.build())
+        self.assertEqual(path, self.build() / "project")
         self.assertEqual(self.messages[-1], str(path))
         for directory, dirs, files in os.walk(self.root / "build"):
             self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700, directory)
@@ -367,11 +367,11 @@ class BuildDirectory(Base):
 
     def test_rerender_keeps_previous_build(self):
         render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
-        (self.build() / "marker").write_text("old")
+        (self.build() / "project" / "marker").write_text("old")
         render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
-        self.assertFalse((self.build() / "marker").exists())
-        self.assertEqual((self.build().parent / "helm.prev" / "marker").read_text(), "old")
-        self.assertFalse((self.build().parent / "helm.new").exists())
+        self.assertFalse((self.build() / "project" / "marker").exists())
+        self.assertEqual((self.build() / "project.prev" / "marker").read_text(), "old")
+        self.assertFalse((self.build() / "project.new").exists())
 
     def test_symlinked_build_directory_is_refused(self):
         target = Path(self._tmp.name) / "elsewhere"
@@ -391,17 +391,61 @@ class BuildDirectory(Base):
             render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
         self.assertEqual(list(target.iterdir()), [])
 
-    def test_symlinked_display_directory_is_replaced_not_followed(self):
+    def test_symlinked_display_directory_is_refused_not_followed(self):
         target = Path(self._tmp.name) / "victim"
         target.mkdir()
         (target / "keep").write_text("data")
         (self.root / "build" / "displays").mkdir(parents=True, mode=0o700)
         os.symlink(target, self.build())
-        os.symlink(target, self.build().parent / "helm.new")  # stale planted temp
-        render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
-        self.assertFalse(self.build().is_symlink())
+        with self.assertRaises(render.RenderError) as caught:
+            render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
+        self.assertIn("symbolic link", str(caught.exception))
         self.assertEqual([p.name for p in target.iterdir()], ["keep"])
-        self.assertTrue((self.build() / "helm.yaml").is_file())
+
+    def test_planted_project_new_symlink_is_unlinked_not_followed(self):
+        target = Path(self._tmp.name) / "victim"
+        target.mkdir()
+        (target / "keep").write_text("data")
+        (self.build()).mkdir(parents=True, mode=0o700)
+        os.symlink(target, self.build() / "project.new")  # stale planted temp
+        render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
+        self.assertEqual([p.name for p in target.iterdir()], ["keep"])
+        self.assertTrue((self.build() / "project" / "helm.yaml").is_file())
+
+    def test_render_never_touches_the_firmware_directories(self):
+        render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
+        for name in ("firmware", "firmware.prev", "firmware.new"):
+            (self.build() / name).mkdir(mode=0o700)
+            (self.build() / name / "manifest.json").write_text(name)
+        for _ in range(3):
+            render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
+        for name in ("firmware", "firmware.prev", "firmware.new"):
+            self.assertEqual((self.build() / name / "manifest.json").read_text(), name)
+        # nothing of the firmware ends up inside the mounted project
+        self.assertEqual(sorted(p.name for p in (self.build() / "project").iterdir()),
+                         ["README.txt", "app", "boards", "fonts", "helm.yaml", "secrets.yaml"])
+
+    def test_old_layout_is_migrated_keeping_firmware(self):
+        old = self.build()
+        (old / "firmware").mkdir(parents=True, mode=0o700)
+        (old / "firmware.prev").mkdir(mode=0o700)
+        (old / "firmware" / "manifest.json").write_text("new-build")
+        (old / "firmware.prev" / "manifest.json").write_text("older-build")
+        for leftover in (old, old.parent / "helm.new", old.parent / "helm.prev"):
+            leftover.mkdir(exist_ok=True, mode=0o700)
+            (leftover / "secrets.yaml").write_text("wifi_password: old")
+        (old / "helm.yaml").write_text("old: project")
+        (old / ".esphome").mkdir()
+        (old / ".esphome" / "big").write_text("scratch")
+        render.render(self.ctx(), "helm", allow_missing_wifi=True, warn=lambda t: None)
+        self.assertEqual((old / "firmware" / "manifest.json").read_text(), "new-build")
+        self.assertEqual((old / "firmware.prev" / "manifest.json").read_text(), "older-build")
+        self.assertFalse((old.parent / "helm.new").exists())
+        self.assertFalse((old.parent / "helm.prev").exists())
+        self.assertEqual(sorted(p.name for p in old.iterdir()),
+                         ["firmware", "firmware.prev", "project"])
+        self.assertNotIn("wifi_password: old", (old / "project" / "secrets.yaml").read_text())
+        self.assertFalse((old / "project.prev").exists())  # the old project was not carried over
 
     def test_requires_root_by_default(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -486,7 +530,8 @@ class Cli(Base):
     def test_render_prints_only_the_path_on_stdout(self):
         result = self.run_cli("render", "helm", "--allow-missing-wifi")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.decode().strip(), str(self.root / "build/displays/helm"))
+        self.assertEqual(result.stdout.decode().strip(),
+                         str(self.root / "build/displays/helm/project"))
         self.assertIn(b"mDNS", result.stderr)
 
     def test_placeholder_warning_without_wifi(self):

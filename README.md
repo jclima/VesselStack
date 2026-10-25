@@ -880,13 +880,13 @@ or a service, so `compose up` can never start ESPHome.
 
 ```bash
 sudo vesselstackctl display wifi                       # once, shared by all displays
-sudo vesselstackctl display render helm                # writes /opt/vesselstack/build/displays/helm/
+sudo vesselstackctl display render helm                # writes /opt/vesselstack/build/displays/helm/project/
 ssh pi 'sudo vesselstackctl display export helm --stdout' > helm.tar.gz   # laptop copy
 ```
 
 | Command | What it does |
 | --- | --- |
-| `render ID [--allow-missing-wifi]` | Root. Generates the project into `$VESSELSTACK_ROOT/build/displays/ID/` and prints that path. Fails with a clear message if the display, its MQTT password (run `sync-mqtt` first) or the Wi-Fi credentials are missing; `--allow-missing-wifi` writes placeholder Wi-Fi values and warns (for CI and golden tests only; never flash such a build). Missing per-display secrets (OTA password, API key) are generated and stored under the same lock as the other lifecycle commands. |
+| `render ID [--allow-missing-wifi]` | Root. Generates the project into `$VESSELSTACK_ROOT/build/displays/ID/project/` and prints that path. Fails with a clear message if the display, its MQTT password (run `sync-mqtt` first) or the Wi-Fi credentials are missing; `--allow-missing-wifi` writes placeholder Wi-Fi values and warns (for CI and golden tests only; never flash such a build). Missing per-display secrets (OTA password, API key) are generated and stored under the same lock as the other lifecycle commands. |
 | `export ID (--output FILE \| --stdout) [--allow-missing-wifi]` | Root. Renders, then writes a deterministic `tar.gz` (sorted entries, fixed mtime, uid/gid 0, modes 0700/0600) containing `ID/`: the device file `ID.yaml`, `secrets.yaml`, the board and app packages, the fonts and their license, and a short `README.txt` with the build and flash commands. `--output` creates FILE exclusively with mode 0600 and refuses an existing path or a symlink; `--stdout` refuses a terminal. Warnings go to stderr, so stdout carries only the archive. |
 
 `ID.yaml` is generated and holds no secrets. It composes `boards/<board>.yaml`
@@ -914,8 +914,10 @@ Where files live:
 | Path | Owner | Mode | Notes |
 | --- | --- | --- | --- |
 | `$VESSELSTACK_ROOT/build/` and `build/displays/` | `root:root` | `0700` | Deliberately **not** under `$VESSELSTACK_DATA` (service-user owned: root writing there is a symlink hazard). Created and swapped with directory-relative, no-follow operations; a symlink anywhere in the path is refused. Files the build container produced are read only after a regular-file check and with `O_NONBLOCK|O_NOFOLLOW`, so a FIFO planted at an artifact path is refused instead of hanging the build. |
-| `build/displays/ID/` | `root:root` | dirs `0700`, files `0600` | Self-contained project, including `secrets.yaml`. Rendering again keeps the previous project as `ID.prev` (one generation) for rollback. |
-| `build/displays/ID/firmware/` and `firmware.prev/` | `root:root` | dirs `0700`, files `0600` | Only after `display build`: `firmware.factory.bin`, `firmware.ota.bin` and `manifest.json` of the newest and the previous build. Rendering again carries both directories over into the new project. |
+| `build/displays/ID/project/` | `root:root` | dirs `0700`, files `0600` | The self-contained ESPHome project, including `secrets.yaml`, and the **only** directory ever mounted into a container (as `/config`). Rendering again keeps the previous project as `project.prev/` (one generation). |
+| `build/displays/ID/firmware/` and `firmware.prev/` | `root:root` | dirs `0700`, files `0600` | Only after `display build`: `firmware.factory.bin`, `firmware.ota.bin` and `manifest.json` of the newest and the previous build. They sit **beside** `project/`, never inside it and never mounted into a container, so a compromised build (the toolchain and components are downloaded into a persistent cache) cannot rewrite the stored images or their manifests, nor poison the `--previous` rollback. `render` replaces only `project/` and never touches these directories. |
+
+Upgrading from the earlier layout (project files directly in `build/displays/ID/`, with `ID.new` and `ID.prev` beside it): the next `render`, `export` or `build` of that display moves to the layout above. `firmware/` and `firmware.prev/` are already in the right place and are kept; the superseded project files (which contain plaintext secrets) and `ID.new`/`ID.prev` are deleted and the project is rendered again. `flash` refuses an old-layout directory and tells you to run `render` once. Rollback to the older layout is not supported; rebuild with `display build`.
 
 The build tree, including any stored firmware, is excluded from `vesselstackctl
 backup` (it is regenerable from `config/`, and contains secrets; compiled
@@ -967,12 +969,16 @@ docker run --rm -v "$PWD":/config -v vesselstack-esphome-cache:/cache \
   about 1.1 MB (13% of flash).
 - **Later updates over Wi-Fi (OTA):** `esphome upload helm.yaml --device
   <display-ip>` from the project directory (it uses the OTA password in
-  `secrets.yaml`). `rotate` changes the OTA, MQTT and API secrets in the Pi's
-  files while the display keeps the old ones: reflash over USB after a rotate.
-- **Rollback:** reflash a previous project (`ID.prev`, an older export, or a
+  `secrets.yaml`). The OTA password changes only with `rotate`, and the display
+  keeps the old one until it is reflashed: after a `rotate` (and a re-render,
+  export or rebuild) reflash over USB. Changed Wi-Fi credentials do not change
+  the OTA password, but the display cannot join the new network, so OTA cannot
+  reach it either: reflash over USB.
+- **Rollback:** reflash a previous project (`project.prev/`, an older export, or a
   firmware binary you kept), or on the Pi `display flash ID ... --previous`
   (see [Building and flashing on the Pi](#building-and-flashing-on-the-pi)). A display refused by the broker (after `rotate` or
-  `remove`) or on changed Wi-Fi credentials always needs a USB reflash.
+  `remove`) or on changed Wi-Fi credentials always needs a USB reflash (the display never reaches the
+  network or the broker, so there is nothing to update over the air).
 
 #### Building and flashing on the Pi
 
@@ -992,8 +998,8 @@ sudo vesselstackctl display flash helm --ota helm.local --previous   # roll back
 | Command | What it does |
 | --- | --- |
 | `build ID` | Root. Renders the project exactly like `render` (so it fails with the same message if Wi-Fi is not configured), checks free disk space, then runs **one** `docker run --rm` container of the pinned image (`displays/esphome/IMAGE`) with `esphome compile`. The project directory is mounted at `/config` and the named volume `vesselstack-esphome-cache` at `/cache` (toolchain cache). Compiler output streams to the terminal. On success it stores `firmware.factory.bin` and `firmware.ota.bin` plus `manifest.json` in `build/displays/ID/firmware/` (directory 0700, files 0600), moves the previous `firmware/` to `firmware.prev/` (exactly one previous build is kept), removes the roughly 600 MB scratch tree `.esphome/`, and prints the elapsed time. If the image is not present it is pulled first (about 250 MB download, 1.2 GB on disk; a note is printed). A failed compile leaves the stored firmware untouched. |
-| `flash ID --serial DEVICE` | Root. Verifies the stored `firmware.factory.bin` against `manifest.json` (sha256 and size), then runs a one-shot container with `--device DEVICE` and `esphome upload /config/ID.yaml --device DEVICE --file /config/firmware/firmware.factory.bin`. Does not compile and never pulls the image. |
-| `flash ID --ota HOST` | Root. Verifies the stored `firmware.ota.bin` the same way, then runs a one-shot container with `--network host` and `esphome upload ... --device HOST --file /config/firmware/firmware.ota.bin`. The OTA password is read by ESPHome from `secrets.yaml` inside the container; it is never on a command line. |
+| `flash ID --serial DEVICE` | Root. Verifies the stored `firmware.factory.bin` against `manifest.json` (sha256 and size), then copies exactly those verified bytes into a fresh root-only `0700` temporary directory under `$VESSELSTACK_ROOT/build/` (re-verifying the copy's sha256) and runs a one-shot container with `--device DEVICE` and `esphome upload /config/ID.yaml --device DEVICE --file /fw.bin`, where only that copy is mounted, read-only, at `/fw.bin`. The project is mounted read-only at `/config`; ESPHome's scratch space (`/tmp`, `/cache`) is tmpfs. The temporary directory is removed afterwards. Does not compile and never pulls the image. |
+| `flash ID --ota HOST` | Root. Verifies the stored `firmware.ota.bin` the same way, then runs a one-shot container with `--network host` and `esphome upload ... --device HOST --file /fw.bin` (the verified copy, as above). The OTA password is read by ESPHome from `secrets.yaml` inside the container; it is never on a command line. |
 | `flash ... --previous` | Flashes `firmware.prev/` instead (verified against its own manifest). Refused when there is no previous build. |
 
 How the flash is done, and why it flashes exactly the recorded bytes: ESPHome
@@ -1008,7 +1014,16 @@ still loads `/config/ID.yaml` and `secrets.yaml` to validate the
 configuration (and, for OTA, to read the password and port), but it does not
 compile and does not look at `.esphome/`. Before starting the container,
 `flash` reads the image without following symbolic links and refuses to continue
-unless its sha256 and size match `manifest.json`.
+unless its sha256 and size match `manifest.json`, and the container only ever
+sees a copy of those verified bytes, so a build or a swapped file cannot change
+what is uploaded after the check. Why `flash` can mount the project read-only:
+verified with the pinned image, `esphome upload --file` against an unreachable
+host with `-v project:/config:ro` still loads the configuration and reaches the
+connection attempt; its only complaints are about the cache and
+`/config/.esphome/storage`, which `flash` redirects to tmpfs
+(`--tmpfs /tmp --tmpfs /cache -e ESPHOME_DATA_DIR=/tmp/esphome-data`). Serial
+upload with a read-only project is expected to behave the same but is not
+verified without hardware.
 
 `manifest.json` records `image` and `image_digest` (the pinned ESPHome image),
 `esphome_version`, `vesselstack_version`, `device_name`, `source_sha256` (a hash
@@ -1040,9 +1055,11 @@ Requirements and limits:
   detected, hold BOOT while tapping RESET to enter download mode.
 - **OTA.** HOST is an IP address or an RFC 1123 host name (no URL, port or
   path). The display must be powered, on Wi-Fi and reachable from the Pi on the
-  LAN. OTA uses the OTA password in the *current* `secrets.yaml`, so after
-  `display rotate` or changed Wi-Fi credentials the running firmware no longer
-  matches: flash over USB.
+  LAN. OTA uses the OTA password in the project's `secrets.yaml`. That password
+  changes only with `display rotate`: after a rotate and a re-render or
+  rebuild, the running firmware no longer matches it, so flash over USB. Changed
+  Wi-Fi credentials do not change the OTA password; the display just cannot join
+  the new network until it is reflashed over USB.
 - **Rollback.** `flash ID ... --previous` re-sends the previous build. OTA
   rollback works only while the OTA password in `secrets.yaml` is the one that
   build was compiled with; serial always works. Anything older than one build

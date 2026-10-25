@@ -66,7 +66,7 @@ PY
 
 fail=0
 check() {
-    local variant=$1 display=$2 dir="$WORK/$1/build/displays/$2"
+    local variant=$1 display=$2 dir="$WORK/$1/build/displays/$2/project"
     echo "== esphome config: $variant/$display"
     if ! docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$dir":/config "$IMAGE" \
             config --show-secrets /config/"$display".yaml > "$WORK/$variant-$display.log" 2>&1; then

@@ -12,15 +12,19 @@ root-owned ``secrets.yaml`` that ESPHome reads inside the container.
 
 Layout under ``$VESSELSTACK_ROOT/build/displays/<id>/`` (root:root, 0700/0600)::
 
-    <id>.yaml, secrets.yaml, ...      the rendered project (render.py)
+    project/                           the rendered ESPHome project (render.py): the ONLY
+                                       directory mounted into a container (as /config)
+    project.prev/                      the project before it
     firmware/                          newest build: factory + ota image, manifest.json
     firmware.prev/                     the build before it (rollback)
 
-``render`` carries ``firmware/`` and ``firmware.prev/`` over into the regenerated
-project, so rendering again never discards a finished build.
+The stored firmware sits beside ``project/``, never inside it, so a compromised compile
+container (which can write to its ``/config`` mount) cannot rewrite the images or the
+manifests that ``flash`` trusts. ``render`` replaces only ``project/``.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import ipaddress
@@ -31,6 +35,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -385,6 +390,7 @@ def build(ctx, display_id: str, *, stream=default_stream_runner, statvfs=os.stat
     preflight_disk(ctx, cache_present, statvfs)
     project = render.write_project(ctx, rendered)
     mount = _check_mount_path(project)
+    container_dir = project.parent
     if not image_present:
         ctx.out("note: " + PULL_NOTICE % CACHE_VOLUME)
     elif not cache_present:
@@ -404,7 +410,7 @@ def build(ctx, display_id: str, *, stream=default_stream_runner, statvfs=os.stat
     with DisplayDir(ctx.root, display_id, create=False) as dd:
         artifacts = {}
         for name in ARTIFACTS:
-            relative = [".esphome", "build", device_name, "build", name]
+            relative = [render.PROJECT_DIR, ".esphome", "build", device_name, "build", name]
             try:
                 artifacts[name] = _read_at(dd.display_fd, relative, "/".join(relative))
             except RenderError as exc:
@@ -429,15 +435,19 @@ def build(ctx, display_id: str, *, stream=default_stream_runner, statvfs=os.stat
         files[MANIFEST_NAME] = _manifest_bytes(manifest)
         _write_firmware_dir(dd, files, owner)
         try:  # the ~600 MB scratch tree is no longer needed
-            render._remove_tree(dd.display_fd, ".esphome")
-        except OSError as exc:
+            project_fd = _open_existing(dd.display_fd, render.PROJECT_DIR, str(project))
+            try:
+                render._remove_tree(project_fd, ".esphome")
+            finally:
+                os.close(project_fd)
+        except (OSError, RenderError) as exc:
             warn(f"warning: could not remove the build scratch tree .esphome: {exc}")
-    ctx.out(f"Firmware stored in {project / FIRMWARE_DIR} (built in {elapsed:.0f} s)")
+    ctx.out(f"Firmware stored in {container_dir / FIRMWARE_DIR} (built in {elapsed:.0f} s)")
     ctx.out(f"  {FACTORY_NAME}  sha256 {manifest['files'][FACTORY_NAME]['sha256']}")
     ctx.out(f"  {OTA_NAME}      sha256 {manifest['files'][OTA_NAME]['sha256']}")
     ctx.out("Flash it with 'vesselstackctl display flash %s --serial /dev/serial/by-id/... "
             "| --ota HOST'" % display_id)
-    return project / FIRMWARE_DIR
+    return container_dir / FIRMWARE_DIR
 
 
 # --- flash -------------------------------------------------------------------------
@@ -472,6 +482,48 @@ def load_firmware(dd: DisplayDir, directory: str, name: str) -> tuple[bytes, dic
     return data, manifest
 
 
+FLASH_STAGED_NAME = "fw.bin"
+# `esphome upload` wants to write .esphome/ (storage sidecar) and a platformio cache. The
+# project is mounted read-only, so give it throwaway tmpfs locations instead. Verified with
+# the pinned image: an OTA attempt against an unreachable host runs exactly as with a
+# writable /config, without the "Read-only file system" warnings.
+UPLOAD_SCRATCH_FLAGS = ["--tmpfs", "/tmp", "--tmpfs", "/cache",
+                        "-e", "ESPHOME_DATA_DIR=/tmp/esphome-data"]
+
+
+@contextlib.contextmanager
+def staged_firmware(ctx, data: bytes, expected_sha256: str):
+    """Copy verified firmware bytes into a fresh root-only temp dir and yield the file path.
+
+    The container reads this copy, not the stored file, so nothing can swap the bytes
+    between verification and upload. The temp dir lives under ``$ROOT/build/`` (root-only),
+    not in a shared /tmp, and is removed afterwards.
+    """
+    build_dir = ctx.root / render.BUILD_DIR_NAME
+    tmp = Path(tempfile.mkdtemp(prefix=".flash-", dir=build_dir))
+    try:
+        os.chmod(tmp, 0o700)
+        staged = tmp / FLASH_STAGED_NAME
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            mqtt_auth._write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        fd = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            copy = b"".join(iter(lambda: os.read(fd, 65536), b""))
+        finally:
+            os.close(fd)
+        if sha256_hex(copy) != expected_sha256:
+            raise RenderError("the staged firmware copy does not match its recorded sha256; "
+                              "refusing to flash")
+        _check_mount_path(staged)
+        yield staged
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = None,
           previous: bool = False, stream=default_stream_runner, lstat=os.lstat,
           realpath=os.path.realpath) -> None:
@@ -485,33 +537,38 @@ def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = 
     directory = PREVIOUS_DIR if previous else FIRMWARE_DIR
     name = FACTORY_NAME if serial else OTA_NAME
     with DisplayDir(ctx.root, display_id, create=False) as dd:
-        if not render._exists(dd.display_fd, f"{display_id}.yaml"):
+        if render._exists(dd.display_fd, f"{display_id}.yaml"):
+            raise RenderError(f"{dd.path} still has the old directory layout: run "
+                              f"'vesselstackctl display render {display_id}' once to migrate it "
+                              "(stored firmware is kept)")
+        if not render._exists(dd.display_fd, render.PROJECT_DIR):
             raise RenderError(f"the project for {display_id} is missing: run "
                               f"'vesselstackctl display build {display_id}' first")
-        _data, manifest = load_firmware(dd, directory, name)
-        mount = _check_mount_path(dd.path)
+        data, manifest = load_firmware(dd, directory, name)
+        mount = _check_mount_path(dd.path / render.PROJECT_DIR)
     if not _image_present(ctx, image):
         raise RenderError(f"the ESPHome image {image.split('@', 1)[0]} is not present locally and "
                           "flashing never pulls it; run "
                           f"'vesselstackctl display build {display_id}' first")
-    target = f"/config/{directory}/{name}"
-    argv = ["docker", "run", "--rm", "--pull", "never", *CONTAINER_FLAGS]
-    if device:
-        argv += ["--device", device]
-    else:
-        argv += ["--network", "host"]
-    argv += ["-v", f"{mount}:/config", image, "upload", f"/config/{display_id}.yaml",
-             "--device", device or host, "--file", target]
     label = "rollback firmware" if previous else "firmware"
-    ctx.out(f"Flashing {label} built {manifest.get('built_at_utc', 'at an unknown time')} "
-            f"({name}, sha256 {manifest['files'][name]['sha256'][:16]}...) to "
-            f"{device or host} {'over USB serial' if device else 'over the air'}")
-    status = stream(argv)
+    with staged_firmware(ctx, data, manifest["files"][name]["sha256"]) as staged:
+        argv = ["docker", "run", "--rm", "--pull", "never", *CONTAINER_FLAGS, *UPLOAD_SCRATCH_FLAGS]
+        if device:
+            argv += ["--device", device]
+        else:
+            argv += ["--network", "host"]
+        argv += ["-v", f"{mount}:/config:ro", "-v", f"{staged}:/fw.bin:ro",
+                 image, "upload", f"/config/{display_id}.yaml",
+                 "--device", device or host, "--file", "/fw.bin"]
+        ctx.out(f"Flashing {label} built {manifest.get('built_at_utc', 'at an unknown time')} "
+                f"({name}, sha256 {manifest['files'][name]['sha256'][:16]}...) to "
+                f"{device or host} {'over USB serial' if device else 'over the air'}")
+        status = stream(argv)
     if status != 0:
         hint = ("Check the cable and that the board is in download mode (hold BOOT, tap RESET)."
                 if device else
-                "Check that the display is online and reachable on the LAN; after "
-                "'display rotate' or changed Wi-Fi credentials the OTA password no longer "
-                "matches, so flash over USB instead.")
+                "Check that the display is online and reachable on the LAN. After 'display rotate' "
+                "and a re-render or rebuild the project carries a new OTA password that the "
+                "device does not know yet: flash over USB instead.")
         raise RenderError(f"the upload failed (exit status {status}). {hint}")
     ctx.out("Upload finished")
