@@ -31,6 +31,9 @@ BROKER_GID = 1883
 DIR_OWNER = (0, BROKER_GID)
 DIR_MODE = 0o750
 FILE_OWNER = (BROKER_UID, BROKER_GID)
+# The temporary plaintext password list is never broker-readable: root:root 0600
+# until the hashing container (running as root) hands over only the hashed file.
+PLAINTEXT_OWNER = (0, 0)
 FILE_MODE = 0o600
 AUTH_DIR_NAME = "mosquitto-auth"
 CONTAINER = "vesselstack-mosquitto"
@@ -379,14 +382,16 @@ def _cleanup(dir_fd: int, *names: str) -> None:
 
 def write_broker_files(root: Path, accounts: list[dict], image: str,
                        runner=default_runner, dir_owner=DIR_OWNER,
-                       file_owner=FILE_OWNER) -> None:
+                       file_owner=FILE_OWNER, plaintext_owner=PLAINTEXT_OWNER) -> None:
     """Install acl and hashed passwords in $ROOT/config/mosquitto-auth.
 
     The directory is root:1883 0750 and mounted read-only into the broker; the
-    files are 1883:1883 0600. Nothing under the broker-writable data directory
-    is touched.
+    final files are 1883:1883 0600. The temporary plaintext list passwords.new
+    is root:root 0600 and is removed on any failure. Nothing under the
+    broker-writable data directory is touched.
     """
     owner = _owner(file_owner)
+    plain_owner = _owner(plaintext_owner)
     auth = root / "config" / AUTH_DIR_NAME
     dir_fd = open_auth_dir(root, _owner(dir_owner))
     try:
@@ -395,9 +400,10 @@ def write_broker_files(root: Path, accounts: list[dict], image: str,
             _require_regular_or_absent(name, dir_fd)
         try:
             _write_new("acl.new", render_acl(accounts).encode("utf-8"), dir_fd, FILE_MODE, owner)
-            # Plaintext stays root-only until the container hashes and re-modes it.
+            # Plaintext is root:root 0600 (never the broker's uid) until the root
+            # hashing container hashes it and hands over only the hashed file.
             _write_new("passwords.new", render_passwords(accounts).encode("utf-8"),
-                       dir_fd, 0o600, owner)
+                       dir_fd, 0o600, plain_owner)
             _keep_previous("acl", dir_fd, owner)
             _keep_previous("passwords", dir_fd, owner)
             result = runner(["docker", "run", "--rm", "--entrypoint", "/bin/sh",

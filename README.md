@@ -487,7 +487,9 @@ configuration"), and `vesselstackctl start` when the files are missing, render
 the list and hashed passwords through
 `python3 displays/displayctl.py sync-mqtt`. Passwords are hashed inside the
 pinned Mosquitto image (`mosquitto_passwd -U`) and are never placed on a
-command line.
+command line. The plaintext list exists only briefly as `root:root` `0600`
+before hashing and is never readable by the broker; the hashing container then
+hands only the hashed file to `1883:1883`.
 
 Where the files live and who owns them:
 

@@ -216,6 +216,59 @@ class MqttAuthTests(unittest.TestCase):
         self.assertIn("mosquitto_passwd -U", run[-1])
         self.assertNotIn(" -b ", run[-1])
 
+    def _plaintext_probe(self):
+        seen = {}
+        mdir = self.mdir
+        inner = FakeRunner()
+
+        def runner(argv):
+            if argv[:2] == ["docker", "run"]:
+                new = mdir / "passwords.new"
+                seen["exists"] = new.exists()
+                seen["mode"] = new.stat().st_mode & 0o777
+                seen["text"] = new.read_text()
+            return inner(argv)
+        return runner, seen
+
+    def test_plaintext_list_is_0600_when_hashing_runs(self):
+        write_displays(self.config, ["helm"])
+        runner, seen = self._plaintext_probe()
+        self.run_sync(runner=runner)
+        self.assertTrue(seen["exists"])
+        self.assertEqual(seen["mode"], 0o600)
+        self.assertIn("homeassistant:", seen["text"])
+        self.assertFalse((self.mdir / "passwords.new").exists())
+
+    def test_plaintext_list_is_chowned_root_never_broker(self):
+        write_displays(self.config, ["helm"])
+        runner, seen = self._plaintext_probe()
+        chowns = []
+        names = {}
+        real_open = os.open
+
+        def fake_fchown(fd, uid, gid):
+            chowns.append((names.get(fd), uid, gid))
+
+        def fake_open(path, *a, **kw):
+            fd = real_open(path, *a, **kw)
+            names[fd] = path
+            return fd
+        with mock.patch.object(mqtt_auth.os, "geteuid", return_value=0), \
+                mock.patch.object(mqtt_auth.os, "fchown", side_effect=fake_fchown), \
+                mock.patch.object(mqtt_auth.os, "open", side_effect=fake_open):
+            mqtt_auth.sync(self.root, self.data, self.env(), runner=runner,
+                           dir_owner=None, file_owner=mqtt_auth.FILE_OWNER)
+        self.assertEqual(seen["mode"], 0o600)
+        plain = [(u, g) for n, u, g in chowns if n == "passwords.new"]
+        self.assertEqual(plain, [(0, 0)])
+        self.assertIn((1883, 1883), [(u, g) for _, u, g in chowns])
+
+    def test_plaintext_removed_when_hashing_fails(self):
+        write_displays(self.config, ["helm"])
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync(runner=FakeRunner(hash_ok=False))
+        self.assertFalse((self.mdir / "passwords.new").exists())
+
     def test_hup_only_when_running(self):
         summary, runner = self.run_sync(runner=FakeRunner(running=True))
         self.assertTrue(summary["reloaded"])
