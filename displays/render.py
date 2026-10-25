@@ -1033,8 +1033,45 @@ def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None,
         buffer.write(archive)
         buffer.flush()
         return
+    directory, leaf = os.path.split(output)
+    if leaf in ("", ".", ".."):
+        raise RenderError(f"--output {output!r} must name a file, not a directory", 2)
+    # The checked directory is the one the file is created in: open it without following a
+    # symlink as its last component, and create the file relative to that descriptor.
     try:
-        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
+        dir_fd = os.open(directory or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise RenderError(f"cannot use the directory of {output}: {exc.strerror} (a symbolic "
+                          "link is refused)", 2) from exc
+    try:
+        _export_to_dir(dir_fd, leaf, output, archive, emit, environ)
+    finally:
+        os.close(dir_fd)
+
+
+def _handover_allowed(info, owner) -> str | None:
+    """None when the file may be given to ``owner``; otherwise why it must stay root-owned.
+
+    Root creates the file, so handing it over is only safe in a directory that already
+    belongs to that user and that nobody else can write to: otherwise a user allowed to run
+    only vesselstackctl could pick any directory (say /etc/cron.d) and end up owning a file
+    there, or others could replace the file afterwards.
+    """
+    if info.st_uid != owner[0]:
+        return f"its directory is owned by uid {info.st_uid}, not uid {owner[0]}"
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return "its directory is writable by group or others"
+    return None
+
+
+def _fstat_dir(fd: int):
+    return os.fstat(fd)
+
+
+def _export_to_dir(dir_fd: int, leaf: str, output: str, archive: bytes, emit, environ) -> None:
+    try:
+        fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE,
+                     dir_fd=dir_fd)
     except FileExistsError:
         raise RenderError(f"{output} already exists; refusing to overwrite it", 2) from None
     except OSError as exc:
@@ -1042,15 +1079,21 @@ def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None,
     try:
         os.fchmod(fd, FILE_MODE)
         # Under sudo the file would belong to root in the user's directory: hand it to the
-        # invoking user, still mode 0600, so they can read and delete their own archive.
+        # invoking user (still mode 0600) only when that directory is theirs alone.
         owner = sudo_owner(os.environ if environ is None else environ)
         owned = ""
         if owner and _may_chown():
-            try:
-                os.fchown(fd, *owner)
-                owned = f", owned by uid {owner[0]}"
-            except OSError as exc:
-                emit(f"warning: could not give {output} to uid {owner[0]}: {exc.strerror}")
+            refusal = _handover_allowed(_fstat_dir(dir_fd), owner)
+            if refusal:
+                emit(f"note: {output} stays owned by root (mode 0600) because {refusal}. Take it "
+                     f'with: sudo chown "$USER" {output}   (or write with --stdout inside '
+                     "(umask 077; ...) so your shell creates the file)")
+            else:
+                try:
+                    os.fchown(fd, *owner)
+                    owned = f", owned by uid {owner[0]}"
+                except OSError as exc:
+                    emit(f"warning: could not give {output} to uid {owner[0]}: {exc.strerror}")
         view = memoryview(archive)
         while view:
             view = view[os.write(fd, view):]
@@ -1058,7 +1101,7 @@ def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None,
     except BaseException:
         os.close(fd)
         try:
-            os.unlink(output)
+            os.unlink(leaf, dir_fd=dir_fd)
         except OSError:
             pass
         raise

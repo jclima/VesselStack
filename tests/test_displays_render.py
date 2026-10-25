@@ -613,11 +613,21 @@ class Export(Base):
                 mock.patch.object(render.grp, "getgrgid", return_value=object()),
                 mock.patch.object(render, "_may_chown", return_value=True))
 
-    def export_with(self, name, env, fchown):
+    def dir_info(self, uid=12345, mode=0o040700):
+        """What fstat of the output directory reports (the real owner is the test runner)."""
+        return os.stat_result((mode, 1, 1, 2, uid, 0, 4096, 0, 0, 0))
+
+    def export_with(self, name, env, fchown, info=None, subdir=None):
         from unittest import mock
-        out = Path(self._tmp.name) / name
+        base = Path(self._tmp.name)
+        if subdir:
+            (base / subdir).mkdir(exist_ok=True)
+            base = base / subdir
+        out = base / name
         patches = self.fake_accounts()
-        with patches[0], patches[1], patches[2], mock.patch("os.fchown", side_effect=fchown):
+        info = info or self.dir_info()
+        with patches[0], patches[1], patches[2], mock.patch("os.fchown", side_effect=fchown), \
+                mock.patch.object(render, "_fstat_dir", return_value=info):
             render.export(self.ctx(), "helm", str(out), False, warn=self.messages.append,
                           allow_missing_wifi=True, environ=env)
         return out
@@ -628,6 +638,98 @@ class Export(Base):
         self.assertEqual([c for c in calls if c != (0, 0)], [(12345, 12345)])
         self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
         self.assertTrue(any("owned by uid 12345" in m for m in self.messages))
+
+    def chowns(self, **kw):
+        calls = []
+        out = self.export_with(kw.pop("name", "x.tar.gz"), self.FAKE,
+                               lambda fd, uid, gid: calls.append((uid, gid)), **kw)
+        return out, [c for c in calls if c != (0, 0)]
+
+    def test_output_in_a_directory_owned_by_the_sudo_user_is_handed_over(self):
+        out, calls = self.chowns(info=self.dir_info(uid=12345, mode=0o040755))
+        self.assertEqual(calls, [(12345, 12345)])
+        self.assertFalse(any("stays owned by root" in m for m in self.messages))
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+
+    def test_output_in_a_root_owned_directory_is_not_handed_over_and_a_hint_is_printed(self):
+        out, calls = self.chowns(info=self.dir_info(uid=0, mode=0o040755))
+        self.assertEqual(calls, [])
+        self.assertTrue(out.stat().st_size > 0)
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+        hint = [m for m in self.messages if "stays owned by root" in m]
+        self.assertEqual(len(hint), 1)
+        self.assertIn('sudo chown "$USER"', hint[0])
+        self.assertIn(str(out), hint[0])
+        self.assertIn("--stdout", hint[0])
+
+    def test_directory_owned_by_someone_else_is_not_handed_over(self):
+        self.assertEqual(self.chowns(info=self.dir_info(uid=999))[1], [])
+
+    def test_group_or_world_writable_directory_is_not_handed_over(self):
+        for index, mode in enumerate((0o040775, 0o040757, 0o041777, 0o040777)):
+            with self.subTest(mode=oct(mode)):
+                self.messages.clear()
+                _, calls = self.chowns(name=f"w{index}.tar.gz", info=self.dir_info(mode=mode))
+                self.assertEqual(calls, [])
+                self.assertTrue(any("writable by group or others" in m for m in self.messages))
+
+    def test_handover_decision_is_a_pure_function_of_owner_and_mode(self):
+        owner = (12345, 12345)
+        self.assertIsNone(render._handover_allowed(self.dir_info(12345, 0o040700), owner))
+        self.assertIsNone(render._handover_allowed(self.dir_info(12345, 0o040755), owner))
+        self.assertIsNotNone(render._handover_allowed(self.dir_info(0, 0o040700), owner))
+        self.assertIsNotNone(render._handover_allowed(self.dir_info(12345, 0o040770), owner))
+
+    def test_the_checked_directory_is_the_one_the_file_is_created_in(self):
+        # The fstat is taken on the descriptor the file was created through.
+        from unittest import mock
+        seen = []
+        real = os.open
+
+        def spy(path, flags, mode=0o777, *, dir_fd=None):
+            fd = real(path, flags, mode, dir_fd=dir_fd)
+            seen.append((path, dir_fd, fd))
+            return fd
+
+        info_fds = []
+        with mock.patch("os.open", side_effect=spy), mock.patch.object(
+                render, "_fstat_dir", side_effect=lambda fd: info_fds.append(fd) or self.dir_info()):
+            out = Path(self._tmp.name) / "same.tar.gz"
+            with mock.patch.object(render, "_may_chown", return_value=True), \
+                    mock.patch.object(render.pwd, "getpwuid", return_value=object()), \
+                    mock.patch.object(render.grp, "getgrgid", return_value=object()), \
+                    mock.patch("os.fchown"):
+                render.export(self.ctx(), "helm", str(out), False, warn=lambda t: None,
+                              allow_missing_wifi=True, environ=self.FAKE)
+        created = [entry for entry in seen if entry[0] == "same.tar.gz"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(info_fds, [created[0][1]])  # fstat'd the dir fd used as dir_fd
+
+    def test_symlinked_output_directory_is_refused_and_nothing_is_written(self):
+        base = Path(self._tmp.name)
+        target = base / "realdir"
+        target.mkdir()
+        (base / "linkdir").symlink_to(target)
+        with self.assertRaises(render.RenderError) as caught:
+            render.export(self.ctx(), "helm", str(base / "linkdir" / "a.tar.gz"), False,
+                          warn=lambda t: None, allow_missing_wifi=True)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_output_must_name_a_file(self):
+        base = Path(self._tmp.name)
+        for bad in (str(base) + "/", str(base / "."), str(base / "..")):
+            with self.assertRaises(render.RenderError, msg=bad):
+                render.export(self.ctx(), "helm", bad, False, warn=lambda t: None,
+                              allow_missing_wifi=True)
+
+    def test_relative_output_uses_the_current_directory(self):
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self._tmp.name)
+        render.export(self.ctx(), "helm", "rel.tar.gz", False, warn=lambda t: None,
+                      allow_missing_wifi=True)
+        self.assertEqual(stat.S_IMODE(os.stat("rel.tar.gz").st_mode), 0o600)
 
     def test_invalid_or_missing_sudo_ids_are_ignored(self):
         bad = [{}, {"SUDO_UID": "0", "SUDO_GID": "0"}, {"SUDO_UID": "abc", "SUDO_GID": "1"},
