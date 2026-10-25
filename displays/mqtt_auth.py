@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,17 @@ import schema  # noqa: E402
 
 BROKER_UID = 1883
 BROKER_GID = 1883
+# The auth DIRECTORY is root-owned and only group-readable by the broker, so the
+# broker can traverse it but can never create, remove or rename entries (no
+# planted symlinks for root-run code). The auth FILES are owned by the broker
+# user with mode 0600 because Mosquitto warns about, and a future version will
+# refuse, files it does not own. The files themselves cannot be swapped or
+# redirected because the directory is not writable by the broker.
+DIR_OWNER = (0, BROKER_GID)
+DIR_MODE = 0o750
+FILE_OWNER = (BROKER_UID, BROKER_GID)
+FILE_MODE = 0o600
+AUTH_DIR_NAME = "mosquitto-auth"
 CONTAINER = "vesselstack-mosquitto"
 DEFAULT_BRIDGE_USERNAME = "vesselstack-bridge"
 DISPLAY_USER_PREFIX = "vsdisp-"
@@ -31,10 +43,10 @@ ROOT_TOPIC = "vesselstack/v1"
 
 HASH_SCRIPT = (
     "set -e; "
-    "mosquitto_passwd -U /mosquitto/data/passwords.new; "
-    "chown 1883:1883 /mosquitto/data/passwords.new; "
-    "chmod 0600 /mosquitto/data/passwords.new; "
-    "mv -f /mosquitto/data/passwords.new /mosquitto/data/passwords"
+    "mosquitto_passwd -U /auth/passwords.new; "
+    "chown 1883:1883 /auth/passwords.new; "
+    "chmod 0600 /auth/passwords.new; "
+    "mv -f /auth/passwords.new /auth/passwords"
 )
 
 
@@ -211,86 +223,199 @@ def render_passwords(accounts: list[dict]) -> str:
 
 
 # --- writing --------------------------------------------------------------
+# Every operation below is relative to a directory file descriptor opened with
+# O_NOFOLLOW, and every file open uses O_NOFOLLOW, so a symlink can never be
+# followed even if something managed to plant one.
 
-def _owner(uid, gid):
-    """Chown only when running as root; tests inject uid=None."""
-    if uid is None or gid is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
+def _owner(owner):
+    """Chown only when running as root; tests inject owner=None."""
+    if owner is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return None
-    return uid, gid
+    return owner
 
 
-def _secure(path: Path, owner) -> None:
-    os.chmod(path, 0o600)
-    if owner:
-        os.chown(path, *owner)
-
-
-def _new_file(path: Path, text: str, owner) -> None:
+def _lstat(name: str, dir_fd: int):
     try:
-        path.unlink()
+        return os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+
+
+def _check_dir_component(path: Path, label: str, create: bool, mode: int):
+    """lstat a directory; refuse symlinks and non-directories."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if not create:
+            raise MqttAuthError(f"{label} {path} does not exist") from None
+        os.mkdir(path, mode)
+        info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise MqttAuthError(f"refusing to use {label} {path}: it is a symbolic link")
+    if not stat.S_ISDIR(info.st_mode):
+        raise MqttAuthError(f"refusing to use {label} {path}: it is not a directory")
+    return info
+
+
+def open_auth_dir(root: Path, dir_owner) -> int:
+    """Create/verify $ROOT/config/mosquitto-auth and return a no-follow dir fd.
+
+    When running as root the directory must already be root-owned and not
+    group/world-writable; otherwise something other than root could have
+    modified it and it is refused rather than repaired.
+    """
+    config = root / "config"
+    _check_dir_component(config, "configuration directory", True, 0o755)
+    auth = config / AUTH_DIR_NAME
+    info = _check_dir_component(auth, "MQTT auth directory", True, DIR_MODE)
+    if dir_owner:
+        if info.st_uid != dir_owner[0]:
+            raise MqttAuthError(
+                f"refusing to use {auth}: it is owned by uid {info.st_uid}, expected {dir_owner[0]}")
+        if info.st_mode & 0o022:
+            raise MqttAuthError(
+                f"refusing to use {auth}: it is group or world writable "
+                f"(mode {info.st_mode & 0o777:o})")
+    fd = os.open(auth, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        now = os.fstat(fd)
+        if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+            raise MqttAuthError(f"{auth} changed while it was being opened")
+        os.fchmod(fd, DIR_MODE)
+        if dir_owner:
+            os.fchown(fd, *dir_owner)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _require_regular_or_absent(name: str, dir_fd: int) -> None:
+    info = _lstat(name, dir_fd)
+    if info is not None and not stat.S_ISREG(info.st_mode):
+        raise MqttAuthError(f"refusing to use {name} in the MQTT auth directory: "
+                            "it is not a regular file")
+
+
+def _remove_stale(name: str, dir_fd: int) -> None:
+    """Remove a leftover temp file, but only if it is a regular file."""
+    _require_regular_or_absent(name, dir_fd)
+    try:
+        os.unlink(name, dir_fd=dir_fd)
     except FileNotFoundError:
         pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    _secure(path, owner)
 
 
-def _keep_previous(live: Path, owner) -> None:
-    if not live.exists():
+def _write_new(name: str, data: bytes, dir_fd: int, mode: int, owner) -> None:
+    _remove_stale(name, dir_fd)
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                 dir_fd=dir_fd)
+    try:
+        _write_all(fd, data)
+        os.fchmod(fd, mode)
+        if owner:
+            os.fchown(fd, *owner)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _read_regular(name: str, dir_fd: int) -> bytes | None:
+    if _lstat(name, dir_fd) is None:
+        return None
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MqttAuthError(f"refusing to read {name}: it is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _keep_previous(name: str, dir_fd: int, owner) -> None:
+    data = _read_regular(name, dir_fd)
+    if data is None:
         return
-    prev = live.with_name(live.name + ".prev")
-    tmp = live.with_name(live.name + ".prev.tmp")
+    prev = name + ".prev"
+    _require_regular_or_absent(prev, dir_fd)
+    tmp = prev + ".tmp"
+    _write_new(tmp, data, dir_fd, FILE_MODE, owner)
+    os.replace(tmp, prev, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
+def _secure_existing(name: str, dir_fd: int, owner) -> None:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
     try:
-        tmp.unlink()
-    except FileNotFoundError:
-        pass
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(live.read_bytes())
-    _secure(tmp, owner)
-    os.replace(tmp, prev)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MqttAuthError(f"refusing to use {name}: it is not a regular file")
+        os.fchmod(fd, FILE_MODE)
+        if owner:
+            os.fchown(fd, *owner)
+    finally:
+        os.close(fd)
 
 
-def _cleanup(*paths: Path) -> None:
-    for path in paths:
+def _cleanup(dir_fd: int, *names: str) -> None:
+    for name in names:
         try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+            info = os.lstat(name, dir_fd=dir_fd)
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                os.unlink(name, dir_fd=dir_fd)
         except OSError:
             pass
 
 
-def write_broker_files(data_dir: Path, accounts: list[dict], image: str,
-                       runner=default_runner, uid=BROKER_UID, gid=BROKER_GID) -> None:
-    """Install acl and hashed passwords, both owned by the broker with mode 0600."""
-    owner = _owner(uid, gid)
-    mdir = data_dir / "mosquitto"
-    mdir.mkdir(mode=0o750, parents=True, exist_ok=True)
-    acl, acl_new = mdir / "acl", mdir / "acl.new"
-    pw, pw_new = mdir / "passwords", mdir / "passwords.new"
+def write_broker_files(root: Path, accounts: list[dict], image: str,
+                       runner=default_runner, dir_owner=DIR_OWNER,
+                       file_owner=FILE_OWNER) -> None:
+    """Install acl and hashed passwords in $ROOT/config/mosquitto-auth.
+
+    The directory is root:1883 0750 and mounted read-only into the broker; the
+    files are 1883:1883 0600. Nothing under the broker-writable data directory
+    is touched.
+    """
+    owner = _owner(file_owner)
+    auth = root / "config" / AUTH_DIR_NAME
+    dir_fd = open_auth_dir(root, _owner(dir_owner))
     try:
-        _new_file(acl_new, render_acl(accounts), owner)
-        _new_file(pw_new, render_passwords(accounts), owner)
-        _keep_previous(acl, owner)
-        _keep_previous(pw, owner)
-        result = runner(["docker", "run", "--rm", "--entrypoint", "/bin/sh",
-                         "-v", f"{mdir}:/mosquitto/data", image, "-c", HASH_SCRIPT])
-        if result.returncode != 0:
-            detail = (result.stderr or "").strip().splitlines()
-            raise MqttAuthError("hashing MQTT passwords in the Mosquitto image failed"
-                                + (f": {detail[-1]}" if detail else ""))
-        if not pw.exists() or pw_new.exists():
-            raise MqttAuthError("MQTT password file was not installed")
-        _secure(pw, owner)
-        os.replace(acl_new, acl)
-        _secure(acl, owner)
-    except BaseException:
-        _cleanup(acl_new, pw_new)
-        raise
+        for name in ("acl", "acl.new", "acl.prev", "acl.prev.tmp",
+                     "passwords", "passwords.new", "passwords.prev", "passwords.prev.tmp"):
+            _require_regular_or_absent(name, dir_fd)
+        try:
+            _write_new("acl.new", render_acl(accounts).encode("utf-8"), dir_fd, FILE_MODE, owner)
+            # Plaintext stays root-only until the container hashes and re-modes it.
+            _write_new("passwords.new", render_passwords(accounts).encode("utf-8"),
+                       dir_fd, 0o600, owner)
+            _keep_previous("acl", dir_fd, owner)
+            _keep_previous("passwords", dir_fd, owner)
+            result = runner(["docker", "run", "--rm", "--entrypoint", "/bin/sh",
+                             "-v", f"{auth}:/auth", image, "-c", HASH_SCRIPT])
+            if result.returncode != 0:
+                detail = (result.stderr or "").strip().splitlines()
+                raise MqttAuthError("hashing MQTT passwords in the Mosquitto image failed"
+                                    + (f": {detail[-1]}" if detail else ""))
+            if _lstat("passwords", dir_fd) is None or _lstat("passwords.new", dir_fd) is not None:
+                raise MqttAuthError("MQTT password file was not installed")
+            _secure_existing("passwords", dir_fd, owner)
+            os.replace("acl.new", "acl", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            _secure_existing("acl", dir_fd, owner)
+        except BaseException:
+            _cleanup(dir_fd, "acl.new", "passwords.new", "acl.prev.tmp", "passwords.prev.tmp")
+            raise
+    finally:
+        os.close(dir_fd)
 
 
 def reload_broker(runner=default_runner, container: str = CONTAINER) -> bool:
@@ -304,10 +429,29 @@ def reload_broker(runner=default_runner, container: str = CONTAINER) -> bool:
     return True
 
 
-def sync(root: Path, data_dir: Path, env: dict, displays_config: Path | None = None,
+def ensure_image(image: str, runner=default_runner) -> None:
+    """Make sure the hashing image is local; fail clearly (before any write) if not."""
+    if runner(["docker", "image", "inspect", image]).returncode == 0:
+        return
+    result = runner(["docker", "pull", image])
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        raise MqttAuthError(
+            f"the Mosquitto image {image} is not available locally and could not be pulled"
+            + (f" ({detail[-1]})" if detail else "")
+            + "; connect to the internet once or load the image, then run the command again."
+            " No MQTT access files were changed")
+
+
+def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | None = None,
          image: str | None = None, runner=default_runner,
-         uid=BROKER_UID, gid=BROKER_GID, container: str = CONTAINER) -> dict:
-    """Render and install ACL + passwords from env values; returns a summary."""
+         dir_owner=DIR_OWNER, file_owner=FILE_OWNER, container: str = CONTAINER) -> dict:
+    """Render and install ACL + passwords from env values; returns a summary.
+
+    ``data_dir`` is accepted for compatibility and deliberately unused: the
+    broker-writable data directory is never touched by root-run code.
+    """
+    _check_dir_component(root / "config", "configuration directory", True, 0o755)
     enabled_text = env.get("DISPLAYS_ENABLE", "false")
     if enabled_text not in ("true", "false"):
         raise MqttAuthError("DISPLAYS_ENABLE must be true or false")
@@ -318,12 +462,14 @@ def sync(root: Path, data_dir: Path, env: dict, displays_config: Path | None = N
     admin_user = _check_username("MQTT_USERNAME", env.get("MQTT_USERNAME", ""))
     _check_password("MQTT_PASSWORD", env.get("MQTT_PASSWORD", ""))
     display_ids = load_display_ids(displays_config, enabled)
+    image = image or find_image(root)
+    ensure_image(image, runner)
     secret_path = root / "config" / SECRETS_NAME
     secret_data = ensure_secrets(secret_path, display_ids, enabled) if enabled else \
         load_secrets(secret_path)
     accounts = build_accounts(admin_user, env["MQTT_PASSWORD"], enabled, bridge_user,
                               display_ids, secret_data)
-    write_broker_files(data_dir, accounts, image or find_image(root), runner, uid, gid)
+    write_broker_files(root, accounts, image, runner, dir_owner, file_owner)
     reloaded = reload_broker(runner, container)
     return {"enabled": enabled, "accounts": len(accounts), "displays": len(display_ids),
             "reloaded": reloaded}

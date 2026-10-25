@@ -235,7 +235,8 @@ sudo systemd-analyze verify /etc/systemd/system/vesselstack-control-panel.servic
 sudo ./install.sh --config vesselstack.env --start
 ```
 
-This creates the Mosquitto ACL and hashed password file (see
+This renders the Mosquitto ACL and hashed password file into
+`/opt/vesselstack/config/mosquitto-auth/` (see
 [MQTT access control](#mqtt-access-control)), starts Docker services, recreates
 the Mosquitto container when its configuration changed, creates the
 configured InfluxDB buckets and one-minute downsample task, and starts Boat
@@ -479,11 +480,38 @@ SignalK, Boat Chat, InfluxDB, and Prometheus.
 
 ## MQTT access control
 
-Mosquitto always enforces an access list (`acl_file /mosquitto/data/acl`). The
-installer and `vesselstackctl start` render it, together with hashed
-passwords, through `python3 displays/displayctl.py sync-mqtt`. Passwords are
-hashed inside the pinned Mosquitto image (`mosquitto_passwd -U`) and are never
-placed on a command line.
+Mosquitto always enforces an access list (`acl_file /mosquitto/auth/acl`,
+`password_file /mosquitto/auth/passwords`). Every `install.sh` run that is not
+`--dry-run` (including render-only runs such as Control Panel "Apply
+configuration"), and `vesselstackctl start` when the files are missing, render
+the list and hashed passwords through
+`python3 displays/displayctl.py sync-mqtt`. Passwords are hashed inside the
+pinned Mosquitto image (`mosquitto_passwd -U`) and are never placed on a
+command line.
+
+Where the files live and who owns them:
+
+| Path | Owner | Mode | Notes |
+| --- | --- | --- | --- |
+| `$VESSELSTACK_ROOT/config/mosquitto-auth/` | `root:1883` | `0750` | mounted **read-only** into the broker at `/mosquitto/auth` |
+| `acl`, `passwords`, `acl.prev`, `passwords.prev` inside it | `1883:1883` | `0600` | the broker's user owns them, as Mosquitto expects |
+
+The directory is root-owned and not writable by the broker (uid/gid 1883), so a
+compromised or misbehaving broker cannot create, remove, rename or replace
+entries there, in particular it cannot plant symlinks for the root-run sync
+code to follow. The files are owned by the broker user only because Mosquitto
+warns about files it does not own and states that future versions will refuse
+to load them; the broker cannot swap them out because the directory and mount
+are read-only. The sync code is hardened accordingly: it refuses a symlinked
+`config/` or `mosquitto-auth` directory, refuses (as root) a directory that is
+not owned by root or is group/world writable, opens everything relative to a
+directory file descriptor with `O_NOFOLLOW`, creates temporary files with
+`O_CREAT|O_EXCL|O_NOFOLLOW`, sets owner and mode on the open file descriptor,
+refuses symlinks or non-regular files at `acl`, `passwords` and their `.new`,
+`.prev` and `.prev.tmp` names, and never touches
+`$VESSELSTACK_DATA/mosquitto`. The Mosquitto image must be present to hash
+passwords; if it is missing and cannot be pulled (for example offline), sync
+stops with a clear message before changing any file.
 
 With `DISPLAYS_ENABLE=false` (the default) only the administrator account
 (`MQTT_USERNAME`) exists: it has `readwrite #` and `read $SYS/#`, so Home
@@ -509,23 +537,33 @@ Operational notes:
   temporarily broken or missing `displays.json` cannot destroy them); delete
   the entry by hand to retire it permanently. With displays enabled and no
   `displays.json`, only the admin and bridge accounts exist.
-- The broker reads `acl` and `passwords` as uid/gid 1883. Both must be owned
-  `1883:1883` with mode `0600`; the tool sets this (it must run as root), keeps
-  `acl.prev` and `passwords.prev` copies, and signals the running broker to
-  reload (`SIGHUP`), which also disconnects removed accounts. A root-owned
-  password file prevents the broker from starting.
+- The sync tool sets the ownership and modes above (it must run as root),
+  keeps `acl.prev` and `passwords.prev` copies, and signals the running broker
+  to reload (`SIGHUP`), which also disconnects removed accounts. Because the
+  auth directory is mounted as a directory, replaced files reach the running
+  broker without a restart.
+- `install.sh --dry-run` (the Control Panel "Preflight") exits before any
+  rendering: it does not write files, pull images or signal containers. Apply
+  configuration and install do sync, and may therefore pull the pinned
+  Mosquitto image on first use and send `SIGHUP` to a running broker.
 - Upgrade impact: the first `install.sh --start`, `vesselstackctl update` or
   any other run that starts the stack recreates the Mosquitto container once
-  (a brief MQTT interruption) so the new configuration takes effect. A
-  render-only `install.sh` run updates the ACL and passwords but the broker
-  enforces the ACL only after it is recreated.
-- Manually added MQTT users are not preserved: `install.sh --start` and
-  `vesselstackctl update` rebuild the password file from `MQTT_USERNAME` and the
+  (a brief MQTT interruption) so the new configuration and the new read-only
+  mount take effect. A render-only `install.sh` run updates the files in
+  `config/mosquitto-auth/`, but a broker still running the previous container
+  keeps its old configuration and mounts until it is recreated.
+- Legacy files: releases that kept `passwords`, `acl` and their `.prev`/`.new`
+  copies in `$VESSELSTACK_DATA/mosquitto/` leave them there untouched and
+  unused (the broker's persistence database stays in that directory). They are
+  safe to delete by hand once the new configuration works; VesselStack never
+  deletes or follows anything in that broker-writable directory.
+- Manually added MQTT users are not preserved: every non-dry-run `install.sh`
+  and `vesselstackctl update` rebuild the password file from `MQTT_USERNAME` and the
   displays accounts, and any account not in the ACL has no access. Add other
   clients by sharing the administrator account or extend VesselStack.
 - Accounts are rebuilt when you change `DISPLAYS_ENABLE`, the bridge name or
-  `displays.json` and run `sudo ./install.sh --config ... --start` (a
-  render-only run also syncs when the broker data directory exists). Names must
+  `displays.json` and run `sudo ./install.sh --config ...` (render-only runs sync too; add `--start`
+  to recreate the broker). Names must
   match `[A-Za-z0-9_.-]{1,64}` and cannot collide; invalid input or a hashing
   failure aborts with an error and leaves the previous live files in place.
   An existing `MQTT_PASSWORD` containing `:` or leading/trailing spaces is
@@ -533,10 +571,23 @@ Operational notes:
   it in the Control Panel first.
 - Rollback: set `DISPLAYS_ENABLE=false` and run `sudo ./install.sh --config
   ... --start`; the ACL returns to administrator-only. Downgrading to a release
-  without this feature: its installer recreates an administrator-only password
-  file and its Mosquitto configuration has no `acl_file`, so a leftover `acl`
-  file is ignored; `displays.secrets.json` is left in place.
-- Verify with `sudo tests/test-displays-mosquitto.sh` (real broker in Docker)
+  without this feature: its Mosquitto configuration points at the legacy
+  `$VESSELSTACK_DATA/mosquitto/passwords` path and its installer recreates the
+  files there, so the broker works again after the downgrade; the
+  `config/mosquitto-auth/` directory and `displays.secrets.json` are left in
+  place. `vesselstackctl restore` extracts with `--numeric-owner` so the
+  `root:1883` and `1883:1883` ownership survives a restore.
+- Troubleshooting: if the broker log contains "owner is not mosquitto",
+  "world readable" or "permission denied" for `/mosquitto/auth/...`, re-run
+  `sudo ./install.sh --config /opt/vesselstack/config/vesselstack.env` to
+  rewrite the files with the correct ownership. If sync reports that the image
+  "could not be pulled", connect the boat to the internet once (or load the
+  image with `docker load`) and run it again; nothing is changed before then.
+  "refusing to use ... symbolic link" or "group or world writable" means the
+  auth directory was tampered with: inspect and remove it, then re-run.
+- Verify with `sudo tests/test-displays-mosquitto.sh` (real broker in Docker;
+  as root it verifies the real ownership, otherwise a one-shot container copies
+  the files into a Docker volume with that ownership first)
   and `python3 -m unittest discover -s tests -p 'test_displays*.py'`.
 
 ## Instrument displays (preview)
@@ -812,13 +863,16 @@ Confirm SignalK and InfluxDB values in
 ### Mosquitto restarts repeatedly
 
 ```bash
-sudo ls -ln /opt/vesselstack-data/mosquitto/
+sudo ls -lnd /opt/vesselstack/config/mosquitto-auth
+sudo ls -ln /opt/vesselstack/config/mosquitto-auth/
 sudo docker logs vesselstack-mosquitto --tail 100
 ```
 
-`passwords` and `acl` must both exist and be owned by `1883:1883` with mode
-`0600`. To repair them, run `sudo vesselstackctl stop`, delete the two files and
-run `sudo vesselstackctl start`, or re-run `install.sh --start`. A client that
+The directory must be `root:1883` mode `0750`, and `passwords` and `acl` must
+both exist and be owned by `1883:1883` with mode `0600`. To repair them, re-run
+`sudo ./install.sh --config /opt/vesselstack/config/vesselstack.env` (add
+`--start` to restart the stack); the sync rewrites the files and fixes the
+modes. A client that
 connects but receives nothing, or whose publishes vanish, is usually missing
 from the ACL (see [MQTT access control](#mqtt-access-control)).
 

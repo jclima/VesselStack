@@ -292,6 +292,8 @@ install -m 0644 "$SCRIPT_DIR/templates/compose.yml" "$VESSELSTACK_ROOT/compose.y
 install -m 0644 "$SCRIPT_DIR/templates/prometheus.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
 # Mosquitto reads this file through a single-file bind mount that never sees a
 # replaced inode, so remember whether it changed and recreate the container.
+# (The auth files are a directory mount, so atomic replaces reach the broker;
+# a changed compose definition is recreated by "compose up -d" itself.)
 mosquitto_conf_hash() {
     sha256sum "$VESSELSTACK_ROOT/config/mosquitto.conf" 2>/dev/null | cut -d' ' -f1 || true
 }
@@ -310,11 +312,10 @@ sync_mqtt_access() {
         python3 "$VESSELSTACK_ROOT/displays/displayctl.py" sync-mqtt \
         --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA"
 }
-# Keep an existing broker's accounts consistent on render-only runs (for
-# example Control Panel apply); --start creates the data directory itself.
-if [ "$START" -eq 0 ] && [ -d "$VESSELSTACK_DATA/mosquitto" ]; then
-    sync_mqtt_access
-fi
+# The auth files live in the root-owned config/mosquitto-auth directory (mounted
+# read-only into the broker), so syncing is safe on every run, including
+# render-only runs such as Control Panel apply.
+sync_mqtt_access
 install -d -m 0755 "$VESSELSTACK_ROOT/config/grafana/provisioning/datasources" \
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards"
@@ -517,7 +518,6 @@ if [ "$START" -eq 1 ]; then
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
     install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
-    sync_mqtt_access
     compose up -d
     if [ "$MOSQUITTO_CONF_CHANGED" -eq 1 ]; then
         compose up -d --force-recreate mosquitto

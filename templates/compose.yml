@@ -90,6 +90,7 @@ services:
     volumes:
       - ${VESSELSTACK_ROOT}/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ${VESSELSTACK_DATA}/mosquitto:/mosquitto/data
+      - ${VESSELSTACK_ROOT}/config/mosquitto-auth:/mosquitto/auth:ro
 
   heimdall:
     image: lscr.io/linuxserver/heimdall:v2.8.1-ls357

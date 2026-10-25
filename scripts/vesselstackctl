@@ -56,7 +56,6 @@ sync_mqtt_access() {
     : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
     local displayctl="$VESSELSTACK_ROOT/displays/displayctl.py"
     [ -r "$displayctl" ] || { echo "Missing displays tool: $displayctl" >&2; return 1; }
-    install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
     PYTHONDONTWRITEBYTECODE=1 \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
         DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
@@ -76,8 +75,8 @@ start_stack() {
     if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
         systemctl enable --now vesselstack-firewall.service
     fi
-    if [ ! -s "$VESSELSTACK_DATA/mosquitto/passwords" ] || \
-        [ ! -s "$VESSELSTACK_DATA/mosquitto/acl" ]; then
+    if [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/passwords" ] || \
+        [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/acl" ]; then
         sync_mqtt_access
     fi
     "${COMPOSE[@]}" up -d
@@ -358,7 +357,7 @@ restore_stack() {
     [ "$confirmation" = --yes ] || { echo "restore requires --yes" >&2; exit 2; }
     verify_backup "$archive"
     stop_stack
-    tar -xzf "$archive" -C / --strip-components=1
+    tar --numeric-owner -xzf "$archive" -C / --strip-components=1
     systemctl daemon-reload
     start_stack
     echo "Restore completed"

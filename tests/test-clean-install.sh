@@ -14,13 +14,17 @@ install -d "$FAKE_BIN"
 
 cat > "$FAKE_BIN/docker" <<'EOF'
 #!/bin/bash
+printf '%s\n' "$*" >> "$(dirname "$0")/docker.log"
 # Emulate the Mosquitto hashing container used by displayctl sync-mqtt.
 if [ "${1:-}" = run ]; then
     for argument in "$@"; do
         case "$argument" in
-            *:/mosquitto/data)
-                host_path=${argument%:/mosquitto/data}
+            *:/auth)
+                host_path=${argument%:/auth}
+                # Emulate the hashing container: promote passwords.new as 1883:1883 0600.
                 [ -f "$host_path/passwords.new" ] && mv -f "$host_path/passwords.new" "$host_path/passwords"
+                chmod 0600 "$host_path/passwords"
+                if [ "$(id -u)" -eq 0 ]; then chown 1883:1883 "$host_path/passwords"; fi
                 ;;
         esac
     done
@@ -132,7 +136,9 @@ test -s "$APP_ROOT/displays/displayctl.py"
 test -s "$APP_ROOT/displays/mqtt_auth.py"
 test -s "$APP_ROOT/installer/displays/mqtt_auth.py"
 test ! -e "$APP_ROOT/displays/__pycache__"
-grep -q 'acl_file /mosquitto/data/acl' "$APP_ROOT/config/mosquitto.conf"
+grep -q '^acl_file /mosquitto/auth/acl$' "$APP_ROOT/config/mosquitto.conf"
+grep -q '^password_file /mosquitto/auth/passwords$' "$APP_ROOT/config/mosquitto.conf"
+grep -q 'config/mosquitto-auth:/mosquitto/auth:ro' "$APP_ROOT/compose.yml"
 grep -q '^DISPLAYS_ENABLE=false$' "$APP_ROOT/config/vesselstack.env"
 grep -q '^DISPLAYS_BRIDGE_MQTT_USERNAME=vesselstack-bridge$' "$APP_ROOT/config/vesselstack.env"
 test -s "$APP_ROOT/config/grafana/dashboards/system-health.json"
@@ -165,16 +171,31 @@ grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
     "$panel_token_before"
 
-# A render-only re-run keeps an existing broker's ACL and passwords in sync.
-install -d -m 0750 "$DATA_ROOT/mosquitto"
+# A render-only re-run keeps the broker's ACL and passwords in sync without
+# touching the broker-writable data directory.
+AUTH_DIR="$APP_ROOT/config/mosquitto-auth"
+rm -rf "$AUTH_DIR"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$APP_ROOT/installer/install.sh" \
     --config "$APP_ROOT/config/vesselstack.env" >/dev/null
-test -s "$DATA_ROOT/mosquitto/acl"
-test -s "$DATA_ROOT/mosquitto/passwords"
-grep -qx 'user homeassistant' "$DATA_ROOT/mosquitto/acl"
-test "$(stat -c '%a:%u:%g' "$DATA_ROOT/mosquitto/acl")" = 600:1883:1883
-test "$(stat -c '%a:%u:%g' "$DATA_ROOT/mosquitto/passwords")" = 600:1883:1883
+test -s "$AUTH_DIR/acl"
+test -s "$AUTH_DIR/passwords"
+grep -qx 'user homeassistant' "$AUTH_DIR/acl"
+test "$(stat -c '%a:%u:%g' "$AUTH_DIR")" = 750:0:1883
+test "$(stat -c '%a:%u:%g' "$AUTH_DIR/acl")" = 600:1883:1883
+test "$(stat -c '%a:%u:%g' "$AUTH_DIR/passwords")" = 600:1883:1883
+test ! -e "$DATA_ROOT/mosquitto"
+# Preflight (--dry-run) must not create or change any MQTT access files.
+acl_before=$(sha256sum "$AUTH_DIR/acl")
+log_before=$(wc -l < "$FAKE_BIN/docker.log")
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$APP_ROOT/installer/install.sh" --dry-run \
+    --config "$APP_ROOT/config/vesselstack.env" >/dev/null
+test "$(sha256sum "$AUTH_DIR/acl")" = "$acl_before"
+if tail -n +"$((log_before + 1))" "$FAKE_BIN/docker.log" | grep -Eq '^(run|pull|kill|image|compose (up|pull))'; then
+    echo 'Preflight ran or pulled a container or signalled the broker' >&2
+    exit 1
+fi
 test ! -e "$APP_ROOT/config/displays.secrets.json"
 
 echo "clean installation checks passed"

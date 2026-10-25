@@ -54,15 +54,16 @@ fi
 if [ "${1:-}" = run ]; then
     for argument in "$@"; do
         case "$argument" in
-            *:/mosquitto/data)
-                host_path=${argument%:/mosquitto/data}
-                install -d "$host_path"
-                # Emulate the hashing container: promote passwords.new.
+            *:/auth)
+                host_path=${argument%:/auth}
+                # Emulate the hashing container: promote passwords.new as 1883:1883 0600.
                 if [ -f "$host_path/passwords.new" ]; then
                     mv -f "$host_path/passwords.new" "$host_path/passwords"
                 else
                     printf 'test-password-file\n' > "$host_path/passwords"
                 fi
+                chmod 0600 "$host_path/passwords"
+                if [ "$(id -u)" -eq 0 ]; then chown 1883:1883 "$host_path/passwords"; fi
                 ;;
         esac
     done
@@ -100,21 +101,33 @@ grep -q 'installed: 1.3.0' <<<"$version_output"
 grep -q 'Boat Chat service' <<<"$status_output"
 grep -q '^prometheus[[:space:]]\+healthy$' <<<"$status_output"
 run_ctl start
-test -s "$DATA_ROOT/mosquitto/passwords" || {
+AUTH_DIR="$APP_ROOT/config/mosquitto-auth"
+test -s "$AUTH_DIR/passwords" || {
     echo 'Lifecycle start did not create the MQTT password file' >&2
     exit 1
 }
-test -s "$DATA_ROOT/mosquitto/acl" || {
+test -s "$AUTH_DIR/acl" || {
     echo 'Lifecycle start did not create the MQTT ACL file' >&2
     exit 1
 }
-grep -qx 'user test-user' "$DATA_ROOT/mosquitto/acl"
-grep -q '^topic readwrite #$' "$DATA_ROOT/mosquitto/acl"
-if grep -q 'vsdisp-\|vesselstack-bridge' "$DATA_ROOT/mosquitto/acl"; then
+grep -qx 'user test-user' "$AUTH_DIR/acl"
+grep -q '^topic readwrite #$' "$AUTH_DIR/acl"
+if grep -q 'vsdisp-\|vesselstack-bridge' "$AUTH_DIR/acl"; then
     echo 'Displays are disabled but the ACL grants display accounts' >&2
     exit 1
 fi
-test "$(stat -c '%a' "$DATA_ROOT/mosquitto/acl" 2>/dev/null || stat -f '%Lp' "$DATA_ROOT/mosquitto/acl")" = 600
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+test "$(file_mode "$AUTH_DIR")" = 750
+test "$(file_mode "$AUTH_DIR/acl")" = 600
+test "$(file_mode "$AUTH_DIR/passwords")" = 600
+if [ "$(id -u)" -eq 0 ]; then
+    test "$(stat -c '%u:%g' "$AUTH_DIR")" = 0:1883
+    test "$(stat -c '%u:%g' "$AUTH_DIR/acl")" = 1883:1883
+    test "$(stat -c '%u:%g' "$AUTH_DIR/passwords")" = 1883:1883
+fi
+# Root-run sync never creates anything in the broker-writable data directory.
+test ! -e "$DATA_ROOT/mosquitto/acl"
+test ! -e "$DATA_ROOT/mosquitto/passwords"
 grep -q 'RESULT healthy' <<<"$doctor_output"
 
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"

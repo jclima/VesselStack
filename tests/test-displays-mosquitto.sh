@@ -1,7 +1,11 @@
 #!/bin/bash
 # Real-broker check of the always-on Mosquitto ACL and per-display accounts.
 # Needs Docker and the pinned eclipse-mosquitto image. On Linux it must run as
-# root (sudo) so the broker-owned 1883:1883 files can be written and verified.
+# root (sudo) so the real ownership (directory root:1883 0750, files 1883:1883
+# 0600) is produced and verified by the sync code itself. On macOS (non-root) a
+# one-shot root container copies the synced files into a named Docker volume
+# with the same real ownership, and the broker mounts that volume, because macOS
+# bind mounts do not carry real uid/gid and would make the warning check vacuous.
 
 # shellcheck disable=SC2016  # $SYS topics and regexes are intentionally literal
 set -euo pipefail
@@ -23,15 +27,18 @@ BROKER="vs-acl-broker-$SUFFIX"
 TEST_ROOT=$(mktemp -d)
 ROOT="$TEST_ROOT/root"
 DATA="$TEST_ROOT/data"
-MDIR="$DATA/mosquitto"
+MDIR="$ROOT/config/mosquitto-auth"
+PDIR="$DATA/mosquitto"
 install -d -m 0755 "$ROOT/config"
 install -d -m 0750 "$DATA"
+install -d -m 0750 "$PDIR"
 install -m 0644 "$REPO_ROOT/templates/compose.yml" "$ROOT/compose.yml"
 install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto.conf"
 
 cleanup() {
     docker rm -f "$BROKER" "$BROKER-sub" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
+    [ "$IS_ROOT" -eq 1 ] || docker volume rm "$AUTH_SRC" >/dev/null 2>&1 || true
     # Files may be owned by uid 1883; remove them from inside a container if needed.
     rm -rf -- "$TEST_ROOT" 2>/dev/null || \
         docker run --rm -v "$TEST_ROOT:/t" --entrypoint /bin/sh "$IMAGE" -c 'rm -rf /t/* /t/.[!.]*' \
@@ -74,6 +81,21 @@ print(d["bridge"]["mqtt_password"] if sys.argv[2] == "bridge"
 PY
 }
 
+# Where the broker reads its auth directory from: the real directory on a root
+# (Linux) run, a volume with real ownership otherwise.
+if [ "$IS_ROOT" -eq 1 ]; then AUTH_SRC="$MDIR"; else AUTH_SRC="$BROKER-auth"; fi
+
+# Non-root hosts (macOS) cannot chown: have a root container copy the synced
+# files into the volume with the ownership install.sh produces on Linux.
+emulate_ownership() {
+    [ "$IS_ROOT" -eq 1 ] && return 0
+    docker volume create "$AUTH_SRC" >/dev/null
+    docker run --rm -v "$AUTH_SRC:/auth" -v "$MDIR:/src:ro" --entrypoint /bin/sh "$IMAGE" -c \
+        'rm -f /auth/acl /auth/passwords; cp /src/acl /src/passwords /auth/; chown 0:1883 /auth; chmod 0750 /auth; chown 1883:1883 /auth/acl /auth/passwords; chmod 0600 /auth/acl /auth/passwords' >/dev/null
+    # sync already signalled the broker before the volume was refreshed.
+    docker kill -s HUP "$BROKER" >/dev/null 2>&1 || true
+}
+
 check_files() {
     local f mode owner
     for f in acl passwords; do
@@ -84,8 +106,33 @@ check_files() {
             [ "$owner" = 1883:1883 ] || fail "$f owner is $owner"
         fi
     done
+    mode=$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$MDIR")
+    [ "$mode" = 0o750 ] || fail "auth directory mode is $mode"
+    if [ "$IS_ROOT" -eq 1 ]; then
+        owner=$(python3 -c 'import os,sys;s=os.stat(sys.argv[1]);print(f"{s.st_uid}:{s.st_gid}")' "$MDIR")
+        [ "$owner" = 0:1883 ] || fail "auth directory owner is $owner"
+    fi
     [ ! -e "$MDIR/acl.new" ] && [ ! -e "$MDIR/passwords.new" ] || fail "temp files left behind"
+    [ ! -e "$PDIR/acl" ] && [ ! -e "$PDIR/passwords" ] || fail "auth files leaked into the broker data directory"
     grep -q '^[^:]*:\$7\$' "$MDIR/passwords" || fail "passwords are not hashed"
+    pass
+}
+
+# The broker log must show no ownership warning or permission trouble for the
+# auth files ("owner is not mosquitto" becomes a hard error in future releases).
+check_broker_log() {
+    local log
+    log=$(docker logs "$BROKER" 2>&1)
+    # On macOS bind mounts the persistence database (mosquitto.db in the data
+    # directory) can always warn; there only the auth files are judged. On a
+    # real-ownership (root) run every such message fails the test.
+    local scope='/mosquitto/auth|passwords|acl'
+    [ "$IS_ROOT" -eq 1 ] && scope=.
+    if grep -Ei 'owner is not mosquitto|world readable|permission denied|unable to open' <<<"$log" \
+        | grep -Eiq "$scope"; then
+        echo "$log" >&2
+        fail "broker log shows ownership or permission problems for the auth files"
+    fi
     pass
 }
 
@@ -128,7 +175,8 @@ wait_ready() {
 start_broker() {
     docker run -d --name "$BROKER" --network "$NETWORK" \
         -v "$ROOT/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
-        -v "$MDIR:/mosquitto/data" "$IMAGE" >/dev/null
+        -v "$PDIR:/mosquitto/data" \
+        -v "$AUTH_SRC:/mosquitto/auth:ro" "$IMAGE" >/dev/null
     wait_ready
 }
 
@@ -138,9 +186,14 @@ docker network create "$NETWORK" >/dev/null
 # 1. Displays enabled: admin, bridge, two displays.
 write_displays helm aux
 sync_mqtt true
+emulate_ownership
 check_files
 [ "$(grep -c '^user ' "$MDIR/acl")" -eq 4 ] || fail "expected 4 ACL users"
 start_broker
+check_broker_log
+# The auth directory is read-only inside the broker.
+! docker exec "$BROKER" touch /mosquitto/auth/planted >/dev/null 2>&1 || fail "auth directory is writable in the broker"
+pass
 BRIDGE=vesselstack-bridge; BRIDGE_PASS=$(secret bridge)
 HELM=vsdisp-helm; HELM_PASS=$(secret display helm)
 AUX=vsdisp-aux; AUX_PASS=$(secret display aux)
@@ -151,8 +204,8 @@ expect_read "$ADMIN_USER" "$ADMIN_PASS" homeassistant/test
 expect_read "$ADMIN_USER" "$ADMIN_PASS" '$SYS/broker/version'
 
 # A passworded user that is not in the ACL gets nothing.
-docker run --rm -v "$MDIR:/mosquitto/data" --entrypoint /bin/sh "$IMAGE" -c \
-    'printf "unlisted:unlistedpw\n" > /tmp/u && chmod 600 /tmp/u && mosquitto_passwd -U /tmp/u && cat /tmp/u >> /mosquitto/data/passwords && chown 1883:1883 /mosquitto/data/passwords' >/dev/null
+docker run --rm -v "$AUTH_SRC:/auth" --entrypoint /bin/sh "$IMAGE" -c \
+    'printf "unlisted:unlistedpw\n" > /tmp/u && chmod 600 /tmp/u && mosquitto_passwd -U /tmp/u && cat /tmp/u >> /auth/passwords && chown 1883:1883 /auth/passwords && chmod 0600 /auth/passwords' >/dev/null
 docker kill -s HUP "$BROKER" >/dev/null
 sleep 1
 expect_noread unlisted unlistedpw homeassistant/test
@@ -184,6 +237,7 @@ expect_noread "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/instruments/sog
 # Add a display: sync + HUP makes the new account work with no restart.
 write_displays helm aux nav
 sync_mqtt true
+emulate_ownership
 check_files
 NAV_PASS=$(secret display nav)
 sleep 1
@@ -199,6 +253,7 @@ sleep 2
 [ "$(docker inspect -f '{{.State.Running}}' "$BROKER-sub")" = true ] || fail "subscriber did not stay connected"
 write_displays helm nav
 sync_mqtt true
+emulate_ownership
 check_files
 for _ in $(seq 1 10); do
     [ "$(docker inspect -f '{{.State.Running}}' "$BROKER-sub")" = false ] && break
@@ -207,11 +262,13 @@ done
 [ "$(docker inspect -f '{{.State.Running}}' "$BROKER-sub")" = false ] || fail "removed display stayed connected after HUP"
 pass
 expect_refused "$AUX" "$AUX_PASS"
+check_broker_log
 docker inspect -f '{{.State.Running}}' "$BROKER" | grep -qx true || fail "broker died after HUP"
 pass
 
 # Disable displays: admin only; a container restart picks up everything.
 sync_mqtt false
+emulate_ownership
 check_files
 [ "$(grep -c '^user ' "$MDIR/acl")" -eq 1 ] || fail "disabled ACL should list only the admin"
 docker restart "$BROKER" >/dev/null
@@ -219,6 +276,7 @@ wait_ready
 expect_refused "$HELM" "$HELM_PASS"
 expect_refused "$BRIDGE" "$BRIDGE_PASS"
 expect_read "$ADMIN_USER" "$ADMIN_PASS" homeassistant/test
+check_broker_log
 clear_retained homeassistant/test
 
 echo "displays mosquitto ACL checks passed ($COUNT assertions)"

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,11 +58,14 @@ class FakeRunner:
         if argv[:2] == ["docker", "run"]:
             if not self.hash_ok:
                 return subprocess.CompletedProcess(argv, 1, "", "boom")
-            mdir = Path(argv[argv.index("-v") + 1].split(":")[0])
+            mount = argv[argv.index("-v") + 1]
+            assert mount.endswith(":/auth"), mount
+            mdir = Path(mount.rsplit(":", 1)[0])
             new = mdir / "passwords.new"
             text = new.read_text()
             hashed = "".join(f"{line.split(':', 1)[0]}:$7$fake\n" for line in text.splitlines())
             new.write_text(hashed)
+            os.chmod(new, 0o600)
             os.replace(new, mdir / "passwords")
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:2] == ["docker", "inspect"]:
@@ -87,7 +91,7 @@ class MqttAuthTests(unittest.TestCase):
         (self.root / "compose.yml").write_text(
             "services:\n  mosquitto:\n    image: eclipse-mosquitto:9.9.9-alpine\n")
         self.config = self.root / "config" / "displays.json"
-        self.mdir = self.data / "mosquitto"
+        self.mdir = self.root / "config" / mqtt_auth.AUTH_DIR_NAME
 
     def env(self, enabled="true", **extra):
         values = {"MQTT_USERNAME": "homeassistant", "MQTT_PASSWORD": ADMIN_PASSWORD,
@@ -97,7 +101,8 @@ class MqttAuthTests(unittest.TestCase):
 
     def run_sync(self, runner=None, **env):
         runner = runner or FakeRunner()
-        summary = mqtt_auth.sync(self.root, self.data, self.env(**env), runner=runner, uid=None, gid=None)
+        summary = mqtt_auth.sync(self.root, self.data, self.env(**env), runner=runner,
+                                 dir_owner=None, file_owner=None)
         return summary, runner
 
     def acl(self):
@@ -188,6 +193,8 @@ class MqttAuthTests(unittest.TestCase):
         self.run_sync()
         for name in ("acl", "passwords", "acl.prev", "passwords.prev"):
             self.assertEqual((self.mdir / name).stat().st_mode & 0o777, 0o600, name)
+        self.assertEqual(self.mdir.stat().st_mode & 0o777, 0o750)
+        self.assertFalse((self.data / "mosquitto").exists())
         self.assertEqual((self.root / "config" / mqtt_auth.SECRETS_NAME).stat().st_mode & 0o777, 0o600)
         self.assertFalse((self.mdir / "acl.new").exists())
         self.assertFalse((self.mdir / "passwords.new").exists())
@@ -203,6 +210,9 @@ class MqttAuthTests(unittest.TestCase):
                 self.assertNotIn(value, " ".join(argv))
         run = next(c for c in runner.calls if c[:2] == ["docker", "run"])
         self.assertIn("eclipse-mosquitto:9.9.9-alpine", run)
+        self.assertIn(f"{self.mdir}:/auth", run)
+        self.assertIn("chown 1883:1883", run[-1])
+        self.assertIn("chmod 0600", run[-1])
         self.assertIn("mosquitto_passwd -U", run[-1])
         self.assertNotIn(" -b ", run[-1])
 
@@ -228,6 +238,143 @@ class MqttAuthTests(unittest.TestCase):
         self.config.write_text("{not json")
         with self.assertRaises(mqtt_auth.MqttAuthError):
             self.run_sync()
+
+    # --- symlink hardening ------------------------------------------------
+
+    def victim(self, text="victim\n"):
+        path = Path(self._tmp.name) / "victim"
+        path.write_text(text)
+        os.chmod(path, 0o644)
+        return path
+
+    def test_symlinked_auth_dir_refused(self):
+        target = Path(self._tmp.name) / "elsewhere"
+        target.mkdir()
+        (self.root / "config" / mqtt_auth.AUTH_DIR_NAME).symlink_to(target)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync()
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_symlinked_config_dir_refused(self):
+        real = Path(self._tmp.name) / "realconfig"
+        real.mkdir()
+        (self.root / "config").rmdir()
+        (self.root / "config").symlink_to(real)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync()
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_auth_path_that_is_a_file_refused(self):
+        (self.root / "config" / mqtt_auth.AUTH_DIR_NAME).write_text("x")
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync()
+
+    def test_symlinked_files_refused_and_target_untouched(self):
+        self.run_sync()
+        for name in ("acl", "passwords", "acl.prev", "passwords.prev",
+                     "acl.new", "passwords.new", "acl.prev.tmp"):
+            victim = self.victim()
+            link = self.mdir / name
+            existing = None
+            if link.exists() or link.is_symlink():
+                existing = link.read_bytes()
+                link.unlink()
+            link.symlink_to(victim)
+            runner = FakeRunner()
+            with self.assertRaises(mqtt_auth.MqttAuthError, msg=name):
+                self.run_sync(runner=runner)
+            self.assertEqual(victim.read_text(), "victim\n", name)
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o644, name)
+            self.assertTrue(link.is_symlink(), name)
+            self.assertFalse(any(c[:2] == ["docker", "run"] for c in runner.calls), name)
+            link.unlink()
+            if existing is not None:
+                link.write_bytes(existing)
+                os.chmod(link, 0o600)
+
+    def test_stale_regular_temp_files_are_cleaned(self):
+        self.run_sync()
+        for name in ("acl.new", "passwords.new", "acl.prev.tmp", "passwords.prev.tmp"):
+            (self.mdir / name).write_text("stale")
+        self.run_sync()
+        for name in ("acl.new", "passwords.new", "acl.prev.tmp", "passwords.prev.tmp"):
+            self.assertFalse((self.mdir / name).exists(), name)
+
+    def test_directory_as_temp_file_refused(self):
+        self.run_sync()
+        (self.mdir / "acl.new").mkdir()
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync()
+
+    def test_legacy_data_dir_files_are_left_alone(self):
+        legacy = self.data / "mosquitto"
+        legacy.mkdir(parents=True)
+        outside = self.victim()
+        for name in ("acl", "acl.prev", "acl.new", "passwords", "passwords.prev", "passwords.new"):
+            (legacy / name).symlink_to(outside) if name.endswith(".new") else \
+                (legacy / name).write_text(f"old {name}\n")
+        self.run_sync()
+        for name in ("acl", "acl.prev", "passwords", "passwords.prev"):
+            self.assertEqual((legacy / name).read_text(), f"old {name}\n")
+        self.assertTrue((legacy / "acl.new").is_symlink())
+        self.assertEqual(outside.read_text(), "victim\n")
+
+    def test_existing_auth_dir_mode_is_corrected(self):
+        self.mdir.mkdir()
+        os.chmod(self.mdir, 0o777)
+        self.run_sync()
+        self.assertEqual(self.mdir.stat().st_mode & 0o777, 0o750)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root")
+    def test_root_refuses_writable_auth_dir(self):
+        self.mdir.mkdir()
+        os.chmod(self.mdir, 0o770)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            mqtt_auth.sync(self.root, self.data, self.env(), runner=FakeRunner())
+        os.chmod(self.mdir, 0o757)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            mqtt_auth.sync(self.root, self.data, self.env(), runner=FakeRunner())
+
+    def test_writable_auth_dir_refused_when_ownership_enforced(self):
+        # Exercise the owner/mode check without root by enforcing the current uid.
+        self.mdir.mkdir()
+        os.chmod(self.mdir, 0o770)
+        info = self.mdir.stat()
+        with mock.patch.object(mqtt_auth.os, "geteuid", return_value=0, create=True), \
+                mock.patch.object(mqtt_auth.os, "fchown"):
+            with self.assertRaises(mqtt_auth.MqttAuthError):
+                mqtt_auth.sync(self.root, self.data, self.env(), runner=FakeRunner(),
+                               dir_owner=(info.st_uid, info.st_gid),
+                               file_owner=(info.st_uid, info.st_gid))
+
+    def test_missing_image_and_failed_pull_fail_before_any_write(self):
+        class Offline(FakeRunner):
+            def __call__(self, argv):
+                self.calls.append(list(argv))
+                if argv[:3] == ["docker", "image", "inspect"]:
+                    return subprocess.CompletedProcess(argv, 1, "", "")
+                if argv[:2] == ["docker", "pull"]:
+                    return subprocess.CompletedProcess(argv, 1, "", "network unreachable")
+                return super().__call__(argv)
+        runner = Offline()
+        with self.assertRaises(mqtt_auth.MqttAuthError) as ctx:
+            self.run_sync(runner=runner)
+        self.assertIn("could not be pulled", str(ctx.exception))
+        self.assertFalse(self.mdir.exists())
+        self.assertFalse((self.root / "config" / mqtt_auth.SECRETS_NAME).exists())
+        self.assertFalse(any(c[:2] == ["docker", "run"] for c in runner.calls))
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root")
+    def test_root_refuses_foreign_owned_auth_dir(self):
+        self.mdir.mkdir()
+        os.chown(self.mdir, 1234, 1234)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            mqtt_auth.sync(self.root, self.data, self.env(), runner=FakeRunner())
+
+    def test_source_never_touches_the_broker_data_directory(self):
+        source = (ROOT / "displays" / "mqtt_auth.py").read_text()
+        self.assertNotIn('"mosquitto"', source)
+        self.assertNotIn("/mosquitto/data", source)
 
     def test_image_is_read_from_compose(self):
         self.assertEqual(mqtt_auth.find_image(self.root), "eclipse-mosquitto:9.9.9-alpine")
