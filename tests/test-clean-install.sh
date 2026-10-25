@@ -14,6 +14,17 @@ install -d "$FAKE_BIN"
 
 cat > "$FAKE_BIN/docker" <<'EOF'
 #!/bin/bash
+# Emulate the Mosquitto hashing container used by displayctl sync-mqtt.
+if [ "${1:-}" = run ]; then
+    for argument in "$@"; do
+        case "$argument" in
+            *:/mosquitto/data)
+                host_path=${argument%:/mosquitto/data}
+                [ -f "$host_path/passwords.new" ] && mv -f "$host_path/passwords.new" "$host_path/passwords"
+                ;;
+        esac
+    done
+fi
 exit 0
 EOF
 cat > "$FAKE_BIN/systemctl" <<'EOF'
@@ -117,6 +128,13 @@ test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.timer"
 test -s "$APP_ROOT/control-panel/app.py"
 test -s "$APP_ROOT/installer/install.sh"
+test -s "$APP_ROOT/displays/displayctl.py"
+test -s "$APP_ROOT/displays/mqtt_auth.py"
+test -s "$APP_ROOT/installer/displays/mqtt_auth.py"
+test ! -e "$APP_ROOT/displays/__pycache__"
+grep -q 'acl_file /mosquitto/data/acl' "$APP_ROOT/config/mosquitto.conf"
+grep -q '^DISPLAYS_ENABLE=false$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^DISPLAYS_BRIDGE_MQTT_USERNAME=vesselstack-bridge$' "$APP_ROOT/config/vesselstack.env"
 test -s "$APP_ROOT/config/grafana/dashboards/system-health.json"
 test -s "$DATA_ROOT/homeassistant/blueprints/automation/vesselstack/low-battery.yaml"
 test -s "$DATA_ROOT/homeassistant/vesselstack-dashboard.example.yaml"
@@ -146,5 +164,17 @@ grep -qx 'BOAT_CHAT_PROVIDER=ollama' "$APP_ROOT/config/boat-chat.env"
 grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
     "$panel_token_before"
+
+# A render-only re-run keeps an existing broker's ACL and passwords in sync.
+install -d -m 0750 "$DATA_ROOT/mosquitto"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$APP_ROOT/installer/install.sh" \
+    --config "$APP_ROOT/config/vesselstack.env" >/dev/null
+test -s "$DATA_ROOT/mosquitto/acl"
+test -s "$DATA_ROOT/mosquitto/passwords"
+grep -qx 'user homeassistant' "$DATA_ROOT/mosquitto/acl"
+test "$(stat -c '%a:%u:%g' "$DATA_ROOT/mosquitto/acl")" = 600:1883:1883
+test "$(stat -c '%a:%u:%g' "$DATA_ROOT/mosquitto/passwords")" = 600:1883:1883
+test ! -e "$APP_ROOT/config/displays.secrets.json"
 
 echo "clean installation checks passed"

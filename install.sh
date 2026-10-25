@@ -63,6 +63,8 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
+: "${DISPLAYS_ENABLE:=false}"
+: "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -87,11 +89,18 @@ case "$INFLUXDB_CONTAINER_NAME" in
         ;;
 esac
 for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
     esac
+done
+# MQTT account names are written into the Mosquitto password and ACL files.
+for key in MQTT_USERNAME DISPLAYS_BRIDGE_MQTT_USERNAME; do
+    if ! [[ "${!key}" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+        echo "$key may contain 1-64 letters, numbers, dot, underscore, and hyphen" >&2
+        exit 1
+    fi
 done
 for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
@@ -250,7 +259,7 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
-    "$VESSELSTACK_ROOT/installer"
+    "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
@@ -264,11 +273,13 @@ tar -C "$SOURCE_ROOT/boat-chat" \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/boat-chat" -xf -
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
+tar -C "$SOURCE_ROOT/displays" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
+    | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
 # Keep a bundled, reviewed installer so the control panel can run preflight and
 # apply operations without depending on a source checkout that may be removed.
 if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
     tar -C "$SOURCE_ROOT" --exclude='__pycache__' --exclude='*.pyc' \
-        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel \
+        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel displays \
         | tar --no-same-owner -C "$VESSELSTACK_ROOT/installer" -xf -
 fi
 # The source application keeps legacy defaults for compatibility. Installed
@@ -279,7 +290,31 @@ sed -i "s/VesselStack/$BOAT_NAME/g" \
     "$VESSELSTACK_ROOT/boat-chat/telegram_bot.py"
 install -m 0644 "$SCRIPT_DIR/templates/compose.yml" "$VESSELSTACK_ROOT/compose.yml"
 install -m 0644 "$SCRIPT_DIR/templates/prometheus.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
+# Mosquitto reads this file through a single-file bind mount that never sees a
+# replaced inode, so remember whether it changed and recreate the container.
+mosquitto_conf_hash() {
+    sha256sum "$VESSELSTACK_ROOT/config/mosquitto.conf" 2>/dev/null | cut -d' ' -f1 || true
+}
+mosquitto_conf_before=$(mosquitto_conf_hash)
 install -m 0644 "$SCRIPT_DIR/templates/mosquitto.conf" "$VESSELSTACK_ROOT/config/mosquitto.conf"
+MOSQUITTO_CONF_CHANGED=0
+[ "$mosquitto_conf_before" = "$(mosquitto_conf_hash)" ] || MOSQUITTO_CONF_CHANGED=1
+
+# Render the always-on Mosquitto ACL and hashed passwords. Secrets travel in the
+# child environment only, never on a command line.
+sync_mqtt_access() {
+    PYTHONDONTWRITEBYTECODE=1 \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
+        python3 "$VESSELSTACK_ROOT/displays/displayctl.py" sync-mqtt \
+        --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA"
+}
+# Keep an existing broker's accounts consistent on render-only runs (for
+# example Control Panel apply); --start creates the data directory itself.
+if [ "$START" -eq 0 ] && [ -d "$VESSELSTACK_DATA/mosquitto" ]; then
+    sync_mqtt_access
+fi
 install -d -m 0755 "$VESSELSTACK_ROOT/config/grafana/provisioning/datasources" \
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards"
@@ -343,6 +378,8 @@ CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
 TELEMETRY_INDEXER_ENABLE
+DISPLAYS_ENABLE
+DISPLAYS_BRIDGE_MQTT_USERNAME
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
@@ -480,10 +517,11 @@ if [ "$START" -eq 1 ]; then
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
     install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
-    docker run --rm -v "$VESSELSTACK_DATA/mosquitto:/mosquitto/data" \
-        eclipse-mosquitto:2.1.2-alpine mosquitto_passwd -b -c \
-        /mosquitto/data/passwords "$MQTT_USERNAME" "$MQTT_PASSWORD"
+    sync_mqtt_access
     compose up -d
+    if [ "$MOSQUITTO_CONF_CHANGED" -eq 1 ]; then
+        compose up -d --force-recreate mosquitto
+    fi
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then

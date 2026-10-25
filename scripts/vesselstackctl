@@ -49,6 +49,21 @@ load_config() {
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
 }
 
+# Render the Mosquitto ACL and hashed passwords (admin, plus the displays bridge
+# and per-display accounts when enabled). Secrets pass through the environment.
+sync_mqtt_access() {
+    : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
+    : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
+    local displayctl="$VESSELSTACK_ROOT/displays/displayctl.py"
+    [ -r "$displayctl" ] || { echo "Missing displays tool: $displayctl" >&2; return 1; }
+    install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
+    PYTHONDONTWRITEBYTECODE=1 \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
+        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
+        python3 "$displayctl" sync-mqtt --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA"
+}
+
 start_stack() {
     local installer_scripts="$VESSELSTACK_ROOT/installer/scripts"
     if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
@@ -61,13 +76,9 @@ start_stack() {
     if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
         systemctl enable --now vesselstack-firewall.service
     fi
-    if [ ! -s "$VESSELSTACK_DATA/mosquitto/passwords" ]; then
-        : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
-        : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
-        install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
-        docker run --rm -v "$VESSELSTACK_DATA/mosquitto:/mosquitto/data" \
-            eclipse-mosquitto:2.1.2-alpine mosquitto_passwd -b -c \
-            /mosquitto/data/passwords "$MQTT_USERNAME" "$MQTT_PASSWORD"
+    if [ ! -s "$VESSELSTACK_DATA/mosquitto/passwords" ] || \
+        [ ! -s "$VESSELSTACK_DATA/mosquitto/acl" ]; then
+        sync_mqtt_access
     fi
     "${COMPOSE[@]}" up -d
     [ -x "$installer_scripts/bootstrap-influx.sh" ] || {

@@ -68,3 +68,5 @@ jobs:
       - uses: actions/checkout@v6
       - name: Start and verify observability services
         run: tests/test-service-integration.sh
+      - name: Verify Mosquitto ACL and display accounts
+        run: sudo tests/test-displays-mosquitto.sh

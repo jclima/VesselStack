@@ -8,6 +8,7 @@ Semantic Versioning.
 - Add a configured one-command application update/preview/rollback launcher.
 - Restart an active Telegram worker when its code changes and retain the restart plan for rollback.
 - Add instrument displays preview: configuration schema and validation (`displays/displayctl.py validate`), unit conversions, MQTT topic/freshness logic, and a board registry seeded with the Waveshare ESP32-S3-Touch-LCD-2.8C. Nothing is installed or wired into the stack yet.
+- Always enforce a Mosquitto ACL: the administrator account keeps full access, unlisted accounts get none, and `DISPLAYS_ENABLE=true` adds a scoped bridge account and generated per-display read-only accounts (`displayctl.py sync-mqtt`). Passwords are hashed in the pinned Mosquitto image with no secrets on a command line, `acl`/`passwords` are written as 1883:1883 mode 0600, and Mosquitto is recreated once when its configuration changes. Manually added MQTT users lose access unless added through VesselStack.
 
 ### Added
 

@@ -31,7 +31,8 @@ printf 'version one\n' > "$DATA_ROOT/state.txt"
 ln -s state.txt "$DATA_ROOT/current-state"
 install -d "$APP_ROOT/boat-chat/.venv/bin"
 ln -s /usr/bin/python3 "$APP_ROOT/boat-chat/.venv/bin/python3"
-printf 'services: {}\n' > "$APP_ROOT/compose.yml"
+printf 'services:\n  mosquitto:\n    image: eclipse-mosquitto:2.1.2-alpine\n' > "$APP_ROOT/compose.yml"
+cp -R "$REPO_ROOT/displays" "$APP_ROOT/displays"
 printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
@@ -56,7 +57,12 @@ if [ "${1:-}" = run ]; then
             *:/mosquitto/data)
                 host_path=${argument%:/mosquitto/data}
                 install -d "$host_path"
-                printf 'test-password-file\n' > "$host_path/passwords"
+                # Emulate the hashing container: promote passwords.new.
+                if [ -f "$host_path/passwords.new" ]; then
+                    mv -f "$host_path/passwords.new" "$host_path/passwords"
+                else
+                    printf 'test-password-file\n' > "$host_path/passwords"
+                fi
                 ;;
         esac
     done
@@ -98,6 +104,17 @@ test -s "$DATA_ROOT/mosquitto/passwords" || {
     echo 'Lifecycle start did not create the MQTT password file' >&2
     exit 1
 }
+test -s "$DATA_ROOT/mosquitto/acl" || {
+    echo 'Lifecycle start did not create the MQTT ACL file' >&2
+    exit 1
+}
+grep -qx 'user test-user' "$DATA_ROOT/mosquitto/acl"
+grep -q '^topic readwrite #$' "$DATA_ROOT/mosquitto/acl"
+if grep -q 'vsdisp-\|vesselstack-bridge' "$DATA_ROOT/mosquitto/acl"; then
+    echo 'Displays are disabled but the ACL grants display accounts' >&2
+    exit 1
+fi
+test "$(stat -c '%a' "$DATA_ROOT/mosquitto/acl" 2>/dev/null || stat -f '%Lp' "$DATA_ROOT/mosquitto/acl")" = 600
 grep -q 'RESULT healthy' <<<"$doctor_output"
 
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"

@@ -179,6 +179,9 @@ nano vesselstack.env
 | `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
 | `TELEMETRY_INDEXER_ENABLE` | Refresh Boat Chat's telemetry memory every five minutes |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
+| `MQTT_USERNAME`, `MQTT_PASSWORD` | Mosquitto administrator account; the username may contain letters, numbers, `.`, `_` and `-` (1-64), and a custom password must not contain `:` or leading/trailing whitespace |
+| `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
+| `DISPLAYS_BRIDGE_MQTT_USERNAME` | Bridge account name; default `vesselstack-bridge`; must differ from `MQTT_USERNAME` |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
 under `/opt/vesselstack/config/` and are not printed.
@@ -232,7 +235,9 @@ sudo systemd-analyze verify /etc/systemd/system/vesselstack-control-panel.servic
 sudo ./install.sh --config vesselstack.env --start
 ```
 
-This creates the Mosquitto password file, starts Docker services, creates the
+This creates the Mosquitto ACL and hashed password file (see
+[MQTT access control](#mqtt-access-control)), starts Docker services, recreates
+the Mosquitto container when its configuration changed, creates the
 configured InfluxDB buckets and one-minute downsample task, and starts Boat
 Chat plus each enabled worker. Allow several minutes for initial image downloads
 and Home Assistant.
@@ -252,8 +257,8 @@ sudo vesselstackctl urls
 exits nonzero when a required service or endpoint is unhealthy, so one running
 container cannot hide another that failed or stopped.
 `vesselstackctl start` is also a complete first-start path: it configures
-enabled hardware and firewall policy, creates the MQTT password file when
-missing, starts services, and idempotently provisions InfluxDB history.
+enabled hardware and firewall policy, creates the MQTT ACL and password files when
+either is missing, starts services, and idempotently provisions InfluxDB history.
 `doctor` adds dependency, Compose, free-space, service, and endpoint checks and
 finishes with either `RESULT healthy` or `RESULT attention required`. Use
 `vesselstackctl logs chat`, `logs containers`, or `logs all` for recent
@@ -472,6 +477,68 @@ continue to work while it is disabled.
 Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
 SignalK, Boat Chat, InfluxDB, and Prometheus.
 
+## MQTT access control
+
+Mosquitto always enforces an access list (`acl_file /mosquitto/data/acl`). The
+installer and `vesselstackctl start` render it, together with hashed
+passwords, through `python3 displays/displayctl.py sync-mqtt`. Passwords are
+hashed inside the pinned Mosquitto image (`mosquitto_passwd -U`) and are never
+placed on a command line.
+
+With `DISPLAYS_ENABLE=false` (the default) only the administrator account
+(`MQTT_USERNAME`) exists: it has `readwrite #` and `read $SYS/#`, so Home
+Assistant, SignalK and other existing clients that use that account keep
+working. With `DISPLAYS_ENABLE=true` these accounts are added:
+
+| Account | Read | Write |
+| --- | --- | --- |
+| `MQTT_USERNAME` (admin) | `#`, `$SYS/#` | `#` |
+| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/bridge/#` |
+| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
+
+Display accounts are read-only for instrument data and cannot read other MQTT
+topics such as `homeassistant/#`. Any other MQTT account is granted nothing.
+
+Operational notes:
+
+- Bridge and display passwords are generated once (`secrets.token_urlsafe(32)`)
+  into `$VESSELSTACK_ROOT/config/displays.secrets.json` (mode 0600) and are
+  reused on every later run; this file is inside the backed-up `config/`
+  directory, so treat backups as secrets. Credentials of a display removed from
+  `displays.json` stop working immediately but remain in that file (so a
+  temporarily broken or missing `displays.json` cannot destroy them); delete
+  the entry by hand to retire it permanently. With displays enabled and no
+  `displays.json`, only the admin and bridge accounts exist.
+- The broker reads `acl` and `passwords` as uid/gid 1883. Both must be owned
+  `1883:1883` with mode `0600`; the tool sets this (it must run as root), keeps
+  `acl.prev` and `passwords.prev` copies, and signals the running broker to
+  reload (`SIGHUP`), which also disconnects removed accounts. A root-owned
+  password file prevents the broker from starting.
+- Upgrade impact: the first `install.sh --start`, `vesselstackctl update` or
+  any other run that starts the stack recreates the Mosquitto container once
+  (a brief MQTT interruption) so the new configuration takes effect. A
+  render-only `install.sh` run updates the ACL and passwords but the broker
+  enforces the ACL only after it is recreated.
+- Manually added MQTT users are not preserved: `install.sh --start` and
+  `vesselstackctl update` rebuild the password file from `MQTT_USERNAME` and the
+  displays accounts, and any account not in the ACL has no access. Add other
+  clients by sharing the administrator account or extend VesselStack.
+- Accounts are rebuilt when you change `DISPLAYS_ENABLE`, the bridge name or
+  `displays.json` and run `sudo ./install.sh --config ... --start` (a
+  render-only run also syncs when the broker data directory exists). Names must
+  match `[A-Za-z0-9_.-]{1,64}` and cannot collide; invalid input or a hashing
+  failure aborts with an error and leaves the previous live files in place.
+  An existing `MQTT_PASSWORD` containing `:` or leading/trailing spaces is
+  rejected because `mosquitto_passwd` would store a different password; change
+  it in the Control Panel first.
+- Rollback: set `DISPLAYS_ENABLE=false` and run `sudo ./install.sh --config
+  ... --start`; the ACL returns to administrator-only. Downgrading to a release
+  without this feature: its installer recreates an administrator-only password
+  file and its Mosquitto configuration has no `acl_file`, so a leftover `acl`
+  file is ignored; `displays.secrets.json` is left in place.
+- Verify with `sudo tests/test-displays-mosquitto.sh` (real broker in Docker)
+  and `python3 -m unittest discover -s tests -p 'test_displays*.py'`.
+
 ## Instrument displays (preview)
 
 VesselStack is gaining configurable live-instrument displays: small ESP32 touch
@@ -480,12 +547,14 @@ so on) on pages you define. The first board is the Waveshare
 ESP32-S3-Touch-LCD-2.8C, planned to run ESPHome with LVGL. The board registry
 and page layouts are data, so more boards and layouts can be added later.
 
-**Status: preview.** Only the configuration schema, validation, unit
-conversions, the MQTT topic/payload and freshness logic, and the board registry
-exist today (`displays/`). Nothing is installed, started, firewalled or wired
-into `install.sh`, `vesselstackctl`, Mosquitto or Compose yet, and no firmware
-is built. There is no operational impact on an existing installation. Rollback
-is simply removing the `displays/` directory.
+**Status: preview.** The configuration schema, validation, unit conversions,
+the MQTT topic/payload and freshness logic, the board registry and the MQTT
+account/ACL provisioning (`displayctl.py sync-mqtt`, wired into `install.sh` and
+`vesselstackctl`) exist today (`displays/`). The bridge service, Compose wiring
+and firmware do not exist yet, so enabling displays only creates broker accounts
+and credentials. The always-on Mosquitto ACL does affect existing installations
+(see [MQTT access control](#mqtt-access-control)). `displays/` is copied to
+`$VESSELSTACK_ROOT/displays` by the installer.
 
 ### Configuration and validation
 
@@ -743,9 +812,15 @@ Confirm SignalK and InfluxDB values in
 ### Mosquitto restarts repeatedly
 
 ```bash
-sudo test -s /opt/vesselstack-data/mosquitto/passwords
+sudo ls -ln /opt/vesselstack-data/mosquitto/
 sudo docker logs vesselstack-mosquitto --tail 100
 ```
+
+`passwords` and `acl` must both exist and be owned by `1883:1883` with mode
+`0600`. To repair them, run `sudo vesselstackctl stop`, delete the two files and
+run `sudo vesselstackctl start`, or re-run `install.sh --start`. A client that
+connects but receives nothing, or whose publishes vanish, is usually missing
+from the ACL (see [MQTT access control](#mqtt-access-control)).
 
 ### Container mount permissions fail
 
@@ -766,6 +841,7 @@ tests/test-migrations.sh
 sudo tests/test-clean-install.sh
 tests/test-image-manifests.sh
 tests/test-service-integration.sh
+sudo tests/test-displays-mosquitto.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
