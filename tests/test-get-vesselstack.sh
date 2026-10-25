@@ -57,26 +57,73 @@ EOF2
 cat > "$FAKE_BIN/apt-get" <<'EOF2'
 #!/bin/bash
 echo "apt-get $*" >> "$LOG"
-case "$*" in *docker*) touch "$TEST_ROOT/docker-installed" ;; esac
+case "$1" in
+    -s)  # simulation: "Remv" lines a test chose
+        if [ "$2" = remove ] && [ -e "$TEST_ROOT/apt-sim-remove" ]; then cat "$TEST_ROOT/apt-sim-remove"; fi ;;
+    update)
+        if [ -e "$TEST_ROOT/apt-update-fail" ]; then echo "E: Failed to fetch https://download.docker.com" >&2; exit 100; fi ;;
+    install)
+        case "$*" in
+            *docker*)
+                if [ -e "$TEST_ROOT/apt-install-fail" ]; then echo "E: Unable to locate package" >&2; exit 100; fi
+                touch "$TEST_ROOT/docker-installed"
+                # The "no docker" PATH (docker_absent) gains the docker stub once the engine is installed.
+                case "$*" in
+                    *docker-ce*)
+                        fake=$(dirname "$(readlink -f "$0")")
+                        if [ -d "$TEST_ROOT/bin-nodocker" ]; then ln -sf "$fake/docker" "$TEST_ROOT/bin-nodocker/docker"; fi ;;
+                esac ;;
+        esac ;;
+esac
 exit 0
 EOF2
 cat > "$FAKE_BIN/apt-cache" <<'EOF2'
 #!/bin/bash
-# "policy PKG": the candidate comes from $TEST_ROOT/apt-candidates lines "PKG VERSION".
+# "policy PKG": candidates come from $TEST_ROOT/apt-candidates ("PKG VERSION" lines) and, once
+# Docker's repository entry has been written, also from $TEST_ROOT/apt-candidates-repo.
 [ "$1" = policy ] || exit 1
-version=$(awk -v p="$2" '$1 == p {print $2}' "$TEST_ROOT/apt-candidates" 2>/dev/null)
+files=("$TEST_ROOT/apt-candidates")
+if [ -e "$TEST_ROOT/etc-apt/sources.list.d/docker.sources" ]; then files+=("$TEST_ROOT/apt-candidates-repo"); fi
+version=$(cat "${files[@]}" 2>/dev/null | awk -v p="$2" '$1 == p {print $2; exit}')
 printf '%s:\n  Installed: (none)\n  Candidate: %s\n' "$2" "${version:-(none)}"
 EOF2
 cat > "$FAKE_BIN/dpkg-query" <<'EOF2'
 #!/bin/bash
 pkg=${*: -1}
 if grep -qxF "$pkg" "$TEST_ROOT/missing-pkgs" 2>/dev/null; then exit 1; fi
+case "$pkg" in
+    # Docker-related packages count as installed only when a test lists them.
+    docker-ce|docker.io|docker-cli|docker-compose|docker-compose-v2|docker-doc|docker-buildx|podman-docker|containerd|runc)
+        grep -qxF "$pkg" "$TEST_ROOT/installed-pkgs" 2>/dev/null || exit 1 ;;
+esac
 printf installed
+EOF2
+cat > "$FAKE_BIN/dpkg" <<'EOF2'
+#!/bin/bash
+# Querying the architecture is read-only and is not logged (the truncation test counts logged calls).
+if [ "$1" = --print-architecture ]; then cat "$TEST_ROOT/dpkg-arch"; exit 0; fi
+echo "dpkg $*" >> "$LOG"
+exit 0
+EOF2
+cat > "$FAKE_BIN/gpg" <<'EOF2'
+#!/bin/bash
+# Prints the colon-format listing a test chose for "the downloaded key".
+echo "gpg $*" >> "$LOG"
+[ ! -e "$TEST_ROOT/gpg-unreadable" ] || exit 2
+cat "$TEST_ROOT/gpg-colons"
 EOF2
 cat > "$FAKE_BIN/docker" <<'EOF2'
 #!/bin/bash
 echo "docker $*" >> "$LOG"
-[ -e "$TEST_ROOT/docker-installed" ]
+case "$1" in
+    --version) echo "Docker version 29.9.2, build 0000000" ;;
+    info) [ ! -e "$TEST_ROOT/docker-info-fail" ] || exit 1 ;;
+    ps) if [ -e "$TEST_ROOT/docker-containers" ]; then echo abc123; fi ;;
+    volume) if [ -e "$TEST_ROOT/docker-volumes" ]; then echo vol1; fi ;;
+    compose) [ -e "$TEST_ROOT/docker-installed" ] || exit 1
+             echo "Docker Compose version $(cat "$TEST_ROOT/compose-version")" ;;
+    *) [ -e "$TEST_ROOT/docker-installed" ] ;;
+esac
 EOF2
 cat > "$FAKE_BIN/systemctl" <<'EOF2'
 #!/bin/bash
@@ -85,6 +132,12 @@ if [ "$1" = is-active ] && [ -e "$TEST_ROOT/docker-inactive" ]; then exit 3; fi
 if [ "$1" = enable ]; then rm -f "$TEST_ROOT/docker-inactive"; fi
 exit 0
 EOF2
+for tool in usermod gpasswd adduser groupadd; do
+    cat > "$FAKE_BIN/$tool" <<EOF2
+#!/bin/bash
+echo "$tool \$*" >> "\$LOG"
+EOF2
+done
 cat > "$FAKE_BIN/runuser" <<'EOF2'
 #!/bin/bash
 echo "runuser $*" >> "$LOG"
@@ -227,13 +280,32 @@ EOF2
     chmod 0644 "$TEST_ROOT/in.env"
 }
 
+DOCKER_FPR=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# set_os ID CODENAME [EXTRA os-release lines...]: the os-release file the script reads.
+set_os() {
+    local id=$1 codename=$2
+    shift 2
+    { printf 'ID=%s\nVERSION_CODENAME=%s\nPRETTY_NAME="Fake %s %s"\n' "$id" "$codename" "$id" "$codename"; printf '%s\n' "$@"; } > "$TEST_ROOT/os-release"
+}
+
 reset_state() {
     rm -rf -- "$RELEASE_BASE" "$APP_ROOT" "$LOG" "$TEST_ROOT/curl.log" "$TEST_ROOT/docker-installed" "$TEST_ROOT/docker-inactive" \
-        "$TEST_ROOT/missing-pkgs" "$TEST_ROOT/answers" "$TEST_ROOT/wizard-mode" "$TEST_ROOT/pwned-wizard" "$SERVE"/*.fail
-    printf 'docker-compose-v2 2.24.0\n' > "$TEST_ROOT/apt-candidates"
+        "$TEST_ROOT/missing-pkgs" "$TEST_ROOT/answers" "$TEST_ROOT/wizard-mode" "$TEST_ROOT/pwned-wizard" "$SERVE"/*.fail \
+        "$TEST_ROOT/etc-apt" "$TEST_ROOT/var-lib-docker" "$TEST_ROOT/installed-pkgs" "$TEST_ROOT/apt-update-fail" \
+        "$TEST_ROOT/apt-install-fail" "$TEST_ROOT/docker-info-fail" "$TEST_ROOT/docker-containers" "$TEST_ROOT/docker-volumes" \
+        "$TEST_ROOT/gpg-unreadable" "$TEST_ROOT/bin-nodocker" "$TEST_ROOT/apt-sim-remove"
+    : > "$TEST_ROOT/apt-candidates"
+    printf 'docker-ce 5:29.9.2-1~debian.12~bookworm\ndocker-compose-plugin 5.6.1-1~debian.12~bookworm\n' > "$TEST_ROOT/apt-candidates-repo"
+    : > "$TEST_ROOT/installed-pkgs"
+    printf 'arm64\n' > "$TEST_ROOT/dpkg-arch"
+    printf 'v5.6.1\n' > "$TEST_ROOT/compose-version"
+    set_os debian bookworm
+    printf 'pub:-:4096:1:8D81803C0EBFCD88:1487788586:::-:::escaESCA::::::23::0:\nfpr:::::::::%s:\nuid:-::::1487792064::B50C6A3598EE2C27B34302761B93B277BF674C93::Docker Release (CE deb) <docker@docker.com>::::::::::0:\nsub:-:4096:1:7EA0A9C3F273FCD8:1487788586:::::s::::::23:\nfpr:::::::::D3306A018370199E527AE7997EA0A9C3F273FCD8:\n' \
+        "$DOCKER_FPR" > "$TEST_ROOT/gpg-colons"
     : > "$LOG"
     touch "$TEST_ROOT/docker-installed"
     serve_tarball "$GOOD"
+    printf 'FAKE-DOCKER-KEY\n' > "$SERVE/gpg"
     write_config
 }
 
@@ -243,6 +315,9 @@ run() {  # args... (stdin is never a terminal)
     # SUDO_USER is always unset here (CI runs the test under sudo, which sets it); cases set it via EXTRA_ENV.
     env -u SUDO_USER PATH="${RUN_PATH:-$FAKE_BIN:$PATH}" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
         VESSELSTACK_VERSION="$VER" VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT=0 NO_COLOR=1 \
+        VESSELSTACK_OS_RELEASE="$TEST_ROOT/os-release" VESSELSTACK_APT_KEYRING_DIR="$TEST_ROOT/etc-apt/keyrings" \
+        VESSELSTACK_APT_SOURCES_DIR="$TEST_ROOT/etc-apt/sources.list.d" VESSELSTACK_APT_SOURCES_FILE="$TEST_ROOT/etc-apt/sources.list" \
+        VESSELSTACK_DOCKER_DATA_DIR="$TEST_ROOT/var-lib-docker" \
         ${EXTRA_ENV:+"$EXTRA_ENV"} \
         bash "$GET" --dir "$RELEASE_BASE" --base-url "https://example.invalid/releases/v$VER" "$@" \
         </dev/null >"$OUT" 2>&1 || RC=$?
@@ -580,54 +655,11 @@ expect_log "^apt-get update"
 expect_log "^apt-get install -y --no-install-recommends (.* )?jq rsync"
 expect_out "installed Debian packages"
 
-reset_state
-rm -f "$TEST_ROOT/docker-installed"
-printf '' > "$TEST_ROOT/answers"
-EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
-EXTRA_ENV=
-expect_rc 1 "no terminal and no --yes"
-expect_out "no terminal|No answer"
-refuse_log "docker.io"
-
-reset_state
-rm -f "$TEST_ROOT/docker-installed"
-printf 'y\nn\n' > "$TEST_ROOT/answers"
-EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
-EXTRA_ENV=
-expect_rc 1 "declining the Docker install"
-expect_out "Docker is required"
-refuse_log "^apt-get install .*docker"
-expect_no_release
-
-reset_state
-rm -f "$TEST_ROOT/docker-installed"
-touch "$TEST_ROOT/docker-inactive"
-run --yes --no-wizard --config "$TEST_ROOT/in.env"
-expect_rc 0 "--yes installs Docker"
-expect_log "^apt-get install -y --no-install-recommends docker-compose-v2"
-expect_log "^systemctl enable --now docker"
-
-# Debian 13 style: only docker-compose, at 2.x, is offered.
-reset_state
-rm -f "$TEST_ROOT/docker-installed"
-printf 'docker-compose 2.26.1-4\n' > "$TEST_ROOT/apt-candidates"
-run --yes --no-wizard --config "$TEST_ROOT/in.env"
-expect_rc 0 "docker-compose 2.x package"
-expect_log "^apt-get install -y --no-install-recommends docker-compose$"
-# Debian 12 style: only the v1 docker-compose exists, so point at Docker's repository.
-reset_state
-rm -f "$TEST_ROOT/docker-installed"
-printf 'docker-compose 1.29.2-3\n' > "$TEST_ROOT/apt-candidates"
-run --yes --no-wizard --config "$TEST_ROOT/in.env"
-expect_rc 1 "only Compose v1 available"
-expect_out "docker-compose-plugin"
-expect_out "docs.docker.com/engine/install/debian"
-refuse_log "^apt-get install .*docker"
-expect_no_release
-# Package selection. The default fake docker binary counts as "Docker already installed".
-# To simulate a machine without Docker the script runs under a PATH made only of the
-# stubs (minus docker) and symlinks to every host tool except docker*, because CI
-# runners ship a real docker in /usr/bin that hiding the stub would expose.
+# Docker. The default fake docker binary counts as "Docker already installed". To simulate
+# a machine without Docker the script runs under a PATH made only of the stubs (minus docker)
+# and symlinks to every host tool except docker*, because CI runners ship a real docker in
+# /usr/bin that hiding the stub would expose. (The apt-get stub puts the docker stub on that
+# PATH when docker-ce is "installed".)
 docker_absent() {
     local nodocker="$TEST_ROOT/bin-nodocker" dir tool name
     rm -rf -- "$nodocker"
@@ -647,42 +679,445 @@ docker_absent() {
     done
     ! PATH="$nodocker" command -v docker >/dev/null 2>&1 || fail_test "docker is still on the isolated PATH"
     RUN_PATH=$nodocker
+    rm -f "$TEST_ROOT/docker-installed"
 }
 docker_restore() { RUN_PATH=; }
-# Ubuntu style, no Docker: Debian/Ubuntu engine together with docker-compose-v2.
+KEYFILE="$TEST_ROOT/etc-apt/keyrings/docker.asc"
+SRCFILE="$TEST_ROOT/etc-apt/sources.list.d/docker.sources"
+# line_of REGEX: first line number in the calls log.
+line_of() { grep -nE -- "$1" "$LOG" | head -n 1 | cut -d: -f1; }
+expect_before() {  # REGEX1 REGEX2: the first call happens before the second
+    local a b
+    a=$(line_of "$1"); b=$(line_of "$2")
+    { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fail_test "/$1/ must come before /$2/ in the calls"
+}
+expect_sources() {  # URI SUITE ARCH
+    [ -f "$SRCFILE" ] || fail_test "no $SRCFILE"
+    grep -qxF "URIs: $1" "$SRCFILE" || fail_test "sources: wrong URIs ($(grep URIs "$SRCFILE"))"
+    grep -qxF "Suites: $2" "$SRCFILE" || fail_test "sources: wrong Suites"
+    grep -qxF "Architectures: $3" "$SRCFILE" || fail_test "sources: wrong Architectures"
+    grep -qxF "Components: stable" "$SRCFILE" || fail_test "sources: wrong Components"
+    grep -qxF "Signed-By: $KEYFILE" "$SRCFILE" || fail_test "sources: wrong Signed-By"
+    cmp -s "$KEYFILE" "$SERVE/gpg" || fail_test "installed key differs from the verified download"
+}
+expect_untouched_apt() {
+    [ ! -e "$KEYFILE" ] || fail_test "key must not be installed"
+    [ ! -e "$SRCFILE" ] || fail_test "repository entry must not be written"
+}
+refuse_group_change() { refuse_log "^(usermod|gpasswd|adduser|groupadd) "; }
+
+# Without --yes and without a terminal the Docker question cannot be answered.
 reset_state
 docker_absent
-printf 'docker-compose-v2 2.24.5-1\n' > "$TEST_ROOT/apt-candidates"
-run --yes --no-wizard --config "$TEST_ROOT/in.env"
+printf 'y\n' > "$TEST_ROOT/answers"   # "Continue?" only
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
 docker_restore
-expect_log "^apt-get install -y --no-install-recommends docker.io docker-compose-v2$"
-# Docker's own repository, no Docker: the whole engine comes from that repository,
-# never Debian's docker.io next to docker-compose-plugin.
+expect_rc 1 "no terminal and no --yes"
+expect_out "no terminal|No answer"
+refuse_log "^apt-get (install|remove)"
+expect_untouched_apt
+
+# Declining the Docker installation changes nothing.
 reset_state
 docker_absent
-printf 'docker-compose-plugin 2.29.1-1\ndocker-ce 5:27.0.0-1\n' > "$TEST_ROOT/apt-candidates"
-run --yes --no-wizard --config "$TEST_ROOT/in.env"
+printf 'y\nn\n' > "$TEST_ROOT/answers"   # Continue? yes, install Docker? no
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
 docker_restore
-expect_log "^apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin$"
-refuse_log "docker\.io"
-# Docker's repository lists the plugin but not docker-ce: stop with instructions.
+expect_rc 1 "declining the Docker install"
+expect_out "Docker is required"
+refuse_log "^apt-get (install|remove)"
+expect_untouched_apt
+[ ! -e "$TEST_ROOT/curl.log" ] || ! grep -q 'download.docker.com' "$TEST_ROOT/curl.log" || fail_test "nothing may be downloaded before the answer"
+expect_no_release
+
+# Fresh Raspberry Pi OS bookworm (arm64): official repository, verified key, full package set.
 reset_state
 docker_absent
-printf 'docker-compose-plugin 2.29.1-1\n' > "$TEST_ROOT/apt-candidates"
+touch "$TEST_ROOT/docker-inactive"
 run --yes --no-wizard --config "$TEST_ROOT/in.env"
 docker_restore
-expect_rc 1 "plugin without docker-ce"
-expect_out "docs.docker.com/engine/install/debian"
-refuse_log "^apt-get install .*docker"
-# Docker already present: only the missing Compose plugin is installed.
+expect_rc 0 "fresh bookworm arm64"
+expect_sources "https://download.docker.com/linux/debian" bookworm arm64
+expect_log "^apt-get update"
+expect_log "^apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin$"
+expect_before "^apt-get update" "^apt-get install -y docker-ce"
+expect_log "^gpg .*--show-keys --with-colons"
+expect_log "^systemctl enable --now docker"
+expect_before "^apt-get install -y docker-ce" "^systemctl enable --now docker"
+expect_log "^docker --version"
+expect_log "^docker compose version"
+expect_log "^docker info"
+expect_before "^systemctl enable --now docker" "^docker info"
+expect_out "signing key verified"
+expect_out "Docker Compose version v5.6.1"
+refuse_log "docker\.io|docker-compose-v2|apt-get remove"
+refuse_log "^apt-get install .*--no-install-recommends .*docker"
+refuse_group_change
+grep -qE -- "--proto '?=https'? .*https://download.docker.com/linux/debian/gpg" "$TEST_ROOT/curl.log" || fail_test "key must be fetched over https only"
+grep -qE -- "--tlsv1.2" "$TEST_ROOT/curl.log" || fail_test "key download must require TLS 1.2"
+[ ! -e "$TEST_ROOT/etc-apt/keyrings/.docker-key-verify" ] || fail_test "temporary key directory was not removed"
+expect_out "No docker group change"
+# Re-running when everything is in place is a no-op.
+: > "$LOG"
+rm -rf -- "$APP_ROOT" "$RELEASE_BASE"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "re-run after the install"
+expect_out "Docker and Docker Compose v2 are installed"
+refuse_log "^apt-get"
+
+# Raspberry Pi OS / Debian 13 (trixie).
+reset_state
+docker_absent
+set_os debian trixie
+printf 'docker-ce 5:29.9.2-1~debian.13~trixie\ndocker-compose-plugin 2.40.3-1~debian.13~trixie\n' > "$TEST_ROOT/apt-candidates-repo"
+printf 'v2.40.3\n' > "$TEST_ROOT/compose-version"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 0 "trixie"
+expect_sources "https://download.docker.com/linux/debian" trixie arm64
+expect_out "Docker Compose version v2.40.3"
+
+# Debian amd64.
+reset_state
+docker_absent
+printf 'amd64\n' > "$TEST_ROOT/dpkg-arch"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 0 "amd64"
+expect_sources "https://download.docker.com/linux/debian" bookworm amd64
+
+# Ubuntu uses Docker's ubuntu repository (and UBUNTU_CODENAME for derivatives).
+reset_state
+docker_absent
+set_os ubuntu noble
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 0 "ubuntu"
+expect_sources "https://download.docker.com/linux/ubuntu" noble arm64
+reset_state
+docker_absent
+set_os linuxmint wilma 'ID_LIKE="ubuntu debian"' 'UBUNTU_CODENAME=noble'
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 0 "ubuntu derivative"
+expect_sources "https://download.docker.com/linux/ubuntu" noble arm64
+
+# A key that does not match the pinned fingerprint is refused before anything is written.
+reset_state
+docker_absent
+sed -i 's/9DC858229FC7DD38854AE2D88D81803C0EBFCD88/0000000000000000000000000000000000000000/' "$TEST_ROOT/gpg-colons"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "fingerprint mismatch"
+expect_out "Refusing to trust the downloaded Docker key"
+expect_out "expected: $DOCKER_FPR"
+expect_out "Nothing was changed"
+refuse_log "^apt-get (install|remove|update)"
+expect_untouched_apt
+expect_no_release
+# A file holding Docker's key plus a second key is refused too (apt trusts every key in Signed-By).
+reset_state
+docker_absent
+printf 'pub:-:4096:1:AAAAAAAAAAAAAAAA:1487788586:::-:::escaESCA::::::23::0:\nfpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n' >> "$TEST_ROOT/gpg-colons"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "two keys in the file"
+expect_out "2 key\\(s\\)"
+refuse_log "^apt-get (install|remove|update)"
+expect_untouched_apt
+# Docker's key listed second (an attacker's key first) is refused as well.
+reset_state
+docker_absent
+printf 'pub:-:4096:1:AAAAAAAAAAAAAAAA:1487788586:::-:::escaESCA::::::23::0:\nfpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n%s\n' "$(cat "$TEST_ROOT/gpg-colons")" > "$TEST_ROOT/gpg-colons.new"
+mv "$TEST_ROOT/gpg-colons.new" "$TEST_ROOT/gpg-colons"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "attacker key first"
+expect_untouched_apt
+# Download and gpg failures stop cleanly.
+reset_state
+docker_absent
+touch "$SERVE/gpg.fail"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "key download fails"
+expect_out "Could not download Docker's package signing key"
+expect_out "Failing command: curl"
+expect_untouched_apt
+reset_state
+docker_absent
+touch "$TEST_ROOT/gpg-unreadable"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "gpg cannot read the key"
+expect_out "gpg could not read"
+expect_untouched_apt
+
+# 32-bit Raspberry Pi OS (armhf, even on a 64-bit kernel) is refused with reflash advice.
+reset_state
+docker_absent
+printf 'armhf\n' > "$TEST_ROOT/dpkg-arch"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "armhf"
+expect_out "32-bit Raspberry Pi OS"
+expect_out "Raspberry Pi OS \\(64-bit\\)"
+expect_out "Raspberry Pi Imager"
+expect_out "Nothing was changed"
+refuse_log "^apt-get (install|remove|update)"
+expect_untouched_apt
+[ ! -e "$TEST_ROOT/curl.log" ] || ! grep -q 'download.docker.com' "$TEST_ROOT/curl.log" || fail_test "no download for unsupported systems"
+expect_no_release
+# Other architectures and other distributions get a clear message too.
+reset_state
+docker_absent
+printf 'riscv64\n' > "$TEST_ROOT/dpkg-arch"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "unsupported architecture"
+expect_out "supports 64-bit ARM \\(arm64\\) and x86-64 \\(amd64\\)"
+reset_state
+docker_absent
+set_os kali kali-rolling 'ID_LIKE=debian'
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "unsupported Debian derivative"
+expect_out "supports Debian, Raspberry Pi OS \\(64-bit\\) and Ubuntu"
+refuse_log "^apt-get (install|remove|update)"
+
+# Conflicting unofficial packages: declined, accepted interactively, accepted with --yes.
+reset_state
+docker_absent
+printf 'docker.io\ncontainerd\nrunc\n' > "$TEST_ROOT/installed-pkgs"
+printf 'y\ny\nn\n' > "$TEST_ROOT/answers"   # Continue, install Docker, then the last question: no
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+docker_restore
+expect_rc 1 "declining the removal of conflicting packages"
+expect_out "must be removed first: docker.io containerd runc"
+expect_out "Nothing was changed"
+refuse_log "^apt-get (install|remove)"
+expect_untouched_apt
+reset_state
+docker_absent
+printf 'docker.io\ncontainerd\n' > "$TEST_ROOT/installed-pkgs"
+printf 'y\ny\ny\ny\ny\ny\n' > "$TEST_ROOT/answers"   # Continue, install Docker, remove packages, then yes to everything after
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+docker_restore
+expect_rc 0 "accepting the removal"
+expect_log "^apt-get remove -y docker.io containerd$"
+refuse_log "^apt-get purge|autoremove"
+expect_log "^apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin$"
+expect_before "^apt-get update" "^apt-get remove"
+expect_before "^apt-get remove" "^apt-get install -y docker-ce"
+expect_sources "https://download.docker.com/linux/debian" bookworm arm64
+reset_state
+docker_absent
+printf 'docker.io\ndocker-compose\npodman-docker\n' > "$TEST_ROOT/installed-pkgs"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 0 "--yes removes conflicting packages"
+expect_log "^apt-get remove -y docker.io docker-compose podman-docker$"
+expect_log "^apt-get install -y docker-ce"
+# Packages that apt would remove as a side effect are named in the question and the output.
+reset_state
+docker_absent
+printf 'runc\n' > "$TEST_ROOT/installed-pkgs"
+printf 'Remv runc [1.1.5]\nRemv podman [4.3.1]\n' > "$TEST_ROOT/apt-sim-remove"
+printf 'y\ny\nn\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+expect_rc 1 "declining the removal of dependents"
+expect_out "apt would also remove packages that depend on them: podman"
+expect_out "Remove runc \\(and, because they depend on them: podman\\)"
+refuse_log "^apt-get (install|remove) "
+expect_log "^apt-get -s remove runc$"
+printf 'y\ny\ny\ny\ny\ny\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+docker_restore
+expect_rc 0 "accepting the removal with dependents"
+expect_log "^apt-get remove -y runc$"
+expect_out "removed conflicting packages: runc \\(and dependents: podman\\)"
+# The repository does not offer docker-ce: nothing is removed.
+reset_state
+docker_absent
+printf 'docker.io\n' > "$TEST_ROOT/installed-pkgs"
+: > "$TEST_ROOT/apt-candidates-repo"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "repository without docker-ce"
+expect_out "does not offer docker-ce"
+refuse_log "^apt-get (remove|install -y docker)"
+# Conflicts while a daemon holds containers: --yes is not enough ...
+reset_state
+printf 'docker.io\n' > "$TEST_ROOT/installed-pkgs"
+rm -f "$TEST_ROOT/docker-installed"   # Compose is missing
+touch "$TEST_ROOT/docker-containers"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 1 "containers present with --yes"
+expect_out "already holds 1 container\\(s\\)"
+expect_out "--yes is not enough"
+refuse_log "^apt-get (install|remove|update)"
+expect_untouched_apt
+# ... and the same for volumes only.
+reset_state
+printf 'docker.io\n' > "$TEST_ROOT/installed-pkgs"
+rm -f "$TEST_ROOT/docker-installed"   # Compose is missing
+touch "$TEST_ROOT/docker-volumes"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 1 "volumes present with --yes"
+refuse_log "^apt-get (install|remove|update)"
+# ... but an explicit interactive confirmation proceeds (default answer is no).
+reset_state
+printf 'docker.io\n' > "$TEST_ROOT/installed-pkgs"
+rm -f "$TEST_ROOT/docker-installed"   # Compose is missing
+touch "$TEST_ROOT/docker-containers"
+printf 'y\ny\nn\n' > "$TEST_ROOT/answers"   # Continue, install Docker, then the last question: no
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+expect_rc 1 "declining with containers present"
+refuse_log "^apt-get (install|remove)"
+reset_state
+printf 'docker.io\n' > "$TEST_ROOT/installed-pkgs"
+rm -f "$TEST_ROOT/docker-installed"   # Compose is missing
+touch "$TEST_ROOT/docker-containers"
+printf 'y\ny\ny\ny\ny\ny\n' > "$TEST_ROOT/answers"   # Continue, install Docker, remove packages, then yes to everything after
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+expect_rc 0 "confirming with containers present"
+expect_log "^apt-get remove -y docker.io$"
+# A stray Compose v1 package alone is not an engine conflict, so --yes may remove it.
+reset_state
+printf 'docker-compose\n' > "$TEST_ROOT/installed-pkgs"
+rm -f "$TEST_ROOT/docker-installed"
+touch "$TEST_ROOT/docker-containers"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "docker-compose v1 removed, plugin installed"
+expect_log "^apt-get remove -y docker-compose$"
+expect_log "^apt-get install -y docker-compose-plugin$"
+refuse_log "^apt-get install -y docker-ce"
+
+# Docker present, Compose plugin missing: only the plugin is installed (candidate already known).
 reset_state
 rm -f "$TEST_ROOT/docker-installed"
-printf 'docker-compose-plugin 2.29.1-1\ndocker-ce 5:27.0.0-1\n' > "$TEST_ROOT/apt-candidates"
+printf 'docker-compose-plugin 5.6.1-1~debian.12~bookworm\n' > "$TEST_ROOT/apt-candidates"
 run --yes --no-wizard --config "$TEST_ROOT/in.env"
-expect_log "^apt-get install -y --no-install-recommends docker-compose-plugin$"
-# Package lists are refreshed even when no base package is missing.
+expect_rc 0 "plugin only"
+expect_log "^apt-get install -y docker-compose-plugin$"
+refuse_log "docker-ce|docker\.io|apt-get remove"
+expect_untouched_apt
+refuse_group_change
+# ... and the repository is set up first when apt has no candidate for the plugin.
 reset_state
 rm -f "$TEST_ROOT/docker-installed"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "plugin only after repository setup"
+expect_sources "https://download.docker.com/linux/debian" bookworm arm64
+expect_before "^apt-get update" "^apt-get install -y docker-compose-plugin"
+refuse_log "^apt-get install -y docker-ce|docker\.io"
+# Plugin missing and Docker's repository lacks it too: stop with instructions.
+reset_state
+rm -f "$TEST_ROOT/docker-installed"
+: > "$TEST_ROOT/apt-candidates-repo"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 1 "no plugin candidate"
+expect_out "does not offer docker-compose-plugin"
+refuse_log "^apt-get install -y docker"
+
+# Already satisfied: nothing is installed, downloaded or removed.
+reset_state
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "docker already satisfied"
+expect_out "Docker and Docker Compose v2 are installed"
+refuse_log "^apt-get (install|remove)"
+refuse_log "^gpg"
+expect_untouched_apt
+[ ! -e "$TEST_ROOT/curl.log" ] || ! grep -q 'download.docker.com' "$TEST_ROOT/curl.log" || fail_test "no download when Docker is satisfied"
+# ... and a stopped service is only started.
+reset_state
+touch "$TEST_ROOT/docker-inactive"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "docker installed but stopped"
+expect_log "^systemctl enable --now docker"
+refuse_log "^apt-get (install|remove)"
+
+# apt-get update fails after the repository was added: say what was left behind.
+reset_state
+docker_absent
+touch "$TEST_ROOT/apt-update-fail"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "apt-get update failure"
+expect_out "apt-get update failed after adding Docker's repository"
+expect_out "Failing command: apt-get update"
+expect_out "To undo: sudo rm "
+expect_out "$SRCFILE"
+refuse_log "^apt-get (install|remove)"
+expect_no_release
+# apt-get install fails: command and state are reported.
+reset_state
+docker_absent
+touch "$TEST_ROOT/apt-install-fail"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "apt-get install failure"
+expect_out "Failing command: apt-get install -y docker-ce"
+expect_out "Re-run this installer"
+# Compose older than v2 is rejected after the install.
+reset_state
+docker_absent
+printf 'v1.29.2\n' > "$TEST_ROOT/compose-version"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "Compose v1 after install"
+expect_out "needs Compose v2 or newer"
+
+# A leftover docker.list (the old manual instructions) is set aside, with consent.
+reset_state
+docker_absent
+install -d "$TEST_ROOT/etc-apt/sources.list.d"
+printf 'deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable\n' > "$TEST_ROOT/etc-apt/sources.list.d/docker.list"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 0 "leftover docker.list"
+[ ! -e "$TEST_ROOT/etc-apt/sources.list.d/docker.list" ] || fail_test "docker.list must be set aside"
+[ -f "$TEST_ROOT/etc-apt/sources.list.d/docker.list.vesselstack-saved" ] || fail_test "docker.list must be kept under the new name"
+expect_sources "https://download.docker.com/linux/debian" bookworm arm64
+reset_state
+docker_absent
+install -d "$TEST_ROOT/etc-apt/sources.list.d"
+printf 'deb https://download.docker.com/linux/debian bookworm stable\n' > "$TEST_ROOT/etc-apt/sources.list.d/docker.list"
+printf 'y\ny\nn\n' > "$TEST_ROOT/answers"   # Continue, install Docker, then the last question: no
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+docker_restore
+expect_rc 1 "declining to set aside docker.list"
+[ -f "$TEST_ROOT/etc-apt/sources.list.d/docker.list" ] || fail_test "docker.list must stay"
+refuse_log "^apt-get (install|remove|update)"
+expect_untouched_apt
+
+# Offline mode cannot install Docker.
+reset_state
+docker_absent
+install -d -m 0755 "$TEST_ROOT/bundle/wheelhouse"
+install -d "$TEST_ROOT/carry"
+cp "$GOOD" "$TEST_ROOT/carry/vesselstack-$VER.tar.gz"
+printf '%s  vesselstack-%s.tar.gz\n' "$GOOD_SHA" "$VER" > "$TEST_ROOT/carry/vesselstack-$VER.tar.gz.sha256"
+run --yes --offline --bundle "$TEST_ROOT/bundle" --tarball "$TEST_ROOT/carry/vesselstack-$VER.tar.gz" --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "offline without Docker"
+expect_out "cannot be installed automatically"
+refuse_log "^apt-get"
+[ ! -e "$TEST_ROOT/curl.log" ] || fail_test "offline mode must not use curl"
+rm -rf "$TEST_ROOT/bundle" "$TEST_ROOT/carry"
+
+# Package lists are refreshed when a base package is missing.
+reset_state
+printf 'rsync\n' > "$TEST_ROOT/missing-pkgs"
 run --yes --no-wizard --config "$TEST_ROOT/in.env"
 expect_log "^apt-get update"
 
