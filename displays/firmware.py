@@ -374,11 +374,21 @@ def _write_firmware_dir(dd: DisplayDir, files: dict, owner) -> None:
     os.rename(NEW_DIR, FIRMWARE_DIR, src_dir_fd=parent, dst_dir_fd=parent)
 
 
-def build(ctx, display_id: str, *, stream=default_stream_runner, statvfs=os.statvfs,
-          monotonic=time.monotonic, now=_utc_now, warn=None) -> Path:
-    """Render, compile in a one-shot container and store the firmware with a manifest."""
+def build(ctx, display_id: str, *, warn=None, **kw) -> Path:
+    """Render, compile in a one-shot container and store the firmware with a manifest.
+
+    Holds the per-display build lock from the render to the end of the rotation, so a
+    concurrent render, export, build or flash of the same display cannot delete, rename
+    or half-read what this build is working on.
+    """
     lifecycle._require_root(ctx, "build")
     warn = warn or (lambda text: print(text, file=sys.stderr))
+    with render.build_lock(ctx, display_id, notify=warn):
+        return _build_locked(ctx, display_id, warn=warn, **kw)
+
+
+def _build_locked(ctx, display_id: str, *, stream=default_stream_runner, statvfs=os.statvfs,
+                  monotonic=time.monotonic, now=_utc_now, warn) -> Path:
     image = render.pinned_image()
     rendered = render.collect(ctx, display_id)  # fails when Wi-Fi is not configured
     for message in rendered.warnings:
@@ -526,13 +536,23 @@ def staged_firmware(ctx, data: bytes, expected_sha256: str):
 
 def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = None,
           previous: bool = False, stream=default_stream_runner, lstat=os.lstat,
-          realpath=os.path.realpath) -> None:
-    """Upload the stored firmware; never compiles and never pulls an image."""
+          realpath=os.path.realpath, notify=None) -> None:
+    """Upload the stored firmware; never compiles and never pulls an image.
+
+    Holds the per-display build lock for the whole run, so a build cannot rotate the
+    firmware directories while the bytes are being verified, copied and uploaded.
+    """
     lifecycle._require_root(ctx, "flash")
     if bool(serial) == bool(ota):
         raise RenderError("choose exactly one of --serial DEVICE or --ota HOST", 2)
     device = validate_serial(serial, lstat, realpath) if serial else None
     host = validate_host(ota) if ota else None
+    with render.build_lock(ctx, display_id, notify=notify):
+        _flash_locked(ctx, display_id, device=device, host=host, previous=previous,
+                      stream=stream, serial=serial)
+
+
+def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream, serial) -> None:
     image = render.pinned_image()
     directory = PREVIOUS_DIR if previous else FIRMWARE_DIR
     name = FACTORY_NAME if serial else OTA_NAME

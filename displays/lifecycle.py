@@ -67,6 +67,7 @@ class Context:
     file_owner: tuple = mqtt_auth.FILE_OWNER
     require_root: bool = True
     lock_timeout: float = LOCK_TIMEOUT_S
+    build_lock_timeout: float = 30.0  # per-display build/flash lock (builds are long)
     image: str | None = None
     container: str = mqtt_auth.CONTAINER
     out: Callable = print

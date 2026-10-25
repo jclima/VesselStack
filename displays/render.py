@@ -18,6 +18,9 @@ Safety notes:
 """
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import gzip
 import io
 import os
@@ -27,6 +30,7 @@ import stat
 import struct
 import sys
 import tarfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -571,6 +575,103 @@ def _open_dir(parent_fd: int, name: str, label: str) -> int:
     return fd
 
 
+def _open_existing_dir(parent_fd: int, name: str, label: str):
+    """Open an existing subdirectory without following symlinks; None when it is absent."""
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RenderError(f"refusing to use {label}: it is not a plain directory")
+    return _open_dir(parent_fd, name, label)
+
+
+@contextlib.contextmanager
+def build_lock(ctx, display_id: str, create: bool = True, notify=None):
+    """Exclusive per-display lock ``build/displays/.<id>.lock`` (root, 0600, no-follow flock).
+
+    Every command that creates, replaces, reads for flashing or removes this display's
+    build directory holds it for its whole run: render and export (around write_project),
+    build (render + compile + artifact copy + rotation), flash and remove. It is separate
+    from the 10 s configuration lock; always take it FIRST and the configuration lock
+    (inside ``collect``) second. flock belongs to the open file description, so never
+    take it twice in one process: only the commands above lock, write_project does not.
+
+    Builds are long, so a waiter says so, waits up to ``ctx.build_lock_timeout`` seconds
+    and then fails with a clear message instead of blocking silently. With
+    ``create=False`` nothing is created: yields False when ``build/displays`` is absent.
+    """
+    if not schema.DISPLAY_ID.fullmatch(display_id):
+        raise RenderError("display id must match ^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$", 2)
+    notify = notify or (lambda text: print(text, file=sys.stderr))
+    try:
+        root_fd = os.open(ctx.root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise RenderError(f"cannot open {ctx.root}: {exc.strerror}") from exc
+    fds = [root_fd]
+    lock_fd = -1
+    try:
+        label = str(ctx.root / BUILD_DIR_NAME)
+        if create:
+            build_fd = _open_dir(root_fd, BUILD_DIR_NAME, label)
+        else:
+            build_fd = _open_existing_dir(root_fd, BUILD_DIR_NAME, label)
+        if build_fd is None:
+            yield False
+            return
+        fds.append(build_fd)
+        if create:
+            parent_fd = _open_dir(build_fd, "displays", label + "/displays")
+        else:
+            parent_fd = _open_existing_dir(build_fd, "displays", label + "/displays")
+        if parent_fd is None:
+            yield False
+            return
+        fds.append(parent_fd)
+        name = f".{display_id}.lock"
+        try:
+            info = os.lstat(name, dir_fd=parent_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RenderError(f"refusing to use {label}/displays/{name}: not a regular file")
+        except FileNotFoundError:
+            pass
+        try:
+            lock_fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, FILE_MODE,
+                              dir_fd=parent_fd)
+        except OSError as exc:
+            raise RenderError(f"cannot open the build lock {name}: {exc.strerror}") from exc
+        owner = mqtt_auth._owner((0, 0))
+        if owner:
+            os.fchown(lock_fd, *owner)
+        timeout = ctx.build_lock_timeout
+        deadline = time.monotonic() + timeout
+        told = False
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+            if time.monotonic() >= deadline:
+                raise RenderError(f"another build/flash for {display_id} is running (waited "
+                                  f"{timeout:g} s); try again when it has finished")
+            if not told:
+                notify(f"another build/flash for {display_id} is running; waiting up to "
+                       f"{timeout:g} s for it to finish")
+                told = True
+            time.sleep(0.1)
+        yield True
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)  # closing releases the flock
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 PROJECT_DIR = "project"
 PROJECT_NEW = "project.new"
 PROJECT_PREV = "project.prev"
@@ -734,8 +835,9 @@ def make_archive(rendered: Rendered) -> bytes:
 
 def render(ctx, display_id: str, allow_missing_wifi: bool = False, warn=None) -> Path:
     lifecycle._require_root(ctx, "render")
-    rendered = collect(ctx, display_id, allow_missing_wifi)
-    path = write_project(ctx, rendered)
+    with build_lock(ctx, display_id):
+        rendered = collect(ctx, display_id, allow_missing_wifi)
+        path = write_project(ctx, rendered)
     for message in rendered.warnings:
         (warn or ctx.out)(f"warning: {message}")
     ctx.out(str(path))
@@ -754,8 +856,9 @@ def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None,
                               "file or use --output FILE", 2)
     elif not output:
         raise RenderError("choose --output FILE or --stdout", 2)
-    rendered = collect(ctx, display_id, allow_missing_wifi)
-    write_project(ctx, rendered)
+    with build_lock(ctx, display_id):
+        rendered = collect(ctx, display_id, allow_missing_wifi)
+        write_project(ctx, rendered)
     archive = make_archive(rendered)
     emit = warn or (lambda text: print(text, file=sys.stderr))
     for message in rendered.warnings:

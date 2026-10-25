@@ -66,7 +66,7 @@ class Base(unittest.TestCase):
         return cfg
 
     def ctx(self, **kw):
-        values = dict(root=self.root, require_root=False, lock_timeout=0.3,
+        values = dict(root=self.root, require_root=False, lock_timeout=0.3, build_lock_timeout=0.3,
                       out=self.messages.append)
         values.update(kw)
         return lifecycle.Context(**values)

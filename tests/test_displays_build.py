@@ -463,6 +463,123 @@ class FlashStagingTests(ServerFlashBase):
         self.assertEqual(self.docker.streamed, [])
 
 
+class BuildLockTests(ServerFlashBase):
+    def lock(self, display="helm", **kw):
+        return render.build_lock(self.ctx(), display, notify=self.notices.append, **kw)
+
+    def setUp(self):
+        super().setUp()
+        self.notices: list = []
+
+    def test_lock_file_is_private_and_named_after_the_display(self):
+        with self.lock() as held:
+            self.assertTrue(held)
+        path = self.root / "build" / "displays" / ".helm.lock"
+        self.assertTrue(path.is_file())
+        self.assertEqual(self.mode(path), 0o600)
+
+    def test_build_flash_render_and_export_wait_then_fail_clearly(self):
+        calls = {
+            "build": lambda: firmware.build(self.ctx(), "helm", stream=self.docker.stream,
+                                            statvfs=vfs_free(50), warn=self.notices.append),
+            "flash": lambda: firmware.flash(self.ctx(), "helm", ota="192.0.2.50",
+                                            stream=self.docker.stream, notify=self.notices.append),
+            "render": lambda: render.render(self.ctx(), "helm", warn=lambda t: None),
+            "export": lambda: render.export(self.ctx(), "helm", None, True, warn=lambda t: None,
+                                            stdout=self._stream()),
+        }
+        self.docker.streamed.clear()
+        before = (self.project() / "firmware" / "manifest.json").read_bytes()
+        with self.lock():
+            for name, call in calls.items():
+                with self.assertRaises(render.RenderError, msg=name) as caught:
+                    call()
+                self.assertIn("another build/flash for helm is running", str(caught.exception), name)
+        self.assertEqual(self.docker.streamed, [])  # nothing ran while the lock was held
+        self.assertEqual((self.project() / "firmware" / "manifest.json").read_bytes(), before)
+        # the waiter said so once, up front, rather than blocking silently
+        self.assertEqual(sum("waiting up to" in n for n in self.notices if "waiting" in n), 2)
+        # and everything works again once the lock is free
+        render.render(self.ctx(), "helm", warn=lambda t: None)
+        self.flash(ota="192.0.2.50")
+
+    def _stream(self):
+        import io
+        stream = io.BytesIO()
+        stream.isatty = lambda: False
+        return stream
+
+    def test_lock_is_per_display_and_released_on_error(self):
+        with self.lock("helm"):
+            with self.lock("aux") as other:  # a different id does not block
+                self.assertTrue(other)
+        with self.assertRaises(RuntimeError):
+            with self.lock():
+                raise RuntimeError("boom")
+        with self.lock() as again:
+            self.assertTrue(again)
+
+    def test_build_releases_the_lock_after_a_failed_compile(self):
+        self.docker.compile_status = 1
+        with self.assertRaises(render.RenderError):
+            self.build()
+        with self.lock() as held:
+            self.assertTrue(held)
+
+    def test_config_lock_is_taken_inside_the_build_lock_and_released(self):
+        # A held configuration lock makes render fail on the (separate) 10 s lock, and the
+        # build lock is not left behind.
+        with lifecycle.ConfigDir(self.ctx()) as cfg_dir:
+            cfg_dir.lock()
+            with self.assertRaises(lifecycle.LifecycleError) as caught:
+                render.render(self.ctx(), "helm", warn=lambda t: None)
+            self.assertIn("another displayctl command", str(caught.exception))
+        with self.lock() as held:
+            self.assertTrue(held)
+
+    def test_a_waiter_proceeds_when_another_process_releases_the_lock(self):
+        import subprocess
+        code = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(ROOT / 'displays')!r})\n"
+            "import lifecycle, render\n"
+            f"ctx = lifecycle.Context(root=__import__('pathlib').Path({str(self.root)!r}), "
+            "require_root=False)\n"
+            "with render.build_lock(ctx, 'helm'):\n"
+            "    print('held', flush=True)\n"
+            "    time.sleep(1.0)\n")
+        holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = __import__("time").monotonic()
+        render.render(self.ctx(build_lock_timeout=10), "helm", warn=lambda t: None)
+        self.assertGreater(__import__("time").monotonic() - started, 0.3)  # it really waited
+
+    def test_symlinked_lock_file_is_refused(self):
+        displays = self.root / "build" / "displays"
+        (displays / ".helm.lock").unlink(missing_ok=True)
+        target = Path(self._tmp.name) / "victim"
+        target.write_text("keep")
+        os.symlink(target, displays / ".helm.lock")
+        with self.assertRaises(render.RenderError):
+            with self.lock():
+                pass
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_display_id_is_validated_before_it_becomes_a_file_name(self):
+        for bad in ("../x", "a/b", "Helm", ""):
+            with self.assertRaises(render.RenderError):
+                with self.lock(bad):
+                    pass
+
+    def test_no_lock_without_create_when_nothing_was_ever_built(self):
+        import shutil
+        shutil.rmtree(self.root / "build")
+        with self.lock(create=False) as held:
+            self.assertFalse(held)
+        self.assertFalse((self.root / "build").exists())
+
+
 class FlashOtaTests(ServerFlashBase):
     def test_ota_uses_host_network_and_the_stored_ota_image(self):
         self.flash(ota="192.0.2.50")
