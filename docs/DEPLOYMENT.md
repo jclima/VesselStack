@@ -23,6 +23,43 @@ the scripts in this repository; where a thing does not exist the text says so.
 Related: [INSTALLATION.md](INSTALLATION.md) (hardware and first install),
 [README.md](../README.md) (reference for every variable and command).
 
+## Simple path: one command
+
+For most people the guided installer is all that is needed, on both targets.
+The detailed runbook below is the advanced path: signing, soak, rehearsals,
+carrying bundles, rollback and the acceptance checklist.
+
+**Home lab (internet-connected Pi).** On the Pi:
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.0/get-vesselstack.sh | sudo bash
+```
+
+(`.../releases/latest/download/get-vesselstack.sh` follows the newest release.)
+It installs prerequisites, asks before installing Docker, verifies the release
+sha256 (compare it with the value recorded in section 2), runs the wizard (browser
+on the Pi, or the printed `ssh -L` tunnel), then `install.sh --dry-run`,
+`install.sh --start` and `vesselstackctl doctor`. If a VesselStack is already
+installed it offers `vesselstackctl update` (with its backup) instead of
+overwriting. You can read the script before running it: download with `curl -fsSLO`,
+read it, then `sudo bash get-vesselstack.sh`. `--yes` skips the questions.
+
+**Boat (offline Pi).** The boat has no internet, so carry the files in (section 4):
+`get-vesselstack.sh`, `vesselstack-1.4.0.tar.gz` with its `.sha256`, and the
+offline bundle (copy the bundle root-owned, `chmod -R go-w`). Install Docker and
+the apt prerequisites while the Pi still has internet (the script cannot install
+packages offline and tells you what is missing), then:
+
+```bash
+sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle \
+  --tarball /path/to/vesselstack-1.4.0.tar.gz
+```
+
+It verifies the tarball checksum and the bundle (`prepare-offline-bundle.sh
+--verify`), loads the images (`--load`) and runs the offline installer or, on an
+existing install, `vesselstackctl update --offline`. Add `--sha256 HASH` with the
+value you recorded on the home lab to pin the tarball to your own build.
+
 ## 0. Prerequisites and read-only pre-flight
 
 Run on each Pi before anything else. All **[read-only]**.

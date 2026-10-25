@@ -64,6 +64,18 @@ expected=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],
 grep -q "^$expected" "$TEST_ROOT/build.out"
 grep -q "^$expected  vesselstack-$VERSION.tar.gz$" "$TARBALL.sha256"
 
+# The bootstrap is emitted with the release version baked in, plus its sha256.
+BOOTSTRAP="$REPO/generated/get-vesselstack.sh"
+test -x "$BOOTSTRAP"
+grep -qx "DEFAULT_VERSION=\"$VERSION\"" "$BOOTSTRAP"
+test "$(tail -n 1 "$BOOTSTRAP")" = 'main "$@"'
+bash -n "$BOOTSTRAP"
+diff <(sed 's/^DEFAULT_VERSION=".*"//' "$BOOTSTRAP") \
+    <(tar -xzOf "$TARBALL" "vesselstack-$VERSION/scripts/get-vesselstack.sh" | sed 's/^DEFAULT_VERSION=".*"//') >/dev/null
+( cd "$REPO/generated" && sha256sum -c get-vesselstack.sh.sha256 >/dev/null )
+grep -q "^[0-9a-f]\{64\}  get-vesselstack.sh$" "$REPO/generated/get-vesselstack.sh.sha256"
+grep -q "get-vesselstack.sh" "$TEST_ROOT/build.out"
+
 # Strict mode refuses a dirty tracked tree.
 if VESSELSTACK_BUILD_REQUIRE_CLEAN=true "$REPO/build-package.sh" >/dev/null 2>&1; then
     echo "Strict build accepted a dirty tracked tree" >&2

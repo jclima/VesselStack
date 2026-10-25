@@ -48,6 +48,8 @@ jobs:
         run: sudo tests/test-offline-install.sh
       - name: Update launcher root-trust checks
         run: sudo tests/test-update-launcher.sh
+      - name: Guided bootstrap (get-vesselstack.sh) checks
+        run: sudo tests/test-get-vesselstack.sh
       - name: SocketCAN unit rendering checks
         run: tests/test-socketcan.sh
       - name: Release package content checks
@@ -65,6 +67,8 @@ jobs:
           ./build-package.sh
           (cd generated && sha256sum -c vesselstack-$(cat ../VERSION).tar.gz.sha256)
           test "$(awk '{print $2}' generated/vesselstack-$(cat VERSION).tar.gz.sha256)" = "vesselstack-$(cat VERSION).tar.gz"
+          (cd generated && sha256sum -c get-vesselstack.sh.sha256)
+          grep -qx "DEFAULT_VERSION=\"$(cat VERSION)\"" generated/get-vesselstack.sh
 
   service-integration:
     runs-on: ubuntu-latest

@@ -122,6 +122,35 @@ class WizardHttpTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/api/system")[0], 403)
         self.assertEqual(self.request("GET", "/api/system", None, {"X-Wizard-Token": self.TOKEN})[0], 200)
 
+    def test_exit_after_save_stops_the_server(self):
+        wizard.Handler.exit_after_save = True
+        self.addCleanup(setattr, wizard.Handler, "exit_after_save", False)
+        status, _ = self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Test"}}, self.good())
+        self.assertEqual(status, 200)
+        for _ in range(50):
+            try:
+                self.request("GET", "/api/system", None, self.good())
+            except OSError:
+                break
+            threading.Event().wait(0.1)
+        else:
+            self.fail("server still accepting connections after save")
+
+    def test_failed_save_does_not_stop_the_server(self):
+        wizard.Handler.exit_after_save = True
+        self.addCleanup(setattr, wizard.Handler, "exit_after_save", False)
+        self.assertEqual(self.request("POST", "/api/save", {"values": {"NOT_A_SETTING": "x"}}, self.good())[0], 400)
+        self.assertEqual(self.request("GET", "/api/system", None, self.good())[0], 200)
+
+    def test_save_does_not_follow_a_planted_temp_symlink(self):
+        victim = Path(self.directory.name) / "victim"
+        victim.write_text("keep")
+        os.symlink(victim, str(self.output) + ".tmp")
+        status, _ = self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Test"}}, self.good())
+        self.assertEqual(status, 200)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+
     def test_unset_token_refuses_everything(self):
         wizard.Handler.token = None
         self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good())[0], 403)
@@ -135,5 +164,26 @@ class WizardHttpTests(unittest.TestCase):
         self.assertIn("VESSELSTACK_FIREWALL_ALLOW_TCP=22", wizard.render({}))
         with self.assertRaises(ValueError): wizard.render({"VESSELSTACK_FIREWALL_STRICT": "maybe"})
         with self.assertRaises(ValueError): wizard.render({"VESSELSTACK_FIREWALL_ALLOW_TCP": "22,abc"})
+
+class WizardCommandLineTests(unittest.TestCase):
+    def test_output_and_exit_after_save_flags(self):
+        import subprocess, urllib.request, re as regex
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "custom.env"
+            process = subprocess.Popen(
+                ["python3", "-I", str(ROOT / "vesselstack-wizard.py"), "--port", "0", "--output", str(target), "--exit-after-save"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.addCleanup(process.kill)
+            banner = [process.stdout.readline() for _ in range(3)]
+            url = regex.search(r"http://127\.0\.0\.1:(\d+)", banner[0])
+            token = regex.search(r"run only\): (\S+)|this run only\): (\S+)", banner[1])
+            self.assertTrue(url and token, banner)
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{url.group(1)}/api/save", data=json.dumps({"values": {"BOAT_NAME": "Cli"}}).encode(),
+                headers={"Content-Type": "application/json", "X-Wizard-Token": token.group(1) or token.group(2)})
+            self.assertEqual(urllib.request.urlopen(request, timeout=5).status, 200)
+            self.assertEqual(process.wait(timeout=10), 0)
+            self.assertIn("BOAT_NAME=Cli", target.read_text())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
 if __name__ == "__main__": unittest.main()

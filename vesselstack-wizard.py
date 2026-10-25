@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Loopback-only first-run configuration wizard for VesselStack."""
 
-import argparse, hmac, json, os, platform, re, secrets, shlex, shutil, subprocess
+import argparse, hmac, json, os, platform, re, secrets, shlex, shutil, subprocess, threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -57,6 +57,9 @@ LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 class Handler(SimpleHTTPRequestHandler):
     # Per-run secret; set by main() (or tests). While unset, every API call is refused.
     token = None
+    # When true (--exit-after-save) the server stops after the first successful save,
+    # so a calling installer knows the wizard is finished.
+    exit_after_save = False
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(WIZARD),**kwargs)
     def log_message(self,fmt,*args): pass
     def end_headers(self):
@@ -95,15 +98,28 @@ class Handler(SimpleHTTPRequestHandler):
             size=int(self.headers.get("Content-Length","0"))
             if size>65536: raise ValueError("Request too large")
             values=json.loads(self.rfile.read(size)).get("values",{})
-            temp=OUTPUT.with_suffix(".env.tmp"); temp.write_text(render(values)); os.chmod(temp,0o600); os.replace(temp,OUTPUT)
+            text=render(values); temp=OUTPUT.with_name(OUTPUT.name+".tmp")
+            # Created 0600 from the start (never briefly world-readable) and never through a symlink.
+            try: os.unlink(temp)
+            except FileNotFoundError: pass
+            fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,"w") as handle: handle.write(text)
+            os.replace(temp,OUTPUT)
             self.reply(200,{"saved":str(OUTPUT),"next":f"sudo ./install.sh --config {OUTPUT.name} --dry-run"})
+            if type(self).exit_after_save: threading.Thread(target=self.server.shutdown,daemon=True).start()
         except (ValueError,json.JSONDecodeError,OSError,AttributeError) as exc: self.reply(400,{"error":str(exc)})
 
 def main():
-    parser=argparse.ArgumentParser(description="VesselStack first-run wizard"); parser.add_argument("--host",default="127.0.0.1",choices=["127.0.0.1","::1"]); parser.add_argument("--port",type=int,default=8088); args=parser.parse_args()
+    global OUTPUT
+    parser=argparse.ArgumentParser(description="VesselStack first-run wizard"); parser.add_argument("--host",default="127.0.0.1",choices=["127.0.0.1","::1"]); parser.add_argument("--port",type=int,default=8088)
+    parser.add_argument("--output",help="where to write the generated env file (default: vesselstack.env next to this script)")
+    parser.add_argument("--exit-after-save",action="store_true",help="stop the wizard after the configuration has been saved once")
+    args=parser.parse_args()
+    if args.output: OUTPUT=Path(args.output).resolve()
+    Handler.exit_after_save=args.exit_after_save
     Handler.token=secrets.token_urlsafe(32)
     server=ThreadingHTTPServer((args.host,args.port),Handler); shown=f"[{args.host}]" if ":" in args.host else args.host
-    print(f"VesselStack wizard: http://{shown}:{args.port}"); print(f"Wizard token (the page sends it automatically; valid for this run only): {Handler.token}"); print("Press Ctrl-C to stop.")
+    port=server.server_address[1]; print(f"VesselStack wizard: http://{shown}:{port}",flush=True); print(f"Wizard token (the page sends it automatically; valid for this run only): {Handler.token}",flush=True); print(f"Configuration will be written to: {OUTPUT}",flush=True); print("The wizard stops by itself after you save." if args.exit_after_save else "Press Ctrl-C to stop.",flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: server.server_close()

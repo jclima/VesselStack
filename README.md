@@ -19,9 +19,83 @@ acceptance checklist and known gaps. It is documentation only; it changes no
 code, configuration or runtime behaviour, so there is nothing to roll back
 beyond deleting the file.
 
-## Guided first installation
+## Quick start: one command on the Raspberry Pi
 
-After installing the OS and Docker prerequisites from the end-to-end guide:
+On a Raspberry Pi running 64-bit Raspberry Pi OS (or Debian) with internet access,
+paste this into a terminal on the Pi:
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
+```
+
+To install an exact release instead (recommended once you have tested one):
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.0/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=1.4.0 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 1.4.0
+```
+
+The guided installer explains each step in plain language and asks before it
+does anything beyond installing ordinary Debian packages:
+
+1. checks the computer (Linux, root, Debian family, 64-bit ARM; warns, does not
+   fail, on other systems), disk space, memory and internet access, and detects an
+   existing installation (an existing install is **never overwritten silently**: it
+   is offered the built-in `vesselstackctl update` upgrade, with its backup);
+2. installs the packages VesselStack needs with `apt-get` (`ca-certificates curl jq
+   openssl python3 python3-venv rsync tar gzip`; no `git`) and **asks** before
+   installing Docker and the Compose v2 plugin;
+3. downloads `vesselstack-<version>.tar.gz` and its `.sha256` from the GitHub
+   release, verifies the checksum, refuses unsafe archives (absolute or `..` paths,
+   links, devices, setuid bits) and unpacks to `/opt/vesselstack-release/<version>`,
+   owned by root and not writable by others;
+4. starts the loopback-only configuration wizard and tells you how to open it:
+   in a browser on the Pi at `http://127.0.0.1:8088`, or from your laptop with the
+   exact `ssh -L 8088:127.0.0.1:8088 USER@PI` command for this Pi; the wizard
+   closes itself when you save;
+5. shows a summary of the chosen configuration (no secrets), asks for confirmation,
+   runs `install.sh --dry-run`, then `install.sh --start`, then `vesselstackctl
+   doctor`, and prints `vesselstackctl urls`, where the generated tokens are
+   stored and the next steps. It ends with a list of everything it changed.
+
+Options (`sudo bash get-vesselstack.sh --help`): `--yes` (no questions),
+`--version X.Y.Z`, `--no-wizard --config FILE` (use an existing `vesselstack.env`),
+`--offline --bundle DIR [--tarball FILE]` (no internet, see
+[Offline install](#offline-install-no-internet-on-the-boat)), `--sha256 HASH`
+(pin the tarball to a checksum you obtained elsewhere), `--dir DIR`,
+`--wizard-port N`. Questions are read from the terminal, so the piped form works;
+without a terminal pass `--yes`. Re-running is safe: finished steps are reported
+and skipped, an already installed version just reports "nothing to do", and an
+earlier saved configuration can be reused.
+
+**What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
+root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the
+downloads) and the VesselStack release you fetch it from. The tarball's `.sha256`
+is published in the *same* release, so it protects against corruption and partial
+downloads but not against a compromised release or account: compare the printed
+sha256 with the one on the GitHub release page, or pass `--sha256`. The whole
+script is wrapped in functions and ends with a single `main "$@"` call, so a
+truncated download cannot half-run. If you prefer to read it first (recommended):
+
+```bash
+curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
+less get-vesselstack.sh
+sudo bash get-vesselstack.sh
+```
+
+The script is `scripts/get-vesselstack.sh` in this repository; each release ships
+a copy with that release's version baked in as the default, plus
+`get-vesselstack.sh.sha256`. Rollback: nothing outside the listed changes is
+touched; `sudo vesselstackctl stop` stops the services and the README's
+[uninstall](#stopping-or-removing-services) and restore sections cover the rest.
+Releases are unpacked next to each other and never deleted; remove
+`/opt/vesselstack-release/<version>` yourself when you no longer need it.
+
+## Advanced: manual guided installation
+
+Prefer to run each step yourself? After installing the OS and Docker prerequisites
+from the end-to-end guide:
 
 ```bash
 git clone https://github.com/jclima/VesselStack.git
@@ -31,15 +105,20 @@ python3 vesselstack-wizard.py
 ```
 
 Open `http://127.0.0.1:8088`, or use the SSH tunnel documented in the guide.
-The wizard prints a per-run token on start; the page it serves sends that token
+The wizard accepts `--port N`, `--output FILE` (where to write the env file) and
+`--exit-after-save` (stop after the first successful save; the one-line installer
+uses it). It prints a per-run token on start; the page it serves sends that token
 (`X-Wizard-Token`) with every API call. Requests are refused unless the `Host`
 header is `127.0.0.1`/`localhost`/`[::1]` on the bound port, any `Origin` is the
 same loopback origin, the token matches, and saves use `Content-Type:
-application/json` (this blocks cross-site form posts and DNS rebinding). Open the
+application/json` (this blocks cross-site form posts and DNS rebinding). The env
+file is created mode 600 from the start and never through a symlink. Open the
 printed URL itself; a bookmarked older page needs a reload after restarting the
 wizard. The dependency-free wizard binds only to loopback, shows relevant host
 prerequisites, and writes a complete private `vesselstack.env`. It does not
-change boot firmware, firewall rules, marine wiring, or start services.
+change boot firmware, firewall rules, marine wiring, or start services. Then run
+`sudo ./install.sh --config vesselstack.env --dry-run` and `--start` as described
+in the sections below.
 
 > [!WARNING]
 > VesselStack is not certified navigation, collision-avoidance, engine-control,
@@ -894,7 +973,12 @@ Rollback of a completed upgrade is a restore of the pre-update backup that
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on the home lab or any connected machine, carry it to the
-boat, then install without any network access:
+boat, then install without any network access. The guided installer does the
+checks, `--verify`, `--load` and install for you:
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-1.4.0.tar.gz`
+(copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
+carry media; the bundle must be root-owned and not group/world-writable, and
+packages and Docker must already be installed). The manual steps follow:
 
 ```bash
 # Connected machine (needs docker and python3 with pip). Defaults target
@@ -1062,6 +1146,7 @@ tests/test-build-package.sh
 tests/test-socketcan.sh
 sudo tests/test-offline-install.sh
 sudo tests/test-update-launcher.sh
+sudo tests/test-get-vesselstack.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -1086,6 +1171,20 @@ checkout is refused.
 
 The checksum records only the archive basename, so the archive and `.sha256`
 file can be downloaded and verified together from any directory.
+
+`./build-package.sh` also writes `generated/get-vesselstack.sh` (the committed
+`scripts/get-vesselstack.sh` with this release's version baked in as the default)
+and `generated/get-vesselstack.sh.sha256`. A GitHub release must carry exactly
+four files: `vesselstack-<version>.tar.gz`, its `.sha256`, `get-vesselstack.sh`
+and `get-vesselstack.sh.sha256`; the quick-start URLs depend on those names. The
+checklist is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#release-checklist).
+`.github/workflows/release.yml` runs only when a `vX.Y.Z` tag is pushed (never on
+pull requests), re-runs the checks and creates a **draft** release with those
+files for the maintainer to review and publish.
+`sudo tests/test-get-vesselstack.sh` covers the bootstrap (checksum mismatch,
+truncated downloads and scripts, unsafe archives, existing-install detection,
+non-root refusal, `--help`, offline and `--no-wizard --config` flows) with fake
+`curl`/`apt-get`/`docker`/`systemctl` stubs.
 
 ## Documentation policy
 

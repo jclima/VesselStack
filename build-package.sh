@@ -74,5 +74,28 @@ tar -cf - -C "$STAGE" "$PACKAGE_NAME" | gzip -n > "$OUTPUT"
     sha256_of "$PACKAGE_NAME.tar.gz" > "$PACKAGE_NAME.tar.gz.sha256"
     cat "$PACKAGE_NAME.tar.gz.sha256"
 )
+
+# The one-line bootstrap is published next to the tarball so that
+# .../releases/latest/download/get-vesselstack.sh always matches the release it
+# comes from: a copy of the committed script with this release's version baked in.
+BOOTSTRAP="$SCRIPT_DIR/generated/get-vesselstack.sh"
+sed "s/^DEFAULT_VERSION=\".*\"/DEFAULT_VERSION=\"$VERSION\"/" \
+    "$STAGE/$PACKAGE_NAME/scripts/get-vesselstack.sh" > "$BOOTSTRAP"
+chmod 0755 "$BOOTSTRAP"
+grep -qx "DEFAULT_VERSION=\"$VERSION\"" "$BOOTSTRAP" || {
+    echo "Could not bake version $VERSION into get-vesselstack.sh" >&2
+    exit 1
+}
+bash -n "$BOOTSTRAP"
+[ "$(tail -n 1 "$BOOTSTRAP")" = 'main "$@"' ] || {
+    echo "get-vesselstack.sh must end with a single main call" >&2
+    exit 1
+}
+(
+    cd "$SCRIPT_DIR/generated"
+    sha256_of get-vesselstack.sh > get-vesselstack.sh.sha256
+    cat get-vesselstack.sh.sha256
+)
 echo "commit  $COMMIT"
 echo "$OUTPUT"
+echo "$BOOTSTRAP"

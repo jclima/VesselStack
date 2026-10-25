@@ -32,6 +32,42 @@ The privacy checker prints filenames/reasons, not matched values. It is a
 heuristic guard and does not replace reviewing documentation, fixtures or history.
 Every change must update README.md as required by AGENTS.md.
 
+## Release checklist
+
+The quick-start URLs (`.../releases/latest/download/get-vesselstack.sh` and
+`.../releases/download/vX.Y.Z/get-vesselstack.sh`) only work if the GitHub release
+carries exactly these files. Nothing publishes a release for you except the
+tag-triggered workflow below, and that only creates a **draft**.
+
+1. Bump `VERSION`, `DEFAULT_VERSION` in `scripts/get-vesselstack.sh` (must equal
+   `VERSION`; `tests/test-distribution.sh` checks it), the version in the
+   README/docs examples, and `CHANGELOG.md`. Update `README.md` as AGENTS.md requires.
+2. Run the checks from a clean checkout: `python3 scripts/check-public-tree.py`,
+   `tests/test-distribution.sh`, `python3 -m unittest discover -s tests -p 'test_*.py'`,
+   and as root on Linux `tests/test-get-vesselstack.sh`, `tests/test-build-package.sh`
+   and the install/update tests listed in the README.
+3. Commit, create the signed tag (see [DEPLOYMENT.md](DEPLOYMENT.md) section 1) and
+   run `./build-package.sh` (set `VESSELSTACK_BUILD_REQUIRE_CLEAN=true`). Record
+   the printed sha256 values.
+4. Upload these four files to the GitHub release for the tag, byte for byte:
+   - `generated/vesselstack-<version>.tar.gz`
+   - `generated/vesselstack-<version>.tar.gz.sha256`
+   - `generated/get-vesselstack.sh` (default version baked in from `VERSION`)
+   - `generated/get-vesselstack.sh.sha256`
+5. Verify from a scratch directory after publishing (never run the script piped
+   into root before you have read the downloaded copy):
+   `curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v<version>/get-vesselstack.sh`,
+   `curl -fsSLO .../get-vesselstack.sh.sha256`, `sha256sum -c get-vesselstack.sh.sha256`,
+   then run it on a spare Pi with `--help` and a full lab install.
+6. Mark the release as the latest only after that works: `releases/latest/download/`
+   follows the latest published, non-draft, non-prerelease release.
+
+`.github/workflows/release.yml` automates steps 2 to 4: pushing a `vX.Y.Z` tag
+(it never runs on pull requests or branch pushes) checks that the tag equals
+`VERSION`, reruns the tests, builds, verifies the checksums and creates a draft
+release with the four files; review and publish it by hand. It does not verify
+the tag signature; do that locally before pushing the tag.
+
 ## Pull without deploying
 
 From the clean source checkout:
