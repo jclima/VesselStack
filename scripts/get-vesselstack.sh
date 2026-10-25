@@ -2,14 +2,15 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.0/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.1/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
 #   sudo bash get-vesselstack.sh
 #
 # What it does: checks the computer, installs the Debian packages VesselStack needs
-# (and asks before installing Docker), downloads the release tarball and its
+# (and asks before installing Docker Engine from Docker's official apt repository),
+# downloads the release tarball and its
 # .sha256 from the GitHub release, verifies the checksum, unpacks it root-owned,
 # runs the loopback-only configuration wizard, and then runs install.sh
 # (--dry-run first). Re-running is safe. Options: see --help.
@@ -17,13 +18,31 @@
 # The whole script is wrapped in functions and ends with a single `main "$@"`
 # line, so a truncated download cannot half-execute.
 
+# shellcheck disable=SC1090,SC1091  # os-release is read from a path (overridable for tests).
 set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="1.4.0"
+DEFAULT_VERSION="1.4.1"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
+
+# Docker Engine comes from Docker's own apt repository (https://docs.docker.com/engine/install/debian/).
+# Fingerprint of Docker's package signing key; the downloaded key must match it exactly.
+DOCKER_KEY_FPR="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+DOCKER_REPO_BASE="https://download.docker.com/linux"
+DOCKER_PACKAGES=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+# Unofficial packages that conflict with Docker's own (docs.docker.com, "Uninstall old versions"),
+# plus Debian's own docker-cli/docker-compose-v2, which ship the same files.
+DOCKER_CONFLICTS=(docker.io docker-cli docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
+# Conflicts that provide or replace the engine itself (they may be running containers).
+DOCKER_ENGINE_CONFLICTS=(docker.io docker-cli podman-docker containerd runc)
+# Locations are overridable only so the tests never touch the real system.
+OS_RELEASE_FILE=${VESSELSTACK_OS_RELEASE:-/etc/os-release}
+APT_KEYRING_DIR=${VESSELSTACK_APT_KEYRING_DIR:-/etc/apt/keyrings}
+APT_SOURCES_DIR=${VESSELSTACK_APT_SOURCES_DIR:-/etc/apt/sources.list.d}
+APT_MAIN_SOURCES=${VESSELSTACK_APT_SOURCES_FILE:-/etc/apt/sources.list}
+DOCKER_DATA_DIR=${VESSELSTACK_DOCKER_DATA_DIR:-/var/lib/docker}
 
 # Global state (set by parse_args / the steps).
 ASSUME_YES=0
@@ -54,6 +73,11 @@ ENV_FILE=
 UPGRADE=0
 PKG_MODE=apt
 APT_UPDATED=0
+DOCKER_KEY_DIR=
+DOCKER_DISTRO=
+DOCKER_CODENAME=
+DOCKER_ARCH=
+DOCKER_INSTALLED_NOW=0
 HEALTHY=1
 INSTALLED_VERSION=
 CHANGES=()
@@ -250,10 +274,307 @@ apt_candidate() {
 
 compose_ok() { command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; }
 
+# ---------------------------------------------------------------- Docker Engine
+
+# Decides which of Docker's repositories applies. Sets DOCKER_DISTRO (debian|ubuntu),
+# DOCKER_CODENAME and DOCKER_ARCH, or stops with a plain explanation. The architecture is
+# the package architecture (dpkg), not the kernel's: 32-bit Raspberry Pi OS often runs on
+# a 64-bit kernel.
+docker_platform() {
+    local id='' id_like='' codename='' ubuntu_codename=''
+    if [ -r "$OS_RELEASE_FILE" ]; then
+        id=$(. "$OS_RELEASE_FILE" && printf '%s' "${ID:-}")
+        id_like=$(. "$OS_RELEASE_FILE" && printf '%s' "${ID_LIKE:-}")
+        codename=$(. "$OS_RELEASE_FILE" && printf '%s' "${VERSION_CODENAME:-}")
+        ubuntu_codename=$(. "$OS_RELEASE_FILE" && printf '%s' "${UBUNTU_CODENAME:-}")
+    fi
+    DOCKER_ARCH=$(dpkg --print-architecture 2>/dev/null || true)
+    if [ "$DOCKER_ARCH" = armhf ] || [ "$id" = raspbian ]; then
+        die "This is 32-bit Raspberry Pi OS (package architecture '${DOCKER_ARCH:-armhf}'). VesselStack needs the 64-bit version." \
+            "Docker Engine v28 was the last major release for 32-bit Raspberry Pi OS (armhf); newer releases are 64-bit only." \
+            "(uname -m can say aarch64 on a 32-bit system; 'dpkg --print-architecture' is what counts.)" \
+            "Re-flash the card or SSD with 'Raspberry Pi OS (64-bit)' using Raspberry Pi Imager (Pi 3, 4, 5 and Zero 2 W can run it)," \
+            "restore your files and run this installer again. Nothing was changed."
+    fi
+    case "$DOCKER_ARCH" in
+        arm64|amd64) ;;
+        *) die "Docker's apt repository supports 64-bit ARM (arm64) and x86-64 (amd64); this system reports '${DOCKER_ARCH:-unknown}'." \
+               "Install Docker Engine and the Compose plugin yourself (https://docs.docker.com/engine/install/), then re-run. Nothing was changed." ;;
+    esac
+    case "$id" in
+        debian) DOCKER_DISTRO=debian; DOCKER_CODENAME=$codename ;;
+        ubuntu) DOCKER_DISTRO=ubuntu; DOCKER_CODENAME=${ubuntu_codename:-$codename} ;;
+        *)
+            case " $id_like " in
+                *" ubuntu "*) DOCKER_DISTRO=ubuntu; DOCKER_CODENAME=$ubuntu_codename ;;
+                *) die "Automatic Docker installation supports Debian, Raspberry Pi OS (64-bit) and Ubuntu; this system is '${id:-unknown}'." \
+                       "Install Docker Engine and the Compose plugin for your system (https://docs.docker.com/engine/install/), then re-run. Nothing was changed." ;;
+            esac ;;
+    esac
+    [ -n "$DOCKER_CODENAME" ] || die "Could not tell which $DOCKER_DISTRO release this is (no VERSION_CODENAME in $OS_RELEASE_FILE)." \
+        "Install Docker Engine from https://docs.docker.com/engine/install/$DOCKER_DISTRO/ and re-run. Nothing was changed."
+}
+
+# Prints what a Docker daemon here already holds ("3 containers and 1 volume"), or nothing.
+docker_data_summary() {
+    local containers=0 volumes=0
+    if command -v docker >/dev/null 2>&1 && timeout 20 docker info >/dev/null 2>&1; then
+        containers=$({ timeout 20 docker ps -aq 2>/dev/null || true; } | wc -l | tr -d ' ')
+        volumes=$({ timeout 20 docker volume ls -q 2>/dev/null || true; } | wc -l | tr -d ' ')
+    else
+        # The daemon is not running: look at what is on disk.
+        if [ -d "$DOCKER_DATA_DIR/containers" ]; then
+            containers=$(find "$DOCKER_DATA_DIR/containers" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+        fi
+        if [ -d "$DOCKER_DATA_DIR/volumes" ]; then
+            volumes=$(find "$DOCKER_DATA_DIR/volumes" -mindepth 1 -maxdepth 1 ! -name metadata.db | wc -l | tr -d ' ')
+        fi
+    fi
+    if [ "$containers" -gt 0 ] || [ "$volumes" -gt 0 ]; then
+        printf '%s container(s) and %s volume(s)' "$containers" "$volumes"
+    fi
+    return 0
+}
+
+# Lists apt source files other than ours that already use download.docker.com.
+docker_foreign_sources() {
+    local file
+    for file in "$APT_SOURCES_DIR"/*.list "$APT_SOURCES_DIR"/*.sources; do
+        [ -f "$file" ] || continue
+        [ "$file" != "$APT_SOURCES_DIR/docker.sources" ] || continue
+        if grep -qs 'download\.docker\.com' "$file"; then printf '%s\n' "$file"; fi
+    done
+    return 0
+}
+
+# Downloads Docker's signing key into a private directory and checks it before anything
+# on the system is touched. The file must hold exactly ONE key and it must be the pinned one
+# (apt trusts every key in a Signed-By file).
+docker_fetch_key() {
+    local url=$DOCKER_REPO_BASE/$DOCKER_DISTRO/gpg gpg_out pubs primary
+    require_root_controlled "$APT_KEYRING_DIR" || die "$APT_KEYRING_DIR (or a parent directory) is not root-owned, or is writable by others." \
+        "Fix its ownership and permissions, then re-run. Nothing was changed."
+    install -d -m 0755 -o root -g root "$APT_KEYRING_DIR"
+    DOCKER_KEY_DIR=$APT_KEYRING_DIR/.docker-key-verify
+    rm -rf -- "$DOCKER_KEY_DIR"
+    install -d -m 0700 -o root -g root "$DOCKER_KEY_DIR" "$DOCKER_KEY_DIR/gnupg"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o "$DOCKER_KEY_DIR/docker.asc" "$url" </dev/null \
+        || die "Could not download Docker's package signing key." \
+               "Failing command: curl --proto '=https' --tlsv1.2 -fsSL $url" \
+               "Check the internet connection and the clock, then re-run. Nothing was changed."
+    gpg_out=$(GNUPGHOME=$DOCKER_KEY_DIR/gnupg gpg --batch --no-tty --show-keys --with-colons -- "$DOCKER_KEY_DIR/docker.asc" 2>/dev/null) \
+        || die "gpg could not read the downloaded key file." \
+               "Failing command: gpg --show-keys --with-colons $DOCKER_KEY_DIR/docker.asc" \
+               "Nothing was changed."
+    pubs=$(printf '%s\n' "$gpg_out" | awk -F: '$1 == "pub" {n++} END {print n + 0}')
+    primary=$(printf '%s\n' "$gpg_out" | awk -F: '$1 == "pub" {p = 1; next} p && $1 == "fpr" {print $10; exit}')
+    if [ "$pubs" != 1 ] || [ "$primary" != "$DOCKER_KEY_FPR" ]; then
+        die "Refusing to trust the downloaded Docker key: it does not match Docker's published fingerprint." \
+            "  expected: $DOCKER_KEY_FPR" \
+            "  found:    ${primary:-none} ($pubs key(s) in the file)" \
+            "The download may have been tampered with, or Docker rotated its key. Compare with" \
+            "https://docs.docker.com/engine/install/$DOCKER_DISTRO/ before trying again. Nothing was changed."
+    fi
+    ok "Docker's signing key verified (fingerprint $DOCKER_KEY_FPR)"
+}
+
+# Installs the verified key, writes /etc/apt/sources.list.d/docker.sources (deb822, as in
+# Docker's instructions) and refreshes the package lists.
+docker_setup_repo() {
+    local keyfile=$APT_KEYRING_DIR/docker.asc srcfile=$APT_SOURCES_DIR/docker.sources foreign f
+    if ! command -v gpg >/dev/null 2>&1; then
+        apt_update_once
+        DEBIAN_FRONTEND=noninteractive apt-get install -y gpg </dev/null \
+            || die "apt-get could not install gpg, which is needed to check Docker's signing key." \
+                   "Failing command: apt-get install -y gpg" "Nothing else was changed."
+        changed "installed the Debian package gpg"
+    fi
+    if [ -f "$APT_MAIN_SOURCES" ] && grep -qs 'download\.docker\.com' "$APT_MAIN_SOURCES"; then
+        die "$APT_MAIN_SOURCES already lists download.docker.com, which would clash with the repository entry this installer writes." \
+            "Remove that line (Docker's instructions use $APT_SOURCES_DIR/docker.sources instead), then re-run. Nothing was changed."
+    fi
+    docker_fetch_key
+    foreign=$(docker_foreign_sources)
+    if [ -n "$foreign" ]; then
+        say "  Other apt source files already point at download.docker.com:"
+        while IFS= read -r f; do info "$f"; done <<<"$foreign"
+        info "A second entry with a different key makes 'apt-get update' fail, so they must be set aside."
+        ask_yn "Rename them to *.vesselstack-saved (apt ignores those; rename back to undo)?" y \
+            || die "Stopped. Nothing was changed." "Remove or disable those files yourself, then re-run."
+        while IFS= read -r f; do
+            mv -- "$f" "$f.vesselstack-saved"
+            changed "set aside $f (now $f.vesselstack-saved)"
+        done <<<"$foreign"
+    fi
+    install -d -m 0755 -o root -g root "$APT_SOURCES_DIR"
+    if ! cmp -s "$DOCKER_KEY_DIR/docker.asc" "$keyfile"; then
+        install -m 0644 -o root -g root "$DOCKER_KEY_DIR/docker.asc" "$keyfile"
+        changed "installed Docker's signing key at $keyfile"
+    fi
+    cat > "$DOCKER_KEY_DIR/docker.sources" <<SOURCES
+Types: deb
+URIs: $DOCKER_REPO_BASE/$DOCKER_DISTRO
+Suites: $DOCKER_CODENAME
+Components: stable
+Architectures: $DOCKER_ARCH
+Signed-By: $keyfile
+SOURCES
+    if ! cmp -s "$DOCKER_KEY_DIR/docker.sources" "$srcfile"; then
+        install -m 0644 -o root -g root "$DOCKER_KEY_DIR/docker.sources" "$srcfile"
+        changed "added Docker's apt repository ($srcfile: $DOCKER_DISTRO $DOCKER_CODENAME $DOCKER_ARCH)"
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get update </dev/null \
+        || die "apt-get update failed after adding Docker's repository." \
+               "Failing command: apt-get update" \
+               "Left in place: $srcfile and $keyfile (nothing else was installed or removed)." \
+               "Check the internet connection and the clock, then re-run (safe to repeat)." \
+               "To undo: sudo rm $srcfile $keyfile"
+    APT_UPDATED=1
+}
+
+# Installs Docker Engine and the Compose v2 plugin. Called only when they are not both there.
+install_docker() {
+    local conflicts=() engine_conflicts=() pkg mode data would_remove extras=() name conflicts_label=
+    local keyfile=$APT_KEYRING_DIR/docker.asc srcfile=$APT_SOURCES_DIR/docker.sources
+    local -a packages
+    docker_platform
+    for pkg in "${DOCKER_CONFLICTS[@]}"; do
+        if pkg_installed "$pkg"; then conflicts+=("$pkg"); fi
+    done
+    for pkg in "${conflicts[@]}"; do
+        case " ${DOCKER_ENGINE_CONFLICTS[*]} " in *" $pkg "*) engine_conflicts+=("$pkg") ;; esac
+    done
+    if [ "${#engine_conflicts[@]}" -gt 0 ] || ! command -v docker >/dev/null 2>&1; then
+        mode=full
+        packages=("${DOCKER_PACKAGES[@]}")
+    else
+        mode=plugin
+        packages=(docker-compose-plugin)
+    fi
+
+    say ""
+    say "  Docker Engine and the Compose v2 plugin are not both installed."
+    info "VesselStack runs Home Assistant, InfluxDB, Grafana and the other services as"
+    info "containers, so it needs them. This installs Docker's own packages from Docker's"
+    info "official apt repository, as described at https://docs.docker.com/engine/install/$DOCKER_DISTRO/:"
+    info "  - repository: $DOCKER_REPO_BASE/$DOCKER_DISTRO ($DOCKER_CODENAME, $DOCKER_ARCH), signed-by $keyfile"
+    info "  - signing key: downloaded over https and checked against fingerprint $DOCKER_KEY_FPR"
+    info "  - packages: ${packages[*]}"
+    info "  - the docker service is enabled and started"
+    info "No docker group change is made: this installer runs as root and does not need it."
+    if [ "$OFFLINE" -eq 1 ] || [ "$PKG_MODE" != apt ]; then
+        die "Docker with Compose v2 is required but missing, and it cannot be installed automatically here." \
+            "Install Docker Engine and the compose plugin (https://docs.docker.com/engine/install/$DOCKER_DISTRO/), then re-run."
+    fi
+    ask_yn "Add Docker's apt repository and install ${packages[*]} now?" y || die "Docker is required. Nothing more was changed." \
+        "Install it yourself (see docs/INSTALLATION.md) and re-run."
+
+    if [ "${#conflicts[@]}" -gt 0 ]; then
+        say ""
+        say "  These installed packages conflict with Docker's own and must be removed first: ${conflicts[*]}"
+        info "They are removed with 'apt-get remove' (not purge): images, containers and volumes"
+        info "under $DOCKER_DATA_DIR stay on disk, and Docker's engine reuses that directory."
+        # Ask apt what else would go with them (packages that depend on them).
+        would_remove=$(DEBIAN_FRONTEND=noninteractive apt-get -s remove "${conflicts[@]}" </dev/null 2>/dev/null \
+            | awk '$1 == "Remv" {print $2}' || true)
+        for name in $would_remove; do
+            case " ${conflicts[*]} " in *" $name "*) ;; *) extras+=("$name") ;; esac
+        done
+        if [ "${#extras[@]}" -gt 0 ]; then
+            warn "apt would also remove packages that depend on them: ${extras[*]}"
+            conflicts_label="${conflicts[*]} (and, because they depend on them: ${extras[*]})"
+        else
+            conflicts_label="${conflicts[*]}"
+        fi
+        data=
+        if [ "${#engine_conflicts[@]}" -gt 0 ]; then data=$(docker_data_summary); fi
+        if [ -n "$data" ]; then
+            warn "A Docker daemon on this machine already holds $data."
+            if [ "$ASSUME_YES" -eq 1 ]; then
+                die "Not removing ${conflicts[*]}: Docker here already holds $data, and --yes is not enough to remove it." \
+                    "Back up what you need, then run again from a terminal and confirm, or remove the packages yourself:" \
+                    "  sudo apt-get remove ${conflicts[*]}" \
+                    "Nothing was changed."
+            fi
+            ask_yn "Remove $conflicts_label anyway? The containers stop while Docker is replaced." n \
+                || die "Stopped. Nothing was changed." "Back up your containers first, or remove the packages yourself, then re-run."
+        else
+            ask_yn "Remove $conflicts_label now?" n \
+                || die "Docker cannot be installed next to them. Nothing was changed." \
+                       "Remove them yourself (sudo apt-get remove ${conflicts[*]}) and re-run."
+        fi
+    fi
+
+    if [ "$mode" = plugin ]; then
+        # Docker's engine is already there: add only the Compose plugin. The repository is
+        # set up first when apt does not know the package yet.
+        apt_update_once
+        if [ -z "$(apt_candidate docker-compose-plugin)" ]; then docker_setup_repo; fi
+        [ -n "$(apt_candidate docker-compose-plugin)" ] || die "Docker's repository does not offer docker-compose-plugin for $DOCKER_DISTRO $DOCKER_CODENAME ($DOCKER_ARCH)." \
+            "Install the Compose plugin as described at https://docs.docker.com/compose/install/linux/ and re-run."
+    else
+        docker_setup_repo
+        [ -n "$(apt_candidate docker-ce)" ] || die "Docker's repository is configured but does not offer docker-ce for $DOCKER_DISTRO $DOCKER_CODENAME ($DOCKER_ARCH)." \
+            "That release may not be supported yet: see https://download.docker.com/linux/$DOCKER_DISTRO/dists/" \
+            "Left in place: $srcfile and $keyfile (undo: sudo rm $srcfile $keyfile)."
+    fi
+    if [ "${#conflicts[@]}" -gt 0 ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y "${conflicts[@]}" </dev/null \
+            || die "apt-get could not remove the conflicting packages." \
+                   "Failing command: apt-get remove -y ${conflicts[*]}" \
+                   "Docker's repository is configured; nothing from it was installed. Fix the apt error above and re-run."
+        changed "removed conflicting packages: ${conflicts[*]}${extras[*]:+ (and dependents: ${extras[*]})}"
+        hash -r
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" </dev/null \
+        || die "apt-get could not install: ${packages[*]}" \
+               "Failing command: apt-get install -y ${packages[*]}" \
+               "Docker's repository is configured ($srcfile); some packages may be half-installed." \
+               "Re-run this installer (safe to repeat) or run: sudo apt-get install -f"
+    changed "installed ${packages[*]}"
+    hash -r
+    DOCKER_INSTALLED_NOW=1
+}
+
+# Starts the daemon if needed, then (after a fresh install) proves the result: docker
+# --version, Compose major version >= 2 and a daemon that answers (docker info pulls nothing).
+docker_start_and_verify() {
+    local out major i
+    if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet docker 2>/dev/null; then
+        systemctl enable --now docker </dev/null || die "Could not start the Docker service." \
+            "Failing command: systemctl enable --now docker" "Check: systemctl status docker; journalctl -u docker"
+        changed "enabled and started the docker service"
+    fi
+    [ "$DOCKER_INSTALLED_NOW" -eq 1 ] || return 0
+    out=$(docker --version 2>&1) || die "docker --version failed after the installation." "Output: $out" \
+        "Docker's packages are installed; check 'dpkg -l docker-ce docker-ce-cli' and re-run."
+    ok "$out"
+    out=$(docker compose version 2>&1) || die "docker compose version failed after the installation." "Output: $out" \
+        "Check 'dpkg -l docker-compose-plugin' (installed from $APT_SOURCES_DIR/docker.sources) and re-run."
+    major=$(printf '%s\n' "$out" | sed -nE 's/.*[Vv]ersion v?([0-9]+)\..*/\1/p' | head -n 1)
+    if [ -n "$major" ] && [ "$major" -lt 2 ]; then
+        die "Docker Compose is version $major, but VesselStack needs Compose v2 or newer." "Output: $out" \
+            "Make sure no old docker-compose package is installed, then re-run."
+    fi
+    ok "$out"
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if docker info >/dev/null 2>&1; then break; fi
+        if [ "$i" -eq 10 ]; then
+            die "The Docker daemon does not answer (docker info failed)." \
+                "Check: systemctl status docker; journalctl -u docker -n 50" \
+                "The packages are installed; fix the daemon, then re-run (safe to repeat)."
+        fi
+        sleep 1
+    done
+    ok "the Docker daemon answers (docker info)"
+}
+
 # shellcheck disable=SC2317,SC2329  # Invoked through the EXIT trap.
 cleanup() {
     if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then rm -rf -- "$STAGE"; fi
     if [ -n "$WIZARD_DIR" ] && [ -d "$WIZARD_DIR" ]; then rm -rf -- "$WIZARD_DIR"; fi
+    if [ -n "$DOCKER_KEY_DIR" ] && [ -d "$DOCKER_KEY_DIR" ]; then rm -rf -- "$DOCKER_KEY_DIR"; fi
     remove_wizard_user
 }
 
@@ -433,10 +754,10 @@ step_check_computer() {
     ok "running as root"
     local id='' id_like='' pretty='this system' arch
     # shellcheck disable=SC1091  # The system's own file.
-    if [ -r /etc/os-release ]; then
-        id=$(. /etc/os-release && printf '%s' "${ID:-}")
-        id_like=$(. /etc/os-release && printf '%s' "${ID_LIKE:-}")
-        pretty=$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-this system}")
+    if [ -r "$OS_RELEASE_FILE" ]; then
+        id=$(. "$OS_RELEASE_FILE" && printf '%s' "${ID:-}")
+        id_like=$(. "$OS_RELEASE_FILE" && printf '%s' "${ID_LIKE:-}")
+        pretty=$(. "$OS_RELEASE_FILE" && printf '%s' "${PRETTY_NAME:-this system}")
     fi
     case " $id $id_like " in
         *" debian "*|*" raspbian "*|*" ubuntu "*)
@@ -451,6 +772,11 @@ step_check_computer() {
         aarch64|arm64) ok "processor: $arch (64-bit Raspberry Pi)" ;;
         *) warn "processor is $arch. VesselStack is built and tested for 64-bit Raspberry Pi (aarch64); other CPUs are unsupported." ;;
     esac
+    # A 32-bit Raspberry Pi OS can run on a 64-bit kernel: uname says aarch64, the packages are armhf.
+    if [ "$(dpkg --print-architecture 2>/dev/null || true)" = armhf ]; then
+        warn "The installed system is 32-bit (armhf packages), even if the kernel is 64-bit."
+        warn "VesselStack needs 64-bit Raspberry Pi OS; Docker no longer publishes new Engine releases for 32-bit."
+    fi
     PKG_MODE=apt
     case " $id $id_like " in
         *" debian "*|*" raspbian "*|*" ubuntu "*) ;;
@@ -548,58 +874,15 @@ step_prerequisites() {
 
     if compose_ok; then
         ok "Docker and Docker Compose v2 are installed"
-    else
+    elif [ "$OFFLINE" -eq 1 ] || [ "$PKG_MODE" != apt ]; then
         say ""
         say "  Docker Engine and the Compose v2 plugin are not both installed."
-        info "VesselStack runs Home Assistant, InfluxDB, Grafana and the other services as"
-        info "containers, so it needs them. The Debian packages are installed with apt-get;"
-        info "this also starts the Docker service and keeps it enabled at boot."
-        if [ "$OFFLINE" -eq 1 ] || [ "$PKG_MODE" != apt ]; then
-            die "Docker with Compose v2 is required but missing, and it cannot be installed automatically here." \
-                "Install Docker Engine and the compose plugin (https://docs.docker.com/engine/install/debian/), then re-run."
-        fi
-        local packages=() candidate
-        apt_update_once
-        # Compose v2 is packaged as docker-compose-v2 (Ubuntu), docker-compose-plugin
-        # (Docker's own repository) or, from Debian 13, docker-compose at version 2.x.
-        # Debian 12 only has docker-compose 1.x, which does not work here.
-        # The engine and the plugin must come from the same source: never pair Debian's
-        # docker.io with Docker's docker-compose-plugin.
-        if [ -n "$(apt_candidate docker-compose-v2)" ]; then
-            command -v docker >/dev/null 2>&1 || packages+=(docker.io)
-            packages+=(docker-compose-v2)
-        elif [ -n "$(apt_candidate docker-compose-plugin)" ]; then
-            if ! command -v docker >/dev/null 2>&1; then
-                [ -n "$(apt_candidate docker-ce)" ] || die "Docker's apt repository is configured but docker-ce is not available from it." \
-                    "Follow the official steps at https://docs.docker.com/engine/install/debian/ and re-run."
-                packages+=(docker-ce docker-ce-cli containerd.io)
-            fi
-            packages+=(docker-compose-plugin)
-        else
-            candidate=$(apt_candidate docker-compose)
-            if [[ "$candidate" =~ ^(1:)?2\. ]]; then
-                command -v docker >/dev/null 2>&1 || packages+=(docker.io)
-                packages+=(docker-compose)
-            else
-                die "This system's package sources have no Docker Compose v2 package (Debian 12 / Raspberry Pi OS 'bookworm' only ships the old v1)." \
-                    "Install Docker Engine and the docker-compose-plugin package from Docker's own repository:" \
-                    "  https://docs.docker.com/engine/install/debian/" \
-                    "then re-run this script; it will find Docker and continue."
-            fi
-        fi
-        ask_yn "Install ${packages[*]} now?" y || die "Docker is required. Nothing more was changed." \
-            "Install it yourself (see docs/INSTALLATION.md) and re-run."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" </dev/null \
-            || die "apt-get could not install: ${packages[*]}"
-        changed "installed ${packages[*]}"
-        compose_ok || die "Docker Compose v2 still does not work (docker compose version failed)." \
-            "Install Docker Engine and the compose plugin from Docker's repository, then re-run."
-        ok "Docker and Compose v2 installed"
+        die "Docker with Compose v2 is required but missing, and it cannot be installed automatically here." \
+            "Install Docker Engine and the compose plugin (https://docs.docker.com/engine/install/debian/), then re-run."
+    else
+        install_docker
     fi
-    if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet docker 2>/dev/null; then
-        systemctl enable --now docker </dev/null || die "Could not start the Docker service." "Check: systemctl status docker"
-        changed "enabled and started the docker service"
-    fi
+    docker_start_and_verify
 }
 
 # Copies the tarball into a root-owned staging directory, verifies it there, and

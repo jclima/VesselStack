@@ -63,7 +63,10 @@ Do not build and upload files by hand.
    rehearsals. The build is reproducible on Linux (same commit, same bytes).
 6. **Manual gate (not automated): one real interactive run** of `get-vesselstack.sh`
    on a real Raspberry Pi: fresh install through the wizard with a browser, the Docker
-   step on stock bookworm, an upgrade from the previous release, and an offline
+   step on stock 64-bit Raspberry Pi OS bookworm without Docker (expect: the signing key
+   verified, `/etc/apt/sources.list.d/docker.sources` written, `docker-ce` and
+   `docker-compose-plugin` installed, `docker info` answering; check `dpkg --print-architecture`
+   says `arm64`), an upgrade from the previous release, and an offline
    upgrade. The test suites use stubs and cannot cover this. Do not publish before it
    passes.
 7. Publish the draft as a **pre-release** (or otherwise not latest) first, so

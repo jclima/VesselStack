@@ -21,25 +21,54 @@ beyond deleting the file.
 
 ## Quick start: one command on the Raspberry Pi
 
-**Stock Raspberry Pi OS bookworm (Debian 12) has no Docker Compose v2 package.**
-On a fresh bookworm image the one-liner below stops at the Docker step and tells you
-what to do; it does not install Docker for you there. Install Docker Engine and the
-Compose plugin from Docker's own apt repository first, then run the one-liner again
-(it finds Docker and continues). These are the steps from Docker's official
-documentation (<https://docs.docker.com/engine/install/debian/>, apt repository
-method; check that page for the current version before running them):
+**Docker is installed for you.** If Docker Engine with the Compose v2 plugin is missing,
+the script asks once and then follows Docker's official apt-repository instructions
+(<https://docs.docker.com/engine/install/debian/>; the Ubuntu page for Ubuntu):
+
+- it checks the system first: 64-bit Raspberry Pi OS, Debian 12 (bookworm) or 13
+  (trixie), or Ubuntu; **32-bit Raspberry Pi OS (armhf) is refused** (see below);
+- it downloads Docker's signing key over HTTPS, checks that the file holds exactly
+  one key and that its fingerprint is `9DC8 5822 9FC7 DD38 854A  E2D8 8D81 803C 0EBF CD88`,
+  and stops without changing anything if it does not match;
+- it installs the key as `/etc/apt/keyrings/docker.asc`, writes
+  `/etc/apt/sources.list.d/docker.sources` (Docker's deb822 entry for your release and
+  CPU), runs `apt-get update` and installs `docker-ce docker-ce-cli containerd.io
+  docker-buildx-plugin docker-compose-plugin`; it enables and starts the `docker`
+  service and verifies `docker --version`, `docker compose version` (v2 or newer) and
+  `docker info` (nothing is pulled);
+- if Docker is already installed but the Compose plugin is missing, only
+  `docker-compose-plugin` is added from the same repository;
+- if Docker and Compose v2 are already present, it does nothing to Docker;
+- unofficial packages that conflict with Docker's own (`docker.io`, `docker-cli`,
+  `docker-compose`, `docker-compose-v2`, `docker-doc`, `docker-buildx`,
+  `podman-docker`, `containerd`, `runc`) are **never removed silently**: the script
+  lists the ones that are installed (plus any dependent packages apt would remove with
+  them, taken from `apt-get -s remove`) and asks; `--yes` accepts. They are removed with
+  `apt-get remove` (not purge), so `/var/lib/docker` is kept. If a Docker daemon
+  already holds containers or volumes, `--yes` is not enough: the script stops, and you
+  must confirm interactively (back up first) or remove the packages yourself;
+- an older `docker.list` (the manual steps of v1.4.0) or any other apt source that
+  already points at `download.docker.com` is renamed to `*.vesselstack-saved` after
+  asking, because two entries with different keys make `apt-get update` fail;
+- no `docker` group change is made: the installer runs as root and VesselStack's
+  service account does not need Docker access;
+- `--offline` cannot install Docker; install it first while online.
+
+If a step fails, the script prints the failing command and what it left behind;
+re-running is safe. **32-bit Raspberry Pi OS:** Docker Engine v28 was the last release
+for it, so VesselStack needs 64-bit Raspberry Pi OS. Re-flash the card or SSD with
+"Raspberry Pi OS (64-bit)" in Raspberry Pi Imager (Pi 3, 4, 5 and Zero 2 W support it);
+`dpkg --print-architecture` must say `arm64` (`uname -m` can say `aarch64` on a 32-bit
+system running a 64-bit kernel).
+
+To undo the Docker part (your containers and data stay unless you delete them):
 
 ```bash
-sudo apt-get update && sudo apt-get install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+sudo apt-get remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo rm -f /etc/apt/sources.list.d/docker.sources /etc/apt/keyrings/docker.asc
+sudo apt-get update
+# optional, deletes ALL images, containers and volumes: sudo rm -rf /var/lib/docker /var/lib/containerd
 ```
-
-If Docker's repository is already configured and Docker is not installed, the script
-itself installs `docker-ce docker-ce-cli containerd.io docker-compose-plugin` (never
-Debian's `docker.io` next to Docker's plugin).
 
 On a Raspberry Pi running 64-bit Raspberry Pi OS (or Debian) with internet access,
 paste this into a terminal on the Pi:
@@ -60,9 +89,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.0/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=1.4.0 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 1.4.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.1/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=1.4.1 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 1.4.1
 ```
 
 The guided installer explains each step in plain language and asks before it
@@ -73,15 +102,12 @@ does anything beyond installing ordinary Debian packages:
    existing installation (an existing install is **never overwritten silently**: it
    is offered the built-in `vesselstackctl update` upgrade, with its backup);
 2. installs the packages VesselStack needs with `apt-get` (`ca-certificates curl jq
-   openssl python3 python3-venv rsync tar gzip`; no `git`) and **asks** before
-   installing Docker and the Compose v2 plugin (`docker.io` with `docker-compose-v2`
-   on Ubuntu, `docker-ce docker-ce-cli containerd.io docker-compose-plugin` when
-   Docker's own repository is configured, or `docker.io` with a 2.x `docker-compose`
-   on Debian 13; Debian's `docker.io` is never mixed with Docker's plugin). Debian 12 / Raspberry Pi OS bookworm packages only the old
-   Compose v1, so there the script stops with a pointer to Docker's own apt
-   repository (`docker-compose-plugin`): install Docker from
-   <https://docs.docker.com/engine/install/debian/> first, then run the
-   one-liner again; it detects Docker and continues;
+   openssl python3 python3-venv rsync tar gzip`; no `git`) and, if Docker Engine or
+   the Compose v2 plugin is missing, **asks** before adding Docker's official apt
+   repository (key fingerprint checked) and installing `docker-ce docker-ce-cli
+   containerd.io docker-buildx-plugin docker-compose-plugin` (details and undo steps in
+   the Docker box above; conflicting unofficial packages are only removed after you
+   confirm, 32-bit Raspberry Pi OS is refused);
 3. downloads `vesselstack-<version>.tar.gz` and its `.sha256` from the GitHub
    release, verifies the checksum, refuses unsafe archives (absolute or `..` paths,
    links, devices, setuid bits) and unpacks to `/opt/vesselstack-release/<version>`,
@@ -155,7 +181,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.4.0
+git checkout v1.4.1
 python3 vesselstack-wizard.py
 ```
 
@@ -258,8 +284,9 @@ sudo apt update
 sudo apt install -y ca-certificates curl git jq openssl python3 python3-venv
 ```
 
-Install Docker Engine and Compose v2 using Docker's instructions for your OS:
-<https://docs.docker.com/engine/install/>.
+Install Docker Engine and Compose v2 from Docker's official apt repository
+(<https://docs.docker.com/engine/install/debian/> for 64-bit Raspberry Pi OS and
+Debian), or let the one-line installer do it (see "Quick start" above).
 
 ```bash
 sudo docker version
@@ -293,7 +320,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.4.0
+git checkout v1.4.1
 ```
 
 ## 4. Configure the vessel
@@ -1819,7 +1846,7 @@ Rollback of a completed upgrade is a restore of the pre-update backup that
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-1.4.0.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-1.4.1.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -2012,8 +2039,14 @@ be removed with `sudo rmdir /usr/local/share/vs-test`.
 `tests/test-get-vesselstack.sh` simulates "Docker absent" by running the
 bootstrap under an isolated `PATH` made of its stubs and symlinks to every host
 tool except `docker*`, so the result no longer depends on whether the host (for
-example a GitHub runner) ships a real `docker` and Compose plugin. The product
-script gained no test hook.
+example a GitHub runner) ships a real `docker` and Compose plugin. To keep the
+tests away from the runner's real apt configuration, the bootstrap reads the
+locations it touches from `VESSELSTACK_OS_RELEASE`, `VESSELSTACK_APT_KEYRING_DIR`,
+`VESSELSTACK_APT_SOURCES_DIR`, `VESSELSTACK_APT_SOURCES_FILE` and
+`VESSELSTACK_DOCKER_DATA_DIR` (defaults: `/etc/os-release`, `/etc/apt/keyrings`,
+`/etc/apt/sources.list.d`, `/etc/apt/sources.list`, `/var/lib/docker`); they are
+test hooks and are not needed in normal use. Docker's key fingerprint is not
+overridable.
 
 ```bash
 tests/test-distribution.sh
@@ -2042,7 +2075,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.4.0.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-1.4.1.tar.gz.sha256)
 ```
 
 The package is produced by `git archive` of the committed `HEAD`, so untracked
@@ -2068,8 +2101,9 @@ pull requests), re-runs the checks and creates a **draft** release with those
 files for the maintainer to review and publish.
 `sudo tests/test-get-vesselstack.sh` covers the bootstrap (checksum mismatch,
 truncated downloads and scripts, unsafe archives, existing-install detection,
-non-root refusal, `--help`, offline and `--no-wizard --config` flows) with fake
-`curl`/`apt-get`/`docker`/`systemctl` stubs.
+non-root refusal, `--help`, offline and `--no-wizard --config` flows, and the Docker
+installation cases listed in the 1.4.1 changelog entry) with fake
+`curl`/`apt-get`/`apt-cache`/`dpkg`/`gpg`/`docker`/`systemctl` stubs.
 
 ## Documentation policy
 
