@@ -1049,7 +1049,7 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   `convert` (one named conversion), `unit` (up to 8 characters), `precision`
   (0-3), `stale_after_s` (1-3600 and at least 2 x `heartbeat_s`) and optional
   `min_interval_ms` (100-60000, default 1000).
-- A display (`^[a-z][a-z0-9-]{0,23}$`) has a `name`, a `board` from
+- A display (`^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$`: 1-24 characters, starting with a letter and not ending in a hyphen) has a `name`, a `board` from
   `displays/boards/registry.json`, optional `home_assistant_api` (boolean) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
   supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6) and

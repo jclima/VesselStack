@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -307,6 +308,25 @@ class MqttAuthTests(unittest.TestCase):
         with self.assertRaises(mqtt_auth.MqttAuthError):
             self.run_sync()
         self.assertEqual(list(target.iterdir()), [])
+
+    def test_write_atomic_refuses_symlinks(self):
+        target = Path(self._tmp.name) / "victim"
+        target.write_text("keep")
+        final = Path(self._tmp.name) / "out.json"
+        final.symlink_to(target)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            mqtt_auth.write_atomic(final, "new")
+        self.assertEqual(target.read_text(), "keep")
+        self.assertTrue(final.is_symlink())
+        final.unlink()
+        # a planted temp file symlink is replaced, never written through
+        tmp = Path(self._tmp.name) / "out.json.tmp"
+        tmp.symlink_to(target)
+        mqtt_auth.write_atomic(final, "new")
+        self.assertEqual(target.read_text(), "keep")
+        self.assertEqual(final.read_text(), "new")
+        self.assertFalse(final.is_symlink())
+        self.assertEqual(stat.S_IMODE(final.stat().st_mode), 0o600)
 
     def test_symlinked_config_dir_refused(self):
         real = Path(self._tmp.name) / "realconfig"

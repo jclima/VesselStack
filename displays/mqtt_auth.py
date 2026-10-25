@@ -162,12 +162,18 @@ def load_secrets(path: Path) -> dict:
 
 
 def write_atomic(path: Path, text: str, mode: int = 0o600) -> None:
+    """Write ``path`` atomically; a symlinked temp file or final path is refused."""
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            raise MqttAuthError(f"refusing to write {path}: it is a symbolic link")
+    except FileNotFoundError:
+        pass
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.unlink()
     except FileNotFoundError:
         pass
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)

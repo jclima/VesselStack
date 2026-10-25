@@ -287,7 +287,7 @@ def default_page(registry: dict, config: dict, board_id: str) -> dict:
 def add(ctx: Context, display_id: str, board: str, name: str | None = None,
         home_assistant_api: bool = False) -> None:
     if not schema.DISPLAY_ID.fullmatch(display_id):
-        raise LifecycleError("display id must match ^[a-z][a-z0-9-]{0,23}$ (lowercase letters, "
+        raise LifecycleError("display id must match ^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$ (lowercase letters, "
                              "digits and hyphens, starting with a letter)", 2)
     registry = load_registry()
     if board not in registry["boards"]:

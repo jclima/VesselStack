@@ -12,7 +12,7 @@ MODULE_DIR = Path(__file__).resolve().parent
 DEFAULT_REGISTRY = MODULE_DIR / "boards" / "registry.json"
 
 INSTRUMENT_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-DISPLAY_ID = re.compile(r"^[a-z][a-z0-9-]{0,23}$")
+DISPLAY_ID = re.compile(r"^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$")
 ESPHOME_PACKAGE = re.compile(r"^boards/[a-z0-9][a-z0-9.-]{0,63}\.yaml$")
 BOARD_ID = re.compile(r"^[a-z][a-z0-9.-]{0,63}$")
 LAYOUT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -196,7 +196,7 @@ def validate_config(cfg, registry) -> list[str]:
             for did, disp in displays.items():
                 where = f"$.displays.{did}"
                 if not DISPLAY_ID.fullmatch(str(did)):
-                    errors.append(f"{where}: display id must match ^[a-z][a-z0-9-]{{0,23}}$")
+                    errors.append(f"{where}: display id must match ^[a-z]([a-z0-9-]{{0,22}}[a-z0-9])?$")
                 if not isinstance(disp, dict):
                     errors.append(f"{where}: must be an object")
                     continue

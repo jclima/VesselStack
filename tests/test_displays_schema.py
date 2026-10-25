@@ -49,6 +49,12 @@ class SchemaTests(unittest.TestCase):
         self.assertIsNone(schema.DISPLAY_ID.fullmatch("ab\n"))
         self.assertTrue(schema.DISPLAY_ID.fullmatch("ab"))
 
+    def test_display_ids_never_end_in_a_hyphen(self) -> None:
+        for good in ("a", "helm", "helm-2", "a" + "b" * 22 + "c", "x9"):
+            self.assertTrue(schema.DISPLAY_ID.fullmatch(good), good)
+        for bad in ("helm-", "a-", "-a", "1a", "Helm", "a" * 25, "", "a--"):
+            self.assertIsNone(schema.DISPLAY_ID.fullmatch(bad), bad)
+
         def rename(cfg, old, new, key):
             cfg[key][new] = cfg[key].pop(old)
         self.assertError(lambda c: rename(c, "helm", "helm\n", "displays"), "helm")
