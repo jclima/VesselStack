@@ -42,6 +42,8 @@ TICK_INTERVAL_S = 1.0
 BACKOFF_START_S = 1.0
 BACKOFF_MAX_S = 30.0
 STABLE_CONNECTION_S = 10.0
+MESSAGE_ERROR_LOG_INTERVAL_S = 60.0
+MQTT_MAX_QUEUED_MESSAGES = 1000
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
 SIGNALK_CONNECTED = "connected"
@@ -158,6 +160,8 @@ class Bridge:
         self.self_urn = None
         self.signalk_state = SIGNALK_DISCONNECTED
         self._next_tick = 0.0
+        self._error_logged_at = None
+        self._errors_suppressed = 0
 
     # -- publishing -------------------------------------------------------
     def _send(self, messages):
@@ -250,7 +254,27 @@ class Bridge:
             timeout = max(0.05, min(TICK_INTERVAL_S, self._next_tick - self.clock()))
             message = source.recv(timeout)
             if message is not None:
-                self.handle_message(message)
+                self._handle_safely(message)
+
+    def _handle_safely(self, message):
+        """One bad message must not cost the SignalK connection: log it, drop it.
+
+        Logging is rate limited (once per MESSAGE_ERROR_LOG_INTERVAL_S, with the
+        number of errors suppressed in between) so a stream of bad messages
+        cannot flood the journal.
+        """
+        try:
+            self.handle_message(message)
+        except Exception as exc:
+            now = self.clock()
+            if self._error_logged_at is None or now - self._error_logged_at >= MESSAGE_ERROR_LOG_INTERVAL_S:
+                suppressed, self._errors_suppressed = self._errors_suppressed, 0
+                self._error_logged_at = now
+                LOG.warning("dropped an unprocessable SignalK message: %s: %s%s",
+                            type(exc).__name__, exc,
+                            f" ({suppressed} similar error(s) suppressed)" if suppressed else "")
+            else:
+                self._errors_suppressed += 1
 
     def handle_message(self, message):
         try:
@@ -328,6 +352,8 @@ class MqttPublisher:
         client.username_pw_set(s.mqtt_username, s.mqtt_password)
         client.will_set(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, qos=1, retain=True)
         client.reconnect_delay_set(min_delay=1, max_delay=30)
+        # Bound memory while the broker is down (paho's default queue is unbounded).
+        client.max_queued_messages_set(MQTT_MAX_QUEUED_MESSAGES)
 
         def connected(_client, _userdata, _flags, reason, _properties):
             if reason.is_failure:

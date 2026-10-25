@@ -253,6 +253,16 @@ fi
 displays_preflight --pull-image
 install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
 
+# Only boats that opt in need the extra network download. It runs before
+# anything is rendered, so an offline boat fails here with the installation
+# untouched. The environment is root-owned but readable by the service user
+# (see the helper for why this cannot rely on this script's umask 077).
+if [ "$DISPLAYS_ENABLE" = true ]; then
+    install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/displays"
+    "$SCRIPT_DIR/scripts/install-displays-venv.sh" \
+        "$VESSELSTACK_ROOT/displays/.venv" "$SCRIPT_DIR/displays/requirements.txt"
+fi
+
 generate_secret() {
     local current=$1
     if [ -z "$current" ] || [ "$current" = GENERATE ]; then
@@ -300,6 +310,10 @@ tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -c
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
+# GNU tar run as root keeps the archive's modes, which are only as readable as the
+# source checkout (often 0600/0700 under umask 077). The bridge runs as the
+# service user and needs read access; the tree holds no secrets and stays root-owned.
+chmod -R u=rwX,go=rX "$VESSELSTACK_ROOT/displays"
 # Keep a bundled, reviewed installer so the control panel can run preflight and
 # apply operations without depending on a source checkout that may be removed.
 if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
@@ -540,12 +554,6 @@ jq -n \
 python3 -m venv "$VESSELSTACK_ROOT/boat-chat/.venv"
 "$VESSELSTACK_ROOT/boat-chat/.venv/bin/pip" install -r "$VESSELSTACK_ROOT/boat-chat/requirements.txt"
 chown -R "$VESSELSTACK_USER:$VESSELSTACK_USER" "$VESSELSTACK_ROOT/boat-chat"
-
-if [ "$DISPLAYS_ENABLE" = true ]; then
-    # Only boats that opt in need the extra network download.
-    python3 -m venv "$VESSELSTACK_ROOT/displays/.venv"
-    "$VESSELSTACK_ROOT/displays/.venv/bin/pip" install -r "$VESSELSTACK_ROOT/displays/requirements.txt"
-fi
 
 sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \

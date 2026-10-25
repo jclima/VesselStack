@@ -9,7 +9,9 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh"
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" \
+    "$ROOT/tests/test-displays-envfile-systemd.sh" "$ROOT/scripts/install-displays-venv.sh"
+python3 -m py_compile "$ROOT/scripts/pin-displays-requirements.py"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 for f in "$ROOT"/displays/*.py "$ROOT"/tests/fixtures/*.py; do python3 -m py_compile "$f"; done
@@ -22,7 +24,8 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" \
-    "$ROOT/tests/test-mosquitto-upgrade.sh"
+    "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-displays-envfile-systemd.sh" \
+    "$ROOT/scripts/install-displays-venv.sh"
 if grep -nE 'mosquitto_passwd -b' "$ROOT/install.sh" "$ROOT/scripts/vesselstackctl" "$ROOT"/displays/*.py; then
     echo "MQTT passwords must not be passed on a command line" >&2
     exit 1
@@ -40,9 +43,16 @@ grep -q '^EnvironmentFile=@VESSELSTACK_ROOT@/config/displays-bridge.env$' \
     "$ROOT/systemd/vesselstack-displays-bridge.service.in"
 grep -q '^ExecStart=@VESSELSTACK_ROOT@/displays/.venv/bin/python @VESSELSTACK_ROOT@/displays/bridge.py$' \
     "$ROOT/systemd/vesselstack-displays-bridge.service.in"
-# Every displays dependency is pinned exactly; CI imports the rest with stdlib only.
-test "$(grep -c '^[A-Za-z0-9._-]*==[0-9][0-9.]*$' "$ROOT/displays/requirements.txt")" -eq \
-    "$(grep -c . "$ROOT/displays/requirements.txt")"
+# Every displays dependency is pinned exactly and by hash (installed with --require-hashes).
+REQ="$ROOT/displays/requirements.txt"
+test "$(grep -cE '^[A-Za-z]' "$REQ")" -ge 2
+test "$(grep -cE '^[A-Za-z0-9._-]+==[0-9][0-9.]* \\$' "$REQ")" -eq "$(grep -cE '^[A-Za-z]' "$REQ")"
+if grep -vE '^$|^#|^[A-Za-z0-9._-]+==[0-9][0-9.]* \\$|^    --hash=sha256:[0-9a-f]{64}( \\)?$' "$REQ"; then
+    echo "displays/requirements.txt must contain only hash-pinned requirements" >&2
+    exit 1
+fi
+grep -q -- '--require-hashes' "$ROOT/scripts/install-displays-venv.sh"
+grep -q '^RestartPreventExitStatus=2 3$' "$ROOT/systemd/vesselstack-displays-bridge.service.in"
 test -s "$ROOT/docs/INSTALLATION.md"
 test -s "$ROOT/docs/BOM.md"
 test -s "$ROOT/wizard/index.html"

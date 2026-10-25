@@ -57,6 +57,7 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
     cat > "$3/bin/pip" <<'PIP'
 #!/bin/bash
 printf '%s\n' "$*" >> "$(dirname "$0")/../pip.log"
+[ -z "${FAKE_PIP_FAIL:-}" ] || { echo "simulated: no route to pypi.org" >&2; exit 1; }
 exit 0
 PIP
     chmod +x "$3/bin/pip"
@@ -269,6 +270,7 @@ bridge_secret=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["
     "$ON_APP/config/displays.secrets.json")
 grep -qx "DISPLAYS_BRIDGE_MQTT_PASSWORD=\"$bridge_secret\"" "$BENV"
 grep -q 'displays/requirements.txt' "$ON_APP/displays/.venv/pip.log"
+grep -q -- '--require-hashes' "$ON_APP/displays/.venv/pip.log"
 test -s "$ON_APP/displays/bridge.py"
 test ! -e "$ON_APP/installer/displays/.venv"
 if grep -q 'DISPLAYS_BRIDGE_MQTT_PASSWORD\|'"$bridge_secret" "$ON_APP/config/vesselstack.env"; then
@@ -297,6 +299,62 @@ if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     echo "Preflight accepted a SignalK token containing a line break" >&2
     exit 1
 fi
+
+# --- The service user must be able to run the bridge ------------------------------
+# install.sh runs under umask 077 and as root; the bridge runs unprivileged. The
+# environment and the copied sources must stay root-owned yet world-readable, even
+# when the source checkout itself is private and when an earlier release left a
+# 0700 environment behind.
+assert_bridge_tree_readable() {
+    local app=$1 venv=$1/displays/.venv
+    test "$(stat -c '%a:%u:%g' "$venv")" = 755:0:0
+    test -z "$(find "$venv" ! -perm -o=r)"
+    test -z "$(find "$venv" -type d ! -perm -o=x)"
+    test -z "$(find "$venv/bin" -type f ! -perm -o=x)"
+    test -z "$(find "$app/displays" ! -perm -o=r)"
+    test -z "$(find "$app/displays" -type d ! -perm -o=x)"
+    test -r "$app/displays/boards/registry.json"
+    test "$(find "$app/displays" ! -user root | wc -l)" -eq 0
+}
+assert_bridge_tree_readable "$ON_APP"
+PRIVATE_SRC="$TEST_ROOT/private-src"
+install -d -m 0755 "$PRIVATE_SRC"
+tar -C "$REPO_ROOT" --exclude=.git --exclude=generated --exclude='__pycache__' -cf - . \
+    | tar --no-same-owner -C "$PRIVATE_SRC" -xf -
+chmod -R go-rwx "$PRIVATE_SRC"
+P_APP="$TEST_ROOT/p/opt/vesselstack"
+P_CONFIG="$TEST_ROOT/p.env"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$P_APP\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$TEST_ROOT/p/opt/vesselstack-data\"|" \
+    -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/p-backups\"|" "$CONFIG" > "$P_CONFIG"
+printf 'DISPLAYS_ENABLE="true"\n' >> "$P_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$PRIVATE_SRC/install.sh" --config "$P_CONFIG" >/dev/null
+assert_bridge_tree_readable "$P_APP"
+# A venv an earlier release left 0700/0600 is repaired by the next run.
+chmod -R go-rwx "$P_APP/displays/.venv" "$P_APP/displays"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$PRIVATE_SRC/install.sh" --config "$P_CONFIG" >/dev/null
+assert_bridge_tree_readable "$P_APP"
+# The Boat Chat environment is owned by the service user as before.
+test "$(stat -c '%U' "$P_APP/boat-chat/.venv")" = "$(id -un)"
+# Unreachable PyPI aborts before anything is rendered, with a clear message.
+OFF_APP="$TEST_ROOT/o/opt/vesselstack"
+OFF_CONFIG="$TEST_ROOT/o.env"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$OFF_APP\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$TEST_ROOT/o/opt/vesselstack-data\"|" \
+    -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/o-backups\"|" "$CONFIG" > "$OFF_CONFIG"
+printf 'DISPLAYS_ENABLE="true"\n' >> "$OFF_CONFIG"
+if env FAKE_PIP_FAIL=1 PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$OFF_CONFIG" >"$TEST_ROOT/offline.out" 2>&1; then
+    echo "install.sh succeeded although pip failed" >&2
+    exit 1
+fi
+grep -q 'Could not install the displays bridge dependencies' "$TEST_ROOT/offline.out"
+test ! -e "$OFF_APP/compose.yml"
+test ! -e "$OFF_APP/config/vesselstack.env"
+test ! -e "$OFF_APP/config/mosquitto-auth"
+test ! -e "$OFF_APP/boat-chat"
 
 # --- Failure atomicity, preflight and the Mosquitto configuration path ---------
 tree_digest() {

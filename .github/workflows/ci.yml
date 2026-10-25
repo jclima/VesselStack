@@ -74,3 +74,5 @@ jobs:
         run: sudo tests/test-mosquitto-upgrade.sh
       - name: Verify the SignalK to MQTT displays bridge
         run: sudo tests/test-displays-bridge.sh
+      - name: Verify the bridge EnvironmentFile and unit under real systemd
+        run: tests/test-displays-envfile-systemd.sh

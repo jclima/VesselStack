@@ -214,6 +214,68 @@ class BridgeLoopTests(unittest.TestCase):
         self.assertEqual((gaps[0], gaps[1]), (1, 2))
         self.assertEqual(gaps[3], 1)  # after the stable session the delay restarts at 1 s
 
+    def test_one_bad_message_does_not_drop_the_connection(self):
+        h = Harness([[("msg", delta(5 * KN)), ("msg", delta(6 * KN)), ("msg", delta(7 * KN)),
+                      ("idle",)]])
+        calls = []
+        real = h.bridge.handle_message
+
+        def flaky(message):
+            calls.append(message)
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return real(message)
+        h.bridge.handle_message = flaky
+        with self.assertLogs(bridge.LOG, "WARNING") as logs:
+            pub = h.run()
+        self.assertEqual(len(h.sources), 1)  # no reconnect
+        self.assertEqual(len(calls), 3)  # the message after the failing one was still processed
+        self.assertEqual(sum("dropped an unprocessable" in line for line in logs.output), 1)
+        self.assertNotIn("stream error", " ".join(logs.output))
+        oks = [json.loads(p)["v"] for p, _ in pub.on(SOG_TOPIC) if json.loads(p)["st"] == "ok"]
+        self.assertIn(7.0, oks)
+
+    def test_bad_message_logging_is_rate_limited_with_a_suppressed_count(self):
+        h = Harness([])
+        h.bridge.handle_message = mock.Mock(side_effect=ValueError("bad"))
+        with self.assertLogs(bridge.LOG, "WARNING") as logs:
+            for _ in range(5):
+                h.bridge._handle_safely("x")
+            self.assertEqual(len(logs.output), 1)
+            h.clock.now += bridge.MESSAGE_ERROR_LOG_INTERVAL_S
+            h.bridge._handle_safely("x")
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("4 similar error(s) suppressed", logs.output[1])
+
+    def test_mqtt_client_queue_is_bounded(self):
+        created = []
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                created.append(self)
+                self.calls = []
+
+            def __getattr__(self, name):
+                def record(*args, **kwargs):
+                    self.calls.append((name, args, kwargs))
+                return record
+
+        fake_mqtt = mock.Mock()
+        fake_mqtt.Client = FakeClient
+        fake_pkg = mock.Mock(client=fake_mqtt)
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        with mock.patch.dict(sys.modules, {"paho": mock.Mock(mqtt=fake_pkg),
+                                           "paho.mqtt": fake_pkg,
+                                           "paho.mqtt.client": fake_mqtt}):
+            bridge.MqttPublisher(settings).start(lambda: None)
+        names = [name for name, _, _ in created[0].calls]
+        self.assertIn("max_queued_messages_set", names)
+        call = next(c for c in created[0].calls if c[0] == "max_queued_messages_set")
+        self.assertEqual(call[1], (bridge.MQTT_MAX_QUEUED_MESSAGES,))
+        self.assertEqual(bridge.MQTT_MAX_QUEUED_MESSAGES, 1000)
+
     def test_mqtt_reconnect_republishes_online_and_signalk_state(self):
         h = Harness([])
         h.bridge.publisher.publish(STATUS, "x", True)
@@ -350,6 +412,35 @@ class BridgeEnvTests(unittest.TestCase):
         self.assertEqual(displayctl.systemd_env_line("K", 'a"b\\c$d%e'), 'K="a\\"b\\\\c$d%e"\n')
         with self.assertRaises(ValueError):
             displayctl.systemd_env_line("K", "a\nb")
+
+    @staticmethod
+    def systemd_unquote(line):
+        """systemd.exec(5) double-quoted EnvironmentFile value: backslash escapes the
+        next character (\\ and \" are the only ones the renderer emits); no $ or %
+        expansion; a bare quote ends the value."""
+        key, raw = line.split("=", 1)
+        assert raw.startswith('"') and raw.endswith('"') and len(raw) >= 2, raw
+        body, out, i = raw[1:-1], [], 0
+        while i < len(body):
+            ch = body[i]
+            if ch == "\\":
+                out.append(body[i + 1])
+                i += 2
+                continue
+            assert ch != '"', f"unescaped quote in {raw!r}"
+            out.append(ch)
+            i += 1
+        return key, "".join(out)
+
+    def test_env_line_survives_a_systemd_style_parse(self):
+        tokens = ['a$b`c"d\\e\'f#g;h%i j  k', " lead and trail ", "$HOME ${PATH} %h %n \\n \\x41 \\$",
+                  "\\", '"', "'", "#start", 'x\\"y', "\\\\", "trail\\"]
+        for token in tokens:
+            key, value = self.systemd_unquote(displayctl.systemd_env_line("T", token).rstrip("\n"))
+            self.assertEqual((key, value), ("T", token))
+        for bad in ("a\tb", "a\x7fb", "a\0b"):
+            with self.assertRaises(ValueError):
+                displayctl.systemd_env_line("T", bad)
 
     def run_cmd(self, root, output, env):
         args = displayctl.build_parser().parse_args(

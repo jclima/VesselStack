@@ -110,12 +110,26 @@ wait_for() {
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE" >/dev/null
 docker network create "$NETWORK" >/dev/null
 
-# Pinned requirements, installed once into a volume shared by the fake SignalK
-# server and the bridge (both use the same websockets).
+# The pinned, hash-checked requirements are installed exactly the way install.sh
+# does it: with the same helper, from a shell running under install.sh's
+# "umask 077", as root. Everything below then runs as an unprivileged uid
+# (like the service user), so an unreadable environment fails this test.
+UNPRIV=(--user 1000:1000)
 docker volume create "$VENV_VOL" >/dev/null
-docker run --rm -v "$VENV_VOL:/venv" -v "$REPO_ROOT/displays/requirements.txt:/requirements.txt:ro" \
-    "$PYIMAGE" sh -c 'python -m venv /venv && /venv/bin/pip install -q --disable-pip-version-check -r /requirements.txt' \
-    >/dev/null || fail "could not install displays/requirements.txt"
+docker run --rm -v "$VENV_VOL:/venv" -v "$REPO_ROOT/scripts/install-displays-venv.sh:/install-venv.sh:ro" \
+    -v "$REPO_ROOT/displays/requirements.txt:/requirements.txt:ro" "$PYIMAGE" \
+    bash -c 'umask 077 && bash /install-venv.sh /venv /requirements.txt' >/dev/null \
+    || fail "could not install displays/requirements.txt with install-displays-venv.sh"
+[ -z "$(docker run --rm "${UNPRIV[@]}" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
+    sh -c 'find /venv ! -perm -o=r; find /venv -type d ! -perm -o=x; /venv/bin/python -c "import paho.mqtt.client, websockets"' 2>&1)" ] \
+    || fail "the environment is not readable and importable by an unprivileged user"
+# Re-running with the requirements satisfied needs no network (offline re-apply).
+docker run --rm --network none -v "$VENV_VOL:/venv" \
+    -v "$REPO_ROOT/scripts/install-displays-venv.sh:/install-venv.sh:ro" \
+    -v "$REPO_ROOT/displays/requirements.txt:/requirements.txt:ro" "$PYIMAGE" \
+    bash -c 'umask 077 && bash /install-venv.sh /venv /requirements.txt' >/dev/null 2>&1 \
+    || fail "re-running the venv helper offline failed although the requirements are satisfied"
+pass
 
 docker run -d --name "$BROKER" --network "$NETWORK" \
     -v "$ROOT/config/mosquitto:/mosquitto/config:ro" \
@@ -156,7 +170,7 @@ chmod 0600 "$DOCKER_ENV"
 
 run_bridge() {
     docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
-    docker run -d --name "$BRIDGE" --network "$NETWORK" --env-file "$DOCKER_ENV" \
+    docker run -d --name "$BRIDGE" --network "$NETWORK" --env-file "$DOCKER_ENV" "${UNPRIV[@]}" \
         -e PYTHONDONTWRITEBYTECODE=1 \
         -v "$REPO_ROOT/displays:/app/displays:ro" -v "$ROOT/config/displays.json:/cfg/displays.json:ro" \
         -v "$VENV_VOL:/venv:ro" "$PYIMAGE" /venv/bin/python /app/displays/bridge.py >/dev/null
@@ -171,7 +185,7 @@ wait_for vesselstack/v1/instruments/sog '"st":"missing"' 10
 pass
 
 # 2. SignalK appears (requires the bearer token), streams 10 kn for ~8 s, then exits.
-docker run -d --name "$SIGNALK" --network "$NETWORK" \
+docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
     -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
     /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 8 --token "$SK_TOKEN" >/dev/null
 wait_for vesselstack/v1/bridge/signalk '^connected$' 40
@@ -199,7 +213,7 @@ pass
 
 # 5. SignalK returns: the bridge reconnects by itself and values flow again.
 docker rm -f "$SIGNALK" >/dev/null 2>&1 || true
-docker run -d --name "$SIGNALK" --network "$NETWORK" \
+docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
     -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
     /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 40 --token "$SK_TOKEN" >/dev/null
 wait_for vesselstack/v1/bridge/signalk '^connected$' 60
@@ -228,7 +242,7 @@ pass
 # 8. An invalid displays.json stops the bridge with a clear message and a non-zero exit.
 echo '{"schema": 1}' > "$TEST_ROOT/bad.json"
 code=0
-out=$(docker run --rm --env-file "$DOCKER_ENV" -e DISPLAYS_CONFIG=/cfg/bad.json \
+out=$(docker run --rm "${UNPRIV[@]}" --env-file "$DOCKER_ENV" -e DISPLAYS_CONFIG=/cfg/bad.json \
     -v "$REPO_ROOT/displays:/app/displays:ro" -v "$TEST_ROOT/bad.json:/cfg/bad.json:ro" \
     -v "$VENV_VOL:/venv:ro" "$PYIMAGE" /venv/bin/python -B /app/displays/bridge.py 2>&1) || code=$?
 [ "$code" -eq 2 ] || fail "invalid config exited $code, expected 2"

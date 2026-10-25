@@ -645,6 +645,15 @@ Operational notes:
   release-1.3.0 broker (single-file conf, legacy passwords, no ACL) must
   survive the new render plus `docker restart`, and only the container
   recreated from the real `compose.yml` mounts enforces the ACL.
+- `tests/test-displays-envfile-systemd.sh` boots systemd in a privileged
+  Debian container and checks that a SignalK token containing dollar, backtick, quote, backslash,
+  hash, semicolon and percent characters and spaces reaches the service environment unchanged through
+  `EnvironmentFile=` (systemd does not expand `$` or `%` there), and that
+  `systemd-analyze verify` accepts the rendered unit. If the container cannot
+  boot systemd it skips loudly; `python3 -m unittest` also covers a
+  parser-equivalent check. `sudo tests/test-displays-bridge.sh` builds the
+  environment with the installer's helper under `umask 077` and runs the bridge
+  as uid 1000, so an unreadable environment is caught.
 - Verify with `sudo tests/test-displays-mosquitto.sh` (real broker in Docker;
   as root it verifies the real ownership, otherwise a one-shot container copies
   the files into a Docker volume with that ownership first)
@@ -696,9 +705,25 @@ Enable it:
    restarts the bridge if it is running (`--start` also starts it).
 
 What changes on the host: the installer creates a Python virtual environment in
-`/opt/vesselstack/displays/.venv` and installs the pinned `paho-mqtt==2.1.0` and
-`websockets==17.3` from `displays/requirements.txt` (internet needed once; only
-when `DISPLAYS_ENABLE=true`), writes `config/displays-bridge.env` (`root:root`,
+`/opt/vesselstack/displays/.venv` and installs `paho-mqtt==2.1.0` and
+`websockets==17.3` from `displays/requirements.txt` (only when
+`DISPLAYS_ENABLE=true`) with `pip install --require-hashes`: every release file
+(sdist, pure-Python wheel and all Linux x86_64/aarch64/armv7 wheels) is pinned
+by sha256, generated from PyPI by `scripts/pin-displays-requirements.py`, so a
+tampered or substituted package is refused; review that diff like any other
+dependency change when bumping a version. This runs through
+`scripts/install-displays-venv.sh` *before* anything is rendered: it needs the
+internet (PyPI) only the first time, an offline first install aborts with
+"Could not install the displays bridge dependencies" and the installation
+untouched, and once the pinned versions are installed a re-run (for example a
+Control Panel Apply while offline) needs no network. The installer runs under
+`umask 077`, so the helper builds the environment under `umask 022` and then
+normalises it to `u=rwX,go=rX`: the environment and the copied `displays/`
+sources stay **root-owned** (the service user can run but not modify the code it
+executes) and readable by the service user; this also repairs an environment
+that an earlier run left `0700` (the symptom was `status=203/EXEC` and a
+restart loop). Boat Chat's environment is created as before and owned by the
+service user. The installer also writes `config/displays-bridge.env` (`root:root`,
 mode 0600; systemd reads it as PID 1 before dropping to the service account, so
 the service user never needs read access; it contains the bridge MQTT password
 and the optional SignalK token), renders and enables the unit, and starts it with
@@ -717,8 +742,15 @@ backoff (1 s up to 30 s with jitter). While SignalK is unreachable the clock
 keeps running, so instruments turn `stale` after their `stale_after_s`; they
 read `missing` until the first value arrives. Treat `bridge/status` as the
 authority: if the bridge dies hard, `bridge/signalk` keeps its last retained
-value. An invalid `displays.json` makes the bridge exit with a clear journal
-message and systemd retries every 10 seconds, so fixing the file is enough.
+value. A single SignalK message the bridge cannot process is logged (at most once a
+minute, with a count of the ones suppressed) and dropped; it does not cost the
+SignalK connection. The MQTT client queues at most 1000 messages while the
+broker is down, bounding memory. An invalid `displays.json` or settings (exit
+status 2) or a missing Python dependency (exit status 3) make the bridge exit
+with a clear journal message and stay stopped (`RestartPreventExitStatus=2 3`);
+fix the problem and run `sudo systemctl restart
+vesselstack-displays-bridge` (or `vesselstackctl start`, or the installer with
+`--start`). Other failures are retried every 10 seconds.
 
 Verify:
 
@@ -741,7 +773,10 @@ Troubleshooting:
   `MQTT connection refused` means the bridge password in
   `displays-bridge.env` no longer matches the broker: re-run the installer.
   `missing Python dependency` means `displays/.venv` is gone: re-run the
-  installer with `DISPLAYS_ENABLE=true`.
+  installer with `DISPLAYS_ENABLE=true` (needs the internet once).
+  `status=203/EXEC` means the service user cannot execute
+  `displays/.venv/bin/python`; re-run the installer, which repairs the modes.
+  The unit stays stopped after exit status 2 or 3 until you restart it.
 - `bridge/signalk` is `disconnected`: check `SIGNALK_URL` answers
   (`curl -fsS "$SIGNALK_URL/signalk"`); an HTTP 401 in the log means set
   `DISPLAYS_SIGNALK_TOKEN`.
