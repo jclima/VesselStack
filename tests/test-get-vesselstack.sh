@@ -241,7 +241,7 @@ RC=0
 run() {  # args... (stdin is never a terminal)
     RC=0
     # SUDO_USER is always unset here (CI runs the test under sudo, which sets it); cases set it via EXTRA_ENV.
-    env -u SUDO_USER PATH="$FAKE_BIN:$PATH" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
+    env -u SUDO_USER PATH="${RUN_PATH:-$FAKE_BIN:$PATH}" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
         VESSELSTACK_VERSION="$VER" VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT=0 NO_COLOR=1 \
         ${EXTRA_ENV:+"$EXTRA_ENV"} \
         bash "$GET" --dir "$RELEASE_BASE" --base-url "https://example.invalid/releases/v$VER" "$@" \
@@ -624,10 +624,31 @@ expect_out "docker-compose-plugin"
 expect_out "docs.docker.com/engine/install/debian"
 refuse_log "^apt-get install .*docker"
 expect_no_release
-# Package selection. The default fake docker binary counts as "Docker already installed";
-# hide it to simulate a machine without Docker.
-docker_absent() { mv "$FAKE_BIN/docker" "$FAKE_BIN/docker.off"; }
-docker_restore() { [ ! -e "$FAKE_BIN/docker.off" ] || mv "$FAKE_BIN/docker.off" "$FAKE_BIN/docker"; }
+# Package selection. The default fake docker binary counts as "Docker already installed".
+# To simulate a machine without Docker the script runs under a PATH made only of the
+# stubs (minus docker) and symlinks to every host tool except docker*, because CI
+# runners ship a real docker in /usr/bin that hiding the stub would expose.
+docker_absent() {
+    local nodocker="$TEST_ROOT/bin-nodocker" dir tool name
+    rm -rf -- "$nodocker"
+    install -d "$nodocker"
+    for tool in "$FAKE_BIN"/*; do
+        name=${tool##*/}
+        [ "$name" = docker ] || ln -s "$tool" "$nodocker/$name"
+    done
+    for dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        [ -d "$dir" ] || continue
+        for tool in "$dir"/*; do
+            name=${tool##*/}
+            case "$name" in docker|docker-*) continue ;; esac
+            [ -x "$tool" ] && [ ! -d "$tool" ] && [ ! -e "$nodocker/$name" ] || continue
+            ln -s "$tool" "$nodocker/$name"
+        done
+    done
+    ! PATH="$nodocker" command -v docker >/dev/null 2>&1 || fail_test "docker is still on the isolated PATH"
+    RUN_PATH=$nodocker
+}
+docker_restore() { RUN_PATH=; }
 # Ubuntu style, no Docker: Debian/Ubuntu engine together with docker-compose-v2.
 reset_state
 docker_absent

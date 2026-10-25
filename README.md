@@ -1202,6 +1202,12 @@ tests verify the whole base chain is root-controlled and fail clearly otherwise;
 the product check is unchanged. The directory is left empty after a run and can
 be removed with `sudo rmdir /usr/local/share/vs-test`.
 
+`tests/test-get-vesselstack.sh` simulates "Docker absent" by running the
+bootstrap under an isolated `PATH` made of its stubs and symlinks to every host
+tool except `docker*`, so the result no longer depends on whether the host (for
+example a GitHub runner) ships a real `docker` and Compose plugin. The product
+script gained no test hook.
+
 ```bash
 tests/test-distribution.sh
 sudo tests/test-lifecycle.sh
