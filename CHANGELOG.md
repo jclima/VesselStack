@@ -3,18 +3,38 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## 1.4.1 - 2026-10-25
+## Version renumbering (2026-10-25)
 
+The project is not ready for 1.0, so the version history was renumbered from 1.x to 0.x on 2026-10-25. Only the version numbers changed: the code, dates and behaviour of each release are as described in its entry. Former `v1.x` tags and GitHub releases were removed; use the `v0.x` ones. Mapping:
+
+| Former version | New version | Date |
+| --- | --- | --- |
+| 1.4.1 | 0.4.1 | 2026-10-25 |
+| 1.4.0 | 0.4.0 | 2026-10-24 |
+| 1.3.0 | 0.3.0 | 2026-08-28 |
+| 1.2.0 | 0.2.0 | 2026-08-25 |
+| 1.1.0 | 0.1.0 | 2026-08-25 |
+| 1.0.1 | 0.0.2 | 2026-08-21 |
+| 1.0.0 | 0.0.1 | 2026-08-21 |
+
+Note that the number 0.1.0 now means the former 1.1.0; an older, pre-release "0.1" configuration layout (migrated by the former 1.0.0 release) is a different thing.
+
+Upgrading a machine that installed a former 1.x release: its `config/installed-version` still says `1.x.y`, which is numerically newer than `0.4.1`. `migrate.sh` and `get-vesselstack.sh` contain a one-time renumbering shim that treats an installed 1.0.0/1.0.1 as 0.0.1/0.0.2 and any other installed `1.M.P` as `0.M.P` when the target is a 0.x release, so `get-vesselstack.sh` or `vesselstackctl update` upgrade such machines normally (a 1.4.1 install is the same release as 0.4.1 and the marker is simply rewritten). Without the shim (an old `migrate.sh` from an earlier release) the upgrade is refused as a downgrade; the manual path is `sudo vesselstackctl backup`, then write the matching new number into `/opt/vesselstack/config/installed-version` (for example `echo 0.4.1 | sudo tee ...` for a 1.4.1 install; the configuration format of each release is unchanged by the renumbering), or reinstall 0.4.1 and `vesselstackctl restore` the backup.
+
+## 0.4.1 - 2026-10-25
+
+- Changed: `VERSION`, `DEFAULT_VERSION` in `scripts/get-vesselstack.sh`, pinned URLs and examples, docs and test fixtures use the new numbers; `MIN_UPGRADE_FROM` in `scripts/migrate.sh` is now `0.0.1`. The release workflow already accepts `v0.4.1` (`v[0-9]+.[0-9]+.[0-9]+`, tag must equal `v$(cat VERSION)`).
+- Tests: `tests/test-migrations.sh` covers every new-scheme version, the shim mapping (also refusing a 1.x target and an installed version above the mapped range) and `tests/test-get-vesselstack.sh` covers renumbered installs in the bootstrap.
 - Fixed: `get-vesselstack.sh` could not install Docker on Raspberry Pi OS (Debian 12 bookworm), where the distribution only packages Compose v1. The Docker step is replaced by Docker's official apt-repository installation (https://docs.docker.com/engine/install/debian/): the script checks the platform (64-bit Raspberry Pi OS / Debian 12 or 13 on arm64 or amd64, or Ubuntu; judged by `dpkg --print-architecture`, not `uname -m`), asks, downloads Docker's key over HTTPS, requires exactly one key with fingerprint `9DC858229FC7DD38854AE2D88D81803C0EBFCD88` before writing anything, installs it as `/etc/apt/keyrings/docker.asc`, writes `/etc/apt/sources.list.d/docker.sources`, runs `apt-get update` and installs `docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`, enables and starts the service and verifies `docker --version`, `docker compose version` (v2 or newer; the plugin is currently 5.x) and `docker info`. Docker with Compose v2 already present is left alone; Docker without the plugin gets only `docker-compose-plugin`.
-- Changed: conflicting unofficial packages (`docker.io`, `docker-cli`, `docker-compose`, `docker-compose-v2`, `docker-doc`, `docker-buildx`, `podman-docker`, `containerd`, `runc`) are listed, together with dependent packages apt would remove with them (from `apt-get -s remove`), and removed with `apt-get remove` only after confirmation (`--yes` accepts); when a Docker daemon already holds containers or volumes, `--yes` is refused and an interactive confirmation is required. A leftover `docker.list` (the manual steps of 1.4.0) or another source for `download.docker.com` is renamed to `*.vesselstack-saved` after asking. No `docker` group change is made. Failures name the failing command and what was left behind. The previous `docker.io` / `docker-compose-v2` / `docker-compose` package-juggling is gone.
+- Changed: conflicting unofficial packages (`docker.io`, `docker-cli`, `docker-compose`, `docker-compose-v2`, `docker-doc`, `docker-buildx`, `podman-docker`, `containerd`, `runc`) are listed, together with dependent packages apt would remove with them (from `apt-get -s remove`), and removed with `apt-get remove` only after confirmation (`--yes` accepts); when a Docker daemon already holds containers or volumes, `--yes` is refused and an interactive confirmation is required. A leftover `docker.list` (the manual steps of 0.4.0) or another source for `download.docker.com` is renamed to `*.vesselstack-saved` after asking. No `docker` group change is made. Failures name the failing command and what was left behind. The previous `docker.io` / `docker-compose-v2` / `docker-compose` package-juggling is gone.
 - Changed: 32-bit Raspberry Pi OS (armhf, also on a 64-bit kernel) is refused with a message to reflash 64-bit Raspberry Pi OS (Docker Engine v28 was the last release for armhf); preflight warns about a 32-bit userland. `--offline` still cannot install Docker.
 - Docs: README, `docs/INSTALLATION.md` and the real-Pi gate in `docs/DEVELOPMENT.md` drop the "bookworm stops at the Docker step" notice and manual Docker steps, describe what the script now changes and how to undo it.
 - Tests: `tests/test-get-vesselstack.sh` covers fresh bookworm arm64, trixie, amd64, Ubuntu and a derivative, fingerprint mismatch (also two keys in one file), key download and gpg failures, armhf and other unsupported systems, conflicting packages (declined, accepted, `--yes`, with containers or volumes), plugin-only installs, an already satisfied system, `apt-get update` and `install` failures, Compose older than v2, a leftover `docker.list`, dependents named in the removal question and offline mode, with stubs for apt-get, apt-cache, dpkg, gpg, curl and docker and isolated apt locations, independent of Docker on the host.
 
-## 1.4.0 - 2026-10-24
+## 0.4.0 - 2026-10-24
 
-- Added: one-command guided installation. `scripts/get-vesselstack.sh` is published with each GitHub release (`curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash`, pinned form `.../releases/download/v1.4.0/get-vesselstack.sh`, `VESSELSTACK_VERSION` or `--version`). It checks OS/arch/disk/memory/network, installs the Debian packages the installer needs (asks before installing Docker and Compose v2; picks `docker-compose-v2`, `docker-compose-plugin` or a 2.x `docker-compose`, and on Debian 12 points to Docker's repository because only Compose v1 is packaged), downloads `vesselstack-<version>.tar.gz` and its `.sha256`, verifies the checksum, refuses unsafe archives (absolute or `..` paths, links, devices, setuid, wrong top-level directory) and unpacks root-owned under `/opt/vesselstack-release/<version>`, runs the loopback wizard (prints the browser URL and the exact `ssh -L` command), shows a secret-free summary, asks for confirmation, runs `install.sh --dry-run`, `install.sh --start` and `vesselstackctl doctor`/`urls`, and lists what it changed. An existing installation is detected and offered `vesselstackctl update` instead of being overwritten. Options: `--yes`, `--no-wizard --config FILE`, `--offline --bundle DIR [--tarball FILE]`, `--sha256 HASH`, `--dir`, `--wizard-port`, `--help`. Wrapped in functions with a single `main "$@"` last line (a truncated download cannot half-run); never evaluates downloaded content and never runs anything from `/tmp`. Covered by `tests/test-get-vesselstack.sh` and a CI step.
-- Fixed: `get-vesselstack.sh` upgrades through an already installed `vesselstackctl` of any version. It now runs `vesselstackctl update DIR` (directory first) with `VESSELSTACK_OFFLINE=true` and `VESSELSTACK_WHEELHOUSE` in the environment instead of `update --offline DIR`, which v1.2.0/v1.3.0 controllers read as the directory and refused. Docs use the same form. `tests/test-get-vesselstack.sh` uses a stub controller with the old first-argument-only behaviour.
+- Added: one-command guided installation. `scripts/get-vesselstack.sh` is published with each GitHub release (`curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash`, pinned form `.../releases/download/v0.4.0/get-vesselstack.sh`, `VESSELSTACK_VERSION` or `--version`). It checks OS/arch/disk/memory/network, installs the Debian packages the installer needs (asks before installing Docker and Compose v2; picks `docker-compose-v2`, `docker-compose-plugin` or a 2.x `docker-compose`, and on Debian 12 points to Docker's repository because only Compose v1 is packaged), downloads `vesselstack-<version>.tar.gz` and its `.sha256`, verifies the checksum, refuses unsafe archives (absolute or `..` paths, links, devices, setuid, wrong top-level directory) and unpacks root-owned under `/opt/vesselstack-release/<version>`, runs the loopback wizard (prints the browser URL and the exact `ssh -L` command), shows a secret-free summary, asks for confirmation, runs `install.sh --dry-run`, `install.sh --start` and `vesselstackctl doctor`/`urls`, and lists what it changed. An existing installation is detected and offered `vesselstackctl update` instead of being overwritten. Options: `--yes`, `--no-wizard --config FILE`, `--offline --bundle DIR [--tarball FILE]`, `--sha256 HASH`, `--dir`, `--wizard-port`, `--help`. Wrapped in functions with a single `main "$@"` last line (a truncated download cannot half-run); never evaluates downloaded content and never runs anything from `/tmp`. Covered by `tests/test-get-vesselstack.sh` and a CI step.
+- Fixed: `get-vesselstack.sh` upgrades through an already installed `vesselstackctl` of any version. It now runs `vesselstackctl update DIR` (directory first) with `VESSELSTACK_OFFLINE=true` and `VESSELSTACK_WHEELHOUSE` in the environment instead of `update --offline DIR`, which v0.2.0/v0.3.0 controllers read as the directory and refused. Docs use the same form. `tests/test-get-vesselstack.sh` uses a stub controller with the old first-argument-only behaviour.
 - Changed: Docker packages never mix sources. With Docker's repository configured and Docker absent the bootstrap installs `docker-ce docker-ce-cli containerd.io docker-compose-plugin` (never `docker.io` beside `docker-compose-plugin`); README and INSTALLATION state up front that stock Raspberry Pi OS bookworm stops at the Docker step and give Docker's official apt-repository commands. Package selection is covered by tests.
 - Security: a reused saved configuration is copied to the root-only staging directory and linted and validated like fresh input; downloads use `--proto-redir '=https'`; re-run hints print the full `curl ... | sudo bash -s --` form when the script was piped; `VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT` must be numeric.
 - Changed: release workflow least privilege and parity. `ci.yml` is callable and `release.yml` runs it first, then a read-only build job (no persisted credentials) and a separate publish job with `contents: write` that creates a draft with `--verify-tag --latest=false` (skipped if the release exists) and both sha256 values in the notes. Tags not on `main` are refused. Actions are pinned to commit SHAs. `build-package.sh` produces a reproducible tarball with GNU tar (sorted names, fixed owner and mtime; bsdtar keeps the old behaviour). `docs/DEVELOPMENT.md` makes the CI-built draft authoritative, adds the pre-release/`--latest` sequence and a manual real-Pi gate; README explains that the `latest` one-liner works only once a release is marked latest.
@@ -23,9 +43,9 @@ Semantic Versioning.
 - Security: `get-vesselstack.sh --config FILE` is opened once without following symlinks (regular file, at most 64 KiB), copied into the root-only staging directory, and only that copy is linted and installed (closes a check-then-use race on a user-controlled path). Tests cover symlink, FIFO, directory, missing, oversized and injection content.
 - Added: wizard flags `--output FILE` and `--exit-after-save`; the wizard prints the port it actually bound, creates the env file mode 600 from the start (`O_EXCL|O_NOFOLLOW` temp file, never through a symlink) and, with `--exit-after-save`, stops after the first successful save. All security properties (loopback only, Host/Origin checks, per-run token) are unchanged.
 - Added: `build-package.sh` also emits `generated/get-vesselstack.sh` (default version baked from `VERSION`) and `generated/get-vesselstack.sh.sha256`; new release checklist in `docs/DEVELOPMENT.md`; `.github/workflows/release.yml` (tag-triggered only, creates a draft release with the four files). Docs: README, `docs/INSTALLATION.md` and `docs/DEPLOYMENT.md` now lead with the one-line install; the manual flow is kept as the advanced path.
-- Docs: added `docs/DEPLOYMENT.md`, an operator runbook for deploying 1.4.0 to a home-lab Pi 4B and an offline boat Pi 5 (signing, build, soak, rehearsals, offline carry, rollback, acceptance checklist, known gaps). Documentation only.
+- Docs: added `docs/DEPLOYMENT.md`, an operator runbook for deploying 0.4.0 to a home-lab Pi 4B and an offline boat Pi 5 (signing, build, soak, rehearsals, offline carry, rollback, acceptance checklist, known gaps). Documentation only.
 - Security: the data directory is no longer service-writable. `VESSELSTACK_DATA` is `root:<service group>` 0750 and only leaf mount roots (`influxdb` 1000, `grafana` 472, `boat-chat`/`signalk` service user) are owned by their writers, so the service user cannot swap a path component for a symlink between the installer's check and its `install -d`/`chown` (TOCTOU). The installer refuses symlinks at managed entries and non-root-owned managed intermediate directories (`homeassistant/...`), and migrates legacy runtime state through a root-only staging directory published with `rename(2)`. Upgrades take ownership of the data root on the first run (not recursive).
-- Security: the legacy quarantine moved out of the data tree to `/var/lib/vesselstack/quarantine` (root 0700, lstat-verified not a symlink); quarantine directories from earlier 1.4.0 builds are relocated there.
+- Security: the legacy quarantine moved out of the data tree to `/var/lib/vesselstack/quarantine` (root 0700, lstat-verified not a symlink); quarantine directories from earlier 0.4.0 builds are relocated there.
 - Security: root no longer executes `scripts/deploy-chat.py` from the unprivileged-owned checkout. `install.sh` installs `vesselstack-update` and the helper root-owned (0755) under `/usr/local/libexec/vesselstack`; as root the launcher runs only that copy and refuses an `update.env` or helper whose path chain is not root-owned and free of group/world write access (and an `update.env` inside `SOURCE_DIRECTORY`). The helper also refuses to run as root from an unprivileged-controlled location. The first copy requires running the installer once; non-root home-lab runs still use the checkout helper.
 - Added: `vesselstackctl update --offline` (or `VESSELSTACK_OFFLINE=true`) passes offline mode to the release's preflight and install. New `tests/test-update-launcher.sh` and CI step.
 - Security: `scripts/deploy-chat.py` no longer runs `git archive` or `git verify-*` inside the unprivileged-owned checkout. Root fetches the pinned remote (or imports the checkout's refs over file transport) into its own root-owned bare mirror (`UPDATE_MIRROR_DIR`, default `/var/lib/vesselstack/update-mirror`, mode 0700, fsck on fetch), verifies the signature there with the fixed git configuration (attributes file, hooks, fsmonitor disabled; system/global config and inherited `GIT_*` variables ignored) and exports the tree as raw blobs (`git ls-tree -r -z` + `git cat-file blob`), refusing symlinks, submodules, unsafe paths and modes other than 100644/100755. Tests still run on the exported tree and the HEAD/clean/tree re-check before apply is kept. New `vesselstack-update` setting `UPDATE_MIRROR_DIR`.
@@ -74,7 +94,7 @@ Semantic Versioning.
 - Honor lifecycle readiness flags while retaining configured service URLs, schemas, timezone and default access protection.
 - Keep computed evidence for complex explanations and distinguish missing/stale status from normal state.
 
-## 1.3.0 - 2026-08-28
+## 0.3.0 - 2026-08-28
 
 ### Added
 
@@ -97,7 +117,7 @@ Semantic Versioning.
 - Added per-client request throttling and a two-request concurrency bound.
 - Made Boat Chat time-window planning honor the configured vessel timezone.
 
-## 1.2.0 - 2026-08-25
+## 0.2.0 - 2026-08-25
 
 ### Added
 
@@ -111,7 +131,7 @@ Semantic Versioning.
 - Documented galvanic isolation, single-source Pi power, GPIO HAT stacking,
   backbone termination, powered-down connection, and CAN error-counter checks.
 
-## 1.1.0 - 2026-08-25
+## 0.1.0 - 2026-08-25
 
 ### Added
 
@@ -161,12 +181,12 @@ Semantic Versioning.
   credential storage.
 - Made uninstall validate purge confirmation and safe paths before any mutation,
   reject surplus lifecycle arguments, and added preserve-data regression coverage.
-- Added explicit migration edges from legacy 0.1 and both 1.0 patch releases to
-  the 1.1 configuration schema.
+- Added explicit migration edges from the legacy pre-release 0.1 layout and both former 1.0 patch releases (now 0.0.1 and 0.0.2) to
+  the 0.1.0 (formerly 1.1.0) configuration schema.
 - Added bounded retries to external registry manifest checks so transient resets
   do not mask actual Linux ARM64 compatibility results.
 
-## 1.0.1 - 2026-08-21
+## 0.0.2 - 2026-08-21
 
 ### Privacy
 
@@ -176,7 +196,7 @@ Semantic Versioning.
 - Added distribution checks and publishing guidance to reduce the chance of
   committing vessel identity, credentials, or private key material.
 
-## 1.0.0 - 2026-08-21
+## 0.0.1 - 2026-08-21
 
 ### Added
 
@@ -191,7 +211,7 @@ Semantic Versioning.
   blueprints plus a Lovelace starter view.
 - `vesselstackctl` status, start, stop, restart, backup, verified restore,
   guarded update, and uninstall workflows.
-- Optional untrusted-interface firewall and explicit 0.1-to-1.0 configuration
+- Optional untrusted-interface firewall and explicit legacy-0.1-to-0.0.1 configuration
   migration.
 - Clean-install, migration, recovery, ARM64 manifest, application, packaging,
   and disposable service-integration test gates.

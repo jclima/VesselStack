@@ -1,6 +1,6 @@
 # VesselStack 1.3 validation
 
-This record describes the evidence used to release 1.3.0. It does not convert
+This record describes the evidence used to release 0.3.0. It does not convert
 VesselStack into certified marine safety equipment.
 
 ## Automated release gates

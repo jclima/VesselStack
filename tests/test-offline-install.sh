@@ -309,13 +309,13 @@ test "$(( 0$(stat -c '%a' "$APP_ROOT/boat-chat/.venv/bin/tool") & 0044 ))" -ne 0
 test -z "$(find "$APP_ROOT/boat-chat/.venv" -not -type l \( -perm -g=w -o -perm -o=w \) -print -quit)"
 
 # --- A failed package install changes nothing ---------------------------------
-printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
+printf '0.3.0\n' > "$APP_ROOT/config/installed-version"
 before=$(snapshot)
 touch "$TEST_ROOT/pip-fail"
 if installer >/dev/null 2>"$TEST_ROOT/err"; then fail "install succeeded although pip failed"; fi
 grep -q 'Nothing was changed' "$TEST_ROOT/err"
 test "$(snapshot)" = "$before" || fail "failed install modified the installation"
-grep -qx '1.3.0' "$APP_ROOT/config/installed-version"
+grep -qx '0.3.0' "$APP_ROOT/config/installed-version"
 no_staging
 # Offline failure message names the wheelhouse.
 if installer --offline >/dev/null 2>"$TEST_ROOT/err"; then fail "offline install succeeded although pip failed"; fi
@@ -332,7 +332,7 @@ for flags in "--dry-run" ""; do
     grep -q 'Downgrade from 9.0.0 to .* is not supported' "$TEST_ROOT/err"
     test "$(snapshot)" = "$before" || fail "refused downgrade modified the installation"
 done
-printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
+printf '0.3.0\n' > "$APP_ROOT/config/installed-version"
 installer --dry-run >/dev/null 2>&1
 installer >/dev/null 2>&1
 grep -qx "$VERSION" "$APP_ROOT/config/installed-version"

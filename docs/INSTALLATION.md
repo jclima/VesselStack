@@ -32,7 +32,7 @@ the script asks once and then follows Docker's official apt-repository instructi
   `apt-get remove` (not purge), so `/var/lib/docker` is kept. If a Docker daemon
   already holds containers or volumes, `--yes` is not enough: the script stops, and you
   must confirm interactively (back up first) or remove the packages yourself;
-- an older `docker.list` (the manual steps of v1.4.0) or any other apt source that
+- an older `docker.list` (the manual steps of v0.4.0) or any other apt source that
   already points at `download.docker.com` is renamed to `*.vesselstack-saved` after
   asking, because two entries with different keys make `apt-get update` fail;
 - no `docker` group change is made: the installer runs as root and VesselStack's
@@ -63,8 +63,8 @@ curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-ve
 ```
 
 The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v1.4.1/get-vesselstack.sh`, or add
-`--version 1.4.1` (`| sudo bash -s -- --version 1.4.1`). It installs the Debian
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.1/get-vesselstack.sh`, or add
+`--version 0.4.1` (`| sudo bash -s -- --version 0.4.1`). It installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, opens the wizard (it prints the address to open in a browser on the Pi or
@@ -169,7 +169,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.4.1
+git checkout v0.4.1
 python3 vesselstack-wizard.py
 ```
 

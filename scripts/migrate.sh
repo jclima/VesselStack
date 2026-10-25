@@ -7,7 +7,8 @@
 #
 # Data-driven: any upgrade from MIN_UPGRADE_FROM or newer is accepted. Only
 # releases that ship scripts/migrations/<version>.sh run extra steps; otherwise
-# just the version marker changes. Downgrades are never supported.
+# just the version marker changes. Downgrades are never supported (apart from
+# the documented 1.x -> 0.x renumbering shim below).
 
 set -euo pipefail
 
@@ -15,7 +16,7 @@ CHECK=0
 if [ "${1:-}" = --check ]; then CHECK=1; shift; fi
 ENV_FILE=${1:?Usage: migrate.sh [--check] ENV_FILE TARGET_VERSION}
 TARGET_VERSION=${2:?Usage: migrate.sh [--check] ENV_FILE TARGET_VERSION}
-MIN_UPGRADE_FROM=0.1.0
+MIN_UPGRADE_FROM=0.0.1
 MIGRATIONS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/migrations
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -31,6 +32,24 @@ for version in "$current_version" "$TARGET_VERSION"; do
         exit 1
     }
 done
+
+# One-time renumbering shim (2026-10-25): releases 1.0.0-1.4.1 were renumbered to
+# 0.0.1-0.4.1 (1.0.0 -> 0.0.1, 1.0.1 -> 0.0.2, 1.M.P -> 0.M.P for M >= 1). A machine
+# that recorded a former 1.x version is treated as the matching 0.x version when
+# the target is a 0.x release, so it upgrades instead of being refused as a
+# downgrade. Anything above the mapped range (for example 1.5.0 -> 0.5.0) still
+# compares as newer than the target and is refused as usual. Remove once no 1.x
+# installation can remain.
+if [[ "$current_version" =~ ^1\.([0-9]+)\.([0-9]+)$ ]] && [[ "$TARGET_VERSION" == 0.* ]]; then
+    legacy_version=$current_version
+    if [ "${BASH_REMATCH[1]}" -eq 0 ]; then
+        current_version="0.0.$((BASH_REMATCH[2] + 1))"
+    else
+        current_version="0.${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+    fi
+    echo "Installed version $legacy_version was renumbered; treating it as $current_version" >&2
+fi
+
 version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }
 
 if [ "$current_version" = "$TARGET_VERSION" ]; then

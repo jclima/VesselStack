@@ -32,7 +32,7 @@ RELEASE_BASE="$TEST_ROOT/releases"
 APP_ROOT="$TEST_ROOT/opt/vesselstack"
 LOG="$TEST_ROOT/calls.log"
 OUT="$TEST_ROOT/out"
-VER=9.9.9
+VER=0.9.9
 install -d "$FAKE_BIN" "$SERVE"
 install -m 0755 "$REPO_ROOT/scripts/get-vesselstack.sh" "$GET"
 
@@ -163,7 +163,7 @@ EOF2
 cat > "$FAKE_BIN/vesselstackctl" <<'EOF2'
 #!/bin/bash
 echo "ctl $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-} OFFLINE=${VESSELSTACK_OFFLINE:-}" >> "$LOG"
-# Behave like the released v1.2.0/v1.3.0 controllers: "update" reads ONLY $1, as the
+# Behave like the released v0.2.0/v0.3.0 controllers: "update" reads ONLY $1, as the
 # release directory, and fails on anything else (for example a leading --offline).
 if [ "$1" = update ]; then
     [ -x "$2/install.sh" ] || { echo "Not a VesselStack release directory: $2" >&2; exit 1; }
@@ -1139,7 +1139,7 @@ refuse_log "^install "
 # ---- 8. existing installation / upgrade -------------------------------------------------
 reset_state
 install -d "$APP_ROOT/config"
-echo 1.0.0 > "$APP_ROOT/config/installed-version"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
 run --yes
 expect_rc 0 "upgrade with --yes"
 expect_out "UPGRADE"
@@ -1150,7 +1150,7 @@ expect_out "backup made first"
 
 reset_state
 install -d "$APP_ROOT/config"
-echo 1.0.0 > "$APP_ROOT/config/installed-version"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
 printf 'y\nn\n' > "$TEST_ROOT/answers"
 EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
 EXTRA_ENV=
@@ -1158,6 +1158,23 @@ expect_rc 0 "declined upgrade"
 expect_out "Nothing was changed on the installed system"
 expect_out "vesselstackctl update"
 refuse_log "^ctl update"
+
+reset_state
+install -d "$APP_ROOT/config"
+echo 1.4.1 > "$APP_ROOT/config/installed-version"
+run --yes
+expect_rc 0 "renumbered 1.x install (older than $VER) is an upgrade"
+expect_out "renumbered"
+expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE= OFFLINE=$"
+
+# 1.9.9 is the same release as 0.9.9 under the new numbering: still goes through update.
+reset_state
+install -d "$APP_ROOT/config"
+echo 1.9.9 > "$APP_ROOT/config/installed-version"
+run --yes
+expect_rc 0 "renumbered 1.x install (same release as $VER)"
+expect_out "renumbered"
+expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE= OFFLINE=$"
 
 reset_state
 install -d "$APP_ROOT/config"
@@ -1202,7 +1219,7 @@ expect_out "Checksum file not found"
 # Offline upgrade passes the wheelhouse through to vesselstackctl update.
 reset_state
 install -d "$APP_ROOT/config"
-echo 1.0.0 > "$APP_ROOT/config/installed-version"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
 run --yes --offline --bundle "$TEST_ROOT/bundle" --tarball "$TEST_ROOT/carry/vesselstack-$VER.tar.gz"
 expect_rc 0 "offline upgrade"
 expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse OFFLINE=true$"
