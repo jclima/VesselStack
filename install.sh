@@ -543,7 +543,7 @@ quarantine_legacy() {
     mv -- "$old" "$LEGACY_QUARANTINE/"
     echo "WARNING: moved legacy $old to $LEGACY_QUARANTINE (root-only); review and merge manually, then remove it" >&2
 }
-# Earlier 1.4.0 builds created quarantine directories inside the data tree.
+# Earlier 0.4.0 builds created quarantine directories inside the data tree.
 for earlier_quarantine in "$VESSELSTACK_DATA"/boat-chat-legacy-*; do
     if [ -d "$earlier_quarantine" ] && [ ! -L "$earlier_quarantine" ]; then
         ensure_quarantine_root

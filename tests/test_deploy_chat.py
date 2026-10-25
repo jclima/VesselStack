@@ -171,8 +171,8 @@ class SourceTrustTests(unittest.TestCase):
 
     def test_signed_tag_is_accepted_when_commit_unsigned(self):
         trust=deploy.make_trust()
-        def tgit_ok(source,trust,*args):return args==('verify-tag','v1.3.1')
-        with mock.patch.object(deploy,'tgit',side_effect=lambda source,trust,*a:'abc123' if a[0]=='rev-parse' else 'v1.3.0\nv1.3.1'),mock.patch.object(deploy,'tgit_ok',side_effect=tgit_ok):
+        def tgit_ok(source,trust,*args):return args==('verify-tag','v0.3.1')
+        with mock.patch.object(deploy,'tgit',side_effect=lambda source,trust,*a:'abc123' if a[0]=='rev-parse' else 'v0.3.0\nv0.3.1'),mock.patch.object(deploy,'tgit_ok',side_effect=tgit_ok):
             self.assertTrue(deploy.commit_is_verified(Path('/x'),'abc123',trust))
         with mock.patch.object(deploy,'tgit',side_effect=lambda source,trust,*a:'abc123' if a[0]=='rev-parse' else ''),mock.patch.object(deploy,'tgit_ok',return_value=False):
             self.assertFalse(deploy.commit_is_verified(Path('/x'),'abc123',trust))

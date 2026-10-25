@@ -40,7 +40,7 @@ install -d -m 0700 "$APP_ROOT/build/displays/helm"
 printf 'wifi_password: secret\n' > "$APP_ROOT/build/displays/helm/secrets.yaml"
 install -d -m 0700 "$APP_ROOT/build/displays/helm/firmware"
 printf 'firmware with embedded credentials\n' > "$APP_ROOT/build/displays/helm/firmware/firmware.factory.bin"
-printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
+printf '0.3.0\n' > "$APP_ROOT/config/installed-version"
 # The real credential helper runs against the fake docker below.
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
@@ -191,7 +191,7 @@ doctor_output=$(run_ctl doctor)
 grep -q '127.0.0.1:9876' <<<"$urls_output" || grep -q ':9876' <<<"$urls_output"
 grep -q 'Boat Chat .*ALL interfaces' <<<"$urls_output"
 grep -q 'InfluxDB .*this device only' <<<"$urls_output"
-grep -q 'installed: 1.3.0' <<<"$version_output"
+grep -q 'installed: 0.3.0' <<<"$version_output"
 grep -q 'Boat Chat service' <<<"$status_output"
 grep -q '^prometheus[[:space:]]\+healthy$' <<<"$status_output"
 grep -q '^Displays bridge[[:space:]]\+disabled$' <<<"$status_output"

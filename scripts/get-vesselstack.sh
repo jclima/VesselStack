@@ -2,7 +2,7 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.1/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.1/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
@@ -23,7 +23,7 @@ set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="1.4.1"
+DEFAULT_VERSION="0.4.1"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
 
@@ -215,7 +215,7 @@ parse_args() {
     fi
     VERSION=${VERSION:-$DEFAULT_VERSION}
     VERSION=${VERSION#v}
-    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version must look like 1.4.0 (got: $VERSION)"
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version must look like 0.4.0 (got: $VERSION)"
     if [ -n "$WIZARD_PORT" ] && { ! [[ "$WIZARD_PORT" =~ ^[0-9]{4,5}$ ]] || [ "$WIZARD_PORT" -lt 1024 ] || [ "$WIZARD_PORT" -gt 65535 ]; }; then
         die "--wizard-port must be a number from 1024 to 65535"
     fi
@@ -828,7 +828,26 @@ step_preflight() {
             info "Show addresses: sudo vesselstackctl urls"
             exit 0
         fi
-        if [ "$(printf '%s\n%s\n' "$INSTALLED_VERSION" "$VERSION" | sort -V | head -n1)" != "$INSTALLED_VERSION" ]; then
+        # One-time renumbering shim (2026-10-25): former 1.x releases are now 0.x
+        # (1.0.0 -> 0.0.1, 1.0.1 -> 0.0.2, 1.M.P -> 0.M.P). Same mapping as migrate.sh.
+        COMPARE_VERSION=$INSTALLED_VERSION
+        if [[ "$INSTALLED_VERSION" =~ ^1\.([0-9]+)\.([0-9]+)$ && "$VERSION" == 0.* ]]; then
+            if [ "${BASH_REMATCH[1]}" -eq 0 ]; then
+                COMPARE_VERSION="0.0.$((BASH_REMATCH[2] + 1))"
+            else
+                COMPARE_VERSION="0.${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            fi
+            info "Installed version $INSTALLED_VERSION was renumbered; it is treated as $COMPARE_VERSION."
+        fi
+        if [ "$COMPARE_VERSION" = "$VERSION" ]; then
+            UPGRADE=1
+            say ""
+            warn "VesselStack $INSTALLED_VERSION is installed and is the same release as $VERSION under the new numbering."
+            info "The configuration marker is updated by 'vesselstackctl update', which runs a preflight check and a verified backup first."
+            info "Nothing will be overwritten until you confirm that, later in this run."
+            return 0
+        fi
+        if [ "$(printf '%s\n%s\n' "$COMPARE_VERSION" "$VERSION" | sort -V | head -n1)" != "$COMPARE_VERSION" ]; then
             die "VesselStack $INSTALLED_VERSION is installed, which is newer than $VERSION. Downgrades are not supported." \
                 "Restore a backup instead (see the README), or pass the newer --version."
         fi
