@@ -21,6 +21,9 @@ Commands:
   version                      Print installed and command versions
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
+  display list|add|remove|rotate|wifi|status|validate|sync-mqtt [ARGUMENTS]
+                               Manage instrument displays; see
+                               "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
@@ -61,6 +64,22 @@ sync_mqtt_access() {
         DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
         python3 "$displayctl" sync-mqtt --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA"
+}
+
+# Pass-through to the displays tool with the installed configuration. Broker
+# credentials travel in the environment only (never on a command line); wifi
+# reads its SSID and password from the terminal or standard input.
+display_command() {
+    : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
+    : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
+    local displayctl="$VESSELSTACK_ROOT/displays/displayctl.py"
+    [ -r "$displayctl" ] || { echo "Missing displays tool: $displayctl" >&2; return 1; }
+    PYTHONDONTWRITEBYTECODE=1 \
+        VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
+        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
+        python3 "$displayctl" "$@"
 }
 
 start_stack() {
@@ -449,5 +468,6 @@ case "$command" in
     restore) [ $# -eq 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
     update) [ $# -eq 1 ] || { usage; exit 2; }; update_stack "$1" ;;
     uninstall) uninstall_stack "$@" ;;
+    display) [ $# -ge 1 ] || { usage; exit 2; }; display_command "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
 esac

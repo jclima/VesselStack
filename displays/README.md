@@ -8,7 +8,8 @@ Pure-logic core for configurable live-instrument displays. The root `README.md`
 - `topics.py` - MQTT topics, payloads, freshness state machine, SignalK helpers
 - `bridge.py` - the `vesselstack-displays-bridge` service: SignalK websocket to MQTT, driving `topics.Engine` (runtime adapter only; the only module that needs `requirements.txt`)
 - `requirements.txt` - exact pins for the bridge (`paho-mqtt`, `websockets`), installed into `displays/.venv` when `DISPLAYS_ENABLE=true`
-- `displayctl.py` - `validate [FILE]`, `sync-mqtt` (renders the Mosquitto ACL and hashed passwords) and `bridge-env --output FILE` (writes the bridge's 0600 systemd environment file); run by `install.sh` and `vesselstackctl`
+- `displayctl.py` - `validate [FILE]`, the lifecycle commands (`list`, `add`, `remove`, `rotate`, `wifi`, `status`), `sync-mqtt` (renders the Mosquitto ACL and hashed passwords) and `bridge-env --output FILE` (writes the bridge's 0600 systemd environment file); run by `install.sh` and `vesselstackctl`
+- `lifecycle.py` - `list`, `add`, `remove`, `rotate`, `wifi` and `status` behind `displayctl.py` (locked, no-follow, atomic edits of `displays.json` and `displays.secrets.json`; also reachable as `vesselstackctl display ...`)
 - `mqtt_auth.py` - MQTT account, secrets and ACL rendering used by `sync-mqtt`
 - `boards/registry.json` - supported boards and layouts
 - `displays.example.json` - example configuration (runtime `displays.json` is never committed)

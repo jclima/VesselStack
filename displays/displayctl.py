@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VesselStack displays control tool (preview: validation and MQTT account sync)."""
+"""VesselStack displays control tool (preview: validation, MQTT account sync, device lifecycle)."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import lifecycle  # noqa: E402
 import mqtt_auth  # noqa: E402
 import schema  # noqa: E402
 
@@ -118,6 +119,58 @@ def cmd_bridge_env(args) -> int:
     return 0
 
 
+LIFECYCLE_ENV_KEYS = ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
+                      "DISPLAYS_BRIDGE_MQTT_USERNAME")
+
+
+def run_lifecycle(args, action) -> int:
+    """Run a lifecycle action with a Context built from the environment."""
+    root_text = args.root or os.environ.get("VESSELSTACK_ROOT", "")
+    if not root_text:
+        print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
+        return 2
+    ctx = lifecycle.Context(
+        root=Path(root_text),
+        env={key: os.environ[key] for key in LIFECYCLE_ENV_KEYS if key in os.environ},
+        require_root=not getattr(args, "allow_non_root", False),
+        container=getattr(args, "container", None) or mqtt_auth.CONTAINER,
+        image=getattr(args, "image", None))
+    try:
+        result = action(ctx)
+    except lifecycle.LifecycleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.code
+    except (mqtt_auth.MqttAuthError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return result if isinstance(result, int) else 0
+
+
+def cmd_list(args) -> int:
+    return run_lifecycle(args, lifecycle.list_displays)
+
+
+def cmd_add(args) -> int:
+    return run_lifecycle(args, lambda ctx: lifecycle.add(
+        ctx, args.id, args.board, args.name, args.home_assistant_api))
+
+
+def cmd_remove(args) -> int:
+    return run_lifecycle(args, lambda ctx: lifecycle.remove(ctx, args.id, args.yes))
+
+
+def cmd_rotate(args) -> int:
+    return run_lifecycle(args, lambda ctx: lifecycle.rotate(ctx, args.id))
+
+
+def cmd_wifi(args) -> int:
+    return run_lifecycle(args, lambda ctx: lifecycle.wifi(ctx, args.clear, args.open))
+
+
+def cmd_status(args) -> int:
+    return run_lifecycle(args, lifecycle.status)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="displayctl", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -137,6 +190,36 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_env.add_argument("--output", required=True, help="file to write (mode 0600)")
     bridge_env.add_argument("--owner", help="user that will own the file")
     bridge_env.set_defaults(func=cmd_bridge_env)
+    def lifecycle_parser(name, help_text, func, with_id=False):
+        parser_ = sub.add_parser(name, help=help_text)
+        if with_id:
+            parser_.add_argument("id", metavar="ID", help="display id")
+        parser_.add_argument("--root", help="VESSELSTACK_ROOT (default: environment)")
+        parser_.add_argument("--container", default=mqtt_auth.CONTAINER, help=argparse.SUPPRESS)
+        parser_.add_argument("--image", help=argparse.SUPPRESS)
+        # Integration tests on non-root hosts; file permissions still apply.
+        parser_.add_argument("--allow-non-root", action="store_true", help=argparse.SUPPRESS)
+        parser_.set_defaults(func=func)
+        return parser_
+
+    lifecycle_parser("list", "list configured displays (never prints secrets)", cmd_list)
+    add = lifecycle_parser("add", "add a display with a default page (root)", cmd_add, True)
+    add.add_argument("--board", required=True, help="board id from the registry")
+    add.add_argument("--name", help="display name (default: derived from the id)")
+    add.add_argument("--home-assistant-api", action="store_true",
+                     help="enable the Home Assistant API on the display")
+    remove = lifecycle_parser("remove", "remove a display and its credentials (root)",
+                              cmd_remove, True)
+    remove.add_argument("--yes", action="store_true", help="confirm the removal")
+    lifecycle_parser("rotate", "issue new generated credentials for a display (root)",
+                     cmd_rotate, True)
+    wifi = lifecycle_parser("wifi", "store the shared Wi-Fi credentials, read from the "
+                            "terminal (root)", cmd_wifi)
+    wifi.add_argument("--clear", action="store_true", help="remove the stored credentials")
+    wifi.add_argument("--open", action="store_true",
+                      help="allow an empty password (open network)")
+    lifecycle_parser("status", "show bridge and display online state from retained MQTT topics",
+                     cmd_status)
     return parser
 
 

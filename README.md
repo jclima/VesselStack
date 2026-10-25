@@ -536,10 +536,12 @@ Operational notes:
 - Bridge and display passwords are generated once (`secrets.token_urlsafe(32)`)
   into `$VESSELSTACK_ROOT/config/displays.secrets.json` (mode 0600) and are
   reused on every later run; this file is inside the backed-up `config/`
-  directory, so treat backups as secrets. Credentials of a display removed from
-  `displays.json` stop working immediately but remain in that file (so a
-  temporarily broken or missing `displays.json` cannot destroy them); delete
-  the entry by hand to retire it permanently. With displays enabled and no
+  directory, so treat backups as secrets. `vesselstackctl display remove`
+  deletes the display's entry here as well. Credentials of a display removed
+  from `displays.json` by hand stop working immediately but remain in that file
+  (so a temporarily broken or missing `displays.json` cannot destroy them);
+  delete the entry by hand, or re-add and then `remove` the display, to retire
+  it permanently. With displays enabled and no
   `displays.json`, only the admin and bridge accounts exist.
 - The sync tool sets the ownership and modes above (it must run as root),
   keeps `acl.prev` and `passwords.prev` copies, and signals the running broker
@@ -604,8 +606,9 @@ and page layouts are data, so more boards and layouts can be added later.
 
 **Status: preview.** The configuration schema, validation, unit conversions,
 the MQTT topic/payload and freshness logic, the board registry, the MQTT
-account/ACL provisioning (`displayctl.py sync-mqtt`) and the **SignalK-to-MQTT
-bridge service** exist today (`displays/`). With `DISPLAYS_ENABLE=true` the
+account/ACL provisioning (`displayctl.py sync-mqtt`), the **device lifecycle
+commands** (`vesselstackctl display list|add|remove|rotate|wifi|status`) and the
+**SignalK-to-MQTT bridge service** exist today (`displays/`). With `DISPLAYS_ENABLE=true` the
 bridge publishes your configured instruments to Mosquitto; the display screens
 and firmware do not exist yet, so nothing consumes those topics beyond your own
 MQTT clients. The always-on Mosquitto ACL does affect existing installations
@@ -701,6 +704,70 @@ Backups: `vesselstackctl backup` includes `config/displays-bridge.env` and
 files; keep archives private. It excludes `displays/.venv` and `__pycache__`
 (rebuilt by the installer).
 
+### Managing displays
+
+`vesselstackctl display COMMAND ...` (root, uses the installed configuration)
+and `python3 displays/displayctl.py COMMAND ...` (with `VESSELSTACK_ROOT` set;
+`MQTT_USERNAME`/`MQTT_PASSWORD` from `vesselstack.env` for commands that touch
+the broker) are the same tool. `validate`, `sync-mqtt` and `bridge-env` behave
+as before and are also reachable through `vesselstackctl display`.
+
+```bash
+sudo vesselstackctl display add helm --board waveshare-esp32-s3-touch-lcd-2.8c --name Helm
+sudo vesselstackctl display wifi            # prompts for SSID and (hidden) password
+sudo vesselstackctl display list
+sudo vesselstackctl display status
+sudo vesselstackctl display rotate helm
+sudo vesselstackctl display remove helm --yes
+```
+
+| Command | What it changes |
+| --- | --- |
+| `list` | Nothing. Table of id, name, board, page count, MQTT username, whether generated credentials exist (`SECRETS`) and whether Wi-Fi credentials are stored (`WIFI`). Works without root if the files are readable; without root the secrets/Wi-Fi columns show `unknown`. Never prints secret values. |
+| `add ID --board BOARD [--name NAME] [--home-assistant-api]` | Appends the display to `displays.json` with one default page: title `Main`, the board's largest layout, and the first N instruments in `displays.json` order (N = layout capacity, fewer if you have fewer instruments). It refuses an existing id, an unknown board or a configuration with no instruments, and validates the whole resulting file before writing. It then syncs MQTT like `sync-mqtt`: creates the display password in `displays.secrets.json`, rewrites the ACL/passwords and signals the broker. It prints the MQTT username (`vsdisp-ID`) and next steps, never the password. Edit the pages in `displays.json` afterwards and check with `validate`. Export and flashing: coming in a later release. |
+| `remove ID --yes` | Deletes the display from `displays.json` and its entry from `displays.secrets.json`, then syncs: the broker reload disconnects the connected device and refuses it afterwards. Without `--yes` it refuses. Adding the same id again generates new credentials. The Wi-Fi block and other displays are untouched. |
+| `rotate ID` | Regenerates every generated secret of that display (currently the MQTT password), then syncs. Other displays are untouched. The device is refused until it is **reflashed** with the new credentials. |
+| `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it. Nothing is echoed. |
+| `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the SignalK link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
+
+Behaviour that applies to the changing commands (`add`, `remove`, `rotate`,
+`wifi`):
+
+- They need root and take an exclusive lock (`flock` on
+  `config/.displays.lock`, mode 0600). A second command waits up to 10 seconds
+  for the lock and then fails with a message, changing nothing. Run
+  `sync-mqtt`/the installer separately if you want to be sure no edit is in
+  flight.
+- Files are read and written without following symbolic links (a symlinked
+  `displays.json`, secrets file, lock file or `config/` directory is
+  refused), written atomically (temporary file created exclusively, fsynced,
+  renamed) and keep their modes: `displays.json` 0644 and
+  `displays.secrets.json` 0600, both root-owned. `displays.json` is rewritten
+  with two-space indentation and key order preserved; hand-made formatting is
+  not kept.
+- If the MQTT sync fails after the files were updated (for example the Docker
+  image is unavailable), the command exits 1 and names the retry:
+  `vesselstackctl display sync-mqtt`.
+- With `DISPLAYS_ENABLE=false` the files are still edited but no MQTT sync
+  runs; the command says so, and the accounts take effect once displays are
+  enabled and the installer or `sync-mqtt` runs. With it enabled the bridge
+  already publishes every configured instrument, so `add` and `remove` need no
+  bridge restart.
+- Exit status: `0` success, `1` operational error (not root, lock timeout,
+  broker down, sync failed), `2` usage or validation error (unknown id or
+  board, invalid Wi-Fi value, missing `--yes`, invalid configuration).
+
+`status` passes the broker administrator credentials to `mosquitto_sub`
+inside the container as a mode-0600 options file (`-o`) streamed over the
+`docker exec -i` standard input, never as command-line arguments or `-e`
+environment variables, so they do not appear in `ps` on the host or in the
+container. The temporary file exists only for the duration of the command and
+is removed when it ends.
+
+Rollback: `remove` and `rotate` are not reversible (the old password is gone);
+restore `config/displays.json` and `config/displays.secrets.json` from a
+`vesselstackctl backup` archive and run `vesselstackctl display sync-mqtt`.
+
 ### Configuration and validation
 
 The runtime configuration lives at `$VESSELSTACK_ROOT/config/displays.json`.
@@ -771,7 +838,8 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 - With the VesselStack firewall enabled, displays must be on a trusted
   interface that can reach the Raspberry Pi's MQTT port.
 - The primary planned build path is exporting from the Pi and compiling on a
-  laptop; no firmware, flashing or over-the-air flow ships in this preview.
+  laptop; no firmware, export, flashing or over-the-air flow ships in this
+  preview (the lifecycle commands only manage configuration and credentials).
 - The runtime `displays.json`, `displays.secrets.json`, ESPHome
   `secrets.yaml`, `.esphome/` and `displays/build/` output, and firmware
   binaries (`.bin`, `.elf`, `.uf2`) are git-ignored and rejected by

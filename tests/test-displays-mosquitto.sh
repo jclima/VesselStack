@@ -90,8 +90,16 @@ if [ "$IS_ROOT" -eq 1 ]; then AUTH_SRC="$MDIR"; else AUTH_SRC="$BROKER-auth"; fi
 emulate_ownership() {
     [ "$IS_ROOT" -eq 1 ] && return 0
     docker volume create "$AUTH_SRC" >/dev/null
-    docker run --rm -v "$AUTH_SRC:/auth" -v "$MDIR:/src:ro" --entrypoint /bin/sh "$IMAGE" -c \
-        'rm -f /auth/acl /auth/passwords; cp /src/acl /src/passwords /auth/; chown 0:1883 /auth; chmod 0750 /auth; chown 1883:1883 /auth/acl /auth/passwords; chmod 0600 /auth/acl /auth/passwords' >/dev/null
+    # Docker Desktop bind mounts can briefly serve a stale view right after an
+    # atomic rename, so retry the copy a few times.
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        docker run --rm -v "$AUTH_SRC:/auth" -v "$MDIR:/src:ro" --entrypoint /bin/sh "$IMAGE" -c \
+            'rm -f /auth/acl /auth/passwords; cp /src/acl /src/passwords /auth/ && chown 0:1883 /auth && chmod 0750 /auth && chown 1883:1883 /auth/acl /auth/passwords && chmod 0600 /auth/acl /auth/passwords' \
+            >/dev/null 2>&1 && break
+        [ "$attempt" -lt 5 ] || fail "could not copy the auth files into the volume"
+        sleep 1
+    done
     # sync already signalled the broker before the volume was refreshed.
     docker kill -s HUP "$BROKER" >/dev/null 2>&1 || true
 }
@@ -265,6 +273,75 @@ expect_refused "$AUX" "$AUX_PASS"
 check_broker_log
 docker inspect -f '{{.State.Running}}' "$BROKER" | grep -qx true || fail "broker died after HUP"
 pass
+
+# Device lifecycle through the CLI: add, rotate, wifi, status, remove.
+dctl() {
+    (cd "$REPO_ROOT" && VESSELSTACK_ROOT="$ROOT" VESSELSTACK_DATA="$DATA" \
+        MQTT_USERNAME="$ADMIN_USER" MQTT_PASSWORD="$ADMIN_PASS" DISPLAYS_ENABLE=true \
+        python3 displays/displayctl.py "$@" --container "$BROKER" --allow-non-root)
+}
+CLI_OUT=$(dctl add ops --board waveshare-esp32-s3-touch-lcd-2.8c --name Ops 2>&1) || fail "displayctl add failed: $CLI_OUT"
+grep -q 'MQTT username: vsdisp-ops' <<<"$CLI_OUT" || fail "add did not print the MQTT username"
+OPS_PASS=$(secret display ops)
+! grep -qF "$OPS_PASS" <<<"$CLI_OUT" || fail "add printed the display password"
+emulate_ownership
+check_files
+sleep 1
+expect_write vsdisp-ops "$OPS_PASS" vesselstack/v1/displays/vsdisp-ops/status
+python3 -c 'import json,sys;p=json.load(open(sys.argv[1]))["displays"]["ops"]["pages"][0];assert p["layout"]=="grid-2x2" and len(p["items"])==4' \
+    "$ROOT/config/displays.json" || fail "add did not create the default page"
+pass
+
+CLI_OUT=$(dctl rotate ops 2>&1) || fail "displayctl rotate failed: $CLI_OUT"
+NEW_OPS_PASS=$(secret display ops)
+[ "$NEW_OPS_PASS" != "$OPS_PASS" ] || fail "rotate kept the old password"
+emulate_ownership
+check_files
+sleep 1
+expect_refused vsdisp-ops "$OPS_PASS"
+expect_write vsdisp-ops "$NEW_OPS_PASS" vesselstack/v1/displays/vsdisp-ops/status
+expect_read "$HELM" "$HELM_PASS" vesselstack/v1/instruments/sog
+
+printf 'Test Net\ntest-wifi-pass-1\n' | dctl wifi >/dev/null 2>&1 || fail "displayctl wifi failed"
+CLI_OUT=$(dctl list 2>&1) || fail "displayctl list failed"
+grep -q 'vsdisp-ops' <<<"$CLI_OUT" || fail "list does not show the new display"
+! grep -qF -e "$NEW_OPS_PASS" -e test-wifi-pass-1 -e "$ADMIN_PASS" <<<"$CLI_OUT" || fail "list printed a secret"
+pass
+
+# status reads the retained topics through the real broker with the admin options file.
+admin_put vesselstack/v1/bridge/status online
+admin_put vesselstack/v1/bridge/signalk connected
+admin_put vesselstack/v1/displays/vsdisp-ops/status online
+CLI_OUT=$(dctl status 2>&1) || fail "displayctl status failed: $CLI_OUT"
+grep -Eq '^Bridge +online$' <<<"$CLI_OUT" || fail "status did not show the bridge online: $CLI_OUT"
+grep -Eq '^ops +online$' <<<"$CLI_OUT" || fail "status did not show ops online: $CLI_OUT"
+grep -Eq '^helm +' <<<"$CLI_OUT" || fail "status did not list helm: $CLI_OUT"
+! grep -qF "$ADMIN_PASS" <<<"$CLI_OUT" || fail "status printed the admin password"
+! docker exec "$BROKER" ls /tmp 2>/dev/null | grep -q . || fail "status left a temporary options file in the broker container"
+pass
+clear_retained vesselstack/v1/bridge/status
+clear_retained vesselstack/v1/bridge/signalk
+clear_retained vesselstack/v1/displays/vsdisp-ops/status
+
+docker run -d --name "$BROKER-sub" --network "$NETWORK" "$IMAGE" \
+    mosquitto_sub -h "$BROKER" -u vsdisp-ops -P "$NEW_OPS_PASS" -t 'vesselstack/v1/instruments/#' -W 60 >/dev/null 2>&1 \
+    || docker start "$BROKER-sub" >/dev/null
+sleep 2
+CLI_OUT=$(dctl remove ops 2>&1) && fail "remove without --yes should be refused"
+CLI_OUT=$(dctl remove ops --yes 2>&1) || fail "displayctl remove failed: $CLI_OUT"
+emulate_ownership
+check_files
+for _ in $(seq 1 10); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$BROKER-sub")" = false ] && break
+    sleep 1
+done
+[ "$(docker inspect -f '{{.State.Running}}' "$BROKER-sub")" = false ] || fail "removed display stayed connected after HUP"
+expect_refused vsdisp-ops "$NEW_OPS_PASS"
+! grep -q 'vsdisp-ops' "$MDIR/acl" || fail "removed display is still in the ACL"
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert "ops" not in d["displays"] and d["displays"]' \
+    "$ROOT/config/displays.secrets.json" || fail "remove did not delete the display secrets"
+pass
+check_broker_log
 
 # Disable displays: admin only; a container restart picks up everything.
 sync_mqtt false
