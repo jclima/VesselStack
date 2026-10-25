@@ -299,6 +299,73 @@ class CliTests(unittest.TestCase):
         self.assertIn("aux, helm", text)
         self.assertIn("still contains the old Wi-Fi credentials", text)
 
+    def secrets_everywhere(self, display_id):
+        """Plant a secrets.yaml in every location a rendered tree has ever lived."""
+        base = self.root / "build" / "displays"
+        paths = [base / display_id / "project.new", base / display_id,
+                 base / f"{display_id}.new", base / f"{display_id}.prev",
+                 base / f"{display_id}.new" / "project", base / f"{display_id}.prev" / "project.prev"]
+        for path in paths:
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            (path / "secrets.yaml").write_text("wifi_password: old")
+        return [path / "secrets.yaml" for path in paths] + [
+            base / display_id / "project" / "secrets.yaml",
+            base / display_id / "project.prev" / "secrets.yaml"]
+
+    def test_wifi_clear_scrubs_every_build_tree_location(self):
+        self.wifi(f"net\n{WIFI_PASSWORD}\n")
+        self.make_build_tree("helm", "aux")
+        planted = self.secrets_everywhere("helm")
+        self.assertTrue(all(path.exists() for path in planted))
+        lifecycle.wifi(self.ctx(), clear=True)
+        self.assertEqual([str(path) for path in planted if path.exists()], [])
+        base = self.root / "build" / "displays"
+        self.assertTrue((base / "helm" / "firmware" / "firmware.ota.bin").exists())
+        self.assertTrue((base / "helm" / "project" / "helm.yaml").exists())
+
+    def test_wifi_clear_scrubs_even_when_no_credentials_were_stored(self):
+        self.make_build_tree("helm")
+        planted = self.secrets_everywhere("helm")
+        lifecycle.wifi(self.ctx(), clear=True)
+        text = self.output()
+        self.assertIn("No Wi-Fi credentials were stored", text)
+        self.assertIn("Deleted secrets.yaml from the rendered project of: helm", text)
+        self.assertEqual([str(path) for path in planted if path.exists()], [])
+
+    def test_scrub_covers_legacy_siblings_alone_and_ignores_other_names(self):
+        import render
+        base = self.root / "build" / "displays"
+        (base / "ghost.new").mkdir(parents=True, mode=0o700)
+        (base / "ghost.new" / "secrets.yaml").write_text("x")
+        (base / "not.an.id").mkdir(mode=0o700)
+        (base / "not.an.id" / "secrets.yaml").write_text("keep")
+        cleaned, skipped = render.scrub_project_secrets(self.ctx())
+        self.assertEqual((cleaned, skipped), (["ghost"], []))
+        self.assertFalse((base / "ghost.new" / "secrets.yaml").exists())
+        self.assertTrue((base / "not.an.id" / "secrets.yaml").exists())
+
+    def test_scrub_follows_no_symlink(self):
+        import render
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "secrets.yaml").write_text("must survive")
+        self.make_build_tree("helm")
+        base = self.root / "build" / "displays"
+        (base / "helm.new").symlink_to(outside)
+        (base / "helm" / "project.new").symlink_to(outside)
+        render.scrub_project_secrets(self.ctx())
+        self.assertTrue((outside / "secrets.yaml").exists())
+        self.assertFalse((base / "helm" / "project" / "secrets.yaml").exists())
+
+    def test_scrub_waits_for_each_displays_lock_including_its_siblings(self):
+        import render
+        self.make_build_tree("helm")
+        planted = self.secrets_everywhere("helm")
+        with render.build_lock(self.ctx(), "helm", notify=lambda text: None):
+            cleaned, skipped = render.scrub_project_secrets(self.ctx(), timeout=0.2)
+        self.assertEqual((cleaned, skipped), ([], ["helm"]))
+        self.assertTrue(all(path.exists() for path in planted))
+
     def test_wifi_clear_skips_a_display_that_is_being_built(self):
         import render
         self.wifi(f"net\n{WIFI_PASSWORD}\n")

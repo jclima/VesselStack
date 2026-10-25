@@ -771,18 +771,42 @@ def remove_build_tree(ctx, display_id: str) -> bool:
         os.close(parent_fd)
 
 
-def scrub_project_secrets(ctx, notify=None, timeout: float = 2.0) -> tuple[list, list]:
-    """Delete ``secrets.yaml`` from every rendered project (not the stored firmware).
+LEGACY_SIBLING_SUFFIXES = (".new", ".prev")
 
-    Used by ``wifi --clear``. Returns (cleaned display ids, ids skipped because a
-    build or flash held their lock for longer than ``timeout`` seconds).
+
+def _scrub_ids(parent_fd: int) -> list:
+    """Display ids that own at least one entry in ``build/displays``.
+
+    ``<id>``, and the old-layout siblings ``<id>.new`` and ``<id>.prev`` (ids cannot
+    contain a dot, so these names never belong to another display). Lock files and
+    everything else are ignored.
+    """
+    ids = set()
+    for name in os.listdir(parent_fd):
+        base = name
+        for suffix in LEGACY_SIBLING_SUFFIXES:
+            if name.endswith(suffix):
+                base = name[:-len(suffix)]
+        if schema.DISPLAY_ID.fullmatch(base):
+            ids.add(base)
+    return sorted(ids)
+
+
+def scrub_project_secrets(ctx, notify=None, timeout: float = 2.0) -> tuple[list, list]:
+    """Delete ``secrets.yaml`` from every rendered project tree (not the stored firmware).
+
+    Covers, for every valid display id, ``<id>/project``, ``project.new`` and
+    ``project.prev``, the old layout's ``<id>/secrets.yaml`` and its ``<id>.new`` and
+    ``<id>.prev`` siblings (also the ``project*`` directories inside them). Each display
+    is handled under its own build lock and no symlink is followed. Used by
+    ``wifi --clear``. Returns (cleaned display ids, ids skipped because a build or
+    flash held their lock for longer than ``timeout`` seconds).
     """
     parent_fd = _displays_dir(ctx)
     if parent_fd is None:
         return [], []
     try:
-        names = sorted(name for name in os.listdir(parent_fd)
-                       if schema.DISPLAY_ID.fullmatch(name))
+        names = _scrub_ids(parent_fd)
     finally:
         os.close(parent_fd)
     cleaned, skipped = [], []
@@ -796,33 +820,52 @@ def scrub_project_secrets(ctx, notify=None, timeout: float = 2.0) -> tuple[list,
     return cleaned, skipped
 
 
+def _open_plain_dir(parent_fd: int, name: str, label: str):
+    """Open an existing real directory; None when absent, a symlink or not a directory."""
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None  # never followed, never touched
+    return _open_dir(parent_fd, name, label)
+
+
+def _unlink_secrets(dir_fd: int) -> bool:
+    try:
+        os.unlink("secrets.yaml", dir_fd=dir_fd)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _scrub_tree(top_fd: int, label: str) -> bool:
+    """secrets.yaml directly in ``top_fd`` and in its project/project.new/project.prev."""
+    removed = _unlink_secrets(top_fd)
+    for sub in (PROJECT_DIR, PROJECT_NEW, PROJECT_PREV):
+        sub_fd = _open_plain_dir(top_fd, sub, f"{label}/{sub}")
+        if sub_fd is not None:
+            try:
+                removed = _unlink_secrets(sub_fd) or removed
+            finally:
+                os.close(sub_fd)
+    return removed
+
+
 def _scrub_one(ctx, display_id: str) -> bool:
     parent_fd = _displays_dir(ctx)
     if parent_fd is None:
         return False
     removed = False
     try:
-        display_fd = _open_existing_dir(parent_fd, display_id, display_id)
-        if display_fd is None:
-            return False
-        try:
-            targets = [(display_fd, "secrets.yaml")]  # old layout: project files sat here
-            opened = []
-            for sub in (PROJECT_DIR, PROJECT_NEW, PROJECT_PREV):
-                sub_fd = _open_existing_dir(display_fd, sub, f"{display_id}/{sub}")
-                if sub_fd is not None:
-                    opened.append(sub_fd)
-                    targets.append((sub_fd, "secrets.yaml"))
+        for name in (display_id, *(display_id + suffix for suffix in LEGACY_SIBLING_SUFFIXES)):
+            top_fd = _open_plain_dir(parent_fd, name, name)
+            if top_fd is None:
+                continue
             try:
-                for fd, name in targets:
-                    if _exists(fd, name):
-                        os.unlink(name, dir_fd=fd)
-                        removed = True
+                removed = _scrub_tree(top_fd, name) or removed
             finally:
-                for fd in opened:
-                    os.close(fd)
-        finally:
-            os.close(display_fd)
+                os.close(top_fd)
     finally:
         os.close(parent_fd)
     return removed

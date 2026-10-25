@@ -435,16 +435,18 @@ def wifi(ctx: Context, clear: bool = False, allow_open: bool = False, stdin=None
     with ConfigDir(ctx) as cfg_dir:
         cfg_dir.lock()
         secret_data = read_secrets(cfg_dir)
-        if clear and "wifi" not in secret_data:
-            ctx.out("No Wi-Fi credentials were stored.")
-            return
-        if clear:
+        if clear and "wifi" in secret_data:
             del secret_data["wifi"]
+            write_secrets(cfg_dir, secret_data)
+            ctx.out("Wi-Fi credentials removed.")
+        elif clear:
+            # Nothing stored, but earlier renders (or a failed earlier --clear) may still
+            # hold the password in a project: always scrub.
+            ctx.out("No Wi-Fi credentials were stored.")
         else:
             secret_data["wifi"] = credentials
-        write_secrets(cfg_dir, secret_data)
+            write_secrets(cfg_dir, secret_data)
     if clear:
-        ctx.out("Wi-Fi credentials removed.")
         _scrub_rendered_wifi(ctx)
         return
     kind = "open network" if credentials["password"] == "" else "WPA passphrase"
