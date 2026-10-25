@@ -35,7 +35,7 @@ carrying bundles, rollback and the acceptance checklist.
 curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.0/get-vesselstack.sh | sudo bash
 ```
 
-(`.../releases/latest/download/get-vesselstack.sh` follows the newest release.)
+(`.../releases/latest/download/get-vesselstack.sh` works only once a release is marked latest.)
 It installs prerequisites, asks before installing Docker, verifies the release
 sha256 (compare it with the value recorded in section 2), runs the wizard (browser
 on the Pi, or the printed `ssh -L` tunnel), then `install.sh --dry-run`,
@@ -57,7 +57,9 @@ sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle \
 
 It verifies the tarball checksum and the bundle (`prepare-offline-bundle.sh
 --verify`), loads the images (`--load`) and runs the offline installer or, on an
-existing install, `vesselstackctl update --offline`. Add `--sha256 HASH` with the
+existing install, `VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=... vesselstackctl update DIR`
+(directory first, mode in the environment, so it also works through an older installed
+`vesselstackctl`). Add `--sha256 HASH` with the
 value you recorded on the home lab to pin the tarball to your own build.
 
 ## 0. Prerequisites and read-only pre-flight
@@ -172,6 +174,12 @@ branch tip itself may not verify under your allowed-signers file; the signed
 **tag** on that commit is what `vesselstack-update` accepts.
 
 ## 2. Cut and build
+
+The release workflow builds the files on GitHub when the tag is pushed and attaches them
+to a **draft** release; that CI-built draft is authoritative (see
+[DEVELOPMENT.md](DEVELOPMENT.md)). Take the recorded sha256 values from the draft. A
+local build below is a cross-check: on Linux (GNU tar) it is byte-identical to CI for
+the same commit; on macOS the archive is valid but may differ.
 
 From a clean clone, so no stray files can matter (`build-package.sh` packages
 `git archive HEAD` only and refuses tracked private artifacts):
@@ -346,8 +354,8 @@ values, and record the `doctor` result and data-directory size each day.
    ```bash
    sudo chown -R root:root offline-bundle && sudo chmod -R go-w offline-bundle
    sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle   # docker load
-   sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
-     vesselstackctl update --offline /var/lib/vesselstack/releases/vesselstack-1.4.0
+   sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+     vesselstackctl update /var/lib/vesselstack/releases/vesselstack-1.4.0
    ```
 
    The bundle path and **every parent** must be root-owned and not
@@ -436,8 +444,8 @@ backup, the recorded sha256 and a console/Ethernet path ready.
    ```bash
    sudo /var/lib/vesselstack/releases/vesselstack-1.4.0/scripts/prepare-offline-bundle.sh \
      --load /var/lib/vesselstack/releases/offline-bundle      # verifies, then docker load
-   sudo VESSELSTACK_WHEELHOUSE=/var/lib/vesselstack/releases/offline-bundle/wheelhouse \
-     vesselstackctl update --offline /var/lib/vesselstack/releases/vesselstack-1.4.0
+   sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/var/lib/vesselstack/releases/offline-bundle/wheelhouse \
+     vesselstackctl update /var/lib/vesselstack/releases/vesselstack-1.4.0
    ```
 
 5. **Verify.**

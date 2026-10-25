@@ -14,12 +14,32 @@ Deploying a release to a home-lab Pi and an offline boat Pi? Follow the
 [deployment runbook](docs/DEPLOYMENT.md): SSH release signing and the signed
 `v1.4.0` tag, a clean build with recorded sha256, a home-lab soak and rehearsals
 (update, backup/restore, offline install, `vcan` replay), the carry bundle,
-dock-side install with `vesselstackctl update --offline`, rollback, an
+dock-side install with `VESSELSTACK_OFFLINE=true vesselstackctl update DIR`, rollback, an
 acceptance checklist and known gaps. It is documentation only; it changes no
 code, configuration or runtime behaviour, so there is nothing to roll back
 beyond deleting the file.
 
 ## Quick start: one command on the Raspberry Pi
+
+**Stock Raspberry Pi OS bookworm (Debian 12) has no Docker Compose v2 package.**
+On a fresh bookworm image the one-liner below stops at the Docker step and tells you
+what to do; it does not install Docker for you there. Install Docker Engine and the
+Compose plugin from Docker's own apt repository first, then run the one-liner again
+(it finds Docker and continues). These are the steps from Docker's official
+documentation (<https://docs.docker.com/engine/install/debian/>, apt repository
+method; check that page for the current version before running them):
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+```
+
+If Docker's repository is already configured and Docker is not installed, the script
+itself installs `docker-ce docker-ce-cli containerd.io docker-compose-plugin` (never
+Debian's `docker.io` next to Docker's plugin).
 
 On a Raspberry Pi running 64-bit Raspberry Pi OS (or Debian) with internet access,
 paste this into a terminal on the Pi:
@@ -27,6 +47,15 @@ paste this into a terminal on the Pi:
 ```bash
 curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
 ```
+
+The `releases/latest/download/` form works only once a release carrying
+`get-vesselstack.sh` has been published **and marked latest**. Until then (and while a
+release is still being install-tested) use the pinned form shown next, which works for
+any published release, including a pre-release.
+
+Releases are built by the tag-triggered GitHub workflow (read-only build job, separate
+write-only publish job, draft first, reproducible tarball on Linux); maintainers follow the
+release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 To install an exact release instead (recommended once you have tested one):
 
@@ -45,9 +74,10 @@ does anything beyond installing ordinary Debian packages:
    is offered the built-in `vesselstackctl update` upgrade, with its backup);
 2. installs the packages VesselStack needs with `apt-get` (`ca-certificates curl jq
    openssl python3 python3-venv rsync tar gzip`; no `git`) and **asks** before
-   installing Docker and the Compose v2 plugin (`docker.io` plus whichever of
-   `docker-compose-v2`, `docker-compose-plugin` or, on Debian 13, `docker-compose`
-   2.x apt offers). Debian 12 / Raspberry Pi OS bookworm packages only the old
+   installing Docker and the Compose v2 plugin (`docker.io` with `docker-compose-v2`
+   on Ubuntu, `docker-ce docker-ce-cli containerd.io docker-compose-plugin` when
+   Docker's own repository is configured, or `docker.io` with a 2.x `docker-compose`
+   on Debian 13; Debian's `docker.io` is never mixed with Docker's plugin). Debian 12 / Raspberry Pi OS bookworm packages only the old
    Compose v1, so there the script stops with a pointer to Docker's own apt
    repository (`docker-compose-plugin`): install Docker from
    <https://docs.docker.com/engine/install/debian/> first, then run the
@@ -957,7 +987,8 @@ perform preflight, a verified pre-update backup, installation, and startup:
 
 ```bash
 sudo vesselstackctl update /path/to/VesselStack-release
-sudo vesselstackctl update --offline /path/to/VesselStack-release   # no network
+sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+  vesselstackctl update /path/to/VesselStack-release   # no network
 ```
 
 For Control Panel updates, stage the reviewed release beneath its restricted
@@ -1075,8 +1106,11 @@ digests PyPI publishes. `tests/test_requirements_lock.py` fails when the lock is
 stale. `scripts/deploy-chat.py` treats a changed `requirements.lock` like a
 changed `requirements.txt` and refuses the code-only deploy.
 
-`sudo vesselstackctl update --offline /path/to/release` (or
-`VESSELSTACK_OFFLINE=true sudo -E vesselstackctl update /path/to/release`) passes
+`sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/bundle/wheelhouse vesselstackctl update /path/to/release`
+(the directory is always the first argument; the `--offline` flag form is also
+accepted by this release's `vesselstackctl`, but older installed `vesselstackctl`
+versions would read it as the directory, so the guided installer and the docs use the
+variable) passes
 `--offline` to both the preflight and the install of that release; any value other
 than `true`/`false` in `VESSELSTACK_OFFLINE` is rejected. Without the flag or
 variable the behaviour is unchanged apart from the hash-pinned lock. Rollback:

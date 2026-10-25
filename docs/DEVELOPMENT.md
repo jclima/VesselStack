@@ -36,37 +36,45 @@ Every change must update README.md as required by AGENTS.md.
 
 The quick-start URLs (`.../releases/latest/download/get-vesselstack.sh` and
 `.../releases/download/vX.Y.Z/get-vesselstack.sh`) only work if the GitHub release
-carries exactly these files. Nothing publishes a release for you except the
-tag-triggered workflow below, and that only creates a **draft**.
+carries exactly these files. Nothing publishes a release for you: the tag-triggered
+workflow only creates a **draft**, and the CI-built draft is the authoritative release.
+Do not build and upload files by hand.
 
 1. Bump `VERSION`, `DEFAULT_VERSION` in `scripts/get-vesselstack.sh` (must equal
    `VERSION`; `tests/test-distribution.sh` checks it), the version in the
    README/docs examples, and `CHANGELOG.md`. Update `README.md` as AGENTS.md requires.
-2. Run the checks from a clean checkout: `python3 scripts/check-public-tree.py`,
-   `tests/test-distribution.sh`, `python3 -m unittest discover -s tests -p 'test_*.py'`,
-   and as root on Linux `tests/test-get-vesselstack.sh`, `tests/test-build-package.sh`
-   and the install/update tests listed in the README.
-3. Commit, create the signed tag (see [DEPLOYMENT.md](DEPLOYMENT.md) section 1) and
-   run `./build-package.sh` (set `VESSELSTACK_BUILD_REQUIRE_CLEAN=true`). Record
-   the printed sha256 values.
-4. Upload these four files to the GitHub release for the tag, byte for byte:
-   - `generated/vesselstack-<version>.tar.gz`
-   - `generated/vesselstack-<version>.tar.gz.sha256`
-   - `generated/get-vesselstack.sh` (default version baked in from `VERSION`)
-   - `generated/get-vesselstack.sh.sha256`
-5. Verify from a scratch directory after publishing (never run the script piped
-   into root before you have read the downloaded copy):
+2. Open a pull request; CI must pass (privacy check, distribution checks with
+   shellcheck, lifecycle, migrations, clean/offline install, update launcher,
+   bootstrap, build-package, Compose config, image manifests, Python, service
+   integration). Merge it to `main`.
+3. Tag the merged `main` commit (signed tag, see [DEPLOYMENT.md](DEPLOYMENT.md)
+   section 1) and push the tag. The workflow refuses a tag whose commit is not on
+   `main`, or that differs from `VERSION`.
+4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
+   tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
+   read-only job and uploads the files as workflow artifacts, and (c) in a separate
+   job with write access creates a **draft** release (`--draft --latest=false`) with
+   the four files and both sha256 values in the notes. It skips creation if a release
+   for the tag already exists. It does not verify the tag signature; do that locally
+   before pushing the tag.
+5. Take the sha256 values from the draft's notes (or the workflow log). Download the
+   draft's assets and test **those exact files** on the home-lab Pi (see
+   [DEPLOYMENT.md](DEPLOYMENT.md)): `sha256sum -c`, then the install and update
+   rehearsals. The build is reproducible on Linux (same commit, same bytes).
+6. **Manual gate (not automated): one real interactive run** of `get-vesselstack.sh`
+   on a real Raspberry Pi: fresh install through the wizard with a browser, the Docker
+   step on stock bookworm, an upgrade from the previous release, and an offline
+   upgrade. The test suites use stubs and cannot cover this. Do not publish before it
+   passes.
+7. Publish the draft as a **pre-release** (or otherwise not latest) first, so
+   `releases/latest/download/` still points at the previous release. Install-test
+   through the pinned URL from a scratch directory (never run it piped into root
+   before reading it):
    `curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v<version>/get-vesselstack.sh`,
    `curl -fsSLO .../get-vesselstack.sh.sha256`, `sha256sum -c get-vesselstack.sh.sha256`,
-   then run it on a spare Pi with `--help` and a full lab install.
-6. Mark the release as the latest only after that works: `releases/latest/download/`
-   follows the latest published, non-draft, non-prerelease release.
-
-`.github/workflows/release.yml` automates steps 2 to 4: pushing a `vX.Y.Z` tag
-(it never runs on pull requests or branch pushes) checks that the tag equals
-`VERSION`, reruns the tests, builds, verifies the checksums and creates a draft
-release with the four files; review and publish it by hand. It does not verify
-the tag signature; do that locally before pushing the tag.
+   then `sudo bash get-vesselstack.sh --help` and a full lab install.
+8. Only after that works make it the latest release:
+   `gh release edit v<version> --prerelease=false --latest`.
 
 ## Pull without deploying
 

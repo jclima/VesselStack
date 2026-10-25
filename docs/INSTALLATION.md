@@ -6,6 +6,26 @@ build; do not commission while underway.
 
 ## Quick path: one command
 
+**Stock Raspberry Pi OS bookworm (Debian 12) has no Docker Compose v2 package.**
+On a fresh bookworm image the one-liner below stops at the Docker step and tells you
+what to do; it does not install Docker for you there. Install Docker Engine and the
+Compose plugin from Docker's own apt repository first, then run the one-liner again
+(it finds Docker and continues). These are the steps from Docker's official
+documentation (<https://docs.docker.com/engine/install/debian/>, apt repository
+method; check that page for the current version before running them):
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+```
+
+If Docker's repository is already configured and Docker is not installed, the script
+itself installs `docker-ce docker-ce-cli containerd.io docker-compose-plugin` (never
+Debian's `docker.io` next to Docker's plugin).
+
 Once the hardware is assembled, the operating system is installed (section 3) and
 `can0` works if you use NMEA 2000 (section 4), paste this on the Raspberry Pi:
 
@@ -13,11 +33,11 @@ Once the hardware is assembled, the operating system is installed (section 3) an
 curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
 ```
 
-Pinned to one release: `.../releases/download/v1.4.0/get-vesselstack.sh`, or add
+The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v1.4.0/get-vesselstack.sh`, or add
 `--version 1.4.0` (`| sudo bash -s -- --version 1.4.0`). It installs the Debian
-prerequisites, asks before installing Docker (on Raspberry Pi OS bookworm, whose own
-packages only have Compose v1, install Docker Engine and `docker-compose-plugin` from
-Docker's repository first; the script then continues), downloads and checksum-verifies the
+prerequisites, asks before installing Docker (on stock Raspberry Pi OS bookworm it stops at the
+Docker step; see the box above), downloads and checksum-verifies the
 release, opens the wizard (it prints the address to open in a browser on the Pi or
 the exact `ssh -L` command for your laptop), then runs the installer dry run, the
 installation, `vesselstackctl doctor` and `vesselstackctl urls`. It shows a list of

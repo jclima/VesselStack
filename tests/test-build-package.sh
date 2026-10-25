@@ -86,6 +86,15 @@ if grep -q '/\._\|^\._' "$TEST_ROOT/listing"; then
     exit 1
 fi
 
+# Two builds of the same commit are byte-identical where tar can pin metadata (GNU tar).
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    first=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+    sleep 2
+    "$REPO/build-package.sh" >/dev/null 2>&1
+    second=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+    [ "$first" = "$second" ] || { echo "Package build is not reproducible" >&2; exit 1; }
+fi
+
 # Strict mode refuses a dirty tracked tree.
 if VESSELSTACK_BUILD_REQUIRE_CLEAN=true "$REPO/build-package.sh" >/dev/null 2>&1; then
     echo "Strict build accepted a dirty tracked tree" >&2

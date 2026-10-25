@@ -109,7 +109,13 @@ exit 0
 EOF2
 cat > "$FAKE_BIN/vesselstackctl" <<'EOF2'
 #!/bin/bash
-echo "ctl $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-}" >> "$LOG"
+echo "ctl $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-} OFFLINE=${VESSELSTACK_OFFLINE:-}" >> "$LOG"
+# Behave like the released v1.2.0/v1.3.0 controllers: "update" reads ONLY $1, as the
+# release directory, and fails on anything else (for example a leading --offline).
+if [ "$1" = update ]; then
+    [ -x "$2/install.sh" ] || { echo "Not a VesselStack release directory: $2" >&2; exit 1; }
+    [ "$#" -eq 2 ] || { echo "old ctl: unexpected extra arguments" >&2; exit 1; }
+fi
 case "$1" in urls) echo "Boat Chat  http://0.0.0.0:8765" ;; esac
 [ -z "${FAKE_CTL_FAIL:-}" ] || [ "$1" != "${FAKE_CTL_FAIL}" ]
 EOF2
@@ -555,6 +561,15 @@ run --yes
 expect_rc 0 "second run reuses the saved config"
 expect_out "reusing the saved configuration"
 refuse_log "^wizard "
+# The reused saved config goes through the same strict validation as new input.
+reset_state
+run --yes
+expect_rc 0 "run that saves a config"
+rm -rf "$APP_ROOT"; : > "$LOG"
+printf 'SOME_UNKNOWN_KEY=1\n' >> "$RELEASE_BASE/vesselstack.env"
+run --yes
+expect_rc 1 "reused config with an unknown key"
+refuse_log "^install "
 
 # ---- 6. prerequisites ------------------------------------------------------------
 reset_state
@@ -609,6 +624,41 @@ expect_out "docker-compose-plugin"
 expect_out "docs.docker.com/engine/install/debian"
 refuse_log "^apt-get install .*docker"
 expect_no_release
+# Package selection. The default fake docker binary counts as "Docker already installed";
+# hide it to simulate a machine without Docker.
+docker_absent() { mv "$FAKE_BIN/docker" "$FAKE_BIN/docker.off"; }
+docker_restore() { [ ! -e "$FAKE_BIN/docker.off" ] || mv "$FAKE_BIN/docker.off" "$FAKE_BIN/docker"; }
+# Ubuntu style, no Docker: Debian/Ubuntu engine together with docker-compose-v2.
+reset_state
+docker_absent
+printf 'docker-compose-v2 2.24.5-1\n' > "$TEST_ROOT/apt-candidates"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_log "^apt-get install -y --no-install-recommends docker.io docker-compose-v2$"
+# Docker's own repository, no Docker: the whole engine comes from that repository,
+# never Debian's docker.io next to docker-compose-plugin.
+reset_state
+docker_absent
+printf 'docker-compose-plugin 2.29.1-1\ndocker-ce 5:27.0.0-1\n' > "$TEST_ROOT/apt-candidates"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_log "^apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin$"
+refuse_log "docker\.io"
+# Docker's repository lists the plugin but not docker-ce: stop with instructions.
+reset_state
+docker_absent
+printf 'docker-compose-plugin 2.29.1-1\n' > "$TEST_ROOT/apt-candidates"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+docker_restore
+expect_rc 1 "plugin without docker-ce"
+expect_out "docs.docker.com/engine/install/debian"
+refuse_log "^apt-get install .*docker"
+# Docker already present: only the missing Compose plugin is installed.
+reset_state
+rm -f "$TEST_ROOT/docker-installed"
+printf 'docker-compose-plugin 2.29.1-1\ndocker-ce 5:27.0.0-1\n' > "$TEST_ROOT/apt-candidates"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_log "^apt-get install -y --no-install-recommends docker-compose-plugin$"
 # Package lists are refreshed even when no base package is missing.
 reset_state
 rm -f "$TEST_ROOT/docker-installed"
@@ -637,7 +687,7 @@ echo 1.0.0 > "$APP_ROOT/config/installed-version"
 run --yes
 expect_rc 0 "upgrade with --yes"
 expect_out "UPGRADE"
-expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE=$"
+expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE= OFFLINE=$"
 refuse_log "^wizard "
 refuse_log "^install "
 expect_out "backup made first"
@@ -699,7 +749,9 @@ install -d "$APP_ROOT/config"
 echo 1.0.0 > "$APP_ROOT/config/installed-version"
 run --yes --offline --bundle "$TEST_ROOT/bundle" --tarball "$TEST_ROOT/carry/vesselstack-$VER.tar.gz"
 expect_rc 0 "offline upgrade"
-expect_log "^ctl update --offline $RELEASE_BASE/$VER WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse"
+expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse OFFLINE=true$"
+refuse_log "^ctl update --offline"
+expect_out "VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse vesselstackctl update"
 
 # ---- 10. root-controlled release directory ------------------------------------------------
 reset_state

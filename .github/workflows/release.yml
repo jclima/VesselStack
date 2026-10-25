@@ -1,8 +1,12 @@
 name: Release
 
-# Runs only when a version tag is pushed. It never runs on pull requests or
-# branch pushes. It builds the release files and creates a DRAFT GitHub release
-# so the maintainer can review the files and publish it by hand.
+# Runs only when a version tag is pushed (never on pull requests or branch pushes).
+# 1. ci:      the full CI workflow, reused unchanged, against the tagged commit.
+# 2. build:   read-only; checks the tag, builds the release files, uploads them as
+#             workflow artifacts.
+# 3. publish: the only job with write access; creates a DRAFT release from those
+#             artifacts. The draft is the authoritative release: test its assets, then
+#             publish it by hand (see docs/DEVELOPMENT.md).
 on:
   push:
     tags:
@@ -12,47 +16,86 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Tag must match VERSION
         env:
           TAG: ${{ github.ref_name }}
         run: |
           test "$TAG" = "v$(cat VERSION)" || { echo "Tag $TAG does not match VERSION $(cat VERSION)" >&2; exit 1; }
-      - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
-      - name: Public-source privacy check
-        run: python3 scripts/check-public-tree.py
-      - name: Static distribution checks
-        run: tests/test-distribution.sh
-      - name: Python regressions
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
-      - name: Bootstrap and release package checks
+      - name: Tagged commit must be on main
         run: |
-          sudo tests/test-get-vesselstack.sh
-          tests/test-build-package.sh
+          # fetch-depth 0 fetched every branch; refuse tags that main does not contain.
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null || { echo "origin/main was not fetched" >&2; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "Tagged commit $GITHUB_SHA is not an ancestor of main; merge it first, then tag main." >&2
+            exit 1
+          }
       - name: Build and verify release files
         run: |
           VESSELSTACK_BUILD_REQUIRE_CLEAN=true ./build-package.sh
           cd generated
           sha256sum -c "vesselstack-$(cat ../VERSION).tar.gz.sha256"
           sha256sum -c get-vesselstack.sh.sha256
+          grep -qx "DEFAULT_VERSION=\"$(cat ../VERSION)\"" get-vesselstack.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-files
+          path: |
+            generated/vesselstack-*.tar.gz
+            generated/vesselstack-*.tar.gz.sha256
+            generated/get-vesselstack.sh
+            generated/get-vesselstack.sh.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-files
+          path: release
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          v=$(cat VERSION)
-          gh release create "$TAG" \
-            "generated/vesselstack-$v.tar.gz" \
-            "generated/vesselstack-$v.tar.gz.sha256" \
-            generated/get-vesselstack.sh \
-            generated/get-vesselstack.sh.sha256 \
-            --draft --verify-tag --title "VesselStack $v" \
-            --notes "Release files for VesselStack $v. Review, then publish. See CHANGELOG.md."
+          cd release
+          sha256sum -c "vesselstack-${TAG#v}.tar.gz.sha256"
+          sha256sum -c get-vesselstack.sh.sha256
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; not creating another draft."
+            exit 0
+          fi
+          {
+            echo "Release files for VesselStack ${TAG#v}. Review, test the assets, then publish. See CHANGELOG.md."
+            echo
+            echo "sha256:"
+            echo '```'
+            cat "vesselstack-${TAG#v}.tar.gz.sha256" get-vesselstack.sh.sha256
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            "vesselstack-${TAG#v}.tar.gz" \
+            "vesselstack-${TAG#v}.tar.gz.sha256" \
+            get-vesselstack.sh \
+            get-vesselstack.sh.sha256 \
+            --draft --verify-tag --latest=false \
+            --title "VesselStack ${TAG#v}" --notes-file notes.md

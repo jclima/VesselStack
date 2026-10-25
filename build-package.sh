@@ -8,6 +8,7 @@
 # tracked files are not included (a warning is printed).
 
 set -euo pipefail
+umask 022
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 VERSION=$(<"$SCRIPT_DIR/VERSION")
@@ -71,7 +72,17 @@ printf '%s\n' "$COMMIT" > "$STAGE/$PACKAGE_NAME/COMMIT"
 # bsdtar on macOS would otherwise add AppleDouble "._*" entries, which the
 # one-line installer's archive check (rightly) refuses.
 export COPYFILE_DISABLE=1
-tar -cf - -C "$STAGE" "$PACKAGE_NAME" | gzip -n > "$OUTPUT"
+# Reproducible archive: two builds of the same commit give identical bytes. GNU tar can
+# sort entries and pin owner and mtime; bsdtar (macOS) cannot, so there the archive is
+# valid but byte-for-byte reproducibility is not promised (the CI build on Linux is
+# the authoritative one).
+COMMIT_EPOCH=$(git_in_repo show -s --format=%ct HEAD)
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    LC_ALL=C tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$COMMIT_EPOCH" \
+        -cf - -C "$STAGE" "$PACKAGE_NAME" | gzip -n > "$OUTPUT"
+else
+    tar -cf - -C "$STAGE" "$PACKAGE_NAME" | gzip -n > "$OUTPUT"
+fi
 (
     cd "$SCRIPT_DIR/generated"
     sha256_of "$PACKAGE_NAME.tar.gz" > "$PACKAGE_NAME.tar.gz.sha256"

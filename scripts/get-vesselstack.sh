@@ -44,6 +44,9 @@ CONFIG_MAX_BYTES=65536
 INSTALL_ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 PROMPT_SOURCE=${VESSELSTACK_BOOTSTRAP_ANSWERS:-/dev/tty}
 DOCTOR_WAIT=${VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT:-30}
+case "$DOCTOR_WAIT" in
+    "" | *[!0-9]*) echo "VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT must be a whole number of seconds" >&2; exit 2 ;;
+esac
 PROMPT_OPEN=0
 STAGE=
 RELEASE_DIR=
@@ -404,6 +407,17 @@ if count == 0:
     sys.exit(1)
 PY
 
+# Command to re-run this script: the saved file when there is one, otherwise the full
+# download-and-run form (when piped, $0 is just "bash" and there is no file to re-run).
+rerun_cmd() {
+    if [ -f "$0" ]; then
+        printf 'sudo bash %q %s' "$0" "$*"
+    else
+        printf "curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 %s/v%s/get-vesselstack.sh | sudo bash -s -- %s" \
+            "$GITHUB_RELEASES" "$DEFAULT_VERSION" "$*"
+    fi
+}
+
 # ---------------------------------------------------------------- steps
 
 step_check_computer() {
@@ -413,7 +427,7 @@ step_check_computer() {
     if [ "$(id -u)" -ne 0 ]; then
         die "This installer must run as root, because it installs packages and system services." \
             "Re-run it with sudo, for example:" \
-            "  curl -fsSL $GITHUB_RELEASES/v$DEFAULT_VERSION/get-vesselstack.sh | sudo bash" \
+            "  curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 $GITHUB_RELEASES/v$DEFAULT_VERSION/get-vesselstack.sh | sudo bash" \
             "or, if you saved the script first:  sudo bash get-vesselstack.sh"
     fi
     ok "running as root"
@@ -470,7 +484,7 @@ step_preflight() {
         ok "offline mode: skipping the internet check"
     elif [ -n "$TARBALL_ARG" ]; then
         ok "using a local release tarball: skipping the internet check"
-    elif curl -fsSI --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 https://github.com >/dev/null 2>&1; then
+    elif curl -fsSI --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 https://github.com >/dev/null 2>&1; then
         ok "internet: github.com reachable"
     else
         die "Cannot reach https://github.com. Check the network (and DNS) and re-run." \
@@ -546,17 +560,25 @@ step_prerequisites() {
         fi
         local packages=() candidate
         apt_update_once
-        command -v docker >/dev/null 2>&1 || packages+=(docker.io)
         # Compose v2 is packaged as docker-compose-v2 (Ubuntu), docker-compose-plugin
         # (Docker's own repository) or, from Debian 13, docker-compose at version 2.x.
         # Debian 12 only has docker-compose 1.x, which does not work here.
+        # The engine and the plugin must come from the same source: never pair Debian's
+        # docker.io with Docker's docker-compose-plugin.
         if [ -n "$(apt_candidate docker-compose-v2)" ]; then
+            command -v docker >/dev/null 2>&1 || packages+=(docker.io)
             packages+=(docker-compose-v2)
         elif [ -n "$(apt_candidate docker-compose-plugin)" ]; then
+            if ! command -v docker >/dev/null 2>&1; then
+                [ -n "$(apt_candidate docker-ce)" ] || die "Docker's apt repository is configured but docker-ce is not available from it." \
+                    "Follow the official steps at https://docs.docker.com/engine/install/debian/ and re-run."
+                packages+=(docker-ce docker-ce-cli containerd.io)
+            fi
             packages+=(docker-compose-plugin)
         else
             candidate=$(apt_candidate docker-compose)
             if [[ "$candidate" =~ ^(1:)?2\. ]]; then
+                command -v docker >/dev/null 2>&1 || packages+=(docker.io)
                 packages+=(docker-compose)
             else
                 die "This system's package sources have no Docker Compose v2 package (Debian 12 / Raspberry Pi OS 'bookworm' only ships the old v1)." \
@@ -606,7 +628,7 @@ step_download() {
         say "  Downloading $BASE_URL/$name"
         local file
         for file in "$name" "$name.sha256"; do
-            curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 15 \
+            curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 15 \
                 -o "$STAGE/$file" "$BASE_URL/$file" </dev/null \
                 || die "Download failed: $BASE_URL/$file" \
                        "Check that release v$VERSION exists and that github.com is reachable. Nothing was installed."
@@ -755,8 +777,12 @@ step_configure() {
         local choice
         choice=$(ask_choice "Reuse it (r) or run the wizard again (w)?" r r w)
         if [ "$choice" = r ]; then
+            # Treat the saved file like any other input: copy once to staging, check that copy.
+            stage_untrusted "$ENV_FILE" "$STAGE/saved.env" \
+                || die "The saved configuration was refused (see above); run again and choose w."
+            python3 -I -c "$ENVTOOL" lint "$STAGE/saved.env" || die "The saved configuration is invalid; run again and choose w."
+            validate_staged "$STAGE/saved.env" || die "The saved configuration is invalid (see above); run again and choose w."
             ok "reusing the saved configuration"
-            python3 -I -c "$ENVTOOL" lint "$ENV_FILE" || die "The saved configuration is invalid; run again and choose w."
             return 0
         fi
         mv -- "$ENV_FILE" "$ENV_FILE.previous"
@@ -810,10 +836,8 @@ ensure_service_account() {
 
 step_install() {
     step 6 "Install and check"
-    local install_args=(--config "$ENV_FILE") bundle_wheels='' offline_flag=''
+    local install_args=(--config "$ENV_FILE") bundle_wheels='' offline_env=''
     if [ "$OFFLINE" -eq 1 ]; then
-        offline_flag='--offline '
-
         [ -d "$BUNDLE" ] || die "Offline bundle not found: $BUNDLE"
         BUNDLE=$(readlink -f -- "$BUNDLE")
         say "  Verifying the offline bundle..."
@@ -822,17 +846,18 @@ step_install() {
         ok "offline bundle verified"
         install_args+=(--offline)
         bundle_wheels=$BUNDLE/wheelhouse
+        offline_env="VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=$bundle_wheels "
     fi
 
     if [ "$UPGRADE" -eq 1 ]; then
         say ""
-        say "  Ready to upgrade $INSTALLED_VERSION -> $VERSION with:  vesselstackctl update ${offline_flag}$RELEASE_DIR"
+        say "  Ready to upgrade $INSTALLED_VERSION -> $VERSION with:  ${offline_env}vesselstackctl update $RELEASE_DIR"
         info "This runs a preflight check, makes a verified full backup, then installs and restarts services."
         info "Services are briefly unavailable during the restart. Do not do this while underway."
         if ! ask_yn "Upgrade now?" n; then
             say ""
             say "  Nothing was changed on the installed system. To upgrade later:"
-            info "sudo vesselstackctl update ${offline_flag}$RELEASE_DIR"
+            info "sudo ${offline_env}vesselstackctl update $RELEASE_DIR"
             exit 0
         fi
     else
@@ -851,7 +876,7 @@ step_install() {
         ask_yn "Install and start VesselStack now?" y || {
             say ""
             say "  Stopped before installing. Your configuration is saved. To continue later:"
-            info "sudo bash get-vesselstack.sh --no-wizard --config $ENV_FILE"
+            info "$(rerun_cmd --no-wizard --config "$ENV_FILE")"
             exit 0
         }
         ensure_service_account
@@ -868,16 +893,16 @@ step_install() {
     if [ "$UPGRADE" -eq 1 ]; then
         ctl=$(find_ctl) || die "vesselstackctl was not found, although VesselStack $INSTALLED_VERSION is installed." \
             "Run the installer directly: sudo $RELEASE_DIR/install.sh --config $INSTALL_ROOT/config/vesselstack.env --dry-run"
-        local update_args=(update)
-        [ "$OFFLINE" -ne 1 ] || update_args+=(--offline)
-        update_args+=("$RELEASE_DIR")
-        say "  Running: vesselstackctl ${update_args[*]}"
-        if [ -n "$bundle_wheels" ]; then
-            VESSELSTACK_WHEELHOUSE=$bundle_wheels "$ctl" "${update_args[@]}" </dev/null \
+        # The installed ctl may be an old release whose "update" only reads $1 as the
+        # directory, so the directory goes first and the mode travels in the environment
+        # (read by old ctls' child install.sh and by the new ctl alike).
+        say "  Running: ${offline_env}vesselstackctl update $RELEASE_DIR"
+        if [ "$OFFLINE" -eq 1 ]; then
+            VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=$bundle_wheels "$ctl" update "$RELEASE_DIR" </dev/null \
                 || die "The update failed (see above). Your data and the pre-update backup are untouched." \
                        "See the README sections on updating and restoring."
         else
-            "$ctl" "${update_args[@]}" </dev/null \
+            "$ctl" update "$RELEASE_DIR" </dev/null \
                 || die "The update failed (see above). Your data and the pre-update backup are untouched." \
                        "See the README sections on updating and restoring."
         fi
@@ -887,19 +912,19 @@ step_install() {
         if [ -n "$bundle_wheels" ]; then
             VESSELSTACK_WHEELHOUSE=$bundle_wheels "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
-                       "Fix the problem, then re-run: sudo bash get-vesselstack.sh --no-wizard --config $ENV_FILE"
+                       "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
             VESSELSTACK_WHEELHOUSE=$bundle_wheels "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
                 || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
-                       "After fixing the problem, re-run: sudo bash get-vesselstack.sh --no-wizard --config $ENV_FILE"
+                       "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
         else
             "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
-                       "Fix the problem, then re-run: sudo bash get-vesselstack.sh --no-wizard --config $ENV_FILE"
+                       "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
             "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
                 || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
-                       "After fixing the problem, re-run: sudo bash get-vesselstack.sh --no-wizard --config $ENV_FILE"
+                       "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
         fi
         changed "installed VesselStack $VERSION to $(env_get "$ENV_FILE" VESSELSTACK_ROOT) and started its services"
     fi
