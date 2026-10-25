@@ -1028,8 +1028,9 @@ Requirements and limits:
 - **Time (estimates).** About 10-15 minutes for the first build on a Raspberry
   Pi 5 (image pull, toolchain download, full compile) and 3-6 minutes with a warm
   cache. These are estimates for a Pi 5, not measurements; the laptop figures
-  above (measured) are about 4 minutes cold and 2 minutes warm. A Pi 4 is
-  slower.
+  above (measured) are about 4 minutes cold and 2 minutes warm, and `display
+  build` itself measured 99 s cold (including the toolchain download) and 31 s
+  warm in Docker Desktop on an Apple-silicon laptop. A Pi 4 is slower.
 - **Serial device.** DEVICE must be an absolute path under `/dev` that is a
   character device named `/dev/tty*` (for example `/dev/ttyACM0`), or a symbolic
   link under `/dev/serial/by-id/` that resolves to one (preferred: the name
