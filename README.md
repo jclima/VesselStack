@@ -10,6 +10,15 @@ the illustrated [end-to-end installation and commissioning guide](docs/INSTALLAT
 It covers Raspberry Pi 5 assembly, marine power, isolated NMEA 2000/SocketCAN,
 backbone connection, acceptance tests, backup, and rollback.
 
+Deploying a release to a home-lab Pi and an offline boat Pi? Follow the
+[deployment runbook](docs/DEPLOYMENT.md): SSH release signing and the signed
+`v1.4.0` tag, a clean build with recorded sha256, a home-lab soak and rehearsals
+(update, backup/restore, offline install, `vcan` replay), the carry bundle,
+dock-side install with `vesselstackctl update --offline`, rollback, an
+acceptance checklist and known gaps. It is documentation only; it changes no
+code, configuration or runtime behaviour, so there is nothing to roll back
+beyond deleting the file.
+
 ## Guided first installation
 
 After installing the OS and Docker prerequisites from the end-to-end guide:
