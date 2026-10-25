@@ -587,7 +587,7 @@ def _open_existing_dir(parent_fd: int, name: str, label: str):
 
 
 @contextlib.contextmanager
-def build_lock(ctx, display_id: str, create: bool = True, notify=None):
+def build_lock(ctx, display_id: str, create: bool = True, notify=None, timeout=None):
     """Exclusive per-display lock ``build/displays/.<id>.lock`` (root, 0600, no-follow flock).
 
     Every command that creates, replaces, reads for flashing or removes this display's
@@ -600,6 +600,7 @@ def build_lock(ctx, display_id: str, create: bool = True, notify=None):
     Builds are long, so a waiter says so, waits up to ``ctx.build_lock_timeout`` seconds
     and then fails with a clear message instead of blocking silently. With
     ``create=False`` nothing is created: yields False when ``build/displays`` is absent.
+    ``timeout`` overrides ``ctx.build_lock_timeout``.
     """
     if not schema.DISPLAY_ID.fullmatch(display_id):
         raise RenderError("display id must match ^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$", 2)
@@ -643,7 +644,7 @@ def build_lock(ctx, display_id: str, create: bool = True, notify=None):
         owner = mqtt_auth._owner((0, 0))
         if owner:
             os.fchown(lock_fd, *owner)
-        timeout = ctx.build_lock_timeout
+        timeout = ctx.build_lock_timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
         told = False
         while True:
@@ -726,6 +727,103 @@ def write_project(ctx, rendered: Rendered) -> Path:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def _displays_dir(ctx):
+    """``build/displays`` as an fd, or None when it does not exist (nothing is created)."""
+    try:
+        root_fd = os.open(ctx.root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise RenderError(f"cannot open {ctx.root}: {exc.strerror}") from exc
+    try:
+        label = str(ctx.root / BUILD_DIR_NAME)
+        build_fd = _open_existing_dir(root_fd, BUILD_DIR_NAME, label)
+        if build_fd is None:
+            return None
+        try:
+            return _open_existing_dir(build_fd, "displays", label + "/displays")
+        finally:
+            os.close(build_fd)
+    finally:
+        os.close(root_fd)
+
+
+def remove_build_tree(ctx, display_id: str) -> bool:
+    """Delete everything under build/displays for one display; True if anything was there.
+
+    Exactly ``<id>`` (project, project.prev, stored firmware, scratch) and the old-layout
+    siblings ``<id>.new`` and ``<id>.prev``; ids cannot contain a dot, so these names can
+    never belong to another display. No symlink is followed. The caller holds the build lock.
+    """
+    parent_fd = _displays_dir(ctx)
+    if parent_fd is None:
+        return False
+    try:
+        found = False
+        for name in (display_id, f"{display_id}.new", f"{display_id}.prev"):
+            if _exists(parent_fd, name):
+                _remove_tree(parent_fd, name)
+                found = True
+        return found
+    finally:
+        os.close(parent_fd)
+
+
+def scrub_project_secrets(ctx, notify=None, timeout: float = 2.0) -> tuple[list, list]:
+    """Delete ``secrets.yaml`` from every rendered project (not the stored firmware).
+
+    Used by ``wifi --clear``. Returns (cleaned display ids, ids skipped because a
+    build or flash held their lock for longer than ``timeout`` seconds).
+    """
+    parent_fd = _displays_dir(ctx)
+    if parent_fd is None:
+        return [], []
+    try:
+        names = sorted(name for name in os.listdir(parent_fd)
+                       if schema.DISPLAY_ID.fullmatch(name))
+    finally:
+        os.close(parent_fd)
+    cleaned, skipped = [], []
+    for display_id in names:
+        try:
+            with build_lock(ctx, display_id, create=False, notify=notify, timeout=timeout) as held:
+                if held and _scrub_one(ctx, display_id):
+                    cleaned.append(display_id)
+        except RenderError:
+            skipped.append(display_id)
+    return cleaned, skipped
+
+
+def _scrub_one(ctx, display_id: str) -> bool:
+    parent_fd = _displays_dir(ctx)
+    if parent_fd is None:
+        return False
+    removed = False
+    try:
+        display_fd = _open_existing_dir(parent_fd, display_id, display_id)
+        if display_fd is None:
+            return False
+        try:
+            targets = [(display_fd, "secrets.yaml")]  # old layout: project files sat here
+            opened = []
+            for sub in (PROJECT_DIR, PROJECT_NEW, PROJECT_PREV):
+                sub_fd = _open_existing_dir(display_fd, sub, f"{display_id}/{sub}")
+                if sub_fd is not None:
+                    opened.append(sub_fd)
+                    targets.append((sub_fd, "secrets.yaml"))
+            try:
+                for fd, name in targets:
+                    if _exists(fd, name):
+                        os.unlink(name, dir_fd=fd)
+                        removed = True
+            finally:
+                for fd in opened:
+                    os.close(fd)
+        finally:
+            os.close(display_fd)
+    finally:
+        os.close(parent_fd)
+    return removed
 
 
 def migrate_legacy_layout(parent_fd: int, display_fd: int, display_id: str) -> bool:

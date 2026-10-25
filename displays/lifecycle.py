@@ -9,6 +9,7 @@ Secret values are never printed and never placed on a command line.
 from __future__ import annotations
 
 import base64
+import contextlib
 import getpass
 import json
 import os
@@ -225,6 +226,21 @@ def _require_root(ctx: Context, command: str) -> None:
         raise LifecycleError(f"'{command}' changes root-owned files; run it as root (sudo)")
 
 
+@contextlib.contextmanager
+def _display_build_lock(ctx: Context, display_id: str, timeout=None):
+    """The per-display build lock (render.build_lock) with LifecycleError for failures.
+
+    Taken before the configuration lock, like every other user of it. Yields False when
+    the display has never been rendered or built (nothing is created for that).
+    """
+    import render  # imported late: render imports this module
+    try:
+        with render.build_lock(ctx, display_id, create=False, timeout=timeout) as held:
+            yield held
+    except render.RenderError as exc:
+        raise LifecycleError(str(exc), exc.code) from exc
+
+
 def _check_sync_env(ctx: Context) -> None:
     if ctx.enabled:
         for key in ("MQTT_USERNAME", "MQTT_PASSWORD"):
@@ -332,12 +348,14 @@ def add(ctx: Context, display_id: str, board: str, name: str | None = None,
 def remove(ctx: Context, display_id: str, yes: bool) -> None:
     if not yes:
         raise LifecycleError(
-            f"remove {display_id} deletes the display, its MQTT account and its stored "
-            "credentials; run again with --yes to confirm", 2)
+            f"remove {display_id} deletes the display, its MQTT account, its stored "
+            "credentials and its rendered project and firmware under build/displays; run "
+            "again with --yes to confirm", 2)
     _require_root(ctx, "remove")
     registry = load_registry()
     _check_sync_env(ctx)
-    with ConfigDir(ctx) as cfg_dir:
+    import render  # imported late: render imports this module
+    with _display_build_lock(ctx, display_id) as held, ConfigDir(ctx) as cfg_dir:
         cfg_dir.lock()
         config = _loaded_config(cfg_dir, registry)
         _display_or_error(config, display_id)
@@ -348,6 +366,13 @@ def remove(ctx: Context, display_id: str, yes: bool) -> None:
             del secret_data["displays"][display_id]
             write_secrets(cfg_dir, secret_data)
         ctx.out(f"Removed display {display_id!r} and its stored credentials.")
+        try:
+            if held and render.remove_build_tree(ctx, display_id):
+                ctx.out(f"Deleted build/displays/{display_id}: the rendered project "
+                        "(secrets.yaml) and any stored firmware, which embed the old credentials.")
+        except (render.RenderError, OSError) as exc:
+            ctx.out(f"warning: could not delete build/displays/{display_id}: {exc}; delete it "
+                    "by hand, it still holds the old credentials")
         _sync(ctx)
     ctx.out("The device is disconnected by the broker reload; erase or reflash it before reuse. "
             "Adding the same id again creates new credentials.")
@@ -410,19 +435,45 @@ def wifi(ctx: Context, clear: bool = False, allow_open: bool = False, stdin=None
     with ConfigDir(ctx) as cfg_dir:
         cfg_dir.lock()
         secret_data = read_secrets(cfg_dir)
-        if clear:
-            if "wifi" not in secret_data:
-                ctx.out("No Wi-Fi credentials were stored.")
-                return
-            del secret_data["wifi"]
-            write_secrets(cfg_dir, secret_data)
-            ctx.out("Wi-Fi credentials removed.")
+        if clear and "wifi" not in secret_data:
+            ctx.out("No Wi-Fi credentials were stored.")
             return
-        secret_data["wifi"] = credentials
+        if clear:
+            del secret_data["wifi"]
+        else:
+            secret_data["wifi"] = credentials
         write_secrets(cfg_dir, secret_data)
+    if clear:
+        ctx.out("Wi-Fi credentials removed.")
+        _scrub_rendered_wifi(ctx)
+        return
     kind = "open network" if credentials["password"] == "" else "WPA passphrase"
     ctx.out(f"Wi-Fi credentials saved ({kind}) in {mqtt_auth.SECRETS_NAME}, shared by all "
-            "displays. Displays must be reflashed to pick up changes.")
+            "displays. Displays must be reflashed to pick up changes (over USB: they cannot "
+            "reach the new network).")
+    ctx.out("Note: projects already rendered under build/displays and firmware built earlier "
+            "still contain the OLD Wi-Fi credentials until you run 'display render' or "
+            "'display build' again, and 'display flash' refuses that older firmware without "
+            "--force.")
+
+
+def _scrub_rendered_wifi(ctx: Context) -> None:
+    """After ``wifi --clear``: delete rendered projects' secrets.yaml (not the firmware)."""
+    import render  # imported late: render imports this module
+    try:
+        cleaned, skipped = render.scrub_project_secrets(
+            ctx, notify=lambda text: print(text, file=sys.stderr))
+    except (render.RenderError, OSError) as exc:
+        ctx.out(f"warning: could not clean the rendered projects: {exc}; delete the secrets.yaml "
+                "files under build/displays/*/project by hand")
+        return
+    if cleaned:
+        ctx.out(f"Deleted secrets.yaml from the rendered project of: {', '.join(cleaned)}.")
+    if skipped:
+        ctx.out(f"warning: a build or flash was running for {', '.join(skipped)}; its project "
+                "secrets.yaml was not deleted. Run 'wifi --clear' again later or delete it by hand")
+    ctx.out("Firmware already built or exported still contains the old Wi-Fi credentials until "
+            "it is rebuilt; 'display flash' refuses it without --force.")
 
 
 def list_displays(ctx: Context) -> list[list[str]]:

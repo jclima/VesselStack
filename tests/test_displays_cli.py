@@ -241,6 +241,89 @@ class CliTests(unittest.TestCase):
             lifecycle.remove(self.ctx(), "ghost", True)
         self.assertEqual(caught.exception.code, 2)
 
+    # --- build tree cleanup --------------------------------------------------
+
+    def make_build_tree(self, *ids):
+        for display_id in ids:
+            base = self.root / "build" / "displays" / display_id
+            for sub in ("project", "project.prev", "firmware", "firmware.prev"):
+                (base / sub).mkdir(parents=True, mode=0o700)
+            for sub in ("project", "project.prev"):
+                (base / sub / "secrets.yaml").write_text("wifi_password: old")
+                (base / sub / f"{display_id}.yaml").write_text("device")
+            (base / "firmware" / "firmware.ota.bin").write_text("compiled-in secrets")
+            (base / "firmware.prev" / "firmware.ota.bin").write_text("older compiled-in secrets")
+
+    def test_remove_deletes_exactly_that_displays_build_tree(self):
+        self.add("helm")
+        self.add("helm-2")
+        self.make_build_tree("helm", "helm-2")
+        displays = self.root / "build" / "displays"
+        for legacy in ("helm.new", "helm.prev"):  # old-layout siblings
+            (displays / legacy).mkdir()
+            (displays / legacy / "secrets.yaml").write_text("old")
+        lifecycle.remove(self.ctx(), "helm", True)
+        self.assertEqual(sorted(p.name for p in displays.iterdir() if not p.name.startswith(".")),
+                         ["helm-2"])  # not a prefix glob: helm-2 is a different display
+        self.assertTrue((displays / "helm-2" / "firmware" / "firmware.ota.bin").exists())
+        self.assertIn("Deleted build/displays/helm", self.output())
+
+    def test_remove_without_a_build_tree_creates_nothing(self):
+        self.add("helm")
+        lifecycle.remove(self.ctx(), "helm", True)
+        self.assertFalse((self.root / "build").exists())
+        self.assertNotIn("Deleted build", self.output())
+
+    def test_remove_waits_for_a_running_build_and_changes_nothing_if_it_stays_busy(self):
+        import render
+        self.add("helm")
+        self.make_build_tree("helm")
+        with render.build_lock(self.ctx(), "helm", notify=lambda text: None):
+            with self.assertRaises(lifecycle.LifecycleError) as caught:
+                lifecycle.remove(self.ctx(build_lock_timeout=0.3), "helm", True)
+        self.assertIn("another build/flash for helm is running", str(caught.exception))
+        self.assertIn("helm", self.cfg()["displays"])
+        self.assertTrue((self.root / "build" / "displays" / "helm" / "firmware").exists())
+
+    def test_wifi_clear_deletes_rendered_project_secrets_but_not_firmware(self):
+        self.wifi(f"net\n{WIFI_PASSWORD}\n")
+        self.make_build_tree("helm", "aux")
+        lifecycle.wifi(self.ctx(), clear=True)
+        for display_id in ("helm", "aux"):
+            base = self.root / "build" / "displays" / display_id
+            self.assertFalse((base / "project" / "secrets.yaml").exists())
+            self.assertFalse((base / "project.prev" / "secrets.yaml").exists())
+            self.assertTrue((base / "project" / f"{display_id}.yaml").exists())
+            self.assertTrue((base / "firmware" / "firmware.ota.bin").exists())
+        text = self.output()
+        self.assertIn("aux, helm", text)
+        self.assertIn("still contains the old Wi-Fi credentials", text)
+
+    def test_wifi_clear_skips_a_display_that_is_being_built(self):
+        import render
+        self.wifi(f"net\n{WIFI_PASSWORD}\n")
+        self.make_build_tree("helm", "aux")
+        with render.build_lock(self.ctx(), "helm", notify=lambda text: None):
+            lifecycle.wifi(self.ctx(), clear=True)
+        base = self.root / "build" / "displays"
+        self.assertTrue((base / "helm" / "project" / "secrets.yaml").exists())
+        self.assertFalse((base / "aux" / "project" / "secrets.yaml").exists())
+        self.assertNotIn("wifi", self.sec())  # the credentials themselves are gone regardless
+        self.assertIn("a build or flash was running for helm", self.output())
+
+    def test_wifi_change_says_existing_projects_and_firmware_keep_the_old_credentials(self):
+        self.wifi(f"net\n{WIFI_PASSWORD}\n")
+        self.make_build_tree("helm")
+        self.wifi("othernet\nabcdefgh2\n")
+        self.assertTrue((self.root / "build/displays/helm/project/secrets.yaml").exists())
+        self.assertIn("OLD Wi-Fi credentials", self.output())
+
+    def test_rotate_leaves_build_tree_alone(self):
+        self.add("helm")
+        self.make_build_tree("helm")
+        lifecycle.rotate(self.ctx(), "helm")
+        self.assertTrue((self.root / "build/displays/helm/firmware/firmware.ota.bin").exists())
+
     def test_rotate_changes_only_that_display(self):
         self.add("helm")
         self.add("aux")
