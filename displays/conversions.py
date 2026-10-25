@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import math
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Callable
 
 _GAL = 0.003785411784  # US gallon in m3
+MAX_ABS_VALUE = 1e15  # larger converted readings are treated as invalid
 
 
 def _signed_deg(rad: float) -> float:
@@ -54,15 +55,29 @@ def convert(name: str, value: float) -> float:
     return CONVERSIONS[name](float(value))
 
 
-def round_value(value: float, precision: int) -> float | int:
-    """Round half away from zero to `precision` places; never returns -0.0."""
-    q = Decimal(1).scaleb(-precision)
-    out = Decimal(repr(float(value))).quantize(q, rounding=ROUND_HALF_UP)
-    if precision == 0:
-        return int(out)
-    result = float(out)
+def round_value(value: float, precision: int) -> float | int | None:
+    """Round half away from zero to `precision` places; never returns -0.0.
+
+    Returns None for non-finite values, values beyond MAX_ABS_VALUE, or any
+    value that cannot be converted or rounded.
+    """
+    try:
+        number = float(value)
+        if not math.isfinite(number) or abs(number) > MAX_ABS_VALUE:
+            return None
+        q = Decimal(1).scaleb(-precision)
+        out = Decimal(repr(number)).quantize(q, rounding=ROUND_HALF_UP)
+        if precision == 0:
+            return int(out)
+        result = float(out)
+    except (InvalidOperation, OverflowError, ValueError):
+        return None
     return 0.0 if result == 0 else result
 
 
-def convert_and_round(name: str, value: float, precision: int) -> float | int:
-    return round_value(convert(name, value), precision)
+def convert_and_round(name: str, value: float, precision: int) -> float | int | None:
+    try:
+        converted = convert(name, value)
+    except (OverflowError, ValueError):
+        return None
+    return round_value(converted, precision)

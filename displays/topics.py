@@ -81,7 +81,10 @@ class Engine:
         out = []
         for iid in self._by_path.get(path, ()):
             inst, st = self.instruments[iid], self._state[iid]
-            st.value = conversions.convert_and_round(inst["convert"], raw, inst["precision"])
+            rounded = conversions.convert_and_round(inst["convert"], raw, inst["precision"])
+            if rounded is None:
+                continue
+            st.value = rounded
             st.ts = ts if isinstance(ts, str) else None
             st.received = now
             st.state = "ok"

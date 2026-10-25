@@ -74,6 +74,15 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(str(conversions.round_value(-0.04, 1)), "0.0")
         self.assertEqual(conversions.convert_and_round("m/s->kn", 3.2918, 1), 6.4)
 
+    def test_round_value_rejects_out_of_range(self) -> None:
+        for bad in (1e30, 1e300, -1e300, float("inf"), float("-inf"), float("nan"), 1e15 * 1.0001):
+            self.assertIsNone(conversions.round_value(bad, 1), repr(bad))
+            self.assertIsNone(conversions.round_value(bad, 0), repr(bad))
+        self.assertEqual(conversions.round_value(1e15, 1), 1e15)
+        self.assertEqual(conversions.round_value(-1e15, 0), -10**15)
+        self.assertIsNone(conversions.convert_and_round("m/s->kn", 1e308, 1))
+        self.assertIsNone(conversions.convert_and_round("rad->deg_signed", 1e308, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

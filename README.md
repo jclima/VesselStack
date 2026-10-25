@@ -539,7 +539,7 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 - A changed value is published at most once per `min_interval_ms`; unchanged
   values are not republished except by the `heartbeat_s` heartbeat, which also
   refreshes `age`. Null, non-numeric, non-finite and boolean SignalK values are
-  ignored.
+  ignored, as are values whose magnitude exceeds 1e15 after conversion.
 
 ### Supported boards
 

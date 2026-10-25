@@ -98,6 +98,16 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.update("unknown.path", 1.0, TS, 1.0), [])
         self.assertEqual(decode(self.engine.tick(2.0))[0][1]["st"], "missing")
 
+    def test_out_of_range_values_ignored(self) -> None:
+        # 1e30 exceeds the magnitude limit; 1e308 only overflows after m/s->kn.
+        for bad in (1e30, -1e30, 1e308):
+            self.assertEqual(self.engine.update(SOG, bad, TS, 1.0), [], repr(bad))
+        self.assertEqual(decode(self.engine.tick(2.0))[0][1]["st"], "missing")
+        msgs = decode(self.engine.update(SOG, KN * 6.4, TS, 3.0))
+        self.assertEqual(msgs[0][1]["v"], 6.4)
+        self.assertEqual(msgs[0][1]["st"], "ok")
+        self.assertEqual(self.engine.update(SOG, 1e30, TS, 4.0), [])
+
     def test_signed_conversion_rounding_in_payload(self) -> None:
         engine = topics.Engine({"instruments": {"awa": {"path": "environment.wind.angleApparent",
                                 "convert": "rad->deg_signed", "unit": "deg", "precision": 0, "stale_after_s": 10}}})
