@@ -10,7 +10,7 @@ BLOCKED_PARTS = {'.git-local', '.local', '.venv', 'memory', 'data', 'backups',
                  'pre-change-backups', 'reviews', '.claude', '.codex', '.agents', '.tools', '.esphome'}
 BLOCKED_NAMES = {'.mcp.json', 'boat_facts.json', 'boat-chat.env', 'boatstack.env', 'token.pass',
                  'secrets.yaml', 'displays.json', 'displays.secrets.json'}
-BLOCKED_PREFIXES = (('displays', 'build'),)
+BLOCKED_PREFIXES = (('displays', 'build'), ('build', 'displays'))
 BLOCKED_SUFFIXES = {'.sqlite', '.sqlite3', '.db', '.jsonl', '.log', '.secret', '.tar', '.gz', '.zip',
                     '.bin', '.elf', '.uf2'}
 SECRET_PATTERNS = [

@@ -16,3 +16,15 @@ copyright, and attribution notices.
 
 VesselStack's Apache-2.0 license applies only to original VesselStack material;
 it does not override or replace any upstream license.
+
+## Bundled fonts
+
+`displays/esphome/fonts/` contains the static Regular and Bold instances of
+Roboto Condensed, Copyright 2011 The Roboto Project Authors
+(<https://github.com/googlefonts/roboto-classic>), distributed by Google Fonts
+(<https://github.com/google/fonts/tree/main/ofl/robotocondensed>) under the SIL
+Open Font License, Version 1.1. The license text is kept next to the fonts in
+`displays/esphome/fonts/OFL.txt`. The generated display firmware embeds glyph
+bitmaps rendered from these fonts; the firmware is built with ESPHome (GPLv3 and
+MIT components) and LVGL (MIT), which are downloaded at build time and not
+distributed by VesselStack.

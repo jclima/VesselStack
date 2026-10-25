@@ -14,6 +14,7 @@
       "safe_inset": 70,
       "content_width": 340,
       "content_height": 340,
+      "esphome_package": "boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml",
       "layouts": ["single", "grid-2x2"]
     }
   }

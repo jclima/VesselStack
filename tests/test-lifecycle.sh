@@ -36,6 +36,8 @@ cp -R "$REPO_ROOT/displays" "$APP_ROOT/displays"
 install -d "$APP_ROOT/displays/.venv/bin" "$APP_ROOT/displays/__pycache__"
 printf 'rebuildable\n' > "$APP_ROOT/displays/.venv/bin/python"
 printf 'cache\n' > "$APP_ROOT/displays/__pycache__/x.pyc"
+install -d -m 0700 "$APP_ROOT/build/displays/helm"
+printf 'wifi_password: secret\n' > "$APP_ROOT/build/displays/helm/secrets.yaml"
 printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
@@ -95,6 +97,10 @@ fi
 archive_listing=$(tar -tzf "$archive")  # not piped into grep -q: SIGPIPE trips pipefail
 if grep -q '/displays/.venv\|/displays/__pycache__' <<<"$archive_listing"; then
     echo 'Rebuildable displays virtual environment or bytecode was included in backup' >&2
+    exit 1
+fi
+if grep -q '/build/' <<<"$archive_listing"; then
+    echo 'Generated firmware build directories (with secrets) were included in backup' >&2
     exit 1
 fi
 if ! grep -q '/displays/bridge.py' <<<"$archive_listing"; then

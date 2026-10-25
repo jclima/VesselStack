@@ -21,9 +21,9 @@ Commands:
   version                      Print installed and command versions
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
-  display list|add|remove|rotate|wifi|status|validate|sync-mqtt [ARGUMENTS]
-                               Manage instrument displays; see
-                               "vesselstackctl display --help"
+  display list|add|remove|rotate|wifi|status|render|export|validate|sync-mqtt [ARGUMENTS]
+                               Manage instrument displays and generate their
+                               ESPHome projects; see "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
@@ -328,6 +328,7 @@ PY
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/__pycache__" \
         --exclude="${VESSELSTACK_ROOT#/}/displays/.venv" \
         --exclude="${VESSELSTACK_ROOT#/}/displays/__pycache__" \
+        --exclude="${VESSELSTACK_ROOT#/}/build" \
         --transform 's,^,vesselstack-backup/,' \
         "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA"
     sha256sum "$archive" > "$manifest"

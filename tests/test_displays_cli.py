@@ -122,7 +122,7 @@ class CliTests(unittest.TestCase):
         self.assertIn(["docker", "kill", "-s", "HUP", mqtt_auth.CONTAINER], self.runner.calls)
         text = self.output()
         self.assertIn("MQTT username: vsdisp-helm", text)
-        self.assertIn("coming in a later release", text)
+        self.assertIn("display export", text)
         self.assertNotIn(self.sec()["displays"]["helm"]["mqtt_password"], text)
 
     def test_add_uses_capacity_and_instrument_order(self):

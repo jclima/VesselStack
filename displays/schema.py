@@ -13,6 +13,7 @@ DEFAULT_REGISTRY = MODULE_DIR / "boards" / "registry.json"
 
 INSTRUMENT_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 DISPLAY_ID = re.compile(r"^[a-z][a-z0-9-]{0,23}$")
+ESPHOME_PACKAGE = re.compile(r"^boards/[a-z0-9][a-z0-9.-]{0,63}\.yaml$")
 BOARD_ID = re.compile(r"^[a-z][a-z0-9.-]{0,63}$")
 LAYOUT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SK_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z0-9_-]+)+$")
@@ -24,7 +25,8 @@ INSTRUMENT_REQUIRED = {"path", "label", "convert", "unit", "precision", "stale_a
 DISPLAY_KEYS = {"name", "board", "home_assistant_api", "pages"}
 DISPLAY_REQUIRED = {"name", "board", "pages"}
 PAGE_KEYS = {"title", "layout", "items"}
-BOARD_KEYS = {"name", "width", "height", "shape", "safe_inset", "content_width", "content_height", "layouts"}
+BOARD_KEYS = {"name", "width", "height", "shape", "safe_inset", "content_width", "content_height", "layouts",
+              "esphome_package"}
 
 DEFAULT_HEARTBEAT_S = 5
 DEFAULT_MIN_INTERVAL_MS = 1000
@@ -113,6 +115,11 @@ def validate_registry(reg) -> list[str]:
                 for key in ("width", "height"):
                     if key in board:
                         dims_ok &= _int_range(board, key, 1, 4096, where, errors)
+                if "esphome_package" in board and not (
+                        isinstance(board["esphome_package"], str)
+                        and ESPHOME_PACKAGE.fullmatch(board["esphome_package"])
+                        and ".." not in board["esphome_package"]):
+                    errors.append(f"{where}.esphome_package: must look like boards/NAME.yaml")
                 if "shape" in board and board["shape"] not in ("round", "rect"):
                     errors.append(f"{where}.shape: must be 'round' or 'rect'")
                 if "safe_inset" in board:

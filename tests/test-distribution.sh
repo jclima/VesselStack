@@ -10,13 +10,20 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" \
-    "$ROOT/tests/test-displays-envfile-systemd.sh" "$ROOT/scripts/install-displays-venv.sh"
+    "$ROOT/tests/test-displays-envfile-systemd.sh" "$ROOT/scripts/install-displays-venv.sh" \
+    "$ROOT/tests/test-displays-esphome-config.sh" "$ROOT/tests/compile-display-firmware.sh"
 python3 -m py_compile "$ROOT/scripts/pin-displays-requirements.py"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 for f in "$ROOT"/displays/*.py "$ROOT"/tests/fixtures/*.py; do python3 -m py_compile "$f"; done
 python3 -m json.tool "$ROOT/displays/boards/registry.json" >/dev/null
 python3 "$ROOT/displays/displayctl.py" validate >/dev/null
+# The ESPHome image pin lives in displays/esphome/IMAGE only; the README must quote the same digest.
+IMAGE_PIN=$(tr -d '[:space:]' < "$ROOT/displays/esphome/IMAGE")
+grep -Eq '^ghcr\.io/esphome/esphome:[0-9.]+@sha256:[0-9a-f]{64}$' <<<"$IMAGE_PIN"
+grep -qF "$IMAGE_PIN" "$ROOT/README.md"
+grep -qF "esphome==$(tr -d '[:space:]' < "$ROOT/displays/esphome/VERSION")" "$ROOT/README.md"
+grep -qF ":$(tr -d '[:space:]' < "$ROOT/displays/esphome/VERSION")@" <<<"$IMAGE_PIN"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
@@ -25,7 +32,7 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" \
     "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-displays-envfile-systemd.sh" \
-    "$ROOT/scripts/install-displays-venv.sh"
+    "$ROOT/scripts/install-displays-venv.sh" "$ROOT/tests/test-displays-esphome-config.sh" "$ROOT/tests/compile-display-firmware.sh"
 if grep -nE 'mosquitto_passwd -b' "$ROOT/install.sh" "$ROOT/scripts/vesselstackctl" "$ROOT"/displays/*.py; then
     echo "MQTT passwords must not be passed on a command line" >&2
     exit 1

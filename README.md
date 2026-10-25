@@ -670,11 +670,14 @@ and page layouts are data, so more boards and layouts can be added later.
 **Status: preview.** The configuration schema, validation, unit conversions,
 the MQTT topic/payload and freshness logic, the board registry, the MQTT
 account/ACL provisioning (`displayctl.py sync-mqtt`), the **device lifecycle
-commands** (`vesselstackctl display list|add|remove|rotate|wifi|status`) and the
-**SignalK-to-MQTT bridge service** exist today (`displays/`). With `DISPLAYS_ENABLE=true` the
-bridge publishes your configured instruments to Mosquitto; the display screens
-and firmware do not exist yet, so nothing consumes those topics beyond your own
-MQTT clients. The always-on Mosquitto ACL does affect existing installations
+commands** (`vesselstackctl display list|add|remove|rotate|wifi|status`), the
+**SignalK-to-MQTT bridge service** and the **ESPHome project generator**
+(`vesselstackctl display render|export`, see [Firmware: generate, build and
+flash](#firmware-generate-build-and-flash)) exist today (`displays/`). With
+`DISPLAYS_ENABLE=true` the bridge publishes your configured instruments to
+Mosquitto. The generated firmware config validates and compiles but has not yet
+run on real display hardware, and building or flashing on the Pi itself is not
+available (compile on a laptop). The always-on Mosquitto ACL does affect existing installations
 (see [MQTT access control](#mqtt-access-control)). `displays/` is copied to
 `$VESSELSTACK_ROOT/displays` by the installer.
 
@@ -816,9 +819,10 @@ sudo vesselstackctl display remove helm --yes
 | Command | What it changes |
 | --- | --- |
 | `list` | Nothing. Table of id, name, board, page count, MQTT username, whether generated credentials exist (`SECRETS`) and whether Wi-Fi credentials are stored (`WIFI`). Works without root if the files are readable; without root the secrets/Wi-Fi columns show `unknown`. Never prints secret values. |
-| `add ID --board BOARD [--name NAME] [--home-assistant-api]` | Appends the display to `displays.json` with one default page: title `Main`, the board's largest layout, and the first N instruments in `displays.json` order (N = layout capacity, fewer if you have fewer instruments). It refuses an existing id, an unknown board or a configuration with no instruments, and validates the whole resulting file before writing. It then syncs MQTT like `sync-mqtt`: creates the display password in `displays.secrets.json`, rewrites the ACL/passwords and signals the broker. It prints the MQTT username (`vsdisp-ID`) and next steps, never the password. Edit the pages in `displays.json` afterwards and check with `validate`. Export and flashing: coming in a later release. |
+| `add ID --board BOARD [--name NAME] [--home-assistant-api]` | Appends the display to `displays.json` with one default page: title `Main`, the board's largest layout, and the first N instruments in `displays.json` order (N = layout capacity, fewer if you have fewer instruments). It refuses an existing id, an unknown board or a configuration with no instruments, and validates the whole resulting file before writing. It then syncs MQTT like `sync-mqtt`: creates the display password in `displays.secrets.json`, rewrites the ACL/passwords and signals the broker. It prints the MQTT username (`vsdisp-ID`) and next steps, never the password. Edit the pages in `displays.json` afterwards and check with `validate`; then generate the firmware project with `render` or `export` (see [Firmware: generate, build and flash](#firmware-generate-build-and-flash)). |
 | `remove ID --yes` | Deletes the display from `displays.json` and its entry from `displays.secrets.json`, then syncs: the broker reload disconnects the connected device and refuses it afterwards. Without `--yes` it refuses. Adding the same id again generates new credentials. The Wi-Fi block and other displays are untouched. |
-| `rotate ID` | Regenerates every generated secret of that display (currently the MQTT password), then syncs. Other displays are untouched. The device is refused until it is **reflashed** with the new credentials. |
+| `rotate ID` | Regenerates every generated secret of that display (the MQTT password, the OTA password and the Home Assistant API encryption key), then syncs. Other displays are untouched. The device is refused until it is **reflashed** (over USB) with the new credentials. |
+| `render ID`, `export ID` | Generate the ESPHome project for a display; see [Firmware: generate, build and flash](#firmware-generate-build-and-flash). Root. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it. Nothing is echoed. |
 | `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the SignalK link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
@@ -859,6 +863,179 @@ is removed when it ends.
 Rollback: `remove` and `rotate` are not reversible (the old password is gone);
 restore `config/displays.json` and `config/displays.secrets.json` from a
 `vesselstackctl backup` archive and run `vesselstackctl display sync-mqtt`.
+
+### Firmware: generate, build and flash
+
+`vesselstackctl display render ID` and `vesselstackctl display export ID`
+generate a complete, validated ESPHome project for one display from
+`displays.json`, the board registry and the stored secrets. Compiling and
+flashing happen on a laptop (building on the Pi is planned for a later release;
+nothing here adds a Docker Compose profile or a service).
+
+```bash
+sudo vesselstackctl display wifi                       # once, shared by all displays
+sudo vesselstackctl display render helm                # writes /opt/vesselstack/build/displays/helm/
+ssh pi 'sudo vesselstackctl display export helm --stdout' > helm.tar.gz   # laptop copy
+```
+
+| Command | What it does |
+| --- | --- |
+| `render ID [--allow-missing-wifi]` | Root. Generates the project into `$VESSELSTACK_ROOT/build/displays/ID/` and prints that path. Fails with a clear message if the display, its MQTT password (run `sync-mqtt` first) or the Wi-Fi credentials are missing; `--allow-missing-wifi` writes placeholder Wi-Fi values and warns (for CI and golden tests only; never flash such a build). Missing per-display secrets (OTA password, API key) are generated and stored under the same lock as the other lifecycle commands. |
+| `export ID (--output FILE \| --stdout) [--allow-missing-wifi]` | Root. Renders, then writes a deterministic `tar.gz` (sorted entries, fixed mtime, uid/gid 0, modes 0700/0600) containing `ID/`: the device file `ID.yaml`, `secrets.yaml`, the board and app packages, the fonts and their license, and a short `README.txt` with the build and flash commands. `--output` creates FILE exclusively with mode 0600 and refuses an existing path or a symlink; `--stdout` refuses a terminal. Warnings go to stderr, so stdout carries only the archive. |
+
+`ID.yaml` is generated and holds no secrets. It composes `boards/<board>.yaml`
+(hardware only), `app/vesselstack.yaml` (Wi-Fi, OTA, MQTT) and, only when the
+display has `"home_assistant_api": true`, `app/api.yaml`, then adds the
+generated interface: one LVGL page per configured page, `single` (one big
+tile) and `grid-2x2` tiles inside the board's centred content box, a tile per
+item with its label, value and unit, and a value format of `precision`
+decimals. With more than one page, a tap anywhere shows the next page and
+wraps around; with one page there is no navigation. The display subscribes
+only to the instruments it shows. A tile shows `--` unless the retained
+`bridge/status` is `online`, MQTT is connected, the last message for that
+instrument has `st` equal to `ok`, **and** a message arrived within
+`stale_after_s + 2 x heartbeat_s` seconds (computed per tile).
+
+`secrets.yaml` holds `wifi_ssid`, `wifi_password`, `mqtt_host`,
+`mqtt_password`, `ota_password` and, only with the Home Assistant API,
+`api_encryption_key`. `ota_password` and `api_encryption_key` (32 random bytes,
+base64; always generated so enabling the API later needs no new key) are
+created on first render in `displays.secrets.json`, and `display rotate`
+regenerates all of the display's generated secrets.
+
+Where files live:
+
+| Path | Owner | Mode | Notes |
+| --- | --- | --- | --- |
+| `$VESSELSTACK_ROOT/build/` and `build/displays/` | `root:root` | `0700` | Deliberately **not** under `$VESSELSTACK_DATA` (service-user owned: root writing there is a symlink hazard). Created and swapped with directory-relative, no-follow operations; a symlink anywhere in the path is refused. |
+| `build/displays/ID/` | `root:root` | dirs `0700`, files `0600` | Self-contained project, including `secrets.yaml`. Rendering again keeps the previous project as `ID.prev` (one generation) for rollback. |
+
+The build tree is excluded from `vesselstackctl backup` (it is regenerable from
+`config/`, and contains secrets) and from the public tree, and
+`uninstall --purge-data` removes it with `$VESSELSTACK_ROOT`. Treat an export
+archive like a password: it contains the Wi-Fi password and the display's MQTT,
+OTA and API secrets. `export` prints a warning to stderr; move archives over SSH
+only, never commit or e-mail them, and delete them after flashing.
+
+Pinned ESPHome. The firmware is built with exactly one ESPHome release,
+`2026.10.0`, and the generated device file requires it
+(`esphome: min_version: 2026.10.0`). The container image is pinned by digest
+(the multi-architecture index digest; arm64 and amd64 are present):
+
+```text
+ghcr.io/esphome/esphome:2026.10.0@sha256:1dff19a59070cdb523b76576cdc74d200f862d43c1407809088855920cf57145
+```
+
+The single source of truth is `displays/esphome/IMAGE` (with
+`displays/esphome/VERSION`); `render` reads it for the exported `README.txt`,
+`tests/test-displays-esphome-config.sh` and CI use the same file, and
+`tests/test-distribution.sh` fails if this README quotes a different pin. To
+bump: pick the new release, `docker buildx imagetools inspect
+ghcr.io/esphome/esphome:NEW` for the index digest, update `IMAGE`, `VERSION` and
+the two places in this README, re-run `tests/test-displays-esphome-config.sh`
+and a `compile`, then re-flash displays at your own pace (firmware and
+generator must match, so regenerate and reflash after an update).
+
+Build and flash on a laptop:
+
+```bash
+tar -xzf helm.tar.gz && cd helm
+docker run --rm -v "$PWD":/config -v vesselstack-esphome-cache:/cache \
+  ghcr.io/esphome/esphome:2026.10.0@sha256:1dff19a59070cdb523b76576cdc74d200f862d43c1407809088855920cf57145 \
+  compile /config/helm.yaml
+```
+
+- **Linux:** the same image can flash directly; add `--device=/dev/ttyACM0` and
+  use `run /config/helm.yaml --device /dev/ttyACM0` instead of `compile`.
+- **macOS and Windows:** Docker Desktop cannot pass USB serial devices into
+  containers. Compile with Docker as above, or install ESPHome natively
+  (`pipx install esphome==2026.10.0` or `pip install esphome==2026.10.0`) and run
+  `esphome run helm/helm.yaml` (first flash over USB). Alternatively upload the
+  `firmware.factory.bin` that `compile` creates with <https://web.esphome.io>
+  (Chrome or Edge). The first compile downloads the ESP-IDF toolchain (about
+  2 GB into the cache volume; allow 5-10 minutes); each display's build adds
+  about 600 MB under `.esphome/` in its project directory, and the firmware is
+  about 1.2 MB.
+- **Later updates over Wi-Fi (OTA):** `esphome upload helm.yaml --device
+  <display-ip>` from the project directory (it uses the OTA password in
+  `secrets.yaml`). `rotate` changes the OTA, MQTT and API secrets in the Pi's
+  files while the display keeps the old ones: reflash over USB after a rotate.
+- **Rollback:** reflash a previous project (`ID.prev`, an older export, or a
+  firmware binary you kept). A display refused by the broker (after `rotate` or
+  `remove`) or on changed Wi-Fi credentials always needs a USB reflash.
+
+Security and behaviour decisions:
+
+- **No fallback access point and no captive portal.** They would add an
+  always-listening configuration surface to a boat network device. If the Wi-Fi
+  credentials change, reflash over USB. OTA is `platform: esphome` with the
+  generated `ota_password`. The Home Assistant `api:` is included only per
+  display, with `encryption` and `reboot_timeout: 0s`. MQTT discovery, IP
+  discovery, the log topic and the display's own backlight entity are off or
+  internal because the display's ACL allows only reading `bridge/` and
+  `instruments/` topics and writing its own `status` topic. Its birth and will
+  messages are retained on `vesselstack/v1/displays/vsdisp-ID/status`.
+- **User text cannot become code.** ESPHome 2026.10 evaluates `$var`, `${expr}`
+  and `<% %>` in **every** string, including values read from `secrets.yaml`,
+  with an unsandboxed Jinja environment, and has no `$$` escape (verified with
+  `esphome config`: `$$x` is still substituted). The only suppression is the
+  `!literal` tag, so labels, units, glyph lists and every secret are emitted as
+  `!literal` double-quoted YAML scalars (non-ASCII as `\u` escapes) and never
+  placed inside a C++ lambda. A Wi-Fi password such as `pa$$w${x}` or a label
+  such as `${1+1} <% x %>` therefore arrives unchanged;
+  `tests/test-displays-esphome-config.sh` checks that against the real ESPHome.
+  Instrument ids are `[a-z][a-z0-9_]*` and are the only user-derived text in
+  identifiers.
+- **Font coverage.** The tiles use Roboto Condensed (SIL OFL 1.1, bundled in
+  `displays/esphome/fonts/` with its license; local files, so builds work
+  offline). The glyph list is computed from the characters actually used in
+  labels and units plus digits, `.`, `-` and space. A character the font lacks
+  is rejected by `render`, `export` and `displayctl.py validate` with the
+  instrument and code point.
+- **`mqtt_host` and mDNS.** The generated MQTT client uses lwIP's resolver
+  (`esphome/components/mqtt/mqtt_client.cpp`, `start_dnslookup_`). On ESP-IDF
+  ESPHome enables `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES` by default
+  (`esphome/components/esp32/__init__.py`, option `enable_lwip_mdns_queries`;
+  present in a compiled `sdkconfig`) and the `network` component auto-loads
+  `mdns`, so `vesselstack.local` should resolve by multicast DNS. That is
+  **not verified on the display hardware**, depends on the Pi advertising its
+  name (Avahi) and on the access point passing multicast, so `render` warns
+  when `mqtt_host` ends in `.local`; use a fixed IP address or a DNS name.
+- The broker connection is plaintext MQTT on port 1883 (see the limitations
+  below).
+
+Optional local tuning of a board is done by editing the exported copy's board
+file (`boards/*.yaml`), which survives until you export again. A package
+override that survives updates is not offered: ESPHome appends list entries such
+as `display:` from separate packages instead of merging them by `id` (checked
+with `esphome config` on 2026.10.0), so an override file cannot adjust the
+existing display.
+
+#### Hardware bring-up checklist (Waveshare ESP32-S3-Touch-LCD-2.8C)
+
+The configuration validates and compiles with the pinned ESPHome, but it has
+not been run on real hardware yet. On first boot, check in this order and turn
+only the matching knob in `boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml` of the
+exported project (or in `displays/esphome/boards/` for all future exports):
+
+| Symptom | Knob |
+| --- | --- |
+| Screen stays blank or backlight only | Try `spi_mode: MODE3` with `data_rate: 2MHz`; check `cs_pin`, `reset_pin` (IO expander numbers) |
+| Red and blue swapped | Swap the `red` and `blue` lists under `data_pins` |
+| Garbled or noisy picture | `byte_order: little_endian`, then `pixel_mode: 16bit` |
+| Inverted colours | `invert_colors: true` |
+| Mirrored left to right | In `init_sequence` change `[0xC7, 0x00]` to `[0xC7, 0x04]` |
+| Upside down or rotated | Display `rotation` (or the `transform` block) |
+| Picture shifted | Swap the horizontal and/or vertical front and back porch values |
+| Shimmering edges | `pclk_inverted: true` |
+| Drift or tearing while Wi-Fi is busy | Lower `pclk_frequency` to `16MHz`, then `14MHz` |
+| Touch axes wrong | The `touchscreen` `transform` (`swap_xy`, `mirror_x`, `mirror_y`) |
+
+The `mipi_rgb` model is `CUSTOM` on purpose: ESPHome's `ST7701S` model prepends
+its own init table and appends a C7 command in the wrong register bank. ESPHome
+itself appends the `3A`, `36`, `20`/`21`, `11` and `29` commands, so the board
+file's `init_sequence` omits them. Delays are written as `- delay 120ms`.
+Please report the settings that worked on your unit.
 
 ### Configuration and validation
 
@@ -918,7 +1095,7 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Hardware unverified |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); hardware unverified (see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 
@@ -929,11 +1106,11 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
   network.
 - With the VesselStack firewall enabled, displays must be on a trusted
   interface that can reach the Raspberry Pi's MQTT port.
-- The primary planned build path is exporting from the Pi and compiling on a
-  laptop; no firmware, export, flashing or over-the-air flow ships in this
-  preview (the lifecycle commands only manage configuration and credentials).
+- The build path is exporting from the Pi and compiling on a laptop; building
+  and flashing on the Pi (a Compose profile) is planned and not available yet.
+  Only the `single` and `grid-2x2` layouts are generated.
 - The runtime `displays.json`, `displays.secrets.json`, ESPHome
-  `secrets.yaml`, `.esphome/` and `displays/build/` output, and firmware
+  `secrets.yaml`, `.esphome/` and `displays/build/` output, `$VESSELSTACK_ROOT/build/` and firmware
   binaries (`.bin`, `.elf`, `.uf2`) are git-ignored and rejected by
   `scripts/check-public-tree.py`; never commit them.
 
@@ -1137,7 +1314,9 @@ ownership: containers use different internal user IDs.
 
 ## Developer validation
 
-GitHub Actions uses `actions/checkout@v6`, which runs on Node.js 24 and keeps
+The `displays-esphome-config` CI job pulls the image pinned in
+`displays/esphome/IMAGE` and runs `tests/test-displays-esphome-config.sh` on every
+push and pull request. GitHub Actions uses `actions/checkout@v6`, which runs on Node.js 24 and keeps
 persisted checkout credentials outside the repository Git configuration.
 External registry manifest checks retry short transport failures three times;
 missing Linux ARM64 support still fails the release gate.
@@ -1151,6 +1330,8 @@ tests/test-image-manifests.sh
 tests/test-service-integration.sh
 sudo tests/test-displays-mosquitto.sh
 sudo tests/test-displays-bridge.sh
+tests/test-displays-esphome-config.sh   # renders projects and runs the pinned ESPHome "config" (Docker, ~1.2 GB image)
+tests/compile-display-firmware.sh       # optional, not in CI: full "esphome compile" (~2 GB cache, 5-10 min)
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v

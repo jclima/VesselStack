@@ -31,6 +31,7 @@ displays.secrets.json
 secrets.yaml
 .esphome/
 displays/build/
+/build/
 *.bin
 *.elf
 *.uf2

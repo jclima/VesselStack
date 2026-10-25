@@ -76,3 +76,12 @@ jobs:
         run: sudo tests/test-displays-bridge.sh
       - name: Verify the bridge EnvironmentFile and unit under real systemd
         run: tests/test-displays-envfile-systemd.sh
+
+  displays-esphome-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Pull the pinned ESPHome image
+        run: docker pull "$(tr -d '[:space:]' < displays/esphome/IMAGE)"
+      - name: Validate generated display projects with the pinned ESPHome
+        run: tests/test-displays-esphome-config.sh

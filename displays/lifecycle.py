@@ -1,4 +1,4 @@
-"""Display lifecycle: list/add/remove/rotate/wifi/status (stdlib only).
+"""Display lifecycle: list/add/remove/rotate/wifi/status (stdlib only; render/export live in render.py).
 
 All edits of ``config/displays.json`` and ``config/displays.secrets.json`` are
 made under an exclusive ``flock`` on ``config/.displays.lock`` and go through
@@ -8,6 +8,7 @@ Secret values are never printed and never placed on a command line.
 """
 from __future__ import annotations
 
+import base64
 import getpass
 import json
 import os
@@ -33,7 +34,13 @@ DISPLAYS_MODE = 0o644
 SECRETS_MODE = 0o600
 # Per-display generated secrets. rotate regenerates every key listed here, so a
 # future generated secret only needs to be added to this table.
-GENERATED_SECRETS = {"mqtt_password": lambda: secrets_module.token_urlsafe(32)}
+GENERATED_SECRETS = {
+    "mqtt_password": lambda: secrets_module.token_urlsafe(32),
+    "ota_password": lambda: secrets_module.token_urlsafe(32),
+    # ESPHome Home Assistant API encryption key: 32 random bytes, base64. Always
+    # generated so enabling home_assistant_api later needs no new key.
+    "api_encryption_key": lambda: base64.b64encode(secrets_module.token_bytes(32)).decode("ascii"),
+}
 STATUS_WAIT_S = 3
 SANITIZE_MAX = 40
 
@@ -316,7 +323,8 @@ def add(ctx: Context, display_id: str, board: str, name: str | None = None,
     ctx.out("Next steps:")
     ctx.out(f"  1. Edit the pages in {ctx.config_dir / DISPLAYS_NAME} and check with 'validate'.")
     ctx.out("  2. Store the shared Wi-Fi credentials with 'vesselstackctl display wifi'.")
-    ctx.out("  3. Export/flash: coming in a later release.")
+    ctx.out(f"  3. Generate the firmware project: 'vesselstackctl display export {display_id} "
+            "--stdout' (see the README for building and flashing).")
     _bridge_note(ctx)
 
 

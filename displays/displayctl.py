@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VesselStack displays control tool (preview: validation, MQTT account sync, device lifecycle)."""
+"""VesselStack displays control tool (preview: validation, MQTT account sync, device lifecycle, firmware config)."""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lifecycle  # noqa: E402
 import mqtt_auth  # noqa: E402
+import render  # noqa: E402
 import schema  # noqa: E402
 
 DEFAULT_CONFIG = schema.MODULE_DIR / "displays.example.json"
@@ -29,6 +30,8 @@ def cmd_validate(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     errors = schema.validate_config(config, registry)
+    if not errors:
+        errors = render.check_glyphs(config)
     if errors:
         for err in errors:
             print(f"{args.file}: {err}", file=sys.stderr)
@@ -204,6 +207,46 @@ def cmd_status(args) -> int:
     return run_lifecycle(args, lifecycle.status)
 
 
+def _warn(text: str) -> None:
+    print(text, file=sys.stderr)
+
+
+def run_render(args, action) -> int:
+    root_text = args.root or os.environ.get("VESSELSTACK_ROOT", "")
+    if not root_text:
+        print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
+        return 2
+    # Informational output goes to stderr so 'export --stdout' keeps stdout clean.
+    ctx = lifecycle.Context(root=Path(root_text), env={}, require_root=not args.allow_non_root,
+                            out=print if action is cmd_render_action else _warn)
+    try:
+        action(ctx, args)
+    except (render.RenderError, lifecycle.LifecycleError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.code
+    except (mqtt_auth.MqttAuthError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_render_action(ctx, args) -> None:
+    render.render(ctx, args.id, args.allow_missing_wifi, warn=_warn)
+
+
+def cmd_export_action(ctx, args) -> None:
+    render.export(ctx, args.id, args.output, args.stdout, warn=_warn,
+                  allow_missing_wifi=args.allow_missing_wifi)
+
+
+def cmd_render(args) -> int:
+    return run_render(args, cmd_render_action)
+
+
+def cmd_export(args) -> int:
+    return run_render(args, cmd_export_action)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="displayctl", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -262,6 +305,23 @@ def build_parser() -> argparse.ArgumentParser:
     wifi.add_argument("--clear", action="store_true", help="remove the stored credentials")
     wifi.add_argument("--open", action="store_true",
                       help="allow an empty password (open network)")
+    def render_parser(name, help_text, func):
+        parser_ = sub.add_parser(name, help=help_text)
+        parser_.add_argument("id", metavar="ID", help="display id")
+        parser_.add_argument("--root", help="VESSELSTACK_ROOT (default: environment)")
+        parser_.add_argument("--allow-missing-wifi", action="store_true",
+                             help="write placeholder Wi-Fi values (CI and golden tests only)")
+        parser_.add_argument("--allow-non-root", action="store_true", help=argparse.SUPPRESS)
+        parser_.set_defaults(func=func)
+        return parser_
+
+    render_parser("render", "generate the ESPHome project in $VESSELSTACK_ROOT/build/displays/ID "
+                  "(root)", cmd_render)
+    export = render_parser("export", "write the ESPHome project as a tar.gz with secrets (root)",
+                           cmd_export)
+    target = export.add_mutually_exclusive_group(required=True)
+    target.add_argument("--output", metavar="FILE", help="create FILE (mode 0600); refuses to overwrite")
+    target.add_argument("--stdout", action="store_true", help="stream the archive to stdout")
     lifecycle_parser("status", "show bridge and display online state from retained MQTT topics",
                      cmd_status)
     return parser
