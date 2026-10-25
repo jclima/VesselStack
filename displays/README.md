@@ -12,7 +12,7 @@ Pure-logic core for configurable live-instrument displays. The root `README.md`
 - `lifecycle.py` - `list`, `add`, `remove`, `rotate`, `wifi` and `status` behind `displayctl.py` (locked, no-follow, atomic edits of `displays.json` and `displays.secrets.json`; also reachable as `vesselstackctl display ...`)
 - `render.py` - `render` and `export`: the ESPHome project generator (device file, `secrets.yaml`, root-owned no-follow build tree, deterministic tar.gz); it reads `esphome/`
 - `esphome/` - the pinned image (`IMAGE`, `VERSION`), per-board hardware packages (`boards/`), the app packages (`app/`: Wi-Fi/OTA/MQTT, optional Home Assistant API) and the bundled Roboto Condensed fonts (`fonts/`, SIL OFL)
-- `firmware.py` - `build` and `flash`: optional on-host firmware compile and upload in one-shot containers of the pinned ESPHome image (stored firmware plus `manifest.json`, sha256 verified before every flash, never recompiles on flash)
+- `firmware.py` - `build` and `flash`: optional on-host firmware compile and upload in one-shot containers of the pinned ESPHome image (stored firmware plus `manifest.json` beside, not inside, the mounted `project/`; per-display build lock; sha256 and credential fingerprint verified before every flash, which uploads a private verified copy and never recompiles)
 - `mqtt_auth.py` - MQTT account, secrets and ACL rendering used by `sync-mqtt`
 - `boards/registry.json` - supported boards and layouts
 - `displays.example.json` - example configuration (runtime `displays.json` is never committed)

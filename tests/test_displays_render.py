@@ -603,45 +603,54 @@ class Export(Base):
                           allow_missing_wifi=True)
         self.assertFalse((Path(self._tmp.name) / "victim").exists())
 
-    def test_output_is_handed_to_the_sudo_user_but_stays_0600(self):
+    # Other code legitimately calls os.fchown(fd, 0, 0) when the suite runs as root, so these
+    # tests only look at chowns to a non-root account (12345 stands in for the sudo user).
+    FAKE = {"SUDO_UID": "12345", "SUDO_GID": "12345"}
+
+    def fake_accounts(self):
         from unittest import mock
-        out = Path(self._tmp.name) / "owned.tar.gz"
-        calls = []
-        env = {"SUDO_UID": str(os.getuid()), "SUDO_GID": str(os.getgid())}
-        with mock.patch.object(render, "_may_chown", return_value=True), \
-                mock.patch("os.fchown", side_effect=lambda fd, uid, gid: calls.append((uid, gid))):
+        return (mock.patch.object(render.pwd, "getpwuid", return_value=object()),
+                mock.patch.object(render.grp, "getgrgid", return_value=object()),
+                mock.patch.object(render, "_may_chown", return_value=True))
+
+    def export_with(self, name, env, fchown):
+        from unittest import mock
+        out = Path(self._tmp.name) / name
+        patches = self.fake_accounts()
+        with patches[0], patches[1], patches[2], mock.patch("os.fchown", side_effect=fchown):
             render.export(self.ctx(), "helm", str(out), False, warn=self.messages.append,
                           allow_missing_wifi=True, environ=env)
-        self.assertEqual(calls, [(os.getuid(), os.getgid())])
+        return out
+
+    def test_output_is_handed_to_the_sudo_user_but_stays_0600(self):
+        calls = []
+        out = self.export_with("owned.tar.gz", self.FAKE, lambda fd, uid, gid: calls.append((uid, gid)))
+        self.assertEqual([c for c in calls if c != (0, 0)], [(12345, 12345)])
         self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
-        self.assertTrue(any("owned by uid" in m for m in self.messages))
+        self.assertTrue(any("owned by uid 12345" in m for m in self.messages))
 
     def test_invalid_or_missing_sudo_ids_are_ignored(self):
-        from unittest import mock
         bad = [{}, {"SUDO_UID": "0", "SUDO_GID": "0"}, {"SUDO_UID": "abc", "SUDO_GID": "1"},
                {"SUDO_UID": "-5", "SUDO_GID": "1"}, {"SUDO_UID": "1" * 11, "SUDO_GID": "1"},
-               {"SUDO_UID": "4000000000", "SUDO_GID": "4000000000"},  # no such account
-               {"SUDO_UID": str(os.getuid())}]
+               {"SUDO_UID": "12345"}]
         for index, env in enumerate(bad):
             with self.subTest(env=env):
                 self.assertIsNone(render.sudo_owner(env))
                 calls = []
-                out = Path(self._tmp.name) / f"bad{index}.tar.gz"
-                with mock.patch.object(render, "_may_chown", return_value=True), \
-                        mock.patch("os.fchown", side_effect=lambda *a: calls.append(a)):
-                    render.export(self.ctx(), "helm", str(out), False, warn=lambda t: None,
-                                  allow_missing_wifi=True, environ=env)
-                self.assertEqual(calls, [])
+                out = self.export_with(f"bad{index}.tar.gz", env,
+                                       lambda fd, uid, gid: calls.append((uid, gid)))
+                self.assertEqual([c for c in calls if c != (0, 0)], [])
                 self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
 
+    def test_ids_without_an_account_are_ignored(self):
+        # no patching of pwd/grp: uid and gid 4000000000 do not exist anywhere
+        self.assertIsNone(render.sudo_owner({"SUDO_UID": "4000000000", "SUDO_GID": "4000000000"}))
+
     def test_failed_chown_warns_but_keeps_the_archive(self):
-        from unittest import mock
-        out = Path(self._tmp.name) / "warn.tar.gz"
-        env = {"SUDO_UID": str(os.getuid()), "SUDO_GID": str(os.getgid())}
-        with mock.patch.object(render, "_may_chown", return_value=True), \
-                mock.patch("os.fchown", side_effect=PermissionError(1, "Operation not permitted")):
-            render.export(self.ctx(), "helm", str(out), False, warn=self.messages.append,
-                          allow_missing_wifi=True, environ=env)
+        def refuse(fd, uid, gid):
+            if uid != 0:
+                raise PermissionError(1, "Operation not permitted")
+        out = self.export_with("warn.tar.gz", self.FAKE, refuse)
         self.assertTrue(out.stat().st_size > 0)
         self.assertTrue(any("could not give" in m for m in self.messages))
 
