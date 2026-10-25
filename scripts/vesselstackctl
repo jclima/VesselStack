@@ -19,7 +19,7 @@ Commands:
   doctor                       Validate config, dependencies, disk, and health
   urls                         Print the configured service URLs
   version                      Print installed and command versions
-  logs [chat|telegram|indexer|control|containers|all]
+  logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
   start                        Start the stack
   stop                         Stop the stack
@@ -95,10 +95,14 @@ start_stack() {
     if [ "${TELEMETRY_INDEXER_ENABLE:-true}" = true ]; then
         systemctl start vesselstack-telemetry-indexer.timer
     fi
+    if [ "${DISPLAYS_ENABLE:-false}" = true ]; then
+        systemctl start vesselstack-displays-bridge.service
+    fi
     systemctl start vesselstack-control-panel.service
 }
 
 stop_stack() {
+    systemctl stop vesselstack-displays-bridge.service 2>/dev/null || true
     systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
     systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
     systemctl stop vesselstack-chat.service || true
@@ -162,6 +166,8 @@ status_stack() {
         "${TELEGRAM_ENABLE:-false}" || failed=1
     status_unit 'Telemetry indexer' vesselstack-telemetry-indexer.timer \
         "${TELEMETRY_INDEXER_ENABLE:-true}" || failed=1
+    status_unit 'Displays bridge' vesselstack-displays-bridge.service \
+        "${DISPLAYS_ENABLE:-false}" || failed=1
     status_unit 'Native SignalK' vesselstack-signalk.service \
         "$([ "${SIGNALK_MODE:-existing}" = native ] && echo true || echo false)" || failed=1
     status_unit 'SocketCAN' vesselstack-socketcan.service \
@@ -215,15 +221,17 @@ show_logs() {
         telegram) journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager ;;
         indexer) journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager ;;
         control) journalctl -u vesselstack-control-panel.service -n 100 --no-pager ;;
+        displays) journalctl -u vesselstack-displays-bridge.service -n 100 --no-pager ;;
         containers) "${COMPOSE[@]}" logs --tail 100 ;;
         all)
             journalctl -u vesselstack-chat.service -n 100 --no-pager
             journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager
             journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager
             journalctl -u vesselstack-control-panel.service -n 100 --no-pager
+            journalctl -u vesselstack-displays-bridge.service -n 100 --no-pager
             "${COMPOSE[@]}" logs --tail 100
             ;;
-        *) echo 'logs target must be chat, telegram, indexer, control, containers, or all' >&2; exit 2 ;;
+        *) echo 'logs target must be chat, telegram, indexer, control, displays, containers, or all' >&2; exit 2 ;;
     esac
 }
 
@@ -288,6 +296,8 @@ PY
     tar --numeric-owner -czf "$archive" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/.venv" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/__pycache__" \
+        --exclude="${VESSELSTACK_ROOT#/}/displays/.venv" \
+        --exclude="${VESSELSTACK_ROOT#/}/displays/__pycache__" \
         --transform 's,^,vesselstack-backup/,' \
         "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA"
     sha256sum "$archive" > "$manifest"
@@ -394,6 +404,7 @@ uninstall_stack() {
     systemctl disable --now vesselstack-signalk.service || true
     systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
+    systemctl disable --now vesselstack-displays-bridge.service || true
     if [ -x "$SBIN_DIR/vesselstack-firewall" ]; then
         "$SBIN_DIR/vesselstack-firewall" remove || true
     fi
@@ -404,6 +415,7 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer" \
         "$SYSTEMD_DIR/vesselstack-signalk.service" \
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
+        "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall"
     systemctl daemon-reload

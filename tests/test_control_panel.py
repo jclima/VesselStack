@@ -128,6 +128,18 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertEqual(panel.component_command("telegram", "start"), ["systemctl", "start", "vesselstack-chat-telegram.service"])
                 self.assertEqual(panel.component_command("telemetry-indexer", "restart"), ["systemctl", "restart", "vesselstack-telemetry-indexer.timer"])
 
+    def test_displays_bridge_is_opt_in_and_token_is_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vessel = Path(directory) / "vessel.env"
+            with mock.patch.object(panel, "VESSEL_ENV", vessel):
+                panel.write_env(vessel, {"DISPLAYS_ENABLE": "false"}, [])
+                with self.assertRaisesRegex(ValueError, "disabled"):
+                    panel.component_command("displays-bridge", "start")
+                panel.write_env(vessel, {"DISPLAYS_ENABLE": "true"}, [])
+                self.assertEqual(panel.component_command("displays-bridge", "restart"),
+                                 ["systemctl", "restart", "vesselstack-displays-bridge.service"])
+        self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_SIGNALK_TOKEN"]["kind"], "secret")
+
     def test_update_requires_reviewed_release_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

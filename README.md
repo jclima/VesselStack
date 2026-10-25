@@ -43,6 +43,7 @@ change boot firmware, firewall rules, marine wiring, or start services.
 | Heimdall | Local service launcher | `http://HOST` |
 | Boat Chat | Telemetry-backed diagnostic assistant | `http://HOST:8765` |
 | Control Panel | Component installation, configuration, and lifecycle | `http://127.0.0.1:8780` |
+| Displays bridge (opt-in, `DISPLAYS_ENABLE=true`) | Publishes configured SignalK instruments to MQTT for instrument displays | systemd service `vesselstack-displays-bridge`; no listener |
 
 The installer generates credentials, renders a pinned Docker Compose stack,
 creates a confined systemd service for Boat Chat, creates configurable InfluxDB
@@ -182,6 +183,7 @@ nano vesselstack.env
 | `MQTT_USERNAME`, `MQTT_PASSWORD` | Mosquitto administrator account; the username may contain letters, numbers, `.`, `_` and `-` (1-64), and a custom password must not contain `:` or leading/trailing whitespace |
 | `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
 | `DISPLAYS_BRIDGE_MQTT_USERNAME` | Bridge account name; default `vesselstack-bridge`; must differ from `MQTT_USERNAME` |
+| `DISPLAYS_SIGNALK_TOKEN` | Optional SignalK access token for the displays bridge, sent as `Authorization: Bearer`; leave empty unless SignalK security requires it; must not contain line breaks |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
 under `/opt/vesselstack/config/` and are not printed.
@@ -601,17 +603,107 @@ ESP32-S3-Touch-LCD-2.8C, planned to run ESPHome with LVGL. The board registry
 and page layouts are data, so more boards and layouts can be added later.
 
 **Status: preview.** The configuration schema, validation, unit conversions,
-the MQTT topic/payload and freshness logic, the board registry and the MQTT
-account/ACL provisioning (`displayctl.py sync-mqtt`, wired into `install.sh` and
-`vesselstackctl`) exist today (`displays/`). The bridge service, Compose wiring
-and firmware do not exist yet, so enabling displays only creates broker accounts
-and credentials. The always-on Mosquitto ACL does affect existing installations
+the MQTT topic/payload and freshness logic, the board registry, the MQTT
+account/ACL provisioning (`displayctl.py sync-mqtt`) and the **SignalK-to-MQTT
+bridge service** exist today (`displays/`). With `DISPLAYS_ENABLE=true` the
+bridge publishes your configured instruments to Mosquitto; the display screens
+and firmware do not exist yet, so nothing consumes those topics beyond your own
+MQTT clients. The always-on Mosquitto ACL does affect existing installations
 (see [MQTT access control](#mqtt-access-control)). `displays/` is copied to
 `$VESSELSTACK_ROOT/displays` by the installer.
 
+### Displays bridge service
+
+`vesselstack-displays-bridge.service` (`displays/bridge.py`) subscribes to the
+SignalK websocket stream (`vessels.self` only, only the paths in
+`displays.json`), converts and rounds values with the same tested logic as the
+topic schema below, and publishes them retained to Mosquitto. It is opt-in and
+adds no listening port.
+
+Enable it:
+
+1. Set `DISPLAYS_ENABLE=true` in `/opt/vesselstack/config/vesselstack.env` (or
+   the Displays section of the Control Panel). If SignalK security is on, also
+   set `DISPLAYS_SIGNALK_TOKEN` to a SignalK access token (read access is
+   enough).
+2. Run `sudo ./install.sh --config /opt/vesselstack/config/vesselstack.env
+   --start` (or Control Panel Apply). On the first run the installer seeds
+   `/opt/vesselstack/config/displays.json` (mode 0644, no secrets) with the
+   example instruments and an **empty** `displays` map, so no display account is
+   created implicitly. It never overwrites an existing `displays.json`, and
+   because it only seeds when the file is missing, editing is entirely yours.
+3. Edit `displays.json` (see [Configuration and validation](#configuration-and-validation)),
+   check it with `python3 /opt/vesselstack/displays/displayctl.py validate
+   /opt/vesselstack/config/displays.json`, then re-run the installer. Each
+   re-run re-syncs the MQTT accounts, rewrites the bridge environment and
+   restarts the bridge (with `--start`).
+
+What changes on the host: the installer creates a Python virtual environment in
+`/opt/vesselstack/displays/.venv` and installs the pinned `paho-mqtt==2.1.0` and
+`websockets==17.3` from `displays/requirements.txt` (internet needed once; only
+when `DISPLAYS_ENABLE=true`), writes `config/displays-bridge.env` (mode 0600,
+owned by the service account; it contains the bridge MQTT password and the
+optional SignalK token), renders and enables the unit, and starts it with
+`--start`. The unit runs as the unprivileged service account with the same
+hardening as Boat Chat plus a read-only filesystem view; it only reads
+`displays.json`. The bridge MQTT account may only publish
+`vesselstack/v1/instruments/#` and `vesselstack/v1/bridge/#`.
+
+Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
+`online` (and `offline` on a clean stop; Mosquitto publishes the retained last
+will `offline` if the bridge dies), reports `vesselstack/v1/bridge/signalk`
+`connected` or `disconnected`, and reconnects to SignalK with exponential
+backoff (1 s up to 30 s with jitter). While SignalK is unreachable the clock
+keeps running, so instruments turn `stale` after their `stale_after_s`; they
+read `missing` until the first value arrives. Treat `bridge/status` as the
+authority: if the bridge dies hard, `bridge/signalk` keeps its last retained
+value. An invalid `displays.json` makes the bridge exit with a clear journal
+message and systemd retries every 10 seconds, so fixing the file is enough.
+
+Verify:
+
+```bash
+sudo vesselstackctl status            # "Displays bridge   healthy"
+sudo vesselstackctl logs displays     # connects, instrument count; no secrets
+# watch the retained state as the MQTT administrator; the password is passed to the
+# container through its environment, never on the host command line
+sudo bash -c 'source /opt/vesselstack/config/vesselstack.env &&
+  export MQTT_USERNAME MQTT_PASSWORD &&
+  docker exec -e MQTT_USERNAME -e MQTT_PASSWORD vesselstack-mosquitto \
+    sh -c "mosquitto_sub -v -W 5 -u \"\$MQTT_USERNAME\" -P \"\$MQTT_PASSWORD\" -t vesselstack/v1/#"'
+```
+
+Troubleshooting:
+
+- `bridge/status` is `offline` or missing: `sudo systemctl status
+  vesselstack-displays-bridge` and `vesselstackctl logs displays`. An
+  `invalid displays configuration` line names the offending JSON path;
+  `MQTT connection refused` means the bridge password in
+  `displays-bridge.env` no longer matches the broker: re-run the installer.
+  `missing Python dependency` means `displays/.venv` is gone: re-run the
+  installer with `DISPLAYS_ENABLE=true`.
+- `bridge/signalk` is `disconnected`: check `SIGNALK_URL` answers
+  (`curl -fsS "$SIGNALK_URL/signalk"`); an HTTP 401 in the log means set
+  `DISPLAYS_SIGNALK_TOKEN`.
+- Every instrument is `stale` or `missing` while the bridge is online and
+  connected: the SignalK `path` in `displays.json` is not being produced, or the
+  token cannot read it.
+
+Stop or remove: `sudo systemctl stop vesselstack-displays-bridge` stops it until
+the next `vesselstackctl start`/installer `--start`. Set `DISPLAYS_ENABLE=false`
+and run `sudo ./install.sh --config ... --start` to disable and stop the unit,
+delete `config/displays-bridge.env`, and drop the bridge and display MQTT
+accounts from the ACL (rollback). `displays.json`, `displays.secrets.json` and
+`displays/.venv` are left in place; `vesselstackctl uninstall` removes the unit.
+
+Backups: `vesselstackctl backup` includes `config/displays-bridge.env` and
+`config/displays.secrets.json`, which contain secrets, like the other `*.env`
+files; keep archives private. It excludes `displays/.venv` and `__pycache__`
+(rebuilt by the installer).
+
 ### Configuration and validation
 
-The runtime configuration will live at `$VESSELSTACK_ROOT/config/displays.json`.
+The runtime configuration lives at `$VESSELSTACK_ROOT/config/displays.json`.
 Start from [`displays/displays.example.json`](displays/displays.example.json).
 It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
 `heartbeat_s` (1-60, default 5), `instruments` and `displays`:
@@ -898,6 +990,7 @@ sudo tests/test-clean-install.sh
 tests/test-image-manifests.sh
 tests/test-service-integration.sh
 sudo tests/test-displays-mosquitto.sh
+sudo tests/test-displays-bridge.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v

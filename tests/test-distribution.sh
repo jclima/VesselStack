@@ -8,10 +8,11 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
-    "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh"
+    "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
+    "$ROOT/tests/test-displays-bridge.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
-for f in "$ROOT"/displays/*.py; do python3 -m py_compile "$f"; done
+for f in "$ROOT"/displays/*.py "$ROOT"/tests/fixtures/*.py; do python3 -m py_compile "$f"; done
 python3 -m json.tool "$ROOT/displays/boards/registry.json" >/dev/null
 python3 "$ROOT/displays/displayctl.py" validate >/dev/null
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
@@ -20,7 +21,7 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-lifecycle.sh"
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh"
 if grep -nE 'mosquitto_passwd -b' "$ROOT/install.sh" "$ROOT/scripts/vesselstackctl" "$ROOT"/displays/*.py; then
     echo "MQTT passwords must not be passed on a command line" >&2
     exit 1
@@ -33,6 +34,14 @@ test -s "$ROOT/systemd/vesselstack-control-panel.service.in"
 test -s "$ROOT/systemd/vesselstack-chat-telegram.service.in"
 test -s "$ROOT/systemd/vesselstack-telemetry-indexer.service.in"
 test -s "$ROOT/systemd/vesselstack-telemetry-indexer.timer"
+test -s "$ROOT/systemd/vesselstack-displays-bridge.service.in"
+grep -q '^EnvironmentFile=@VESSELSTACK_ROOT@/config/displays-bridge.env$' \
+    "$ROOT/systemd/vesselstack-displays-bridge.service.in"
+grep -q '^ExecStart=@VESSELSTACK_ROOT@/displays/.venv/bin/python @VESSELSTACK_ROOT@/displays/bridge.py$' \
+    "$ROOT/systemd/vesselstack-displays-bridge.service.in"
+# Every displays dependency is pinned exactly; CI imports the rest with stdlib only.
+test "$(grep -c '^[A-Za-z0-9._-]*==[0-9][0-9.]*$' "$ROOT/displays/requirements.txt")" -eq \
+    "$(grep -c . "$ROOT/displays/requirements.txt")"
 test -s "$ROOT/docs/INSTALLATION.md"
 test -s "$ROOT/docs/BOM.md"
 test -s "$ROOT/wizard/index.html"

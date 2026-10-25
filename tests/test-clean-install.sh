@@ -33,6 +33,7 @@ exit 0
 EOF
 cat > "$FAKE_BIN/systemctl" <<'EOF'
 #!/bin/bash
+printf '%s\n' "$*" >> "$(dirname "$0")/systemctl.log"
 exit 0
 EOF
 cat > "$FAKE_BIN/curl" <<'EOF'
@@ -45,6 +46,7 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
     install -d "$3/bin"
     cat > "$3/bin/pip" <<'PIP'
 #!/bin/bash
+printf '%s\n' "$*" >> "$(dirname "$0")/../pip.log"
 exit 0
 PIP
     chmod +x "$3/bin/pip"
@@ -130,6 +132,21 @@ test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-control-panel.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat-telegram.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.timer"
+# The displays bridge unit is always rendered but stays disabled by default.
+unit="$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
+test -s "$unit"
+grep -q "^User=$(id -un)\$" "$unit"
+grep -q "^EnvironmentFile=$APP_ROOT/config/displays-bridge.env\$" "$unit"
+grep -q "^ExecStart=$APP_ROOT/displays/.venv/bin/python $APP_ROOT/displays/bridge.py\$" "$unit"
+if grep -q '@' "$unit"; then echo "Unit contains an unrendered placeholder" >&2; exit 1; fi
+grep -qx 'disable --now vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"
+if grep -qx 'enable vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"; then
+    echo "Displays bridge was enabled with DISPLAYS_ENABLE=false" >&2
+    exit 1
+fi
+test ! -e "$APP_ROOT/config/displays-bridge.env"
+test ! -e "$APP_ROOT/config/displays.json"
+test ! -e "$APP_ROOT/displays/.venv"
 test -s "$APP_ROOT/control-panel/app.py"
 test -s "$APP_ROOT/installer/install.sh"
 test -s "$APP_ROOT/displays/displayctl.py"
@@ -197,5 +214,70 @@ if tail -n +"$((log_before + 1))" "$FAKE_BIN/docker.log" | grep -Eq '^(run|pull|
     exit 1
 fi
 test ! -e "$APP_ROOT/config/displays.secrets.json"
+
+# Opt in: seeded instruments-only displays.json, bridge environment file, venv and
+# an enabled unit; an existing displays.json is never overwritten.
+ON_APP="$TEST_ROOT/on/opt/vesselstack"
+ON_DATA="$TEST_ROOT/on/opt/vesselstack-data"
+ON_CONFIG="$TEST_ROOT/displays-on.env"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$ON_APP\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$ON_DATA\"|" \
+    -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/on-backups\"|" "$CONFIG" > "$ON_CONFIG"
+printf 'DISPLAYS_ENABLE="true"\nDISPLAYS_SIGNALK_TOKEN="to\\"k\\\\en"\n' >> "$ON_CONFIG"
+: > "$FAKE_BIN/systemctl.log"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$ON_CONFIG" >/dev/null
+grep -qx 'enable vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"
+if grep -q 'disable --now vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"; then
+    echo "Displays bridge was disabled with DISPLAYS_ENABLE=true" >&2
+    exit 1
+fi
+DJSON="$ON_APP/config/displays.json"
+test -s "$DJSON"
+test "$(stat -c '%a' "$DJSON")" = 644
+test "$(jq -c '.displays' "$DJSON")" = '{}'
+test "$(jq '.instruments | length' "$DJSON")" -eq 4
+python3 "$REPO_ROOT/displays/displayctl.py" validate "$DJSON" >/dev/null
+test ! -e "$ON_APP/config/mosquitto-auth/acl" || ! grep -q 'vsdisp-' "$ON_APP/config/mosquitto-auth/acl"
+BENV="$ON_APP/config/displays-bridge.env"
+test "$(stat -c '%a:%u:%g' "$BENV")" = "600:$(id -u):$(id -g)"
+grep -qx "DISPLAYS_CONFIG=\"$ON_APP/config/displays.json\"" "$BENV"
+grep -qx 'SIGNALK_URL="http://127.0.0.1:3000"' "$BENV"
+grep -qx 'MQTT_HOST="127.0.0.1"' "$BENV"
+grep -qx 'MQTT_PORT="1883"' "$BENV"
+grep -qx 'DISPLAYS_BRIDGE_MQTT_USERNAME="vesselstack-bridge"' "$BENV"
+grep -qx 'DISPLAYS_SIGNALK_TOKEN="to\\"k\\\\en"' "$BENV"
+bridge_secret=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["bridge"]["mqtt_password"])' \
+    "$ON_APP/config/displays.secrets.json")
+grep -qx "DISPLAYS_BRIDGE_MQTT_PASSWORD=\"$bridge_secret\"" "$BENV"
+grep -q 'displays/requirements.txt' "$ON_APP/displays/.venv/pip.log"
+test -s "$ON_APP/displays/bridge.py"
+test ! -e "$ON_APP/installer/displays/.venv"
+if grep -q 'DISPLAYS_BRIDGE_MQTT_PASSWORD\|'"$bridge_secret" "$ON_APP/config/vesselstack.env"; then
+    echo "Bridge MQTT password leaked into vesselstack.env" >&2
+    exit 1
+fi
+# Re-run: the operator's displays.json (and its mode fix-up) survives; the
+# password is stable; turning displays off removes the secret-bearing env file.
+jq '.mqtt_host = "boat.local"' "$DJSON" > "$TEST_ROOT/edited.json"
+cp "$TEST_ROOT/edited.json" "$DJSON"
+chmod 0600 "$DJSON"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$ON_APP/installer/install.sh" --config "$ON_APP/config/vesselstack.env" >/dev/null
+test "$(jq -r '.mqtt_host' "$DJSON")" = boat.local
+test "$(stat -c '%a' "$DJSON")" = 644
+grep -qx "DISPLAYS_BRIDGE_MQTT_PASSWORD=\"$bridge_secret\"" "$BENV"
+sed -i 's/^DISPLAYS_ENABLE=.*/DISPLAYS_ENABLE=false/' "$ON_APP/config/vesselstack.env"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$ON_APP/installer/install.sh" --config "$ON_APP/config/vesselstack.env" >/dev/null
+test ! -e "$BENV"
+test "$(jq -r '.mqtt_host' "$DJSON")" = boat.local
+# A control character in the token is refused before anything is installed.
+printf 'DISPLAYS_SIGNALK_TOKEN=$'"'"'bad\\ntoken'"'"'\n' >> "$ON_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$ON_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted a SignalK token containing a line break" >&2
+    exit 1
+fi
 
 echo "clean installation checks passed"

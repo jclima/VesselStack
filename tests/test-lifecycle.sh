@@ -33,15 +33,19 @@ install -d "$APP_ROOT/boat-chat/.venv/bin"
 ln -s /usr/bin/python3 "$APP_ROOT/boat-chat/.venv/bin/python3"
 printf 'services:\n  mosquitto:\n    image: eclipse-mosquitto:2.1.2-alpine\n' > "$APP_ROOT/compose.yml"
 cp -R "$REPO_ROOT/displays" "$APP_ROOT/displays"
+install -d "$APP_ROOT/displays/.venv/bin" "$APP_ROOT/displays/__pycache__"
+printf 'rebuildable\n' > "$APP_ROOT/displays/.venv/bin/python"
+printf 'cache\n' > "$APP_ROOT/displays/__pycache__/x.pyc"
 printf '1.3.0\n' > "$APP_ROOT/config/installed-version"
 for helper in configure-hardware.sh bootstrap-influx.sh; do
     printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
     chmod +x "$APP_ROOT/installer/scripts/$helper"
 done
 
-for command in docker systemctl curl; do
+for command in docker systemctl curl journalctl; do
 cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
+printf '%s %s\n' "$(basename "$0")" "$*" >> "$(dirname "$0")/calls.log"
 if [ "$(basename "$0")" = curl ]; then
     printf '%s\n' '{"ok":true,"ready":true}'
 fi
@@ -88,6 +92,15 @@ if run_ctl backup "$DATA_ROOT/recursive-backups" >/dev/null 2>&1; then
     echo 'Backup accepted a destination inside the data tree' >&2
     exit 1
 fi
+archive_listing=$(tar -tzf "$archive")  # not piped into grep -q: SIGPIPE trips pipefail
+if grep -q '/displays/.venv\|/displays/__pycache__' <<<"$archive_listing"; then
+    echo 'Rebuildable displays virtual environment or bytecode was included in backup' >&2
+    exit 1
+fi
+if ! grep -q '/displays/bridge.py' <<<"$archive_listing"; then
+    echo 'Displays sources are missing from the backup' >&2
+    exit 1
+fi
 if tar -tzf "$archive" | grep -q '/boat-chat/.venv'; then
     echo 'Rebuildable virtual environment was included in backup' >&2
     exit 1
@@ -100,7 +113,13 @@ grep -q '127.0.0.1:9876' <<<"$urls_output"
 grep -q 'installed: 1.3.0' <<<"$version_output"
 grep -q 'Boat Chat service' <<<"$status_output"
 grep -q '^prometheus[[:space:]]\+healthy$' <<<"$status_output"
+grep -q '^Displays bridge[[:space:]]\+disabled$' <<<"$status_output"
+: > "$FAKE_BIN/calls.log"
 run_ctl start
+if grep -q 'displays-bridge' "$FAKE_BIN/calls.log"; then
+    echo 'Disabled displays bridge was started' >&2
+    exit 1
+fi
 AUTH_DIR="$APP_ROOT/config/mosquitto-auth"
 test -s "$AUTH_DIR/passwords" || {
     echo 'Lifecycle start did not create the MQTT password file' >&2
@@ -130,6 +149,29 @@ test ! -e "$DATA_ROOT/mosquitto/acl"
 test ! -e "$DATA_ROOT/mosquitto/passwords"
 grep -q 'RESULT healthy' <<<"$doctor_output"
 
+# Enabled displays bridge: status, start, stop and logs include the unit.
+printf 'DISPLAYS_ENABLE=true\n' >> "$APP_ROOT/config/vesselstack.env"
+enabled_status=$(run_ctl status)
+grep -q '^Displays bridge[[:space:]]\+healthy$' <<<"$enabled_status"
+: > "$FAKE_BIN/calls.log"
+run_ctl start
+grep -qx 'systemctl start vesselstack-displays-bridge.service' "$FAKE_BIN/calls.log"
+: > "$FAKE_BIN/calls.log"
+run_ctl logs displays >/dev/null
+grep -qx 'journalctl -u vesselstack-displays-bridge.service -n 100 --no-pager' "$FAKE_BIN/calls.log"
+: > "$FAKE_BIN/calls.log"
+run_ctl logs >/dev/null
+grep -q 'vesselstack-displays-bridge.service' "$FAKE_BIN/calls.log"
+if run_ctl logs bogus >/dev/null 2>&1; then
+    echo 'logs accepted an unknown target' >&2
+    exit 1
+fi
+: > "$FAKE_BIN/calls.log"
+run_ctl stop >/dev/null
+grep -qx 'systemctl stop vesselstack-displays-bridge.service' "$FAKE_BIN/calls.log"
+sed -i.bak '/^DISPLAYS_ENABLE=true$/d' "$APP_ROOT/config/vesselstack.env"
+rm -f "$APP_ROOT/config/vesselstack.env.bak"
+
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"
 python3 - "$unsafe" "${APP_ROOT#/}" <<'PY'
 import io
@@ -152,7 +194,8 @@ printf 'changed\n' > "$DATA_ROOT/state.txt"
 run_ctl restore "$archive" --yes >/dev/null
 grep -qx 'version one' "$DATA_ROOT/state.txt"
 
-touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \
+    "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
 if run_ctl uninstall --purge-data >/dev/null 2>&1; then
     echo 'Purge uninstall accepted missing --yes confirmation' >&2
     exit 1
@@ -160,6 +203,7 @@ fi
 test -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 run_ctl uninstall >/dev/null
 test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
 test -e "$DATA_ROOT/state.txt"
 
 if run_ctl status unexpected >/dev/null 2>&1; then

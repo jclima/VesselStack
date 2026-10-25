@@ -70,3 +70,5 @@ jobs:
         run: tests/test-service-integration.sh
       - name: Verify Mosquitto ACL and display accounts
         run: sudo tests/test-displays-mosquitto.sh
+      - name: Verify the SignalK to MQTT displays bridge
+        run: sudo tests/test-displays-bridge.sh

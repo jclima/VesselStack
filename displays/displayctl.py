@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pwd
 import sys
 from pathlib import Path
 
@@ -63,6 +64,60 @@ def cmd_sync_mqtt(args) -> int:
     return 0
 
 
+def systemd_env_line(key: str, value: str) -> str:
+    """One systemd EnvironmentFile line: KEY="value" with backslash and quote escaped.
+
+    systemd does not expand $ or % in EnvironmentFile values, so only the
+    backslash and double quote need escaping; control characters are refused.
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(f"{key} must not contain control characters or line breaks")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{key}="{escaped}"\n'
+
+
+def render_bridge_env(root: Path, env: dict, bridge_password: str) -> str:
+    username = env.get("DISPLAYS_BRIDGE_MQTT_USERNAME") or mqtt_auth.DEFAULT_BRIDGE_USERNAME
+    values = [
+        ("DISPLAYS_CONFIG", str(root / "config" / "displays.json")),
+        ("SIGNALK_URL", env.get("SIGNALK_URL", "")),
+        ("MQTT_HOST", "127.0.0.1"),
+        ("MQTT_PORT", env.get("MQTT_PORT") or "1883"),
+        ("DISPLAYS_BRIDGE_MQTT_USERNAME", username),
+        ("DISPLAYS_BRIDGE_MQTT_PASSWORD", bridge_password),
+        ("DISPLAYS_SIGNALK_TOKEN", env.get("DISPLAYS_SIGNALK_TOKEN", "")),
+    ]
+    return "".join(systemd_env_line(key, value) for key, value in values)
+
+
+def cmd_bridge_env(args) -> int:
+    """Write the bridge's systemd EnvironmentFile (0600) without secrets on argv."""
+    root_text = args.root or os.environ.get("VESSELSTACK_ROOT", "")
+    if not root_text:
+        print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
+        return 2
+    root = Path(root_text)
+    env = {key: os.environ[key] for key in
+           ("SIGNALK_URL", "MQTT_PORT", "DISPLAYS_BRIDGE_MQTT_USERNAME",
+            "DISPLAYS_SIGNALK_TOKEN") if key in os.environ}
+    try:
+        secrets_data = mqtt_auth.load_secrets(root / "config" / mqtt_auth.SECRETS_NAME)
+        password = secrets_data["bridge"].get("mqtt_password")
+        if not isinstance(password, str) or not password:
+            raise ValueError("no bridge MQTT password yet; run sync-mqtt with DISPLAYS_ENABLE=true first")
+        text = render_bridge_env(root, env, password)
+        owner = pwd.getpwnam(args.owner) if args.owner else None
+        output = Path(args.output)
+        mqtt_auth.write_atomic(output, text, 0o600)
+        if owner is not None:
+            os.chown(output, owner.pw_uid, owner.pw_gid)
+    except (mqtt_auth.MqttAuthError, OSError, ValueError, KeyError) as exc:
+        print(f"error: bridge-env failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Wrote {args.output} (mode 0600)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="displayctl", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -77,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--container", default=mqtt_auth.CONTAINER,
                       help=argparse.SUPPRESS)  # integration tests use a unique broker name
     sync.set_defaults(func=cmd_sync_mqtt)
+    bridge_env = sub.add_parser("bridge-env", help="write the displays bridge environment file")
+    bridge_env.add_argument("--root", help="VESSELSTACK_ROOT (default: environment)")
+    bridge_env.add_argument("--output", required=True, help="file to write (mode 0600)")
+    bridge_env.add_argument("--owner", help="user that will own the file")
+    bridge_env.set_defaults(func=cmd_bridge_env)
     return parser
 
 

@@ -108,6 +108,7 @@ FIELDS = [
     field("MQTT_PORT", "Published port", "MQTT", kind="port"),
     field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
     field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
+    field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
     field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 unless access is protected by a trusted VPN or proxy."),
@@ -149,6 +150,7 @@ SYSTEMD_COMPONENTS = {
     "boat-chat": "vesselstack-chat.service",
     "telegram": "vesselstack-chat-telegram.service",
     "telemetry-indexer": "vesselstack-telemetry-indexer.timer",
+    "displays-bridge": "vesselstack-displays-bridge.service",
     "signalk-native": "vesselstack-signalk.service",
     "socketcan": "vesselstack-socketcan.service",
     "firewall": "vesselstack-firewall.service",
@@ -329,6 +331,7 @@ def component_command(component: str, verb: str) -> list[str]:
             "signalk-native": settings.get("SIGNALK_MODE") == "native",
             "socketcan": settings.get("SOCKETCAN_ENABLE", "false") == "true",
             "firewall": settings.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true",
+            "displays-bridge": settings.get("DISPLAYS_ENABLE", "false") == "true",
         }
         if component in enabled and not enabled[component]:
             raise ValueError(f"{component} is disabled by configuration")
@@ -418,6 +421,8 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("SOCKETCAN_ENABLE", "false") == "true"
         elif name == "firewall":
             enabled = vessel.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true"
+        elif name == "displays-bridge":
+            enabled = vessel.get("DISPLAYS_ENABLE", "false") == "true"
         components.append({"id": name, "label": name.replace("-", " ").title(), "kind": "systemd", "enabled": enabled, "state": output or ("active" if code == 0 else "inactive")})
     return components
 
