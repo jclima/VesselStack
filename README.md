@@ -10,21 +10,178 @@ the illustrated [end-to-end installation and commissioning guide](docs/INSTALLAT
 It covers Raspberry Pi 5 assembly, marine power, isolated NMEA 2000/SocketCAN,
 backbone connection, acceptance tests, backup, and rollback.
 
-## Guided first installation
+Deploying a release to a home-lab Pi and an offline boat Pi? Follow the
+[deployment runbook](docs/DEPLOYMENT.md): SSH release signing and the signed
+`v1.4.0` tag, a clean build with recorded sha256, a home-lab soak and rehearsals
+(update, backup/restore, offline install, `vcan` replay), the carry bundle,
+dock-side install with `VESSELSTACK_OFFLINE=true vesselstackctl update DIR`, rollback, an
+acceptance checklist and known gaps. It is documentation only; it changes no
+code, configuration or runtime behaviour, so there is nothing to roll back
+beyond deleting the file.
 
-After installing the OS and Docker prerequisites from the end-to-end guide:
+## Quick start: one command on the Raspberry Pi
+
+**Stock Raspberry Pi OS bookworm (Debian 12) has no Docker Compose v2 package.**
+On a fresh bookworm image the one-liner below stops at the Docker step and tells you
+what to do; it does not install Docker for you there. Install Docker Engine and the
+Compose plugin from Docker's own apt repository first, then run the one-liner again
+(it finds Docker and continues). These are the steps from Docker's official
+documentation (<https://docs.docker.com/engine/install/debian/>, apt repository
+method; check that page for the current version before running them):
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+```
+
+If Docker's repository is already configured and Docker is not installed, the script
+itself installs `docker-ce docker-ce-cli containerd.io docker-compose-plugin` (never
+Debian's `docker.io` next to Docker's plugin).
+
+On a Raspberry Pi running 64-bit Raspberry Pi OS (or Debian) with internet access,
+paste this into a terminal on the Pi:
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
+```
+
+The `releases/latest/download/` form works only once a release carrying
+`get-vesselstack.sh` has been published **and marked latest**. Until then (and while a
+release is still being install-tested) use the pinned form shown next, which works for
+any published release, including a pre-release.
+
+Releases are built by the tag-triggered GitHub workflow (read-only build job, separate
+write-only publish job, draft first, reproducible tarball on Linux); maintainers follow the
+release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+To install an exact release instead (recommended once you have tested one):
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.0/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=1.4.0 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 1.4.0
+```
+
+The guided installer explains each step in plain language and asks before it
+does anything beyond installing ordinary Debian packages:
+
+1. checks the computer (Linux, root, Debian family, 64-bit ARM; warns, does not
+   fail, on other systems), disk space, memory and internet access, and detects an
+   existing installation (an existing install is **never overwritten silently**: it
+   is offered the built-in `vesselstackctl update` upgrade, with its backup);
+2. installs the packages VesselStack needs with `apt-get` (`ca-certificates curl jq
+   openssl python3 python3-venv rsync tar gzip`; no `git`) and **asks** before
+   installing Docker and the Compose v2 plugin (`docker.io` with `docker-compose-v2`
+   on Ubuntu, `docker-ce docker-ce-cli containerd.io docker-compose-plugin` when
+   Docker's own repository is configured, or `docker.io` with a 2.x `docker-compose`
+   on Debian 13; Debian's `docker.io` is never mixed with Docker's plugin). Debian 12 / Raspberry Pi OS bookworm packages only the old
+   Compose v1, so there the script stops with a pointer to Docker's own apt
+   repository (`docker-compose-plugin`): install Docker from
+   <https://docs.docker.com/engine/install/debian/> first, then run the
+   one-liner again; it detects Docker and continues;
+3. downloads `vesselstack-<version>.tar.gz` and its `.sha256` from the GitHub
+   release, verifies the checksum, refuses unsafe archives (absolute or `..` paths,
+   links, devices, setuid bits) and unpacks to `/opt/vesselstack-release/<version>`,
+   owned by root and not writable by others;
+4. starts the loopback-only configuration wizard on a random free port (override
+   with `--wizard-port N`) and tells you how to open it. The wizard runs as an
+   unprivileged user (the account that ran `sudo`; if there is none, or it is root, a
+   temporary dedicated system account `vesselstack-wizard` is created for the run
+   with `useradd --system --no-create-home --shell /usr/sbin/nologin` and removed
+   again when the script ends, even after a failure; the shared `nobody` identity is
+   never used, so no other daemon can tamper with the output; a stale
+   `vesselstack-wizard` left by an interrupted run is replaced) with a minimal environment, writing only into a private 0700 directory
+   owned by that user, so other local users cannot obtain a root-installed
+   configuration. It prints one address ending in `#token=...`; open that exact
+   address in a browser on the Pi, or on your laptop after running the printed
+   `ssh -L PORT:127.0.0.1:PORT USER@PI` command. The token is in the URL fragment,
+   so it is never sent to the server or served in the page, and the page removes
+   it from the address bar. The wizard closes itself when you save; the bootstrap
+   then copies the result once into a root-only staging directory, lints that copy,
+   re-validates it as root with the wizard's own rules
+   (`vesselstack-wizard.py --validate FILE`: known settings only, allowed characters,
+   enum and boolean values) and installs only it. `--config FILE` gets the same treatment: opened without
+   following symlinks, must be a regular file of at most 64 KiB, copied once, and
+   only the staged copy is linted, validated the same way (unknown keys, disallowed
+   characters or bad enum values are refused) and used. Limitation: the Docker line in the
+   wizard's preflight page reflects what the unprivileged wizard user can see;
+   `install.sh` performs the authoritative checks;
+5. shows a summary of the chosen configuration (no secrets), asks for confirmation,
+   runs `install.sh --dry-run`, then `install.sh --start`, then `vesselstackctl
+   doctor`, and prints `vesselstackctl urls`, where the generated tokens are
+   stored and the next steps. It ends with a list of everything it changed.
+
+Options (`sudo bash get-vesselstack.sh --help`): `--yes` (no questions),
+`--version X.Y.Z`, `--no-wizard --config FILE` (use an existing `vesselstack.env`),
+`--offline --bundle DIR [--tarball FILE]` (no internet, see
+[Offline install](#offline-install-no-internet-on-the-boat)), `--sha256 HASH`
+(pin the tarball to a checksum you obtained elsewhere), `--dir DIR`,
+`--wizard-port N` (default: a random free port). Questions are read from the terminal, so the piped form works;
+without a terminal pass `--yes`. Re-running is safe: finished steps are reported
+and skipped, an already installed version just reports "nothing to do", and an
+earlier saved configuration can be reused.
+
+**What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
+root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the
+downloads) and the VesselStack release you fetch it from. The tarball's `.sha256`
+is published in the *same* release, so it protects against corruption and partial
+downloads but not against a compromised release or account: compare the printed
+sha256 with the one on the GitHub release page, or pass `--sha256`. The whole
+script is wrapped in functions and ends with a single `main "$@"` call, so a
+truncated download cannot half-run. If you prefer to read it first (recommended):
+
+```bash
+curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
+less get-vesselstack.sh
+sudo bash get-vesselstack.sh
+```
+
+The script is `scripts/get-vesselstack.sh` in this repository; each release ships
+a copy with that release's version baked in as the default, plus
+`get-vesselstack.sh.sha256`. Rollback: nothing outside the listed changes is
+touched; `sudo vesselstackctl stop` stops the services and the README's
+[uninstall](#stopping-or-removing-services) and restore sections cover the rest.
+Releases are unpacked next to each other and never deleted; remove
+`/opt/vesselstack-release/<version>` yourself when you no longer need it.
+
+## Advanced: manual guided installation
+
+Prefer to run each step yourself? After installing the OS and Docker prerequisites
+from the end-to-end guide:
 
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.3.0
+git checkout v1.4.0
 python3 vesselstack-wizard.py
 ```
 
-Open `http://127.0.0.1:8088`, or use the SSH tunnel documented in the guide.
-The dependency-free wizard binds only to loopback, shows relevant host
+Open the address the wizard prints (`http://127.0.0.1:8088/#token=...`), or use the
+SSH tunnel documented in the guide and open the same address on your workstation.
+The wizard accepts `--port N`, `--output FILE` (where to write the env file) and
+`--exit-after-save` (stop after the first successful save; the one-line installer
+uses it) and `--validate FILE` (check an existing env file with the wizard's rules,
+exit 0 if valid, 1 otherwise, no server started; `VESSELSTACK_CAN_CREATE_VCAN` is now a
+known wizard setting, default `false`). Rollback: revert this change; nothing is
+persisted except the temporary account, which is removed on exit (`sudo userdel
+vesselstack-wizard` if a run was killed with SIGKILL). It prints a per-run address of the form `http://127.0.0.1:PORT/#token=...`; open
+that exact address. The token is carried in the URL fragment (never sent to the
+server, never present in any served file); `wizard/app.js` reads it, removes it
+from the address bar with `history.replaceState` and sends it as `X-Wizard-Token`
+with every API call (`/api/system` and `/api/save` refuse requests without it).
+The wizard needs no root privileges; run it as a normal user. Requests are refused unless the `Host`
+header is `127.0.0.1`/`localhost`/`[::1]` on the bound port, any `Origin` is the
+same loopback origin, the token matches, and saves use `Content-Type:
+application/json` (this blocks cross-site form posts and DNS rebinding). The env
+file is created mode 600 from the start and never through a symlink. Open the
+printed URL itself (including the `#token=` part); a bookmarked older address stops working when the wizard restarts. The dependency-free wizard binds only to loopback, shows relevant host
 prerequisites, and writes a complete private `vesselstack.env`. It does not
-change boot firmware, firewall rules, marine wiring, or start services.
+change boot firmware, firewall rules, marine wiring, or start services. Then run
+`sudo ./install.sh --config vesselstack.env --dry-run` and `--start` as described
+in the sections below.
 
 > [!WARNING]
 > VesselStack is not certified navigation, collision-avoidance, engine-control,
@@ -136,7 +293,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.3.0
+git checkout v1.4.0
 ```
 
 ## 4. Configure the vessel
@@ -153,6 +310,9 @@ nano vesselstack.env
 | `BOAT_TYPE` | Vessel make/model or general type |
 | `BOAT_MMSI`, `BOAT_CALLSIGN` | Optional identity fields |
 | `*_PORT` | Host ports for Grafana, Heimdall HTTP/HTTPS, InfluxDB, Prometheus, MQTT, and AIS |
+| `VESSELSTACK_DATA_BIND_ADDRESS` | IPv4 address InfluxDB, Prometheus and MQTT publish on; default `127.0.0.1` (this device only) |
+| `VESSELSTACK_WEB_BIND_ADDRESS` | IPv4 address Grafana and Heimdall publish on; default `0.0.0.0` (LAN dashboards), `127.0.0.1` to restrict |
+| `BOAT_CHAT_ACCESS_TOKEN` | `GENERATE` (default) creates a random token, preserved on re-install; required for chat, status and data APIs |
 | `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
 | `BOAT_UNITS` | `us_customary` or `metric` |
@@ -166,7 +326,8 @@ nano vesselstack.env
 | `SIGNALK_URL` | Existing SignalK endpoint |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
-| `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate |
+| `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
+| `VESSELSTACK_CAN_CREATE_VCAN` | `true` creates a missing `vcan*` interface at boot (home-lab replay only; default `false`) |
 | `AIS_ENABLE` | Opt in to the AIS-catcher Compose profile |
 | `AIS_DEVICE` | USB bus or receiver device mapped into AIS-catcher |
 | `AIS_CATCHER_ARGS` | Reviewed AIS-catcher receiver/output arguments |
@@ -175,7 +336,8 @@ nano vesselstack.env
 | `INFLUXDB_HISTORY_BUCKET` | One-minute retained history; default `signalk_1m` |
 | `INFLUXDB_HOME_ASSISTANT_BUCKET` | Home Assistant history bucket |
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
-| `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values |
+| `INFLUXDB_RAW_RETENTION` | Raw-bucket retention: `720h`, `30d`, `8w`, or `0` (forever). Empty (default) = `30d` on a new install and **no change** to an existing bucket; see "Raw data retention" |
+| `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
 | `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
 | `TELEMETRY_INDEXER_ENABLE` | Refresh Boat Chat's telemetry memory every five minutes |
@@ -198,6 +360,11 @@ components before Docker or systemd encounters a harder-to-diagnose bind error:
 ```bash
 sudo ./install.sh --config vesselstack.env --dry-run
 ```
+
+The dry run also validates the upgrade path from the installed version (so an
+unsupported upgrade or a downgrade is reported before anything is overwritten)
+and the Compose template. With `--offline` it also checks the wheelhouse and the
+locally loaded container images (see Offline install).
 
 Resolve every error before continuing.
 
@@ -344,6 +511,78 @@ sudo docker exec vesselstack-influxdb influx task list \
 Upgrades from 0.x retain any previously configured InfluxDB bucket names
 when those settings are absent, so existing history remains accessible.
 
+Start, restart and the backup restart path all run `scripts/bootstrap-influx.sh`,
+which first waits (up to 120 s, `INFLUXDB_READY_TIMEOUT`) for InfluxDB to report
+healthy. A failed `bucket list` is retried and then reported as an error; a
+bucket is created only when a *successful* listing lacks it. The admin token is
+handed to the `influx` CLI through the environment, never as a command-line
+argument. The one-minute downsample task averages **numeric fields only**
+(string and boolean fields such as navigation state or relay status are dropped
+before `mean()`, which would otherwise fail the whole run); an existing task from
+an older release is updated in place to this version.
+
+#### Raw data retention
+
+The full-resolution bucket (`INFLUXDB_RAW_BUCKET`) used to keep data forever,
+which eventually fills the boat's disk. New installs now create it with a 30-day
+retention (`INFLUXDB_RAW_RETENTION`, default `30d`); the one-minute history
+bucket keeps one year as before. **Upgrades never change an existing bucket
+implicitly**, because shortening retention permanently deletes older raw data.
+To apply a window to an existing install, set `INFLUXDB_RAW_RETENTION` (for
+example `90d`, or `0` to keep forever) in `vesselstack.env` or the control panel
+and run `sudo vesselstackctl restart` (or the installer with `--start`); the
+bootstrap step then runs `influx bucket update`. Back up first. Removing the
+value later does not restore deleted data and leaves the bucket's current
+retention as is. `vesselstackctl doctor` warns when the data filesystem is more
+than 80 % full (`VESSELSTACK_DISK_WARN_PERCENT` overrides the threshold) and
+prints the size of the data directory.
+
+#### Rotating secrets
+
+`INFLUXDB_PASSWORD`, `INFLUXDB_TOKEN` and `GRAFANA_ADMIN_PASSWORD` are read by
+InfluxDB and Grafana only when their data volumes are first created, so they are
+**read-only in the control panel**: editing the file alone would make the config
+disagree with the running service. To rotate one deliberately, change it inside
+the service first, then update `config/vesselstack.env`, then re-apply:
+
+- Grafana: `docker exec vesselstack-grafana grafana cli admin reset-admin-password NEW`
+- InfluxDB password: `docker exec -e INFLUX_TOKEN=... vesselstack-influxdb influx user password -n boatadmin -p NEW`
+- InfluxDB admin token: create a new all-access token with `influx auth create`,
+  put it in `INFLUXDB_TOKEN`, run `sudo ./install.sh --config /opt/vesselstack/config/vesselstack.env --start`
+  (updates Boat Chat and Grafana), then delete the old token with `influx auth delete`.
+
+`MQTT_PASSWORD` is editable: the Mosquitto password file is created only when
+missing and otherwise updated in place (other users are kept) when the
+username/password changed since the last run, so re-running the installer no
+longer resets MQTT credentials. Update Home Assistant's MQTT integration to match.
+
+#### Virtual CAN for home-lab replay
+
+On a lab machine without a CAN adapter you can replay a recorded log into a
+virtual CAN interface and let SignalK read it as if it were the boat bus. Set
+
+```bash
+SOCKETCAN_ENABLE="true"
+SOCKETCAN_INTERFACE="vcan0"
+VESSELSTACK_CAN_CREATE_VCAN="true"   # creates vcan0 (modprobe vcan + ip link add) at boot
+```
+
+For `vcan*` interfaces VesselStack renders `ip link set vcan0 up` only: virtual
+CAN has no bitrate and rejects `type can`/`restart-ms`, so `SOCKETCAN_BITRATE` is
+ignored. With the default `VESSELSTACK_CAN_CREATE_VCAN=false` the interface must
+already exist (`sudo ip link add dev vcan0 type vcan`). Physical `can*` interfaces
+are unchanged (bitrate 250000 by default, never auto-created). Then replay a
+log you recorded yourself with `candump -l can0` using `can-utils`:
+
+```bash
+sudo apt install can-utils
+canplayer -I /path/to/your-candump.log vcan0=can0   # add -l i to loop forever
+```
+
+Point the SignalK NMEA 2000/SocketCAN connection at `vcan0`. Recorded logs
+contain vessel identifiers and positions: keep them outside the repository (the
+public-tree check rejects `.log` files) and never commit or share them.
+
 ### Grafana
 
 Open `http://HOST:43000`. Retrieve the generated initial password locally:
@@ -361,7 +600,9 @@ reusable versions in the repository so reinstallations remain reproducible.
 
 ### Boat Chat
 
-Open `http://HOST:8765`. The `local` provider returns gathered context without
+Open `http://HOST:8765`. Chat requires the access token
+(`BOAT_CHAT_ACCESS_TOKEN` in `config/boat-chat.env`) and refuses requests without
+it unless `BOAT_CHAT_ALLOW_OPEN=true` is set. The `local` provider returns gathered context without
 sending it to an external model. Configure an optional provider in Settings.
 Retrieve the settings token locally when needed:
 
@@ -381,17 +622,108 @@ relative AIS context, recent-trip insights, and a local maintenance tracker.
 The interface rate-limits each client and runs at most two chat requests at a
 time so slow model calls cannot exhaust the Raspberry Pi.
 
-Set `BOAT_CHAT_ACCESS_TOKEN` in Boat Chat Settings to protect chat, live status,
-insights, feedback, and maintenance data. The browser keeps the entered token
-only in session storage. Without an access token, ordinary chat remains
-available but live status, insights, and maintenance endpoints stay locked.
+The installer generates `BOAT_CHAT_ACCESS_TOKEN` (random, preserved on
+re-install) and writes it to `config/boat-chat.env`. Chat, feedback, session,
+live status, insights, and maintenance endpoints all require it in the
+`X-Boat-Chat-Token` header; the web UI asks for it through **Connect** and keeps
+it only in session storage, and the Telegram bridge sends it automatically. Find
+it with:
+
+```bash
+sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' /opt/vesselstack/config/boat-chat.env
+```
+
+An empty token **fails closed**: all of those endpoints return 401. A reviewed,
+trusted installation can opt out by adding `BOAT_CHAT_ALLOW_OPEN=true` to
+`config/boat-chat.env`; this key is deliberately not editable from the Settings
+page. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN` is retired and no longer disables
+protection.
+
+#### Settings and configuration precedence
+
+Boat Chat reads two files; both Boat Chat and the Telegram bridge resolve them
+the same way (`boat-chat/env_config.py`):
+
+1. **Settings-page overrides** (highest): `$VESSELSTACK_DATA/boat-chat/boat-chat.env`,
+   selected by `BOAT_CHAT_ENV`. This is the only settings file the service user
+   can write.
+2. **Base configuration**: `config/boat-chat.env`, written by the installer and
+   control panel and loaded by systemd into the environment.
+
+Saving a value on the Settings page that equals the base value stores no
+override. Saving a Boat Chat field in the control panel removes that key from
+the override file so the new value takes effect, and the panel marks any field
+that is currently overridden. Settings writes require `BOAT_CHAT_SETTINGS_TOKEN`
+from any address; with no settings token they are accepted from loopback only
+(private-LAN addresses are no longer trusted). `TELEGRAM_ALLOWED_CHAT_IDS` is a
+secret setting and is never returned by `GET /api/settings`.
 
 `BOAT_CHAT_WEB_SEARCH=true` enables the OpenAI Responses API web-search tool
 when the OpenAI provider is selected. This can send the question and grounded
 context to an external service and may incur provider charges; it is disabled
 by default. Boat Chat sessions, audits, feedback, and maintenance tasks stay in
-the private SQLite memory database under the configured data directory and are
-excluded from release packages.
+the private SQLite memory database
+(`$VESSELSTACK_DATA/boat-chat/memory/boat_memory.sqlite`, power observations in
+`$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`) and are excluded from
+release packages. Settings values containing a newline, carriage return or NUL
+byte are rejected (HTTP 400, nothing written), matching the control panel.
+
+`vesselstackctl urls` prints the effective bind address of each service (read
+from `config/boat-chat.env`, `config/control-panel.env` and the Compose bind
+variables, never by sourcing service-writable files), e.g. whether Boat Chat is
+reachable on all interfaces or only this device.
+
+Hardening of service-writable paths: the control panel clears stale Settings
+overrides without following symlinks (it refuses a symlinked override file,
+writes through a random `O_EXCL` temporary file and sets mode/owner on the open
+descriptor).
+
+**Data-directory ownership (no check-then-use race).** `VESSELSTACK_DATA` is
+`root:<service group>` mode 0750: the service user can traverse it but cannot
+create, rename, replace or symlink anything directly in it. Only the leaf mount
+roots belong to the accounts that must write them: `influxdb` (uid/gid 1000),
+`grafana` (uid 472, gid 0) and `boat-chat` (service user; native SignalK state
+`signalk` likewise). Intermediate directories the installer writes through
+(`homeassistant`, `homeassistant/blueprints/...`) must be root-owned and not
+group/world-writable. Before touching anything the installer refuses, with a
+message naming the path, a symlink at any managed entry (`influxdb`, `grafana`,
+`boat-chat`, `signalk`, `mosquitto`, `homeassistant/...`) or a managed
+intermediate directory that is not root-owned; fix it as the message says and
+rerun. Because the service user cannot alter the parent, a symlink cannot be
+swapped in between the check and the `install -d`/`chown`. Legacy runtime
+state is copied and chowned in a root-only staging directory and published with
+`rename(2)` (which never follows a symlink at the destination); a destination
+that already exists or is a symlink sends the legacy copy to quarantine instead.
+Upgrade: installs from earlier 1.4.0 builds had a service-owned data root; the
+first run of this installer takes ownership of the data root (not recursive:
+existing database files keep their owners) and moves old quarantine directories
+out of it. Rollback: `chown -R` is not needed; reinstalling the previous release
+makes the data root service-owned again, and restoring a backup keeps recorded
+owners.
+
+Security layout (1.3.x hardening): the installed application code, its Python
+virtualenv and the generated `boat_facts.json` are owned by `root` and are not
+writable by the service account (`boat_facts.json` is `root:SERVICE 0640`).
+Everything Boat Chat writes at runtime (memory/session database, power database,
+Telegram state and the Settings-page `boat-chat.env`) lives under
+`$VESSELSTACK_DATA/boat-chat` (default `/opt/vesselstack-data/boat-chat`,
+selected by `BOAT_CHAT_STATE_DIR`). The chat, Telegram and telemetry-indexer
+units run with `ProtectSystem=strict`, `ProtectHome=true`, `NoNewPrivileges=true`,
+`PrivateTmp=true` and `ReadWritePaths=$VESSELSTACK_DATA/boat-chat`. Consequences:
+`VESSELSTACK_ROOT`/`VESSELSTACK_DATA` may not be under `/home` or `/root`, and the
+`codex_cli`/`claude_cli` providers cannot use binaries or credentials kept in a
+home directory (install them system-wide and set `BOAT_CHAT_CODEX_BIN` /
+`BOAT_CHAT_CLAUDE_BIN` in the root-owned `config/boat-chat.env`; these two
+settings are no longer accepted from the web Settings page or the Settings
+`boat-chat.env`). On the first install/upgrade the installer stops the chat
+workers, moves any legacy `boat-chat/memory`, `boat-chat/data` and
+`boat-chat/boat-chat.env` into the new state directory (refusing symlinks),
+recreates the virtualenv as root and restarts the services only with `--start`.
+Rollback: restore the pre-update backup (`vesselstackctl restore`) or reinstall the
+previous release; the legacy files are moved, not copied, so keep the backup
+taken by `vesselstackctl update`. `systemd-analyze verify` was not run in the
+development environment; run it on the Pi after upgrading
+(`systemd-analyze verify /etc/systemd/system/vesselstack-chat*.service`).
 
 ### Control Panel
 
@@ -682,6 +1014,20 @@ Pi](#building-and-flashing-on-the-pi)); building on a laptop remains the
 primary documented path. The always-on Mosquitto ACL does affect existing installations
 (see [MQTT access control](#mqtt-access-control)). `displays/` is copied to
 `$VESSELSTACK_ROOT/displays` by the installer.
+
+**Network and offline requirements.** Compose publishes MQTT on loopback by
+default (`VESSELSTACK_DATA_BIND_ADDRESS=127.0.0.1`, see [Network
+security](#network-security)), so a display on the boat LAN can only reach the
+broker after you set that variable to a trusted LAN IPv4 address and re-run the
+installer; note it also moves InfluxDB and Prometheus. A dedicated option to
+publish only MQTT on a LAN address is planned; until then the default binding
+is unchanged and displays cannot connect. The broker always
+enforces the ACL and each display has its own read-only account. The displays
+bridge dependencies (`displays/requirements.txt`, installed with
+`--require-hashes` into `$VESSELSTACK_ROOT/displays/.venv`) are fetched from
+PyPI and are not part of the offline bundle yet: `install.sh --offline` with
+`DISPLAYS_ENABLE=true` is refused, before anything changes, unless that
+environment already exists.
 
 ### Displays bridge service
 
@@ -1240,10 +1586,17 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 
 ## Network security
 
-Compose publishes several ports on every host interface. At minimum:
+Compose now publishes InfluxDB `8086`, Prometheus `9090`, and MQTT `1883` on
+`127.0.0.1` by default (`VESSELSTACK_DATA_BIND_ADDRESS`). Grafana `43000` and
+Heimdall `80/443` remain reachable on every interface by default
+(`VESSELSTACK_WEB_BIND_ADDRESS=0.0.0.0`) because the documented dashboards are
+used over the boat LAN; set it to `127.0.0.1` to keep them local. Grafana still
+reaches InfluxDB and Prometheus by service name, and host-networked Home
+Assistant reaches MQTT on loopback. AIS ports are unchanged. At minimum:
 
-- restrict InfluxDB `8086`, Grafana `43000`, Prometheus `9090`, and MQTT `1883`
-  to trusted management networks;
+- restrict Grafana `43000` and Heimdall to trusted management networks, and set
+  `VESSELSTACK_DATA_BIND_ADDRESS` to a trusted LAN/VPN IPv4 address only if
+  external devices must publish to MQTT or InfluxDB;
 - keep Home Assistant, SignalK, and Boat Chat off the public internet unless
   protected by an authenticated reverse proxy;
 - keep the root-privileged Control Panel loopback-only or behind a trusted VPN
@@ -1265,8 +1618,41 @@ Preflight requires that interface to exist. The policy blocks MQTT, InfluxDB,
 Prometheus, and Grafana administrative/data ports arriving on that interface,
 including Docker-forwarded traffic, while leaving Home Assistant, SignalK,
 Boat Chat, AIS viewer, HTTP/HTTPS, loopback, VPN, and outbound traffic intact.
-Review the rendered policy in `scripts/vesselstack-firewall` against the boat's
-network design before enabling it. Disable and remove its chains with:
+Review the policy without root or any change using
+`vesselstack-firewall print` (renders the exact `iptables-restore` payloads).
+Chain contents are replaced atomically (`iptables-restore --noflush`), so an
+existing chain is never briefly empty. The host (INPUT) rules are applied first;
+`DOCKER-USER` only exists once Docker is running, so the service waits up to 60 s
+for it (`TimeoutStartSec=180`) and, if Docker is still absent, creates the chain
+itself. Until Docker starts no container ports are published, so that window
+exposes nothing. A missing untrusted interface no longer aborts: rules are
+installed anyway (with a warning) and take effect when the interface appears.
+
+Strict mode (opt-in, default off) is for boats where nothing should be reachable
+over Wi-Fi except what you list:
+
+```bash
+VESSELSTACK_FIREWALL_STRICT="true"
+VESSELSTACK_FIREWALL_ALLOW_TCP="22"        # comma-separated ports or LOW:HIGH ranges
+VESSELSTACK_FIREWALL_ALLOW_UDP=""
+```
+
+On the untrusted interface strict mode drops everything except replies to
+connections the boat started, ICMP/ICMPv6, DHCP client replies and the
+allow-lists. That covers host-networked SignalK `3000`, AIS, Boat Chat `8765`
+(INPUT) and published container ports such as Heimdall `80/443` and Grafana
+(`DOCKER-USER`, matched on the published port). The allow-list therefore opens
+ports on both paths; the default `22` only lets SSH in. Keep Ethernet, a VPN or
+console access before enabling it: a wrong interface name or allow-list can lock
+you out of Wi-Fi access, and remote `ssh` on that interface needs `22` listed.
+Rollback: set `VESSELSTACK_FIREWALL_STRICT="false"` and
+`sudo systemctl restart vesselstack-firewall.service` (or `vesselstack-firewall
+remove`). IPv6 is restricted only for INPUT; Docker's IPv6 forwarding is not
+managed. The rules were rendered and tested but not loaded into a live kernel
+in the development environment; confirm with `sudo iptables -S
+VESSELSTACK-INPUT` on the Pi.
+
+Disable and remove its chains with:
 
 ```bash
 sudo systemctl disable --now vesselstack-firewall.service
@@ -1287,16 +1673,55 @@ Backup creation runs the same checksum, path, link, and special-file verifier
 automatically. Rebuildable Boat Chat virtual-environment and bytecode files are
 excluded; application source, configuration, memory, and data remain included.
 The destination is resolved before writing and is rejected if it falls inside
-the application or data tree, including through a symlink.
+the application or data tree, including through a symlink. Destinations under
+`/media` or `/mnt` must be a mounted filesystem (`mountpoint -q`), so a missing
+USB drive can no longer silently fill the SD card; pass
+`vesselstackctl backup --allow-unmounted DIR` (or set
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true`, which also applies to
+`vesselstackctl update`) to override. A warning is printed when the destination
+is on the same filesystem as the data. Besides the application and data trees the
+archive now includes `/etc/systemd/system/vesselstack-*`,
+`/usr/local/sbin/vesselstack{ctl,-firewall}` and `/etc/vesselstack/update.env`
+when they exist, so a restore across versions is complete.
 
-Restore only during a maintenance window. This replaces installed config and
-data after checksum and archive validation. Verification rejects path
-traversal, absolute or escaping links, device nodes, and FIFOs before anything
-is extracted:
+The whole stack, including Home Assistant, stays stopped for the copy. Home
+Assistant, Grafana, InfluxDB and Boat Chat all keep SQLite or write-ahead-log
+state in the data tree, and a file copy of a running database is not
+crash-consistent, so partial stops were rejected in favour of a consistent
+archive.
+
+Restore only during a maintenance window. Verification rejects path traversal,
+absolute or escaping links, device nodes, FIFOs and any setuid, setgid or sticky
+member (a legitimate backup never contains one) before anything is extracted:
 
 ```bash
 sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 ```
+
+Restore no longer extracts over the live tree. It (1) verifies the archive,
+(2) checks free space (staging holds a second full copy next to the live trees;
+the previous trees are kept too, so you need room for old + new), (3) extracts
+as root with the recorded numeric owners into a private `.vesselstack-restore.*`
+directory beside the data directory, (4) stops the stack, (5) renames the live
+trees to `/opt/vesselstack.pre-restore-STAMP` and
+`/opt/vesselstack-data.pre-restore-STAMP` and moves the staged trees in (so
+InfluxDB WAL/shard files created after the backup cannot mix with the restored
+ones), (6) restores the unit files, control scripts and `update.env` by rename,
+and (7) runs the restored bundled installer
+(`/opt/vesselstack/installer/install.sh --config ... --start`) to rebuild the
+Boat Chat virtualenv (not part of the backup), re-render units and start the
+stack. This step needs network access for `pip`; use `--skip-installer` to
+only start services and run the printed installer command later. If the swap
+fails the previous trees are put back. `/opt/vesselstack` and
+`/opt/vesselstack-data` must be plain directories on one filesystem with their
+parent; restore refuses a mount point (restore manually in that case).
+
+The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
+pre-restore config, secrets and databases, and are not covered by `uninstall
+--purge-data`). Verify the system first, then
+`sudo rm -rf -- /opt/vesselstack.pre-restore-STAMP /opt/vesselstack-data.pre-restore-STAMP`.
+Rollback of a restore: stop the stack, move the current trees aside and rename
+the `.pre-restore-STAMP` trees back.
 
 Back up at least:
 
@@ -1330,20 +1755,27 @@ sudo ./install.sh \
   --config /opt/vesselstack/config/vesselstack.env
 ```
 
-Review Compose and release notes before applying container changes. Never
-upgrade with the original example containing `GENERATE`; use the installed
-configuration so credentials remain stable.
+Review Compose and release notes before applying container changes. Prefer the
+installed configuration as input. If you do re-run with a file that still says
+`GENERATE` (for example a fresh copy of the example), the installer now keeps
+the already-installed InfluxDB, Grafana, MQTT, Boat Chat and control-panel
+secrets instead of generating new ones. A non-`GENERATE` value you set
+explicitly still wins.
 
 Once a reviewed release directory is downloaded, the lifecycle command can
 perform preflight, a verified pre-update backup, installation, and startup:
 
 ```bash
 sudo vesselstackctl update /path/to/VesselStack-release
+sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+  vesselstackctl update /path/to/VesselStack-release   # no network
 ```
 
 For Control Panel updates, stage the reviewed release beneath its restricted
 root first. The panel rejects symlinks, missing release metadata, paths outside
-this directory, files owned by another user, and group/world-writable content:
+this directory, and any entry anywhere in the release tree (`scripts/`,
+`boat-chat/`, `templates/`, `systemd/`, ...) that is a symlink, owned by a user
+other than root/the panel account, or group/world-writable:
 
 ```bash
 sudo install -d -m 0755 /var/lib/vesselstack/releases
@@ -1357,10 +1789,113 @@ Shell-initiated `vesselstackctl update` remains available for a trusted operator
 and is not limited to the panel staging directory.
 
 The installer records the configuration schema in
-`/opt/vesselstack/config/installed-version` and accepts only explicit migration
-edges. It refuses unknown or future schemas instead of guessing. The 1.0
-migration supports 0.1 installations and retains legacy InfluxDB names when
-the new bucket settings are absent.
+`/opt/vesselstack/config/installed-version`. Any upgrade from 0.1.0 or newer to a
+newer release is accepted: when a release needs no data change only the version
+marker moves, and releases that do need one ship an executable
+`scripts/migrations/<version>.sh` that runs once, in version order. The 1.0
+migration supports 0.1 installations and retains legacy InfluxDB names when the
+new bucket settings are absent.
+
+**Downgrades are not supported.** Configuration and data may already use the
+newer schema, so `install.sh` (including `--dry-run`) and `migrate.sh` refuse to
+install an older release over a newer one and change nothing. To go back, restore
+a backup taken before the upgrade (`sudo vesselstackctl restore ...`, see
+Backups) or install the newer release again. Unknown or malformed version
+markers are refused instead of guessed at.
+
+Install order is transactional. Preflight (`--dry-run` runs the same checks)
+validates the upgrade path, the Compose template and, offline, the wheelhouse and
+local images **before** any installed file is touched. The Python environment is
+then built in a staging virtualenv next to the install; only if that succeeds are
+the environment, units and code rewritten, the staged virtualenv swapped in, and
+`installed-version` written last. A failed or offline-without-bundle run
+therefore leaves the previous installation, `vesselstack.env`, units and version
+marker exactly as they were (the installer says "Nothing was changed").
+Rollback of a completed upgrade is a restore of the pre-update backup that
+`vesselstackctl update` takes automatically.
+
+### Offline install (no internet on the boat)
+
+Prepare a bundle on the home lab or any connected machine, carry it to the
+boat, then install without any network access. The guided installer does the
+checks, `--verify`, `--load` and install for you:
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-1.4.0.tar.gz`
+(copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
+carry media; the bundle must be root-owned and not group/world-writable, and
+packages and Docker must already be installed). The manual steps follow:
+
+```bash
+# Connected machine (needs docker and python3 with pip). Defaults target
+# Raspberry Pi OS 64-bit with Python 3.11 and linux/arm64 images.
+scripts/prepare-offline-bundle.sh --output ./offline-bundle
+#   other targets: --python-version 3.13  --platform manylinux_2_39_aarch64
+#   same architecture as this machine:     --native
+#   see the image list without downloading: --list
+
+# Copy ./offline-bundle (wheelhouse/, images/, MANIFEST.sha256, BUNDLE_INFO) and
+# a copy of this release to the boat. As root the bundle must be root-owned and
+# not group/world-writable along its whole path, so make it so first:
+sudo chown -R root:root /path/to/offline-bundle && sudo chmod -R go-w /path/to/offline-bundle
+sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle   # verifies the bundle, docker load
+sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+  ./install.sh --config /opt/vesselstack/config/vesselstack.env --offline --dry-run
+sudo VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
+  ./install.sh --config /opt/vesselstack/config/vesselstack.env --offline --start
+```
+
+The bundle contains a wheelhouse (`pip download --require-hashes
+--only-binary=:all:` of the release's hash-pinned `boat-chat/requirements.lock`
+for the chosen platform, so only wheels whose sha256 the lock lists are fetched
+and no source distribution is ever built), a `docker save` tarball for every
+image in `templates/compose.yml` (all profiles; this includes the Mosquitto image that also hashes the broker passwords),
+`BUNDLE_INFO` (release, platform, image list, `lock_sha256`) and
+`MANIFEST.sha256`. It holds no configuration, credentials or vessel data.
+
+Before installing or loading anything, `--verify DIR`, `--load DIR` and
+`install.sh --offline` refuse the bundle unless: the manifest lists exactly the
+files present (no extra, unlisted or missing files, no symlinks) and every
+checksum matches; `BUNDLE_INFO` names this release and the sha256 of **this
+release's** `requirements.lock` (the manifest is anchored to the release content,
+not only to itself); every wheelhouse file is a `.whl` whose sha256 is in the
+lock; and, when running as root, the bundle path chain and every file in it are
+root-owned and not group/world-writable. `install.sh --offline` also requires
+`VESSELSTACK_WHEELHOUSE` to be the `wheelhouse/` directory of such a bundle, then
+runs `pip install --no-index --find-links $VESSELSTACK_WHEELHOUSE
+--only-binary=:all: --require-hashes -r boat-chat/requirements.lock`, so even a
+bundle forged consistently cannot install a wheel the signed release did not
+pin. Containers start with `docker compose up -d --pull never`. If an image is
+missing the installer lists it with the `docker load` hint: `--start` fails
+before changing anything, while a plain render only warns. Offline mode never
+contacts a registry or PyPI; SignalK/InfluxDB version bumps still need a new
+bundle. Image tarballs are covered by the manifest and the root-controlled path
+check but, unlike wheels, are not pinned by digest in the release (Compose images
+are tag-pinned).
+
+Online installs use the same lock (`--only-binary=:all: --require-hashes`), so
+the Python environment is the same hash-verified set either way. The lock lists
+Linux aarch64 and x86_64 wheels for Python 3.11-3.13; on another platform or
+architecture the install fails with a clear message instead of building from
+source. A release without `boat-chat/requirements.lock`, or a lock missing for
+an offline bundle build, is refused before anything changes.
+
+Maintainers: when `boat-chat/requirements.txt` changes, run
+`scripts/update-requirements-lock.sh` (needs network; `--python-version` and
+`--platform` select targets) and commit the regenerated lock. It is generated
+trust-on-first-use from PyPI: review the diff and compare the hashes with the
+digests PyPI publishes. `tests/test_requirements_lock.py` fails when the lock is
+stale. `scripts/deploy-chat.py` treats a changed `requirements.lock` like a
+changed `requirements.txt` and refuses the code-only deploy.
+
+`sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/bundle/wheelhouse vesselstackctl update /path/to/release`
+(the directory is always the first argument; the `--offline` flag form is also
+accepted by this release's `vesselstackctl`, but older installed `vesselstackctl`
+versions would read it as the directory, so the guided installer and the docs use the
+variable) passes
+`--offline` to both the preflight and the install of that release; any value other
+than `true`/`false` in `VESSELSTACK_OFFLINE` is rejected. Without the flag or
+variable the behaviour is unchanged apart from the hash-pinned lock. Rollback:
+restore the pre-update backup; to return to the previous behaviour revert this
+change (the lock file is inert for older releases).
 
 ## Stopping or removing services
 
@@ -1457,6 +1992,29 @@ persisted checkout credentials outside the repository Git configuration.
 External registry manifest checks retry short transport failures three times;
 missing Linux ARM64 support still fails the release gate.
 
+`tests/test-distribution.sh` runs `shellcheck` at full severity (including
+info-level findings) on the shell scripts it lists, and they currently pass
+with no findings. The style `A && B || handler` is avoided (SC2015); use
+`if ! { A && B; }; then ... fi` instead.
+Run local checks with `shellcheck -S info` (and default severity) over
+`install.sh`, `build-package.sh`, `scripts/*` and `tests/*.sh`, since CI does; a
+recent ShellCheck (0.11.0) and the Debian bookworm one (0.9.0) both report no
+findings.
+
+Root-controlled test fixtures (`tests/test-offline-install.sh`,
+`tests/test-update-launcher.sh`) are created under `/usr/local/share/vs-test`,
+not `/opt`: the product refuses root-used paths whose chain is not root-owned
+and group/world-writable-free, and GitHub runners ship `/opt` as mode 0777. The
+tests verify the whole base chain is root-controlled and fail clearly otherwise;
+the product check is unchanged. The directory is left empty after a run and can
+be removed with `sudo rmdir /usr/local/share/vs-test`.
+
+`tests/test-get-vesselstack.sh` simulates "Docker absent" by running the
+bootstrap under an isolated `PATH` made of its stubs and symlinks to every host
+tool except `docker*`, so the result no longer depends on whether the host (for
+example a GitHub runner) ships a real `docker` and Compose plugin. The product
+script gained no test hook.
+
 ```bash
 tests/test-distribution.sh
 sudo tests/test-lifecycle.sh
@@ -1468,6 +2026,11 @@ sudo tests/test-displays-mosquitto.sh
 sudo tests/test-displays-bridge.sh
 tests/test-displays-esphome-config.sh   # renders projects and runs the pinned ESPHome "config" (Docker, ~1.2 GB image)
 tests/compile-display-firmware.sh       # optional, not in CI: full "esphome compile" (~2 GB cache, 2-5 min)
+tests/test-build-package.sh
+tests/test-socketcan.sh
+sudo tests/test-offline-install.sh
+sudo tests/test-update-launcher.sh
+sudo tests/test-get-vesselstack.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -1479,11 +2042,34 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.3.0.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-1.4.0.tar.gz.sha256)
 ```
+
+The package is produced by `git archive` of the committed `HEAD`, so untracked
+or ignored files (`.venv`, `boat-chat/boat_facts.json`, env files, memory/data,
+logs) can never enter it, and uncommitted edits to tracked files are excluded
+(with a warning; `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` makes that an error). The
+tarball contains `COMMIT` and `BUILD_INFO` naming the exact source commit, and
+the build prints the sha256 and that commit. `tests/test-build-package.sh`
+proves private and untracked files are not packaged. Building outside a git
+checkout is refused.
 
 The checksum records only the archive basename, so the archive and `.sha256`
 file can be downloaded and verified together from any directory.
+
+`./build-package.sh` also writes `generated/get-vesselstack.sh` (the committed
+`scripts/get-vesselstack.sh` with this release's version baked in as the default)
+and `generated/get-vesselstack.sh.sha256`. A GitHub release must carry exactly
+four files: `vesselstack-<version>.tar.gz`, its `.sha256`, `get-vesselstack.sh`
+and `get-vesselstack.sh.sha256`; the quick-start URLs depend on those names. The
+checklist is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#release-checklist).
+`.github/workflows/release.yml` runs only when a `vX.Y.Z` tag is pushed (never on
+pull requests), re-runs the checks and creates a **draft** release with those
+files for the maintainer to review and publish.
+`sudo tests/test-get-vesselstack.sh` covers the bootstrap (checksum mismatch,
+truncated downloads and scripts, unsafe archives, existing-install detection,
+non-root refusal, `--help`, offline and `--no-wizard --config` flows) with fake
+`curl`/`apt-get`/`docker`/`systemctl` stubs.
 
 ## Documentation policy
 
@@ -1535,6 +2121,29 @@ and hardware-dependent commissioning limits.
 
 ## Current development improvements
 
+**Upgrade notes (secure defaults).** After upgrading, re-run the installer so it
+generates `BOAT_CHAT_ACCESS_TOKEN` and renders the new bind variables. Until it
+does, Boat Chat answers 401 to chat, status and data requests, and Compose
+publishes InfluxDB, Prometheus and MQTT on loopback. Reconnect each browser with
+**Connect** using the new token. External devices that publish to MQTT or
+InfluxDB over the LAN stop working until `VESSELSTACK_DATA_BIND_ADDRESS` is set
+to a trusted address. Settings writes lose the old private-LAN trust (use the
+settings token). Scoped read-only Influx tokens for Boat Chat and Grafana are
+not implemented (deferred: InfluxDB cannot be given a chosen token value, so a
+scoped token must be created after start and written back into the config and
+two services, which is fragile); both still use the admin token.
+
+**Verification.** `python3 -m unittest discover -s tests -p 'test_*.py'`,
+`tests/test-distribution.sh`, `curl -i -X POST http://127.0.0.1:8765/api/chat`
+(expect 401 without the token) and
+`docker compose --env-file /opt/vesselstack/config/vesselstack.env -f /opt/vesselstack/compose.yml config`
+(ports show `127.0.0.1:` for InfluxDB, Prometheus and MQTT).
+
+**Rollback.** Restore the previous release with the `vesselstack-update`
+rollback; to temporarily restore the old network exposure set
+`VESSELSTACK_DATA_BIND_ADDRESS="0.0.0.0"` and re-run the installer. The generated
+`BOAT_CHAT_ACCESS_TOKEN` line is harmless to older releases.
+
 The owner overview now distinguishes missing/stale readings and contradictory
 health indicators, displays observation age, refreshes periodically and retains
 explicitly outdated information during connection loss. Chat preserves per-answer
@@ -1544,8 +2153,8 @@ VesselStack's configured URLs, buckets, timezone and branding remain supported.
 
 Live status remains protected by a dedicated access token by default. Configure
 `BOAT_CHAT_ACCESS_TOKEN` in private Boat Chat settings before connecting the owner
-UI. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN=false` is an explicit opt-out for a reviewed,
-trusted installation; it is not the public default. Settings writes retain their
+UI. `BOAT_CHAT_ALLOW_OPEN=true` is an explicit opt-out for a reviewed, trusted
+installation; it is not the public default. Settings writes retain their
 separate protection. Integration settings survive provider-settings saves.
 
 Fuel economy now uses complete, finite, nonnegative fuel/RPM/speed observations
@@ -1569,24 +2178,124 @@ without touching infrastructure. Dependencies and database migrations remain
 separate reviewed work. Source facts now live in `boat_facts.example.json`; actual
 `boat_facts.json` and other operational data are ignored, not published.
 
+**Upgrade notes (secrets, readiness, retention, update trust).**
+
+- Re-running the installer no longer regenerates InfluxDB/Grafana/MQTT secrets;
+  the control panel shows the init-only ones as read-only (see "Rotating
+  secrets"). The Mosquitto password file is no longer truncated on every start.
+- `bootstrap-influx.sh` waits for InfluxDB health and treats list errors as
+  errors. The downsample task is updated once to the numeric-only version.
+- New installs keep 30 days of raw data. Existing buckets are unchanged unless
+  you set `INFLUXDB_RAW_RETENTION` (deletes older raw data; back up first).
+- `vesselstack-update` now verifies signatures with a root-controlled keyring
+  (`VERIFY_GNUPGHOME` / `VERIFY_ALLOWED_SIGNERS`). **Before the next update,
+  import the maintainer key there**, or verification fails (the checkout
+  owner's keyring is no longer consulted).
+- Legacy `boat-chat/{memory,data,boat-chat.env}` left under the code tree
+  because the new location already existed are moved to a root-only
+  `/var/lib/vesselstack/quarantine/boat-chat-legacy-<timestamp>.XXXXXX` directory
+  (see below) with a warning; nothing is deleted. Review, merge what you need and remove it.
+
+**Verification.** `python3 -m unittest discover -s tests -p 'test_*.py'`,
+`tests/test-distribution.sh`, `tests/test-clean-install.sh` and
+`tests/test-update-launcher.sh` (as root, on Linux),
+`vesselstackctl doctor` (disk line), and
+`docker exec vesselstack-influxdb influx bucket list` after `restart`.
+
+- The legacy quarantine moved out of the data tree: it is now
+  `/var/lib/vesselstack/quarantine/boat-chat-legacy-<timestamp>.XXXXXX` (root
+  0700, verified not to be a symlink), outside every service-writable path.
+  Quarantine directories that earlier 1.4.0 builds created in
+  `$VESSELSTACK_DATA` are moved there on the next install.
+- The installer now installs `vesselstack-update` (`/usr/local/sbin`) and its
+  helper (`/usr/local/libexec/vesselstack/deploy-chat.py`) root-owned; see
+  "One-command application updates" for the new root-only rules.
+
+**Rollback.** Install the previous release's scripts and re-run the installer;
+secrets are preserved either way. Unset `INFLUXDB_RAW_RETENTION` (deleted raw data
+is not recoverable; restore from backup if needed). A pre-existing downsample task
+can be left as is. For the update trust change set `ALLOW_UNSIGNED_SOURCE="true"`
+temporarily (home lab only) or import the key. The quarantine directory can be
+deleted once reviewed.
+
 ### One-command application updates
 
-Install the stable launcher and a private per-machine configuration once:
+`install.sh` installs the launcher (`/usr/local/sbin/vesselstack-update`) and the
+helper it runs (`/usr/local/libexec/vesselstack/deploy-chat.py`), both
+`root:root` mode 0755 in root-owned directories. **Bootstrap:** the first copy of
+the helper comes from running the installer once (`sudo ./install.sh --config ...`);
+until then the launcher refuses to run as root. New helper versions only arrive
+the same way, i.e. through a reviewed release installed by `install.sh` /
+`vesselstackctl update`, never from the update flow itself. Then create the
+private per-machine configuration once:
 
 ```bash
-sudo install -m 0755 scripts/vesselstack-update /usr/local/sbin/vesselstack-update
 sudo install -d -m 0755 /etc/vesselstack
 sudo install -m 0600 templates/update.env.example /etc/vesselstack/update.env
 sudoedit /etc/vesselstack/update.env
 ```
 
+As root the launcher enforces: (1) `update.env` and every parent directory up to
+`/` must be root-owned and not group/world-writable (the file is sourced as
+root), and it must not live inside `SOURCE_DIRECTORY`; (2) it executes **only**
+the installed helper, never `scripts/deploy-chat.py` from the checkout, and
+only if that file and its whole path chain are root-owned and not
+group/world-writable; (3) the helper itself also refuses to run as root from a
+location an unprivileged user controls (this includes calling a source-checkout
+copy directly with `sudo python3 .../scripts/deploy-chat.py`; use the installed
+copy). Home-lab development as a normal user (non-root) still works: the
+launcher then prefers `scripts/deploy-chat.py` from the checkout (falling back to
+the installed copy) and applies none of the root-ownership checks; the helper's
+own pull/verify/test logic is unchanged. Upgrade: run the installer once; the
+old manually installed launcher keeps working only after the helper exists.
+Rollback: reinstall the previous release (its installer places the previous
+launcher/helper); nothing else changes.
+
 Set the separate source/live paths and actual chat/Telegram unit names. After
 pushing changes to the source checkout's upstream branch, run on the boat:
 
 ```bash
-sudo vesselstack-update          # pull, test, preview; no service restart
-sudo vesselstack-update --apply  # pull, test, back up, apply and verify
+sudo vesselstack-update          # fetch, verify, test, preview; no service restart
+sudo vesselstack-update --apply  # same, then back up, apply and verify
 ```
+
+Trust model: pulled source is untrusted until verified. The launcher refuses to
+fetch unless the checkout's `origin` equals `EXPECTED_REMOTE_URL` (default
+`https://github.com/jclima/VesselStack.git`). **Root never runs `git archive` or
+`git verify-*` inside the checkout**, whose `.git/config` filters,
+`.git/info/attributes` and hooks the checkout owner controls. Instead root
+fetches the pinned remote's branches and tags into its **own root-owned bare
+mirror** (`UPDATE_MIRROR_DIR`, default `/var/lib/vesselstack/update-mirror`,
+mode 0700, fsck-checked fetch; without `--pull` the checkout's refs are imported
+into the mirror over file transport), requires the fetched commit there to have
+a valid signature (`git verify-commit`) or a validly signed tag
+(`git verify-tag`), and only then fast-forwards the checkout to that exact
+commit. Verification runs
+with a fixed configuration (`git -c core.hooksPath=/dev/null -c gpg.program=gpg`,
+system and global git config ignored, no repository-local overrides) against a
+**root-controlled** trust anchor, not the checkout owner's keyring:
+`VERIFY_GNUPGHOME` (a GNUPGHOME holding only the maintainer public key) or
+`VERIFY_ALLOWED_SIGNERS` (an SSH allowed-signers file) in `update.env`. When
+running as root, that path and its parents must be root-owned and not
+group/world-writable. After verification the tests and the deployed bytes both
+come from the verified commit object, exported **as raw blobs** from the mirror
+(`git ls-tree -r -z` + `git cat-file blob`; no `git archive`, so attributes,
+`export-subst`, filters and textconv cannot change bytes; symlinks, submodules,
+unsafe paths and modes other than 100644/100755 are refused) into a private tree
+the test user cannot write, not the working tree; HEAD, the clean state and the tree
+are re-checked after the tests and again just before apply, and any change aborts. `scripts/check-public-tree.py` and
+the unit tests run as the checkout owner via `runuser`, never as root; a
+root-owned checkout is refused. Import the maintainer signing key into that root-controlled keyring before first
+use, e.g. `sudo install -d -m 700 /etc/vesselstack/gnupg` then
+`sudo GNUPGHOME=/etc/vesselstack/gnupg gpg --import maintainer.asc`. Home-lab only: set `ALLOW_UNSIGNED_SOURCE="true"` in
+`/etc/vesselstack/update.env` to accept unsigned source (a warning is printed);
+do not enable it on a vessel others can push code to. The checkout owner can no longer
+change what root deploys after verification, because root deploys the verified
+commit's content. Upgrade note: 1.4.0 adds the mirror;
+no action is required (it is created on first run) but a root-owned,
+non-writable `/var/lib/vesselstack` path is enforced. Roll back
+by restoring a printed backup (below) or by setting `ALLOW_UNSIGNED_SOURCE`
+back to `false`.
 
 If Telegram code changes, an already-active configured worker also restarts;
 a stopped worker remains stopped. Restart units are saved in the backup receipt
@@ -1595,6 +2304,7 @@ and used during rollback. Restore a printed backup directory with
 
 These commands update Boat Chat Python/static assets. Dependencies, migrations,
 service definitions, dashboards and container/infrastructure changes require the
-separate reviewed release workflow. The launcher/config stay installed locally
-across Git pulls; reinstall the launcher deliberately when its interface changes.
+separate reviewed release workflow. The launcher, helper and config stay installed
+locally across Git pulls; they change only when you run a reviewed release's
+`install.sh` (the update flow never replaces its own helper).
 See [development/update details](docs/DEVELOPMENT.md).

@@ -57,7 +57,10 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
     cat > "$3/bin/pip" <<'PIP'
 #!/bin/bash
 printf '%s\n' "$*" >> "$(dirname "$0")/../pip.log"
-[ -z "${FAKE_PIP_FAIL:-}" ] || { echo "simulated: no route to pypi.org" >&2; exit 1; }
+# FAKE_PIP_FAIL=displays fails only the displays bridge requirements install.
+if [ -n "${FAKE_PIP_FAIL:-}" ] && { [ "$FAKE_PIP_FAIL" != displays ] || [[ "$*" == *displays* ]]; }; then
+    echo "simulated: no route to pypi.org" >&2; exit 1
+fi
 exit 0
 PIP
     chmod +x "$3/bin/pip"
@@ -110,6 +113,7 @@ BOAT_CHAT_PROVIDER="local"
 BOAT_CHAT_HOST="0.0.0.0"
 BOAT_CHAT_PORT="8765"
 BOAT_CHAT_SETTINGS_TOKEN="GENERATE"
+BOAT_CHAT_ACCESS_TOKEN="GENERATE"
 VESSELSTACK_UNTRUSTED_INTERFACE="wlan0"
 VESSELSTACK_FIREWALL_ENABLE="false"
 TELEGRAM_ENABLE="false"
@@ -138,6 +142,12 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 
 test -x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
+# The update launcher and the helper root executes are installed root-owned (0755)
+# in a root-owned directory chain, never run from a source checkout.
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update")" = "0:755"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py")" = "0:755"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack")" = "0:755"
+cmp "$REPO_ROOT/scripts/deploy-chat.py" "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-control-panel.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat-telegram.service"
@@ -178,8 +188,21 @@ grep -q '^DISPLAYS_BRIDGE_MQTT_USERNAME=vesselstack-bridge$' "$APP_ROOT/config/v
 test -s "$APP_ROOT/config/grafana/dashboards/system-health.json"
 test -s "$DATA_ROOT/homeassistant/blueprints/automation/vesselstack/low-battery.yaml"
 test -s "$DATA_ROOT/homeassistant/vesselstack-dashboard.example.yaml"
+# The data root is root-owned (service group, 0750); only leaf mount roots belong to
+# the accounts that write them.
+test "$(stat -c '%u:%a' "$DATA_ROOT")" = "0:750"
 test "$(stat -c '%u:%g' "$DATA_ROOT/influxdb")" = "1000:1000"
 test "$(stat -c '%u:%g' "$DATA_ROOT/grafana")" = "472:0"
+# Code, venv and generated facts are not writable by the service user; the
+# service user may write only under the state directory in the data tree.
+test "$(stat -c '%u' "$APP_ROOT/boat-chat")" = 0
+test "$(stat -c '%u' "$APP_ROOT/boat-chat/.venv")" = 0
+test "$(stat -c '%u:%a' "$APP_ROOT/boat-chat/boat_facts.json")" = "0:640"
+test -z "$(find "$APP_ROOT/boat-chat" -not -type l \( -perm -g=w -o -perm -o=w \) -print -quit)"
+test -d "$DATA_ROOT/boat-chat"
+grep -qx 'ProtectSystem=strict' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+grep -qx "ReadWritePaths=$DATA_ROOT/boat-chat" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+grep -qx "Environment=BOAT_CHAT_STATE_DIR=$DATA_ROOT/boat-chat" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-telemetry-indexer.service"
 grep -q 'Test Vessel Boat Chat' "$APP_ROOT/boat-chat/static/index.html"
 grep -q '^INFLUXDB_HISTORY_BUCKET=signalk_1m$' "$APP_ROOT/config/vesselstack.env"
 grep -q '^TELEGRAM_ENABLE=false$' "$APP_ROOT/config/vesselstack.env"
@@ -191,8 +214,12 @@ fi
 test "$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")" = 600
 test "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" = 600
 grep -Eq '^CONTROL_PANEL_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/control-panel.env"
-grep -qx '1.3.0' "$APP_ROOT/config/installed-version"
+grep -Eq '^BOAT_CHAT_ACCESS_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/boat-chat.env"
+grep -q '^VESSELSTACK_DATA_BIND_ADDRESS=127.0.0.1$' "$APP_ROOT/config/vesselstack.env"
+grep -qx "Environment=BOAT_CHAT_ENV=$DATA_ROOT/boat-chat/boat-chat.env" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+grep -qx "$(<"$REPO_ROOT/VERSION")" "$APP_ROOT/config/installed-version"
 
+access_token_before=$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
 panel_token_before=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")
 sed -i '/^BOAT_CHAT_PROVIDER=/d' "$APP_ROOT/config/boat-chat.env"
 printf '%s\n' 'BOAT_CHAT_PROVIDER=ollama' 'OPENAI_API_KEY=preserve-test-secret' \
@@ -204,6 +231,158 @@ grep -qx 'BOAT_CHAT_PROVIDER=ollama' "$APP_ROOT/config/boat-chat.env"
 grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
     "$panel_token_before"
+test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = \
+    "$access_token_before"
+
+# Every generated secret survives a re-render from the ORIGINAL example-style
+# config (which still says GENERATE): InfluxDB/Grafana/MQTT ignore changed
+# credentials after first start, so regenerating would desynchronise them.
+secret_keys=(INFLUXDB_PASSWORD INFLUXDB_TOKEN GRAFANA_ADMIN_PASSWORD MQTT_PASSWORD)
+declare -A secret_before=()
+for key in "${secret_keys[@]}"; do
+    secret_before[$key]=$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")
+    [[ "${secret_before[$key]}" =~ ^[a-f0-9]{64}$ ]] || { echo "$key was not generated" >&2; exit 1; }
+done
+influx_token_chat_before=$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
+settings_token_before=$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+for key in "${secret_keys[@]}"; do
+    test "$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")" = "${secret_before[$key]}"
+done
+test "$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$influx_token_chat_before"
+test "$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$settings_token_before"
+test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$access_token_before"
+test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = "$panel_token_before"
+if grep -R 'GENERATE' "$APP_ROOT/config"; then
+    echo "Re-render produced an ungenerated secret" >&2
+    exit 1
+fi
+
+# Retention: empty by default (no implicit change to existing buckets), validated.
+grep -q "^INFLUXDB_RAW_RETENTION=''\?$" "$APP_ROOT/config/vesselstack.env"
+BAD_RETENTION_CONFIG="$TEST_ROOT/bad-retention.env"
+cp "$CONFIG" "$BAD_RETENTION_CONFIG"
+printf '\nINFLUXDB_RAW_RETENTION="1y"\n' >> "$BAD_RETENTION_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$BAD_RETENTION_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted an invalid INFLUXDB_RAW_RETENTION" >&2
+    exit 1
+fi
+
+# Legacy runtime state that cannot be migrated (new path already exists) is moved
+# into a root-only quarantine outside the code tree, never left in place and
+# never deleted.
+install -d "$DATA_ROOT/boat-chat/memory" "$DATA_ROOT/boat-chat/data" \
+    "$APP_ROOT/boat-chat/memory" "$APP_ROOT/boat-chat/data"
+printf 'current\n' > "$DATA_ROOT/boat-chat/memory/current.txt"
+printf 'current\n' > "$DATA_ROOT/boat-chat/data/current.txt"
+printf 'OPENAI_API_KEY=current\n' > "$DATA_ROOT/boat-chat/boat-chat.env"
+printf 'legacy-memory\n' > "$APP_ROOT/boat-chat/memory/legacy.txt"
+printf 'legacy-data\n' > "$APP_ROOT/boat-chat/data/legacy.txt"
+printf 'OPENAI_API_KEY=legacy-secret\n' > "$APP_ROOT/boat-chat/boat-chat.env"
+chmod 0666 "$APP_ROOT/boat-chat/boat-chat.env"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null 2>"$TEST_ROOT/quarantine.stderr"
+grep -q 'moved legacy' "$TEST_ROOT/quarantine.stderr"
+test ! -e "$APP_ROOT/boat-chat/memory"
+test ! -e "$APP_ROOT/boat-chat/data"
+test ! -e "$APP_ROOT/boat-chat/boat-chat.env"
+QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
+quarantine=$(find "$QUARANTINE_ROOT" -maxdepth 1 -type d -name 'boat-chat-legacy-*' | head -n 1)
+test -n "$quarantine"
+test "$(stat -c '%u:%a' "$QUARANTINE_ROOT")" = "0:700"
+test "$(stat -c '%u:%a' "$quarantine")" = "0:700"
+# Never inside the service-writable data tree.
+test -z "$(find "$DATA_ROOT" -maxdepth 1 -name 'boat-chat-legacy-*' -print -quit)"
+grep -qx 'legacy-memory' "$quarantine/memory/legacy.txt"
+grep -qx 'legacy-data' "$quarantine/data/legacy.txt"
+grep -qx 'OPENAI_API_KEY=legacy-secret' "$quarantine/boat-chat.env"
+grep -qx 'current' "$DATA_ROOT/boat-chat/memory/current.txt"
+test -z "$(find "$APP_ROOT/boat-chat" -not -type l \( -perm -g=w -o -perm -o=w \) -print -quit)"
+
+# Non-root service user: ownership model, symlink refusal and quarantine relocation.
+# Needs a real second account, so it only runs as root where useradd exists.
+if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
+    svc="vsstest$$"
+    useradd --system --no-create-home --user-group --shell /usr/sbin/nologin "$svc"
+    trap 'rm -rf -- "$TEST_ROOT"; userdel "$svc" 2>/dev/null || true' EXIT
+    chmod 0755 "$TEST_ROOT"
+    svc_gid=$(id -g "$svc")
+    APP2="$TEST_ROOT/opt2/vesselstack"
+    DATA2="$TEST_ROOT/opt2/vesselstack-data"
+    CONFIG2="$TEST_ROOT/service-user.env"
+    VICTIM="$TEST_ROOT/victim"
+    install -d -m 0755 "$TEST_ROOT/opt2"
+    sed -e "s|^VESSELSTACK_USER=.*|VESSELSTACK_USER=\"$svc\"|" \
+        -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$APP2\"|" \
+        -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$DATA2\"|" "$CONFIG" > "$CONFIG2"
+    # shellcheck disable=SC2120  # Optional extra installer arguments.
+    install_two() {
+        env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+            "$REPO_ROOT/install.sh" --config "$CONFIG2" "$@"
+    }
+    # An upgrade from a release where the service user owned the data root and had
+    # planted a symlink: root must refuse before chowning through it.
+    install -d -m 0750 -o "$svc" -g "$svc" "$DATA2" "$VICTIM"
+    chown root:root "$VICTIM"
+    ln -s "$VICTIM" "$DATA2/grafana"
+    chown -h "$svc:$svc" "$DATA2/grafana"
+    if install_two >/dev/null 2>"$TEST_ROOT/symlink.stderr"; then
+        echo "Installer followed a service-planted symlink" >&2
+        exit 1
+    fi
+    grep -q 'is a symlink' "$TEST_ROOT/symlink.stderr"
+    test "$(stat -c '%u:%g' "$VICTIM")" = "0:0"
+    rm -f -- "$DATA2/grafana"
+    install_two >/dev/null
+    test "$(stat -c '%u:%g:%a' "$DATA2")" = "0:$svc_gid:750"
+    test "$(stat -c '%u:%g' "$DATA2/influxdb")" = "1000:1000"
+    test "$(stat -c '%u:%g' "$DATA2/grafana")" = "472:0"
+    test "$(stat -c '%U' "$DATA2/boat-chat")" = "$svc"
+    test "$(stat -c '%u' "$DATA2/homeassistant")" = 0
+    # The service user can write its state directory but cannot create, rename or
+    # replace anything directly under the data root.
+    runuser -u "$svc" -- touch "$DATA2/boat-chat/state-write-test"
+    if runuser -u "$svc" -- touch "$DATA2/planted" 2>/dev/null; then
+        echo "Service user can create entries in the data root" >&2
+        exit 1
+    fi
+    if runuser -u "$svc" -- mv "$DATA2/boat-chat" "$DATA2/boat-chat.moved" 2>/dev/null; then
+        echo "Service user can rename a managed data entry" >&2
+        exit 1
+    fi
+    # A managed intermediate directory that is not root-owned is refused, not followed.
+    chown "$svc:$svc" "$DATA2/homeassistant"
+    if install_two >/dev/null 2>"$TEST_ROOT/owner.stderr"; then
+        echo "Installer wrote through a service-owned intermediate directory" >&2
+        exit 1
+    fi
+    grep -q 'must be owned by root' "$TEST_ROOT/owner.stderr"
+    chown root:root "$DATA2/homeassistant"
+    # Quarantine directories created in the data tree by earlier builds move out of it.
+    install -d -m 0700 "$DATA2/boat-chat-legacy-earlier.ABC123"
+    printf 'old\n' > "$DATA2/boat-chat-legacy-earlier.ABC123/file"
+    # A dangling symlink planted at a migration destination is never followed.
+    install -d "$APP2/boat-chat/memory"
+    printf 'legacy\n' > "$APP2/boat-chat/memory/legacy.txt"
+    ln -s "$TEST_ROOT/not-created" "$DATA2/boat-chat/memory"
+    install_two >/dev/null 2>"$TEST_ROOT/relocate.stderr"
+    test ! -e "$DATA2/boat-chat-legacy-earlier.ABC123"
+    test -f "$QUARANTINE_ROOT/boat-chat-legacy-earlier.ABC123/file"
+    test ! -e "$TEST_ROOT/not-created"
+    test ! -e "$APP2/boat-chat/memory"
+    grep -q 'moved legacy' "$TEST_ROOT/relocate.stderr"
+    # A symlinked quarantine root is refused.
+    rm -rf -- "$QUARANTINE_ROOT"
+    ln -s "$VICTIM" "$QUARANTINE_ROOT"
+    install -d "$APP2/boat-chat/memory"
+    if install_two >/dev/null 2>&1; then
+        echo "Installer accepted a symlinked quarantine root" >&2
+        exit 1
+    fi
+    rm -f -- "$QUARANTINE_ROOT"
+fi
 
 # A render-only re-run keeps the broker's ACL and passwords in sync without
 # touching the broker-writable data directory.
@@ -345,7 +524,7 @@ sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$OFF_APP\"|" \
     -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$TEST_ROOT/o/opt/vesselstack-data\"|" \
     -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/o-backups\"|" "$CONFIG" > "$OFF_CONFIG"
 printf 'DISPLAYS_ENABLE="true"\n' >> "$OFF_CONFIG"
-if env FAKE_PIP_FAIL=1 PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+if env FAKE_PIP_FAIL=displays PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$OFF_CONFIG" >"$TEST_ROOT/offline.out" 2>&1; then
     echo "install.sh succeeded although pip failed" >&2
     exit 1

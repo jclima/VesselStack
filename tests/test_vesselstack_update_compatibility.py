@@ -25,6 +25,27 @@ class UpdateCompatibilityTests(unittest.TestCase):
             self.assertIn('INFLUXDB_TOKEN=fixture-only-token',text)
             self.assertIn('SIGNALK_URL=http://signalk.test:3000',text)
 
+    def test_executable_paths_are_not_http_or_settings_file_settable(self):
+        for key in ('BOAT_CHAT_CODEX_BIN','BOAT_CHAT_CLAUDE_BIN'):
+            self.assertNotIn(key,app.SETTING_KEYS)
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'chat.env'
+            with mock.patch.object(app,'ENV_CONFIG',path):
+                app.update_settings({'BOAT_CHAT_CODEX_BIN':'/tmp/evil','BOAT_CHAT_CLAUDE_BIN':'/tmp/evil','BOAT_CHAT_PROVIDER':'local'})
+                text=path.read_text()
+                path.write_text(text+'BOAT_CHAT_CODEX_BIN=/tmp/evil\n')
+                self.assertNotIn('BOAT_CHAT_CODEX_BIN',app.parse_env_config())
+            self.assertNotIn('/tmp/evil',text)
+
+    def test_runtime_paths_follow_state_directory_override(self):
+        code=('import sys;sys.path.insert(0,"boat-chat");import memory_index,telemetry_cache,app,telegram_bot;'
+              'print(memory_index.db_path());print(telemetry_cache.power_db_path());print(app.ENV_CONFIG);print(telegram_bot.STATE_DIR);print(telegram_bot.ENV_CONFIG)')
+        root=Path(__file__).resolve().parents[1]
+        env={k:v for k,v in os.environ.items() if k not in ('BOAT_CHAT_MEMORY_DB','BOAT_CHAT_POWER_DB')}
+        env['BOAT_CHAT_STATE_DIR']='/var/state/boat'
+        out=subprocess.run(['python3','-c',code],cwd=root,env=env,text=True,capture_output=True,check=True).stdout.split()
+        self.assertEqual(out,['/var/state/boat/memory/boat_memory.sqlite','/var/state/boat/data/power_tracking.sqlite','/var/state/boat/boat-chat.env','/var/state/boat/memory','/var/state/boat/boat-chat.env'])
+
     def test_economy_query_uses_configured_bucket(self):
         with mock.patch.object(app,'INFLUX_HISTORY_BUCKET','fixture_history'),mock.patch.object(app,'query_influx',return_value=[]) as query,mock.patch.object(app.telemetry_cache,'put_summary'):
             app.fuel_economy_summary(use_cache=False)

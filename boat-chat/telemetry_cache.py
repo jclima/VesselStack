@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import memory_index
 
 
-DEFAULT_POWER_DB_PATH = memory_index.ROOT / "data" / "power_tracking.sqlite"
+DEFAULT_POWER_DB_PATH = memory_index.STATE_DIR / "data" / "power_tracking.sqlite"
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 POWER_MAX_GAP_SECONDS = 15 * 60
 

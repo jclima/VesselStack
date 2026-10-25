@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Reused by release.yml so a release runs exactly the suites CI runs.
+  workflow_call:
 
 permissions:
   contents: read
@@ -13,7 +15,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
       - name: Require README update
@@ -31,7 +33,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install validation tools
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Public-source privacy check
@@ -44,6 +46,16 @@ jobs:
         run: tests/test-migrations.sh
       - name: Clean installation checks
         run: sudo tests/test-clean-install.sh
+      - name: Offline and transactional install checks
+        run: sudo tests/test-offline-install.sh
+      - name: Update launcher root-trust checks
+        run: sudo tests/test-update-launcher.sh
+      - name: Guided bootstrap (get-vesselstack.sh) checks
+        run: sudo tests/test-get-vesselstack.sh
+      - name: SocketCAN unit rendering checks
+        run: tests/test-socketcan.sh
+      - name: Release package content checks
+        run: tests/test-build-package.sh
       - name: Validate Compose configuration
         run: docker compose --env-file vesselstack.example.env -f templates/compose.yml config --quiet
       - name: Validate optional Compose profiles
@@ -52,20 +64,18 @@ jobs:
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Run control panel tests
-        run: python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
-      - name: Run installation wizard tests
-        run: python3 -m unittest discover -s tests -p 'test_wizard.py' -v
       - name: Build and verify release archive
         run: |
           ./build-package.sh
           (cd generated && sha256sum -c vesselstack-$(cat ../VERSION).tar.gz.sha256)
           test "$(awk '{print $2}' generated/vesselstack-$(cat VERSION).tar.gz.sha256)" = "vesselstack-$(cat VERSION).tar.gz"
+          (cd generated && sha256sum -c get-vesselstack.sh.sha256)
+          grep -qx "DEFAULT_VERSION=\"$(cat VERSION)\"" generated/get-vesselstack.sh
 
   service-integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Start and verify observability services
         run: tests/test-service-integration.sh
       - name: Verify Mosquitto ACL and display accounts

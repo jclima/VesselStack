@@ -10,12 +10,17 @@ CONFIG_FILE="$SCRIPT_DIR/vesselstack.env"
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
+LIBEXEC_PARENT="$SYSTEM_ROOT/usr/local/libexec"
+LIBEXEC_DIR="$LIBEXEC_PARENT/vesselstack"
 RELEASES_DIR="$SYSTEM_ROOT/var/lib/vesselstack/releases"
 START=0
 DRY_RUN=0
+OFFLINE=${VESSELSTACK_OFFLINE:-false}
 
 usage() {
-    echo "Usage: sudo ./install.sh [--config FILE] [--dry-run] [--start]"
+    echo "Usage: sudo ./install.sh [--config FILE] [--dry-run] [--start] [--offline]"
+    echo "  --offline  No network: install Python packages from VESSELSTACK_WHEELHOUSE and"
+    echo "             require container images to be loaded already (see README, Offline install)"
 }
 
 while [ $# -gt 0 ]; do
@@ -23,6 +28,7 @@ while [ $# -gt 0 ]; do
         --config) CONFIG_FILE=$2; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --start) START=1; shift ;;
+        --offline) OFFLINE=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
     esac
@@ -51,14 +57,20 @@ source "$CONFIG_FILE"
 : "${SOCKETCAN_ENABLE:=false}"
 : "${SOCKETCAN_INTERFACE:=can0}"
 : "${SOCKETCAN_BITRATE:=250000}"
+: "${VESSELSTACK_CAN_CREATE_VCAN:=false}"
 : "${AIS_ENABLE:=false}"
 : "${AIS_IMAGE:=ghcr.io/jvde-github/ais-catcher:v0.70}"
 : "${AIS_DEVICE:=/dev/bus/usb}"
 : "${AIS_CATCHER_ARGS:=-q -N 8100 -S 5011}"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
+: "${VESSELSTACK_FIREWALL_STRICT:=false}"
+: "${VESSELSTACK_FIREWALL_ALLOW_TCP=22}"
+: "${VESSELSTACK_FIREWALL_ALLOW_UDP=}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
 : "${BOAT_CHAT_HOST:=0.0.0.0}"
+: "${VESSELSTACK_DATA_BIND_ADDRESS:=127.0.0.1}"
+: "${VESSELSTACK_WEB_BIND_ADDRESS:=0.0.0.0}"
 : "${BOAT_CHAT_PORT:=8765}"
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
@@ -66,6 +78,15 @@ source "$CONFIG_FILE"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
 : "${DISPLAYS_SIGNALK_TOKEN:=}"
+# Empty = unset: fresh InfluxDB setups get 30d on the raw bucket; existing buckets
+# are never changed unless a value is set explicitly (see README).
+: "${INFLUXDB_RAW_RETENTION:=}"
+
+: "${VESSELSTACK_WHEELHOUSE:=$SCRIPT_DIR/offline/wheelhouse}"
+case "$OFFLINE" in
+    true|false) ;;
+    *) echo "VESSELSTACK_OFFLINE must be true or false" >&2; exit 1 ;;
+esac
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -75,6 +96,11 @@ done
 
 case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
     *" "*) echo "Install paths cannot contain spaces" >&2; exit 1 ;;
+esac
+case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
+    /home/*|*:/home/*|/root/*|*:/root/*)
+        echo "VESSELSTACK_ROOT and VESSELSTACK_DATA cannot be under /home or /root (services use ProtectHome=true)" >&2
+        exit 1 ;;
 esac
 case "$BOAT_NAME" in
     *[!A-Za-z0-9_.\ -]*) echo "BOAT_NAME may contain letters, numbers, spaces, dot, underscore, and hyphen" >&2; exit 1 ;;
@@ -89,7 +115,12 @@ case "$INFLUXDB_CONTAINER_NAME" in
         exit 1
         ;;
 esac
-for key in SOCKETCAN_ENABLE AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE \
+if [ -n "$INFLUXDB_RAW_RETENTION" ] && \
+    ! [[ "$INFLUXDB_RAW_RETENTION" =~ ^(0|[1-9][0-9]{0,4}[hdw])$ ]]; then
+    echo "INFLUXDB_RAW_RETENTION must be empty, 0 (keep forever), or a duration such as 720h, 30d or 8w" >&2
+    exit 1
+fi
+for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
     TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE; do
     case "${!key}" in
         true|false) ;;
@@ -108,6 +139,12 @@ if [[ "$DISPLAYS_SIGNALK_TOKEN" =~ [[:cntrl:]] ]]; then
     echo "DISPLAYS_SIGNALK_TOKEN must not contain line breaks or control characters" >&2
     exit 1
 fi
+for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
+    [[ "${!key}" =~ ^([0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*)?$ ]] || {
+        echo "$key must be comma-separated ports or LOW:HIGH ranges, e.g. 22,5000:5100" >&2
+        exit 1
+    }
+done
 for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
     CONTROL_PANEL_PORT; do
@@ -120,7 +157,8 @@ for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
         exit 1
     fi
 done
-for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST; do
+for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST VESSELSTACK_DATA_BIND_ADDRESS \
+    VESSELSTACK_WEB_BIND_ADDRESS; do
     python3 - "${!key}" <<'PY' || { echo "$key must be an IPv4 address" >&2; exit 1; }
 import ipaddress
 import sys
@@ -200,10 +238,17 @@ if [ "$SIGNALK_MODE" = native ]; then
     }
 fi
 if [ "$SOCKETCAN_ENABLE" = true ]; then
-    [ -e "/sys/class/net/$SOCKETCAN_INTERFACE" ] || {
-        echo "SocketCAN interface not detected: $SOCKETCAN_INTERFACE" >&2
-        exit 1
-    }
+    case "$SOCKETCAN_INTERFACE" in
+        can[0-9]*|vcan[0-9]*) ;;
+        *) echo "SOCKETCAN_INTERFACE must look like can0 or vcan0" >&2; exit 1 ;;
+    esac
+    # A virtual interface may be created on demand (home-lab replay).
+    if ! { [ "$VESSELSTACK_CAN_CREATE_VCAN" = true ] && [[ "$SOCKETCAN_INTERFACE" == vcan* ]]; }; then
+        [ -e "${VESSELSTACK_SYS_CLASS_NET:-/sys/class/net}/$SOCKETCAN_INTERFACE" ] || {
+            echo "SocketCAN interface not detected: $SOCKETCAN_INTERFACE" >&2
+            exit 1
+        }
+    fi
 fi
 if [ "$AIS_ENABLE" = true ]; then
     [ -e "$AIS_DEVICE" ] || { echo "AIS device not detected: $AIS_DEVICE" >&2; exit 1; }
@@ -224,6 +269,72 @@ if [ "$SIGNALK_MODE" = existing ]; then
     }
 fi
 
+# Everything that can fail for lack of a network, an image, a wheel or a supported
+# upgrade path is checked here, before any installed file is touched.
+if ! "$SCRIPT_DIR/scripts/migrate.sh" --check "$CONFIG_FILE" "$(<"$SCRIPT_DIR/VERSION")"; then
+    echo "Preflight failed: this release cannot be installed over the current installation (see above). Nothing was changed." >&2
+    exit 1
+fi
+compose_template() {
+    SIGNALK_VERSION=$SIGNALK_VERSION AIS_IMAGE=$AIS_IMAGE \
+        docker compose "${COMPOSE_PROFILES[@]}" --env-file "$CONFIG_FILE" \
+        -f "$SCRIPT_DIR/templates/compose.yml" "$@"
+}
+compose_template config --quiet 2>/dev/null || {
+    echo "Compose template validation failed for this configuration:" >&2
+    compose_template config --quiet >&2 || true
+    exit 1
+}
+# Python packages are only ever installed from the hash-pinned lock shipped in the
+# release (pip --require-hashes, wheels only), online and offline.
+PIP_LOCK="$SOURCE_ROOT/boat-chat/requirements.lock"
+[ -s "$PIP_LOCK" ] || {
+    echo "Missing $PIP_LOCK: the hash-pinned requirements lock must ship with the release (maintainers: scripts/update-requirements-lock.sh). Nothing was changed." >&2
+    exit 1
+}
+if [ "$OFFLINE" = true ] && [ "$DISPLAYS_ENABLE" = true ] \
+    && [ ! -x "$VESSELSTACK_ROOT/displays/.venv/bin/python" ]; then
+    echo "Offline install: the displays bridge dependencies (displays/requirements.txt) are not part of the offline bundle yet. Install them once while online (run the installer without --offline), or set DISPLAYS_ENABLE=false. Nothing was changed." >&2
+    exit 1
+fi
+if [ "$OFFLINE" = true ]; then
+    [ -n "$(find "$VESSELSTACK_WHEELHOUSE" -maxdepth 1 -name '*.whl' -print -quit 2>/dev/null)" ] || {
+        echo "Offline install: no Python wheels found in VESSELSTACK_WHEELHOUSE=$VESSELSTACK_WHEELHOUSE" >&2
+        echo "Build the bundle on a connected machine with scripts/prepare-offline-bundle.sh and copy it here." >&2
+        exit 1
+    }
+    # The wheelhouse must be <bundle>/wheelhouse of a bundle that verifies against this
+    # release (manifest, lock hash, wheel hashes, no unlisted files; root-owned when
+    # running as root). pip then reads exactly the verified directory.
+    VESSELSTACK_WHEELHOUSE=$(readlink -f -- "$VESSELSTACK_WHEELHOUSE")
+    [ "$(basename -- "$VESSELSTACK_WHEELHOUSE")" = wheelhouse ] || {
+        echo "Offline install: VESSELSTACK_WHEELHOUSE must be the wheelhouse/ directory of an offline bundle" >&2
+        exit 1
+    }
+    "$SCRIPT_DIR/scripts/prepare-offline-bundle.sh" --verify "$(dirname -- "$VESSELSTACK_WHEELHOUSE")" >/dev/null || {
+        echo "Offline install: the offline bundle did not verify; refusing to install from it. Nothing was changed." >&2
+        exit 1
+    }
+    mapfile -t required_images < <(
+        compose_template config --images | sort -u
+    )
+    missing_images=()
+    for image in "${required_images[@]}"; do
+        docker image inspect "$image" >/dev/null 2>&1 || missing_images+=("$image")
+    done
+    if [ "${#missing_images[@]}" -gt 0 ]; then
+        {
+            echo "Offline install: these container images are not present locally:"
+            printf '  %s\n' "${missing_images[@]}"
+            echo "Load them from the offline bundle first, for example:"
+            echo "  sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle"
+            echo "(or: docker load -i <bundle>/images/<name>.tar for each image)"
+        } >&2
+        # Rendering configuration does not need images; starting services does.
+        if [ "$START" -eq 1 ]; then exit 1; fi
+        echo "WARNING: load the images before running with --start or starting services." >&2
+    fi
+fi
 # Everything the MQTT access sync would reject is checked here, read-only and
 # before anything is changed, so a dry run (and "vesselstackctl update", which
 # runs one before taking a backup) fails early instead of partway through.
@@ -239,9 +350,11 @@ displays_preflight() {
         --root "$VESSELSTACK_ROOT" --compose "$MOSQUITTO_COMPOSE" "$@"
 }
 
+
 if [ "$DRY_RUN" -eq 1 ]; then
     displays_preflight --check-image
     echo "Preflight passed"
+    [ "$OFFLINE" = true ] && echo "Offline mode: Python packages from $VESSELSTACK_WHEELHOUSE, no image pulls"
     echo "Would install to $VESSELSTACK_ROOT with data in $VESSELSTACK_DATA"
     echo "SignalK mode: $SIGNALK_MODE ($SIGNALK_URL)"
     exit 0
@@ -252,6 +365,25 @@ fi
 # any file is changed, so an offline boat fails here with nothing touched.
 displays_preflight --pull-image
 install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
+
+# Transactional ordering: the network/package-dependent step runs FIRST, into a
+# staging virtualenv. Only when it succeeds is anything else rewritten, and the
+# staged venv is swapped in later. A failed (or offline) run therefore changes
+# nothing: no env, units, code or installed-version are touched.
+install -d -m 0755 "$VESSELSTACK_ROOT"
+STAGING_DIR=$(mktemp -d "$VESSELSTACK_ROOT/.venv-staging.XXXXXX")
+trap 'rm -rf -- "$STAGING_DIR"' EXIT
+STAGING_VENV="$STAGING_DIR/venv"
+pip_args=(install --disable-pip-version-check --only-binary=:all: --require-hashes)
+if [ "$OFFLINE" = true ]; then
+    pip_args+=(--no-index --find-links "$VESSELSTACK_WHEELHOUSE")
+fi
+if ! python3 -m venv "$STAGING_VENV" \
+    || ! "$STAGING_VENV/bin/pip" "${pip_args[@]}" -r "$PIP_LOCK"; then
+    echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable, and is there a wheel in boat-chat/requirements.lock for this platform? use --offline with a prepared bundle)")." >&2
+    echo "Nothing was changed on this system." >&2
+    exit 1
+fi
 
 # Only boats that opt in need the extra network download. It runs before
 # anything is rendered, so an offline boat fails here with the installation
@@ -272,40 +404,204 @@ generate_secret() {
     fi
 }
 
-# Preserve generated administration tokens across re-renders when the installed
-# configuration, rather than the original example file, is used as input.
-if [ "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE}" = GENERATE ] && \
-    [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
-    BOAT_CHAT_SETTINGS_TOKEN=$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' \
-        "$VESSELSTACK_ROOT/config/boat-chat.env" | tail -n 1)
-fi
-if [ "${CONTROL_PANEL_TOKEN:-GENERATE}" = GENERATE ] && \
-    [ -r "$VESSELSTACK_ROOT/config/control-panel.env" ]; then
-    CONTROL_PANEL_TOKEN=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' \
-        "$VESSELSTACK_ROOT/config/control-panel.env" | tail -n 1)
-fi
+# Preserve EVERY generated secret across re-renders. When the input config says
+# GENERATE (or leaves a secret empty, e.g. a fresh copy of the example file used
+# to upgrade an installed system) the value already installed wins. InfluxDB and
+# Grafana only read their initial credentials on first start and Mosquitto's
+# password file is keyed to MQTT_PASSWORD, so regenerating any of them would
+# silently desynchronise the config from the running services.
+installed_env="$VESSELSTACK_ROOT/config/vesselstack.env"
+installed_value() {
+    # Prints the installed value of $1 from the root-owned, mode-600 config.
+    [ -r "$installed_env" ] || return 0
+    (
+        set +u
+        unset "$1"
+        # shellcheck disable=SC1090
+        source "$installed_env" >/dev/null 2>&1 || exit 0
+        value=${!1:-}
+        [ "$value" = GENERATE ] || printf '%s' "$value"
+    )
+}
+preserve_secret() {
+    # $2 optionally names a fallback app env file. Those files are writable by
+    # the service user, so only plain hex-like values are accepted from them and
+    # they are never evaluated.
+    local key=$1 file=${2:-} current=${!1:-GENERATE} kept=
+    if [ -n "$current" ] && [ "$current" != GENERATE ]; then
+        return 0
+    fi
+    kept=$(installed_value "$key")
+    if [ -z "$kept" ] && [ -n "$file" ] && [ -r "$file" ]; then
+        kept=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
+        [[ "$kept" =~ ^[A-Za-z0-9._-]+$ ]] || kept=
+        [ "$kept" != GENERATE ] || kept=
+    fi
+    if [ -n "$kept" ]; then
+        printf -v "$key" '%s' "$kept"
+    fi
+}
+preserve_secret INFLUXDB_PASSWORD
+preserve_secret INFLUXDB_TOKEN
+preserve_secret GRAFANA_ADMIN_PASSWORD
+preserve_secret MQTT_PASSWORD
+preserve_secret BOAT_CHAT_SETTINGS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
+preserve_secret BOAT_CHAT_ACCESS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
+preserve_secret CONTROL_PANEL_TOKEN "$VESSELSTACK_ROOT/config/control-panel.env"
 
 INFLUXDB_PASSWORD=$(generate_secret "${INFLUXDB_PASSWORD:-GENERATE}")
 INFLUXDB_TOKEN=$(generate_secret "${INFLUXDB_TOKEN:-GENERATE}")
 GRAFANA_ADMIN_PASSWORD=$(generate_secret "${GRAFANA_ADMIN_PASSWORD:-GENERATE}")
 BOAT_CHAT_SETTINGS_TOKEN=$(generate_secret "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE}")
+BOAT_CHAT_ACCESS_TOKEN=$(generate_secret "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}")
 CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 
+# Ownership model for VESSELSTACK_DATA: the directory itself and every managed
+# intermediate component is ROOT-owned and not writable by the service user, so the
+# service user can never rename, replace or symlink an entry that root later
+# creates, chowns or writes through (no check-then-use race). Only the leaf mount
+# roots are owned by the account that must write them (InfluxDB uid 1000, Grafana
+# uid 472, the service user for boat-chat and native SignalK state).
+fail_data_path() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+safe_data_path() {
+    # $1: path under VESSELSTACK_DATA. Every existing component must be a real
+    # directory/file (never a symlink) and, except an optional leaf, root-owned and
+    # not group/world-writable. Mode "leaf" lets the final component exist with any
+    # owner (a service-owned mount root) but still never as a symlink.
+    local path=$1 mode=${2:-strict} current=$VESSELSTACK_DATA part owner perms index=0 count
+    local rest=${path#"$VESSELSTACK_DATA"}
+    local -a parts
+    IFS=/ read -ra parts <<<"${rest#/}"
+    count=${#parts[@]}
+    for part in "${parts[@]}"; do
+        index=$((index + 1))
+        [ -n "$part" ] || continue
+        current=$current/$part
+        [ -e "$current" ] || [ -L "$current" ] || return 0
+        [ ! -L "$current" ] || fail_data_path "$current is a symlink inside the data directory; remove it and rerun"
+        if [ "$index" -eq "$count" ] && [ "$mode" = leaf ]; then
+            continue
+        fi
+        owner=$(stat -c %u "$current")
+        perms=$(stat -c %a "$current")
+        if [ "$owner" != 0 ] || [ $((8#$perms & 8#022)) -ne 0 ]; then
+            fail_data_path "$current must be owned by root and not group/world-writable (found uid $owner mode $perms); fix with: chown root:root '$current' && chmod go-w '$current'"
+        fi
+    done
+}
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
     "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
-install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA"
+[ ! -L "$VESSELSTACK_DATA" ] || fail_data_path "$VESSELSTACK_DATA is a symlink"
+# Take the data root away from the service user FIRST (upgrades from releases where
+# it was service-owned): it stays traversable by the service group but is not
+# writable. Entries planted before this point are rejected by the checks below.
+install -d -m 0750 -o root -g "$VESSELSTACK_GID" "$VESSELSTACK_DATA"
+for managed in influxdb grafana boat-chat signalk mosquitto; do
+    safe_data_path "$VESSELSTACK_DATA/$managed" leaf
+done
 # Official images run their data processes as these fixed container users.
 # Change only the mount root itself; never recursively rewrite existing data.
 install -d -m 0750 -o 1000 -g 1000 "$VESSELSTACK_DATA/influxdb"
 install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
+# Code and the Python virtualenv are root-owned; the service user may only write
+# under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
+BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
+install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
+# Quarantined legacy state lives OUTSIDE every service-writable tree.
+QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
+ensure_quarantine_root() {
+    [ ! -L "$QUARANTINE_ROOT" ] || fail_data_path "$QUARANTINE_ROOT is a symlink"
+    install -d -m 0700 -o root -g root "$QUARANTINE_ROOT"
+    python3 - "$QUARANTINE_ROOT" <<'PY' || fail_data_path "$QUARANTINE_ROOT must be a root-owned directory with mode 0700 (not a symlink)"
+import os
+import stat
+import sys
+
+info = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+    raise SystemExit(1)
+PY
+}
+LEGACY_QUARANTINE=
+quarantine_legacy() {
+    # Legacy runtime state that cannot be migrated is moved (never deleted) into a
+    # root-only directory outside the code tree and outside the service-writable
+    # data tree, so nothing sensitive stays readable or replaceable by the service user.
+    local old=$1
+    if [ -z "$LEGACY_QUARANTINE" ]; then
+        ensure_quarantine_root
+        LEGACY_QUARANTINE=$(mktemp -d "$QUARANTINE_ROOT/boat-chat-legacy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+        chmod 0700 "$LEGACY_QUARANTINE"
+    fi
+    mv -- "$old" "$LEGACY_QUARANTINE/"
+    echo "WARNING: moved legacy $old to $LEGACY_QUARANTINE (root-only); review and merge manually, then remove it" >&2
+}
+# Earlier 1.4.0 builds created quarantine directories inside the data tree.
+for earlier_quarantine in "$VESSELSTACK_DATA"/boat-chat-legacy-*; do
+    if [ -d "$earlier_quarantine" ] && [ ! -L "$earlier_quarantine" ]; then
+        ensure_quarantine_root
+        mv -- "$earlier_quarantine" "$QUARANTINE_ROOT/"
+        echo "WARNING: moved earlier quarantine $earlier_quarantine to $QUARANTINE_ROOT/ (it sat in a service-writable tree; treat its contents as untrusted)" >&2
+    fi
+done
+migrate_runtime_path() {
+    local name=$1 old="$VESSELSTACK_ROOT/boat-chat/$1" new="$BOAT_CHAT_STATE/$1" stage
+    if [ -L "$old" ]; then
+        rm -f -- "$old"
+        return 0
+    fi
+    [ -e "$old" ] || return 0
+    if [ -e "$new" ] || [ -L "$new" ]; then
+        quarantine_legacy "$old"
+        return 0
+    fi
+    # The state directory is writable by the service user, so copy and chown in a
+    # root-only staging directory and publish with rename(2), which never follows a
+    # symlink planted at the destination.
+    stage=$(mktemp -d "$VESSELSTACK_DATA/.migrate.XXXXXX")
+    cp -a -- "$old" "$stage/$name"
+    chown -hR "$VESSELSTACK_USER:$VESSELSTACK_USER" "$stage/$name"
+    if mv -T -- "$stage/$name" "$new" 2>/dev/null; then
+        rm -rf -- "$stage" "$old"
+    else
+        rm -rf -- "$stage"
+        quarantine_legacy "$old"
+    fi
+}
+if [ -e "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -e "$VESSELSTACK_ROOT/boat-chat/data" ] \
+    || [ -e "$VESSELSTACK_ROOT/boat-chat/boat-chat.env" ] \
+    || [ -L "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -L "$VESSELSTACK_ROOT/boat-chat/data" ]; then
+    # Quiesce writers so SQLite files are not copied mid-write.
+    systemctl stop vesselstack-chat.service vesselstack-chat-telegram.service \
+        vesselstack-telemetry-indexer.service 2>/dev/null || true
+    for runtime_name in memory data boat-chat.env; do
+        migrate_runtime_path "$runtime_name"
+    done
+fi
 tar -C "$SOURCE_ROOT/boat-chat" \
     --exclude=boat-chat.env --exclude=.venv --exclude=memory --exclude=data \
     --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/boat-chat" -xf -
+# Discard any previously service-writable virtualenv, swap in the staged one
+# (built above, root-owned) and take ownership of all application code before
+# root ever executes anything from it. Same filesystem, so the move is a rename;
+# scripts that embedded the staging path are rewritten to the final path.
+rm -rf -- "$VESSELSTACK_ROOT/boat-chat/.venv"
+mv -- "$STAGING_VENV" "$VESSELSTACK_ROOT/boat-chat/.venv"
+grep -rlIF -- "$STAGING_VENV" "$VESSELSTACK_ROOT/boat-chat/.venv" 2>/dev/null \
+    | while IFS= read -r relocated; do
+        sed -i "s|$STAGING_VENV|$VESSELSTACK_ROOT/boat-chat/.venv|g" "$relocated"
+    done || true
+chown -hR root:root "$VESSELSTACK_ROOT/boat-chat"
+# The service user must be able to read and execute the venv but never write it.
+chmod -R go-w,go+rX "$VESSELSTACK_ROOT/boat-chat"
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
@@ -405,6 +701,8 @@ install -m 0644 "$SCRIPT_DIR/templates/grafana/provisioning/dashboards/vesselsta
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards/vesselstack.yml"
 install -m 0644 "$SCRIPT_DIR/templates/grafana/dashboards/system-health.json" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards/system-health.json"
+safe_data_path "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
+safe_data_path "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml" leaf
 install -d -m 0755 "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
 for blueprint in "$SCRIPT_DIR"/templates/homeassistant/blueprints/automation/vesselstack/*.yaml; do
     install -m 0644 "$blueprint" \
@@ -414,6 +712,12 @@ install -m 0644 "$SCRIPT_DIR/templates/homeassistant/lovelace-vesselstack.exampl
     "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml"
 install -m 0755 "$SCRIPT_DIR/scripts/vesselstackctl" "$SBIN_DIR/vesselstackctl"
 install -m 0755 "$SCRIPT_DIR/scripts/vesselstack-firewall" "$SBIN_DIR/vesselstack-firewall"
+# The update launcher and the helper it runs as root are installed root-owned and
+# never executed from a source checkout. A new helper version only arrives through
+# this installer (i.e. from a reviewed/verified release tree).
+install -d -m 0755 -o root -g root "$LIBEXEC_PARENT" "$LIBEXEC_DIR"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-update" "$SBIN_DIR/vesselstack-update"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"
@@ -447,6 +751,7 @@ SIGNALK_URL
 SOCKETCAN_ENABLE
 SOCKETCAN_INTERFACE
 SOCKETCAN_BITRATE
+VESSELSTACK_CAN_CREATE_VCAN
 AIS_ENABLE
 AIS_IMAGE
 AIS_DEVICE
@@ -455,6 +760,9 @@ AIS_WEB_PORT
 AIS_TCP_PORT
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
+VESSELSTACK_FIREWALL_STRICT
+VESSELSTACK_FIREWALL_ALLOW_TCP
+VESSELSTACK_FIREWALL_ALLOW_UDP
 CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
@@ -473,6 +781,7 @@ INFLUXDB_RAW_BUCKET
 INFLUXDB_HISTORY_BUCKET
 INFLUXDB_HOME_ASSISTANT_BUCKET
 INFLUXDB_AIS_BUCKET
+INFLUXDB_RAW_RETENTION
 INFLUXDB_PASSWORD
 INFLUXDB_TOKEN
 GRAFANA_ADMIN_PASSWORD
@@ -483,6 +792,8 @@ PROMETHEUS_PORT
 MQTT_USERNAME
 MQTT_PASSWORD
 MQTT_PORT
+VESSELSTACK_DATA_BIND_ADDRESS
+VESSELSTACK_WEB_BIND_ADDRESS
 EOF
 
 # Retain provider credentials and optional Boat Chat settings across installer
@@ -491,7 +802,7 @@ boat_chat_temp=$(mktemp)
 if [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
     cp "$VESSELSTACK_ROOT/config/boat-chat.env" "$boat_chat_temp"
 fi
-for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN \
+for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN \
     TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE \
     SIGNALK_URL HOME_ASSISTANT_URL \
     HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
@@ -516,6 +827,7 @@ done
     printf 'BOAT_TIMEZONE=%q\n' "$BOAT_TIMEZONE"
     printf 'VESSELSTACK_VERSION=%q\n' "$(<"$SCRIPT_DIR/VERSION")"
     printf 'BOAT_CHAT_SETTINGS_TOKEN=%q\n' "$BOAT_CHAT_SETTINGS_TOKEN"
+    printf 'BOAT_CHAT_ACCESS_TOKEN=%q\n' "$BOAT_CHAT_ACCESS_TOKEN"
     printf 'TELEGRAM_ENABLE=%q\n' "$TELEGRAM_ENABLE"
     printf 'TELEMETRY_INDEXER_ENABLE=%q\n' "$TELEMETRY_INDEXER_ENABLE"
     printf 'SIGNALK_URL=%q\n' "$SIGNALK_URL"
@@ -541,22 +853,22 @@ install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/control-panel.env"
     printf 'CONTROL_PANEL_TOKEN=%q\n' "$CONTROL_PANEL_TOKEN"
 } >> "$VESSELSTACK_ROOT/config/control-panel.env"
 
-"$SCRIPT_DIR/scripts/migrate.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" \
-    "$(<"$SCRIPT_DIR/VERSION")"
-
+# Vessel identity is generated into a root-owned temporary file in the (root-owned)
+# application directory and renamed into place; the service user can only read it.
+facts_temp=$(mktemp "$VESSELSTACK_ROOT/boat-chat/.boat_facts.XXXXXX")
 jq -n \
     --arg name "$BOAT_NAME" --arg type "${BOAT_TYPE:-}" \
     --arg mmsi "${BOAT_MMSI:-}" --arg callsign "${BOAT_CALLSIGN:-}" \
     --arg loa "${BOAT_LOA_M:-}" --arg beam "${BOAT_BEAM_M:-}" \
     '{vessel:{name:$name,type:$type,mmsi:$mmsi,callsign:$callsign,loa_m:$loa,beam_m:$beam}}' \
-    > "$VESSELSTACK_ROOT/boat-chat/boat_facts.json"
-
-python3 -m venv "$VESSELSTACK_ROOT/boat-chat/.venv"
-"$VESSELSTACK_ROOT/boat-chat/.venv/bin/pip" install -r "$VESSELSTACK_ROOT/boat-chat/requirements.txt"
-chown -R "$VESSELSTACK_USER:$VESSELSTACK_USER" "$VESSELSTACK_ROOT/boat-chat"
+    > "$facts_temp"
+chown "root:$VESSELSTACK_USER" "$facts_temp"
+chmod 0640 "$facts_temp"
+mv -f -- "$facts_temp" "$VESSELSTACK_ROOT/boat-chat/boat_facts.json"
 
 sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
@@ -564,6 +876,7 @@ for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.serv
     vesselstack-displays-bridge.service; do
     sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
         -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+        -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
         "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
     chmod 0644 "$SYSTEMD_DIR/$unit"
 done
@@ -597,6 +910,10 @@ fi
 
 compose config --quiet
 
+# Everything rendered and validated: record the new schema version last.
+"$SCRIPT_DIR/scripts/migrate.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" \
+    "$(<"$SCRIPT_DIR/VERSION")"
+
 if [ "$SIGNALK_MODE" = native ]; then
     "$SCRIPT_DIR/scripts/install-signalk-native.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
 fi
@@ -609,7 +926,10 @@ if [ "$START" -eq 1 ]; then
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
     install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
-    compose up -d
+    # Broker access files were already rendered by sync_mqtt_access above.
+    compose_up=(compose up -d)
+    [ "$OFFLINE" != true ] || compose_up=(compose up -d --pull never)
+    "${compose_up[@]}"
     # A changed compose definition is recreated by "compose up -d" itself; a
     # changed configuration file alone is not, and may have been rendered by an
     # earlier render-only run, so compare with the stamp of the last applied one.

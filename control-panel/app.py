@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -60,6 +61,13 @@ def field(
     }
 
 
+INIT_ONLY_NOTE = (
+    "Read-only: {service} reads this only when its data volume is first created, so "
+    "changing it here would desynchronise the config from the running service. "
+    "Rotate it from the recovery shell (change it inside {service} first, then update "
+    "config/vesselstack.env and re-apply the configuration); see the README, Rotating secrets."
+)
+
 FIELDS = [
     field("BOAT_NAME", "Boat name", "Vessel", description="Display name used across VesselStack."),
     field("BOAT_TYPE", "Boat type", "Vessel"),
@@ -88,6 +96,8 @@ FIELDS = [
     field("HOME_ASSISTANT_URL", "Home Assistant URL", "Home Assistant", kind="url"),
     field("HOME_ASSISTANT_TOKEN", "Home Assistant token", "Home Assistant", kind="secret"),
     field("INFLUXDB_URL", "InfluxDB URL", "InfluxDB", kind="url"),
+    field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services bind address", "Network", description="InfluxDB, Prometheus and MQTT publish on this IPv4 address. Keep 127.0.0.1 unless external devices must connect over a trusted network."),
+    field("VESSELSTACK_WEB_BIND_ADDRESS", "Web UI bind address", "Network", description="Grafana and Heimdall publish on this IPv4 address (0.0.0.0 = every interface, 127.0.0.1 = this device only)."),
     field("INFLUXDB_PORT", "Published port", "InfluxDB", kind="port"),
     field("INFLUXDB_CONTAINER_NAME", "Container name", "InfluxDB"),
     field("INFLUXDB_ORG", "Organization", "InfluxDB"),
@@ -96,21 +106,25 @@ FIELDS = [
     field("INFLUXDB_HISTORY_BUCKET", "History bucket", "InfluxDB"),
     field("INFLUXDB_HOME_ASSISTANT_BUCKET", "Home Assistant bucket", "InfluxDB"),
     field("INFLUXDB_AIS_BUCKET", "AIS bucket", "InfluxDB"),
-    field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret"),
-    field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret"),
-    field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret"),
+    field("INFLUXDB_RAW_RETENTION", "Raw bucket retention", "InfluxDB", description="Duration such as 720h, 30d or 8w, or 0 to keep forever. Empty = 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply/start and permanently deletes raw data older than the window."),
+    field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB")),
+    field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB") + " Boat Chat and Grafana also use this token."),
+    field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="Grafana")),
     field("GRAFANA_PORT", "Published port", "Grafana", kind="port"),
     field("HEIMDALL_PORT", "HTTP port", "Heimdall", kind="port"),
     field("HEIMDALL_HTTPS_PORT", "HTTPS port", "Heimdall", kind="port"),
     field("PROMETHEUS_PORT", "Published port", "Prometheus", kind="port"),
     field("MQTT_USERNAME", "MQTT username", "MQTT"),
-    field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret"),
+    field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret", description="Applied to the Mosquitto password file on the next apply/start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "Published port", "MQTT", kind="port"),
     field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
     field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
     field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
+    field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),
+    field("VESSELSTACK_FIREWALL_ALLOW_TCP", "Strict mode allowed TCP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default 22."),
+    field("VESSELSTACK_FIREWALL_ALLOW_UDP", "Strict mode allowed UDP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default none."),
     field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 unless access is protected by a trusted VPN or proxy."),
     field("CONTROL_PANEL_PORT", "Control panel port", "Control Panel", kind="port"),
     field("BOAT_CHAT_PROVIDER", "Primary provider", "Boat Chat", source="chat", kind="select", choices=["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
@@ -130,6 +144,7 @@ FIELDS = [
     field("AWS_SECRET_ACCESS_KEY", "AWS secret key", "Boat Chat", source="chat", kind="secret"),
     field("GOOGLE_API_KEY", "Google API key", "Boat Chat", source="chat", kind="secret"),
     field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", "Boat Chat", source="chat"),
+    field("BOAT_CHAT_ACCESS_TOKEN", "Boat Chat access token", "Boat Chat", source="chat", kind="secret", description="Required by chat, status and data APIs and the Telegram bridge."),
     field("TELEGRAM_BOT_TOKEN", "Telegram bot token", "Telegram", source="chat", kind="secret"),
     field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chat IDs", "Telegram", source="chat", kind="secret"),
     field("TELEGRAM_ENABLE", "Run Telegram worker", "Telegram", kind="boolean"),
@@ -159,11 +174,16 @@ SYSTEMD_COMPONENTS = {
 
 
 def parse_env(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
     try:
-        lines = path.read_text().splitlines()
+        text = path.read_text()
     except OSError:
-        return values
+        return {}
+    return parse_env_text(text)
+
+
+def parse_env_text(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    lines = text.splitlines()
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -223,7 +243,7 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     if kind == "port" and text:
         if not text.isdigit() or not 1 <= int(text) <= 65535:
             raise ValueError(f"{spec['label']} must be an integer from 1 to 65535")
-    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST"} and text:
+    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
         except ValueError as exc:
@@ -237,6 +257,11 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
             raise ValueError(f"{spec['label']} may contain 1-64 letters, numbers, dot, underscore, and hyphen")
     if spec["key"] == "DISPLAYS_SIGNALK_TOKEN" and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
         raise ValueError(f"{spec['label']} must not contain control characters")
+    if spec["key"] in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
+        if not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*", text):
+            raise ValueError(f"{spec['label']} must be comma-separated ports or LOW:HIGH ranges")
+    if spec["key"] == "INFLUXDB_RAW_RETENTION" and text and not re.fullmatch(r"0|[1-9][0-9]{0,4}[hdw]", text):
+        raise ValueError(f"{spec['label']} must be 0, or a duration such as 720h, 30d or 8w")
     if kind == "path" and text and not text.startswith("/"):
         raise ValueError(f"{spec['label']} must be an absolute path")
     if kind == "url" and text:
@@ -244,6 +269,107 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"{spec['label']} must be an HTTP(S) URL")
     return text
+
+
+def chat_override_path(vessel: dict[str, str] | None = None) -> Path | None:
+    """Boat Chat Settings-page override file (BOAT_CHAT_ENV), if locatable."""
+    explicit = os.environ.get("BOAT_CHAT_ENV")
+    if explicit:
+        return Path(explicit)
+    data = (vessel if vessel is not None else parse_env(VESSEL_ENV)).get("VESSELSTACK_DATA", "")
+    return Path(data) / "boat-chat" / "boat-chat.env" if data else None
+
+
+def chat_overrides(vessel: dict[str, str] | None = None) -> set[str]:
+    path = chat_override_path(vessel)
+    if not path:
+        return set()
+    try:
+        return set(parse_env_text(_read_nofollow(path)[0]))
+    except OSError:
+        return set()
+
+
+def _read_nofollow(path: Path) -> tuple[str, os.stat_result]:
+    """Read a regular file without following a final symlink; return text and fstat."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path} is not a regular file")
+        with os.fdopen(fd, "r", closefd=False) as handle:
+            return handle.read(), info
+    finally:
+        os.close(fd)
+
+
+def replace_in_service_dir(path: Path, content: str) -> None:
+    """Atomically replace a file in a directory the service user can write.
+
+    The panel may run as root while the directory belongs to the service user, so
+    nothing here may follow a path the service user could have swapped for a
+    symlink: refuse symlinks, use an O_EXCL random temporary name, and apply
+    mode/ownership through the open descriptor rather than by path.
+    """
+    if stat.S_ISLNK(os.lstat(path).st_mode):
+        raise OSError(f"Refusing to rewrite symlink {path}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"{path} is not a regular file")
+    temp_fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        try:
+            with os.fdopen(temp_fd, "w", closefd=False) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(temp_fd)
+            os.fchmod(temp_fd, stat.S_IMODE(info.st_mode))
+            try:
+                os.fchown(temp_fd, info.st_uid, info.st_gid)
+            except OSError:
+                pass  # not running as root; ownership already matches the caller
+        finally:
+            os.close(temp_fd)
+        if stat.S_ISLNK(os.lstat(temporary).st_mode):
+            raise OSError(f"Refusing symlinked temporary file {temporary}")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def clear_chat_overrides(keys: set[str], vessel: dict[str, str]) -> None:
+    """Drop keys saved here from the Settings-page override file.
+
+    The override file wins over config/boat-chat.env, so without this a value
+    saved in the control panel would be silently shadowed by a stale UI value.
+    The file lives in the service-user-writable state directory, so it is never
+    read or written through a symlink.
+    """
+    path = chat_override_path(vessel)
+    if not path:
+        return
+    try:
+        text, _ = _read_nofollow(path)
+    except OSError:
+        return  # absent, a symlink, or not a regular file: leave it alone
+    stale = {key for key in keys if key in parse_env_text(text)}
+    if not stale:
+        return
+    kept = []
+    for line in text.splitlines():
+        name = line.split("=", 1)[0].strip()
+        if "=" in line and not line.lstrip().startswith("#") and name in stale:
+            continue
+        kept.append(line)
+    replace_in_service_dir(path, "\n".join(kept) + "\n")
 
 
 def public_configuration() -> dict[str, Any]:
@@ -257,10 +383,21 @@ def public_configuration() -> dict[str, Any]:
         if spec["key"] in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             value = panel.get(spec["key"], value)
         result[spec["key"]] = {"configured": bool(value)} if spec["kind"] == "secret" else value
-    return {"fields": FIELDS, "values": result}
+    overridden = chat_overrides(vessel)
+    fields = []
+    for spec in FIELDS:
+        spec = dict(spec)
+        if spec["source"] == "chat" and spec["key"] in overridden:
+            spec["description"] = (spec["description"] + " " if spec["description"] else "") + (
+                "Overridden by the Boat Chat Settings page; the value shown here is not in effect. "
+                "Saving this field replaces the override."
+            )
+        fields.append(spec)
+    return {"fields": fields, "values": result, "overridden": sorted(overridden & {s["key"] for s in FIELDS if s["source"] == "chat"})}
 
 
 def update_configuration(updates: dict[str, Any]) -> str:
+    saved_chat_keys: set[str] = set()
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
     panel = parse_env(PANEL_ENV)
@@ -268,6 +405,8 @@ def update_configuration(updates: dict[str, Any]) -> str:
         spec = FIELD_BY_KEY.get(key)
         if not spec:
             raise ValueError(f"Unsupported setting: {key}")
+        if spec["read_only"] and spec["kind"] == "secret" and raw == "":
+            continue  # a blank secret means "keep the stored value"
         if spec["read_only"]:
             raise ValueError(f"{spec['label']} is read-only in the control panel")
         if spec["kind"] == "secret" and str(raw or "") == "":
@@ -278,6 +417,8 @@ def update_configuration(updates: dict[str, Any]) -> str:
             value = validate_value(spec, raw)
         target = chat if spec["source"] == "chat" else vessel
         target[key] = value
+        if spec["source"] == "chat":
+            saved_chat_keys.add(key)
         if key in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             panel[key] = value
     if vessel.get("DISPLAYS_ENABLE", "false") == "true":
@@ -313,6 +454,7 @@ def update_configuration(updates: dict[str, Any]) -> str:
             else:
                 shutil.copy2(snapshot, path)
         raise
+    clear_chat_overrides(saved_chat_keys, vessel)
     return str(backup)
 
 
@@ -354,6 +496,26 @@ def component_command(component: str, verb: str) -> list[str]:
     raise ValueError("Unknown component")
 
 
+def verify_release_path(path: Path) -> None:
+    stat = path.lstat()
+    if stat.st_uid not in {0, os.geteuid()} or stat.st_mode & 0o022:
+        raise ValueError("Reviewed release paths must be root/panel-owner controlled and not group/world writable")
+
+
+def verify_release_tree(release: Path) -> None:
+    """Reject any symlink, foreign owner or group/world-writable entry in the release.
+
+    install.sh runs as root and executes/copies scripts/, boat-chat/, templates/
+    and systemd/, so the whole tree must be tamper-resistant, not just its top.
+    """
+    for directory, subdirectories, filenames in os.walk(release, followlinks=False):
+        for name in [*subdirectories, *filenames]:
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise ValueError("Reviewed release must not contain symbolic links")
+            verify_release_path(path)
+
+
 def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
     if action in {"preflight", "apply", "install"}:
         if not INSTALLER.is_file():
@@ -378,13 +540,11 @@ def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
             resolved.relative_to(reviewed_root)
         except (FileNotFoundError, ValueError) as exc:
             raise ValueError(f"Update source must be inside {REVIEWED_RELEASE_ROOT}") from exc
-        candidates = [reviewed_root, resolved, resolved / "install.sh", resolved / "VERSION"]
-        if source.is_symlink() or not candidates[-2].is_file() or not candidates[-1].is_file():
+        if source.is_symlink() or not (resolved / "install.sh").is_file() or not (resolved / "VERSION").is_file():
             raise ValueError("Reviewed release must contain regular install.sh and VERSION files")
-        for candidate in candidates:
-            stat = candidate.stat()
-            if stat.st_uid != os.geteuid() or stat.st_mode & 0o022:
-                raise ValueError("Reviewed release paths must be panel-owner controlled and not group/world writable")
+        for candidate in (reviewed_root, resolved):
+            verify_release_path(candidate)
+        verify_release_tree(resolved)
         return [str(CTL), "update", str(resolved)]
     raise ValueError("Unsupported action")
 

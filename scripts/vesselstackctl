@@ -30,10 +30,18 @@ Commands:
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
-  backup [DIRECTORY]           Create a checksummed, consistent backup
+  backup [--allow-unmounted] [DIRECTORY]
+                               Create a checksummed, consistent backup (stops the
+                               whole stack briefly). Refuses /media and /mnt
+                               destinations that are not mounted unless
+                               --allow-unmounted is given
   verify-backup ARCHIVE        Verify an archive and its checksum
-  restore ARCHIVE --yes        Replace config/data from a verified backup
-  update SOURCE_DIRECTORY      Back up and apply a reviewed release
+  restore ARCHIVE --yes [--skip-installer]
+                               Stage and verify a backup, then swap it in; the
+                               previous trees are kept as *.pre-restore-STAMP
+  update [--offline] SOURCE_DIRECTORY
+                               Back up and apply a reviewed release; --offline (or
+                               VESSELSTACK_OFFLINE=true) installs without network
   uninstall [--purge-data --yes]
                                Remove services; preserve data by default
 EOF
@@ -117,6 +125,8 @@ start_stack() {
         echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
         return 1
     }
+    # bootstrap-influx.sh first waits (bounded) for InfluxDB /health, so start,
+    # restart and the backup restart trap never provision against a booting server.
     "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
@@ -229,15 +239,43 @@ status_stack() {
     return "$failed"
 }
 
+# Read KEY from an env file WITHOUT sourcing it (some are service-user-writable).
+env_file_value() {
+    local file=$1 key=$2 value
+    [ -r "$file" ] || return 0
+    value=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)
+    value=${value#\'}; value=${value%\'}; value=${value#\"}; value=${value%\"}
+    printf '%s' "$value"
+}
+
+bind_note() {
+    case "$1" in
+        127.0.0.1|::1|localhost) printf 'this device only' ;;
+        0.0.0.0|::|'') printf 'ALL interfaces' ;;
+        *) printf 'interface %s' "$1" ;;
+    esac
+}
+
 show_urls() {
-    printf '%-20s %s\n' 'Boat Chat' "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}"
-    printf '%-20s %s\n' 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}"
+    local chat_host panel_host data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
+    local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}
+    chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
+    chat_host=${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}
+    panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
+    panel_host=${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}
+    printf '%-20s %s  (bound: %s; access token required)\n' 'Boat Chat' \
+        "http://$chat_host:${BOAT_CHAT_PORT:-8765}" "$(bind_note "$chat_host")"
+    printf '%-20s %s  (bound: %s)\n' 'Control Panel' \
+        "http://$panel_host:${CONTROL_PANEL_PORT:-8780}" "$(bind_note "$panel_host")"
     printf '%-20s %s\n' SignalK "$SIGNALK_URL"
     printf '%-20s %s\n' 'Home Assistant' "$HOME_ASSISTANT_URL"
-    printf '%-20s %s\n' InfluxDB "$INFLUXDB_URL"
-    printf '%-20s %s\n' Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}"
-    printf '%-20s %s\n' Heimdall "http://127.0.0.1:${HEIMDALL_PORT:-80}"
-    printf '%-20s %s\n' Prometheus "http://127.0.0.1:${PROMETHEUS_PORT:-9090}"
+    printf '%-20s %s  (bound: %s)\n' InfluxDB "$INFLUXDB_URL" "$(bind_note "$data_bind")"
+    printf '%-20s %s  (bound: %s)\n' Grafana \
+        "http://$web_bind:${GRAFANA_PORT:-43000}" "$(bind_note "$web_bind")"
+    printf '%-20s %s  (bound: %s)\n' Heimdall \
+        "http://$web_bind:${HEIMDALL_PORT:-80}" "$(bind_note "$web_bind")"
+    printf '%-20s %s  (bound: %s)\n' Prometheus \
+        "http://$data_bind:${PROMETHEUS_PORT:-9090}" "$(bind_note "$data_bind")"
 }
 
 show_version() {
@@ -268,6 +306,20 @@ show_logs() {
     esac
 }
 
+# Warn (never fail) when the data filesystem is more than 80% full. Time-series
+# data grows without bound unless INFLUXDB_RAW_RETENTION is set.
+disk_usage_warning() {
+    local threshold=${VESSELSTACK_DISK_WARN_PERCENT:-80} used data_size
+    used=$(df -Pk "$VESSELSTACK_DATA" | awk 'NR==2 {gsub("%", "", $5); print $5}')
+    data_size=$(du -sk "$VESSELSTACK_DATA" 2>/dev/null | awk '{printf "%d", $1 / 1024}')
+    if [ -n "$used" ] && [ "$used" -gt "$threshold" ]; then
+        printf 'WARN data filesystem is %s%% full (threshold %s%%); %s MiB used by %s. Consider INFLUXDB_RAW_RETENTION, pruning old backups or a larger disk\n' \
+            "$used" "$threshold" "${data_size:-?}" "$VESSELSTACK_DATA" >&2
+    else
+        printf 'OK   data filesystem usage: %s%% (%s MiB in data directory)\n' "${used:-?}" "${data_size:-?}"
+    fi
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -292,6 +344,7 @@ doctor_stack() {
         echo 'FAIL data filesystem has less than 1 GiB free' >&2
         failed=1
     fi
+    disk_usage_warning
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
@@ -301,9 +354,59 @@ doctor_stack() {
     return "$failed"
 }
 
+# Files outside the application and data trees that make a restore complete across
+# versions: unit files, the control scripts and the update-key environment file.
+extra_backup_paths() {
+    local path
+    for path in "$SYSTEMD_DIR"/vesselstack-* "$SBIN_DIR/vesselstackctl" \
+        "$SBIN_DIR/vesselstack-firewall" "$SYSTEM_ROOT/etc/vesselstack/update.env"; do
+        if [ -f "$path" ] && [ ! -L "$path" ]; then printf '%s\n' "$path"; fi
+    done
+}
+
+# Nearest existing ancestor of a path (the destination may not exist yet).
+existing_ancestor() {
+    local path=$1
+    while [ ! -e "$path" ] && [ "$path" != / ]; do path=$(dirname "$path"); done
+    printf '%s' "$path"
+}
+
+check_backup_destination() {
+    local destination=$1 allow_unmounted=$2 mount_dir ancestor
+    case "$destination" in
+        /media/*|/mnt/*)
+            mount_dir=$(printf '%s' "$destination" | cut -d/ -f1-3)
+            if ! mountpoint -q "$mount_dir"; then
+                if [ "$allow_unmounted" -eq 1 ] || [ "${VESSELSTACK_BACKUP_ALLOW_UNMOUNTED:-false}" = true ]; then
+                    echo "WARNING: $mount_dir is not a mounted filesystem; the backup will be written to the system disk" >&2
+                else
+                    echo "Refusing to back up: $mount_dir is not mounted, so the archive would silently land on the system disk (SD card). Mount the backup device or pass --allow-unmounted." >&2
+                    return 1
+                fi
+            fi
+            ;;
+        *) ;;
+    esac
+    ancestor=$(existing_ancestor "$destination")
+    if [ "$(stat -c %d "$ancestor")" = "$(stat -c %d "$VESSELSTACK_DATA")" ]; then
+        echo "WARNING: the backup destination is on the same filesystem as the VesselStack data; it will not survive loss of that disk" >&2
+    fi
+}
+
 backup_stack() {
-    local destination=${1:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
+    local allow_unmounted=0 destination=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --allow-unmounted) allow_unmounted=1 ;;
+            -*) echo "Unknown backup option: $1" >&2; exit 2 ;;
+            *) [ -z "$destination" ] || { echo "backup takes at most one directory" >&2; exit 2; }
+               destination=$1 ;;
+        esac
+        shift
+    done
+    destination=${destination:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
     local stamp archive manifest was_active=0
+    local -a extras
     python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$destination" <<'PY'
 import pathlib
 import sys
@@ -314,6 +417,8 @@ if backup == pathlib.Path("/"):
 if backup == root or root in backup.parents or backup == data or data in backup.parents:
     raise SystemExit("Backup destination must be outside the VesselStack application and data trees")
 PY
+    check_backup_destination "$destination" "$allow_unmounted"
+    mapfile -t extras < <(extra_backup_paths)
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     archive="$destination/vesselstack-$stamp.tar.gz"
     manifest="$archive.sha256"
@@ -325,6 +430,9 @@ PY
         if [ "$was_active" -eq 1 ]; then start_stack; fi
     }
     trap cleanup_backup EXIT
+    # The whole stack is stopped on purpose: InfluxDB (WAL/TSM), Home Assistant,
+    # Grafana and Boat Chat all keep SQLite/WAL state in the data tree, and a
+    # file-level copy of a running database is not crash-consistent.
     stop_stack
     tar --numeric-owner -czf "$archive" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/.venv" \
@@ -333,7 +441,7 @@ PY
         --exclude="${VESSELSTACK_ROOT#/}/displays/__pycache__" \
         --exclude="${VESSELSTACK_ROOT#/}/build" \
         --transform 's,^,vesselstack-backup/,' \
-        "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA"
+        "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "${extras[@]}"
     sha256sum "$archive" > "$manifest"
     verify_backup "$archive" >/dev/null
     chmod 0600 "$archive" "$manifest"
@@ -343,21 +451,29 @@ PY
 }
 
 verify_backup() {
-    local archive=$1 root_path data_path entry invalid=0
+    local archive=$1 root_path data_path systemd_path sbin_path update_path entry invalid=0
     [ -f "$archive" ] || { echo "Backup not found: $archive" >&2; exit 1; }
     [ -f "$archive.sha256" ] || { echo "Checksum not found: $archive.sha256" >&2; exit 1; }
     (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$archive").sha256")
-    python3 - "$archive" "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" <<'PY'
+    python3 - "$archive" "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$SYSTEMD_DIR" "$SBIN_DIR" \
+        "$SYSTEM_ROOT/etc/vesselstack/update.env" <<'PY'
 import pathlib
 import sys
 import tarfile
 
-archive, root, data = sys.argv[1:]
+archive, root, data, systemd_dir, sbin_dir, update_env = sys.argv[1:]
 prefix = pathlib.PurePosixPath("vesselstack-backup")
-allowed = [prefix / root.lstrip("/"), prefix / data.lstrip("/")]
+trees = [prefix / root.lstrip("/"), prefix / data.lstrip("/")]
+systemd_base = prefix / systemd_dir.lstrip("/")
+sbin_files = [prefix / sbin_dir.lstrip("/") / name for name in ("vesselstackctl", "vesselstack-firewall")]
+update_file = prefix / update_env.lstrip("/")
 
 def contained(path):
-    return any(path == base or base in path.parents for base in allowed)
+    if any(path == base or base in path.parents for base in trees):
+        return True
+    if path in sbin_files or path == update_file:
+        return True
+    return path.parent == systemd_base and path.name.startswith("vesselstack-")
 
 with tarfile.open(archive, "r:gz") as bundle:
     for member in bundle.getmembers():
@@ -366,6 +482,8 @@ with tarfile.open(archive, "r:gz") as bundle:
             raise SystemExit(f"Unsafe backup member: {member.name}")
         if member.isdev() or member.isfifo():
             raise SystemExit(f"Unsupported special file: {member.name}")
+        if not member.issym() and member.mode & 0o7000:
+            raise SystemExit(f"Refusing setuid/setgid/sticky member: {member.name}")
         if member.issym() or member.islnk():
             target = pathlib.PurePosixPath(member.linkname)
             if target.is_absolute():
@@ -382,10 +500,18 @@ with tarfile.open(archive, "r:gz") as bundle:
 PY
     root_path=${VESSELSTACK_ROOT#/}
     data_path=${VESSELSTACK_DATA#/}
+    systemd_path=${SYSTEMD_DIR#/}
+    sbin_path=${SBIN_DIR#/}
+    update_path=${SYSTEM_ROOT#/}
+    update_path=${update_path:+$update_path/}etc/vesselstack/update.env
     while IFS= read -r entry; do
         case "$entry" in
             "vesselstack-backup/$root_path"|"vesselstack-backup/$root_path/"*|\
-            "vesselstack-backup/$data_path"|"vesselstack-backup/$data_path/"*) ;;
+            "vesselstack-backup/$data_path"|"vesselstack-backup/$data_path/"*|\
+            "vesselstack-backup/$systemd_path/vesselstack-"*|\
+            "vesselstack-backup/$sbin_path/vesselstackctl"|\
+            "vesselstack-backup/$sbin_path/vesselstack-firewall"|\
+            "vesselstack-backup/$update_path") ;;
             *) invalid=1 ;;
         esac
     done < <(tar -tzf "$archive")
@@ -393,26 +519,140 @@ PY
         echo "Backup contains paths outside this VesselStack installation" >&2
         exit 1
     fi
-    echo "Backup verified (checksum, paths, links, and file types)"
+    echo "Backup verified (checksum, paths, links, file types, no setuid/setgid/sticky bits)"
+}
+
+# Swap a staged directory into place, keeping the old one as TARGET.pre-restore-STAMP.
+swap_in() {
+    local staged=$1 target=$2 stamp=$3
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        mv -- "$target" "$target.pre-restore-$stamp" || return 1
+    fi
+    mv -- "$staged" "$target" || return 1
 }
 
 restore_stack() {
-    local archive=$1 confirmation=${2:-}
+    local archive='' confirmation='' skip_installer=0 argument
+    for argument in "$@"; do
+        case "$argument" in
+            --yes) confirmation=--yes ;;
+            --skip-installer) skip_installer=1 ;;
+            -*) echo "Unknown restore option: $argument" >&2; exit 2 ;;
+            *) [ -z "$archive" ] || { echo "restore takes one archive" >&2; exit 2; }
+               archive=$argument ;;
+        esac
+    done
+    [ -n "$archive" ] || { usage; exit 2; }
     [ "$confirmation" = --yes ] || { echo "restore requires --yes" >&2; exit 2; }
     verify_backup "$archive"
+    local root=$VESSELSTACK_ROOT data=$VESSELSTACK_DATA path
+    for path in "$root" "$data"; do
+        if mountpoint -q "$path" 2>/dev/null; then
+            echo "Refusing to restore: $path is a mount point and cannot be swapped by rename. Restore manually (see README)." >&2
+            exit 1
+        fi
+    done
+    local stage_parent stamp stage need_kib free_kib
+    stage_parent=$(dirname "$data")
+    [ "$(stat -c %d "$stage_parent")" = "$(stat -c %d "$(dirname "$root")")" ] || {
+        echo "Refusing to restore: application and data trees are on different filesystems from their parent directories" >&2
+        exit 1
+    }
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    # Staging holds a full second copy next to the live trees (same filesystem so the
+    # swap is a rename); the old trees are then kept too, so check the space first.
+    need_kib=$(python3 - "$archive" <<'PY'
+import sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as bundle:
+    print(sum(m.size for m in bundle.getmembers() if m.isreg()) // 1024 + 1)
+PY
+)
+    free_kib=$(df -Pk "$stage_parent" | awk 'NR==2 {print $4}')
+    if [ "${free_kib:-0}" -lt $((need_kib + need_kib / 10 + 102400)) ]; then
+        echo "Not enough free space in $stage_parent to stage the restore: need about $((need_kib / 1024)) MiB plus margin, have $((free_kib / 1024)) MiB" >&2
+        exit 1
+    fi
+    stage=$(mktemp -d "$stage_parent/.vesselstack-restore.XXXXXX")
+    chmod 0700 "$stage"
+    # Extract as root with recorded numeric owners (InfluxDB/Grafana/service user data must
+    # keep their uid/gid); setuid/setgid/sticky members were already rejected above.
+    if ! tar -xzf "$archive" -C "$stage" --numeric-owner --same-owner --preserve-permissions; then
+        rm -rf -- "$stage"
+        echo "Extraction failed; nothing was changed" >&2
+        exit 1
+    fi
+    for path in "$root" "$data"; do
+        [ -d "$stage/vesselstack-backup/${path#/}" ] || {
+            rm -rf -- "$stage"
+            echo "Backup does not contain $path; nothing was changed" >&2
+            exit 1
+        }
+    done
     stop_stack
-    tar --numeric-owner -xzf "$archive" -C / --strip-components=1
+    if ! swap_in "$stage/vesselstack-backup/${data#/}" "$data" "$stamp"; then
+        [ -e "$data" ] || { [ ! -e "$data.pre-restore-$stamp" ] || mv -- "$data.pre-restore-$stamp" "$data"; }
+        echo "Restore failed while swapping the data tree; nothing else changed" >&2
+        exit 1
+    fi
+    if ! swap_in "$stage/vesselstack-backup/${root#/}" "$root" "$stamp"; then
+        # Put both trees back so root and data stay a matching pair.
+        if [ ! -e "$root" ] && [ -e "$root.pre-restore-$stamp" ]; then
+            mv -- "$root.pre-restore-$stamp" "$root" || true
+        fi
+        if [ -e "$data.pre-restore-$stamp" ]; then
+            rm -rf -- "$data"
+            mv -- "$data.pre-restore-$stamp" "$data" || true
+        fi
+        echo "Restore failed while swapping the application tree; previous trees put back" >&2
+        exit 1
+    fi
+    # Restore unit files, control scripts and update.env via rename (the running
+    # script keeps its old inode).
+    local extra target
+    while IFS= read -r extra; do
+        target=/${extra#"$stage/vesselstack-backup/"}
+        install -d -m 0755 "$(dirname "$target")"
+        cp -p -- "$extra" "$target.restore-tmp"
+        mv -f -- "$target.restore-tmp" "$target"
+    done < <(find "$stage/vesselstack-backup" -type f \
+        \( -path "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/vesselstack-*" \
+        -o -path "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstack*" \
+        -o -path "$stage/vesselstack-backup/${SYSTEM_ROOT#/}/etc/vesselstack/update.env" \))
+    rm -rf -- "$stage"
     systemctl daemon-reload
-    start_stack
+    if [ "$skip_installer" -eq 0 ] && [ -x "$root/installer/install.sh" ]; then
+        # The backup excludes the Python virtualenv; the restored bundled installer
+        # rebuilds it, re-renders units and starts the stack.
+        "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start
+    else
+        start_stack
+        echo "NOTE: the Boat Chat virtualenv was not rebuilt. Run: sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
+    fi
     echo "Restore completed"
+    echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
+    echo "Verify the system, then remove them to free disk space: sudo rm -rf -- '$root.pre-restore-$stamp' '$data.pre-restore-$stamp'"
 }
 
 update_stack() {
-    local source=$1
+    local source='' offline=${VESSELSTACK_OFFLINE:-false} argument
+    for argument in "$@"; do
+        case "$argument" in
+            --offline) offline=true ;;
+            -*) usage >&2; exit 2 ;;
+            *) [ -z "$source" ] || { usage >&2; exit 2; }; source=$argument ;;
+        esac
+    done
+    [ -n "$source" ] || { usage >&2; exit 2; }
+    case "$offline" in
+        true|false) ;;
+        *) echo "VESSELSTACK_OFFLINE must be true or false" >&2; exit 1 ;;
+    esac
+    local install_args=(--config "$ENV_FILE")
+    [ "$offline" != true ] || install_args+=(--offline)
     [ -x "$source/install.sh" ] || { echo "Not a VesselStack release directory: $source" >&2; exit 1; }
-    "$source/install.sh" --config "$ENV_FILE" --dry-run
+    "$source/install.sh" "${install_args[@]}" --dry-run
     backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}"
-    "$source/install.sh" --config "$ENV_FILE" --start
+    "$source/install.sh" "${install_args[@]}" --start
 }
 
 uninstall_stack() {
@@ -487,10 +727,10 @@ case "$command" in
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
-    backup) [ $# -le 1 ] || { usage; exit 2; }; backup_stack "$@" ;;
+    backup) backup_stack "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
-    restore) [ $# -eq 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
-    update) [ $# -eq 1 ] || { usage; exit 2; }; update_stack "$1" ;;
+    restore) [ $# -ge 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
+    update) [ $# -ge 1 ] || { usage; exit 2; }; update_stack "$@" ;;
     uninstall) uninstall_stack "$@" ;;
     display) [ $# -ge 1 ] || { usage; exit 2; }; display_command "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
