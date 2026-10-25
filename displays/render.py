@@ -605,6 +605,7 @@ def write_project(ctx, rendered: Rendered) -> Path:
             os.close(fd)
         fds[3:] = []
         _remove_tree(parent_fd, prev_name)
+        _carry_over_firmware(parent_fd, display_id, new_name)
         if _exists(parent_fd, display_id):
             os.rename(display_id, prev_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.rename(new_name, display_id, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -615,6 +616,36 @@ def write_project(ctx, rendered: Rendered) -> Path:
                 os.close(fd)
             except OSError:
                 pass
+
+
+CARRIED_DIRS = ("firmware", "firmware.prev")
+
+
+def _carry_over_firmware(parent_fd: int, display_id: str, new_name: str) -> None:
+    """Move finished firmware builds (display build) from the old project into the new one.
+
+    Rendering replaces the whole project directory; the compiled images and their
+    manifests are not part of it and must survive, so they are renamed across.
+    """
+    try:
+        info = os.lstat(display_id, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return  # the swap below deals with (and replaces) anything unexpected
+    old_fd = os.open(display_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    new_fd = os.open(new_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        for name in CARRIED_DIRS:
+            try:
+                entry = os.lstat(name, dir_fd=old_fd)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+                os.rename(name, name, src_dir_fd=old_fd, dst_dir_fd=new_fd)
+    finally:
+        os.close(old_fd)
+        os.close(new_fd)
 
 
 def _exists(parent_fd: int, name: str) -> bool:

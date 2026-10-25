@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import firmware  # noqa: E402
 import lifecycle  # noqa: E402
 import mqtt_auth  # noqa: E402
 import render  # noqa: E402
@@ -218,7 +219,7 @@ def run_render(args, action) -> int:
         return 2
     # Informational output goes to stderr so 'export --stdout' keeps stdout clean.
     ctx = lifecycle.Context(root=Path(root_text), env={}, require_root=not args.allow_non_root,
-                            out=print if action is cmd_render_action else _warn)
+                            out=print if action in STDOUT_ACTIONS else _warn)
     try:
         action(ctx, args)
     except (render.RenderError, lifecycle.LifecycleError) as exc:
@@ -237,6 +238,25 @@ def cmd_render_action(ctx, args) -> None:
 def cmd_export_action(ctx, args) -> None:
     render.export(ctx, args.id, args.output, args.stdout, warn=_warn,
                   allow_missing_wifi=args.allow_missing_wifi)
+
+
+def cmd_build_action(ctx, args) -> None:
+    firmware.build(ctx, args.id, warn=_warn)
+
+
+def cmd_flash_action(ctx, args) -> None:
+    firmware.flash(ctx, args.id, serial=args.serial, ota=args.ota, previous=args.previous)
+
+
+STDOUT_ACTIONS = (cmd_render_action, cmd_build_action, cmd_flash_action)
+
+
+def cmd_build(args) -> int:
+    return run_render(args, cmd_build_action)
+
+
+def cmd_flash(args) -> int:
+    return run_render(args, cmd_flash_action)
 
 
 def cmd_render(args) -> int:
@@ -322,6 +342,25 @@ def build_parser() -> argparse.ArgumentParser:
     target = export.add_mutually_exclusive_group(required=True)
     target.add_argument("--output", metavar="FILE", help="create FILE (mode 0600); refuses to overwrite")
     target.add_argument("--stdout", action="store_true", help="stream the archive to stdout")
+    def firmware_parser(name, help_text, func):
+        parser_ = sub.add_parser(name, help=help_text)
+        parser_.add_argument("id", metavar="ID", help="display id")
+        parser_.add_argument("--root", help="VESSELSTACK_ROOT (default: environment)")
+        parser_.add_argument("--allow-non-root", action="store_true", help=argparse.SUPPRESS)
+        parser_.set_defaults(func=func)
+        return parser_
+
+    firmware_parser("build", "compile the firmware on this machine with the pinned ESPHome "
+                    "image and store it with a manifest (root, optional)", cmd_build)
+    flash = firmware_parser("flash", "upload the stored firmware over USB serial or Wi-Fi "
+                            "(root, optional; never compiles)", cmd_flash)
+    flash_target = flash.add_mutually_exclusive_group(required=True)
+    flash_target.add_argument("--serial", metavar="DEVICE",
+                              help="USB serial device, /dev/ttyACM0 or /dev/serial/by-id/...")
+    flash_target.add_argument("--ota", metavar="HOST",
+                              help="IP address or host name of the display on the LAN")
+    flash.add_argument("--previous", action="store_true",
+                       help="flash the previous build (firmware.prev) to roll back")
     lifecycle_parser("status", "show bridge and display online state from retained MQTT topics",
                      cmd_status)
     return parser
