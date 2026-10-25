@@ -46,6 +46,7 @@ RELEASE_DIR=
 ENV_FILE=
 UPGRADE=0
 PKG_MODE=apt
+APT_UPDATED=0
 HEALTHY=1
 INSTALLED_VERSION=
 CHANGES=()
@@ -228,9 +229,21 @@ nearest_existing() {
 
 pkg_installed() { [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" = installed ]; }
 
+# Lists are refreshed once, before anything asks apt what is available.
+apt_update_once() {
+    [ "$APT_UPDATED" -eq 0 ] || return 0
+    DEBIAN_FRONTEND=noninteractive apt-get update </dev/null || die "apt-get update failed. Check the network and /etc/apt/sources.list."
+    APT_UPDATED=1
+}
+
+# Prints the candidate version apt would install, or nothing.
+apt_candidate() {
+    apt-cache policy "$1" 2>/dev/null | awk '/^ *Candidate:/ && $2 != "(none)" {print $2; exit}'
+}
+
 compose_ok() { command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; }
 
-# shellcheck disable=SC2329  # Invoked through the EXIT trap.
+# shellcheck disable=SC2317,SC2329  # Invoked through the EXIT trap.
 cleanup() {
     if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then rm -rf -- "$STAGE"; fi
 }
@@ -432,7 +445,7 @@ step_prerequisites() {
                 "Install them while the machine has internet (sudo apt-get install ${missing[*]}), or from a local mirror, then re-run."
         else
             say "  Installing with apt-get: ${missing[*]}"
-            DEBIAN_FRONTEND=noninteractive apt-get update </dev/null || die "apt-get update failed. Check the network and /etc/apt/sources.list."
+            apt_update_once
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" </dev/null \
                 || die "apt-get could not install: ${missing[*]}"
             changed "installed Debian packages: ${missing[*]}"
@@ -459,16 +472,26 @@ step_prerequisites() {
             die "Docker with Compose v2 is required but missing, and it cannot be installed automatically here." \
                 "Install Docker Engine and the compose plugin (https://docs.docker.com/engine/install/debian/), then re-run."
         fi
-        local packages=()
+        local packages=() candidate
+        apt_update_once
         command -v docker >/dev/null 2>&1 || packages+=(docker.io)
-        if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+        # Compose v2 is packaged as docker-compose-v2 (Ubuntu), docker-compose-plugin
+        # (Docker's own repository) or, from Debian 13, docker-compose at version 2.x.
+        # Debian 12 only has docker-compose 1.x, which does not work here.
+        if [ -n "$(apt_candidate docker-compose-v2)" ]; then
             packages+=(docker-compose-v2)
-        elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+        elif [ -n "$(apt_candidate docker-compose-plugin)" ]; then
             packages+=(docker-compose-plugin)
         else
-            die "This system's package sources offer neither docker-compose-v2 nor docker-compose-plugin." \
-                "Install Docker from Docker's own repository: https://docs.docker.com/engine/install/debian/" \
-                "then re-run this script."
+            candidate=$(apt_candidate docker-compose)
+            if [[ "$candidate" =~ ^(1:)?2\. ]]; then
+                packages+=(docker-compose)
+            else
+                die "This system's package sources have no Docker Compose v2 package (Debian 12 / Raspberry Pi OS 'bookworm' only ships the old v1)." \
+                    "Install Docker Engine and the docker-compose-plugin package from Docker's own repository:" \
+                    "  https://docs.docker.com/engine/install/debian/" \
+                    "then re-run this script; it will find Docker and continue."
+            fi
         fi
         ask_yn "Install ${packages[*]} now?" y || die "Docker is required. Nothing more was changed." \
             "Install it yourself (see docs/INSTALLATION.md) and re-run."

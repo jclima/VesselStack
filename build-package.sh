@@ -68,6 +68,9 @@ printf '%s\n' "$COMMIT" > "$STAGE/$PACKAGE_NAME/COMMIT"
     echo "commit_time=$COMMIT_TIME"
 } > "$STAGE/$PACKAGE_NAME/BUILD_INFO"
 
+# bsdtar on macOS would otherwise add AppleDouble "._*" entries, which the
+# one-line installer's archive check (rightly) refuses.
+export COPYFILE_DISABLE=1
 tar -cf - -C "$STAGE" "$PACKAGE_NAME" | gzip -n > "$OUTPUT"
 (
     cd "$SCRIPT_DIR/generated"

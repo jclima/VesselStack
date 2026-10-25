@@ -45,7 +45,13 @@ does anything beyond installing ordinary Debian packages:
    is offered the built-in `vesselstackctl update` upgrade, with its backup);
 2. installs the packages VesselStack needs with `apt-get` (`ca-certificates curl jq
    openssl python3 python3-venv rsync tar gzip`; no `git`) and **asks** before
-   installing Docker and the Compose v2 plugin;
+   installing Docker and the Compose v2 plugin (`docker.io` plus whichever of
+   `docker-compose-v2`, `docker-compose-plugin` or, on Debian 13, `docker-compose`
+   2.x apt offers). Debian 12 / Raspberry Pi OS bookworm packages only the old
+   Compose v1, so there the script stops with a pointer to Docker's own apt
+   repository (`docker-compose-plugin`): install Docker from
+   <https://docs.docker.com/engine/install/debian/> first, then run the
+   one-liner again; it detects Docker and continues;
 3. downloads `vesselstack-<version>.tar.gz` and its `.sha256` from the GitHub
    release, verifies the checksum, refuses unsafe archives (absolute or `..` paths,
    links, devices, setuid bits) and unpacks to `/opt/vesselstack-release/<version>`,

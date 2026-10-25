@@ -15,7 +15,9 @@ curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-ve
 
 Pinned to one release: `.../releases/download/v1.4.0/get-vesselstack.sh`, or add
 `--version 1.4.0` (`| sudo bash -s -- --version 1.4.0`). It installs the Debian
-prerequisites, asks before installing Docker, downloads and checksum-verifies the
+prerequisites, asks before installing Docker (on Raspberry Pi OS bookworm, whose own
+packages only have Compose v1, install Docker Engine and `docker-compose-plugin` from
+Docker's repository first; the script then continues), downloads and checksum-verifies the
 release, opens the wizard (it prints the address to open in a browser on the Pi or
 the exact `ssh -L` command for your laptop), then runs the installer dry run, the
 installation, `vesselstackctl doctor` and `vesselstackctl urls`. It shows a list of

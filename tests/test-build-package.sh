@@ -76,6 +76,16 @@ diff <(sed 's/^DEFAULT_VERSION=".*"//' "$BOOTSTRAP") \
 grep -q "^[0-9a-f]\{64\}  get-vesselstack.sh$" "$REPO/generated/get-vesselstack.sh.sha256"
 grep -q "get-vesselstack.sh" "$TEST_ROOT/build.out"
 
+# No AppleDouble or other stray top-level entries (the bootstrap refuses them).
+if grep -vE "^vesselstack-$VERSION(/|$)" "$TEST_ROOT/listing" | grep -q .; then
+    echo "Package has entries outside vesselstack-$VERSION/" >&2
+    exit 1
+fi
+if grep -q '/\._\|^\._' "$TEST_ROOT/listing"; then
+    echo "Package contains AppleDouble entries" >&2
+    exit 1
+fi
+
 # Strict mode refuses a dirty tracked tree.
 if VESSELSTACK_BUILD_REQUIRE_CLEAN=true "$REPO/build-package.sh" >/dev/null 2>&1; then
     echo "Strict build accepted a dirty tracked tree" >&2

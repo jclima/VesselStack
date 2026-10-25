@@ -62,7 +62,10 @@ exit 0
 EOF2
 cat > "$FAKE_BIN/apt-cache" <<'EOF2'
 #!/bin/bash
-[ "$1" = show ] && [ "$2" = docker-compose-v2 ]
+# "policy PKG": the candidate comes from $TEST_ROOT/apt-candidates lines "PKG VERSION".
+[ "$1" = policy ] || exit 1
+version=$(awk -v p="$2" '$1 == p {print $2}' "$TEST_ROOT/apt-candidates" 2>/dev/null)
+printf '%s:\n  Installed: (none)\n  Candidate: %s\n' "$2" "${version:-(none)}"
 EOF2
 cat > "$FAKE_BIN/dpkg-query" <<'EOF2'
 #!/bin/bash
@@ -175,6 +178,7 @@ EOF2
 reset_state() {
     rm -rf -- "$RELEASE_BASE" "$APP_ROOT" "$LOG" "$TEST_ROOT/curl.log" "$TEST_ROOT/docker-installed" "$TEST_ROOT/docker-inactive" \
         "$TEST_ROOT/missing-pkgs" "$TEST_ROOT/answers" "$SERVE"/*.fail
+    printf 'docker-compose-v2 2.24.0\n' > "$TEST_ROOT/apt-candidates"
     : > "$LOG"
     touch "$TEST_ROOT/docker-installed"
     serve_tarball "$GOOD"
@@ -244,7 +248,7 @@ RC=0
 env PATH="$FAKE_BIN:$PATH" TEST_ROOT="$TEST_ROOT" LOG="$LOG" bash -s -- --yes --dir "$RELEASE_BASE" \
     < "$TEST_ROOT/trunc.sh" >"$OUT" 2>&1 || RC=$?
 [ "$RC" -ne 0 ] || fail_test "script cut inside the final main call must fail"
-[ ! -s "$LOG" ] && [ ! -e "$RELEASE_BASE" ] || fail_test "script cut inside the final main call did something"
+if ! { [ ! -s "$LOG" ] && [ ! -e "$RELEASE_BASE" ]; }; then fail_test "script cut inside the final main call did something"; fi
 [ "$(tail -n1 "$GET")" = 'main "$@"' ] || fail_test "main must be invoked on the last line"
 
 # ---- 3. checksum and archive safety ----------------------------------------
@@ -293,7 +297,7 @@ for kind in traversal absolute prefix symlink hardlink setuid device; do
     expect_out "archive refused"
     expect_no_release
     refuse_log "^install "
-    [ ! -e "$TEST_ROOT/releases/escaped.txt" ] && [ ! -e /etc/vs-escaped.txt ] || fail_test "$kind: archive wrote outside the target"
+    if ! { [ ! -e "$TEST_ROOT/releases/escaped.txt" ] && [ ! -e /etc/vs-escaped.txt ]; }; then fail_test "$kind: archive wrote outside the target"; fi
 done
 
 # ---- 4. fresh install with an existing config -----------------------------------
@@ -307,7 +311,7 @@ expect_out "BOAT_MMSI +\(not set\)"
 # Order: dry run first, then the real install; then doctor and urls.
 dry=$(grep -n -- "^install .*--dry-run" "$LOG" | head -n1 | cut -d: -f1)
 real=$(grep -n -- "^install .*--start" "$LOG" | head -n1 | cut -d: -f1)
-[ -n "$dry" ] && [ -n "$real" ] && [ "$dry" -lt "$real" ] || fail_test "dry run must precede install"
+if ! { [ -n "$dry" ] && [ -n "$real" ] && [ "$dry" -lt "$real" ]; }; then fail_test "dry run must precede install"; fi
 expect_log "^install --config $RELEASE_BASE/vesselstack.env --dry-run"
 expect_log "^install --config $RELEASE_BASE/vesselstack.env --start"
 expect_log "^ctl doctor"
@@ -315,7 +319,7 @@ expect_log "^ctl urls"
 refuse_log "^wizard "
 refuse_log "^useradd"
 read -r uid mode < <(stat -c '%u %a' "$RELEASE_BASE/vesselstack.env")
-[ "$uid" = 0 ] && [ "$mode" = 600 ] || fail_test "env copy must be root-only 600 (got $uid $mode)"
+if ! { [ "$uid" = 0 ] && [ "$mode" = 600 ]; }; then fail_test "env copy must be root-only 600 (got $uid $mode)"; fi
 [ "$(stat -c %u "$RELEASE_BASE/$VER")" = 0 ] || fail_test "release dir not root-owned"
 [ -z "$(find "$RELEASE_BASE/$VER" \( ! -uid 0 -o -perm /022 \) -print -quit)" ] || fail_test "release tree is not root-owned and non-writable by others"
 [ -x "$RELEASE_BASE/$VER/install.sh" ] || fail_test "install.sh lost its exec bit"
@@ -434,6 +438,29 @@ run --yes --no-wizard --config "$TEST_ROOT/in.env"
 expect_rc 0 "--yes installs Docker"
 expect_log "^apt-get install -y --no-install-recommends docker-compose-v2"
 expect_log "^systemctl enable --now docker"
+
+# Debian 13 style: only docker-compose, at 2.x, is offered.
+reset_state
+rm -f "$TEST_ROOT/docker-installed"
+printf 'docker-compose 2.26.1-4\n' > "$TEST_ROOT/apt-candidates"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "docker-compose 2.x package"
+expect_log "^apt-get install -y --no-install-recommends docker-compose$"
+# Debian 12 style: only the v1 docker-compose exists, so point at Docker's repository.
+reset_state
+rm -f "$TEST_ROOT/docker-installed"
+printf 'docker-compose 1.29.2-3\n' > "$TEST_ROOT/apt-candidates"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 1 "only Compose v1 available"
+expect_out "docker-compose-plugin"
+expect_out "docs.docker.com/engine/install/debian"
+refuse_log "^apt-get install .*docker"
+expect_no_release
+# Package lists are refreshed even when no base package is missing.
+reset_state
+rm -f "$TEST_ROOT/docker-installed"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_log "^apt-get update"
 
 # ---- 7. service account -----------------------------------------------------------
 reset_state
