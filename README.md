@@ -12,7 +12,7 @@ backbone connection, acceptance tests, backup, and rollback.
 
 Deploying a release to a home-lab Pi and an offline boat Pi? Follow the
 [deployment runbook](docs/DEPLOYMENT.md): SSH release signing and the signed
-`v1.4.0` tag, a clean build with recorded sha256, a home-lab soak and rehearsals
+`v0.4.0` tag, a clean build with recorded sha256, a home-lab soak and rehearsals
 (update, backup/restore, offline install, `vcan` replay), the carry bundle,
 dock-side install with `VESSELSTACK_OFFLINE=true vesselstackctl update DIR`, rollback, an
 acceptance checklist and known gaps. It is documentation only; it changes no
@@ -47,7 +47,7 @@ the script asks once and then follows Docker's official apt-repository instructi
   `apt-get remove` (not purge), so `/var/lib/docker` is kept. If a Docker daemon
   already holds containers or volumes, `--yes` is not enough: the script stops, and you
   must confirm interactively (back up first) or remove the packages yourself;
-- an older `docker.list` (the manual steps of v1.4.0) or any other apt source that
+- an older `docker.list` (the manual steps of v0.4.0) or any other apt source that
   already points at `download.docker.com` is renamed to `*.vesselstack-saved` after
   asking, because two entries with different keys make `apt-get update` fail;
 - no `docker` group change is made: the installer runs as root and VesselStack's
@@ -89,9 +89,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v1.4.1/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=1.4.1 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 1.4.1
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.1/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.1 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.1
 ```
 
 The guided installer explains each step in plain language and asks before it
@@ -181,7 +181,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v1.4.1
+git checkout v0.4.1
 python3 vesselstack-wizard.py
 ```
 
@@ -319,7 +319,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v1.4.1
+git checkout v0.4.1
 ```
 
 ## 4. Configure the vessel
@@ -713,7 +713,7 @@ swapped in between the check and the `install -d`/`chown`. Legacy runtime
 state is copied and chowned in a root-only staging directory and published with
 `rename(2)` (which never follows a symlink at the destination); a destination
 that already exists or is a symlink sends the legacy copy to quarantine instead.
-Upgrade: installs from earlier 1.4.0 builds had a service-owned data root; the
+Upgrade: installs from earlier 0.4.0 builds had a service-owned data root; the
 first run of this installer takes ownership of the data root (not recursive:
 existing database files keep their owners) and moves old quarantine directories
 out of it. Rollback: `chown -R` is not needed; reinstalling the previous release
@@ -1036,12 +1036,28 @@ Shell-initiated `vesselstackctl update` remains available for a trusted operator
 and is not limited to the panel staging directory.
 
 The installer records the configuration schema in
-`/opt/vesselstack/config/installed-version`. Any upgrade from 0.1.0 or newer to a
+`/opt/vesselstack/config/installed-version`. Any upgrade from 0.0.1 or newer to a
 newer release is accepted: when a release needs no data change only the version
 marker moves, and releases that do need one ship an executable
-`scripts/migrations/<version>.sh` that runs once, in version order. The 1.0
-migration supports 0.1 installations and retains legacy InfluxDB names when the
-new bucket settings are absent.
+`scripts/migrations/<version>.sh` that runs once, in version order.
+The first release (0.0.1, formerly 1.0.0) migrates pre-release "0.1" layouts and
+retains legacy InfluxDB names when the new bucket settings are absent.
+
+**Version renumbering (2026-10-25).** The project is pre-1.0, so the former
+1.x releases were renumbered: 1.0.0 is now 0.0.1, 1.0.1 is 0.0.2, and 1.1.0,
+1.2.0, 1.3.0, 1.4.0, 1.4.1 are 0.1.0, 0.2.0, 0.3.0, 0.4.0, 0.4.1 (see the
+CHANGELOG for the table). Former `v1.x` tags and releases were removed. A machine
+that installed a former 1.x release has `1.x.y` in `installed-version`, which
+would look like a downgrade to `0.4.1`. `migrate.sh` and `get-vesselstack.sh`
+therefore treat an installed `1.M.P` as `0.M.P` (1.0.0 and 1.0.1 as 0.0.1 and
+0.0.2) when the target is a 0.x release, so `vesselstackctl update` and
+`get-vesselstack.sh` upgrade it normally and rewrite the marker. If an older
+`migrate.sh` refuses it anyway, run `sudo vesselstackctl backup`, then either
+write the matching new number into `/opt/vesselstack/config/installed-version`
+(for example `echo 0.4.1 | sudo tee /opt/vesselstack/config/installed-version`
+for a 1.4.1 install; the configuration format is unchanged by the renumbering) or
+reinstall 0.4.1 and `sudo vesselstackctl restore` the backup. To roll back the
+renumbering itself, restore that backup on the previous release.
 
 **Downgrades are not supported.** Configuration and data may already use the
 newer schema, so `install.sh` (including `--dry-run`) and `migrate.sh` refuse to
@@ -1066,7 +1082,7 @@ Rollback of a completed upgrade is a restore of the pre-update backup that
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-1.4.1.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.1.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -1267,7 +1283,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-1.4.1.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-0.4.1.tar.gz.sha256)
 ```
 
 The package is produced by `git archive` of the committed `HEAD`, so untracked
@@ -1294,7 +1310,7 @@ files for the maintainer to review and publish.
 `sudo tests/test-get-vesselstack.sh` covers the bootstrap (checksum mismatch,
 truncated downloads and scripts, unsafe archives, existing-install detection,
 non-root refusal, `--help`, offline and `--no-wizard --config` flows, and the Docker
-installation cases listed in the 1.4.1 changelog entry) with fake
+installation cases listed in the 0.4.1 changelog entry) with fake
 `curl`/`apt-get`/`apt-cache`/`dpkg`/`gpg`/`docker`/`systemctl` stubs.
 
 ## Documentation policy
@@ -1431,7 +1447,7 @@ separate reviewed work. Source facts now live in `boat_facts.example.json`; actu
 - The legacy quarantine moved out of the data tree: it is now
   `/var/lib/vesselstack/quarantine/boat-chat-legacy-<timestamp>.XXXXXX` (root
   0700, verified not to be a symlink), outside every service-writable path.
-  Quarantine directories that earlier 1.4.0 builds created in
+  Quarantine directories that earlier 0.4.0 builds created in
   `$VESSELSTACK_DATA` are moved there on the next install.
 - The installer now installs `vesselstack-update` (`/usr/local/sbin`) and its
   helper (`/usr/local/libexec/vesselstack/deploy-chat.py`) root-owned; see
@@ -1517,7 +1533,7 @@ use, e.g. `sudo install -d -m 700 /etc/vesselstack/gnupg` then
 `/etc/vesselstack/update.env` to accept unsigned source (a warning is printed);
 do not enable it on a vessel others can push code to. The checkout owner can no longer
 change what root deploys after verification, because root deploys the verified
-commit's content. Upgrade note: 1.4.0 adds the mirror;
+commit's content. Upgrade note: 0.4.0 adds the mirror;
 no action is required (it is created on first run) but a root-owned,
 non-writable `/var/lib/vesselstack` path is enforced. Roll back
 by restoring a printed backup (below) or by setting `ALLOW_UNSIGNED_SOURCE`
