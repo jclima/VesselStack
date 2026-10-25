@@ -17,7 +17,15 @@ case "$IMAGE" in
     *) echo "displays/esphome/IMAGE must be a digest-pinned reference" >&2; exit 1 ;;
 esac
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+FLASH_PROJECT=""
+cleanup() {
+    # The flash check hands the project to root (see below); take it back so rm can delete it.
+    if [ -n "$FLASH_PROJECT" ] && [ "$(id -u)" -ne 0 ]; then
+        docker run --rm --entrypoint chown -v "$FLASH_PROJECT":/p "$IMAGE" -R "$(id -u):$(id -g)" /p >/dev/null 2>&1 || true
+    fi
+    rm -rf -- "$WORK"
+}
+trap cleanup EXIT
 
 # The flags firmware.py really passes, so a change there is exercised here.
 read_flags() {  # portable (no mapfile): one flag per line from firmware.py
@@ -107,8 +115,17 @@ check() {
 check example helm
 # The flash container's view: project read-only, scratch on tmpfs, same hardening flags.
 echo "== esphome config (flash flags): example/helm"
+# In production the staged project is owned by root (0700/0600) and the container runs as root
+# with --cap-drop ALL, so it reads the files as their owner (no CAP_DAC_OVERRIDE). Mirror that
+# ownership here; a project owned by the unprivileged runner uid would be unreadable on Linux.
+FLASH_PROJECT="$WORK/example/build/displays/helm/project"
+if [ "$(id -u)" -eq 0 ]; then
+    chown -R 0:0 "$FLASH_PROJECT"
+else  # the chown helper needs CAP_CHOWN, so it runs without the hardening flags
+    docker run --rm --entrypoint chown -v "$FLASH_PROJECT":/p "$IMAGE" -R 0:0 /p
+fi
 if ! docker run --rm "${CONTAINER_FLAGS[@]}" "${UPLOAD_SCRATCH_FLAGS[@]}" \
-        -v "$WORK/example/build/displays/helm/project":/config:ro "$IMAGE" \
+        -v "$FLASH_PROJECT":/config:ro "$IMAGE" \
         config /config/helm.yaml > "$WORK/flash-flags.log" 2>&1 \
         || ! grep -q 'Configuration is valid' "$WORK/flash-flags.log"; then
     cat "$WORK/flash-flags.log" >&2

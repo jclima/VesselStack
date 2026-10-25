@@ -121,8 +121,8 @@ check_files() {
         owner=$(python3 -c 'import os,sys;s=os.stat(sys.argv[1]);print(f"{s.st_uid}:{s.st_gid}")' "$MDIR")
         [ "$owner" = 0:1883 ] || fail "auth directory owner is $owner"
     fi
-    [ ! -e "$MDIR/acl.new" ] && [ ! -e "$MDIR/passwords.new" ] || fail "temp files left behind"
-    [ ! -e "$PDIR/acl" ] && [ ! -e "$PDIR/passwords" ] || fail "auth files leaked into the broker data directory"
+    if [ -e "$MDIR/acl.new" ] || [ -e "$MDIR/passwords.new" ]; then fail "temp files left behind"; fi
+    if [ -e "$PDIR/acl" ] || [ -e "$PDIR/passwords" ]; then fail "auth files leaked into the broker data directory"; fi
     grep -q '^[^:]*:\$7\$' "$MDIR/passwords" || fail "passwords are not hashed"
     pass
 }

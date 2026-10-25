@@ -1447,7 +1447,7 @@ The `displays-esphome-config` CI job pulls the image pinned in
 `displays/esphome/IMAGE` and runs `tests/test-displays-esphome-config.sh` on every
 push and pull request. That script runs the containers with the same hardening
 flags `displays/firmware.py` uses (`--cap-drop ALL`, `no-new-privileges`), once
-with the flash flags (project mounted read-only, tmpfs scratch, `--network none`), and fails if
+with the flash flags (project mounted read-only and, as in production, owned by root, which the test sets with a one-shot unhardened `chown` helper container; tmpfs scratch, `--network none`), and fails if
 the pinned image's `esphome upload --help` no longer lists `--file`, which
 `display flash` depends on, so an image bump that drops it cannot go unnoticed.
 `tests/test_displays_render.py` also checks that the topics the generated YAML
