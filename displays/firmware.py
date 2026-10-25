@@ -13,14 +13,15 @@ root-owned ``secrets.yaml`` that ESPHome reads inside the container.
 Layout under ``$VESSELSTACK_ROOT/build/displays/<id>/`` (root:root, 0700/0600)::
 
     project/                           the rendered ESPHome project (render.py): the ONLY
-                                       directory mounted into a container (as /config)
+                                       directory the compile container mounts (as /config)
     project.prev/                      the project before it
     firmware/                          newest build: factory + ota image, manifest.json
     firmware.prev/                     the build before it (rollback)
 
 The stored firmware sits beside ``project/``, never inside it, so a compromised compile
 container (which can write to its ``/config`` mount) cannot rewrite the images or the
-manifests that ``flash`` trusts. ``render`` replaces only ``project/``.
+manifests that ``flash`` trusts. ``render`` replaces only ``project/``. Because that container can write to ``project/``,
+``flash`` never mounts it: it re-renders the project into a private staging dir.
 """
 from __future__ import annotations
 
@@ -509,19 +510,28 @@ UPLOAD_SCRATCH_FLAGS = ["--tmpfs", "/tmp", "--tmpfs", "/cache",
                         "-e", "ESPHOME_DATA_DIR=/tmp/esphome-data"]
 
 
+STAGED_CONFIG_NAME = "config"
+
+
 @contextlib.contextmanager
-def staged_firmware(ctx, data: bytes, expected_sha256: str):
-    """Copy verified firmware bytes into a fresh root-only temp dir and yield the file path.
+def staged_firmware(ctx, data: bytes, expected_sha256: str, rendered=None):
+    """Copy verified firmware bytes into a fresh root-only temp dir; yield (file, config dir).
 
     The container reads this copy, not the stored file, so nothing can swap the bytes
     between verification and upload. The temp dir lives under ``$ROOT/build/`` (root-only),
     not in a shared /tmp, and is removed afterwards.
+
+    With ``rendered`` the freshly re-rendered project is written to ``config/`` beside the
+    firmware copy (also 0700/0600, no-follow) and its path is the second yielded value
+    (None without ``rendered``). ``project/`` is never trusted for flashing: the compile
+    container could write to it.
     """
     build_dir = ctx.root / render.BUILD_DIR_NAME
     tmp = Path(tempfile.mkdtemp(prefix=".flash-", dir=build_dir))
     try:
         os.chmod(tmp, 0o700)
         staged = tmp / FLASH_STAGED_NAME
+        config_path = None
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             mqtt_auth._write_all(fd, data)
@@ -537,7 +547,17 @@ def staged_firmware(ctx, data: bytes, expected_sha256: str):
             raise RenderError("the staged firmware copy does not match its recorded sha256; "
                               "refusing to flash")
         _check_mount_path(staged)
-        yield staged
+        if rendered is not None:
+            config = tmp / STAGED_CONFIG_NAME
+            os.mkdir(config, 0o700)
+            top_fd = os.open(config, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                render._write_files(top_fd, rendered.files, rendered.display_id,
+                                    mqtt_auth._owner((0, 0)))
+            finally:
+                os.close(top_fd)
+            config_path = _check_mount_path(config)
+        yield staged, config_path
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -560,22 +580,16 @@ def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = 
                       stream=stream, serial=serial, force=force)
 
 
-def check_credentials(ctx, display_id: str, manifest: dict, previous: bool) -> None:
+def check_credentials(manifest: dict, display_id: str, previous: bool, current, reason=None) -> None:
     """Refuse firmware that embeds credentials the Pi no longer uses.
 
     The source hash deliberately excludes secrets.yaml, so after ``rotate``, ``wifi`` or a
     remove-then-add the stored images still carry the old MQTT/OTA/Wi-Fi secrets and the
-    device would never connect. Compare the fingerprint recorded at build time with what
-    the current credentials render to. (``collect`` may generate a missing OTA password
-    or API key as a side effect; that is the same thing ``render`` does and is harmless.)
+    device would never connect. Compare the fingerprint recorded at build time with
+    ``current``, what the current credentials render to (None when they cannot be
+    rendered, with ``reason``).
     """
     recorded = manifest.get("secrets_sha256")
-    reason = None
-    current = None
-    try:
-        current = secrets_fingerprint(render.collect(ctx, display_id).files, display_id)
-    except (RenderError, lifecycle.LifecycleError) as exc:
-        reason = str(exc)
     if recorded and current and recorded == current:
         return
     if recorded is None:
@@ -596,6 +610,17 @@ def check_credentials(ctx, display_id: str, manifest: dict, previous: bool) -> N
         f"Run 'vesselstackctl display build {display_id}' first, or pass --force to flash it anyway")
 
 
+def check_source(manifest: dict, display_id: str, previous: bool, current: str) -> None:
+    """Refuse to pair firmware with a configuration other than the one it was built from."""
+    if manifest.get("source_sha256") == current:
+        return
+    which = "the rollback firmware was built from a different configuration, and " if previous else ""
+    raise RenderError(
+        f"refusing to flash: configuration changed since this firmware was built; run "
+        f"'vesselstackctl display build {display_id}' ({which}the upload would use today's "
+        "project, not the one that was compiled). Pass --force to flash it anyway")
+
+
 def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream, serial,
                   force: bool = False) -> None:
     image = render.pinned_image()
@@ -606,33 +631,34 @@ def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream,
             raise RenderError(f"{dd.path} still has the old directory layout: run "
                               f"'vesselstackctl display render {display_id}' once to migrate it "
                               "(stored firmware is kept)")
-        if not render._exists(dd.display_fd, render.PROJECT_DIR):
-            raise RenderError(f"the project for {display_id} is missing: run "
-                              f"'vesselstackctl display build {display_id}' first")
         data, manifest = load_firmware(dd, directory, name)
-        mount = _check_mount_path(dd.path / render.PROJECT_DIR)
-        project_fd = _open_existing(dd.display_fd, render.PROJECT_DIR, mount)
-        try:
-            has_secrets = render._exists(project_fd, "secrets.yaml")
-        finally:
-            os.close(project_fd)
-    if not has_secrets:
-        raise RenderError(f"{mount}/secrets.yaml is missing (display wifi --clear removes it): "
-                          f"run 'vesselstackctl display render {display_id}' first")
+    # project/ was writable by the compile container, so it is never mounted for the
+    # upload: re-render the project from displays.json + registry + secrets (deterministic)
+    # into a fresh private staging dir and mount that instead.
+    reason = None
+    rendered = None
+    try:
+        rendered = render.collect(ctx, display_id)  # may generate a missing OTA password
+    except (RenderError, lifecycle.LifecycleError) as exc:
+        reason = str(exc)
     if not force:
-        check_credentials(ctx, display_id, manifest, previous)
+        current = secrets_fingerprint(rendered.files, display_id) if rendered else None
+        check_credentials(manifest, display_id, previous, current, reason)
+        check_source(manifest, display_id, previous, source_hash(rendered.files, display_id))
+    elif rendered is None:
+        raise RenderError(f"cannot render the project to flash from: {reason}")
     if not _image_present(ctx, image):
         raise RenderError(f"the ESPHome image {image.split('@', 1)[0]} is not present locally and "
                           "flashing never pulls it; run "
                           f"'vesselstackctl display build {display_id}' first")
     label = "rollback firmware" if previous else "firmware"
-    with staged_firmware(ctx, data, manifest["files"][name]["sha256"]) as staged:
+    with staged_firmware(ctx, data, manifest["files"][name]["sha256"], rendered) as (staged, config):
         argv = ["docker", "run", "--rm", "--pull", "never", *CONTAINER_FLAGS, *UPLOAD_SCRATCH_FLAGS]
-        if device:
-            argv += ["--device", device]
-        else:
+        if device:  # USB: the device is passed in; the container needs no network at all
+            argv += ["--network", "none", "--device", device]
+        else:  # OTA must reach the display on the LAN
             argv += ["--network", "host"]
-        argv += ["-v", f"{mount}:/config:ro", "-v", f"{staged}:/fw.bin:ro",
+        argv += ["-v", f"{config}:/config:ro", "-v", f"{staged}:/fw.bin:ro",
                  image, "upload", f"/config/{display_id}.yaml",
                  "--device", device or host, "--file", "/fw.bin"]
         ctx.out(f"Flashing {label} built {manifest.get('built_at_utc', 'at an unknown time')} "
