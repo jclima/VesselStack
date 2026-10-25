@@ -433,6 +433,154 @@ class MqttAuthTests(unittest.TestCase):
         self.assertEqual(mqtt_auth.find_image(self.root), "eclipse-mosquitto:9.9.9-alpine")
         self.assertRegex(mqtt_auth.find_image(ROOT), r"^eclipse-mosquitto:")
 
+    # --- hardening: trailing newlines, leftovers, hashing container -------------
+
+    def test_trailing_newline_usernames_rejected(self):
+        for name in ("homeassistant\n", "bad\n"):
+            with self.assertRaises(mqtt_auth.MqttAuthError):
+                mqtt_auth._check_username("MQTT_USERNAME", name)
+        self.assertEqual(mqtt_auth._check_username("MQTT_USERNAME", "ok-user_1.x"), "ok-user_1.x")
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync(DISPLAYS_BRIDGE_MQTT_USERNAME="bridge\n")
+
+    def test_hashing_container_is_locked_down(self):
+        _, runner = self.run_sync()
+        run = next(c for c in runner.calls if c[:2] == ["docker", "run"])
+        flags = " ".join(run)
+        self.assertIn("--network none", flags)
+        self.assertIn("--cap-drop ALL", flags)
+        self.assertIn("--cap-add CHOWN", flags)
+        self.assertEqual([a for i, a in enumerate(run) if run[i - 1] == "--cap-add"], ["CHOWN"])
+        self.assertIn("umask 077", run[-1])
+        self.assertLess(run[-1].index("chmod 0600"), run[-1].index("chown 1883:1883"))
+
+    def test_mosquitto_passwd_leftovers_are_removed_on_success_and_failure(self):
+        inner = FakeRunner()
+        mdir = self.mdir
+
+        def leaving(argv):
+            if argv[:2] == ["docker", "run"]:
+                (mdir / "passwords.new.backup.AbC123").write_text("u:plaintext\n")
+                (mdir / "passwords.new.new").write_text("u:plaintext\n")
+            return inner(argv)
+        self.run_sync(runner=leaving)
+        self.assertEqual(sorted(p.name for p in mdir.iterdir() if "new" in p.name), [])
+
+        def failing(argv):
+            if argv[:2] == ["docker", "run"]:
+                (mdir / "passwords.new.backup.XyZ789").write_text("u:plaintext\n")
+                return subprocess.CompletedProcess(argv, 1, "", "boom")
+            return inner(argv)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.run_sync(runner=failing)
+        self.assertEqual(sorted(p.name for p in mdir.iterdir() if "new" in p.name), [])
+
+    def test_stale_plaintext_leftovers_are_removed_before_a_sync(self):
+        self.run_sync()
+        stale = self.mdir / "passwords.new.backup.OLD000"
+        stale.write_text("u:plaintext\n")
+        self.run_sync()
+        self.assertFalse(stale.exists())
+
+    # --- lock ---------------------------------------------------------------------
+
+    def test_config_lock_is_exclusive_and_times_out(self):
+        with mqtt_auth.config_lock(self.root):
+            with self.assertRaises(mqtt_auth.MqttAuthError) as caught:
+                with mqtt_auth.config_lock(self.root, timeout=0.2):
+                    pass
+            self.assertIn("another displayctl", str(caught.exception))
+        with mqtt_auth.config_lock(self.root, timeout=0.2):
+            pass
+
+    def test_config_lock_creates_a_missing_config_directory(self):
+        fresh = Path(self._tmp.name) / "fresh"
+        fresh.mkdir()
+        with mqtt_auth.config_lock(fresh):
+            self.assertTrue((fresh / "config" / mqtt_auth.LOCK_NAME).exists())
+
+    # --- preflight ------------------------------------------------------------------
+
+    def preflight(self, runner=None, mode="none", **env):
+        return mqtt_auth.preflight(self.root, self.env(**env), runner=runner or FakeRunner(),
+                                   image_mode=mode)
+
+    def test_preflight_passes_and_changes_nothing(self):
+        write_displays(self.config, ["helm"])
+        runner = FakeRunner()
+        self.assertEqual(self.preflight(runner, mode="check"), [])
+        self.assertFalse((self.root / "config" / mqtt_auth.LOCK_NAME).exists())
+        self.assertFalse(self.mdir.exists())
+        self.assertFalse((self.root / "config" / mqtt_auth.SECRETS_NAME).exists())
+        self.assertEqual([c[:3] for c in runner.calls], [["docker", "image", "inspect"]])
+
+    def test_preflight_rejects_unusable_admin_passwords(self):
+        for bad in ("a:b", " lead", "trail ", "x\ny"):
+            with self.assertRaises(mqtt_auth.MqttAuthError, msg=repr(bad)):
+                self.preflight(MQTT_PASSWORD=bad)
+        # Values the installer replaces with a generated secret are fine.
+        self.preflight(MQTT_PASSWORD="GENERATE")
+        self.preflight(MQTT_PASSWORD="")
+
+    def test_preflight_rejects_collisions_and_bad_names(self):
+        write_displays(self.config, ["helm"])
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.preflight(DISPLAYS_BRIDGE_MQTT_USERNAME="homeassistant")
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.preflight(MQTT_USERNAME="vsdisp-helm")
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.preflight(DISPLAYS_BRIDGE_MQTT_USERNAME="bad name")
+        # The bridge name only matters when displays are enabled.
+        self.preflight(enabled="false", DISPLAYS_BRIDGE_MQTT_USERNAME="homeassistant")
+
+    def test_preflight_rejects_invalid_displays_json_only_when_enabled(self):
+        self.config.write_text("{not json")
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.preflight()
+        self.preflight(enabled="false")
+        self.config.unlink()
+        self.preflight()  # no file yet: nothing to validate
+
+    def test_preflight_image_modes(self):
+        class Absent(FakeRunner):
+            registry = True
+
+            def __call__(self, argv):
+                self.calls.append(list(argv))
+                if argv[:3] == ["docker", "image", "inspect"]:
+                    return subprocess.CompletedProcess(argv, 1, "", "")
+                if argv[:3] == ["docker", "manifest", "inspect"]:
+                    return subprocess.CompletedProcess(argv, 0 if self.registry else 1, "", "")
+                if argv[:2] == ["docker", "pull"]:
+                    return subprocess.CompletedProcess(argv, 0 if self.registry else 1, "", "offline")
+                return super().__call__(argv)
+        online = Absent()
+        warnings = self.preflight(online, mode="check")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("will be pulled", warnings[0])
+        self.assertFalse(any(c[:2] in (["docker", "pull"], ["docker", "run"]) for c in online.calls))
+        offline = Absent()
+        offline.registry = False
+        with self.assertRaises(mqtt_auth.MqttAuthError) as caught:
+            self.preflight(offline, mode="check")
+        self.assertIn("docker pull eclipse-mosquitto:9.9.9-alpine", str(caught.exception))
+        self.assertFalse(any(c[:2] == ["docker", "pull"] for c in offline.calls))
+        pulled = Absent()
+        self.preflight(pulled, mode="pull")
+        self.assertIn(["docker", "pull", "eclipse-mosquitto:9.9.9-alpine"], pulled.calls)
+        with self.assertRaises(mqtt_auth.MqttAuthError):
+            self.preflight(offline, mode="pull")
+
+    def test_compose_argument_overrides_the_installed_definition(self):
+        other = Path(self._tmp.name) / "release-compose.yml"
+        other.write_text("services:\n  mosquitto:\n    image: eclipse-mosquitto:8.8.8-alpine\n")
+        self.assertEqual(mqtt_auth.find_image(self.root, other), "eclipse-mosquitto:8.8.8-alpine")
+        runner = FakeRunner()
+        mqtt_auth.sync(self.root, self.data, self.env(), runner=runner, dir_owner=None,
+                       file_owner=None, compose=other)
+        run = next(c for c in runner.calls if c[:2] == ["docker", "run"])
+        self.assertIn("eclipse-mosquitto:8.8.8-alpine", run)
+
 
 if __name__ == "__main__":
     unittest.main()

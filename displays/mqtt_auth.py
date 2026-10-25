@@ -7,6 +7,9 @@ per display are added. Passwords are hashed inside the pinned Mosquitto image
 """
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import re
@@ -14,6 +17,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -39,18 +43,32 @@ AUTH_DIR_NAME = "mosquitto-auth"
 CONTAINER = "vesselstack-mosquitto"
 DEFAULT_BRIDGE_USERNAME = "vesselstack-bridge"
 DISPLAY_USER_PREFIX = "vsdisp-"
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")  # always used with fullmatch
 IMAGE_RE = re.compile(r"^\s*image:\s*(eclipse-mosquitto:\S+)\s*$", re.M)
 SECRETS_NAME = "displays.secrets.json"
 ROOT_TOPIC = "vesselstack/v1"
+LOCK_NAME = ".displays.lock"
+LOCK_TIMEOUT_S = 10.0
+CONFIG_OWNER = (0, 0)
+# mosquitto_passwd -U works on a copy: "<file>.backup.XXXXXX" (plaintext!) and
+# "<file>.new". Anything that starts with this prefix is a possible plaintext
+# leftover and is removed on every outcome.
+PLAINTEXT_PREFIX = "passwords.new."
 
+# umask 077 keeps every file mosquitto_passwd creates private. chmod runs before
+# chown so only CHOWN is needed (a root process may chmod its own file). Leftover
+# plaintext is removed by the trap on failure and by the host side afterwards.
 HASH_SCRIPT = (
-    "set -e; "
+    "set -e; umask 077; "
+    "trap 'rm -f /auth/passwords.new /auth/passwords.new.*' EXIT; "
     "mosquitto_passwd -U /auth/passwords.new; "
-    "chown 1883:1883 /auth/passwords.new; "
     "chmod 0600 /auth/passwords.new; "
+    "chown 1883:1883 /auth/passwords.new; "
     "mv -f /auth/passwords.new /auth/passwords"
 )
+# The hashing container needs no network and only the CHOWN capability.
+HASH_DOCKER_FLAGS = ["--network", "none", "--cap-drop", "ALL", "--cap-add", "CHOWN",
+                     "--security-opt", "no-new-privileges"]
 
 
 class MqttAuthError(Exception):
@@ -65,13 +83,21 @@ def default_runner(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, check=False, capture_output=True, text=True)
 
 
-def find_image(root: Path) -> str:
-    """The Mosquitto image is pinned once, in compose.yml; read it from there."""
-    candidates = [
-        root / "compose.yml",
-        root / "installer" / "templates" / "compose.yml",
-        Path(__file__).resolve().parent.parent / "templates" / "compose.yml",
-    ]
+def find_image(root: Path, compose: Path | None = None) -> str:
+    """The Mosquitto image is pinned once, in compose.yml; read it from there.
+
+    ``compose`` names the definition about to be installed (the installer passes
+    the release's template, because the installed compose.yml is still the old
+    one while the sync runs); otherwise the installed copy is used.
+    """
+    if compose is not None:
+        candidates = [Path(compose)]
+    else:
+        candidates = [
+            root / "compose.yml",
+            root / "installer" / "templates" / "compose.yml",
+            Path(__file__).resolve().parent.parent / "templates" / "compose.yml",
+        ]
     for path in candidates:
         try:
             match = IMAGE_RE.search(path.read_text(encoding="utf-8"))
@@ -98,7 +124,7 @@ def _check_password(label: str, value) -> str:
 
 
 def _check_username(label: str, value) -> str:
-    if not isinstance(value, str) or not USERNAME_RE.match(value):
+    if not isinstance(value, str) or not USERNAME_RE.fullmatch(value):
         raise MqttAuthError(
             f"{label} must match ^[A-Za-z0-9_.-]{{1,64}}$ (letters, numbers, dot, underscore, hyphen)")
     return value
@@ -380,6 +406,16 @@ def _cleanup(dir_fd: int, *names: str) -> None:
             pass
 
 
+def _cleanup_plaintext(dir_fd: int) -> None:
+    """Remove passwords.new and every leftover mosquitto_passwd made from it."""
+    try:
+        names = os.listdir(dir_fd)
+    except OSError:
+        return
+    _cleanup(dir_fd, "passwords.new",
+             *(name for name in names if name.startswith(PLAINTEXT_PREFIX)))
+
+
 def write_broker_files(root: Path, accounts: list[dict], image: str,
                        runner=default_runner, dir_owner=DIR_OWNER,
                        file_owner=FILE_OWNER, plaintext_owner=PLAINTEXT_OWNER) -> None:
@@ -387,7 +423,9 @@ def write_broker_files(root: Path, accounts: list[dict], image: str,
 
     The directory is root:1883 0750 and mounted read-only into the broker; the
     final files are 1883:1883 0600. The temporary plaintext list passwords.new
-    is root:root 0600 and is removed on any failure. Nothing under the
+    (and any ``passwords.new.*`` file mosquitto_passwd derives from it, such as
+    its ``.backup.XXXXXX`` copy) is root:root 0600 and is removed on every
+    outcome. Nothing under the
     broker-writable data directory is touched.
     """
     owner = _owner(file_owner)
@@ -399,6 +437,7 @@ def write_broker_files(root: Path, accounts: list[dict], image: str,
                      "passwords", "passwords.new", "passwords.prev", "passwords.prev.tmp"):
             _require_regular_or_absent(name, dir_fd)
         try:
+            _cleanup_plaintext(dir_fd)  # leftovers of an earlier interrupted run
             _write_new("acl.new", render_acl(accounts).encode("utf-8"), dir_fd, FILE_MODE, owner)
             # Plaintext is root:root 0600 (never the broker's uid) until the root
             # hashing container hashes it and hands over only the hashed file.
@@ -406,7 +445,8 @@ def write_broker_files(root: Path, accounts: list[dict], image: str,
                        dir_fd, 0o600, plain_owner)
             _keep_previous("acl", dir_fd, owner)
             _keep_previous("passwords", dir_fd, owner)
-            result = runner(["docker", "run", "--rm", "--entrypoint", "/bin/sh",
+            result = runner(["docker", "run", "--rm", *HASH_DOCKER_FLAGS,
+                             "--entrypoint", "/bin/sh",
                              "-v", f"{auth}:/auth", image, "-c", HASH_SCRIPT])
             if result.returncode != 0:
                 detail = (result.stderr or "").strip().splitlines()
@@ -418,8 +458,10 @@ def write_broker_files(root: Path, accounts: list[dict], image: str,
             os.replace("acl.new", "acl", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             _secure_existing("acl", dir_fd, owner)
         except BaseException:
-            _cleanup(dir_fd, "acl.new", "passwords.new", "acl.prev.tmp", "passwords.prev.tmp")
+            _cleanup(dir_fd, "acl.new", "acl.prev.tmp", "passwords.prev.tmp")
+            _cleanup_plaintext(dir_fd)
             raise
+        _cleanup_plaintext(dir_fd)
     finally:
         os.close(dir_fd)
 
@@ -451,7 +493,8 @@ def ensure_image(image: str, runner=default_runner) -> None:
 
 def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | None = None,
          image: str | None = None, runner=default_runner,
-         dir_owner=DIR_OWNER, file_owner=FILE_OWNER, container: str = CONTAINER) -> dict:
+         dir_owner=DIR_OWNER, file_owner=FILE_OWNER, container: str = CONTAINER,
+         compose: Path | None = None) -> dict:
     """Render and install ACL + passwords from env values; returns a summary.
 
     ``data_dir`` is accepted for compatibility and deliberately unused: the
@@ -468,7 +511,7 @@ def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | N
     admin_user = _check_username("MQTT_USERNAME", env.get("MQTT_USERNAME", ""))
     _check_password("MQTT_PASSWORD", env.get("MQTT_PASSWORD", ""))
     display_ids = load_display_ids(displays_config, enabled)
-    image = image or find_image(root)
+    image = image or find_image(root, compose)
     ensure_image(image, runner)
     secret_path = root / "config" / SECRETS_NAME
     secret_data = ensure_secrets(secret_path, display_ids, enabled) if enabled else \
@@ -479,3 +522,106 @@ def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | N
     reloaded = reload_broker(runner, container)
     return {"enabled": enabled, "accounts": len(accounts), "displays": len(display_ids),
             "reloaded": reloaded}
+
+
+# --- configuration lock ------------------------------------------------------
+# One exclusive flock on config/.displays.lock serialises every writer of
+# displays.json, displays.secrets.json and the MQTT access files: the lifecycle
+# commands, sync-mqtt (installer, Control Panel Apply) and bridge-env.
+
+def acquire_lock(config_fd: int, timeout: float = LOCK_TIMEOUT_S) -> int:
+    """Take the exclusive lock relative to a no-follow config directory fd.
+
+    Returns the lock fd; closing it releases the lock. Refuses a lock path that
+    is not a regular file and never follows a symlink.
+    """
+    try:
+        info = os.lstat(LOCK_NAME, dir_fd=config_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MqttAuthError(f"refusing to use {LOCK_NAME}: it is not a regular file")
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=config_fd)
+    except OSError as exc:
+        raise MqttAuthError(f"cannot open lock file {LOCK_NAME}: {exc.strerror}") from exc
+    owner = _owner(CONFIG_OWNER)
+    try:
+        if owner:
+            os.fchown(fd, *owner)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise MqttAuthError(
+                        "another displayctl command is changing the display configuration "
+                        f"(waited {timeout:g}s); try again shortly") from None
+                time.sleep(0.1)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def config_lock(root: Path, timeout: float = LOCK_TIMEOUT_S):
+    """Hold the configuration lock for ``$ROOT/config`` (created if missing)."""
+    config = root / "config"
+    _check_dir_component(config, "configuration directory", True, 0o755)
+    config_fd = os.open(config, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    lock_fd = -1
+    try:
+        lock_fd = acquire_lock(config_fd, timeout)
+        yield
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(config_fd)
+
+
+# --- preflight ---------------------------------------------------------------
+
+def preflight(root: Path, env: dict, compose: Path | None = None,
+              displays_config: Path | None = None, image: str | None = None,
+              image_mode: str = "none", runner=default_runner) -> list[str]:
+    """Read-only validation of everything sync would reject; returns warnings.
+
+    Raises MqttAuthError for the first problem. Nothing is written, locked or
+    started. ``image_mode``: ``none`` skips the image; ``check`` requires it to
+    be local, or at least pullable (``docker manifest inspect``); ``pull`` pulls
+    a missing image now (before the installer changes anything).
+    """
+    warnings: list[str] = []
+    enabled_text = env.get("DISPLAYS_ENABLE", "false")
+    if enabled_text not in ("true", "false"):
+        raise MqttAuthError("DISPLAYS_ENABLE must be true or false")
+    enabled = enabled_text == "true"
+    admin_user = _check_username("MQTT_USERNAME", env.get("MQTT_USERNAME", ""))
+    password = env.get("MQTT_PASSWORD", "")
+    if password and password != "GENERATE":  # an empty/GENERATE value is replaced by a safe one
+        _check_password("MQTT_PASSWORD", password)
+    bridge_user = env.get("DISPLAYS_BRIDGE_MQTT_USERNAME") or DEFAULT_BRIDGE_USERNAME
+    if displays_config is None:
+        displays_config = root / "config" / "displays.json"
+    display_ids = load_display_ids(displays_config, enabled)
+    placeholder = {"bridge": {"mqtt_password": "x"},
+                   "displays": {i: {"mqtt_password": "x"} for i in display_ids}}
+    build_accounts(admin_user, "x", enabled, bridge_user, display_ids, placeholder)
+    if image_mode != "none":
+        image = image or find_image(root, compose)
+        if image_mode == "pull":
+            ensure_image(image, runner)
+        elif runner(["docker", "image", "inspect", image]).returncode != 0:
+            if runner(["docker", "manifest", "inspect", image]).returncode == 0:
+                warnings.append(f"the Mosquitto image {image} is not local yet and will be "
+                                "pulled when the installer runs")
+            else:
+                raise MqttAuthError(
+                    f"the Mosquitto image {image} is not available locally and the registry "
+                    f"cannot be reached; run 'docker pull {image}' while online (or load it "
+                    "with 'docker load'), then run the installer again")
+    return warnings

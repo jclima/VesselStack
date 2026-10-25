@@ -99,6 +99,17 @@ start_stack() {
         sync_mqtt_access
     fi
     "${COMPOSE[@]}" up -d
+    # A changed compose definition is recreated by "up -d"; a changed Mosquitto
+    # configuration file alone is not, so compare with the last applied stamp.
+    local conf="$VESSELSTACK_ROOT/config/mosquitto/mosquitto.conf"
+    local stamp="$VESSELSTACK_ROOT/config/.mosquitto-conf.sha256" conf_hash=
+    if [ -r "$conf" ]; then
+        conf_hash=$(sha256sum "$conf" | cut -d' ' -f1)
+        if [ -r "$stamp" ] && [ "$(<"$stamp")" != "$conf_hash" ]; then
+            "${COMPOSE[@]}" up -d --force-recreate mosquitto
+        fi
+        printf '%s\n' "$conf_hash" > "$stamp"
+    fi
     [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
         echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
         return 1

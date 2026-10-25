@@ -33,7 +33,8 @@ install -d -m 0755 "$ROOT/config"
 install -d -m 0750 "$DATA"
 install -d -m 0750 "$PDIR"
 install -m 0644 "$REPO_ROOT/templates/compose.yml" "$ROOT/compose.yml"
-install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto.conf"
+install -d -m 0755 "$ROOT/config/mosquitto"
+install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto/mosquitto.conf"
 
 cleanup() {
     docker rm -f "$BROKER" "$BROKER-sub" >/dev/null 2>&1 || true
@@ -182,7 +183,7 @@ wait_ready() {
 }
 start_broker() {
     docker run -d --name "$BROKER" --network "$NETWORK" \
-        -v "$ROOT/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
+        -v "$ROOT/config/mosquitto:/mosquitto/config:ro" \
         -v "$PDIR:/mosquitto/data" \
         -v "$AUTH_SRC:/mosquitto/auth:ro" "$IMAGE" >/dev/null
     wait_ready

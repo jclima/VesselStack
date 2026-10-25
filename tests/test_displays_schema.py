@@ -42,6 +42,20 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(schema.validate_config(EXAMPLE, REGISTRY), [])
         self.assertEqual(schema.validate_registry(REGISTRY), [])
 
+    def test_trailing_newlines_are_never_accepted(self) -> None:
+        for pattern in (schema.INSTRUMENT_ID, schema.DISPLAY_ID, schema.BOARD_ID,
+                        schema.LAYOUT_ID, schema.SK_PATH, schema.HOST_LABEL):
+            self.assertTrue(pattern.pattern)  # patterns are always applied with fullmatch
+        self.assertIsNone(schema.DISPLAY_ID.fullmatch("ab\n"))
+        self.assertTrue(schema.DISPLAY_ID.fullmatch("ab"))
+
+        def rename(cfg, old, new, key):
+            cfg[key][new] = cfg[key].pop(old)
+        self.assertError(lambda c: rename(c, "helm", "helm\n", "displays"), "helm")
+        self.assertError(lambda c: rename(c, "sog", "sog\n", "instruments"), "sog")
+        self.assertError(lambda c: inst(c).update(path="navigation.speedOverGround\n"), "path")
+        self.assertError(lambda c: c.update(mqtt_host="boat.local\n"), "$.mqtt_host")
+
     def test_top_level_rules(self) -> None:
         self.assertError(lambda c: c.update(schema=2), "$.schema")
         self.assertError(lambda c: c.update(schema=True), "$.schema")

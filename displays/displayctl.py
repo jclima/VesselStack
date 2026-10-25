@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import pwd
 import sys
 from pathlib import Path
 
@@ -52,9 +51,13 @@ def cmd_sync_mqtt(args) -> int:
            ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
             "DISPLAYS_BRIDGE_MQTT_USERNAME") if key in os.environ}
     try:
-        summary = mqtt_auth.sync(Path(root_text), Path(data_text), env,
-                                 displays_config=Path(args.config) if args.config else None,
-                                 image=args.image, container=args.container)
+        # The same lock as the lifecycle commands: a Control Panel Apply cannot
+        # interleave with a concurrent "displayctl add".
+        with mqtt_auth.config_lock(Path(root_text)):
+            summary = mqtt_auth.sync(Path(root_text), Path(data_text), env,
+                                     displays_config=Path(args.config) if args.config else None,
+                                     image=args.image, container=args.container,
+                                     compose=Path(args.compose) if args.compose else None)
     except (mqtt_auth.MqttAuthError, OSError) as exc:
         print(f"error: sync-mqtt failed: {exc}", file=sys.stderr)
         return 1
@@ -62,6 +65,30 @@ def cmd_sync_mqtt(args) -> int:
           f"{summary['displays']} display(s), displays "
           f"{'enabled' if summary['enabled'] else 'disabled'}, "
           f"broker {'reloaded' if summary['reloaded'] else 'not running'}")
+    return 0
+
+
+def cmd_preflight(args) -> int:
+    """Read-only checks the installer runs before it changes anything."""
+    root_text = args.root or os.environ.get("VESSELSTACK_ROOT", "")
+    if not root_text:
+        print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
+        return 2
+    env = {key: os.environ[key] for key in
+           ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME") if key in os.environ}
+    mode = "pull" if args.pull_image else "check" if args.check_image else "none"
+    try:
+        warnings = mqtt_auth.preflight(
+            Path(root_text), env, compose=Path(args.compose) if args.compose else None,
+            displays_config=Path(args.config) if args.config else None,
+            image=args.image, image_mode=mode)
+    except (mqtt_auth.MqttAuthError, OSError) as exc:
+        print(f"error: MQTT access preflight failed: {exc}", file=sys.stderr)
+        return 1
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    print("MQTT access preflight passed")
     return 0
 
 
@@ -92,7 +119,11 @@ def render_bridge_env(root: Path, env: dict, bridge_password: str) -> str:
 
 
 def cmd_bridge_env(args) -> int:
-    """Write the bridge's systemd EnvironmentFile (0600) without secrets on argv."""
+    """Write the bridge's systemd EnvironmentFile (root:root 0600) without secrets on argv.
+
+    systemd (PID 1, root) reads EnvironmentFile= before it drops to the service
+    user, so the service user never needs read access to this secret-bearing file.
+    """
     root_text = args.root or os.environ.get("VESSELSTACK_ROOT", "")
     if not root_text:
         print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
@@ -102,16 +133,18 @@ def cmd_bridge_env(args) -> int:
            ("SIGNALK_URL", "MQTT_PORT", "DISPLAYS_BRIDGE_MQTT_USERNAME",
             "DISPLAYS_SIGNALK_TOKEN") if key in os.environ}
     try:
-        secrets_data = mqtt_auth.load_secrets(root / "config" / mqtt_auth.SECRETS_NAME)
-        password = secrets_data["bridge"].get("mqtt_password")
-        if not isinstance(password, str) or not password:
-            raise ValueError("no bridge MQTT password yet; run sync-mqtt with DISPLAYS_ENABLE=true first")
-        text = render_bridge_env(root, env, password)
-        owner = pwd.getpwnam(args.owner) if args.owner else None
         output = Path(args.output)
-        mqtt_auth.write_atomic(output, text, 0o600)
-        if owner is not None:
-            os.chown(output, owner.pw_uid, owner.pw_gid)
+        with mqtt_auth.config_lock(root):
+            secrets_data = mqtt_auth.load_secrets(root / "config" / mqtt_auth.SECRETS_NAME)
+            password = secrets_data["bridge"].get("mqtt_password")
+            if not isinstance(password, str) or not password:
+                raise ValueError(
+                    "no bridge MQTT password yet; run sync-mqtt with DISPLAYS_ENABLE=true first")
+            text = render_bridge_env(root, env, password)
+            mqtt_auth.write_atomic(output, text, 0o600)
+            owner = mqtt_auth._owner(mqtt_auth.CONFIG_OWNER)
+            if owner:
+                os.chown(output, *owner)
     except (mqtt_auth.MqttAuthError, OSError, ValueError, KeyError) as exc:
         print(f"error: bridge-env failed: {exc}", file=sys.stderr)
         return 1
@@ -182,13 +215,24 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--data", help="VESSELSTACK_DATA (default: environment)")
     sync.add_argument("--config", help="displays.json (default: $ROOT/config/displays.json)")
     sync.add_argument("--image", help="override the pinned Mosquitto image")
+    sync.add_argument("--compose", help="compose.yml that pins the image (default: the installed one)")
     sync.add_argument("--container", default=mqtt_auth.CONTAINER,
                       help=argparse.SUPPRESS)  # integration tests use a unique broker name
     sync.set_defaults(func=cmd_sync_mqtt)
+    preflight = sub.add_parser("preflight", help="read-only checks before an install or update")
+    preflight.add_argument("--root", help="VESSELSTACK_ROOT (default: environment)")
+    preflight.add_argument("--config", help="displays.json (default: $ROOT/config/displays.json)")
+    preflight.add_argument("--compose", help="compose.yml that pins the image")
+    preflight.add_argument("--image", help="override the pinned Mosquitto image")
+    group = preflight.add_mutually_exclusive_group()
+    group.add_argument("--check-image", action="store_true",
+                       help="require the Mosquitto image to be local or pullable; never pulls")
+    group.add_argument("--pull-image", action="store_true",
+                       help="pull the Mosquitto image now when it is missing")
+    preflight.set_defaults(func=cmd_preflight)
     bridge_env = sub.add_parser("bridge-env", help="write the displays bridge environment file")
     bridge_env.add_argument("--root", help="VESSELSTACK_ROOT (default: environment)")
     bridge_env.add_argument("--output", required=True, help="file to write (mode 0600)")
-    bridge_env.add_argument("--owner", help="user that will own the file")
     bridge_env.set_defaults(func=cmd_bridge_env)
     def lifecycle_parser(name, help_text, func, with_id=False):
         parser_ = sub.add_parser(name, help=help_text)

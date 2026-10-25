@@ -36,7 +36,8 @@ PDIR="$DATA/mosquitto"
 install -d -m 0755 "$ROOT/config" "$ROOT/displays"
 install -d -m 0750 "$DATA" "$PDIR"
 install -m 0644 "$REPO_ROOT/templates/compose.yml" "$ROOT/compose.yml"
-install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto.conf"
+install -d -m 0755 "$ROOT/config/mosquitto"
+install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto/mosquitto.conf"
 
 if [ "$IS_ROOT" -eq 1 ]; then AUTH_SRC="$MDIR"; else AUTH_SRC="$BROKER-auth"; fi
 
@@ -117,7 +118,7 @@ docker run --rm -v "$VENV_VOL:/venv" -v "$REPO_ROOT/displays/requirements.txt:/r
     >/dev/null || fail "could not install displays/requirements.txt"
 
 docker run -d --name "$BROKER" --network "$NETWORK" \
-    -v "$ROOT/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
+    -v "$ROOT/config/mosquitto:/mosquitto/config:ro" \
     -v "$PDIR:/mosquitto/data" -v "$AUTH_SRC:/mosquitto/auth:ro" "$IMAGE" >/dev/null
 for _ in $(seq 1 30); do
     client mosquitto_sub -h "$BROKER" -u "$ADMIN_USER" -P "$ADMIN_PASS" -t '$SYS/broker/version' \

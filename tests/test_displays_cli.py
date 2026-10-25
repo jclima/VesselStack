@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -157,6 +158,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         with self.assertRaises(lifecycle.LifecycleError):
             self.add("Bad_ID")
+        with self.assertRaises(lifecycle.LifecycleError):
+            self.add("helm\n")  # a trailing newline is not a valid id
         self.assertEqual(self.cfg()["displays"], {})
 
     def test_add_with_zero_instruments_refused(self):
@@ -409,6 +412,64 @@ class CliTests(unittest.TestCase):
         self.add("helm")
         lock = self.root / "config" / lifecycle.LOCK_NAME
         self.assertEqual(oct(lock.stat().st_mode & 0o777), "0o600")
+
+    def test_sync_mqtt_and_bridge_env_take_the_same_lock(self):
+        self.add("helm")
+        fd = self.hold_lock()
+        env = {"MQTT_USERNAME": "homeassistant", "MQTT_PASSWORD": ADMIN_PASSWORD,
+               "DISPLAYS_ENABLE": "true", "SIGNALK_URL": "http://127.0.0.1:3000"}
+        real = mqtt_auth.acquire_lock
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(mqtt_auth, "acquire_lock",
+                                  lambda config_fd, timeout=10: real(config_fd, 0.2)), \
+                mock.patch.object(mqtt_auth, "default_runner", self.runner):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = displayctl.main(["sync-mqtt", "--root", str(self.root),
+                                        "--data", str(self.root / "d"),
+                                        "--image", "eclipse-mosquitto:9.9.9-alpine"])
+            self.assertEqual(code, 1)
+            self.assertIn("another displayctl", err.getvalue())
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = displayctl.main(["bridge-env", "--root", str(self.root),
+                                        "--output", str(self.root / "config" / "b.env")])
+            self.assertEqual(code, 1)
+            self.assertIn("another displayctl", err.getvalue())
+        self.assertFalse((self.root / "config" / "b.env").exists())
+        os.close(fd)
+
+    def test_bridge_env_is_root_owned_0600(self):
+        self.add("helm")
+        out = self.root / "config" / "displays-bridge.env"
+        env = {"SIGNALK_URL": "http://127.0.0.1:3000"}
+        chowns = []
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(mqtt_auth.os, "geteuid", return_value=0), \
+                mock.patch.object(displayctl.os, "chown",
+                                  lambda path, uid, gid: chowns.append((str(path), uid, gid))), \
+                mock.patch.object(mqtt_auth.os, "fchown", lambda *a: None):
+            with redirect_stdout(io.StringIO()):
+                code = displayctl.main(["bridge-env", "--root", str(self.root),
+                                        "--output", str(out)])
+        self.assertEqual(code, 0)
+        self.assertEqual(oct(out.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(chowns, [(str(out), 0, 0)])
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                displayctl.build_parser().parse_args(["bridge-env", "--output", "x", "--owner", "u"])
+
+    def test_preflight_command(self):
+        env = {"MQTT_USERNAME": "homeassistant", "MQTT_PASSWORD": "a:b", "DISPLAYS_ENABLE": "true"}
+        with mock.patch.dict(os.environ, env):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(displayctl.main(["preflight", "--root", str(self.root)]), 1)
+            self.assertIn("preflight failed", err.getvalue())
+            self.assertFalse((self.root / "config" / lifecycle.LOCK_NAME).exists())
+        env["MQTT_PASSWORD"] = "fine-password"
+        with mock.patch.dict(os.environ, env), redirect_stdout(io.StringIO()):
+            self.assertEqual(displayctl.main(["preflight", "--root", str(self.root)]), 0)
 
     def test_symlinked_lock_file_refused(self):
         target = Path(self._tmp.name) / "elsewhere"

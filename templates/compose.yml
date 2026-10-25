@@ -88,7 +88,7 @@ services:
     ports:
       - "${MQTT_PORT:-1883}:1883"
     volumes:
-      - ${VESSELSTACK_ROOT}/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ${VESSELSTACK_ROOT}/config/mosquitto:/mosquitto/config:ro
       - ${VESSELSTACK_DATA}/mosquitto:/mosquitto/data
       - ${VESSELSTACK_ROOT}/config/mosquitto-auth:/mosquitto/auth:ro
 

@@ -497,8 +497,19 @@ Where the files live and who owns them:
 
 | Path | Owner | Mode | Notes |
 | --- | --- | --- | --- |
+| `$VESSELSTACK_ROOT/config/mosquitto/` | `root:root` | `0755` | mounted **read-only** as a directory at `/mosquitto/config`; holds `mosquitto.conf` (`root:root` `0644`) |
 | `$VESSELSTACK_ROOT/config/mosquitto-auth/` | `root:1883` | `0750` | mounted **read-only** into the broker at `/mosquitto/auth` |
 | `acl`, `passwords`, `acl.prev`, `passwords.prev` inside it | `1883:1883` | `0600` | the broker's user owns them, as Mosquitto expects |
+| `$VESSELSTACK_ROOT/config/mosquitto.conf` (legacy) | unchanged | unchanged | no longer written or mounted by this release; left in place so a container created by an older release (and a downgrade) keeps working |
+
+The Mosquitto configuration moved from the single-file mount
+`config/mosquitto.conf` to the directory `config/mosquitto/` on purpose: a
+single-file bind mount keeps pointing at the inode it was created with, and
+`restart: unless-stopped` re-resolves the bind source on every restart, so
+replacing that file under a still-running old container would send it into a
+crash loop (it would load the new configuration without the `/mosquitto/auth`
+mount). The installer refuses a symlinked `config/mosquitto` (or
+`mosquitto.conf` inside it) and creates the directory `root:root` `0755`.
 
 The directory is root-owned and not writable by the broker (uid/gid 1883), so a
 compromised or misbehaving broker cannot create, remove, rename or replace
@@ -513,9 +524,16 @@ directory file descriptor with `O_NOFOLLOW`, creates temporary files with
 `O_CREAT|O_EXCL|O_NOFOLLOW`, sets owner and mode on the open file descriptor,
 refuses symlinks or non-regular files at `acl`, `passwords` and their `.new`,
 `.prev` and `.prev.tmp` names, and never touches
-`$VESSELSTACK_DATA/mosquitto`. The Mosquitto image must be present to hash
-passwords; if it is missing and cannot be pulled (for example offline), sync
-stops with a clear message before changing any file.
+`$VESSELSTACK_DATA/mosquitto`. The hashing container runs with
+`--network none --cap-drop ALL --cap-add CHOWN --security-opt
+no-new-privileges` and `umask 077`; the plaintext file and any
+`passwords.new.*` file `mosquitto_passwd` derives from it (such as its
+`.backup.XXXXXX` copy) are removed on every outcome. The Mosquitto image must
+be present to hash passwords; if it is missing and cannot be pulled (for
+example offline), the installer stops with a clear message before changing any
+file. `sync-mqtt`, `bridge-env` and the lifecycle commands all hold the same
+exclusive lock (`config/.displays.lock`, 10 s wait), so a Control Panel Apply
+cannot interleave with a concurrent `displayctl add`.
 
 With `DISPLAYS_ENABLE=false` (the default) only the administrator account
 (`MQTT_USERNAME`) exists: it has `readwrite #` and `read $SYS/#`, so Home
@@ -548,16 +566,45 @@ Operational notes:
   to reload (`SIGHUP`), which also disconnects removed accounts. Because the
   auth directory is mounted as a directory, replaced files reach the running
   broker without a restart.
-- `install.sh --dry-run` (the Control Panel "Preflight") exits before any
-  rendering: it does not write files, pull images or signal containers. Apply
-  configuration and install do sync, and may therefore pull the pinned
-  Mosquitto image on first use and send `SIGHUP` to a running broker.
-- Upgrade impact: the first `install.sh --start`, `vesselstackctl update` or
-  any other run that starts the stack recreates the Mosquitto container once
-  (a brief MQTT interruption) so the new configuration and the new read-only
-  mount take effect. A render-only `install.sh` run updates the files in
-  `config/mosquitto-auth/`, but a broker still running the previous container
-  keeps its old configuration and mounts until it is recreated.
+- `install.sh --dry-run` (the Control Panel "Preflight", and the check that
+  `vesselstackctl update` runs before it takes a backup) never writes files,
+  pulls images, takes the lock or signals containers, but it now runs
+  `displayctl.py preflight`, which rejects up front everything the sync would
+  reject: an administrator `MQTT_PASSWORD` containing `:` or leading/trailing
+  whitespace (a generated one is always fine), invalid account names, a bridge
+  name that collides with `MQTT_USERNAME` or a `vsdisp-<id>` account, an
+  invalid `displays.json` (when `DISPLAYS_ENABLE=true`), and a missing
+  Mosquitto image. A missing image is a failure only when the registry cannot
+  be reached either (`docker manifest inspect`); the message names the
+  `docker pull` to run once while online. With a reachable registry it is only a
+  warning ("will be pulled"), so the documented first-install flow (dry run,
+  then `--start`) still works on a boat that has not pulled anything yet. A real
+  run repeats the same checks and pulls a missing image *before* it changes any
+  file, then syncs the MQTT access files **before** it installs the new
+  `compose.yml` and `config/mosquitto/mosquitto.conf`, so a failure leaves the
+  previous broker definition in place. Apply configuration and install may
+  pull the pinned Mosquitto image on first use and send `SIGHUP` to a running
+  broker.
+- Upgrade impact: the Mosquitto container is recreated (a brief MQTT
+  interruption) by the first `install.sh --start`, `vesselstackctl start` or
+  `vesselstackctl update` after the upgrade, because its compose definition
+  changed (new configuration directory and read-only auth mount). **Until then
+  the old container keeps its old configuration and mounts, also across reboots
+  and `docker restart`:** it still bind-mounts the untouched legacy
+  `config/mosquitto.conf` and reads the legacy `passwords` file in
+  `$VESSELSTACK_DATA/mosquitto`, so existing clients keep working, but the new
+  ACL, the bridge account and the display accounts do **not** exist on that
+  broker. A render-only run (Control Panel "Apply configuration", or
+  `install.sh --config ...` without `--start`) writes the new files but never
+  recreates containers; it prints a `NOTICE` when the running broker predates
+  the new definition (and when the displays bridge is enabled but not running)
+  telling you to run `sudo vesselstackctl start`. In particular, enabling
+  displays through Apply needs that start before the bridge can connect.
+  Further configuration-only changes are applied by the same commands: the
+  installer records the hash of the last applied `mosquitto.conf` in
+  `config/.mosquitto-conf.sha256` and force-recreates the broker when a later
+  `--start` (or `vesselstackctl start`) sees a different file, even if the file
+  was rendered by an earlier render-only run.
 - Legacy files: releases that kept `passwords`, `acl` and their `.prev`/`.new`
   copies in `$VESSELSTACK_DATA/mosquitto/` leave them there untouched and
   unused (the broker's persistence database stays in that directory). They are
@@ -573,15 +620,18 @@ Operational notes:
   match `[A-Za-z0-9_.-]{1,64}` and cannot collide; invalid input or a hashing
   failure aborts with an error and leaves the previous live files in place.
   An existing `MQTT_PASSWORD` containing `:` or leading/trailing spaces is
-  rejected because `mosquitto_passwd` would store a different password; change
-  it in the Control Panel first.
+  rejected (by the preflight, before anything changes) because
+  `mosquitto_passwd` would store a different password; change it in the
+  Control Panel first.
 - Rollback: set `DISPLAYS_ENABLE=false` and run `sudo ./install.sh --config
   ... --start`; the ACL returns to administrator-only. Downgrading to a release
-  without this feature: its Mosquitto configuration points at the legacy
+  without this feature: this release never modifies the legacy
+  `config/mosquitto.conf`, so the older release finds it as it left it; its
+  Mosquitto configuration points at the legacy
   `$VESSELSTACK_DATA/mosquitto/passwords` path and its installer recreates the
   files there, so the broker works again after the downgrade; the
-  `config/mosquitto-auth/` directory and `displays.secrets.json` are left in
-  place. `vesselstackctl restore` extracts with `--numeric-owner` so the
+  `config/mosquitto/`, `config/mosquitto-auth/` directories and
+  `displays.secrets.json` are left in place. `vesselstackctl restore` extracts with `--numeric-owner` so the
   `root:1883` and `1883:1883` ownership survives a restore.
 - Troubleshooting: if the broker log contains "owner is not mosquitto",
   "world readable" or "permission denied" for `/mosquitto/auth/...`, re-run
@@ -591,6 +641,10 @@ Operational notes:
   image with `docker load`) and run it again; nothing is changed before then.
   "refusing to use ... symbolic link" or "group or world writable" means the
   auth directory was tampered with: inspect and remove it, then re-run.
+- Verify the upgrade path with `sudo tests/test-mosquitto-upgrade.sh`: a
+  release-1.3.0 broker (single-file conf, legacy passwords, no ACL) must
+  survive the new render plus `docker restart`, and only the container
+  recreated from the real `compose.yml` mounts enforces the ACL.
 - Verify with `sudo tests/test-displays-mosquitto.sh` (real broker in Docker;
   as root it verifies the real ownership, otherwise a one-shot container copies
   the files into a Docker volume with that ownership first)
@@ -639,15 +693,18 @@ Enable it:
    check it with `python3 /opt/vesselstack/displays/displayctl.py validate
    /opt/vesselstack/config/displays.json`, then re-run the installer. Each
    re-run re-syncs the MQTT accounts, rewrites the bridge environment and
-   restarts the bridge (with `--start`).
+   restarts the bridge if it is running (`--start` also starts it).
 
 What changes on the host: the installer creates a Python virtual environment in
 `/opt/vesselstack/displays/.venv` and installs the pinned `paho-mqtt==2.1.0` and
 `websockets==17.3` from `displays/requirements.txt` (internet needed once; only
-when `DISPLAYS_ENABLE=true`), writes `config/displays-bridge.env` (mode 0600,
-owned by the service account; it contains the bridge MQTT password and the
-optional SignalK token), renders and enables the unit, and starts it with
-`--start`. The unit runs as the unprivileged service account with the same
+when `DISPLAYS_ENABLE=true`), writes `config/displays-bridge.env` (`root:root`,
+mode 0600; systemd reads it as PID 1 before dropping to the service account, so
+the service user never needs read access; it contains the bridge MQTT password
+and the optional SignalK token), renders and enables the unit, and starts it with
+`--start`. A render-only run (Control Panel Apply) runs `systemctl try-restart`
+on the bridge so a running bridge picks up the rewritten environment; a stopped
+bridge is only started by `--start` or `vesselstackctl start`. The unit runs as the unprivileged service account with the same
 hardening as Boat Chat plus a read-only filesystem view; it only reads
 `displays.json`. The bridge MQTT account may only publish
 `vesselstack/v1/instruments/#` and `vesselstack/v1/bridge/#`.

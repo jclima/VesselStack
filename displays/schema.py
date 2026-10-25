@@ -49,7 +49,7 @@ def valid_host(value) -> bool:
     if len(value) > 253 or value.endswith("."):
         return False
     labels = value.split(".")
-    if not all(HOST_LABEL.match(label) for label in labels):
+    if not all(HOST_LABEL.fullmatch(label) for label in labels):
         return False
     return not labels[-1].isdigit()  # numeric last label means a malformed IPv4 literal
 
@@ -88,7 +88,7 @@ def validate_registry(reg) -> list[str]:
             errors.append("$.layouts: must be a non-empty object")
         else:
             for name, cap in layouts.items():
-                if not LAYOUT_ID.match(str(name)):
+                if not LAYOUT_ID.fullmatch(str(name)):
                     errors.append(f"$.layouts.{name}: invalid layout id")
                 if not is_int(cap) or not 1 <= cap <= 64:
                     errors.append(f"$.layouts.{name}: capacity must be an integer 1..64")
@@ -100,7 +100,7 @@ def validate_registry(reg) -> list[str]:
         else:
             for bid, board in boards.items():
                 where = f"$.boards.{bid}"
-                if not BOARD_ID.match(str(bid)):
+                if not BOARD_ID.fullmatch(str(bid)):
                     errors.append(f"{where}: invalid board id")
                 if not isinstance(board, dict):
                     errors.append(f"{where}: must be an object")
@@ -155,7 +155,7 @@ def validate_config(cfg, registry) -> list[str]:
         else:
             for iid, inst in instruments.items():
                 where = f"$.instruments.{iid}"
-                if not INSTRUMENT_ID.match(str(iid)):
+                if not INSTRUMENT_ID.fullmatch(str(iid)):
                     errors.append(f"{where}: instrument id must match ^[a-z][a-z0-9_]{{0,31}}$")
                 if not isinstance(inst, dict):
                     errors.append(f"{where}: must be an object")
@@ -163,7 +163,7 @@ def validate_config(cfg, registry) -> list[str]:
                 valid_ids.add(iid)
                 _unknown(inst, INSTRUMENT_KEYS, where, errors)
                 _missing(inst, INSTRUMENT_REQUIRED, where, errors)
-                if "path" in inst and not (isinstance(inst["path"], str) and SK_PATH.match(inst["path"])):
+                if "path" in inst and not (isinstance(inst["path"], str) and SK_PATH.fullmatch(inst["path"])):
                     errors.append(f"{where}.path: must be a dotted SignalK path")
                 if "label" in inst and not _text(inst["label"], 1, 16):
                     errors.append(f"{where}.label: must be 1..16 printable characters")
@@ -188,7 +188,7 @@ def validate_config(cfg, registry) -> list[str]:
             caps = registry.get("layouts", {})
             for did, disp in displays.items():
                 where = f"$.displays.{did}"
-                if not DISPLAY_ID.match(str(did)):
+                if not DISPLAY_ID.fullmatch(str(did)):
                     errors.append(f"{where}: display id must match ^[a-z][a-z0-9-]{{0,23}}$")
                 if not isinstance(disp, dict):
                     errors.append(f"{where}: must be an object")

@@ -9,7 +9,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh"
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 for f in "$ROOT"/displays/*.py "$ROOT"/tests/fixtures/*.py; do python3 -m py_compile "$f"; done
@@ -21,7 +21,8 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh"
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" \
+    "$ROOT/tests/test-mosquitto-upgrade.sh"
 if grep -nE 'mosquitto_passwd -b' "$ROOT/install.sh" "$ROOT/scripts/vesselstackctl" "$ROOT"/displays/*.py; then
     echo "MQTT passwords must not be passed on a command line" >&2
     exit 1

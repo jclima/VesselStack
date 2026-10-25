@@ -8,8 +8,6 @@ Secret values are never printed and never placed on a command line.
 """
 from __future__ import annotations
 
-import errno
-import fcntl
 import getpass
 import json
 import os
@@ -17,7 +15,6 @@ import secrets as secrets_module
 import stat
 import subprocess
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -29,9 +26,9 @@ import schema  # noqa: E402
 import topics  # noqa: E402
 
 DISPLAYS_NAME = "displays.json"
-LOCK_NAME = ".displays.lock"
-LOCK_TIMEOUT_S = 10.0
-CONFIG_OWNER = (0, 0)
+LOCK_NAME = mqtt_auth.LOCK_NAME
+LOCK_TIMEOUT_S = mqtt_auth.LOCK_TIMEOUT_S
+CONFIG_OWNER = mqtt_auth.CONFIG_OWNER
 DISPLAYS_MODE = 0o644
 SECRETS_MODE = 0o600
 # Per-display generated secrets. rotate regenerates every key listed here, so a
@@ -109,37 +106,9 @@ class ConfigDir:
     def lock(self) -> None:
         """Exclusive lock; waits up to ctx.lock_timeout seconds, then fails."""
         try:
-            info = os.lstat(LOCK_NAME, dir_fd=self.fd)
-            if not stat.S_ISREG(info.st_mode):
-                raise LifecycleError(f"refusing to use {LOCK_NAME}: it is not a regular file")
-        except FileNotFoundError:
-            pass
-        try:
-            fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
-                         dir_fd=self.fd)
-        except OSError as exc:
-            raise LifecycleError(f"cannot open lock file {LOCK_NAME}: {exc.strerror}") from exc
-        owner = mqtt_auth._owner(CONFIG_OWNER)
-        try:
-            if owner:
-                os.fchown(fd, *owner)
-            deadline = time.monotonic() + self.ctx.lock_timeout
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except OSError as exc:
-                    if exc.errno not in (errno.EAGAIN, errno.EACCES):
-                        raise
-                    if time.monotonic() >= deadline:
-                        raise LifecycleError(
-                            "another displayctl command is changing the display configuration "
-                            f"(waited {self.ctx.lock_timeout:g}s); try again shortly") from None
-                    time.sleep(0.1)
-        except BaseException:
-            os.close(fd)
-            raise
-        self.lock_fd = fd
+            self.lock_fd = mqtt_auth.acquire_lock(self.fd, self.ctx.lock_timeout)
+        except mqtt_auth.MqttAuthError as exc:
+            raise LifecycleError(str(exc)) from exc
 
     def unlock(self) -> None:
         if self.lock_fd >= 0:
@@ -310,7 +279,7 @@ def default_page(registry: dict, config: dict, board_id: str) -> dict:
 
 def add(ctx: Context, display_id: str, board: str, name: str | None = None,
         home_assistant_api: bool = False) -> None:
-    if not schema.DISPLAY_ID.match(display_id):
+    if not schema.DISPLAY_ID.fullmatch(display_id):
         raise LifecycleError("display id must match ^[a-z][a-z0-9-]{0,23}$ (lowercase letters, "
                              "digits and hyphens, starting with a letter)", 2)
     registry = load_registry()
