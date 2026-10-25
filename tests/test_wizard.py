@@ -115,12 +115,24 @@ class WizardHttpTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good(Origin="null"))[0], 403)
         self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good(Origin=f"http://localhost:{self.port}"), host=f"localhost:{self.port}")[0], 200)
 
-    def test_page_embeds_token_and_api_system_requires_it(self):
-        status, page = self.request("GET", "/")
-        self.assertEqual(status, 200)
-        self.assertIn(f'content="{self.TOKEN}"'.encode(), page)
+    def test_served_files_never_contain_the_token_and_api_requires_it(self):
+        for path in ("/", "/index.html", "/app.js", "/styles.css"):
+            status, body = self.request("GET", path)
+            self.assertEqual(status, 200, path)
+            self.assertNotIn(self.TOKEN.encode(), body, path)
+            self.assertNotIn(b"wizard-token", body, path)
         self.assertEqual(self.request("GET", "/api/system")[0], 403)
+        self.assertEqual(self.request("GET", "/api/system", None, {"X-Wizard-Token": "wrong"})[0], 403)
         self.assertEqual(self.request("GET", "/api/system", None, {"X-Wizard-Token": self.TOKEN})[0], 200)
+
+    def test_full_flow_with_token_from_fragment(self):
+        # The browser sends the fragment token only as a header, never in a URL.
+        status, _ = self.request("GET", f"/?token={self.TOKEN}")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Frag"}}, {"Content-Type": "application/json"})[0], 403)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Frag"}}, self.good())[0], 200)
+        self.assertIn("BOAT_NAME=Frag", self.output.read_text())
 
     def test_exit_after_save_stops_the_server(self):
         wizard.Handler.exit_after_save = True
@@ -155,10 +167,12 @@ class WizardHttpTests(unittest.TestCase):
         wizard.Handler.token = None
         self.assertEqual(self.request("POST", "/api/save", {"values": {}}, self.good())[0], 403)
 
-    def test_app_js_sends_the_token(self):
+    def test_app_js_reads_token_from_fragment_and_clears_it(self):
         source = (ROOT / "wizard" / "app.js").read_text()
         self.assertEqual(source.count("X-Wizard-Token"), 2)
-        self.assertIn('name="wizard-token"', (ROOT / "wizard" / "index.html").read_text())
+        self.assertIn("location.hash", source)
+        self.assertIn("history.replaceState", source)
+        self.assertNotIn("wizard-token", (ROOT / "wizard" / "index.html").read_text())
 
     def test_firewall_strict_settings_validated(self):
         self.assertIn("VESSELSTACK_FIREWALL_ALLOW_TCP=22", wizard.render({}))
@@ -174,13 +188,14 @@ class WizardCommandLineTests(unittest.TestCase):
                 ["python3", "-I", str(ROOT / "vesselstack-wizard.py"), "--port", "0", "--output", str(target), "--exit-after-save"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             self.addCleanup(process.kill)
-            banner = [process.stdout.readline() for _ in range(3)]
+            banner = [process.stdout.readline() for _ in range(4)]
             url = regex.search(r"http://127\.0\.0\.1:(\d+)", banner[0])
-            token = regex.search(r"run only\): (\S+)|this run only\): (\S+)", banner[1])
+            token = regex.search(r"http://127\.0\.0\.1:\d+/#token=([A-Za-z0-9_-]+)", banner[1])
             self.assertTrue(url and token, banner)
+            self.assertNotIn("token", banner[0].lower())
             request = urllib.request.Request(
                 f"http://127.0.0.1:{url.group(1)}/api/save", data=json.dumps({"values": {"BOAT_NAME": "Cli"}}).encode(),
-                headers={"Content-Type": "application/json", "X-Wizard-Token": token.group(1) or token.group(2)})
+                headers={"Content-Type": "application/json", "X-Wizard-Token": token.group(1)})
             self.assertEqual(urllib.request.urlopen(request, timeout=5).status, 200)
             self.assertEqual(process.wait(timeout=10), 0)
             self.assertIn("BOAT_NAME=Cli", target.read_text())

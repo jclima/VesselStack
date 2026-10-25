@@ -124,14 +124,14 @@ git checkout v1.4.0
 python3 vesselstack-wizard.py
 ```
 
-On the Pi itself open `http://127.0.0.1:8088`. For a headless Pi, keep the
+On the Pi itself open the address the wizard prints (`http://127.0.0.1:8088/#token=...`; the token after `#` is required). For a headless Pi, keep the
 wizard loopback-only and tunnel it from your workstation:
 
 ```bash
 ssh -L 8088:127.0.0.1:8088 YOUR_USER@YOUR_PI
 ```
 
-Then open `http://127.0.0.1:8088` locally. The assistant inventories the host,
+Then open the same printed address (with its `#token=...`) locally. The assistant inventories the host,
 walks through the BOM and deployment choices, and writes `vesselstack.env` with
 mode 600. Stop it with Ctrl-C when finished.
 

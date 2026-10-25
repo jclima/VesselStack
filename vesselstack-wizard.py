@@ -56,7 +56,7 @@ LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 
 class Handler(SimpleHTTPRequestHandler):
     # Per-run secret; set by main() (or tests). While unset, every API call is refused.
-    token = None
+    token = None  # never embedded in served files: delivered in the URL fragment (see main)
     # When true (--exit-after-save) the server stops after the first successful save,
     # so a calling installer knows the wizard is finished.
     exit_after_save = False
@@ -84,10 +84,6 @@ class Handler(SimpleHTTPRequestHandler):
         if route=="/api/system":
             if not self.token_ok(): return self.reply(403,{"error":"Missing or invalid wizard token"})
             return self.reply(200,system_report())
-        if route in ("/","/index.html"):
-            # The token is delivered only in the page itself (never readable cross-origin).
-            body=(WIZARD/"index.html").read_text().replace('<meta name="wizard-token" content="">',f'<meta name="wizard-token" content="{type(self).token or ""}">').encode()
-            self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body); return
         return super().do_GET()
     def do_POST(self):
         if not self.host_ok(): return self.reply(403,{"error":"Forbidden host or origin"})
@@ -111,7 +107,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main():
     global OUTPUT
-    parser=argparse.ArgumentParser(description="VesselStack first-run wizard"); parser.add_argument("--host",default="127.0.0.1",choices=["127.0.0.1","::1"]); parser.add_argument("--port",type=int,default=8088)
+    parser=argparse.ArgumentParser(description="VesselStack first-run wizard"); parser.add_argument("--host",default="127.0.0.1",choices=["127.0.0.1","::1"]); parser.add_argument("--port",type=int,default=8088,help="TCP port; 0 picks a random free port")
     parser.add_argument("--output",help="where to write the generated env file (default: vesselstack.env next to this script)")
     parser.add_argument("--exit-after-save",action="store_true",help="stop the wizard after the configuration has been saved once")
     args=parser.parse_args()
@@ -119,7 +115,10 @@ def main():
     Handler.exit_after_save=args.exit_after_save
     Handler.token=secrets.token_urlsafe(32)
     server=ThreadingHTTPServer((args.host,args.port),Handler); shown=f"[{args.host}]" if ":" in args.host else args.host
-    port=server.server_address[1]; print(f"VesselStack wizard: http://{shown}:{port}",flush=True); print(f"Wizard token (the page sends it automatically; valid for this run only): {Handler.token}",flush=True); print(f"Configuration will be written to: {OUTPUT}",flush=True); print("The wizard stops by itself after you save." if args.exit_after_save else "Press Ctrl-C to stop.",flush=True)
+    port=server.server_address[1]; print(f"VesselStack wizard: http://{shown}:{port}",flush=True)
+    # The token travels in the URL fragment: browsers never send it to the server, so it is
+    # not in any request line, log or served file. app.js reads it and removes it from the address bar.
+    print(f"Open this address (valid for this run only): http://{shown}:{port}/#token={Handler.token}",flush=True); print(f"Configuration will be written to: {OUTPUT}",flush=True); print("The wizard stops by itself after you save." if args.exit_after_save else "Press Ctrl-C to stop.",flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: server.server_close()

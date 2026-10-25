@@ -85,6 +85,11 @@ if [ "$1" = is-active ] && [ -e "$TEST_ROOT/docker-inactive" ]; then exit 3; fi
 if [ "$1" = enable ]; then rm -f "$TEST_ROOT/docker-inactive"; fi
 exit 0
 EOF2
+cat > "$FAKE_BIN/runuser" <<'EOF2'
+#!/bin/bash
+echo "runuser $*" >> "$LOG"
+exec "$(PATH=/usr/sbin:/sbin:/usr/bin:/bin command -v runuser)" "$@"
+EOF2
 cat > "$FAKE_BIN/useradd" <<'EOF2'
 #!/bin/bash
 echo "useradd $*" >> "$LOG"
@@ -118,17 +123,33 @@ echo "bundle $*" >> "$LOG"
 exit 0
 EOF2
 cat > "$SRC/vesselstack-wizard.py" <<'EOF2'
+# Runs as an unprivileged user with a minimal environment (no LOG, no TEST_ROOT).
 import os, sys
 args = sys.argv[1:]
 out = args[args.index("--output") + 1]
-with open(os.environ["LOG"], "a") as log:
-    log.write("wizard " + " ".join(args) + "\n")
-print("VesselStack wizard: http://127.0.0.1:" + args[args.index("--port") + 1])
-if os.environ.get("FAKE_WIZARD_NOSAVE"):
+port = args[args.index("--port") + 1]
+print("VesselStack wizard: http://127.0.0.1:" + port)
+print("Open this address (valid for this run only): http://127.0.0.1:" + port + "/#token=FAKETOKEN123")
+print("uid=" + str(os.getuid()) + " env=" + ",".join(sorted(os.environ)))
+mode = ""
+try:
+    mode = open("@TEST_ROOT@/wizard-mode").read().strip()
+except OSError:
+    pass
+if mode == "nosave":
     sys.exit(0)
+if mode == "symlink":
+    os.symlink("/etc/passwd", out); sys.exit(0)
+if mode == "fifo":
+    os.mkfifo(out); sys.exit(0)
 with open(out, "w") as handle:
-    handle.write("BOAT_NAME='Test Boat'\nVESSELSTACK_USER=" + os.environ.get("FAKE_SERVICE_USER", "daemon") + "\nBOAT_MMSI=''\n")
+    handle.write("BOAT_NAME='Test Boat'\nVESSELSTACK_USER=daemon\nBOAT_MMSI=''\n")
+    if mode == "big":
+        handle.write("# " + "x" * 70000 + "\n")
+    if mode == "inject":
+        handle.write("BOAT_CALLSIGN=$(touch @TEST_ROOT@/pwned-wizard)\n")
 EOF2
+sed -i "s|@TEST_ROOT@|$TEST_ROOT|g" "$SRC/vesselstack-wizard.py"
 chmod 0755 "$SRC/install.sh" "$SRC/scripts/prepare-offline-bundle.sh"
 GOOD="$TEST_ROOT/good.tar.gz"
 tar -C "$TEST_ROOT/src" -czf "$GOOD" "vesselstack-$VER"
@@ -177,7 +198,7 @@ EOF2
 
 reset_state() {
     rm -rf -- "$RELEASE_BASE" "$APP_ROOT" "$LOG" "$TEST_ROOT/curl.log" "$TEST_ROOT/docker-installed" "$TEST_ROOT/docker-inactive" \
-        "$TEST_ROOT/missing-pkgs" "$TEST_ROOT/answers" "$SERVE"/*.fail
+        "$TEST_ROOT/missing-pkgs" "$TEST_ROOT/answers" "$TEST_ROOT/wizard-mode" "$TEST_ROOT/pwned-wizard" "$SERVE"/*.fail
     printf 'docker-compose-v2 2.24.0\n' > "$TEST_ROOT/apt-candidates"
     : > "$LOG"
     touch "$TEST_ROOT/docker-installed"
@@ -378,20 +399,86 @@ reset_state
 run --yes --wizard-port 8123
 expect_rc 0 "wizard flow"
 expect_out "ssh -L 8123:127.0.0.1:8123"
-expect_out "http://127.0.0.1:8123"
-expect_log "^wizard --port 8123 --output $RELEASE_BASE/vesselstack.env --exit-after-save"
-wiz=$(grep -n "^wizard" "$LOG" | head -n1 | cut -d: -f1)
+expect_out "http://127.0.0.1:8123/#token="
+# Runs unprivileged (nobody without SUDO_USER) with a minimal environment, never as root.
+expect_log "^runuser -u nobody -- env -i PATH=[^ ]+ HOME=/[^ ]+ LANG=C.UTF-8 python3 -I $RELEASE_BASE/$VER/vesselstack-wizard.py --port 8123 --output /[^ ]+/vesselstack.env --exit-after-save"
+expect_out "uid=[1-9][0-9]* env=HOME,LANG,PATH$"
+refuse_out "uid=0 "
+wiz=$(grep -n "^runuser" "$LOG" | head -n1 | cut -d: -f1)
 dry=$(grep -n -- "^install .*--dry-run" "$LOG" | head -n1 | cut -d: -f1)
 [ "$wiz" -lt "$dry" ] || fail_test "wizard must run before install"
-[ "$(stat -c %a "$RELEASE_BASE/vesselstack.env")" = 600 ] || fail_test "wizard output must be chmod 600"
+[ "$(stat -c '%a %U' "$RELEASE_BASE/vesselstack.env")" = "600 root" ] || fail_test "wizard output must be root-owned mode 600"
+if ls -d "$RELEASE_BASE"/.wizard.* >/dev/null 2>&1; then fail_test "wizard directory was not removed"; fi
+
+# SUDO_USER is used when it is a real unprivileged account; a random free port otherwise.
+reset_state
+EXTRA_ENV=SUDO_USER=daemon run --yes
+EXTRA_ENV=
+expect_rc 0 "wizard as SUDO_USER"
+expect_log "^runuser -u daemon -- env -i .*--port [0-9]{4,5} "
+expect_out "ssh -L ([0-9]{4,5}):127.0.0.1:\\1 "
+reset_state
+EXTRA_ENV=SUDO_USER=root run --yes
+EXTRA_ENV=
+expect_log "^runuser -u nobody "
 
 # The wizard closed without saving: nothing is installed.
 reset_state
-EXTRA_ENV=FAKE_WIZARD_NOSAVE=1 run --yes
-EXTRA_ENV=
+echo nosave > "$TEST_ROOT/wizard-mode"
+run --yes
 expect_rc 1 "wizard closed without saving"
 expect_out "before a configuration was saved"
 refuse_log "^install "
+
+# Wizard output is copied once without following links, then linted: a symlink, a FIFO,
+# an oversized file and injection content are all refused and nothing is installed.
+for mode in symlink fifo big inject; do
+    reset_state
+    echo "$mode" > "$TEST_ROOT/wizard-mode"
+    run --yes
+    expect_rc 1 "wizard output ($mode) must be refused"
+    expect_out "wizard output was refused|saved configuration is invalid"
+    refuse_log "^install "
+    [ ! -e "$TEST_ROOT/pwned-wizard" ] || fail_test "wizard output content was executed"
+    [ ! -e "$RELEASE_BASE/vesselstack.env" ] || fail_test "refused wizard output must not be installed"
+done
+rm -f "$TEST_ROOT/wizard-mode"
+
+# ---- 5b. --config is staged once (no re-read of the user-controlled file) -------
+reset_state
+mkdir -p "$TEST_ROOT/cfg"
+cp "$TEST_ROOT/in.env" "$TEST_ROOT/cfg/real.env"
+ln -s real.env "$TEST_ROOT/cfg/link.env"
+run --yes --no-wizard --config "$TEST_ROOT/cfg/link.env"
+expect_rc 1 "--config symlink must be refused"
+expect_out "refused"
+refuse_log "^install "
+mkfifo "$TEST_ROOT/cfg/fifo.env"
+run --yes --no-wizard --config "$TEST_ROOT/cfg/fifo.env"
+expect_rc 1 "--config FIFO must be refused (and must not hang)"
+run --yes --no-wizard --config "$TEST_ROOT/cfg"
+expect_rc 1 "--config directory must be refused"
+run --yes --no-wizard --config "$TEST_ROOT/cfg/missing.env"
+expect_rc 1 "--config missing file must be refused"
+{ cat "$TEST_ROOT/in.env"; printf '# %070000d\n' 0; } > "$TEST_ROOT/cfg/big.env"
+run --yes --no-wizard --config "$TEST_ROOT/cfg/big.env"
+expect_rc 1 "oversized --config must be refused"
+expect_out "larger than"
+printf 'BOAT_NAME=%s\n' "\$(touch $TEST_ROOT/pwned-config)" > "$TEST_ROOT/cfg/inject.env"
+run --yes --no-wizard --config "$TEST_ROOT/cfg/inject.env"
+expect_rc 1 "--config injection must be refused"
+[ ! -e "$TEST_ROOT/pwned-config" ] || fail_test "config content was executed"
+refuse_log "^install "
+# A file swapped for a symlink after the check cannot matter: only the staged copy is used.
+# The installed file is a root-owned copy, identical to the original content.
+reset_state
+run --yes --no-wizard --config "$TEST_ROOT/cfg/real.env"
+expect_rc 0 "regular --config"
+[ "$(stat -c '%a %U' "$RELEASE_BASE/vesselstack.env")" = "600 root" ] || fail_test "installed config must be root-owned 600"
+cmp -s "$TEST_ROOT/cfg/real.env" "$RELEASE_BASE/vesselstack.env" || fail_test "installed config differs from staged input"
+# shellcheck disable=SC2016  # literal text search, no expansion wanted
+if grep -n 'install -m 0600 -o root -g root "\$CONFIG_ARG"\|lint "\$CONFIG_ARG"' "$GET"; then fail_test "script must not lint or install the original --config path"; fi
+if ls -d "$RELEASE_BASE"/.stage.* >/dev/null 2>&1; then fail_test "staging directory was not removed"; fi
 
 # A saved configuration from an earlier run is reused (default answer r).
 reset_state

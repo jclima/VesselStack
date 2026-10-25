@@ -36,7 +36,9 @@ BUNDLE=
 TARBALL_ARG=
 PIN_SHA256=
 BASE_URL=
-WIZARD_PORT=8088
+WIZARD_PORT=
+WIZARD_DIR=
+CONFIG_MAX_BYTES=65536
 INSTALL_ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 PROMPT_SOURCE=${VESSELSTACK_BOOTSTRAP_ANSWERS:-/dev/tty}
 DOCTOR_WAIT=${VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT:-30}
@@ -90,7 +92,7 @@ Options:
   --tarball FILE      Use a local vesselstack-X.Y.Z.tar.gz (its .sha256 must sit next to it)
   --sha256 HASH       Also require the tarball to match this sha256 (from a source you trust)
   --dir DIR           Where releases are unpacked (default: $RELEASE_BASE)
-  --wizard-port N     Port for the configuration wizard (default: $WIZARD_PORT)
+  --wizard-port N     Port for the configuration wizard (default: a random free port)
   --base-url URL      Release download base, https only (default: $GITHUB_RELEASES)
   --help, -h          Show this help
 
@@ -185,7 +187,7 @@ parse_args() {
     VERSION=${VERSION:-$DEFAULT_VERSION}
     VERSION=${VERSION#v}
     [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version must look like 1.4.0 (got: $VERSION)"
-    if ! [[ "$WIZARD_PORT" =~ ^[0-9]{4,5}$ ]] || [ "$WIZARD_PORT" -lt 1024 ] || [ "$WIZARD_PORT" -gt 65535 ]; then
+    if [ -n "$WIZARD_PORT" ] && { ! [[ "$WIZARD_PORT" =~ ^[0-9]{4,5}$ ]] || [ "$WIZARD_PORT" -lt 1024 ] || [ "$WIZARD_PORT" -gt 65535 ]; }; then
         die "--wizard-port must be a number from 1024 to 65535"
     fi
     if [ -n "$PIN_SHA256" ] && ! [[ "$PIN_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then die "--sha256 must be 64 hex characters"; fi
@@ -246,6 +248,7 @@ compose_ok() { command -v docker >/dev/null 2>&1 && docker compose version >/dev
 # shellcheck disable=SC2317,SC2329  # Invoked through the EXIT trap.
 cleanup() {
     if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then rm -rf -- "$STAGE"; fi
+    if [ -n "$WIZARD_DIR" ] && [ -d "$WIZARD_DIR" ]; then rm -rf -- "$WIZARD_DIR"; fi
 }
 
 # KEY=VALUE env files are never sourced here. This reads them with shlex after a
@@ -296,6 +299,34 @@ if mode == "get":
     for key in sys.argv[3:]:
         print(values.get(key, ""))
 PY
+
+# Copies an untrusted file ONCE into a root-owned staging path: opened without following
+# a symlink (and without blocking on a FIFO), must be a regular file of at most N bytes.
+# Everything afterwards (lint, install) uses only the staged copy, never the original.
+read -r -d '' STAGETOOL <<'PY' || true
+import os, stat, sys
+
+src, dest, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError as exc:
+    sys.exit(f"{src}: cannot open (missing, or a symlink): {exc.strerror}")
+with os.fdopen(fd, "rb") as handle:
+    info = os.fstat(handle.fileno())
+    if not stat.S_ISREG(info.st_mode):
+        sys.exit(f"{src}: not a regular file")
+    if info.st_size > limit:
+        sys.exit(f"{src}: larger than {limit} bytes")
+    data = handle.read(limit + 1)
+if len(data) > limit:
+    sys.exit(f"{src}: larger than {limit} bytes")
+out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(out, "wb") as handle:
+    os.fchown(handle.fileno(), 0, 0)
+    handle.write(data)
+PY
+
+stage_untrusted() { python3 -I -c "$STAGETOOL" "$1" "$2" "$CONFIG_MAX_BYTES"; }
 
 env_get() { python3 -I -c "$ENVTOOL" get "$1" "$2"; }
 
@@ -608,17 +639,47 @@ describe_ssh_access() {
     say "  The wizard is a web page that only this Raspberry Pi can reach (loopback only)."
     say "  Open it in one of two ways:"
     say ""
-    say "    A) On this Pi, in a browser:   http://127.0.0.1:$WIZARD_PORT"
+    say "  The wizard prints one address ending in #token=... (a one-time key that stays in your"
+    say "  browser and is never sent in a request). Open exactly that address:"
+    say ""
+    say "    A) On this Pi, in a browser: open the address printed below."
     say ""
     say "    B) From your laptop. Open a NEW terminal on the laptop and run:"
     say "         ssh -L $WIZARD_PORT:127.0.0.1:$WIZARD_PORT $user@${ip:-$host}"
     if [ -n "$ip" ]; then say "       (or $user@$host.local if your network resolves that name)"; fi
-    say "       keep that terminal open, then in the laptop's browser open:"
-    say "         http://127.0.0.1:$WIZARD_PORT"
+    say "       keep that terminal open, then open the same printed address"
+    say "       (http://127.0.0.1:$WIZARD_PORT/#token=...) in the laptop's browser."
     say ""
     say "  When you press 'Save configuration' on the last page, the wizard closes by itself and"
     say "  this installer continues. Press Ctrl-C here to cancel."
     say ""
+}
+
+# Runs the wizard as an unprivileged user in a private 0700 directory owned by that user.
+# The user is the one who invoked sudo; with no (or root) SUDO_USER it is "nobody".
+run_wizard() {
+    local user=${SUDO_USER:-} port=$WIZARD_PORT
+    if [ -z "$user" ] || [ "$user" = root ] || ! id -u "$user" >/dev/null 2>&1 || [ "$(id -u "$user")" -eq 0 ]; then
+        user=nobody
+    fi
+    id -u "$user" >/dev/null 2>&1 || die "Cannot run the wizard unprivileged: user '$user' does not exist." \
+        "Run with sudo from a normal account, or use --no-wizard --config FILE."
+    command -v runuser >/dev/null 2>&1 || die "runuser is missing (package util-linux)." \
+        "Install it, or use --no-wizard --config FILE."
+    WIZARD_DIR=$(mktemp -d "$RELEASE_BASE/.wizard.XXXXXX")
+    chown "$user" "$WIZARD_DIR"
+    chmod 0700 "$WIZARD_DIR"
+    if [ -z "$port" ]; then
+        port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])') \
+            || die "Could not pick a free port. Try --wizard-port 8089."
+    fi
+    WIZARD_PORT=$port
+    describe_ssh_access
+    info "the wizard runs as user '$user' (not root); it cannot write anywhere but its private directory"
+    if ! runuser -u "$user" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$WIZARD_DIR" LANG=C.UTF-8 \
+            python3 -I "$RELEASE_DIR/vesselstack-wizard.py" --port "$port" --output "$WIZARD_DIR/vesselstack.env" --exit-after-save </dev/null; then
+        die "The wizard could not run. Is port $port already in use? Try --wizard-port 8089."
+    fi
 }
 
 step_configure() {
@@ -629,14 +690,14 @@ step_configure() {
         return 0
     fi
     if [ -n "$CONFIG_ARG" ]; then
-        if [ ! -f "$CONFIG_ARG" ] || [ -L "$CONFIG_ARG" ]; then die "Config file not found (or is a symlink): $CONFIG_ARG"; fi
-        python3 -I -c "$ENVTOOL" lint "$CONFIG_ARG" \
+        # Copy once into the root-only staging dir, then lint and use ONLY that copy.
+        stage_untrusted "$CONFIG_ARG" "$STAGE/config.env" \
+            || die "The configuration file was refused (see above)." "It must be a regular file (not a symlink) of at most $CONFIG_MAX_BYTES bytes."
+        python3 -I -c "$ENVTOOL" lint "$STAGE/config.env" \
             || die "The configuration file was refused (see above). It must contain only KEY=VALUE lines."
-        if [ "$(realpath -- "$CONFIG_ARG")" != "$(realpath -m -- "$ENV_FILE")" ]; then
-            install -m 0600 -o root -g root "$CONFIG_ARG" "$ENV_FILE.new"
-            mv -f -- "$ENV_FILE.new" "$ENV_FILE"
-            changed "copied $CONFIG_ARG to $ENV_FILE (root only, mode 600)"
-        fi
+        install -m 0600 -o root -g root "$STAGE/config.env" "$ENV_FILE.new"
+        mv -f -- "$ENV_FILE.new" "$ENV_FILE"
+        changed "copied $CONFIG_ARG to $ENV_FILE (root only, mode 600)"
         ok "using the supplied configuration"
         return 0
     fi
@@ -653,16 +714,17 @@ step_configure() {
         changed "kept the old configuration as $ENV_FILE.previous"
     fi
     say "  Starting the configuration wizard on this Pi."
-    describe_ssh_access
-    if ! python3 -I "$RELEASE_DIR/vesselstack-wizard.py" --port "$WIZARD_PORT" --output "$ENV_FILE" --exit-after-save </dev/null; then
-        die "The wizard could not run. Is port $WIZARD_PORT already in use? Try --wizard-port 8089."
-    fi
-    if [ ! -f "$ENV_FILE" ] || [ -L "$ENV_FILE" ]; then
+    run_wizard
+    if [ ! -e "$WIZARD_DIR/vesselstack.env" ] && [ ! -L "$WIZARD_DIR/vesselstack.env" ]; then
         die "The wizard was closed before a configuration was saved. Nothing was installed." "Run this script again to start over."
     fi
-    chown root:root "$ENV_FILE"
-    chmod 0600 "$ENV_FILE"
-    python3 -I -c "$ENVTOOL" lint "$ENV_FILE" || die "The saved configuration is invalid (see above)."
+    # The wizard ran unprivileged and its output directory belongs to that user: copy the
+    # file once into the root-only staging dir, then lint and install only that copy.
+    stage_untrusted "$WIZARD_DIR/vesselstack.env" "$STAGE/wizard.env" \
+        || die "The wizard output was refused (see above). Nothing was installed."
+    python3 -I -c "$ENVTOOL" lint "$STAGE/wizard.env" || die "The saved configuration is invalid (see above)."
+    install -m 0600 -o root -g root "$STAGE/wizard.env" "$ENV_FILE"
+    rm -rf -- "$WIZARD_DIR"
     changed "configuration saved to $ENV_FILE (root only, mode 600)"
 }
 

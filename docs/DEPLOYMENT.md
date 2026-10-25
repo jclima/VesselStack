@@ -222,7 +222,7 @@ cd /var/lib/vesselstack/releases/vesselstack-1.4.0
 ```
 
 Configuration: either the wizard (loopback only; tunnel it with
-`ssh -L 8088:127.0.0.1:8088 YOUR_USER@LAB_PI`, run `python3 vesselstack-wizard.py`)
+`ssh -L 8088:127.0.0.1:8088 YOUR_USER@LAB_PI`, run `python3 vesselstack-wizard.py` as a normal user and open the printed `http://127.0.0.1:8088/#token=...` address)
 or edit a copy of the example. Keep it out of git and mode 600:
 
 ```bash

@@ -56,10 +56,22 @@ does anything beyond installing ordinary Debian packages:
    release, verifies the checksum, refuses unsafe archives (absolute or `..` paths,
    links, devices, setuid bits) and unpacks to `/opt/vesselstack-release/<version>`,
    owned by root and not writable by others;
-4. starts the loopback-only configuration wizard and tells you how to open it:
-   in a browser on the Pi at `http://127.0.0.1:8088`, or from your laptop with the
-   exact `ssh -L 8088:127.0.0.1:8088 USER@PI` command for this Pi; the wizard
-   closes itself when you save;
+4. starts the loopback-only configuration wizard on a random free port (override
+   with `--wizard-port N`) and tells you how to open it. The wizard runs as an
+   unprivileged user (the account that ran `sudo`; `nobody` if there is none or it
+   is root) with a minimal environment, writing only into a private 0700 directory
+   owned by that user, so other local users cannot obtain a root-installed
+   configuration. It prints one address ending in `#token=...`; open that exact
+   address in a browser on the Pi, or on your laptop after running the printed
+   `ssh -L PORT:127.0.0.1:PORT USER@PI` command. The token is in the URL fragment,
+   so it is never sent to the server or served in the page, and the page removes
+   it from the address bar. The wizard closes itself when you save; the bootstrap
+   then copies the result once into a root-only staging directory, lints that copy
+   and installs only it. `--config FILE` gets the same treatment: opened without
+   following symlinks, must be a regular file of at most 64 KiB, copied once, and
+   only the staged copy is linted and used. Limitation: the Docker line in the
+   wizard's preflight page reflects what the unprivileged wizard user can see;
+   `install.sh` performs the authoritative checks;
 5. shows a summary of the chosen configuration (no secrets), asks for confirmation,
    runs `install.sh --dry-run`, then `install.sh --start`, then `vesselstackctl
    doctor`, and prints `vesselstackctl urls`, where the generated tokens are
@@ -70,7 +82,7 @@ Options (`sudo bash get-vesselstack.sh --help`): `--yes` (no questions),
 `--offline --bundle DIR [--tarball FILE]` (no internet, see
 [Offline install](#offline-install-no-internet-on-the-boat)), `--sha256 HASH`
 (pin the tarball to a checksum you obtained elsewhere), `--dir DIR`,
-`--wizard-port N`. Questions are read from the terminal, so the piped form works;
+`--wizard-port N` (default: a random free port). Questions are read from the terminal, so the piped form works;
 without a terminal pass `--yes`. Re-running is safe: finished steps are reported
 and skipped, an already installed version just reports "nothing to do", and an
 earlier saved configuration can be reused.
@@ -110,17 +122,21 @@ git checkout v1.4.0
 python3 vesselstack-wizard.py
 ```
 
-Open `http://127.0.0.1:8088`, or use the SSH tunnel documented in the guide.
+Open the address the wizard prints (`http://127.0.0.1:8088/#token=...`), or use the
+SSH tunnel documented in the guide and open the same address on your workstation.
 The wizard accepts `--port N`, `--output FILE` (where to write the env file) and
 `--exit-after-save` (stop after the first successful save; the one-line installer
-uses it). It prints a per-run token on start; the page it serves sends that token
-(`X-Wizard-Token`) with every API call. Requests are refused unless the `Host`
+uses it). It prints a per-run address of the form `http://127.0.0.1:PORT/#token=...`; open
+that exact address. The token is carried in the URL fragment (never sent to the
+server, never present in any served file); `wizard/app.js` reads it, removes it
+from the address bar with `history.replaceState` and sends it as `X-Wizard-Token`
+with every API call (`/api/system` and `/api/save` refuse requests without it).
+The wizard needs no root privileges; run it as a normal user. Requests are refused unless the `Host`
 header is `127.0.0.1`/`localhost`/`[::1]` on the bound port, any `Origin` is the
 same loopback origin, the token matches, and saves use `Content-Type:
 application/json` (this blocks cross-site form posts and DNS rebinding). The env
 file is created mode 600 from the start and never through a symlink. Open the
-printed URL itself; a bookmarked older page needs a reload after restarting the
-wizard. The dependency-free wizard binds only to loopback, shows relevant host
+printed URL itself (including the `#token=` part); a bookmarked older address stops working when the wizard restarts. The dependency-free wizard binds only to loopback, shows relevant host
 prerequisites, and writes a complete private `vesselstack.env`. It does not
 change boot firmware, firewall rules, marine wiring, or start services. Then run
 `sudo ./install.sh --config vesselstack.env --dry-run` and `--start` as described
