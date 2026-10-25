@@ -470,7 +470,7 @@ class BridgeEnvTests(unittest.TestCase):
             self.assertIn('MQTT_PORT="1884"\n', text)
             self.assertIn('DISPLAYS_BRIDGE_MQTT_PASSWORD="pa\\"ss"\n', text)
             self.assertIn('DISPLAYS_SIGNALK_TOKEN="tok"\n', text)
-            self.assertNotIn("pa", out + err)
+            self.assertNotIn("pa\"ss", out + err)
             # The file round-trips through the bridge's own settings loader.
             values = {}
             for line in text.splitlines():

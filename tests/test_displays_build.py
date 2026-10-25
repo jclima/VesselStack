@@ -303,10 +303,10 @@ class BuildTests(FirmwareBase):
         self.assertIn("docker is not installed", str(caught.exception))
 
     def test_build_requires_root(self):
-        with self.assertRaises(lifecycle.LifecycleError):
-            firmware.build(self.ctx(require_root=True), "helm", stream=self.docker.stream)
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             self.skipTest("running as root")
+        with self.assertRaises(lifecycle.LifecycleError):
+            firmware.build(self.ctx(require_root=True), "helm", stream=self.docker.stream)
 
     def test_mount_path_with_colon_refused(self):
         with self.assertRaises(render.RenderError):
