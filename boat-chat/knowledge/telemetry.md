@@ -7,7 +7,7 @@
 - Current health/watch state comes from Home Assistant.
 - Historical fuel, runtime, speed, and trend calculations come from retained InfluxDB summaries or cached SQLite summaries.
 - The SQLite telemetry cache stores derived summaries only; it is not the source of truth for raw telemetry.
-- Forward solar inference is sampled every five minutes into `boat-chat/data/power_tracking.sqlite`. Positive SmartShunt power is integrated only when the boat is underway, beyond the dock radius, or the charging proxy is off; both engines are below 200 RPM; and adjacent samples are no more than 15 minutes apart.
+- Forward solar inference is sampled every five minutes into `$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`. Positive SmartShunt power is integrated only when the boat is underway, beyond the dock radius, or the charging proxy is off; both engines are below 200 RPM; and adjacent samples are no more than 15 minutes apart.
 - Inferred solar is net battery charging after loads. A compatible solar controller should provide direct `electrical.solar.<id>.panelPower` and `yieldToday` for gross production.
 
 ## Engine Running

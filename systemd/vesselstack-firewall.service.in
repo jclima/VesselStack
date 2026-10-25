@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=180
 RemainAfterExit=yes
 Environment=VESSELSTACK_ENV=@VESSELSTACK_ROOT@/config/vesselstack.env
 ExecStart=/usr/local/sbin/vesselstack-firewall apply

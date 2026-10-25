@@ -37,6 +37,7 @@ const secretKeys = new Set([
   "BOAT_CHAT_SETTINGS_TOKEN",
   "BOAT_CHAT_ACCESS_TOKEN",
   "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_ALLOWED_CHAT_IDS",
   "OPENAI_API_KEY",
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
@@ -648,7 +649,6 @@ async function loadSettings() {
   const provider = populateProviderSelect("#setting-provider", false);
   const fallbackProvider = populateProviderSelect("#setting-fallback-provider", true);
 
-  setSettingValue("BOAT_CHAT_REQUIRE_ACCESS_TOKEN", loadedSettings.BOAT_CHAT_REQUIRE_ACCESS_TOKEN || "false");
   Object.entries(loadedSettings).forEach(([key, value]) => setSettingValue(key, value));
   if (!provider.value && data.active_provider) {
     provider.value = data.active_provider;
@@ -682,7 +682,6 @@ async function saveSettings(event) {
     if (secretKeys.has(key) && !text) continue;
     settings[key] = text;
   }
-  settings.BOAT_CHAT_REQUIRE_ACCESS_TOKEN = settingsForm.elements.BOAT_CHAT_REQUIRE_ACCESS_TOKEN.checked ? "true" : "false";
 
   const primaryProvider = settings.BOAT_CHAT_PROVIDER || "";
   const primaryModel = selectedModel("primary");

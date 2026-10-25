@@ -21,6 +21,7 @@ class ApiIntegrationTests(unittest.TestCase):
         self.original_memory_db = os.environ.get("BOAT_CHAT_MEMORY_DB")
         os.environ["BOAT_CHAT_MEMORY_DB"] = str(Path(self.tempdir.name) / "test.sqlite")
         os.environ["BOAT_CHAT_PROVIDER"] = "local"
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "flow-test-token"
         app.RATE_LIMIT_REQUESTS.clear()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.BoatChatHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -32,10 +33,11 @@ class ApiIntegrationTests(unittest.TestCase):
         if self.original_memory_db is None: os.environ.pop("BOAT_CHAT_MEMORY_DB", None)
         else: os.environ["BOAT_CHAT_MEMORY_DB"] = self.original_memory_db
         os.environ.pop("BOAT_CHAT_PROVIDER", None)
+        os.environ.pop("BOAT_CHAT_ACCESS_TOKEN", None)
         self.tempdir.cleanup()
 
     def post(self, path, payload):
-        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_port}{path}", data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}, method="POST")
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_port}{path}", data=json.dumps(payload).encode(), headers={"Content-Type":"application/json","X-Boat-Chat-Token":"flow-test-token"}, method="POST")
         with urllib.request.urlopen(request, timeout=5) as response: return json.loads(response.read())
 
     def test_chat_feedback_and_clear_flow(self):

@@ -42,11 +42,38 @@ class UpdateCommandTests(unittest.TestCase):
         argv=json.loads(result.stdout)
         for flag in ['--pull','--apply','--restart-chat','--telegram-service']:self.assertIn(flag,argv)
 
+    def test_remote_is_pinned_and_unsigned_is_off_by_default(self):
+        argv=json.loads(self.run_command('--apply').stdout)
+        self.assertEqual(argv[argv.index('--expected-remote')+1],'https://github.com/jclima/VesselStack.git')
+        self.assertNotIn('--allow-unsigned',argv)
+
+    def test_home_lab_opt_in_and_custom_remote_are_passed(self):
+        with self.config.open('a') as handle:handle.write('EXPECTED_REMOTE_URL="https://example.test/fork.git"\nALLOW_UNSIGNED_SOURCE=true\n')
+        argv=json.loads(self.run_command().stdout)
+        self.assertIn('--allow-unsigned',argv)
+        self.assertEqual(argv[argv.index('--expected-remote')+1],'https://example.test/fork.git')
+
     def test_rollback_does_not_pull(self):
         result=self.run_command('--rollback','/example/backup with spaces')
         self.assertEqual(result.returncode,0,result.stderr);argv=json.loads(result.stdout)
         self.assertNotIn('--pull',argv)
         self.assertEqual(argv[argv.index('--rollback')+1],'/example/backup with spaces')
+
+    def test_non_root_prefers_checkout_helper_for_development(self):
+        result=self.run_command();argv=json.loads(result.stdout)
+        self.assertEqual(argv[0],'-I');self.assertEqual(argv[1],str(self.source/'scripts/deploy-chat.py'))
+
+    def test_non_root_falls_back_to_installed_helper(self):
+        (self.source/'scripts/deploy-chat.py').unlink()
+        system=self.root/'system';helper=system/'usr/local/libexec/vesselstack/deploy-chat.py'
+        helper.parent.mkdir(parents=True);helper.touch()
+        self.env['VESSELSTACK_SYSTEM_ROOT']=str(system)
+        argv=json.loads(self.run_command().stdout);self.assertEqual(argv[1],str(helper))
+
+    def test_missing_helper_everywhere_fails(self):
+        (self.source/'scripts/deploy-chat.py').unlink()
+        self.env['VESSELSTACK_SYSTEM_ROOT']=str(self.root/'empty')
+        result=self.run_command();self.assertNotEqual(result.returncode,0);self.assertIn('Missing deployment helper',result.stderr)
 
     def test_unknown_or_extra_arguments_fail(self):
         for args in [('--unknown',),('--apply','extra'),('--rollback',)]:

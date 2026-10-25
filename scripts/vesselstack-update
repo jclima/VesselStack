@@ -1,9 +1,15 @@
 #!/bin/bash
 # Repeatable, preview-first application updates using private local paths.
+#
+# Root only ever executes the helper that install.sh installed root-owned under
+# /usr/local/libexec/vesselstack, and only ever sources a root-controlled
+# update.env, never anything from the (unprivileged-owned) source checkout.
 
 set -euo pipefail
 
-CONFIG_FILE="${VESSELSTACK_UPDATE_CONFIG:-/etc/vesselstack/update.env}"
+SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
+CONFIG_FILE="${VESSELSTACK_UPDATE_CONFIG:-$SYSTEM_ROOT/etc/vesselstack/update.env}"
+INSTALLED_HELPER="$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
 MODE=preview
 BACKUP=""
 
@@ -11,13 +17,44 @@ usage() {
     cat <<'HELP'
 Usage: sudo vesselstack-update [--apply | --rollback BACKUP_DIRECTORY]
 
-  (no arguments)   Pull clean source fast-forward, run tests, preview code changes
-  --apply          Pull, test, back up and apply application code; verify readiness
+  (no arguments)   Fetch+verify clean source, fast-forward, test as the checkout
+                   owner (never root), preview code changes
+  --apply          Same, then back up and apply application code; verify readiness
   --rollback PATH  Restore a printed backup directory and verify readiness
 
 Local configuration: /etc/vesselstack/update.env
 Application updates exclude credentials, facts, databases and infrastructure.
+Source must carry a valid commit/tag signature unless the home-lab opt-in
+ALLOW_UNSIGNED_SOURCE=true is set in the update configuration. Signatures are
+checked with a fixed git/gpg configuration against a root-controlled keyring
+(VERIFY_GNUPGHOME) or allowed-signers file (VERIFY_ALLOWED_SIGNERS), and the
+tests and deployed files come from the verified commit (fetched into a
+root-owned mirror and exported as raw blobs), not the working tree.
+
+As root the launcher runs only the root-owned helper installed by install.sh
+(/usr/local/libexec/vesselstack/deploy-chat.py) and refuses a configuration or
+helper whose path is not root-owned and free of group/world write access. As a
+normal user (home-lab development) it falls back to scripts/deploy-chat.py in
+the source checkout.
 HELP
+}
+
+# Every component from the path up to / must be root-owned and not group/world
+# writable, otherwise an unprivileged account could swap what root reads or runs.
+require_root_controlled() {
+    local label=$1 path=$2 resolved owner mode
+    resolved=$(readlink -f -- "$path") || { echo "Cannot resolve $label: $path" >&2; return 1; }
+    path=$resolved
+    while :; do
+        owner=$(stat -c %u -- "$path")
+        mode=$(stat -c %a -- "$path")
+        if [ "$owner" != 0 ] || [ $((8#$mode & 8#022)) -ne 0 ]; then
+            echo "Refusing to run as root: $label ($resolved) depends on $path, which must be root-owned and not group/world-writable (uid $owner, mode $mode)" >&2
+            return 1
+        fi
+        [ "$path" != / ] || break
+        path=$(dirname -- "$path")
+    done
 }
 
 case "${1:-}" in
@@ -34,18 +71,64 @@ case "${1:-}" in
 esac
 [ $# -eq 0 ] || { usage >&2; exit 2; }
 [ -r "$CONFIG_FILE" ] || { echo "Missing readable update configuration: $CONFIG_FILE" >&2; exit 1; }
-# Operator-owned configuration contains paths and unit names, not credentials.
+IS_ROOT=false
+[ "$(id -u)" -eq 0 ] && IS_ROOT=true
+if [ "$IS_ROOT" = true ]; then
+    # The file is sourced (executed) as root: it must not be writable by, or live in a
+    # directory controlled by, anyone else (e.g. the source checkout's owner).
+    require_root_controlled "update configuration" "$CONFIG_FILE" || exit 1
+fi
+# Root-controlled configuration contains paths and unit names, not credentials.
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 : "${SOURCE_DIRECTORY:?Set SOURCE_DIRECTORY in the update configuration}"
 : "${TARGET_DIRECTORY:?Set TARGET_DIRECTORY in the update configuration}"
 : "${CHAT_SERVICE:?Set CHAT_SERVICE in the update configuration}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8765/health}"
+# Pinned origin: the helper refuses to fetch when the checkout's origin differs.
+EXPECTED_REMOTE_URL="${EXPECTED_REMOTE_URL:-https://github.com/jclima/VesselStack.git}"
+ALLOW_UNSIGNED_SOURCE="${ALLOW_UNSIGNED_SOURCE:-false}"
+# Root-controlled trust anchors for signature verification (optional).
+VERIFY_GNUPGHOME="${VERIFY_GNUPGHOME:-}"
+VERIFY_ALLOWED_SIGNERS="${VERIFY_ALLOWED_SIGNERS:-}"
+# Root-owned bare repository (mode 0700) where objects are fetched, verified and
+# exported; root never runs git archive/verify inside the checkout.
+UPDATE_MIRROR_DIR="${UPDATE_MIRROR_DIR:-/var/lib/vesselstack/update-mirror}"
 
-HELPER="$SOURCE_DIRECTORY/scripts/deploy-chat.py"
-[ -f "$HELPER" ] || { echo "Missing deployment helper: $HELPER" >&2; exit 1; }
+if [ "$IS_ROOT" = true ]; then
+    config_real=$(readlink -f -- "$CONFIG_FILE")
+    source_real=$(readlink -f -- "$SOURCE_DIRECTORY" 2>/dev/null || printf '%s' "$SOURCE_DIRECTORY")
+    case "$config_real/" in
+        "$source_real"/*)
+            echo "Refusing to run as root: the update configuration lives inside SOURCE_DIRECTORY ($source_real); keep it in /etc/vesselstack" >&2
+            exit 1 ;;
+    esac
+    HELPER=$INSTALLED_HELPER
+    [ -f "$HELPER" ] || {
+        echo "Missing installed update helper: $HELPER" >&2
+        echo "Run the VesselStack installer once (sudo ./install.sh --config ...) to install it root-owned." >&2
+        exit 1
+    }
+    require_root_controlled "update helper" "$HELPER" || exit 1
+else
+    # Home-lab development without root: prefer the checkout copy so changes can be tried.
+    HELPER="$SOURCE_DIRECTORY/scripts/deploy-chat.py"
+    [ -f "$HELPER" ] || HELPER=$INSTALLED_HELPER
+    [ -f "$HELPER" ] || { echo "Missing deployment helper: $SOURCE_DIRECTORY/scripts/deploy-chat.py" >&2; exit 1; }
+fi
 ARGS=(--source "$SOURCE_DIRECTORY" --target "$TARGET_DIRECTORY"
-      --service "$CHAT_SERVICE" --health-url "$HEALTH_URL")
+      --service "$CHAT_SERVICE" --health-url "$HEALTH_URL"
+      --expected-remote "$EXPECTED_REMOTE_URL")
+if [ "$ALLOW_UNSIGNED_SOURCE" = true ]; then
+    ARGS+=(--allow-unsigned)
+fi
+ARGS+=(--mirror-dir "$UPDATE_MIRROR_DIR")
+if [ -n "$VERIFY_GNUPGHOME" ]; then
+    ARGS+=(--gnupg-home "$VERIFY_GNUPGHOME")
+fi
+if [ -n "$VERIFY_ALLOWED_SIGNERS" ]; then
+    ARGS+=(--allowed-signers "$VERIFY_ALLOWED_SIGNERS")
+fi
 if [ -n "${TELEGRAM_SERVICE:-}" ]; then
     ARGS+=(--telegram-service "$TELEGRAM_SERVICE")
 fi
@@ -54,4 +137,4 @@ case "$MODE" in
     apply) ARGS+=(--pull --apply --restart-chat) ;;
     rollback) ARGS+=(--rollback "$BACKUP" --apply --restart-chat) ;;
 esac
-exec python3 "$HELPER" "${ARGS[@]}"
+exec python3 -I "$HELPER" "${ARGS[@]}"

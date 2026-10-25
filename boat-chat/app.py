@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import env_config
 import memory_index
 import query_planner
 import session_store
@@ -39,7 +40,8 @@ ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 STATIC_ROOT = ROOT / "static"
 MCP_CONFIG = REPO_ROOT / ".mcp.json"
-ENV_CONFIG = ROOT / "boat-chat.env"
+# Settings-page override file; see env_config for the precedence model.
+ENV_CONFIG = env_config.env_path()
 BOAT_FACTS = Path(os.environ.get("BOAT_CHAT_FACTS_FILE", str(ROOT / "boat_facts.json")))
 BOAT_CHAT_AGENT = ROOT / "BOAT_CHAT_AGENT.md"
 KNOWLEDGE_ROOT = ROOT / "knowledge"
@@ -78,15 +80,12 @@ SETTING_KEYS = [
     "BOAT_CHAT_OLLAMA_NUM_CTX",
     "BOAT_CHAT_SETTINGS_TOKEN",
     "BOAT_CHAT_ACCESS_TOKEN",
-    "BOAT_CHAT_REQUIRE_ACCESS_TOKEN",
     "BOAT_CHAT_WEB_SEARCH",
     "BOAT_CHAT_CLI_TIMEOUT",
     "BOAT_CHAT_CODEX_MODEL",
     "BOAT_CHAT_CODEX_EFFORT",
-    "BOAT_CHAT_CODEX_BIN",
     "BOAT_CHAT_CLAUDE_MODEL",
     "BOAT_CHAT_CLAUDE_EFFORT",
-    "BOAT_CHAT_CLAUDE_BIN",
     "BOAT_CHAT_CLAUDE_MAX_BUDGET_USD",
     "BOAT_CHAT_HOST",
     "BOAT_CHAT_PORT",
@@ -113,6 +112,7 @@ SETTING_KEYS = [
     "BOAT_CHAT_API_KEY",
 ]
 SECRET_SETTING_KEYS = {
+    "TELEGRAM_ALLOWED_CHAT_IDS",
     "BOAT_CHAT_SETTINGS_TOKEN",
     "BOAT_CHAT_ACCESS_TOKEN",
     "TELEGRAM_BOT_TOKEN",
@@ -398,30 +398,9 @@ def load_boat_facts() -> dict[str, Any]:
 
 
 def parse_env_config() -> dict[str, str]:
-    settings: dict[str, str] = {}
-    if not ENV_CONFIG.exists():
-        return settings
-    try:
-        raw_lines = ENV_CONFIG.read_text(errors="ignore").splitlines()
-    except OSError:
-        # The production file is deliberately mode 600. Read-only tooling and
-        # unit tests may run as another user and should fall back to process
-        # environment/defaults instead of failing unrelated requests.
-        return settings
-    for raw_line in raw_lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key not in SETTING_KEYS:
-            continue
-        try:
-            parsed = shlex.split(value, comments=False, posix=True)
-            settings[key] = parsed[0] if parsed else ""
-        except ValueError:
-            settings[key] = value.strip().strip("'\"")
-    return settings
+    # The file is mode 600. Read-only tooling and unit tests may run as another
+    # user and should fall back to process environment/defaults.
+    return env_config.parse_env_file(ENV_CONFIG, SETTING_KEYS)
 
 
 def setting_value(key: str, default: str | None = None) -> str | None:
@@ -437,8 +416,12 @@ def setting_enabled(key: str, default: bool = False) -> bool:
 
 
 def access_token_required() -> bool:
-    """Return whether browser/API access should require the configured token."""
-    return setting_enabled("BOAT_CHAT_REQUIRE_ACCESS_TOKEN", True)
+    """Access always requires the token unless BOAT_CHAT_ALLOW_OPEN=true.
+
+    BOAT_CHAT_ALLOW_OPEN is deliberately not a Settings-page key: it can only be
+    set in the root-managed environment, so a network client cannot open the API.
+    """
+    return not setting_enabled("BOAT_CHAT_ALLOW_OPEN", False)
 
 
 def quote_env_value(value: str) -> str:
@@ -485,6 +468,7 @@ def write_env_config(settings: dict[str, str]) -> None:
                     passthrough.append(raw_line)
         if passthrough:
             lines.extend(["", "# Deployment-managed integration settings", *passthrough])
+    ENV_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     ENV_CONFIG.write_text("\n".join(lines) + "\n")
     try:
         ENV_CONFIG.chmod(0o600)
@@ -513,6 +497,12 @@ def public_settings() -> dict[str, Any]:
 
 
 def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
+    # Reject the whole request before writing anything: a newline/CR/NUL in a value
+    # would inject extra KEY=VALUE lines into the env file read by the services.
+    for key, value in updates.items():
+        if key in SETTING_KEYS and value is not None:
+            if any(char in str(value).strip() for char in ("\n", "\r", "\x00")):
+                raise ValueError(f"{key} contains unsupported characters")
     current = parse_env_config()
     for key, value in updates.items():
         if key not in SETTING_KEYS:
@@ -521,24 +511,14 @@ def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
             current.pop(key, None)
             continue
         text = str(value).strip()
-        if key == "BOAT_CHAT_REQUIRE_ACCESS_TOKEN":
-            normalized = text.lower()
-            if normalized in {"1", "true", "yes", "on"}:
-                text = "true"
-            elif normalized in {"", "0", "false", "no", "off"}:
-                text = "false"
-            else:
-                raise ValueError("BOAT_CHAT_REQUIRE_ACCESS_TOKEN must be true or false")
         if key in SECRET_SETTING_KEYS and text == "":
             continue
-        if text == "":
+        if text == "" or text == os.environ.get(key, ""):
+            # Empty, or identical to the root-managed base value: keep no
+            # override, so later control-panel/installer changes take effect.
             current.pop(key, None)
         else:
             current[key] = text
-    if current.get("BOAT_CHAT_REQUIRE_ACCESS_TOKEN") == "true":
-        configured_token = current.get("BOAT_CHAT_ACCESS_TOKEN", os.environ.get("BOAT_CHAT_ACCESS_TOKEN", "")).strip()
-        if not configured_token:
-            raise ValueError("Set an access code before requiring it")
     write_env_config(current)
     return public_settings()
 
@@ -4829,7 +4809,8 @@ def call_codex_cli(
     model: str | None = None,
     raise_on_error: bool = False,
 ) -> str:
-    codex_bin = setting_value("BOAT_CHAT_CODEX_BIN", "codex") or "codex"
+    # Executable paths are deployment-only (process environment), never HTTP/settings-file settable.
+    codex_bin = os.environ.get("BOAT_CHAT_CODEX_BIN", "codex") or "codex"
     selected_model = model or setting_value("BOAT_CHAT_CODEX_MODEL") or DEFAULT_CODEX_MODEL
     if selected_model and ("/" in selected_model or ":" in selected_model):
         selected_model = DEFAULT_CODEX_MODEL
@@ -4901,7 +4882,8 @@ def call_claude_cli(
     model: str | None = None,
     raise_on_error: bool = False,
 ) -> str:
-    claude_bin = setting_value("BOAT_CHAT_CLAUDE_BIN", "claude") or "claude"
+    # Executable paths are deployment-only (process environment), never HTTP/settings-file settable.
+    claude_bin = os.environ.get("BOAT_CHAT_CLAUDE_BIN", "claude") or "claude"
     selected_model = model or setting_value("BOAT_CHAT_CLAUDE_MODEL") or ""
     effort = (setting_value("BOAT_CHAT_CLAUDE_EFFORT", DEFAULT_CLAUDE_EFFORT) or DEFAULT_CLAUDE_EFFORT).strip().lower()
     if effort not in {"low", "medium", "high", "xhigh", "max"}:
@@ -5084,13 +5066,17 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             addr = ipaddress.ip_address(self.client_address[0])
         except ValueError:
             return False, "unrecognized client address"
-        if not (addr.is_loopback or addr.is_private):
-            return False, "settings can only be changed from the local network"
         token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
         if token:
+            # A configured settings token is required from every address.
             provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
             if not hmac.compare_digest(provided, token):
                 return False, "invalid or missing X-Boat-Chat-Token header"
+            return True, ""
+        # No token configured: only loopback may write. Private-LAN addresses
+        # are not trusted.
+        if not addr.is_loopback:
+            return False, "settings can only be changed from this device unless BOAT_CHAT_SETTINGS_TOKEN is set"
         return True, ""
 
     def access_allowed(self) -> bool:
@@ -5098,7 +5084,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             return True
         token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
         if not token:
-            return True
+            # Fail closed: an unset token never grants access.
+            return False
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
         return hmac.compare_digest(provided, token)
 

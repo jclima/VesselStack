@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,12 +66,12 @@ class EnvironmentFileTests(unittest.TestCase):
             vessel = root / "vessel.env"
             chat = root / "chat.env"
             control = root / "control.env"
-            panel.write_env(vessel, {"INFLUXDB_TOKEN": "remove-me"}, [])
+            panel.write_env(vessel, {"MQTT_PASSWORD": "remove-me"}, [])
             panel.write_env(chat, {}, [])
             panel.write_env(control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
             with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control, CONFIG_BACKUP_ROOT=root / "backups"):
-                panel.update_configuration({"INFLUXDB_TOKEN": None})
-            self.assertEqual(panel.parse_env(vessel)["INFLUXDB_TOKEN"], "")
+                panel.update_configuration({"MQTT_PASSWORD": None})
+            self.assertEqual(panel.parse_env(vessel)["MQTT_PASSWORD"], "")
 
     def test_partial_write_failure_restores_all_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -96,6 +97,58 @@ class EnvironmentFileTests(unittest.TestCase):
                     panel.update_configuration({"BOAT_NAME": "Changed", "BOAT_CHAT_MODEL": "changed-model"})
             self.assertEqual(panel.parse_env(vessel)["BOAT_NAME"], "Original")
             self.assertEqual(panel.parse_env(chat)["BOAT_CHAT_MODEL"], "original-model")
+
+
+class OverrideFileSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.override = self.root / "boat-chat.env"
+        patcher = mock.patch.dict(os.environ, {"BOAT_CHAT_ENV": str(self.override)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_clears_only_stale_keys_and_preserves_mode(self) -> None:
+        self.override.write_text("KEEP=1\nDROP=2\n")
+        os.chmod(self.override, 0o640)
+        panel.clear_chat_overrides({"DROP", "ABSENT"}, {})
+        self.assertEqual(self.override.read_text(), "KEEP=1\n")
+        self.assertEqual(self.override.stat().st_mode & 0o777, 0o640)
+        self.assertEqual([p.name for p in self.root.iterdir()], ["boat-chat.env"])
+
+    def test_symlinked_override_is_neither_read_nor_replaced(self) -> None:
+        target = self.root / "victim"
+        target.write_text("DROP=secret\n")
+        self.override.symlink_to(target)
+        panel.clear_chat_overrides({"DROP"}, {})
+        self.assertTrue(self.override.is_symlink())
+        self.assertEqual(target.read_text(), "DROP=secret\n")
+        self.assertEqual(panel.chat_overrides({}), set())
+
+    def test_replace_refuses_symlink_and_cleans_temp_on_failure(self) -> None:
+        target = self.root / "victim"
+        target.write_text("x")
+        self.override.symlink_to(target)
+        with self.assertRaises(OSError):
+            panel.replace_in_service_dir(self.override, "y\n")
+        self.assertEqual(target.read_text(), "x")
+        self.override.unlink()
+        self.override.write_text("a=1\n")
+        with mock.patch.object(panel.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                panel.replace_in_service_dir(self.override, "b=2\n")
+        self.assertEqual(self.override.read_text(), "a=1\n")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["boat-chat.env", "victim"])
+
+    def test_predictable_tmp_symlink_is_not_followed(self) -> None:
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        (self.root / "boat-chat.env.tmp").symlink_to(victim)
+        self.override.write_text("DROP=1\nKEEP=1\n")
+        panel.clear_chat_overrides({"DROP"}, {})
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertEqual(self.override.read_text(), "KEEP=1\n")
 
 
 class CommandAllowlistTests(unittest.TestCase):
@@ -139,10 +192,47 @@ class CommandAllowlistTests(unittest.TestCase):
             (release / "VERSION").write_text("1.0.1\n")
             with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root):
                 command = panel.action_command("update", {"source_directory": release})
-            self.assertEqual(command[-2:], ["update", str(release)])
+            self.assertEqual(command[-2:], ["update", str(release.resolve())])
             (release / "install.sh").chmod(0o777)
             with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root), self.assertRaises(ValueError):
                 panel.action_command("update", {"source_directory": release})
+
+    def test_update_rejects_unsafe_entries_anywhere_in_release_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "vesselstack-test"
+            for name in ("scripts", "boat-chat", "templates", "systemd"):
+                (release / name).mkdir(parents=True)
+            (release / "install.sh").write_text("#!/bin/bash\n")
+            (release / "VERSION").write_text("1.0.1\n")
+            (release / "systemd/unit.in").write_text("x\n")
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root):
+                panel.action_command("update", {"source_directory": release})
+                (release / "systemd/unit.in").chmod(0o666)
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
+                (release / "systemd/unit.in").chmod(0o644)
+                (release / "scripts").chmod(0o775)
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
+                (release / "scripts").chmod(0o755)
+                (release / "templates/link").symlink_to("/etc/passwd")
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
+                (release / "templates/link").unlink()
+                panel.action_command("update", {"source_directory": release})
+
+    @unittest.skipIf(os.getuid() == 0, "root-owned files are always accepted")
+    def test_update_rejects_foreign_owner_in_release_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "vesselstack-test"
+            (release / "scripts").mkdir(parents=True)
+            (release / "install.sh").write_text("#!/bin/bash\n")
+            (release / "VERSION").write_text("1.0.1\n")
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", root), mock.patch.object(panel.os, "geteuid", return_value=os.getuid() + 12345):
+                with self.assertRaises(ValueError):
+                    panel.action_command("update", {"source_directory": release})
 
 
 class ValidationTests(unittest.TestCase):
@@ -165,6 +255,55 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             panel.validate_value(panel.FIELD_BY_KEY["INFLUXDB_PORT"], "0")
         self.assertEqual(panel.validate_value(panel.FIELD_BY_KEY["INFLUXDB_PORT"], "8086"), "8086")
+
+
+class InitOnlySecretTests(unittest.TestCase):
+    KEYS = ["INFLUXDB_PASSWORD", "INFLUXDB_TOKEN", "GRAFANA_ADMIN_PASSWORD"]
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        root = Path(self.directory.name)
+        self.vessel, self.chat, self.control = root / "vessel.env", root / "chat.env", root / "control.env"
+        panel.write_env(self.vessel, {key: "original" for key in self.KEYS}, [])
+        panel.write_env(self.chat, {}, [])
+        panel.write_env(self.control, {"CONTROL_PANEL_TOKEN": "t"}, [])
+        patcher = mock.patch.multiple(panel, VESSEL_ENV=self.vessel, CHAT_ENV=self.chat, PANEL_ENV=self.control, CONFIG_BACKUP_ROOT=root / "backups")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.directory.cleanup)
+
+    def test_init_only_secrets_are_read_only_with_a_clear_message(self) -> None:
+        for key in self.KEYS:
+            spec = panel.FIELD_BY_KEY[key]
+            self.assertTrue(spec["read_only"])
+            self.assertIn("Read-only", spec["description"])
+            self.assertIn("first created", spec["description"])
+        self.assertFalse(panel.FIELD_BY_KEY["MQTT_PASSWORD"]["read_only"])
+
+    def test_changing_or_clearing_them_is_rejected_and_nothing_is_written(self) -> None:
+        for key in self.KEYS:
+            for value in ("new-secret", None):
+                with self.assertRaisesRegex(ValueError, "read-only"):
+                    panel.update_configuration({key: value})
+        self.assertEqual({key: panel.parse_env(self.vessel)[key] for key in self.KEYS}, {key: "original" for key in self.KEYS})
+
+    def test_blank_value_is_a_no_op_not_an_error(self) -> None:
+        panel.update_configuration({"INFLUXDB_TOKEN": "", "BOAT_NAME": "Renamed"})
+        self.assertEqual(panel.parse_env(self.vessel)["INFLUXDB_TOKEN"], "original")
+        self.assertEqual(panel.parse_env(self.vessel)["BOAT_NAME"], "Renamed")
+
+
+class RetentionSettingTests(unittest.TestCase):
+    def test_valid_and_invalid_raw_retention(self) -> None:
+        spec = panel.FIELD_BY_KEY["INFLUXDB_RAW_RETENTION"]
+        for good in ("", "0", "720h", "30d", "8w"):
+            self.assertEqual(panel.validate_value(spec, good), good)
+        for bad in ("30", "-1d", "30 days", "0d", "1y", "30d;rm", "100000d"):
+            with self.assertRaises(ValueError):
+                panel.validate_value(spec, bad)
+
+    def test_description_warns_about_deletion(self) -> None:
+        self.assertIn("deletes", panel.FIELD_BY_KEY["INFLUXDB_RAW_RETENTION"]["description"])
 
 
 class HttpApiTests(unittest.TestCase):

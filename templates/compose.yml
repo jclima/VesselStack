@@ -41,7 +41,7 @@ services:
     container_name: ${INFLUXDB_CONTAINER_NAME:-vesselstack-influxdb}
     restart: unless-stopped
     ports:
-      - "${INFLUXDB_PORT:-8086}:8086"
+      - "${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${INFLUXDB_PORT:-8086}:8086"
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USERNAME}
@@ -49,6 +49,10 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
       DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_RAW_BUCKET}
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+      # First-run setup only (ignored once the volume is initialised). Empty or
+      # unset means 30d; 0 means keep forever. Existing buckets are changed only
+      # by scripts/bootstrap-influx.sh when INFLUXDB_RAW_RETENTION is set.
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUXDB_RAW_RETENTION:-30d}
     volumes:
       - ${VESSELSTACK_DATA}/influxdb:/var/lib/influxdb2
 
@@ -57,7 +61,7 @@ services:
     container_name: vesselstack-grafana
     restart: unless-stopped
     ports:
-      - "${GRAFANA_PORT:-43000}:3000"
+      - "${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}:${GRAFANA_PORT:-43000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: boatadmin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
@@ -75,7 +79,7 @@ services:
     container_name: vesselstack-prometheus
     restart: unless-stopped
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -86,7 +90,7 @@ services:
     container_name: vesselstack-mosquitto
     restart: unless-stopped
     ports:
-      - "${MQTT_PORT:-1883}:1883"
+      - "${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${MQTT_PORT:-1883}:1883"
     volumes:
       - ${VESSELSTACK_ROOT}/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ${VESSELSTACK_DATA}/mosquitto:/mosquitto/data
@@ -96,8 +100,8 @@ services:
     container_name: vesselstack-heimdall
     restart: unless-stopped
     ports:
-      - "${HEIMDALL_PORT:-80}:80"
-      - "${HEIMDALL_HTTPS_PORT:-443}:443"
+      - "${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}:${HEIMDALL_PORT:-80}:80"
+      - "${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}:${HEIMDALL_HTTPS_PORT:-443}:443"
     environment:
       PUID: ${VESSELSTACK_UID}
       PGID: ${VESSELSTACK_GID}

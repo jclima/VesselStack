@@ -324,7 +324,8 @@
               </label>
               <label>
                 Telegram chat IDs
-                <input name="TELEGRAM_ALLOWED_CHAT_IDS" id="setting-telegram-chat-ids" autocomplete="off" placeholder="123456789,-1001234567890" />
+                <input name="TELEGRAM_ALLOWED_CHAT_IDS" id="setting-telegram-chat-ids" type="password" autocomplete="off" placeholder="123456789,-1001234567890" />
+                <span class="secret-state" data-secret="TELEGRAM_ALLOWED_CHAT_IDS"></span>
               </label>
               <label>
                 Telegram poll timeout
@@ -349,13 +350,9 @@
                 <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional write protection" />
                 <span class="secret-state" data-secret="BOAT_CHAT_SETTINGS_TOKEN"></span>
               </label>
-              <label class="toggle-setting">
-                <input name="BOAT_CHAT_REQUIRE_ACCESS_TOKEN" id="setting-require-access-token" type="checkbox" value="true" />
-                <span>Require access code<small>Off by default. When enabled, protects boat status, Chat, and the Hub.</small></span>
-              </label>
               <label>
                 Access code
-                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="used when access code is required" />
+                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="required for chat and boat data" />
                 <span class="secret-state" data-secret="BOAT_CHAT_ACCESS_TOKEN"></span>
               </label>
             </div>
