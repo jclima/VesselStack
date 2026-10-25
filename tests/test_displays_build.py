@@ -580,6 +580,90 @@ class BuildLockTests(ServerFlashBase):
         self.assertFalse((self.root / "build").exists())
 
 
+class CredentialCheckTests(ServerFlashBase):
+    def refused(self, **kw):
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50", **kw)
+        self.assertEqual(self.docker.streamed, [])
+        return str(caught.exception)
+
+    def test_manifest_records_a_fingerprint_of_the_compiled_in_secrets(self):
+        manifest = json.loads((self.project() / "firmware" / "manifest.json").read_text())
+        secrets = (self.project_files() / "secrets.yaml").read_bytes()
+        self.assertEqual(manifest["secrets_sha256"], firmware.sha256_hex(secrets))
+        self.assertNotIn(MQTT_PW, json.dumps(manifest))
+
+    def test_unchanged_credentials_flash_without_force(self):
+        self.flash(ota="192.0.2.50")
+        self.assertEqual(len(self.docker.streamed), 1)
+
+    def test_rotate_then_flash_is_refused_until_rebuilt_or_forced(self):
+        entry = self.stored()["displays"]["helm"]
+        entry["ota_password"] = "rotated-ota-password"
+        data = self.stored()
+        data["displays"]["helm"] = entry
+        self.secrets_path.write_text(json.dumps(data))
+        text = self.refused()
+        self.assertIn("credentials changed since it was built", text)
+        self.assertIn("display build helm", text)
+        self.assertIn("--force", text)
+        self.flash(ota="192.0.2.50", force=True)
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+        self.docker.streamed.clear()
+        self.build()  # rebuilding makes the new firmware flashable without --force
+        self.flash(ota="192.0.2.50")
+
+    def test_changed_wifi_is_refused(self):
+        self.set_config(None, wifi={"ssid": "other-boat", "password": "another-pass-1"},
+                        display_secrets=self.stored()["displays"])
+        self.assertIn("credentials changed", self.refused())
+
+    def test_remove_then_add_with_new_credentials_is_refused(self):
+        data = self.stored()
+        data["displays"]["helm"] = {"mqtt_password": "brand-new-password"}
+        self.secrets_path.write_text(json.dumps(data))
+        self.assertIn("credentials changed", self.refused())
+
+    def test_previous_is_checked_too_and_explains_the_rollback_risk(self):
+        self.docker.ota = b"NEWER-OTA" * 20
+        self.build()
+        self.docker.streamed.clear()
+        data = self.stored()
+        data["displays"]["helm"]["mqtt_password"] = "rotated-mqtt-password"
+        self.secrets_path.write_text(json.dumps(data))
+        text = self.refused(previous=True)
+        self.assertIn("rollback firmware", text)
+        self.assertIn("revoked or outdated", text)
+        self.flash(ota="192.0.2.50", previous=True, force=True)
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+
+    def test_firmware_without_a_fingerprint_is_refused_unless_forced(self):
+        manifest_path = self.project() / "firmware" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["secrets_sha256"]
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertIn("before credentials were tracked", self.refused())
+        self.flash(ota="192.0.2.50", force=True)
+
+    def test_credentials_that_cannot_be_rendered_are_refused_with_the_reason(self):
+        self.set_config(None, wifi=None, display_secrets=self.stored()["displays"])
+        text = self.refused()
+        self.assertIn("cannot be rendered", text)
+        self.assertIn("Wi-Fi", text)
+        self.assertNotIn("Traceback", text)
+
+    def test_missing_project_secrets_fail_before_the_container_starts(self):
+        (self.project_files() / "secrets.yaml").unlink()
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50", force=True)
+        self.assertIn("display render helm", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_parser_accepts_force(self):
+        args = displayctl.build_parser().parse_args(["flash", "helm", "--ota", "192.0.2.2", "--force"])
+        self.assertTrue(args.force)
+
+
 class FlashOtaTests(ServerFlashBase):
     def test_ota_uses_host_network_and_the_stored_ota_image(self):
         self.flash(ota="192.0.2.50")

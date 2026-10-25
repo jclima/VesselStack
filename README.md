@@ -1002,6 +1002,9 @@ sudo vesselstackctl display flash helm --ota helm.local --previous   # roll back
 | `flash ID --serial DEVICE` | Root. Verifies the stored `firmware.factory.bin` against `manifest.json` (sha256 and size), then copies exactly those verified bytes into a fresh root-only `0700` temporary directory under `$VESSELSTACK_ROOT/build/` (re-verifying the copy's sha256) and runs a one-shot container with `--device DEVICE` and `esphome upload /config/ID.yaml --device DEVICE --file /fw.bin`, where only that copy is mounted, read-only, at `/fw.bin`. The project is mounted read-only at `/config`; ESPHome's scratch space (`/tmp`, `/cache`) is tmpfs. The temporary directory is removed afterwards. Does not compile and never pulls the image. |
 | `flash ID --ota HOST` | Root. Verifies the stored `firmware.ota.bin` the same way, then runs a one-shot container with `--network host` and `esphome upload ... --device HOST --file /fw.bin` (the verified copy, as above). The OTA password is read by ESPHome from `secrets.yaml` inside the container; it is never on a command line. |
 | `flash ... --previous` | Flashes `firmware.prev/` instead (verified against its own manifest). Refused when there is no previous build. |
+| `flash ... --force` | Skips the credential check below. |
+
+**Credential check.** Compiled firmware embeds the Wi-Fi, MQTT, OTA and API secrets, and the source hash deliberately ignores them, so after `display rotate`, `display wifi`, `display wifi --clear` or a `remove` followed by `add` the stored images still carry credentials that are no longer current: the device would never join Wi-Fi or be accepted by the broker. `build` therefore records `secrets_sha256` (the sha256 of the `secrets.yaml` it compiled in; the hash only, never a secret) in `manifest.json`. Before uploading, `flash` renders the current secrets in memory (as `render` would, including generating a missing OTA password or API key) and refuses with "credentials changed since this firmware was built; run `display build ID`" when the fingerprints differ, when the credentials cannot be rendered (Wi-Fi cleared, display removed) or when the manifest predates the fingerprint. For `--previous` the refusal says the older build may carry revoked or outdated credentials. `--force` flashes anyway, for example after you restored the old credentials on purpose. The check does not stop `flash` from running against a project that was rendered after the firmware was built; rebuild to bring both in step.
 
 How the flash is done, and why it flashes exactly the recorded bytes: ESPHome
 2026.10.0 `upload` accepts `--file` (`esphome/__main__.py`, parser option
@@ -1030,7 +1033,7 @@ verified without hardware.
 `esphome_version`, `vesselstack_version`, `device_name`, `source_sha256` (a hash
 of the rendered project without `secrets.yaml` and `README.txt`, so it changes
 when the configuration changes but never depends on a secret), the sha256 and
-size of both images and `built_at_utc`. It contains no secrets.
+size of both images, `secrets_sha256` (see the credential check) and `built_at_utc`. It contains no secrets.
 
 Requirements and limits:
 
@@ -1061,9 +1064,11 @@ Requirements and limits:
   rebuild, the running firmware no longer matches it, so flash over USB. Changed
   Wi-Fi credentials do not change the OTA password; the display just cannot join
   the new network until it is reflashed over USB.
-- **Rollback.** `flash ID ... --previous` re-sends the previous build. OTA
-  rollback works only while the OTA password in `secrets.yaml` is the one that
-  build was compiled with; serial always works. Anything older than one build
+- **Rollback.** `flash ID ... --previous` re-sends the previous build, subject
+  to the same credential check (a rollback build that predates a `rotate` or
+  Wi-Fi change is refused without `--force`, because it would not connect).
+  OTA rollback works only while the OTA password in `secrets.yaml` is the one
+  that build was compiled with; serial always works. Anything older than one build
   needs an earlier export or a rebuild.
 - **Security.** The container runs as root inside Docker (the image default) with
   all capabilities dropped and `no-new-privileges`; the compile container has no

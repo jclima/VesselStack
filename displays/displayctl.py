@@ -245,7 +245,8 @@ def cmd_build_action(ctx, args) -> None:
 
 
 def cmd_flash_action(ctx, args) -> None:
-    firmware.flash(ctx, args.id, serial=args.serial, ota=args.ota, previous=args.previous)
+    firmware.flash(ctx, args.id, serial=args.serial, ota=args.ota, previous=args.previous,
+                   force=args.force, notify=_warn)
 
 
 STDOUT_ACTIONS = (cmd_render_action, cmd_build_action, cmd_flash_action)
@@ -361,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="IP address or host name of the display on the LAN")
     flash.add_argument("--previous", action="store_true",
                        help="flash the previous build (firmware.prev) to roll back")
+    flash.add_argument("--force", action="store_true",
+                       help="flash even if the credentials changed since the firmware was built")
     lifecycle_parser("status", "show bridge and display online state from retained MQTT topics",
                      cmd_status)
     return parser

@@ -268,6 +268,11 @@ def source_hash(files: dict, display_id: str) -> str:
     return digest.hexdigest()
 
 
+def secrets_fingerprint(files: dict, display_id: str) -> str:
+    """sha256 of the rendered secrets.yaml (Wi-Fi, MQTT, OTA and API secrets, MQTT host)."""
+    return sha256_hex(files[f"{display_id}/secrets.yaml"])
+
+
 def vesselstack_version(root: Path, env: dict | None = None) -> str:
     candidates = []
     if env and env.get("VESSELSTACK_VERSION"):
@@ -437,6 +442,9 @@ def _build_locked(ctx, display_id: str, *, stream=default_stream_runner, statvfs
             "esphome_version": render.esphome_version(),
             "vesselstack_version": vesselstack_version(ctx.root, ctx.env),
             "source_sha256": source,
+            # Fingerprint of the secrets.yaml compiled in (never the secrets themselves):
+            # flash refuses firmware whose credentials are no longer the current ones.
+            "secrets_sha256": secrets_fingerprint(rendered.files, display_id),
             "built_at_utc": built,
             "files": {name: {"sha256": sha256_hex(data), "size": len(data)}
                       for name, data in artifacts.items()},
@@ -536,7 +544,7 @@ def staged_firmware(ctx, data: bytes, expected_sha256: str):
 
 def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = None,
           previous: bool = False, stream=default_stream_runner, lstat=os.lstat,
-          realpath=os.path.realpath, notify=None) -> None:
+          realpath=os.path.realpath, notify=None, force: bool = False) -> None:
     """Upload the stored firmware; never compiles and never pulls an image.
 
     Holds the per-display build lock for the whole run, so a build cannot rotate the
@@ -549,10 +557,47 @@ def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = 
     host = validate_host(ota) if ota else None
     with render.build_lock(ctx, display_id, notify=notify):
         _flash_locked(ctx, display_id, device=device, host=host, previous=previous,
-                      stream=stream, serial=serial)
+                      stream=stream, serial=serial, force=force)
 
 
-def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream, serial) -> None:
+def check_credentials(ctx, display_id: str, manifest: dict, previous: bool) -> None:
+    """Refuse firmware that embeds credentials the Pi no longer uses.
+
+    The source hash deliberately excludes secrets.yaml, so after ``rotate``, ``wifi`` or a
+    remove-then-add the stored images still carry the old MQTT/OTA/Wi-Fi secrets and the
+    device would never connect. Compare the fingerprint recorded at build time with what
+    the current credentials render to. (``collect`` may generate a missing OTA password
+    or API key as a side effect; that is the same thing ``render`` does and is harmless.)
+    """
+    recorded = manifest.get("secrets_sha256")
+    reason = None
+    current = None
+    try:
+        current = secrets_fingerprint(render.collect(ctx, display_id).files, display_id)
+    except (RenderError, lifecycle.LifecycleError) as exc:
+        reason = str(exc)
+    if recorded and current and recorded == current:
+        return
+    if recorded is None:
+        why = "it was built before credentials were tracked in the manifest"
+    elif current is None:
+        why = f"the current credentials cannot be rendered ({reason})"
+    else:
+        why = ("the credentials changed since it was built (display rotate, display wifi, or "
+               "the display was removed and added again)")
+    if previous:
+        raise RenderError(
+            f"refusing to flash the rollback firmware: {why}. This older build may carry "
+            "credentials that are revoked or outdated; the device would run it but fail to "
+            "join Wi-Fi or be refused by the broker. Pass --force only if that is what you "
+            "want (for example you restored the old credentials)")
+    raise RenderError(
+        f"refusing to flash: {why}, so this firmware would not connect or accept updates. "
+        f"Run 'vesselstackctl display build {display_id}' first, or pass --force to flash it anyway")
+
+
+def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream, serial,
+                  force: bool = False) -> None:
     image = render.pinned_image()
     directory = PREVIOUS_DIR if previous else FIRMWARE_DIR
     name = FACTORY_NAME if serial else OTA_NAME
@@ -566,6 +611,16 @@ def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream,
                               f"'vesselstackctl display build {display_id}' first")
         data, manifest = load_firmware(dd, directory, name)
         mount = _check_mount_path(dd.path / render.PROJECT_DIR)
+        project_fd = _open_existing(dd.display_fd, render.PROJECT_DIR, mount)
+        try:
+            has_secrets = render._exists(project_fd, "secrets.yaml")
+        finally:
+            os.close(project_fd)
+    if not has_secrets:
+        raise RenderError(f"{mount}/secrets.yaml is missing (display wifi --clear removes it): "
+                          f"run 'vesselstackctl display render {display_id}' first")
+    if not force:
+        check_credentials(ctx, display_id, manifest, previous)
     if not _image_present(ctx, image):
         raise RenderError(f"the ESPHome image {image.split('@', 1)[0]} is not present locally and "
                           "flashing never pulls it; run "
