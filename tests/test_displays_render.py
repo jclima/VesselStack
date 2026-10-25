@@ -514,6 +514,48 @@ class Export(Base):
                           allow_missing_wifi=True)
         self.assertFalse((Path(self._tmp.name) / "victim").exists())
 
+    def test_output_is_handed_to_the_sudo_user_but_stays_0600(self):
+        from unittest import mock
+        out = Path(self._tmp.name) / "owned.tar.gz"
+        calls = []
+        env = {"SUDO_UID": str(os.getuid()), "SUDO_GID": str(os.getgid())}
+        with mock.patch.object(render, "_may_chown", return_value=True), \
+                mock.patch("os.fchown", side_effect=lambda fd, uid, gid: calls.append((uid, gid))):
+            render.export(self.ctx(), "helm", str(out), False, warn=self.messages.append,
+                          allow_missing_wifi=True, environ=env)
+        self.assertEqual(calls, [(os.getuid(), os.getgid())])
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+        self.assertTrue(any("owned by uid" in m for m in self.messages))
+
+    def test_invalid_or_missing_sudo_ids_are_ignored(self):
+        from unittest import mock
+        bad = [{}, {"SUDO_UID": "0", "SUDO_GID": "0"}, {"SUDO_UID": "abc", "SUDO_GID": "1"},
+               {"SUDO_UID": "-5", "SUDO_GID": "1"}, {"SUDO_UID": "1" * 11, "SUDO_GID": "1"},
+               {"SUDO_UID": "4000000000", "SUDO_GID": "4000000000"},  # no such account
+               {"SUDO_UID": str(os.getuid())}]
+        for index, env in enumerate(bad):
+            with self.subTest(env=env):
+                self.assertIsNone(render.sudo_owner(env))
+                calls = []
+                out = Path(self._tmp.name) / f"bad{index}.tar.gz"
+                with mock.patch.object(render, "_may_chown", return_value=True), \
+                        mock.patch("os.fchown", side_effect=lambda *a: calls.append(a)):
+                    render.export(self.ctx(), "helm", str(out), False, warn=lambda t: None,
+                                  allow_missing_wifi=True, environ=env)
+                self.assertEqual(calls, [])
+                self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+
+    def test_failed_chown_warns_but_keeps_the_archive(self):
+        from unittest import mock
+        out = Path(self._tmp.name) / "warn.tar.gz"
+        env = {"SUDO_UID": str(os.getuid()), "SUDO_GID": str(os.getgid())}
+        with mock.patch.object(render, "_may_chown", return_value=True), \
+                mock.patch("os.fchown", side_effect=PermissionError(1, "Operation not permitted")):
+            render.export(self.ctx(), "helm", str(out), False, warn=self.messages.append,
+                          allow_missing_wifi=True, environ=env)
+        self.assertTrue(out.stat().st_size > 0)
+        self.assertTrue(any("could not give" in m for m in self.messages))
+
     def test_needs_exactly_one_target(self):
         with self.assertRaises(render.RenderError):
             render.export(self.ctx(), "helm", None, False, warn=lambda t: None)

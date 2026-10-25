@@ -22,8 +22,10 @@ import contextlib
 import errno
 import fcntl
 import gzip
+import grp
 import io
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -942,8 +944,29 @@ def render(ctx, display_id: str, allow_missing_wifi: bool = False, warn=None) ->
     return path
 
 
+def _may_chown() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def sudo_owner(environ) -> tuple[int, int] | None:
+    """(uid, gid) of the user who ran ``sudo``, when SUDO_UID/SUDO_GID name a real account."""
+    uid_text, gid_text = environ.get("SUDO_UID", ""), environ.get("SUDO_GID", "")
+    for text in (uid_text, gid_text):
+        if not (text.isascii() and text.isdigit() and len(text) <= 10):
+            return None
+    uid, gid = int(uid_text), int(gid_text)
+    if uid == 0:
+        return None  # plain root login: nothing to hand over
+    try:
+        pwd.getpwuid(uid)
+        grp.getgrgid(gid)
+    except (KeyError, OverflowError):
+        return None
+    return uid, gid
+
+
 def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None, stdout=None,
-           allow_missing_wifi: bool = False) -> None:
+           allow_missing_wifi: bool = False, environ=None) -> None:
     lifecycle._require_root(ctx, "export")
     stream = stdout if stdout is not None else sys.stdout
     if to_stdout:
@@ -975,6 +998,16 @@ def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None,
         raise RenderError(f"cannot create {output}: {exc.strerror}") from exc
     try:
         os.fchmod(fd, FILE_MODE)
+        # Under sudo the file would belong to root in the user's directory: hand it to the
+        # invoking user, still mode 0600, so they can read and delete their own archive.
+        owner = sudo_owner(os.environ if environ is None else environ)
+        owned = ""
+        if owner and _may_chown():
+            try:
+                os.fchown(fd, *owner)
+                owned = f", owned by uid {owner[0]}"
+            except OSError as exc:
+                emit(f"warning: could not give {output} to uid {owner[0]}: {exc.strerror}")
         view = memoryview(archive)
         while view:
             view = view[os.write(fd, view):]
@@ -987,4 +1020,4 @@ def export(ctx, display_id: str, output: str | None, to_stdout: bool, warn=None,
             pass
         raise
     os.close(fd)
-    emit(f"Wrote {output} (mode 0600, {len(archive)} bytes)")
+    emit(f"Wrote {output} (mode 0600{owned}, {len(archive)} bytes)")

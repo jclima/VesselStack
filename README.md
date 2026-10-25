@@ -881,13 +881,13 @@ or a service, so `compose up` can never start ESPHome.
 ```bash
 sudo vesselstackctl display wifi                       # once, shared by all displays
 sudo vesselstackctl display render helm                # writes /opt/vesselstack/build/displays/helm/project/
-ssh pi 'sudo vesselstackctl display export helm --stdout' > helm.tar.gz   # laptop copy
+(umask 077; ssh pi 'sudo vesselstackctl display export helm --stdout' > helm.tar.gz)   # laptop copy, private
 ```
 
 | Command | What it does |
 | --- | --- |
 | `render ID [--allow-missing-wifi]` | Root. Generates the project into `$VESSELSTACK_ROOT/build/displays/ID/project/` and prints that path. Fails with a clear message if the display, its MQTT password (run `sync-mqtt` first) or the Wi-Fi credentials are missing; `--allow-missing-wifi` writes placeholder Wi-Fi values and warns (for CI and golden tests only; never flash such a build). Missing per-display secrets (OTA password, API key) are generated and stored under the same lock as the other lifecycle commands. |
-| `export ID (--output FILE \| --stdout) [--allow-missing-wifi]` | Root. Renders, then writes a deterministic `tar.gz` (sorted entries, fixed mtime, uid/gid 0, modes 0700/0600) containing `ID/`: the device file `ID.yaml`, `secrets.yaml`, the board and app packages, the fonts and their license, and a short `README.txt` with the build and flash commands. `--output` creates FILE exclusively with mode 0600 and refuses an existing path or a symlink; `--stdout` refuses a terminal. Warnings go to stderr, so stdout carries only the archive. |
+| `export ID (--output FILE \| --stdout) [--allow-missing-wifi]` | Root. Renders, then writes a deterministic `tar.gz` (sorted entries, fixed mtime, uid/gid 0, modes 0700/0600) containing `ID/`: the device file `ID.yaml`, `secrets.yaml`, the board and app packages, the fonts and their license, and a short `README.txt` with the build and flash commands. `--output` creates FILE exclusively with mode 0600 and refuses an existing path or a symlink; when run through `sudo` it also gives the file to the invoking user (`SUDO_UID`/`SUDO_GID`, only when both are numeric and name an existing account), still mode 0600, so you can read and delete your own archive. `--stdout` refuses a terminal. With `--stdout` the file is created by your shell, not by `vesselstackctl`: redirect inside `(umask 077; ...)` as shown, otherwise the archive, which holds secrets, is created world-readable under the usual umask 022. Warnings go to stderr, so stdout carries only the archive. |
 
 `ID.yaml` is generated and holds no secrets. It composes `boards/<board>.yaml`
 (hardware only), `app/vesselstack.yaml` (Wi-Fi, OTA, MQTT) and, only when the
