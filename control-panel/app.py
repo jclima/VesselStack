@@ -200,6 +200,10 @@ def write_env(path: Path, values: dict[str, str], preferred_order: list[str]) ->
             pass
 
 
+MQTT_ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+DEFAULT_BRIDGE_MQTT_USERNAME = "vesselstack-bridge"
+
+
 def validate_value(spec: dict[str, Any], value: Any) -> str:
     text = str(value).strip()
     kind = spec["kind"]
@@ -226,6 +230,13 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
             raise ValueError(f"{spec['label']} must be an IPv4 address") from exc
         if address.version != 4:
             raise ValueError(f"{spec['label']} must be an IPv4 address")
+    # Mirrors the installer: account names go into the Mosquitto password and ACL
+    # files, and the SignalK token into a systemd EnvironmentFile line.
+    if spec["key"] in {"MQTT_USERNAME", "DISPLAYS_BRIDGE_MQTT_USERNAME"} and text:
+        if not MQTT_ACCOUNT_NAME.fullmatch(text):
+            raise ValueError(f"{spec['label']} may contain 1-64 letters, numbers, dot, underscore, and hyphen")
+    if spec["key"] == "DISPLAYS_SIGNALK_TOKEN" and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        raise ValueError(f"{spec['label']} must not contain control characters")
     if kind == "path" and text and not text.startswith("/"):
         raise ValueError(f"{spec['label']} must be an absolute path")
     if kind == "url" and text:
@@ -269,6 +280,10 @@ def update_configuration(updates: dict[str, Any]) -> str:
         target[key] = value
         if key in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             panel[key] = value
+    if vessel.get("DISPLAYS_ENABLE", "false") == "true":
+        bridge_user = vessel.get("DISPLAYS_BRIDGE_MQTT_USERNAME") or DEFAULT_BRIDGE_MQTT_USERNAME
+        if bridge_user == vessel.get("MQTT_USERNAME", ""):
+            raise ValueError("Displays bridge MQTT username must differ from the MQTT username")
     paths = [VESSEL_ENV, CHAT_ENV, PANEL_ENV]
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
     backup = CONFIG_BACKUP_ROOT / stamp
