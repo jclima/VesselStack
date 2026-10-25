@@ -58,18 +58,25 @@ does anything beyond installing ordinary Debian packages:
    owned by root and not writable by others;
 4. starts the loopback-only configuration wizard on a random free port (override
    with `--wizard-port N`) and tells you how to open it. The wizard runs as an
-   unprivileged user (the account that ran `sudo`; `nobody` if there is none or it
-   is root) with a minimal environment, writing only into a private 0700 directory
+   unprivileged user (the account that ran `sudo`; if there is none, or it is root, a
+   temporary dedicated system account `vesselstack-wizard` is created for the run
+   with `useradd --system --no-create-home --shell /usr/sbin/nologin` and removed
+   again when the script ends, even after a failure; the shared `nobody` identity is
+   never used, so no other daemon can tamper with the output; a stale
+   `vesselstack-wizard` left by an interrupted run is replaced) with a minimal environment, writing only into a private 0700 directory
    owned by that user, so other local users cannot obtain a root-installed
    configuration. It prints one address ending in `#token=...`; open that exact
    address in a browser on the Pi, or on your laptop after running the printed
    `ssh -L PORT:127.0.0.1:PORT USER@PI` command. The token is in the URL fragment,
    so it is never sent to the server or served in the page, and the page removes
    it from the address bar. The wizard closes itself when you save; the bootstrap
-   then copies the result once into a root-only staging directory, lints that copy
-   and installs only it. `--config FILE` gets the same treatment: opened without
+   then copies the result once into a root-only staging directory, lints that copy,
+   re-validates it as root with the wizard's own rules
+   (`vesselstack-wizard.py --validate FILE`: known settings only, allowed characters,
+   enum and boolean values) and installs only it. `--config FILE` gets the same treatment: opened without
    following symlinks, must be a regular file of at most 64 KiB, copied once, and
-   only the staged copy is linted and used. Limitation: the Docker line in the
+   only the staged copy is linted, validated the same way (unknown keys, disallowed
+   characters or bad enum values are refused) and used. Limitation: the Docker line in the
    wizard's preflight page reflects what the unprivileged wizard user can see;
    `install.sh` performs the authoritative checks;
 5. shows a summary of the chosen configuration (no secrets), asks for confirmation,
@@ -126,7 +133,11 @@ Open the address the wizard prints (`http://127.0.0.1:8088/#token=...`), or use 
 SSH tunnel documented in the guide and open the same address on your workstation.
 The wizard accepts `--port N`, `--output FILE` (where to write the env file) and
 `--exit-after-save` (stop after the first successful save; the one-line installer
-uses it). It prints a per-run address of the form `http://127.0.0.1:PORT/#token=...`; open
+uses it) and `--validate FILE` (check an existing env file with the wizard's rules,
+exit 0 if valid, 1 otherwise, no server started; `VESSELSTACK_CAN_CREATE_VCAN` is now a
+known wizard setting, default `false`). Rollback: revert this change; nothing is
+persisted except the temporary account, which is removed on exit (`sudo userdel
+vesselstack-wizard` if a run was killed with SIGKILL). It prints a per-run address of the form `http://127.0.0.1:PORT/#token=...`; open
 that exact address. The token is carried in the URL fragment (never sent to the
 server, never present in any served file); `wizard/app.js` reads it, removes it
 from the address bar with `history.replaceState` and sends it as `X-Wizard-Token`

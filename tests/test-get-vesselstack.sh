@@ -23,7 +23,7 @@ while :; do
 done
 TEST_ROOT=$(mktemp -d -p "$TEST_BASE" vs-get.XXXXXX)
 chmod 0755 "$TEST_ROOT"
-trap 'rm -rf -- "$TEST_ROOT"' EXIT
+trap 'rm -rf -- "$TEST_ROOT"; userdel vesselstack-wizard >/dev/null 2>&1 || true' EXIT
 
 GET="$TEST_ROOT/get-vesselstack.sh"
 FAKE_BIN="$TEST_ROOT/bin"
@@ -90,9 +90,21 @@ cat > "$FAKE_BIN/runuser" <<'EOF2'
 echo "runuser $*" >> "$LOG"
 exec "$(PATH=/usr/sbin:/sbin:/usr/bin:/bin command -v runuser)" "$@"
 EOF2
+# Real account management only for the temporary wizard account; everything else is logged only.
 cat > "$FAKE_BIN/useradd" <<'EOF2'
 #!/bin/bash
 echo "useradd $*" >> "$LOG"
+if [ "${*: -1}" = vesselstack-wizard ]; then
+    exec "$(PATH=/usr/sbin:/sbin:/usr/bin:/bin command -v useradd)" "$@"
+fi
+exit 0
+EOF2
+cat > "$FAKE_BIN/userdel" <<'EOF2'
+#!/bin/bash
+echo "userdel $*" >> "$LOG"
+if [ "${*: -1}" = vesselstack-wizard ]; then
+    exec "$(PATH=/usr/sbin:/sbin:/usr/bin:/bin command -v userdel)" "$@"
+fi
 exit 0
 EOF2
 cat > "$FAKE_BIN/vesselstackctl" <<'EOF2'
@@ -124,8 +136,13 @@ exit 0
 EOF2
 cat > "$SRC/vesselstack-wizard.py" <<'EOF2'
 # Runs as an unprivileged user with a minimal environment (no LOG, no TEST_ROOT).
-import os, sys
+import os, runpy, sys
 args = sys.argv[1:]
+if "--validate" in args:
+    # Root-side validation: run the REAL wizard code from the repository.
+    sys.argv = [sys.argv[0]] + args
+    runpy.run_path("@REPO_ROOT@/vesselstack-wizard.py", run_name="__main__")
+    sys.exit(0)
 out = args[args.index("--output") + 1]
 port = args[args.index("--port") + 1]
 print("VesselStack wizard: http://127.0.0.1:" + port)
@@ -146,10 +163,18 @@ with open(out, "w") as handle:
     handle.write("BOAT_NAME='Test Boat'\nVESSELSTACK_USER=daemon\nBOAT_MMSI=''\n")
     if mode == "big":
         handle.write("# " + "x" * 70000 + "\n")
+    if mode == "unknown":
+        handle.write("NOT_A_SETTING=x\n")
+    if mode == "badchars":
+        handle.write("BOAT_CALLSIGN='a;b'\n")
+    if mode == "enum":
+        handle.write("SIGNALK_MODE=surprise\n")
+    if mode == "boolean":
+        handle.write("AIS_ENABLE=yes\n")
     if mode == "inject":
         handle.write("BOAT_CALLSIGN=$(touch @TEST_ROOT@/pwned-wizard)\n")
 EOF2
-sed -i "s|@TEST_ROOT@|$TEST_ROOT|g" "$SRC/vesselstack-wizard.py"
+sed -i "s|@TEST_ROOT@|$TEST_ROOT|g; s|@REPO_ROOT@|$REPO_ROOT|g" "$SRC/vesselstack-wizard.py"
 chmod 0755 "$SRC/install.sh" "$SRC/scripts/prepare-offline-bundle.sh"
 GOOD="$TEST_ROOT/good.tar.gz"
 tar -C "$TEST_ROOT/src" -czf "$GOOD" "vesselstack-$VER"
@@ -209,7 +234,8 @@ reset_state() {
 RC=0
 run() {  # args... (stdin is never a terminal)
     RC=0
-    env PATH="$FAKE_BIN:$PATH" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
+    # SUDO_USER is always unset here (CI runs the test under sudo, which sets it); cases set it via EXTRA_ENV.
+    env -u SUDO_USER PATH="$FAKE_BIN:$PATH" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
         VESSELSTACK_VERSION="$VER" VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT=0 NO_COLOR=1 \
         ${EXTRA_ENV:+"$EXTRA_ENV"} \
         bash "$GET" --dir "$RELEASE_BASE" --base-url "https://example.invalid/releases/v$VER" "$@" \
@@ -221,6 +247,7 @@ expect_out() { grep -qE -- "$1" "$OUT" || fail_test "output lacks /$1/"; }
 refuse_out() { if grep -qE -- "$1" "$OUT"; then fail_test "output must not contain /$1/"; fi; }
 expect_log() { grep -qE -- "$1" "$LOG" || fail_test "calls lack /$1/"; }
 refuse_log() { if grep -qE -- "$1" "$LOG"; then fail_test "calls must not contain /$1/"; fi; }
+expect_no_wizard_user() { if getent passwd vesselstack-wizard >/dev/null; then fail_test "temporary account vesselstack-wizard was not removed"; fi; }
 expect_no_release() { [ ! -e "$RELEASE_BASE/$VER" ] || fail_test "release directory must not exist"; }
 
 # ---- 1. help and refusals --------------------------------------------------
@@ -400,8 +427,14 @@ run --yes --wizard-port 8123
 expect_rc 0 "wizard flow"
 expect_out "ssh -L 8123:127.0.0.1:8123"
 expect_out "http://127.0.0.1:8123/#token="
-# Runs unprivileged (nobody without SUDO_USER) with a minimal environment, never as root.
-expect_log "^runuser -u nobody -- env -i PATH=[^ ]+ HOME=/[^ ]+ LANG=C.UTF-8 python3 -I $RELEASE_BASE/$VER/vesselstack-wizard.py --port 8123 --output /[^ ]+/vesselstack.env --exit-after-save"
+# No SUDO_USER: runs as a temporary dedicated account (never the shared nobody) with a minimal
+# environment, never as root; the account is created before and removed after the run.
+expect_log "^useradd --system --no-create-home --shell /usr/sbin/nologin vesselstack-wizard$"
+expect_log "^userdel vesselstack-wizard$"
+expect_no_wizard_user
+refuse_log "runuser -u nobody"
+refuse_out "uid=65534 "
+expect_log "^runuser -u vesselstack-wizard -- env -i PATH=[^ ]+ HOME=/[^ ]+ LANG=C.UTF-8 python3 -I $RELEASE_BASE/$VER/vesselstack-wizard.py --port 8123 --output /[^ ]+/vesselstack.env --exit-after-save"
 expect_out "uid=[1-9][0-9]* env=HOME,LANG,PATH$"
 refuse_out "uid=0 "
 wiz=$(grep -n "^runuser" "$LOG" | head -n1 | cut -d: -f1)
@@ -415,29 +448,52 @@ reset_state
 EXTRA_ENV=SUDO_USER=daemon run --yes
 EXTRA_ENV=
 expect_rc 0 "wizard as SUDO_USER"
+refuse_log "^useradd .*vesselstack-wizard"
+expect_no_wizard_user
 expect_log "^runuser -u daemon -- env -i .*--port [0-9]{4,5} "
 expect_out "ssh -L ([0-9]{4,5}):127.0.0.1:\\1 "
 reset_state
 EXTRA_ENV=SUDO_USER=root run --yes
 EXTRA_ENV=
-expect_log "^runuser -u nobody "
+expect_log "^runuser -u vesselstack-wizard "
+expect_no_wizard_user
+# An unknown SUDO_USER also falls back to the dedicated account.
+reset_state
+EXTRA_ENV=SUDO_USER=no-such-account-xyz run --yes
+EXTRA_ENV=
+expect_rc 0 "wizard with unknown SUDO_USER"
+expect_log "^runuser -u vesselstack-wizard "
+expect_no_wizard_user
+# A stale account from an interrupted run is replaced by a fresh one and removed again.
+reset_state
+useradd --system --no-create-home --shell /usr/sbin/nologin vesselstack-wizard
+run --yes
+expect_rc 0 "wizard with a stale vesselstack-wizard account"
+expect_log "^userdel vesselstack-wizard$"
+expect_log "^useradd --system --no-create-home .* vesselstack-wizard$"
+expect_no_wizard_user
 
 # The wizard closed without saving: nothing is installed.
 reset_state
 echo nosave > "$TEST_ROOT/wizard-mode"
 run --yes
 expect_rc 1 "wizard closed without saving"
+expect_no_wizard_user
 expect_out "before a configuration was saved"
 refuse_log "^install "
 
 # Wizard output is copied once without following links, then linted: a symlink, a FIFO,
 # an oversized file and injection content are all refused and nothing is installed.
-for mode in symlink fifo big inject; do
+# Output that passes the syntax lint but breaks the wizard's own rules (unknown key, characters,
+# enum, boolean) is refused too. The temporary account is removed after every failure.
+for mode in symlink fifo big inject unknown badchars enum boolean; do
     reset_state
     echo "$mode" > "$TEST_ROOT/wizard-mode"
     run --yes
     expect_rc 1 "wizard output ($mode) must be refused"
     expect_out "wizard output was refused|saved configuration is invalid"
+    expect_log "^userdel vesselstack-wizard$"
+    expect_no_wizard_user
     refuse_log "^install "
     [ ! -e "$TEST_ROOT/pwned-wizard" ] || fail_test "wizard output content was executed"
     [ ! -e "$RELEASE_BASE/vesselstack.env" ] || fail_test "refused wizard output must not be installed"
@@ -469,6 +525,16 @@ run --yes --no-wizard --config "$TEST_ROOT/cfg/inject.env"
 expect_rc 1 "--config injection must be refused"
 [ ! -e "$TEST_ROOT/pwned-config" ] || fail_test "config content was executed"
 refuse_log "^install "
+# --config gets the same strict validation as the wizard output.
+for bad in 'NOT_A_SETTING=x' "BOAT_CALLSIGN='a;b'" 'SIGNALK_MODE=surprise' 'AIS_ENABLE=yes' 'BOAT_NAME=two words'; do
+    reset_state
+    { cat "$TEST_ROOT/in.env"; printf '%s\n' "$bad"; } > "$TEST_ROOT/cfg/strict.env"
+    run --yes --no-wizard --config "$TEST_ROOT/cfg/strict.env"
+    expect_rc 1 "--config with '$bad' must be refused"
+    expect_out "configuration file was refused"
+    refuse_log "^install "
+    [ ! -e "$RELEASE_BASE/vesselstack.env" ] || fail_test "refused --config must not be installed"
+done
 # A file swapped for a symlink after the check cannot matter: only the staged copy is used.
 # The installed file is a root-owned copy, identical to the original content.
 reset_state

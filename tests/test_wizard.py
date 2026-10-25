@@ -5,6 +5,7 @@ import threading
 from http.server import ThreadingHTTPServer
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -200,5 +201,28 @@ class WizardCommandLineTests(unittest.TestCase):
             self.assertEqual(process.wait(timeout=10), 0)
             self.assertIn("BOAT_NAME=Cli", target.read_text())
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+class ValidateCliTests(unittest.TestCase):
+    def check(self, text):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "in.env"; path.write_text(text)
+            return subprocess.run(["python3", "-I", str(ROOT / "vesselstack-wizard.py"), "--validate", str(path)],
+                                  capture_output=True, text=True, timeout=20)
+
+    def test_wizard_output_and_example_env_are_valid(self):
+        self.assertEqual(self.check(wizard.render({"BOAT_NAME": "A Boat (Test)"})).returncode, 0)
+        self.assertEqual(self.check((ROOT / "vesselstack.example.env").read_text()).returncode, 0)
+
+    def test_refuses_unknown_key_bad_characters_enums_and_syntax(self):
+        for text in ("NOT_A_SETTING=x\n", "BOAT_NAME='a;b'\n", "BOAT_NAME='$(id)'\n", "SIGNALK_MODE=surprise\n",
+                     "AIS_ENABLE=yes\n", "VESSELSTACK_CAN_CREATE_VCAN=maybe\n", "BOAT_NAME=a b\n", "garbage\n"):
+            result = self.check(text)
+            self.assertEqual(result.returncode, 1, text)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_file_is_refused(self):
+        result = subprocess.run(["python3", "-I", str(ROOT / "vesselstack-wizard.py"), "--validate", "/nonexistent/x.env"],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 1)
 
 if __name__ == "__main__": unittest.main()

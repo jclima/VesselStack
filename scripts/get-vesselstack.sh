@@ -38,6 +38,8 @@ PIN_SHA256=
 BASE_URL=
 WIZARD_PORT=
 WIZARD_DIR=
+WIZARD_ACCOUNT=vesselstack-wizard
+WIZARD_TMPUSER=
 CONFIG_MAX_BYTES=65536
 INSTALL_ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 PROMPT_SOURCE=${VESSELSTACK_BOOTSTRAP_ANSWERS:-/dev/tty}
@@ -249,6 +251,38 @@ compose_ok() { command -v docker >/dev/null 2>&1 && docker compose version >/dev
 cleanup() {
     if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then rm -rf -- "$STAGE"; fi
     if [ -n "$WIZARD_DIR" ] && [ -d "$WIZARD_DIR" ]; then rm -rf -- "$WIZARD_DIR"; fi
+    remove_wizard_user
+}
+
+# Removes the temporary wizard account (if this run created one), also after a failure.
+# shellcheck disable=SC2317,SC2329  # Invoked through the EXIT trap.
+remove_wizard_user() {
+    local name=$WIZARD_TMPUSER
+    [ -n "$name" ] || return 0
+    if id -u "$name" >/dev/null 2>&1; then
+        if command -v pkill >/dev/null 2>&1; then pkill -KILL -u "$name" >/dev/null 2>&1 || true; fi
+        userdel "$name" >/dev/null 2>&1 || printf 'WARNING: could not remove the temporary account %s; remove it with: sudo userdel %s\n' "$name" "$name" >&2
+    fi
+    WIZARD_TMPUSER=
+}
+
+# Creates the dedicated, unshared account the wizard runs as when there is no real SUDO_USER.
+# (Never "nobody": other daemons share that identity and could tamper with the wizard output.)
+create_wizard_user() {
+    if id -u "$WIZARD_ACCOUNT" >/dev/null 2>&1; then
+        # Left over from an interrupted run: it is ours by name only, so replace it with a fresh account.
+        WIZARD_TMPUSER=$WIZARD_ACCOUNT
+        remove_wizard_user
+        if id -u "$WIZARD_ACCOUNT" >/dev/null 2>&1; then
+            die "The account '$WIZARD_ACCOUNT' already exists and could not be removed." \
+                "Remove it with: sudo userdel $WIZARD_ACCOUNT   (or use --no-wizard --config FILE)."
+        fi
+    fi
+    WIZARD_TMPUSER=$WIZARD_ACCOUNT
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$WIZARD_ACCOUNT" \
+        || die "Could not create the temporary wizard account '$WIZARD_ACCOUNT'." \
+               "Run with sudo from a normal account, or use --no-wizard --config FILE."
+    changed "created the temporary system account '$WIZARD_ACCOUNT' for the wizard (removed again when this script ends)"
 }
 
 # KEY=VALUE env files are never sourced here. This reads them with shlex after a
@@ -299,6 +333,13 @@ if mode == "get":
     for key in sys.argv[3:]:
         print(values.get(key, ""))
 PY
+
+# Re-validates a staged file with the wizard's own rules (known keys only, allowed characters,
+# enums and booleans). Runs as root from the root-owned release tree; python -I ignores the
+# environment and the current directory.
+validate_staged() {
+    python3 -I "$RELEASE_DIR/vesselstack-wizard.py" --validate "$1"
+}
 
 # Copies an untrusted file ONCE into a root-owned staging path: opened without following
 # a symlink (and without blocking on a FIFO), must be a regular file of at most N bytes.
@@ -656,11 +697,16 @@ describe_ssh_access() {
 }
 
 # Runs the wizard as an unprivileged user in a private 0700 directory owned by that user.
-# The user is the one who invoked sudo; with no (or root) SUDO_USER it is "nobody".
+# The user is the one who invoked sudo; with no (or root) SUDO_USER a temporary dedicated
+# system account is created for the run and removed on exit (never the shared "nobody").
 run_wizard() {
     local user=${SUDO_USER:-} port=$WIZARD_PORT
     if [ -z "$user" ] || [ "$user" = root ] || ! id -u "$user" >/dev/null 2>&1 || [ "$(id -u "$user")" -eq 0 ]; then
-        user=nobody
+        if ! command -v useradd >/dev/null 2>&1 || ! command -v userdel >/dev/null 2>&1; then
+            die "useradd/userdel are missing (package passwd)." "Use --no-wizard --config FILE."
+        fi
+        create_wizard_user
+        user=$WIZARD_ACCOUNT
     fi
     id -u "$user" >/dev/null 2>&1 || die "Cannot run the wizard unprivileged: user '$user' does not exist." \
         "Run with sudo from a normal account, or use --no-wizard --config FILE."
@@ -695,6 +741,9 @@ step_configure() {
             || die "The configuration file was refused (see above)." "It must be a regular file (not a symlink) of at most $CONFIG_MAX_BYTES bytes."
         python3 -I -c "$ENVTOOL" lint "$STAGE/config.env" \
             || die "The configuration file was refused (see above). It must contain only KEY=VALUE lines."
+        validate_staged "$STAGE/config.env" \
+            || die "The configuration file was refused (see above). It may only set known VesselStack settings with plain values." \
+                   "Compare it with vesselstack.example.env."
         install -m 0600 -o root -g root "$STAGE/config.env" "$ENV_FILE.new"
         mv -f -- "$ENV_FILE.new" "$ENV_FILE"
         changed "copied $CONFIG_ARG to $ENV_FILE (root only, mode 600)"
@@ -723,6 +772,7 @@ step_configure() {
     stage_untrusted "$WIZARD_DIR/vesselstack.env" "$STAGE/wizard.env" \
         || die "The wizard output was refused (see above). Nothing was installed."
     python3 -I -c "$ENVTOOL" lint "$STAGE/wizard.env" || die "The saved configuration is invalid (see above)."
+    validate_staged "$STAGE/wizard.env" || die "The saved configuration is invalid (see above). Nothing was installed."
     install -m 0600 -o root -g root "$STAGE/wizard.env" "$ENV_FILE"
     rm -rf -- "$WIZARD_DIR"
     changed "configuration saved to $ENV_FILE (root only, mode 600)"
