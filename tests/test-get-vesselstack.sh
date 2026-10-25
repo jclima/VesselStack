@@ -641,7 +641,7 @@ docker_absent() {
         for tool in "$dir"/*; do
             name=${tool##*/}
             case "$name" in docker|docker-*) continue ;; esac
-            [ -x "$tool" ] && [ ! -d "$tool" ] && [ ! -e "$nodocker/$name" ] || continue
+            if ! { [ -x "$tool" ] && [ ! -d "$tool" ] && [ ! -e "$nodocker/$name" ]; }; then continue; fi
             ln -s "$tool" "$nodocker/$name"
         done
     done
