@@ -602,5 +602,46 @@ class MqttAuthTests(unittest.TestCase):
         self.assertIn("eclipse-mosquitto:8.8.8-alpine", run)
 
 
+class ReadRegularTests(unittest.TestCase):
+    """_read_regular must never block on, or read from, a non-regular file."""
+
+    PROBE = (
+        "import os, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import mqtt_auth\n"
+        "fd = os.open(sys.argv[2], os.O_RDONLY | os.O_DIRECTORY)\n"
+        "try:\n"
+        "    mqtt_auth._read_regular(sys.argv[3], fd)\n"
+        "except mqtt_auth.MqttAuthError as exc:\n"
+        "    print('refused:', exc)\n"
+    )
+
+    def test_fifo_is_refused_without_hanging(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs on this platform")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkfifo(os.path.join(tmp, "artifact.bin"))
+            # A subprocess with a timeout: a regression would block in open() forever.
+            result = subprocess.run(
+                [sys.executable, "-c", self.PROBE, str(ROOT / "displays"), tmp, "artifact.bin"],
+                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refused", result.stdout)
+        self.assertIn("not a regular file", result.stdout)
+
+    def test_symlink_and_regular_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "real").write_bytes(b"data")
+            os.symlink("real", os.path.join(tmp, "link"))
+            fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(mqtt_auth._read_regular("real", fd), b"data")
+                self.assertIsNone(mqtt_auth._read_regular("absent", fd))
+                with self.assertRaises(mqtt_auth.MqttAuthError):
+                    mqtt_auth._read_regular("link", fd)
+            finally:
+                os.close(fd)
+
+
 if __name__ == "__main__":
     unittest.main()

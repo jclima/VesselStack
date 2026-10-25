@@ -362,9 +362,13 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _read_regular(name: str, dir_fd: int) -> bytes | None:
-    if _lstat(name, dir_fd) is None:
+    info = _lstat(name, dir_fd)
+    if info is None:
         return None
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise MqttAuthError(f"refusing to read {name}: it is not a regular file")
+    # O_NONBLOCK: a FIFO swapped in after the lstat must not hang a root command in open().
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise MqttAuthError(f"refusing to read {name}: it is not a regular file")
