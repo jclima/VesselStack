@@ -11,6 +11,9 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/tests/test-service-integration.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
+for f in "$ROOT"/displays/*.py; do python3 -m py_compile "$f"; done
+python3 -m json.tool "$ROOT/displays/boards/registry.json" >/dev/null
+python3 "$ROOT/displays/displayctl.py" validate >/dev/null
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \

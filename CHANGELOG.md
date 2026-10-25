@@ -7,6 +7,7 @@ Semantic Versioning.
 
 - Add a configured one-command application update/preview/rollback launcher.
 - Restart an active Telegram worker when its code changes and retain the restart plan for rollback.
+- Add instrument displays preview: configuration schema and validation (`displays/displayctl.py validate`), unit conversions, MQTT topic/freshness logic, and a board registry seeded with the Waveshare ESP32-S3-Touch-LCD-2.8C. Nothing is installed or wired into the stack yet.
 
 ### Added
 

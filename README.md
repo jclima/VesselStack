@@ -472,6 +472,97 @@ continue to work while it is disabled.
 Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
 SignalK, Boat Chat, InfluxDB, and Prometheus.
 
+## Instrument displays (preview)
+
+VesselStack is gaining configurable live-instrument displays: small ESP32 touch
+screens that show SignalK values (speed, depth, wind angle, battery voltage and
+so on) on pages you define. The first board is the Waveshare
+ESP32-S3-Touch-LCD-2.8C, planned to run ESPHome with LVGL. The board registry
+and page layouts are data, so more boards and layouts can be added later.
+
+**Status: preview.** Only the configuration schema, validation, unit
+conversions, the MQTT topic/payload and freshness logic, and the board registry
+exist today (`displays/`). Nothing is installed, started, firewalled or wired
+into `install.sh`, `vesselstackctl`, Mosquitto or Compose yet, and no firmware
+is built. There is no operational impact on an existing installation. Rollback
+is simply removing the `displays/` directory.
+
+### Configuration and validation
+
+The runtime configuration will live at `$VESSELSTACK_ROOT/config/displays.json`.
+Start from [`displays/displays.example.json`](displays/displays.example.json).
+It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
+`heartbeat_s` (1-60, default 5), `instruments` and `displays`:
+
+- An instrument (`^[a-z][a-z0-9_]{0,31}$`) has a SignalK `path` for
+  `vessels.self` (numeric scalar values only), `label` (1-16 characters),
+  `convert` (one named conversion), `unit` (up to 8 characters), `precision`
+  (0-3), `stale_after_s` (1-3600 and at least 2 x `heartbeat_s`) and optional
+  `min_interval_ms` (100-60000, default 1000).
+- A display (`^[a-z][a-z0-9-]{0,23}$`) has a `name`, a `board` from
+  `displays/boards/registry.json`, optional `home_assistant_api` (boolean) and
+  1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
+  supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6) and
+  unique `items` naming existing instruments.
+- Conversions: `none`, `m/s->kn`, `m/s->km/h`, `m/s->mph`, `K->C`, `K->F`,
+  `rad->deg`, `rad->deg_signed` (-180..180], `rad->deg_360` [0,360), `m->ft`,
+  `m->fathom`, `m->nmi`, `ratio->%`, `Pa->hPa`, `Pa->bar`, `Pa->psi`, `m3->L`,
+  `m3->gal` (US), `m3/s->L/h`, `m3/s->gal/h`, `Hz->rpm`, `C->Ah`, `s->min`,
+  `s->h`.
+
+Unknown keys are rejected at every level, booleans are not accepted where
+integers are expected, and all errors are reported together with a JSON-path
+location. Validate with the standard library only (no extra packages):
+
+```bash
+python3 displays/displayctl.py validate                  # the example file
+python3 displays/displayctl.py validate /path/to/displays.json
+```
+
+Exit status is `0` valid, `1` validation errors (nothing is written), `2`
+usage, file or JSON parse errors.
+
+### MQTT topics and freshness
+
+Values are published retained to `vesselstack/v1/instruments/<instrument_id>`
+as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","age":0.4}`.
+`v` is converted, then rounded to `precision`, and is `null` unless `st` is
+`ok`. `ts` is the SignalK timestamp (or `null`); `age` is seconds since the
+bridge received the value, measured on the bridge clock, not the SignalK
+timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
+`vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/<username>/status`.
+
+- `ok`: a value was received within `stale_after_s`.
+- `stale`: nothing received for more than `stale_after_s`; published
+  immediately on the transition, with `v` null.
+- `missing`: no value has been received since the bridge started.
+- A changed value is published at most once per `min_interval_ms`; unchanged
+  values are not republished except by the `heartbeat_s` heartbeat, which also
+  refreshes `age`. Null, non-numeric, non-finite and boolean SignalK values are
+  ignored.
+
+### Supported boards
+
+| Board | Screen | Layouts | Status |
+| --- | --- | --- | --- |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Hardware unverified |
+
+`list-6` is defined but not offered on the round board.
+
+### Planned limitations
+
+- Version 1 uses plaintext MQTT on the local network; it provides no
+  confidentiality or strong authentication against other devices on that
+  network.
+- With the VesselStack firewall enabled, displays must be on a trusted
+  interface that can reach the Raspberry Pi's MQTT port.
+- The primary planned build path is exporting from the Pi and compiling on a
+  laptop; no firmware, flashing or over-the-air flow ships in this preview.
+- The runtime `displays.json`, `displays.secrets.json`, ESPHome
+  `secrets.yaml`, `.esphome/` and `displays/build/` output, and firmware
+  binaries (`.bin`, `.elf`, `.uf2`) are git-ignored and rejected by
+  `scripts/check-public-tree.py`; never commit them.
+
 ## Network security
 
 Compose publishes several ports on every host interface. At minimum:
@@ -678,6 +769,7 @@ tests/test-service-integration.sh
 docker compose --env-file vesselstack.example.env \
   -f templates/compose.yml config --quiet
 python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 displays/displayctl.py validate
 python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
 ```
 
