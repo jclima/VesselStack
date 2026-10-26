@@ -413,6 +413,7 @@ class StatusGrid(Base):
     def test_status_subscriptions_are_readable_by_the_display_acl(self):
         rules = mqtt_auth.render_acl([{"role": "display", "user": "vsdisp-helm", "password": "x"}])
         self.assertIn("topic read vesselstack/v1/notifications/#", rules)
+        self.assertIn("topic read vesselstack/v1/ha/#", rules)
         self.assertEqual([l for l in rules.splitlines() if l.startswith("topic write")],
                          ["topic write vesselstack/v1/displays/vsdisp-helm/status"])
 
