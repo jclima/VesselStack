@@ -61,9 +61,18 @@ fail() { echo "FAIL: $*" >&2; docker logs "$BRIDGE" >&2 2>&1 || true; exit 1; }
 pass() { COUNT=$((COUNT + 1)); }
 
 # One instrument and one notification, fast heartbeat and staleness so the test stays short.
+# The bridge container runs with a fixed UTC+05:30 zone (POSIX TZ syntax, so no tz database is needed)
+# and the night window is built around the time it will see: it spans local now -2 h .. +2 h (it
+# may cross midnight), so the retained clock must say night is on.
+BRIDGE_TZ='<+0530>-5:30'
 python3 - "$ROOT/config/displays.json" <<'PY'
 import json, sys
+from datetime import datetime, timedelta, timezone
 cfg = json.load(open("displays/displays.example.json"))
+local = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+cfg["night_schedule"] = {"start": (local - timedelta(hours=2)).strftime("%H:%M"),
+                         "end": (local + timedelta(hours=2)).strftime("%H:%M")}
+cfg["displays"]["helm"]["ui"] = {"header": True, "night": "schedule"}
 cfg["heartbeat_s"] = 1
 cfg["instruments"] = {"sog": dict(cfg["instruments"]["sog"], stale_after_s=3, min_interval_ms=100)}
 cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"}}
@@ -173,7 +182,7 @@ chmod 0600 "$DOCKER_ENV"
 run_bridge() {
     docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
     docker run -d --name "$BRIDGE" --network "$NETWORK" --env-file "$DOCKER_ENV" "${UNPRIV[@]}" \
-        -e PYTHONDONTWRITEBYTECODE=1 \
+        -e PYTHONDONTWRITEBYTECODE=1 -e "TZ=$BRIDGE_TZ" \
         -v "$REPO_ROOT/displays:/app/displays:ro" -v "$ROOT/config/displays.json:/cfg/displays.json:ro" \
         -v "$VENV_VOL:/venv:ro" "$PYIMAGE" /venv/bin/python /app/displays/bridge.py >/dev/null
 }
@@ -187,6 +196,25 @@ wait_for vesselstack/v1/instruments/sog '"st":"missing"' 10
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"missing","sev":"unknown"' 10
 # Alarm summary: the one counted item (the notification) is unknown, retained, ids only.
 wait_for vesselstack/v1/alarms/summary '^\{"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\],"ts":"[0-9TZ:-]+"\}$' 10
+# Bridge clock (a header display and a schedule are configured): retained, exact shape, the
+# bridge's local wall clock (UTC+05:30 here) and the night flag of the active window.
+wait_for vesselstack/v1/bridge/clock '^\{"hm":"[0-2][0-9]:[0-5][0-9]","night":true,"ts":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"\}$' 10
+clock=$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/clock)
+python3 - "$clock" <<'PY' || fail "the bridge clock does not show the local time of the bridge's zone: $clock"
+import json, sys
+from datetime import datetime, timedelta, timezone
+body = json.loads(sys.argv[1])
+assert list(body) == ["hm", "night", "ts"], body
+want = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+got = datetime.strptime(body["hm"], "%H:%M")
+diff = abs((got.hour * 60 + got.minute) - (want.hour * 60 + want.minute)) % 1440
+assert min(diff, 1440 - diff) <= 1, (body["hm"], want.strftime("%H:%M"))
+PY
+# The clock is retained (a late subscriber gets it at once) and read-only for displays.
+client mosquitto_pub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" \
+    -t vesselstack/v1/bridge/clock -m '{"hm":"00:00","night":false,"ts":"forged"}' -r -q 1 >/dev/null 2>&1 || true
+[ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/clock | grep -c forged)" = 0 ] \
+    || fail "a display account could publish the bridge clock"
 pass
 
 # 2. SignalK appears (requires the bearer token), streams 10 kn for ~8 s, then exits.

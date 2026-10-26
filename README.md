@@ -1710,8 +1710,8 @@ Please report the settings that worked on your unit.
 The runtime configuration lives at `$VESSELSTACK_ROOT/config/displays.json`.
 Start from [`displays/displays.example.json`](displays/displays.example.json).
 It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
-`heartbeat_s` (1-60, default 5), `instruments`, optional `notifications` and
-`displays`:
+`heartbeat_s` (1-60, default 5), `instruments`, optional `notifications`, optional
+`night_schedule` and `displays`:
 
 - An instrument (`^[a-z][a-z0-9_]{0,31}$`) has a SignalK `path` for
   `vessels.self` (numeric scalar values only), `label` (1-16 characters),
@@ -1721,7 +1721,8 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   and `alarm` (see [Thresholds and severity colours](#thresholds-and-severity-colours)).
 - A display (`^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$`: 1-24 characters, starting with a letter and not ending in a hyphen) has a `name`, a `board` from
   `displays/boards/registry.json`, optional `home_assistant_api` (boolean),
-  optional `ui` (see [Alarm summary and takeover](#alarm-summary-and-takeover)) and
+  optional `ui` (see [Alarm summary and takeover](#alarm-summary-and-takeover) and
+  [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
   supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6,
   `status-grid` holds 1-9) and unique `items` naming existing instruments or,
@@ -1925,6 +1926,127 @@ and `display flash ID` for each display that gets the option. Existing firmware
 ignores the summary. **Rollback:** remove `ui`, rebuild and reflash (or flash
 the previous firmware); the bridge's extra topic is harmless to older displays.
 
+#### Touch, header, night mode and dimming
+
+Per-display `ui` options (all optional; a display without them gets exactly the
+firmware it got before, byte for byte):
+
+| `ui` key | Type, default | Meaning |
+| --- | --- | --- |
+| `alarm_takeover`, `alarm_page` | see [Alarm summary and takeover](#alarm-summary-and-takeover) | alarm banner |
+| `swipe` | boolean, false | swipe left shows the next page, swipe right the previous one; a short tap still shows the next page |
+| `header` | boolean, false | clock, status dots, page title and page dots in the round bands above and below the content area |
+| `night` | `off` (default), `manual`, `schedule` | night palette: `manual` is toggled by a long press, `schedule` follows the top-level `night_schedule` and a long press overrides it |
+| `day_brightness` | integer 5-100, default 100 | backlight in percent by day (and when `night` is `off`) |
+| `night_brightness` | integer 5-100, default 20, not above `day_brightness` | backlight in percent at night; also the idle-dim level when set |
+| `dim_after_s` | integer 0-3600, default 0 (never) | dim after this many seconds without a touch |
+
+`night: schedule` needs the top-level `night_schedule`, `{"start": "21:30",
+"end": "06:15"}`: 24-hour `HH:MM` on the boat's wall clock, `start` inclusive
+and `end` exclusive, `start` and `end` different. A window whose start is later
+than its end crosses midnight. A bad time, a missing end or an unknown key is a
+validation error. `header` needs a board with a `ring` entry in the registry
+(see below). Unknown `ui` keys are still rejected.
+
+```json
+"night_schedule": {"start": "21:30", "end": "06:15"},
+"displays": {"helm": {"ui": {"alarm_takeover": true, "alarm_page": 1, "swipe": true,
+  "header": true, "night": "schedule", "night_brightness": 15, "dim_after_s": 120}}}
+```
+
+**Touch.** Every page has a transparent full-screen touch object above the
+content. Without the new keys a tap anywhere is an `on_click` that shows the
+next page, as before. With `swipe`, `night` (other than `off`) or `dim_after_s`
+the object uses `on_short_click` instead, because LVGL also sends a click after
+a long press and a night toggle must not turn the page. `swipe` adds
+`on_swipe_left` and `on_swipe_right` (explicit page ids, wrapping around the
+first and last page). `night` adds `on_long_press`, which switches night on or
+off (also on a one-page display, which then gets a touch object without paging
+actions). A press that only wakes a dimmed screen, and a gesture that already
+acted, set a flag that makes the rest of that touch do nothing, so waking the
+display never turns the page and a swipe is never followed by a second page
+change even if the touch controller also reports a click. The alarm banner sits
+above this layer on the LVGL top layer and a tap on it still hides it.
+
+**Header** (the Waveshare 2.8C has `"ring": {"header_y": 14, "header_h": 52,
+"footer_y": 414}` in `displays/boards/registry.json`; a board without `ring`
+cannot use `header`, and rectangular boards are not supported yet). The round
+screen is narrow at the top, so the top row (y 14) holds the clock `HH:MM` and
+three 10 px dots, the page title (the `!literal` page `title`, drawn in the small
+font, up to 200 px wide) sits in a second row at y 40, and one 8 px dot per page
+with the current page highlighted sits at y 414, below the 340 x 340 content
+area (y 70-410). Nothing overlaps the content area or the alarm banner. The
+dots, left to right, are SignalK (bridge reports `connected`), the bridge
+(`bridge/status` `online`) and MQTT (the display's own connection): green is
+good, red is bad and grey is unknown. The SignalK dot is retained data, so it is
+only ever green while the bridge is online and MQTT is connected; a stopped
+bridge shows grey, never a stale green. Page titles are checked against the
+bundled font like labels (`validate` and `display render` report a glyph the
+font lacks), but only when `header` is on.
+
+**Clock source.** The display has no clock of its own and does not use SNTP:
+offshore it may have no internet, and a second time source could disagree with
+the boat. The bridge publishes the Pi's wall clock to the retained topic
+`vesselstack/v1/bridge/clock`, `{"hm":"14:05","night":false,"ts":"2026-10-25T21:05:30Z"}`
+(`hm` local `HH:MM`, `night` the schedule flag, `ts` UTC), when the minute or
+the flag changes and every `heartbeat_s`, only if some display uses `header` or
+`night: schedule`. The zone is `BOAT_TIMEZONE` (an IANA name, written to
+`displays-bridge.env` by the installer when set; an unknown name is logged and
+ignored) or, if absent, the Pi's system zone (`timedatectl`). The night window
+compares wall-clock minutes, so a daylight saving change moves the window with
+the clock. **The Pi's time must be right**: keep `chrony` (or `systemd-timesyncd`)
+running and, without internet, feed it from a GPS/PPS source; a Pi that boots
+with a wrong clock shows a wrong time and switches night at the wrong hour. The
+firmware does not display the received string: it reads the two numbers, checks
+them (hour 0-23, minute 0-59) and draws digits it formats itself. The clock
+reads `--:--` when the message is older than 3 x `heartbeat_s`, the bridge is
+offline, MQTT is down or the payload is malformed. The night flag is then held
+at its last value (a dead bridge at night must not light up the cabin); use a
+long press to override. The display ACL already allows reading `bridge/#` and
+nothing else is written by the displays.
+
+**Night.** `night` swaps the palette: tiles black, labels dim red-brown
+(`0x6A1600`), values `0xB02400`, severity fills `0x2A0800` (ok), `0x7A3E00`
+amber (warn) and `0xB00000` (alarm, with brighter text so it stays clearly red),
+unknown stays black with dim text, and the header and page dots turn
+red/amber. Nothing blue or green is used at night. The colours are applied by
+guarded lambdas that run only when the state changes (the severity colours are
+re-evaluated on every flip). A long press toggles night; with `schedule` that
+is a manual override that lasts until the schedule flag next changes (the
+next `start` or `end` time), with `manual` it lasts until the next
+long press or reboot (nothing is stored; a reboot starts in day mode until the
+bridge clock arrives). The alarm banner is never themed: it keeps the day red
+and white at night, and an alarm sets the backlight to 100 % while the banner is
+shown.
+
+**Dimming.** One controller sets the backlight from, in this order: the alarm
+banner (100 %), idle (`dim_after_s` seconds without a touch, using the LVGL
+inactivity time polled four times a second) dims to `night_brightness` if you
+set it, else to 10 %, never brighter than the current level; then night
+(`night_brightness`); then day (`day_brightness`). It writes the backlight only
+when the target changes. A touch restores the level at once, without paging.
+LVGL is never paused, so alarms keep updating a dimmed screen (and, on a rising
+alarm, light it at 100 % and show the banner). The backlight stays an
+`internal` light: nothing is published.
+
+**Cost on the dashboard example** (swipe, header, night schedule and dimming on
+top of the alarm banner): about 16.7 kB more flash and 2.1 kB more RAM than the
+previous dashboard example (flash 1131019 to 1148119 bytes, RAM 118491 to 120595
+bytes in the ESPHome build report).
+
+**To verify on hardware** (not verified yet, and the reason for the defensive
+touch handling): that a swipe on the GT911 does not also deliver a click, how
+reliable swipe left/right is on the round panel, the 400 ms default long-press
+time, readability of the night colours in a dark cabin, backlight steps with
+the LEDC PWM at 5-20 % and that the clock follows the Pi. The only bridge-side
+change is the new retained topic; older firmware ignores it.
+
+**Upgrade and rollback.** Update VesselStack, restart the bridge (the installer
+does and passes `BOAT_TIMEZONE`), add the keys to the display and
+`night_schedule`, then `display build ID` and `display flash ID`. To go back,
+remove the `ui` keys and `night_schedule`, rebuild and reflash (or flash the
+previous firmware); the extra topic is harmless to older displays.
+
 #### The `status-grid` layout
 
 `status-grid` shows 1-9 instruments and notifications, one cell each, inside
@@ -1958,7 +2080,11 @@ object `{"capacity", "min_items", "shapes": ["round","rect"], "types":
 ["instrument","notification"]}` (the allowed item types). `schema` 1
 registries (a layout is just an integer capacity) are still accepted and mean
 `min_items` 1, both shapes and instruments only. A board may only list layouts
-that support its `shape`. `vesselstackctl display add` still picks the largest
+that support its `shape`. A board may also have an optional `ring`
+(`{"header_y", "header_h", "footer_y"}`, pixels): the bands that `ui.header` uses.
+The header band (at least 50 px high) must end above the content area and the
+10 px page indicator must lie between the content area and the bottom edge;
+the registry validator checks it. `vesselstackctl display add` still picks the largest
 layout that takes only instruments for the default page; `status-grid` is
 chosen only when nothing else fits.
 
@@ -1970,7 +2096,9 @@ as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","a
 `ok`. `ts` is the SignalK timestamp (or `null`); `age` is seconds since the
 bridge received the value, measured on the bridge clock, not the SignalK
 timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
-`vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/<username>/status`.
+`vesselstack/v1/bridge/signalk`, `vesselstack/v1/bridge/clock` (see
+[Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
+`vesselstack/v1/displays/<username>/status`.
 Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 (see [Notifications](#notifications)); the combined alarm state is
 `vesselstack/v1/alarms/summary` (see [Alarm summary and takeover](#alarm-summary-and-takeover)).
@@ -1997,7 +2125,7 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2`, `status-grid` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 
