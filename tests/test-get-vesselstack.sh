@@ -194,24 +194,39 @@ echo "bundle $*" >> "$LOG"
 exit 0
 EOF2
 cat > "$SRC/vesselstack-wizard.py" <<'EOF2'
-# Runs as an unprivileged user with a minimal environment (no LOG, no TEST_ROOT).
+# Web mode runs as an unprivileged user with a minimal environment (no LOG, no TEST_ROOT).
+# --validate, --help and --cli run the REAL wizard code from the repository (as root).
 import os, runpy, sys
 args = sys.argv[1:]
-if "--validate" in args:
-    # Root-side validation: run the REAL wizard code from the repository.
-    sys.argv = [sys.argv[0]] + args
-    runpy.run_path("@REPO_ROOT@/vesselstack-wizard.py", run_name="__main__")
-    sys.exit(0)
-out = args[args.index("--output") + 1]
-port = args[args.index("--port") + 1]
-print("VesselStack wizard: http://127.0.0.1:" + port)
-print("Open this address (valid for this run only): http://127.0.0.1:" + port + "/#token=FAKETOKEN123")
-print("uid=" + str(os.getuid()) + " env=" + ",".join(sorted(os.environ)))
 mode = ""
 try:
     mode = open("@TEST_ROOT@/wizard-mode").read().strip()
 except OSError:
     pass
+
+def run_real():
+    sys.argv = [sys.argv[0]] + args
+    try:
+        runpy.run_path("@REPO_ROOT@/vesselstack-wizard.py", run_name="__main__")
+    except SystemExit as exc:
+        return exc.code
+    return 0
+
+if "--validate" in args:
+    with open("@TEST_ROOT@/validate.log", "a") as log:
+        log.write(args[args.index("--validate") + 1] + "\n")
+    sys.exit(run_real())
+if "--help" in args or "--cli" in args:
+    code = run_real()
+    if "--cli" in args and not code and mode == "cli-tamper":
+        with open(args[args.index("--output") + 1], "a") as handle:
+            handle.write("NOT_A_SETTING=x\n")
+    sys.exit(code)
+out = args[args.index("--output") + 1]
+port = args[args.index("--port") + 1]
+print("VesselStack wizard: http://127.0.0.1:" + port)
+print("Open this address (valid for this run only): http://127.0.0.1:" + port + "/#token=FAKETOKEN123")
+print("uid=" + str(os.getuid()) + " env=" + ",".join(sorted(os.environ)))
 if mode == "nosave":
     sys.exit(0)
 if mode == "symlink":
@@ -293,7 +308,7 @@ reset_state() {
         "$TEST_ROOT/missing-pkgs" "$TEST_ROOT/answers" "$TEST_ROOT/wizard-mode" "$TEST_ROOT/pwned-wizard" "$SERVE"/*.fail \
         "$TEST_ROOT/etc-apt" "$TEST_ROOT/var-lib-docker" "$TEST_ROOT/installed-pkgs" "$TEST_ROOT/apt-update-fail" \
         "$TEST_ROOT/apt-install-fail" "$TEST_ROOT/docker-info-fail" "$TEST_ROOT/docker-containers" "$TEST_ROOT/docker-volumes" \
-        "$TEST_ROOT/gpg-unreadable" "$TEST_ROOT/bin-nodocker" "$TEST_ROOT/apt-sim-remove"
+        "$TEST_ROOT/gpg-unreadable" "$TEST_ROOT/bin-nodocker" "$TEST_ROOT/apt-sim-remove" "$TEST_ROOT/validate.log"
     : > "$TEST_ROOT/apt-candidates"
     printf 'docker-ce 5:29.9.2-1~debian.12~bookworm\ndocker-compose-plugin 5.6.1-1~debian.12~bookworm\n' > "$TEST_ROOT/apt-candidates-repo"
     : > "$TEST_ROOT/installed-pkgs"
@@ -313,12 +328,12 @@ RC=0
 run() {  # args... (stdin is never a terminal)
     RC=0
     # SUDO_USER is always unset here (CI runs the test under sudo, which sets it); cases set it via EXTRA_ENV.
-    env -u SUDO_USER PATH="${RUN_PATH:-$FAKE_BIN:$PATH}" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
+    timeout 600 env -u SUDO_USER PATH="${RUN_PATH:-$FAKE_BIN:$PATH}" TEST_ROOT="$TEST_ROOT" LOG="$LOG" VESSELSTACK_ROOT="$APP_ROOT" \
         VESSELSTACK_VERSION="$VER" VESSELSTACK_BOOTSTRAP_DOCTOR_WAIT=0 NO_COLOR=1 \
         VESSELSTACK_OS_RELEASE="$TEST_ROOT/os-release" VESSELSTACK_APT_KEYRING_DIR="$TEST_ROOT/etc-apt/keyrings" \
         VESSELSTACK_APT_SOURCES_DIR="$TEST_ROOT/etc-apt/sources.list.d" VESSELSTACK_APT_SOURCES_FILE="$TEST_ROOT/etc-apt/sources.list" \
         VESSELSTACK_DOCKER_DATA_DIR="$TEST_ROOT/var-lib-docker" \
-        ${EXTRA_ENV:+"$EXTRA_ENV"} \
+        ${EXTRA_ENV:+"$EXTRA_ENV"} ${EXTRA_ENV2:+"$EXTRA_ENV2"} \
         bash "$GET" --dir "$RELEASE_BASE" --base-url "https://example.invalid/releases/v$VER" "$@" \
         </dev/null >"$OUT" 2>&1 || RC=$?
 }
@@ -335,7 +350,7 @@ expect_no_release() { [ ! -e "$RELEASE_BASE/$VER" ] || fail_test "release direct
 reset_state
 run --help
 expect_rc 0 "--help"
-for option in --version --yes --no-wizard --config --offline --bundle --dir; do expect_out -- "$option"; done
+for option in --version --yes --defaults --set --no-wizard --config --cli --web-wizard --offline --bundle --dir; do expect_out -- "$option"; done
 [ ! -e "$RELEASE_BASE" ] || fail_test "--help must not create anything"
 
 # Not root: refuse before touching anything (and --help still works unprivileged).
@@ -504,7 +519,7 @@ expect_rc 0 "the shipped example env must pass the config linter"
 
 # ---- 5. wizard flow -----------------------------------------------------------
 reset_state
-run --yes --wizard-port 8123
+run --yes --web-wizard --wizard-port 8123
 expect_rc 0 "wizard flow"
 expect_out "ssh -L 8123:127.0.0.1:8123"
 expect_out "http://127.0.0.1:8123/#token="
@@ -526,7 +541,7 @@ if ls -d "$RELEASE_BASE"/.wizard.* >/dev/null 2>&1; then fail_test "wizard direc
 
 # SUDO_USER is used when it is a real unprivileged account; a random free port otherwise.
 reset_state
-EXTRA_ENV=SUDO_USER=daemon run --yes
+EXTRA_ENV=SUDO_USER=daemon run --yes --web-wizard
 EXTRA_ENV=
 expect_rc 0 "wizard as SUDO_USER"
 refuse_log "^useradd .*vesselstack-wizard"
@@ -534,13 +549,13 @@ expect_no_wizard_user
 expect_log "^runuser -u daemon -- env -i .*--port [0-9]{4,5} "
 expect_out "ssh -L ([0-9]{4,5}):127.0.0.1:\\1 "
 reset_state
-EXTRA_ENV=SUDO_USER=root run --yes
+EXTRA_ENV=SUDO_USER=root run --yes --web-wizard
 EXTRA_ENV=
 expect_log "^runuser -u vesselstack-wizard "
 expect_no_wizard_user
 # An unknown SUDO_USER also falls back to the dedicated account.
 reset_state
-EXTRA_ENV=SUDO_USER=no-such-account-xyz run --yes
+EXTRA_ENV=SUDO_USER=no-such-account-xyz run --yes --web-wizard
 EXTRA_ENV=
 expect_rc 0 "wizard with unknown SUDO_USER"
 expect_log "^runuser -u vesselstack-wizard "
@@ -548,7 +563,7 @@ expect_no_wizard_user
 # A stale account from an interrupted run is replaced by a fresh one and removed again.
 reset_state
 useradd --system --no-create-home --shell /usr/sbin/nologin vesselstack-wizard
-run --yes
+run --yes --web-wizard
 expect_rc 0 "wizard with a stale vesselstack-wizard account"
 expect_log "^userdel vesselstack-wizard$"
 expect_log "^useradd --system --no-create-home .* vesselstack-wizard$"
@@ -557,7 +572,7 @@ expect_no_wizard_user
 # The wizard closed without saving: nothing is installed.
 reset_state
 echo nosave > "$TEST_ROOT/wizard-mode"
-run --yes
+run --yes --web-wizard
 expect_rc 1 "wizard closed without saving"
 expect_no_wizard_user
 expect_out "before a configuration was saved"
@@ -570,7 +585,7 @@ refuse_log "^install "
 for mode in symlink fifo big inject unknown badchars enum boolean; do
     reset_state
     echo "$mode" > "$TEST_ROOT/wizard-mode"
-    run --yes
+    run --yes --web-wizard
     expect_rc 1 "wizard output ($mode) must be refused"
     expect_out "wizard output was refused|saved configuration is invalid"
     expect_log "^userdel vesselstack-wizard$"
@@ -579,6 +594,259 @@ for mode in symlink fifo big inject unknown badchars enum boolean; do
     [ ! -e "$TEST_ROOT/pwned-wizard" ] || fail_test "wizard output content was executed"
     [ ! -e "$RELEASE_BASE/vesselstack.env" ] || fail_test "refused wizard output must not be installed"
 done
+rm -f "$TEST_ROOT/wizard-mode"
+
+# ---- 5a. terminal wizard (the default), non-interactive options, headless output ----------------
+ANSWERS="$TEST_ROOT/answers"
+run_asking() { EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$ANSWERS" run; EXTRA_ENV=; }
+blank() { local n=$1; while [ "$n" -gt 0 ]; do printf '\n'; n=$((n - 1)); done; }
+SAVED="$RELEASE_BASE/vesselstack.env"
+expect_saved() { grep -qxF -- "$1" "$SAVED" || fail_test "saved configuration lacks the line: $1"; }
+refuse_saved() { if grep -qF -- "$1" "$SAVED"; then fail_test "saved configuration must not contain: $1"; fi; }
+expect_no_web_wizard() {
+    refuse_out '#token='; refuse_out 'Open this address'; refuse_out 'ssh -L [0-9]+:127\.0\.0\.1:[0-9]+ .*wizard'
+    refuse_out '[Bb]rowser wizard'; refuse_log '^runuser '; refuse_log '^useradd .*vesselstack-wizard'; expect_no_wizard_user
+}
+
+# Full walk with the default answer to every question (Enter): confirmation, 17 prompts, review, install.
+reset_state
+{ printf 'y\n'; blank 20; } > "$ANSWERS"
+run_asking
+expect_rc 0 "terminal wizard, all defaults"
+expect_out "Review \\(secrets are never shown\\)"
+expect_out "Boat name \\[My Boat\\]"
+expect_out "Enable SocketCAN / NMEA 2000\\? \\[y/N\\]"
+expect_out "Advanced settings"
+expect_no_web_wizard
+[ "$(stat -c '%a %U' "$SAVED")" = "600 root" ] || fail_test "saved configuration must be root-owned mode 600"
+expect_saved "BOAT_NAME='My Boat'"
+expect_saved "INFLUXDB_PASSWORD=GENERATE"
+expect_saved "SOCKETCAN_ENABLE=false"
+expect_saved "INFLUXDB_RAW_RETENTION=''"
+# The wizard output went through staging, the lint and the root-side --validate, then the install.
+grep -qE '/\.stage\.[A-Za-z0-9]+/wizard\.env$' "$TEST_ROOT/validate.log" || fail_test "the staged wizard output was not validated"
+expect_log "^install .*--dry-run"
+if ls -d "$RELEASE_BASE"/.wizard.* >/dev/null 2>&1; then fail_test "wizard directory was not removed"; fi
+# Headless output: plain addresses, token command, tunnel hint; information only.
+expect_out "Addresses \\(for information"
+expect_out "Grafana \\(history dashboards\\) +http://[^ ]+:43000"
+expect_out "Home Assistant +http://[^ ]+:8123"
+expect_out "Boat Chat +http://[^ ]+:8765"
+expect_out "sudo grep '\\^BOAT_CHAT_ACCESS_TOKEN=' /opt/vesselstack/config/boat-chat.env"
+expect_out "ssh -L 8780:127\\.0\\.0\\.1:8780 [^ ]+@[^ ]+"
+expect_out "sudo grep '\\^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env"
+refuse_out 'Open the addresses printed above'
+
+# A walk with edits, invalid input (re-prompt), ?, b (back) and a secret that must never be printed.
+reset_state
+SECRET=sekrit-token-value-123
+{
+    printf '%s\n' y 'Bad;Name' 'Sea Wolf' 'Sailing yacht' 3 Europe/Oslo y 12345 123456789 b '' ABCD1 11.5 3.8
+    printf '%s\n' 2 http://192.0.2.10:3000                      # Signal K: existing server
+    printf '%s\n' y n '' ''                                      # CAN on, no vcan, interface, bitrate
+    printf '%s\n' y ''                                           # AIS on, device
+    printf '%s\n' '' '?' "$SECRET" 1 n                           # HA url, help, HA token, provider, telegram
+    printf '%s\n' y '' n 22,8080 -                               # firewall on ...
+    printf '%s\n' 14d '' '' n                                    # retention, binds, no advanced
+    printf '%s\n' s y                                            # save, install
+} > "$ANSWERS"
+run_asking
+expect_rc 0 "terminal wizard with edits"
+expect_out "Use only letters, digits, spaces"
+expect_out "An MMSI has exactly 9 digits"
+expect_out "A long-lived access token"
+expect_out "Home Assistant access token \\(optional\\) \\[not set\\]"
+expect_saved "BOAT_NAME='Sea Wolf'"
+expect_saved "BOAT_TYPE='Sailing yacht'"
+expect_saved "BOAT_UNITS=nautical"
+expect_saved "BOAT_TIMEZONE=Europe/Oslo"
+expect_saved "BOAT_MMSI=123456789"
+expect_saved "BOAT_CALLSIGN=ABCD1"
+expect_saved "BOAT_LOA_M=11.5"
+expect_saved "BOAT_BEAM_M=3.8"
+expect_saved "SIGNALK_MODE=existing"
+expect_saved "SIGNALK_URL=http://192.0.2.10:3000"
+expect_saved "SOCKETCAN_ENABLE=true"
+expect_saved "VESSELSTACK_CAN_CREATE_VCAN=false"
+expect_saved "AIS_ENABLE=true"
+expect_saved "HOME_ASSISTANT_TOKEN=$SECRET"
+expect_saved "VESSELSTACK_FIREWALL_ENABLE=true"
+expect_saved "VESSELSTACK_FIREWALL_ALLOW_TCP=22,8080"
+expect_saved "VESSELSTACK_FIREWALL_ALLOW_UDP=''"
+expect_saved "INFLUXDB_RAW_RETENTION=14d"
+# Secrets and private identifiers are never printed or logged; the review shows only "set (hidden)".
+refuse_out "$SECRET"; refuse_log "$SECRET"
+expect_out "Home Assistant access token \\(optional\\) +set \\(hidden\\)"
+refuse_out "123456789"
+expect_out "MMSI \\(9 digits\\) +set \\(hidden\\)"
+expect_no_web_wizard
+
+# Quitting at the review, and input that ends early, install nothing.
+reset_state
+{ printf 'y\n'; blank 17; printf 'q\n'; } > "$ANSWERS"
+run_asking
+expect_rc 1 "quit at the review"
+expect_out "Quit without saving"
+refuse_log "^install "
+[ ! -e "$SAVED" ] || fail_test "nothing may be saved after quit"
+expect_no_wizard_user
+reset_state
+{ printf 'y\n'; blank 5; } > "$ANSWERS"
+run_asking
+expect_rc 1 "answers end early"
+expect_out "answers ended"
+refuse_log "^install "
+[ ! -e "$SAVED" ] || fail_test "nothing may be saved when the input ends"
+
+# Edit a section from the review screen, then save.
+reset_state
+{ printf 'y\n'; blank 17; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
+run_asking
+expect_rc 0 "edit a section at the review"
+expect_saved "BOAT_NAME='Edited Boat'"
+
+# --yes / --defaults: nothing is asked.
+reset_state
+run --yes
+expect_rc 0 "--yes uses the defaults"
+expect_out "Configuring without questions"
+expect_saved "BOAT_NAME='My Boat'"
+expect_no_web_wizard
+expect_out "ssh -L 8780:127\\.0\\.0\\.1:8780"
+reset_state
+run --defaults
+expect_rc 0 "--defaults"
+expect_out "-> yes \\(default\\)"
+expect_saved "SOCKETCAN_ENABLE=false"
+expect_no_web_wizard
+# ... but never upgrades an installed system or removes Docker conflicts (those default to no).
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+run --defaults
+expect_rc 0 "--defaults on an installed system"
+expect_out "Nothing was changed on the installed system"
+refuse_log "^ctl update"
+# --set: valid values, on top of the defaults, a --config and a saved configuration.
+reset_state
+run --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true --set SOCKETCAN_BITRATE=500000
+expect_rc 0 "--set on the defaults"
+expect_saved "BOAT_NAME=Foo"
+expect_saved "SOCKETCAN_ENABLE=true"
+expect_saved "SOCKETCAN_BITRATE=500000"
+expect_saved "BOAT_TYPE='Motor vessel'"
+reset_state
+write_config
+run --yes --config "$TEST_ROOT/in.env" --set BOAT_NAME=Over
+expect_rc 0 "--set on top of --config"
+expect_saved "BOAT_NAME=Over"
+expect_saved "VESSELSTACK_USER=daemon"
+expect_saved "HOME_ASSISTANT_TOKEN=sekrit-token-value"
+grep -qE '/\.stage\.[A-Za-z0-9]+/wizard\.env$' "$TEST_ROOT/validate.log" || fail_test "merged output was not validated"
+reset_state
+run --yes
+expect_rc 0 "first run saves a configuration"
+rm -rf "$APP_ROOT"; : > "$LOG"
+run --yes --set BOAT_NAME=Again
+expect_rc 0 "--set on top of the saved configuration"
+expect_saved "BOAT_NAME=Again"
+[ -f "$SAVED.previous" ] || fail_test "the old saved configuration must be kept as .previous"
+grep -q "My Boat" "$SAVED.previous" || fail_test ".previous must hold the old content"
+# --set is validated: unknown key, bad value, bad shape; nothing is installed and values are not echoed.
+for bad in NOT_A_KEY=1 SIGNALK_MODE=bogus BOAT_MMSI=12 SOCKETCAN_ENABLE=maybe BOAT_NAME= INFLUXDB_RAW_RETENTION=1y VESSELSTACK_FIREWALL_ALLOW_TCP=abc; do
+    reset_state
+    run --yes --set "$bad"
+    expect_rc 1 "--set $bad must be refused"
+    expect_out "${bad%%=*}"
+    refuse_log "^install "
+    [ ! -e "$SAVED" ] || fail_test "--set $bad must not save anything"
+done
+reset_state
+run --yes --set NOT_A_KEY=1
+expect_out "Unknown setting NOT_A_KEY"
+# shellcheck disable=SC2016  # literal text, no expansion wanted
+for bad in lowercase=1 NOEQUALS 'HOME_ASSISTANT_TOKEN=sekr;et' 'BOAT_NAME=$(id)'; do
+    reset_state
+    run --yes --set "$bad"
+    expect_rc 1 "--set $bad (shape) must be refused"
+    refuse_out 'sekr;et'; refuse_out '\$\(id\)'
+    refuse_log "^apt-get"
+    expect_no_release
+done
+run --yes --set
+expect_rc 1 "--set without a value"
+# --set cannot change an installed system's configuration.
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+run --yes --set BOAT_NAME=Foo
+expect_rc 1 "--set on an upgrade"
+expect_out "--set cannot change the configuration of an installed system"
+refuse_log "^ctl update"
+# A --set secret value never appears in the output.
+reset_state
+run --yes --set HOME_ASSISTANT_TOKEN=$SECRET
+expect_rc 0 "--set of a secret"
+expect_saved "HOME_ASSISTANT_TOKEN=$SECRET"
+refuse_out "$SECRET"; refuse_log "$SECRET"
+
+# No terminal and no --yes/--defaults/--set/--config: a clear message, nothing changed, no hang.
+reset_state
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS=/nonexistent/answers run
+EXTRA_ENV=
+expect_rc 1 "no terminal and no options"
+expect_out "No terminal is available"
+for option in -- --yes --defaults --set --config "ssh -t"; do expect_out -- "$option"; done
+refuse_log "^apt-get|^docker "
+expect_no_release
+reset_state
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS=/nonexistent/answers run --set BOAT_NAME=Foo
+EXTRA_ENV=
+expect_rc 1 "--set alone still needs confirmations"
+expect_out "No terminal is available"
+
+# Option conflicts.
+reset_state
+run --yes --web-wizard --set BOAT_NAME=Foo
+expect_rc 1 "--web-wizard with --set"
+run --yes --web-wizard --defaults
+expect_rc 1 "--web-wizard with --defaults"
+run --yes --web-wizard --config "$TEST_ROOT/in.env"
+expect_rc 1 "--web-wizard with --config"
+run --yes --wizard-port 8123
+expect_rc 1 "--wizard-port without --web-wizard"
+expect_out "add --web-wizard"
+run --yes --cli --set BOAT_NAME=Foo
+expect_rc 0 "--cli is accepted"
+run --yes --terminal
+expect_rc 0 "--terminal is accepted"
+
+# The browser wizard still works behind --web-wizard (also asked from a terminal: prints its address).
+reset_state
+run --yes --web-wizard
+expect_rc 0 "--web-wizard"
+expect_out "http://127.0.0.1:[0-9]+/#token="
+expect_log "^runuser -u vesselstack-wizard "
+# A release that predates the terminal wizard cannot be used for it.
+reset_state
+cp "$SRC/vesselstack-wizard.py" "$TEST_ROOT/wizard.keep"
+# (the fixture's wizard is the stub: simulate an old one by hiding --cli from its help)
+sed -i 's/"--help" in args or "--cli" in args/"--cli" in args/' "$SRC/vesselstack-wizard.py"
+tar -C "$TEST_ROOT/src" -czf "$TEST_ROOT/old.tar.gz" "vesselstack-$VER"
+serve_tarball "$TEST_ROOT/old.tar.gz"
+run --yes
+expect_rc 1 "release without the terminal wizard"
+expect_out "older than the terminal wizard"
+cp "$TEST_ROOT/wizard.keep" "$SRC/vesselstack-wizard.py"
+
+# A tampered terminal-wizard output is refused by the staged validation, like web output.
+reset_state
+echo cli-tamper > "$TEST_ROOT/wizard-mode"
+run --yes
+expect_rc 1 "tampered terminal wizard output"
+expect_out "saved configuration is invalid|wizard output was refused"
+refuse_log "^install "
+[ ! -e "$SAVED" ] || fail_test "refused output must not be installed"
 rm -f "$TEST_ROOT/wizard-mode"
 
 # ---- 5b. --config is staged once (no re-read of the user-controlled file) -------
@@ -705,6 +973,32 @@ expect_untouched_apt() {
     [ ! -e "$SRCFILE" ] || fail_test "repository entry must not be written"
 }
 refuse_group_change() { refuse_log "^(usermod|gpasswd|adduser|groupadd) "; }
+
+# --defaults and --yes with Docker missing: the consent and the final confirmation need no terminal.
+# --defaults installs Docker (its question defaults to yes) without a prompt ...
+reset_state
+docker_absent
+run --defaults
+docker_restore
+expect_rc 0 "--defaults installs Docker"
+expect_log "^apt-get install -y docker-ce "
+# ... and never removes conflicting packages (that question defaults to no).
+reset_state
+docker_absent
+printf 'docker.io\n' > "$TEST_ROOT/installed-pkgs"
+run --defaults
+docker_restore
+expect_rc 1 "--defaults does not remove conflicting packages"
+refuse_log "^apt-get (install|remove)"
+
+# --yes under the Docker consent and the final confirmation (also covered with --config above).
+reset_state
+docker_absent
+run --yes --set BOAT_NAME=Foo
+docker_restore
+expect_rc 0 "--yes with Docker missing"
+expect_log "^apt-get install -y docker-ce "
+expect_log "^install --config $RELEASE_BASE/vesselstack.env --start"
 
 # Without --yes and without a terminal the Docker question cannot be answered.
 reset_state

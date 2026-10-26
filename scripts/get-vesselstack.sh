@@ -2,7 +2,7 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.1/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.2/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
@@ -12,8 +12,9 @@
 # (and asks before installing Docker Engine from Docker's official apt repository),
 # downloads the release tarball and its
 # .sha256 from the GitHub release, verifies the checksum, unpacks it root-owned,
-# runs the loopback-only configuration wizard, and then runs install.sh
-# (--dry-run first). Re-running is safe. Options: see --help.
+# asks its configuration questions in the terminal (works over plain SSH, no browser), and
+# then runs install.sh (--dry-run first). Re-running is safe. Options: see --help.
+# Without a terminal (or to script it): --yes, --defaults, --set KEY=VALUE, --config FILE.
 #
 # The whole script is wrapped in functions and ends with a single `main "$@"`
 # line, so a truncated download cannot half-execute.
@@ -23,7 +24,7 @@ set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="0.4.1"
+DEFAULT_VERSION="0.4.2"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
 
@@ -46,6 +47,9 @@ DOCKER_DATA_DIR=${VESSELSTACK_DOCKER_DATA_DIR:-/var/lib/docker}
 
 # Global state (set by parse_args / the steps).
 ASSUME_YES=0
+DEFAULTS_ONLY=0
+WEB_WIZARD=0
+SETS=()
 VERSION=${VESSELSTACK_VERSION:-}
 RELEASE_BASE=/opt/vesselstack-release
 NO_WIZARD=0
@@ -112,22 +116,34 @@ Usage: sudo bash get-vesselstack.sh [options]
 
 Options:
   --version X.Y.Z     Install this release (default: $DEFAULT_VERSION; env VESSELSTACK_VERSION)
-  --yes, -y           Do not ask questions; answer yes (for scripts). Existing installs are
-                      upgraded only with this flag or an explicit yes.
-  --no-wizard         Skip the wizard; use --config FILE
+  --yes, -y           Ask nothing; answer yes to every question and take the settings from
+                      --config / --set / the defaults (for scripts and headless installs).
+                      Existing installs are upgraded only with this flag or an explicit yes.
+  --defaults          Ask nothing; every question gets its own default answer (an existing
+                      install is NOT upgraded and nothing is removed from Docker) and the
+                      settings are the defaults plus any --set.
+  --set KEY=VALUE     Set one setting without prompts (repeatable), checked with the wizard's
+                      rules; on top of --config, a saved configuration or the defaults.
+                      Avoid secrets here (they show in the process list): leave them to be
+                      generated. Example: --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
   --config FILE       Existing vesselstack.env to use (copied to a root-only location)
+  --no-wizard         Skip the wizard; use --config FILE
+  --cli, --terminal   Ask the configuration questions in this terminal (the default)
+  --web-wizard        Use the optional browser wizard instead (loopback only; needs a browser
+                      on the Pi or an ssh -L tunnel)
   --offline           No internet: needs --bundle DIR and a local --tarball FILE
   --bundle DIR        Offline bundle made by scripts/prepare-offline-bundle.sh
   --tarball FILE      Use a local vesselstack-X.Y.Z.tar.gz (its .sha256 must sit next to it)
   --sha256 HASH       Also require the tarball to match this sha256 (from a source you trust)
   --dir DIR           Where releases are unpacked (default: $RELEASE_BASE)
-  --wizard-port N     Port for the configuration wizard (default: a random free port)
+  --wizard-port N     Port for the browser wizard (only with --web-wizard; default: a random port)
   --base-url URL      Release download base, https only (default: $GITHUB_RELEASES)
   --help, -h          Show this help
 
 Nothing is installed or changed before you have seen what will happen and, unless
 you pass --yes, confirmed. Re-running is safe: finished steps are reported and skipped.
-Run it on the Raspberry Pi itself (or over SSH), as root (sudo).
+Run it on the Raspberry Pi itself (or over SSH, use ssh -t so questions can be answered),
+as root (sudo). Without any terminal use --yes, --defaults, --set or --config.
 EOF
 }
 
@@ -151,8 +167,13 @@ ask_yn() {
         say "  $question -> yes (--yes)"
         return 0
     fi
+    if [ "$DEFAULTS_ONLY" -eq 1 ]; then
+        if [ "$default" = y ]; then say "  $question -> yes (default)"; return 0; fi
+        say "  $question -> no (default)"
+        return 1
+    fi
     open_prompt || die "A question needs an answer but there is no terminal to ask on." \
-        "Run again from a terminal, or add --yes to accept the defaults shown in --help."
+        "Run again from a terminal (over SSH use ssh -t), or add --yes or --defaults (see --help)."
     hint="[y/N]"
     [ "$default" = y ] && hint="[Y/n]"
     while :; do
@@ -172,9 +193,9 @@ ask_yn() {
 ask_choice() {
     local question=$1 default=$2 reply
     shift 2
-    if [ "$ASSUME_YES" -eq 1 ]; then printf '%s\n' "$default"; return 0; fi
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DEFAULTS_ONLY" -eq 1 ]; then printf '%s\n' "$default"; return 0; fi
     open_prompt || die "A question needs an answer but there is no terminal to ask on." \
-        "Run again from a terminal, or add --yes."
+        "Run again from a terminal (over SSH use ssh -t), or add --yes or --defaults."
     while :; do
         printf '  %s [%s] (default %s) ' "$question" "$*" "$default" >&2
         read -r reply <&3 || die "No answer received (input ended)."
@@ -192,6 +213,18 @@ parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --yes|-y) ASSUME_YES=1; shift ;;
+            --defaults) DEFAULTS_ONLY=1; shift ;;
+            --cli|--terminal) WEB_WIZARD=0; shift ;;
+            --web-wizard) WEB_WIZARD=1; shift ;;
+            --set)
+                [ $# -ge 2 ] || die "--set needs KEY=VALUE"
+                # Only the shape is checked here (so a typo fails before anything is installed);
+                # the wizard checks the key and the value with its full rules. The value is
+                # never echoed: it may be a secret.
+                local set_re='^[A-Z][A-Z0-9_]*=[A-Za-z0-9 _.,:/@+()-]*$'
+                [[ "$2" =~ $set_re ]] || die "--set needs KEY=VALUE with an upper-case setting name (e.g. BOAT_NAME=Foo)." \
+                    "Values may contain only letters, digits, spaces and . , : / @ + ( ) - _   (setting: ${2%%=*})"
+                SETS+=("$2"); shift 2 ;;
             --version) [ $# -ge 2 ] || die "--version needs a value"; VERSION=$2; shift 2 ;;
             --no-wizard) NO_WIZARD=1; shift ;;
             --config) [ $# -ge 2 ] || die "--config needs a file"; CONFIG_ARG=$2; shift 2 ;;
@@ -230,6 +263,13 @@ parse_args() {
     if [ -n "$BUNDLE" ] && [ "$OFFLINE" -ne 1 ]; then die "--bundle only makes sense together with --offline"; fi
     if [ "$NO_WIZARD" -eq 1 ] && [ -z "$CONFIG_ARG" ]; then die "--no-wizard needs --config FILE"; fi
     if [ -n "$CONFIG_ARG" ]; then NO_WIZARD=1; fi
+    if [ -n "$WIZARD_PORT" ] && [ "$WEB_WIZARD" -ne 1 ]; then die "--wizard-port only applies to the browser wizard: add --web-wizard."; fi
+    if [ "$WEB_WIZARD" -eq 1 ]; then
+        if [ "$NO_WIZARD" -eq 1 ] || [ "${#SETS[@]}" -gt 0 ] || [ "$DEFAULTS_ONLY" -eq 1 ]; then
+            die "--web-wizard cannot be combined with --config, --no-wizard, --set or --defaults." \
+                "Those options set the configuration without questions; the browser wizard is for answering them."
+        fi
+    fi
     case "$RELEASE_BASE" in /*) ;; *) die "--dir must be an absolute path" ;; esac
 }
 
@@ -1052,6 +1092,60 @@ run_wizard() {
     fi
 }
 
+# Runs the terminal wizard (or, without questions, its non-interactive mode) as root: it has
+# no network surface, no web server and no token, so there is nothing to protect by dropping
+# privileges. Its output lands in a private root-only directory and then goes through exactly
+# the same copy, lint and re-validation as the browser wizard's output (finish_wizard_output).
+# Argument: an already staged env file to start from (optional).
+run_terminal_wizard() {
+    local base=${1:-} help_text pair
+    local -a args=(--cli)
+    help_text=$(python3 -I "$RELEASE_DIR/vesselstack-wizard.py" --help 2>&1 || true)
+    case "$help_text" in
+        *--cli*) ;;
+        *) die "Release $VERSION is older than the terminal wizard and cannot ask questions in the terminal." \
+               "Use --web-wizard, or pass --config FILE (see vesselstack.example.env), or install a newer --version." ;;
+    esac
+    WIZARD_DIR=$(mktemp -d "$RELEASE_BASE/.wizard.XXXXXX")
+    chmod 0700 "$WIZARD_DIR"
+    if [ -n "$base" ]; then args+=(--base "$base"); fi
+    for pair in "${SETS[@]+"${SETS[@]}"}"; do args+=(--set "$pair"); done
+    args+=(--output "$WIZARD_DIR/vesselstack.env")
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DEFAULTS_ONLY" -eq 1 ] || [ "${#SETS[@]}" -gt 0 ]; then
+        say "  Configuring without questions (--yes/--defaults/--set)."
+        env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$WIZARD_DIR" LANG=C.UTF-8 \
+            python3 -I "$RELEASE_DIR/vesselstack-wizard.py" "${args[@]}" --non-interactive </dev/null \
+            || die "The configuration was refused (see above). Nothing was installed." \
+                   "Check the --set values against vesselstack.example.env."
+    else
+        open_prompt || die "A question needs an answer but there is no terminal to ask on." \
+            "Run again from a terminal (over SSH use ssh -t), or add --yes or --defaults (see --help)."
+        say "  Starting the setup questions. Press Enter to accept the answer in [brackets]; ? explains a question."
+        say ""
+        env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$WIZARD_DIR" LANG=C.UTF-8 \
+            python3 -I "$RELEASE_DIR/vesselstack-wizard.py" "${args[@]}" --input-fd 3 </dev/null \
+            || die "The setup questions were not finished (cancelled, or the input ended). Nothing was installed." \
+                   "Run this script again to start over."
+    fi
+}
+
+# Copies a wizard's output once into the root-only staging directory, lints and re-validates
+# that copy with the wizard's own rules, and installs only it (root, mode 600).
+finish_wizard_output() {
+    local source=$1
+    if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+        die "The wizard was closed before a configuration was saved. Nothing was installed." "Run this script again to start over."
+    fi
+    stage_untrusted "$source" "$STAGE/wizard.env" \
+        || die "The wizard output was refused (see above). Nothing was installed."
+    python3 -I -c "$ENVTOOL" lint "$STAGE/wizard.env" || die "The saved configuration is invalid (see above)."
+    validate_staged "$STAGE/wizard.env" || die "The saved configuration is invalid (see above). Nothing was installed."
+    install -m 0600 -o root -g root "$STAGE/wizard.env" "$ENV_FILE"
+    rm -rf -- "$WIZARD_DIR"
+    WIZARD_DIR=
+    changed "configuration saved to $ENV_FILE (root only, mode 600)"
+}
+
 step_configure() {
     step 5 "Configure"
     ENV_FILE=$RELEASE_BASE/vesselstack.env
@@ -1068,6 +1162,12 @@ step_configure() {
         validate_staged "$STAGE/config.env" \
             || die "The configuration file was refused (see above). It may only set known VesselStack settings with plain values." \
                    "Compare it with vesselstack.example.env."
+        if [ "${#SETS[@]}" -gt 0 ]; then
+            say "  Applying ${#SETS[@]} --set value(s) on top of $CONFIG_ARG."
+            run_terminal_wizard "$STAGE/config.env"
+            finish_wizard_output "$WIZARD_DIR/vesselstack.env"
+            return 0
+        fi
         install -m 0600 -o root -g root "$STAGE/config.env" "$ENV_FILE.new"
         mv -f -- "$ENV_FILE.new" "$ENV_FILE"
         changed "copied $CONFIG_ARG to $ENV_FILE (root only, mode 600)"
@@ -1084,26 +1184,28 @@ step_configure() {
                 || die "The saved configuration was refused (see above); run again and choose w."
             python3 -I -c "$ENVTOOL" lint "$STAGE/saved.env" || die "The saved configuration is invalid; run again and choose w."
             validate_staged "$STAGE/saved.env" || die "The saved configuration is invalid (see above); run again and choose w."
+            if [ "${#SETS[@]}" -gt 0 ]; then
+                say "  Applying ${#SETS[@]} --set value(s) on top of the saved configuration."
+                run_terminal_wizard "$STAGE/saved.env"
+                cp -p -- "$ENV_FILE" "$ENV_FILE.previous"
+                changed "kept the old configuration as $ENV_FILE.previous"
+                finish_wizard_output "$WIZARD_DIR/vesselstack.env"
+                return 0
+            fi
             ok "reusing the saved configuration"
             return 0
         fi
         mv -- "$ENV_FILE" "$ENV_FILE.previous"
         changed "kept the old configuration as $ENV_FILE.previous"
     fi
-    say "  Starting the configuration wizard on this Pi."
-    run_wizard
-    if [ ! -e "$WIZARD_DIR/vesselstack.env" ] && [ ! -L "$WIZARD_DIR/vesselstack.env" ]; then
-        die "The wizard was closed before a configuration was saved. Nothing was installed." "Run this script again to start over."
+    if [ "$WEB_WIZARD" -eq 1 ]; then
+        say "  Starting the browser configuration wizard on this Pi (--web-wizard)."
+        run_wizard
+        finish_wizard_output "$WIZARD_DIR/vesselstack.env"
+        return 0
     fi
-    # The wizard ran unprivileged and its output directory belongs to that user: copy the
-    # file once into the root-only staging dir, then lint and install only that copy.
-    stage_untrusted "$WIZARD_DIR/vesselstack.env" "$STAGE/wizard.env" \
-        || die "The wizard output was refused (see above). Nothing was installed."
-    python3 -I -c "$ENVTOOL" lint "$STAGE/wizard.env" || die "The saved configuration is invalid (see above)."
-    validate_staged "$STAGE/wizard.env" || die "The saved configuration is invalid (see above). Nothing was installed."
-    install -m 0600 -o root -g root "$STAGE/wizard.env" "$ENV_FILE"
-    rm -rf -- "$WIZARD_DIR"
-    changed "configuration saved to $ENV_FILE (root only, mode 600)"
+    run_terminal_wizard
+    finish_wizard_output "$WIZARD_DIR/vesselstack.env"
 }
 
 show_summary() {
@@ -1245,8 +1347,7 @@ step_install() {
     say ""
     say "  Where to find things:"
     "$ctl" urls </dev/null || true
-    info "Generated passwords and tokens are stored root-only under $INSTALL_ROOT/config/."
-    info "Show the Boat Chat access token:  sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' $INSTALL_ROOT/config/boat-chat.env"
+    print_access_info
     if [ "$healthy" -eq 0 ]; then
         HEALTHY=0
         warn "doctor reported problems. Re-check with 'sudo vesselstackctl doctor' and 'sudo vesselstackctl status'."
@@ -1267,12 +1368,58 @@ final_report() {
     fi
     say ""
     say "Next steps:"
-    info "1. Open the addresses printed above and finish first-run setup (Home Assistant, Grafana, Boat Chat);"
-    info "   the README explains each one."
+    info "1. First-run setup of Home Assistant, Grafana and Boat Chat happens in a browser, whenever you like,"
+    info "   on any computer on the boat network (the addresses are listed above; the README explains each one)."
     info "2. Connect NMEA 2000 only after the bench checks: docs/INSTALLATION.md, section 7."
     info "3. Make and verify a backup:  sudo vesselstackctl backup   then   sudo vesselstackctl verify-backup FILE"
     info "4. Later upgrades: re-run this installer with a newer --version, or use 'sudo vesselstackctl update DIR'."
     info "Roll back: 'sudo vesselstackctl stop' stops everything; see the README (restore, uninstall)."
+}
+
+# Plain-text information for a headless Pi: nothing here has to be opened now.
+print_access_info() {
+    local host ip where user web_bind web_port heimdall chat chat_host panel_port app_root cfg=$ENV_FILE
+    # After an upgrade the settings live in the installed configuration, not in the staged one.
+    if [ "$UPGRADE" -eq 1 ]; then cfg=$INSTALL_ROOT/config/vesselstack.env; fi
+    host=$(hostname 2>/dev/null || true)
+    host=${host:-raspberrypi}
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    where=${ip:-$host}
+    user=${SUDO_USER:-}
+    if [ -z "$user" ] || [ "$user" = root ]; then user=YOUR_USER; fi
+    web_bind=$(env_get "$cfg" VESSELSTACK_WEB_BIND_ADDRESS 2>/dev/null || true)
+    web_port=$(env_get "$cfg" GRAFANA_PORT 2>/dev/null || true)
+    heimdall=$(env_get "$cfg" HEIMDALL_PORT 2>/dev/null || true)
+    chat=$(env_get "$cfg" BOAT_CHAT_PORT 2>/dev/null || true)
+    chat_host=$(env_get "$cfg" BOAT_CHAT_HOST 2>/dev/null || true)
+    panel_port=$(env_get "$cfg" CONTROL_PANEL_PORT 2>/dev/null || true)
+    app_root=$(env_get "$cfg" VESSELSTACK_ROOT 2>/dev/null || true)
+    web_bind=${web_bind:-0.0.0.0}; web_port=${web_port:-43000}; heimdall=${heimdall:-80}
+    chat=${chat:-8765}; chat_host=${chat_host:-0.0.0.0}; panel_port=${panel_port:-8780}
+    app_root=${app_root:-$INSTALL_ROOT}
+    say ""
+    say "  Addresses (for information; use them from any computer on the boat network when you like):"
+    if [ "$web_bind" = 127.0.0.1 ]; then
+        info "Dashboards are limited to this Pi (VESSELSTACK_WEB_BIND_ADDRESS=127.0.0.1); reach them through an SSH tunnel."
+    else
+        info "Grafana (history dashboards)   http://$where:$web_port"
+        if [ "$heimdall" = 80 ]; then info "Heimdall (start page)          http://$where"; else info "Heimdall (start page)          http://$where:$heimdall"; fi
+    fi
+    info "Home Assistant                 http://$where:8123"
+    if [ "$chat_host" = 127.0.0.1 ]; then
+        info "Boat Chat                      this Pi only (BOAT_CHAT_HOST=127.0.0.1), port $chat"
+    else
+        info "Boat Chat                      http://$where:$chat"
+    fi
+    if [ -n "$ip" ]; then info "(or $host.local instead of $ip if your network resolves that name)"; fi
+    say ""
+    say "  Generated passwords and tokens are stored root-only under $app_root/config/."
+    say "  Show the Boat Chat access token (it is printed only when you run this):"
+    info "sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' $app_root/config/boat-chat.env"
+    say "  Control panel (administration; it listens on this Pi only, port $panel_port). From your own computer:"
+    info "ssh -L $panel_port:127.0.0.1:$panel_port $user@$where"
+    info "then browse to http://127.0.0.1:$panel_port on that computer; its token:"
+    info "sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
 }
 
 find_ctl() {
@@ -1289,7 +1436,7 @@ confirm_plan() {
     info "1. check this computer and the internet connection"
     info "2. install the Debian packages VesselStack needs (and ask before installing Docker)"
     info "3. download VesselStack $VERSION from GitHub and verify its sha256 checksum"
-    info "4. open a short configuration wizard (a web page, reachable only from this Pi)"
+    info "4. ask a few configuration questions right here in the terminal (no browser needed)"
     info "5. run the VesselStack installer (a dry run first) and start the services"
     say ""
     if ! ask_yn "Continue?" y; then
@@ -1298,13 +1445,33 @@ confirm_plan() {
     fi
 }
 
+# Stops before anything is changed when questions would have to be asked but there is no
+# terminal (for example `curl | sudo bash` over ssh without -t).
+require_terminal_or_options() {
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DEFAULTS_ONLY" -eq 1 ]; then return 0; fi
+    if open_prompt; then return 0; fi
+    die "No terminal is available to ask questions on, and no option says how to answer without one." \
+        "Over SSH, connect with  ssh -t USER@HOST  and run the command again (the questions are answered there), or choose:" \
+        "  --yes              answer yes to everything and use the defaults, plus any --set values" \
+        "  --defaults         use every question's default answer and ask nothing" \
+        "  --set KEY=VALUE    set one setting (repeatable), for example --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true" \
+        "  --config FILE      use a ready-made vesselstack.env (together with --yes)" \
+        "Example: curl -fsSL URL/get-vesselstack.sh | sudo bash -s -- --yes --set BOAT_NAME=Foo" \
+        "Nothing was changed."
+}
+
 main() {
     parse_args "$@"
     trap cleanup EXIT
     trap 'printf "\nInterrupted. Re-run the same command to continue; finished steps are skipped.\n" >&2; exit 130' INT TERM
     step_check_computer
+    require_terminal_or_options
     confirm_plan
     step_preflight
+    if [ "$UPGRADE" -eq 1 ] && [ "${#SETS[@]}" -gt 0 ]; then
+        die "--set cannot change the configuration of an installed system: an upgrade keeps it." \
+            "Edit $INSTALL_ROOT/config/vesselstack.env and re-run install.sh, or use the control panel. Nothing was changed."
+    fi
     step_prerequisites
     step_download
     step_configure

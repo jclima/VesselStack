@@ -70,12 +70,74 @@ sudo apt-get update
 # optional, deletes ALL images, containers and volumes: sudo rm -rf /var/lib/docker /var/lib/containerd
 ```
 
-On a Raspberry Pi running 64-bit Raspberry Pi OS (or Debian) with internet access,
-paste this into a terminal on the Pi:
+**Headless is the normal case: the Pi needs no screen, keyboard or browser.** On a
+Raspberry Pi running 64-bit Raspberry Pi OS (or Debian) with internet access, SSH into
+it from your laptop (use `ssh -t` so the installer can ask its questions on that
+session), paste this one line and answer the questions in the same terminal:
 
 ```bash
+ssh -t YOUR_USER@raspberrypi.local
 curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
 ```
+
+(Or paste the second line into a terminal on the Pi itself. No address is opened and no
+tunnel is needed.) The questions are grouped in short sections, each with a plain-language
+explanation and a sensible default in `[brackets]`: **Enter** accepts the default, **?**
+explains the question, **b** goes back one question, and a final review screen lists every
+choice (never any secret) with *save*, *edit a section* and *quit*. Example, abridged:
+
+```text
+== Step 5 of 6: Configure ==
+  Starting the setup questions. Press Enter to accept the answer in [brackets]; ? explains a question.
+
+VesselStack setup. Press Enter to accept the answer in [brackets]. ? explains a question, b goes back one question.
+Everything stays on this computer; no secrets are shown or printed.
+This computer: aarch64, 7.6 GiB RAM, Docker ready; CAN: no can0 yet; network: eth0, wlan0.
+
+[1/9] Your boat
+  Names shown in dashboards and Boat Chat. Everything stays on this Raspberry Pi.
+  Boat name [My Boat]: Sea Wolf
+  Boat type [Motor vessel]: Sailing yacht
+    1) metric             metres, km/h, degrees C
+    2) us_customary       feet, mph, degrees F
+    3) nautical           knots, nautical miles, metres/fathoms
+  Units - choose 1-3 [metric]: 3
+    Detected from this computer: Europe/Oslo
+  Timezone [Europe/Oslo]:
+  Add optional vessel details (MMSI, call sign, length, beam)? [y/N]:
+
+[2/9] Signal K (the boat data hub)
+  How should Signal K run? - choose 1-3 [docker]:
+
+[3/9] NMEA 2000 (CAN bus)
+    No can0 interface found yet (normal before the CAN HAT overlay is installed). You can enable it later.
+  Enable SocketCAN / NMEA 2000? [y/N]: ?
+    Needs an isolated CAN interface, a powered and terminated backbone, and the can0 device present. ...
+  Enable SocketCAN / NMEA 2000? [y/N]:
+...
+Advanced settings (service account, folders, ports, container and bucket names, passwords)? [y/N]:
+
+Review (secrets are never shown):
+  1. Your boat
+      Boat name                                            Sea Wolf
+      Units                                                nautical
+  ...
+  [s] save and continue   [e] edit a section   [q] quit without saving - choose [s]:
+
+  Install and start VesselStack now? [Y/n]:
+...
+  Addresses (for information; use them from any computer on the boat network when you like):
+    Grafana (history dashboards)   http://192.0.2.10:43000
+    Home Assistant                 http://192.0.2.10:8123
+    Boat Chat                      http://192.0.2.10:8765
+  Show the Boat Chat access token (it is printed only when you run this):
+    sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' /opt/vesselstack/config/boat-chat.env
+  Control panel (administration; it listens on this Pi only, port 8780). From your own computer:
+    ssh -L 8780:127.0.0.1:8780 YOUR_USER@192.0.2.10
+```
+
+Everything printed at the end is information only: nothing in the install needs a
+browser, and nothing is opened for you.
 
 The `releases/latest/download/` form works only once a release carrying
 `get-vesselstack.sh` has been published **and marked latest**. Until then (and while a
@@ -89,10 +151,30 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.1/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.1 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.1
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.2/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.2 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.2
 ```
+
+**No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
+
+```bash
+# defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
+curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh \
+  | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
+# every question's own default answer, nothing asked
+curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash -s -- --defaults
+# a ready-made vesselstack.env (optionally with --set overrides)
+sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
+```
+
+`--yes` answers yes to every question (Docker installation, final confirmation, upgrade of
+an installed system) and takes the settings from `--config`, then `--set`, else the
+defaults. `--defaults` gives every question its own default instead: it installs Docker
+and VesselStack on a fresh Pi, but leaves an installed system alone (the upgrade question
+defaults to no) and never removes conflicting Docker packages. With neither, and no
+terminal to ask on (for example `curl | sudo bash` over `ssh` without `-t`), the installer
+stops before changing anything and lists these options.
 
 The guided installer explains each step in plain language and asks before it
 does anything beyond installing ordinary Debian packages:
@@ -112,43 +194,65 @@ does anything beyond installing ordinary Debian packages:
    release, verifies the checksum, refuses unsafe archives (absolute or `..` paths,
    links, devices, setuid bits) and unpacks to `/opt/vesselstack-release/<version>`,
    owned by root and not writable by others;
-4. starts the loopback-only configuration wizard on a random free port (override
-   with `--wizard-port N`) and tells you how to open it. The wizard runs as an
-   unprivileged user (the account that ran `sudo`; if there is none, or it is root, a
-   temporary dedicated system account `vesselstack-wizard` is created for the run
-   with `useradd --system --no-create-home --shell /usr/sbin/nologin` and removed
-   again when the script ends, even after a failure; the shared `nobody` identity is
-   never used, so no other daemon can tamper with the output; a stale
-   `vesselstack-wizard` left by an interrupted run is replaced) with a minimal environment, writing only into a private 0700 directory
-   owned by that user, so other local users cannot obtain a root-installed
-   configuration. It prints one address ending in `#token=...`; open that exact
-   address in a browser on the Pi, or on your laptop after running the printed
-   `ssh -L PORT:127.0.0.1:PORT USER@PI` command. The token is in the URL fragment,
-   so it is never sent to the server or served in the page, and the page removes
-   it from the address bar. The wizard closes itself when you save; the bootstrap
-   then copies the result once into a root-only staging directory, lints that copy,
-   re-validates it as root with the wizard's own rules
-   (`vesselstack-wizard.py --validate FILE`: known settings only, allowed characters,
-   enum and boolean values) and installs only it. `--config FILE` gets the same treatment: opened without
-   following symlinks, must be a regular file of at most 64 KiB, copied once, and
-   only the staged copy is linted, validated the same way (unknown keys, disallowed
-   characters or bad enum values are refused) and used. Limitation: the Docker line in the
-   wizard's preflight page reflects what the unprivileged wizard user can see;
-   `install.sh` performs the authoritative checks;
+4. asks the configuration questions **in the terminal** (the terminal wizard,
+   `vesselstack-wizard.py --cli`, the default). It reads your answers from the terminal
+   (`/dev/tty`, so the piped `curl | sudo bash` form works), validates every answer
+   immediately with the same rules as the browser wizard (`DEFAULTS`, `validate()`,
+   `render()`; stricter checks only where `install.sh` enforces the same limits, such as
+   the boat name characters), and offers sections for the boat (name, type, units, timezone
+   detected from the system, optional and private MMSI, call sign, length and beam),
+   Signal K (docker, existing or native; docker recommended), NMEA 2000 / CAN
+   (`SOCKETCAN_ENABLE`, interface, bit rate and the home-lab virtual-CAN option
+   `VESSELSTACK_CAN_CREATE_VCAN`), AIS, Home Assistant (URL, optional hidden token), Boat
+   Chat provider (default `local`) and Telegram, the firewall (untrusted interface, enable,
+   strict mode, allowed ports), raw-data retention (`INFLUXDB_RAW_RETENTION`; empty means
+   30 days on a new install and no change to an existing database) and bind addresses.
+   Ports, container and bucket names, folders, the service account and the generated
+   secrets sit behind "Advanced settings? [y/N]". Passwords and tokens default to being
+   generated during installation, are read without echo when you do type one and are
+   never printed or logged. It detects the architecture, Docker, `can0` and the network
+   interface names to inform defaults and hints; it never turns hardware on by itself.
+   The terminal wizard has no network surface (no web server, no token, no URL), so it
+   runs as root directly, in a private root-only `0700` directory; its output is then
+   treated exactly like the browser wizard's: copied once into the root-only staging
+   directory, linted, re-validated as root with `vesselstack-wizard.py --validate FILE`
+   (known settings only, allowed characters, enum and boolean values) and installed
+   root-only, mode 600. `--config FILE` gets the same treatment (opened without following
+   symlinks, a regular file of at most 64 KiB, copied once, only the staged copy linted,
+   validated and used); with `--set` the staged copy is the base the values are applied
+   to. Optional browser wizard: add `--web-wizard`; it is unchanged (loopback only on a
+   random free port, `--wizard-port N`, run as an unprivileged user or the temporary
+   `vesselstack-wizard` system account, a `#token=` address printed once, open on the Pi
+   or through the printed `ssh -L` tunnel) and cannot be combined with `--yes`-style
+   configuration options (`--config`, `--set`, `--defaults`). Limitation: the Docker line
+   in a wizard's preflight reflects what that wizard sees; `install.sh` performs the
+   authoritative checks;
 5. shows a summary of the chosen configuration (no secrets), asks for confirmation,
    runs `install.sh --dry-run`, then `install.sh --start`, then `vesselstackctl
-   doctor`, and prints `vesselstackctl urls`, where the generated tokens are
-   stored and the next steps. It ends with a list of everything it changed.
+   doctor`, and prints `vesselstackctl urls` plus, as plain text, the service
+   addresses to use from another computer (host name or IP), the command that shows
+   the Boat Chat access token and the SSH tunnel hint for the control panel
+   (information only), where the generated tokens are stored and the next steps.
+   It ends with a list of everything it changed.
 
-Options (`sudo bash get-vesselstack.sh --help`): `--yes` (no questions),
-`--version X.Y.Z`, `--no-wizard --config FILE` (use an existing `vesselstack.env`),
+Options (`sudo bash get-vesselstack.sh --help`): `--yes` (ask nothing, answer yes),
+`--defaults` (ask nothing, each question's default), `--set KEY=VALUE` (repeatable;
+avoid secrets here, they would show in the process list: leave them to be generated),
+`--config FILE` (use an existing `vesselstack.env`; `--no-wizard --config FILE` is the
+same), `--cli` / `--terminal` (the default terminal questions), `--web-wizard` (optional
+browser wizard), `--version X.Y.Z`,
 `--offline --bundle DIR [--tarball FILE]` (no internet, see
 [Offline install](#offline-install-no-internet-on-the-boat)), `--sha256 HASH`
 (pin the tarball to a checksum you obtained elsewhere), `--dir DIR`,
-`--wizard-port N` (default: a random free port). Questions are read from the terminal, so the piped form works;
-without a terminal pass `--yes`. Re-running is safe: finished steps are reported
-and skipped, an already installed version just reports "nothing to do", and an
-earlier saved configuration can be reused.
+`--wizard-port N` (browser wizard only). `--set` values are checked early for shape and
+fully (key, characters, enum, ranges) by the wizard before `install.sh` runs; an unknown
+key or invalid value stops the installer without installing anything (Debian packages
+and Docker may already have been installed by the earlier steps; re-running is safe).
+`--set` cannot change the configuration of an installed system (an upgrade keeps it).
+With a saved configuration from an earlier run, `--yes` and `--defaults` reuse it and
+`--set` is applied on top of it (the old file is kept as `vesselstack.env.previous`). Re-running is safe: finished steps are reported
+and skipped, an already installed version just reports "nothing to do". Rollback of this
+installer change: use the previous release's `get-vesselstack.sh`; nothing else changed.
 
 **What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
 root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the
@@ -181,11 +285,14 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.1
-python3 vesselstack-wizard.py
+git checkout v0.4.2
+python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
+# python3 vesselstack-wizard.py        # or the browser wizard
 ```
 
-Open the address the wizard prints (`http://127.0.0.1:8088/#token=...`), or use the
+The terminal wizard (`--cli`) asks in the terminal and writes `vesselstack.env`; add
+`--defaults` and `--set KEY=VALUE` to configure without questions, `--base FILE` to start from an
+existing file. For the browser wizard open the address it prints (`http://127.0.0.1:8088/#token=...`), or use the
 SSH tunnel documented in the guide and open the same address on your workstation.
 The wizard accepts `--port N`, `--output FILE` (where to write the env file) and
 `--exit-after-save` (stop after the first successful save; the one-line installer
@@ -319,7 +426,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.4.1
+git checkout v0.4.2
 ```
 
 ## 4. Configure the vessel
@@ -1082,7 +1189,7 @@ Rollback of a completed upgrade is a restore of the pre-update backup that
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.1.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.2.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -1283,7 +1390,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-0.4.1.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-0.4.2.tar.gz.sha256)
 ```
 
 The package is produced by `git archive` of the committed `HEAD`, so untracked
@@ -1310,8 +1417,15 @@ files for the maintainer to review and publish.
 `sudo tests/test-get-vesselstack.sh` covers the bootstrap (checksum mismatch,
 truncated downloads and scripts, unsafe archives, existing-install detection,
 non-root refusal, `--help`, offline and `--no-wizard --config` flows, and the Docker
-installation cases listed in the 0.4.1 changelog entry) with fake
-`curl`/`apt-get`/`apt-cache`/`dpkg`/`gpg`/`docker`/`systemctl` stubs.
+installation cases listed in the 0.4.1 changelog entry, and, since 0.4.2, the terminal
+wizard driven through `VESSELSTACK_BOOTSTRAP_ANSWERS` (an answers file read like the
+terminal: a full default walk, edits, invalid input and re-prompts, `?`, `b`, the review,
+secrets never printed or logged, quit and early end of input), `--yes`/`--defaults`/`--set`
+(valid, unknown key, invalid value, on top of `--config` and a saved configuration), the
+no-terminal failure message, `--web-wizard` and the staged validation of the terminal
+wizard's output) with fake `curl`/`apt-get`/`apt-cache`/`dpkg`/`gpg`/`docker`/`systemctl`
+stubs. `tests/test_wizard.py` tests the prompt logic as functions driven by an input
+iterator, the unbuffered descriptor reader and the real wizard on a pseudo-terminal.
 
 ## Documentation policy
 

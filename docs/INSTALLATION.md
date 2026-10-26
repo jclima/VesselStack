@@ -56,19 +56,60 @@ sudo apt-get update
 ```
 
 Once the hardware is assembled, the operating system is installed (section 3) and
-`can0` works if you use NMEA 2000 (section 4), paste this on the Raspberry Pi:
+`can0` works if you use NMEA 2000 (section 4), SSH into the Raspberry Pi from your laptop
+(`ssh -t YOUR_USER@raspberrypi.local`; the `-t` lets the installer ask its questions), paste
+this one line and answer the questions in the same terminal. The Pi needs no screen,
+keyboard or browser, and nothing has to be opened or tunnelled:
 
 ```bash
 curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
 ```
 
+The terminal questions come in short sections (boat, Signal K, NMEA 2000 / CAN, AIS, Home
+Assistant and Boat Chat, firewall, retention, network addresses). Each has a plain-language
+explanation and a default in `[brackets]`: Enter accepts it, `?` explains, `b` goes back one
+question, and a review screen (never showing secrets) lets you save, edit a section or quit.
+Passwords and tokens are generated for you; MMSI, call sign and boat size are optional and
+stay on the Pi. A short example:
+
+```text
+[1/9] Your boat
+  Boat name [My Boat]: Sea Wolf
+  Boat type [Motor vessel]:
+  Units - choose 1-3 [metric]: 3
+  Timezone [Europe/Oslo]:
+  Add optional vessel details (MMSI, call sign, length, beam)? [y/N]:
+...
+  [s] save and continue   [e] edit a section   [q] quit without saving - choose [s]:
+  Install and start VesselStack now? [Y/n]:
+```
+
+At the end the installer prints, as plain text for information, the service addresses to use
+from another computer (Grafana, Home Assistant, Boat Chat), the command that shows the Boat
+Chat access token and the SSH tunnel hint for the control panel
+(`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
+
+**Without questions** (scripts, repeatable installs, or when no terminal is available):
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh \
+  | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
+```
+
+`--yes` answers yes to every question and uses the defaults plus your `--set KEY=VALUE`
+values (repeatable; names as in `vesselstack.example.env`; keep secrets out of `--set`, they
+are generated). `--defaults` gives every question its own default and asks nothing (it does
+not upgrade an installed system or remove Docker conflicts). `--config FILE` uses a ready-made
+`vesselstack.env` (with `--set` overrides on top). With none of these and no terminal, the
+installer stops before changing anything and lists these options. `--web-wizard` is the
+optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
+
 The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.1/get-vesselstack.sh`, or add
-`--version 0.4.1` (`| sudo bash -s -- --version 0.4.1`). It installs the Debian
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.2/get-vesselstack.sh`, or add
+`--version 0.4.2` (`| sudo bash -s -- --version 0.4.2`). It installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
-release, opens the wizard (it prints the address to open in a browser on the Pi or
-the exact `ssh -L` command for your laptop), then runs the installer dry run, the
+release, asks the configuration questions in the terminal, then runs the installer dry run, the
 installation, `vesselstackctl doctor` and `vesselstackctl urls`. It shows a list of
 everything it changed at the end and is safe to re-run. Sections 5 and 6 below are
 the same steps done by hand ("advanced / manual").
@@ -86,8 +127,9 @@ less get-vesselstack.sh
 sudo bash get-vesselstack.sh
 ```
 
-Useful options: `--yes` (no questions), `--no-wizard --config FILE`, `--dir DIR`,
-`--wizard-port N`, `--offline --bundle DIR --tarball FILE` (no internet; see
+Useful options: `--yes` (no questions), `--defaults`, `--set KEY=VALUE`, `--config FILE`
+(`--no-wizard --config FILE`), `--web-wizard` (optional browser wizard) with `--wizard-port N`,
+`--dir DIR`, `--offline --bundle DIR --tarball FILE` (no internet; see
 [DEPLOYMENT.md](DEPLOYMENT.md)), `--help`. If VesselStack is already installed the
 script reports an upgrade and offers `vesselstackctl update`; it never overwrites an
 installation silently. Rollback: `sudo vesselstackctl stop`, and see the README
@@ -169,11 +211,13 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.1
-python3 vesselstack-wizard.py
+git checkout v0.4.2
+python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
+# python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```
 
-On the Pi itself open the address the wizard prints (`http://127.0.0.1:8088/#token=...`; the token after `#` is required). For a headless Pi, keep the
+`--cli` asks in the terminal and writes `vesselstack.env` (mode 600); `--defaults` and
+`--set KEY=VALUE` skip the questions. For the browser wizard, on the Pi itself open the address the wizard prints (`http://127.0.0.1:8088/#token=...`; the token after `#` is required). For a headless Pi, keep the
 wizard loopback-only and tunnel it from your workstation:
 
 ```bash

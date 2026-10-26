@@ -62,7 +62,7 @@ Do not build and upload files by hand.
    [DEPLOYMENT.md](DEPLOYMENT.md)): `sha256sum -c`, then the install and update
    rehearsals. The build is reproducible on Linux (same commit, same bytes).
 6. **Manual gate (not automated): one real interactive run** of `get-vesselstack.sh`
-   on a real Raspberry Pi: fresh install through the wizard with a browser, the Docker
+   on a real Raspberry Pi: fresh install over plain SSH (`ssh -t`) answering the terminal wizard (and one with `--web-wizard`), a no-prompt install (`--yes --set ...`), the Docker
    step on stock 64-bit Raspberry Pi OS bookworm without Docker (expect: the signing key
    verified, `/etc/apt/sources.list.d/docker.sources` written, `docker-ce` and
    `docker-compose-plugin` installed, `docker info` answering; check `dpkg --print-architecture`
