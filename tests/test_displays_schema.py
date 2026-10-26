@@ -179,7 +179,7 @@ class SchemaTests(unittest.TestCase):
                        lambda r: grid(r).pop("types"),
                        lambda r: grid(r).update(types=[]),
                        lambda r: grid(r).update(types=["instrument", "instrument"]),
-                       lambda r: grid(r).update(types=["ha"]),
+                       lambda r: grid(r).update(types=["bogus"]),
                        lambda r: grid(r).update(shapes=["oval"]),
                        lambda r: grid(r).update(extra=1)):
             self.assertTrue(bad(mutate))
@@ -291,6 +291,176 @@ class ThresholdTests(unittest.TestCase):
         self.assertError(lambda c: inst(c).update(threshold={"warn_below": 1}), "threshold: unknown key")
 
 
+BILGE = {"entity_id": "binary_sensor.vesselstack_bilge_pump", "label": "Bilge", "kind": "binary",
+         "states": [{"match": "on", "sev": "warn", "text": "RUNNING"}, {"match": "off", "sev": "ok", "text": "OFF"}]}
+WATCH = {"entity_id": "sensor.boat_watch_summary", "label": "Watch", "kind": "state",
+         "states": [{"match": "clear", "sev": "ok", "text": "CLEAR"},
+                    {"prefix": "dock: clear", "sev": "ok", "text": "DOCK"}],
+         "default": {"sev": "warn", "text": "CHECK"}}
+TEMP = {"entity_id": "sensor.cabin_temp", "label": "Cabin", "kind": "numeric", "unit": "C", "precision": 1,
+        "thresholds": {"warn_above": 30, "alarm_above": 40}, "min": 0, "max": 50}
+
+
+def ha_cfg(layout="status-grid", items=("bilge", "watch", "temp"), **ha):
+    cfg = copy.deepcopy(EXAMPLE)
+    cfg["ha"] = {"bilge": copy.deepcopy(BILGE), "watch": copy.deepcopy(WATCH), "temp": copy.deepcopy(TEMP)}
+    cfg["ha"].update(ha)
+    cfg["displays"]["helm"]["pages"] = [{"title": "T", "layout": layout, "items": list(items)}]
+    return cfg
+
+
+class HomeAssistantSchemaTests(unittest.TestCase):
+    def errors(self, cfg=None, **kw):
+        return schema.validate_config(cfg if cfg is not None else ha_cfg(**kw), REGISTRY)
+
+    def assertError(self, cfg, fragment):
+        errors = self.errors(cfg)
+        self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
+
+    def test_valid_ha_items_on_the_status_grid(self) -> None:
+        self.assertEqual(self.errors(), [])
+
+    def test_ha_is_optional_and_unknown_keys_are_refused(self) -> None:
+        self.assertEqual(schema.validate_config(EXAMPLE, REGISTRY), [])
+        cfg = ha_cfg()
+        cfg["ha"]["bilge"]["color"] = 1
+        self.assertError(cfg, "$.ha.bilge.color: unknown key")
+        cfg = ha_cfg()
+        cfg["ha"] = []
+        self.assertError(cfg, "$.ha: must be an object")
+
+    def test_entity_id_is_fullmatched(self) -> None:
+        for good in ("binary_sensor.x", "sensor.a_b_9", "input_boolean.y" + "z" * 63):
+            cfg = ha_cfg()
+            cfg["ha"]["bilge"]["entity_id"] = good
+            self.assertEqual(self.errors(cfg), [], good)
+        for bad in ("sensor.x\n", "Sensor.x", "sensor", "sensor.", "sensor.Upper", "sensor.x-y", "a.b.c",
+                    "sensor." + "z" * 65, " sensor.x", "sensor.x ", 7, None):
+            cfg = ha_cfg()
+            cfg["ha"]["bilge"]["entity_id"] = bad
+            self.assertError(cfg, "entity_id")
+
+    def test_ids_are_unique_across_instruments_notifications_and_ha(self) -> None:
+        cfg = ha_cfg()
+        cfg["ha"]["sog"] = copy.deepcopy(BILGE)
+        self.assertError(cfg, "$.ha.sog: id is already used by an instrument")
+        cfg = copy.deepcopy(EXAMPLE)
+        cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"}}
+        cfg["ha"] = {"anchor": copy.deepcopy(BILGE)}
+        self.assertError(cfg, "$.ha.anchor: id is already used by a notification")
+
+    def test_kind_rules(self) -> None:
+        for mutate, fragment in (
+                (lambda h: h["bilge"].update(kind="analog"), "kind: must be one of"),
+                (lambda h: h["bilge"].pop("kind"), "kind: required"),
+                (lambda h: h["bilge"].update(unit="x"), "unit: only allowed for kind 'numeric'"),
+                (lambda h: h["bilge"].update(thresholds={"warn_above": 1}), "thresholds: only allowed"),
+                (lambda h: h["temp"].update(states=BILGE["states"]), "states: not allowed for kind 'numeric'"),
+                (lambda h: h["temp"].update(default={"sev": "warn", "text": "x"}), "default: not allowed"),
+                (lambda h: h["temp"].pop("unit"), "unit: required for kind 'numeric'"),
+                (lambda h: h["temp"].pop("precision"), "precision: required for kind 'numeric'"),
+                (lambda h: h["temp"].update(precision=4), "precision"),
+                (lambda h: h["temp"].update(thresholds={"warn_above": 5, "alarm_above": 1}), "alarm_above"),
+                (lambda h: h["temp"].update(min=10, max=1), "min: must be less than max"),
+                (lambda h: h["temp"].update(alarm="yes"), "alarm: must be true or false"),
+                (lambda h: h["temp"].update(label="x" * 17), "label"),
+                (lambda h: h["temp"].update(unit="123456789"), "unit")):
+            cfg = ha_cfg()
+            mutate(cfg["ha"])
+            self.assertError(cfg, fragment)
+
+    def test_states_rules(self) -> None:
+        for mutate, fragment in (
+                (lambda h: h["bilge"].pop("states"), "states: required"),
+                (lambda h: h["bilge"].update(states=[]), "states: must be a list of 1..8"),
+                (lambda h: h["bilge"].update(states=[{"match": "on", "sev": "ok", "text": "T"}] * 9), "1..8"),
+                (lambda h: h["bilge"].update(states="on"), "states: must be a list"),
+                (lambda h: h["bilge"]["states"].append("on"), "states[2]: must be an object"),
+                (lambda h: h["bilge"]["states"][0].update(prefix="on"), "exactly one of match or prefix"),
+                (lambda h: h["bilge"]["states"][0].pop("match"), "exactly one of match or prefix"),
+                (lambda h: h["bilge"]["states"][0].update(match=""), "match"),
+                (lambda h: h["bilge"]["states"][0].update(match="   "), "match"),
+                (lambda h: h["bilge"]["states"][0].update(match=5), "match"),
+                (lambda h: h["bilge"]["states"][0].update(match="a" * 65), "match"),
+                (lambda h: h["bilge"]["states"][0].update(sev="green"), "sev: must be one of"),
+                (lambda h: h["bilge"]["states"][0].pop("sev"), "sev: required"),
+                (lambda h: h["bilge"]["states"][0].update(text="TOO LONG TXT"), "text: must be 1..10"),
+                (lambda h: h["bilge"]["states"][0].update(text=""), "text: must be 1..10"),
+                (lambda h: h["bilge"]["states"][0].update(text="a\nb"), "text: must be 1..10"),
+                (lambda h: h["bilge"]["states"][0].pop("text"), "text: required"),
+                (lambda h: h["bilge"]["states"][0].update(extra=1), "extra: unknown key"),
+                (lambda h: h["watch"].pop("default"), "default: required for kind 'state'"),
+                (lambda h: h["watch"].update(default="warn"), "default: must be an object"),
+                (lambda h: h["watch"]["default"].update(sev="x"), "default.sev"),
+                (lambda h: h["watch"]["default"].update(extra=1), "default.extra: unknown key")):
+            cfg = ha_cfg()
+            mutate(cfg["ha"])
+            self.assertError(cfg, fragment)
+
+    def test_a_binary_item_may_leave_out_default_and_gets_warn_question_mark(self) -> None:
+        cfg = ha_cfg()
+        self.assertNotIn("default", cfg["ha"]["bilge"])
+        self.assertEqual(self.errors(cfg), [])
+        self.assertEqual(schema.ha_default(cfg["ha"]["bilge"]), {"sev": "warn", "text": "?"})
+        self.assertEqual(schema.ha_default(cfg["ha"]["watch"]), {"sev": "warn", "text": "CHECK"})
+
+    def test_eight_states_are_allowed(self) -> None:
+        cfg = ha_cfg()
+        cfg["ha"]["watch"]["states"] = [{"match": f"s{i}", "sev": "ok", "text": f"S{i}"} for i in range(8)]
+        self.assertEqual(self.errors(cfg), [])
+
+    def test_layout_rules(self) -> None:
+        # numeric ha is like an instrument on tile layouts; binary/state only fits the status-grid
+        self.assertEqual(self.errors(ha_cfg("grid-2x2", ("temp",))), [])
+        self.assertEqual(self.errors(ha_cfg("single", ("temp",))), [])
+        self.assertEqual(self.errors(ha_cfg("tank-bars", ("temp",))), [])
+        self.assertEqual(self.errors(ha_cfg("gauge-arc", ("temp",))), [])
+        self.assertError(ha_cfg("grid-2x2", ("bilge",)), "is a binary item; layout 'grid-2x2' shows numbers")
+        self.assertError(ha_cfg("tank-bars", ("watch",)), "is a state item")
+        cfg = ha_cfg("tank-bars", ("temp",))
+        del cfg["ha"]["temp"]["max"]
+        self.assertError(cfg, "needs min and max on layout 'tank-bars'")
+        cfg = ha_cfg("gauge-arc", ("temp",))
+        del cfg["ha"]["temp"]["min"]
+        self.assertError(cfg, "needs min and max on layout 'gauge-arc'")
+
+    def test_unknown_item_message_names_ha(self) -> None:
+        cfg = ha_cfg(items=("bilge", "nope"))
+        self.assertError(cfg, "unknown instrument, notification or Home Assistant item 'nope'")
+        cfg = ha_cfg(items=("bilge", "bilge"))
+        self.assertError(cfg, "duplicate item 'bilge'")
+
+    def test_electrical_shore_slot_takes_a_binary_ha_item_only(self) -> None:
+        def electrical(shore):
+            cfg = ha_cfg("electrical", ("house_v", "batt_soc", "batt_a", shore))
+            cfg["instruments"]["house_v"] = dict(EXAMPLE["instruments"]["sog"], unit="V")
+            cfg["instruments"]["batt_soc"] = dict(EXAMPLE["instruments"]["sog"], unit="%", min=0, max=100)
+            cfg["instruments"]["batt_a"] = dict(EXAMPLE["instruments"]["sog"], unit="A")
+            cfg["ha"]["shore"] = {"entity_id": "binary_sensor.shore", "label": "Shore", "kind": "binary",
+                                  "states": [{"match": "on", "sev": "ok", "text": "ON"}]}
+            return cfg
+        self.assertEqual(self.errors(electrical("shore")), [])
+        self.assertError(electrical("watch"), "must be a binary item to fill this slot")
+        self.assertError(electrical("temp"), "must be a binary item to fill this slot")
+        cfg = electrical("shore")
+        cfg["displays"]["helm"]["pages"][0]["items"][0] = "bilge"
+        self.assertError(cfg, "does not accept ha items here")
+
+    def test_ha_items_count_towards_the_alarm_takeover(self) -> None:
+        cfg = ha_cfg()
+        cfg["instruments"] = {k: {kk: vv for kk, vv in v.items() if kk != "thresholds"}
+                              for k, v in cfg["instruments"].items()}
+        cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True}
+        self.assertEqual(self.errors(cfg), [])
+        for item in cfg["ha"].values():
+            item["alarm"] = False
+        self.assertError(cfg, "nothing counts towards the alarm summary")
+
+    def test_dashboard_example_is_valid(self) -> None:
+        dashboard = schema.load_json(ROOT / "displays" / "displays.dashboard.example.json")
+        self.assertEqual(schema.validate_config(dashboard, REGISTRY), [])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -383,7 +553,7 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(specs["tank-bars"]["shapes"], ["round", "rect"])
         self.assertEqual(specs["gauge-arc"]["capacity"], 1)
         self.assertEqual(specs["gauge-arc"]["shapes"], ["round"])
-        self.assertEqual(specs["gauge-arc"]["types"], ["instrument"])
+        self.assertEqual(specs["gauge-arc"]["types"], ["instrument", "ha"])
         self.assertEqual(schema.RANGE_LAYOUTS, ("tank-bars", "gauge-arc"))
 
     def test_valid_tank_bars_and_gauge_arc_pages(self) -> None:
@@ -647,7 +817,7 @@ class ElectricalLayoutTests(unittest.TestCase):
         self.assertEqual(schema.validate_registry(REGISTRY), [])
         spec = schema.layout_specs(REGISTRY)["electrical"]
         self.assertEqual((spec["capacity"], spec["min_items"], spec["shapes"], spec["types"]),
-                         (5, 3, ["round"], ["instrument", "notification"]))
+                         (5, 3, ["round"], ["instrument", "notification", "ha"]))
         self.assertEqual([s["role"] for s in spec["slots"]], ["voltage", "soc", "current", "shore", "solar"])
         self.assertEqual(spec["slots"][1], {"role": "soc", "types": ["instrument"], "needs": ["numeric", "min_max"]})
         self.assertEqual([bool(s.get("optional")) for s in spec["slots"]], [False, False, False, True, True])

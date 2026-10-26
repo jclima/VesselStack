@@ -20,14 +20,31 @@ LAYOUT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SK_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z0-9_-]+)+$")
 HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
-TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "notifications", "displays", "night_schedule"}
+TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "notifications", "ha", "displays",
+            "night_schedule"}
 NIGHT_SCHEDULE_KEYS = {"start", "end"}
 HHMM = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 NOTIFICATION_KEYS = {"path", "label", "absent", "alarm"}
 NOTIFICATION_REQUIRED = {"path", "label"}
 NOTIFICATION_PREFIX = "notifications."
 ABSENT_MODES = ("ok", "unknown")
-ITEM_TYPES = ("instrument", "notification")
+ITEM_TYPES = ("instrument", "notification", "ha")
+# Home Assistant items: a numeric sensor, or a binary / multi-valued state mapped to a severity and a fixed text.
+HA_ENTITY_ID = re.compile(r"^[a-z_]+\.[a-z0-9_]{1,64}$")
+HA_KEYS = {"entity_id", "label", "kind", "unit", "precision", "thresholds", "min", "max", "states", "default",
+           "alarm"}
+HA_REQUIRED = {"entity_id", "label", "kind"}
+HA_KINDS = ("binary", "state", "numeric")
+HA_NUMERIC_ONLY = {"unit", "precision", "thresholds", "min", "max"}
+HA_STATE_KINDS = ("binary", "state")
+HA_SEVERITIES = ("ok", "warn", "alarm")
+HA_STATE_KEYS = {"match", "prefix", "sev", "text"}
+HA_DEFAULT_KEYS = {"sev", "text"}
+HA_MAX_STATES = 8
+HA_TEXT_MAX = 10
+HA_PATTERN_MAX = 64
+# A binary item without an explicit ``default`` reads "?" as a warning: never green by accident.
+HA_BINARY_DEFAULT = {"sev": "warn", "text": "?"}
 SHAPES = ("round", "rect")
 LAYOUT_KEYS = {"capacity", "min_items", "shapes", "types", "slots"}
 # Positional slots (layout "electrical"): item N of a page fills slot N of the layout.
@@ -131,14 +148,115 @@ def validate_thresholds(th, where: str, errors: list) -> None:
             errors.append(f"{where}.hysteresis: must be less than the smallest gap between bounds ({min(gaps)})")
 
 
+def ha_default(item: dict) -> dict:
+    """The severity and text of a state no ``states`` entry matched (binary items have a built-in default)."""
+    return item.get("default") or HA_BINARY_DEFAULT
+
+
+def _validate_ha_states(item: dict, where: str, errors: list) -> None:
+    kind = item.get("kind")
+    states = item.get("states")
+    if "states" not in item:
+        errors.append(f"{where}.states: required for kind {kind!r}")
+    elif not isinstance(states, list) or not 1 <= len(states) <= HA_MAX_STATES:
+        errors.append(f"{where}.states: must be a list of 1..{HA_MAX_STATES} entries")
+    else:
+        for i, entry in enumerate(states):
+            w = f"{where}.states[{i}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{w}: must be an object")
+                continue
+            _unknown(entry, HA_STATE_KEYS, w, errors)
+            keys = [k for k in ("match", "prefix") if k in entry]
+            if len(keys) != 1:
+                errors.append(f"{w}: needs exactly one of match or prefix")
+            for key in keys:
+                value = entry[key]
+                if not (isinstance(value, str) and value.strip() and len(value) <= HA_PATTERN_MAX
+                        and value.isprintable()):
+                    errors.append(f"{w}.{key}: must be 1..{HA_PATTERN_MAX} printable characters "
+                                  "(not only spaces)")
+            _validate_ha_outcome(entry, w, errors)
+    default = item.get("default")
+    if "default" not in item:
+        if kind == "state":
+            errors.append(f"{where}.default: required for kind 'state' (what an unmatched state shows)")
+    elif not isinstance(default, dict):
+        errors.append(f"{where}.default: must be an object with sev and text")
+    else:
+        _unknown(default, HA_DEFAULT_KEYS, f"{where}.default", errors)
+        _validate_ha_outcome(default, f"{where}.default", errors)
+
+
+def _validate_ha_outcome(entry: dict, where: str, errors: list) -> None:
+    if "sev" not in entry:
+        errors.append(f"{where}.sev: required")
+    elif not (isinstance(entry["sev"], str) and entry["sev"] in HA_SEVERITIES):
+        errors.append(f"{where}.sev: must be one of {', '.join(HA_SEVERITIES)}")
+    if "text" not in entry:
+        errors.append(f"{where}.text: required")
+    elif not _text(entry["text"], 1, HA_TEXT_MAX):
+        errors.append(f"{where}.text: must be 1..{HA_TEXT_MAX} printable characters")
+
+
+def validate_ha_item(item, where: str, heartbeat: int, errors: list) -> None:
+    """One ``ha`` entry: a numeric sensor (like an instrument) or a binary / state mapping."""
+    if not isinstance(item, dict):
+        errors.append(f"{where}: must be an object")
+        return
+    _unknown(item, HA_KEYS, where, errors)
+    _missing(item, HA_REQUIRED, where, errors)
+    if "entity_id" in item and not (isinstance(item["entity_id"], str) and HA_ENTITY_ID.fullmatch(item["entity_id"])):
+        errors.append(f"{where}.entity_id: must look like domain.object_id (lower case letters, digits, underscores)")
+    if "label" in item and not _text(item["label"], 1, 16):
+        errors.append(f"{where}.label: must be 1..16 printable characters")
+    if "alarm" in item and not isinstance(item["alarm"], bool):
+        errors.append(f"{where}.alarm: must be true or false")
+    kind = item.get("kind")
+    if "kind" in item and not (isinstance(kind, str) and kind in HA_KINDS):
+        errors.append(f"{where}.kind: must be one of {', '.join(HA_KINDS)}")
+        return
+    if kind == "numeric":
+        for key in ("states", "default"):
+            if key in item:
+                errors.append(f"{where}.{key}: not allowed for kind 'numeric'")
+        for key in ("unit", "precision"):
+            if key not in item:
+                errors.append(f"{where}.{key}: required for kind 'numeric'")
+        if "unit" in item and not (isinstance(item["unit"], str) and len(item["unit"]) <= 8
+                                   and item["unit"].isprintable()):
+            errors.append(f"{where}.unit: must be a printable string of at most 8 characters")
+        if "precision" in item:
+            _int_range(item, "precision", 0, 3, where, errors)
+        if "thresholds" in item:
+            validate_thresholds(item["thresholds"], f"{where}.thresholds", errors)
+        for key in ("min", "max"):
+            if key in item and not finite_number(item[key]):
+                errors.append(f"{where}.{key}: must be a finite number")
+        if (finite_number(item.get("min")) and finite_number(item.get("max"))
+                and item["min"] >= item["max"]):
+            errors.append(f"{where}.min: must be less than max")
+    elif kind in HA_STATE_KINDS:
+        for key in sorted(HA_NUMERIC_ONLY & set(item)):
+            errors.append(f"{where}.{key}: only allowed for kind 'numeric'")
+        _validate_ha_states(item, where, errors)
+
+
+def ha_numeric(item) -> bool:
+    return isinstance(item, dict) and item.get("kind") == "numeric"
+
+
 def counts_for_alarm_summary(cfg: dict) -> bool:
     """True when at least one item would be counted in the bridge's alarm summary."""
     instruments = cfg.get("instruments")
     notifications = cfg.get("notifications")
+    ha = cfg.get("ha")
     return any(isinstance(i, dict) and i.get("alarm", "thresholds" in i) is True
                for i in (instruments.values() if isinstance(instruments, dict) else ())) \
         or any(isinstance(n, dict) and n.get("alarm", True) is True
-               for n in (notifications.values() if isinstance(notifications, dict) else ()))
+               for n in (notifications.values() if isinstance(notifications, dict) else ())) \
+        or any(isinstance(h, dict) and h.get("alarm", True) is True
+               for h in (ha.values() if isinstance(ha, dict) else ()))
 
 
 def validate_night_schedule(value, where: str, errors: list) -> bool:
@@ -162,7 +280,7 @@ def ui_header_enabled(ui) -> bool:
 
 
 def validate_ui(ui, where: str, pages, instruments, notifications, errors: list, board=None,
-                night_schedule=None) -> None:
+                night_schedule=None, ha=None) -> None:
     """Per-display ``ui`` options (see UI_KEYS); absent keys keep the firmware exactly as it was."""
     if not isinstance(ui, dict):
         errors.append(f"{where}: must be an object")
@@ -179,9 +297,9 @@ def validate_ui(ui, where: str, pages, instruments, notifications, errors: list,
             errors.append(f"{where}.alarm_page: page index {ui['alarm_page']} is out of range "
                           f"(the display has {count} page(s))")
     if ui.get("alarm_takeover") is True and not counts_for_alarm_summary(
-            {"instruments": instruments, "notifications": notifications}):
+            {"instruments": instruments, "notifications": notifications, "ha": ha}):
         errors.append(f"{where}.alarm_takeover: nothing counts towards the alarm summary; add an "
-                      "instrument with thresholds (or alarm: true) or a notification")
+                      "instrument with thresholds (or alarm: true), a notification or a Home Assistant item")
     if ui.get("header") is True and isinstance(board, dict) and "ring" not in board:
         errors.append(f"{where}.header: the board has no header band (its registry entry has no "
                       "'ring' geometry)")
@@ -515,6 +633,24 @@ def validate_config(cfg, registry) -> list[str]:
                 if "alarm" in note and not isinstance(note["alarm"], bool):
                     errors.append(f"{where}.alarm: must be true or false")
 
+    ha = cfg.get("ha")
+    ha_ids: set = set()
+    if "ha" in cfg:
+        if not isinstance(ha, dict):
+            errors.append("$.ha: must be an object")
+        else:
+            for hid, item in ha.items():
+                where = f"$.ha.{hid}"
+                if not INSTRUMENT_ID.fullmatch(str(hid)):
+                    errors.append(f"{where}: Home Assistant item id must match ^[a-z][a-z0-9_]{{0,31}}$")
+                if hid in valid_ids:
+                    errors.append(f"{where}: id is already used by an instrument; ids must be unique")
+                if hid in notification_ids:
+                    errors.append(f"{where}: id is already used by a notification; ids must be unique")
+                if isinstance(item, dict):
+                    ha_ids.add(hid)
+                validate_ha_item(item, where, heartbeat, errors)
+
     night_ok = None
     if "night_schedule" in cfg and validate_night_schedule(cfg["night_schedule"], "$.night_schedule", errors):
         night_ok = cfg["night_schedule"]
@@ -545,7 +681,7 @@ def validate_config(cfg, registry) -> list[str]:
                 pages = disp.get("pages")
                 if "ui" in disp:
                     validate_ui(disp["ui"], f"{where}.ui", pages, instruments, notifications, errors,
-                                board=board, night_schedule=night_ok)
+                                board=board, night_schedule=night_ok, ha=ha)
                 if "pages" not in disp:
                     continue
                 if not isinstance(pages, list) or not 1 <= len(pages) <= 8:
@@ -588,25 +724,34 @@ def validate_config(cfg, registry) -> list[str]:
                         seen: set = set()
                         slots = spec.get("slots") if spec is not None else None
                         for ii, item in enumerate(items):
-                            if not isinstance(item, str) or (item not in valid_ids
-                                                             and item not in notification_ids):
-                                errors.append(f"{pw}.items[{ii}]: unknown instrument or notification {item!r}"
-                                              if notification_ids else
-                                              f"{pw}.items[{ii}]: unknown instrument {item!r}")
+                            if not isinstance(item, str) or (item not in valid_ids and item not in notification_ids
+                                                             and item not in ha_ids):
+                                if ha_ids:
+                                    what = "instrument, notification or Home Assistant item"
+                                elif notification_ids:
+                                    what = "instrument or notification"
+                                else:
+                                    what = "instrument"
+                                errors.append(f"{pw}.items[{ii}]: unknown {what} {item!r}")
                             elif item in seen:
                                 errors.append(f"{pw}.items[{ii}]: duplicate item {item!r}")
                             else:
                                 seen.add(item)
-                                kind = "instrument" if item in valid_ids else "notification"
+                                kind = ("instrument" if item in valid_ids else
+                                        "notification" if item in notification_ids else "ha")
                                 slot = slots[ii] if slots and ii < len(slots) else None
                                 if slot is not None:
-                                    problem = _slot_problem(slot, kind, item, layout, instruments)
+                                    problem = _slot_problem(slot, kind, item, layout, instruments, ha)
                                     if problem:
                                         errors.append(f"{pw}.items[{ii}] ({slot['role']}): {problem}")
                                     continue
                                 if spec is not None and kind not in spec["types"]:
                                     errors.append(f"{pw}.items[{ii}]: layout {layout!r} does not accept "
-                                                  f"{kind} items ({item!r})")
+                                                  f"{'Home Assistant' if kind == 'ha' else kind} items ({item!r})")
+                                elif kind == "ha" and spec is not None:
+                                    problem = _ha_layout_problem(ha[item], item, layout)
+                                    if problem:
+                                        errors.append(f"{pw}.items[{ii}]: {problem}")
                                 elif (layout in RANGE_LAYOUTS and kind == "instrument"
                                       and isinstance(instruments.get(item), dict)
                                       and not all(finite_number(instruments[item].get(k)) for k in ("min", "max"))):
@@ -615,11 +760,37 @@ def validate_config(cfg, registry) -> list[str]:
     return errors
 
 
-def _slot_problem(slot: dict, kind: str, item: str, layout: str, instruments) -> str | None:
+STATUS_LAYOUT = "status-grid"
+
+
+def _ha_layout_problem(entry, item: str, layout: str) -> str | None:
+    """Why a Home Assistant item cannot be shown on a layout that accepts the type, or None.
+
+    Numeric items behave like instruments (a bar or an arc also needs min and max); a binary or
+    state item is a word, which only the status-grid can show.
+    """
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("kind") in HA_STATE_KINDS:
+        if layout != STATUS_LAYOUT:
+            return (f"Home Assistant item {item!r} is a {entry['kind']} item; layout {layout!r} shows "
+                    f"numbers, only {STATUS_LAYOUT} can show it")
+        return None
+    if layout in RANGE_LAYOUTS and not all(finite_number(entry.get(k)) for k in ("min", "max")):
+        return f"Home Assistant item {item!r} needs min and max on layout {layout!r}"
+    return None
+
+
+def _slot_problem(slot: dict, kind: str, item: str, layout: str, instruments, ha=None) -> str | None:
     """Why ``item`` cannot fill ``slot`` of ``layout``, or None."""
     if kind not in slot["types"]:
         return (f"layout {layout!r} does not accept {kind} items here ({item!r}); "
                 f"this slot takes {' or '.join(slot['types'])}")
+    if kind == "ha":
+        entry = ha.get(item) if isinstance(ha, dict) else None
+        if isinstance(entry, dict) and entry.get("kind") != "binary":
+            return f"Home Assistant item {item!r} must be a binary item to fill this slot"
+        return None
     needs = slot.get("needs", [])
     if "numeric" in needs and kind != "instrument":
         return f"{kind} {item!r} is not numeric; this slot needs an instrument"

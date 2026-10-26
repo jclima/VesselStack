@@ -294,7 +294,7 @@ class StatusGrid(Base):
 
     def test_capacity_is_nine_and_one_is_enough(self):
         self.assertEqual(schema.layout_specs(REGISTRY)["status-grid"], {
-            "capacity": 9, "min_items": 1, "shapes": ["round", "rect"], "types": ["instrument", "notification"]})
+            "capacity": 9, "min_items": 1, "shapes": ["round", "rect"], "types": ["instrument", "notification", "ha"]})
         text = self.status_device(["anchor"])
         self.assertEqual(text.count("grid_cell_row_pos:"), 1)
 
@@ -1304,9 +1304,9 @@ class Gauges(Base):
         board = REGISTRY["boards"][BOARD]
         self.assertEqual(board["layouts"][:3], ["single", "grid-2x2", "status-grid"])
         self.assertEqual(REGISTRY["layouts"]["tank-bars"], {"capacity": 4, "min_items": 1,
-                                                            "shapes": ["round", "rect"], "types": ["instrument"]})
+                                                            "shapes": ["round", "rect"], "types": ["instrument", "ha"]})
         self.assertEqual(REGISTRY["layouts"]["gauge-arc"], {"capacity": 1, "min_items": 1,
-                                                            "shapes": ["round"], "types": ["instrument"]})
+                                                            "shapes": ["round"], "types": ["instrument", "ha"]})
         page = lifecycle.default_page(REGISTRY, EXAMPLE, BOARD)
         self.assertEqual(page["layout"], "grid-2x2")           # tank-bars needs min/max: never a default
 

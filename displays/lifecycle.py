@@ -302,7 +302,7 @@ def default_page(registry: dict, config: dict, board_id: str) -> dict:
     board = registry["boards"][board_id]
     specs = schema.layout_specs(registry)
     usable = [name for name in board["layouts"] if "instrument" in specs[name]["types"]]
-    plain = [name for name in usable if specs[name]["types"] == ["instrument"]]
+    plain = [name for name in usable if set(specs[name]["types"]) <= {"instrument", "ha"}]
     layout = max(plain or usable, key=lambda name: specs[name]["capacity"])
     instruments = list(config["instruments"])
     return {"title": "Main", "layout": layout, "items": instruments[:specs[layout]["capacity"]]}
