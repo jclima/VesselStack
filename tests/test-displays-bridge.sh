@@ -185,6 +185,8 @@ wait_for vesselstack/v1/bridge/status '^online$' 20
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 10
 wait_for vesselstack/v1/instruments/sog '"st":"missing"' 10
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"missing","sev":"unknown"' 10
+# Alarm summary: the one counted item (the notification) is unknown, retained, ids only.
+wait_for vesselstack/v1/alarms/summary '^\{"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\],"ts":"[0-9TZ:-]+"\}$' 10
 pass
 
 # 2. SignalK appears (requires the bearer token), streams 10 kn for ~8 s, then exits.
@@ -196,10 +198,15 @@ wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 15
 # The notification is "not raised" (ok) once SignalK is connected, then follows the fake's
 # alarm and clear; the message text never reaches MQTT.
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 15
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"ids":\[\]' 15
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"alarm"' 15
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"ids":\["anchor"\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor | grep -c 'Anchor alarm')" = 0 ] \
     || fail "the notification message text was published"
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 25
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"ids":\[\]' 15
+[ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary | grep -c 'Anchor')" = 0 ] \
+    || fail "the alarm summary carried a label or message text"
 pass
 
 # 3. ACL: the bridge cannot publish to a display's status topic; the display can.
@@ -207,6 +214,10 @@ client mosquitto_pub -h "$BROKER" -u "$BRIDGE_USER" -P "$BRIDGE_PASS" \
     -t "vesselstack/v1/displays/$HELM/status" -m forged-by-bridge -r -q 1 >/dev/null 2>&1 || true
 [ -z "$(read1 "$ADMIN_USER" "$ADMIN_PASS" "vesselstack/v1/displays/$HELM/status")" ] \
     || fail "the bridge account could publish to a display status topic"
+client mosquitto_pub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" \
+    -t vesselstack/v1/alarms/forged -m '{"max":"alarm"}' -r -q 1 >/dev/null 2>&1 || true
+[ -z "$(read1 "$ADMIN_USER" "$ADMIN_PASS" vesselstack/v1/alarms/forged)" ] \
+    || fail "a display account could publish under vesselstack/v1/alarms"
 client mosquitto_pub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" \
     -t "vesselstack/v1/displays/$HELM/status" -m online -r -q 1 >/dev/null 2>&1 || true
 [ "$(read1 "$ADMIN_USER" "$ADMIN_PASS" "vesselstack/v1/displays/$HELM/status")" = online ] \
@@ -218,6 +229,7 @@ pass
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 30
 wait_for vesselstack/v1/instruments/sog '"v":null,"u":"kn","st":"stale"' 15
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"stale","sev":"unknown"' 15
+wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status)" = online ] \
     || fail "bridge status should stay online while only SignalK is down"
 pass
@@ -236,13 +248,20 @@ docker kill "$BRIDGE" >/dev/null
 wait_for vesselstack/v1/bridge/status '^offline$' 30
 pass
 
-# 7. A graceful SIGTERM publishes offline itself and exits 0, with no secrets logged.
+# 7. A graceful SIGTERM publishes offline itself and exits 0, with no secrets logged. With
+# SignalK connected the summary is "ok" first; the clean stop leaves "unknown", not a stale "ok".
+docker rm -f "$SIGNALK" >/dev/null 2>&1 || true
+docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
+    -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
+    /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 90 --alarm-at 1000 --clear-at 1001 --token "$SK_TOKEN" >/dev/null
 run_bridge
 wait_for vesselstack/v1/bridge/status '^online$' 20
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0' 40
 docker stop -t 15 "$BRIDGE" >/dev/null
 [ "$(docker inspect -f '{{.State.ExitCode}}' "$BRIDGE")" = 0 ] || fail "SIGTERM did not exit 0"
 wait_for vesselstack/v1/bridge/status '^offline$' 10
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 10
+wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1' 10
 logs=$(docker logs "$BRIDGE" 2>&1)
 for secret in "$SK_TOKEN" "$BRIDGE_PASS"; do
     ! grep -Fq "$secret" <<<"$logs" || fail "a secret appeared in the bridge log"
