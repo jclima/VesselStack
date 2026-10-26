@@ -480,6 +480,7 @@ nano vesselstack.env
 | `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
 | `DISPLAYS_BRIDGE_MQTT_USERNAME` | Bridge account name, 1-64 letters, numbers, dot, underscore or hyphen; default `vesselstack-bridge`; must differ from `MQTT_USERNAME` (the Control Panel rejects a collision when displays are enabled, and the installer preflight rejects it) |
 | `DISPLAYS_SIGNALK_TOKEN` | Optional SignalK access token for the displays bridge, sent as `Authorization: Bearer`; leave empty unless SignalK security requires it; must not contain line breaks or any other control character (the Control Panel and the installer both refuse them) |
+| Terminal wizard and `--set` | The three `DISPLAYS_*` settings are asked under "Advanced settings" (the bridge user name and token only when displays are enabled; the token is hidden and optional) and can be set headless, for example `--set DISPLAYS_ENABLE=true`; they are kept when you re-run the wizard |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
 under `/opt/vesselstack/config/` and are not printed.

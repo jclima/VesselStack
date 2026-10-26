@@ -15,6 +15,7 @@ Semantic Versioning.
 - Changed: the single code path that writes Mosquitto credentials is now `displays/displayctl.py sync-mqtt` (hashed with `mosquitto_passwd -U` in the pinned image; no password on a command line). It replaces `scripts/mosquitto-credentials.sh` (`mosquitto_passwd -b`, fingerprint file), which is removed together with its helper image lookup; the offline bundle takes the Mosquitto image from `templates/compose.yml`. Broker account files live in the root-owned `config/mosquitto-auth/` directory and the broker configuration in `config/mosquitto/`; the legacy `$VESSELSTACK_DATA/mosquitto/passwords` and `config/mosquitto.conf` are left untouched. Any extra accounts added by hand to the old password file are not carried over.
 - Fixed: the setup wizard (and `vesselstack-wizard.py --validate`, used by the bootstrap) knows `DISPLAYS_ENABLE`, `DISPLAYS_BRIDGE_MQTT_USERNAME` and `DISPLAYS_SIGNALK_TOKEN`, so the shipped example environment validates.
 - Added: offline installs refuse `DISPLAYS_ENABLE=true` before changing anything unless the displays virtual environment already exists; the displays bridge dependencies (`displays/requirements.txt`) are not part of the offline bundle yet.
+- Changed: the terminal wizard (0.4.2) also asks the `DISPLAYS_*` settings as advanced questions (the token as an optional hidden secret), and `--set DISPLAYS_ENABLE=true` (and the other two) is accepted by the headless installs.
 
 ## Version renumbering (2026-10-25)
 
