@@ -226,6 +226,10 @@ admin_put vesselstack/v1/bridge/status online
 admin_put vesselstack/v1/notifications/anchor '{"v":null,"u":"","st":"ok","sev":"ok","ts":null,"age":null}'
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/instruments/sog
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor
+admin_put vesselstack/v1/alarms/summary '{"max":"ok","na":0,"nw":0,"nu":0,"ids":[],"ts":"2026-01-01T00:00:00Z"}'
+expect_read "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary
+expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary
+expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/alarms/forged
 expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/notifications/forged
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status
 expect_noread "$HELM" "$HELM_PASS" homeassistant/test
@@ -242,6 +246,8 @@ expect_noread "$HELM" "$HELM_PASS" vesselstack/v1/displays/vsdisp-aux/status
 expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/instruments/stw
 expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/notifications/bilge
 expect_noread "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/notifications/anchor
+expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/alarms/summary
+expect_noread "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/alarms/summary
 expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/bridge/signalk
 expect_read "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/displays/vsdisp-helm/status
 expect_nowrite "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/displays/vsdisp-nav/status
