@@ -47,6 +47,20 @@ def multipage(cfg):
     ]
 
 
+def status_page(cfg, items=None, title="Status"):
+    """Notifications plus a status-grid page (7 items by default: 3 notifications, 4 instruments)."""
+    cfg["notifications"] = {
+        "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
+        "batt_low": {"path": "notifications.electrical.batteries.house.voltage", "label": "Low battery",
+                     "absent": "unknown"},
+        "bilge": {"path": "notifications.bilge.main", "label": "Bilge"},
+    }
+    with_thresholds(cfg)
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": title, "layout": "status-grid",
+         "items": items or ["anchor", "sog", "depth", "batt_low", "house_v", "awa", "bilge"]}]
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -113,6 +127,10 @@ class GoldenAndDeterminism(Base):
         self.set_config(with_thresholds)
         self.check_golden("helm-thresholds.yaml", self.device(allow_missing_wifi=True))
 
+    def test_status_grid_matches_golden(self):
+        self.set_config(status_page)
+        self.check_golden("helm-status.yaml", self.device(allow_missing_wifi=True))
+
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
 
@@ -126,6 +144,175 @@ class GoldenAndDeterminism(Base):
         self.assertTrue(after_first["ota_password"])
         key = after_first["api_encryption_key"]
         self.assertEqual(len(__import__("base64").b64decode(key)), 32)
+
+
+class StatusGrid(Base):
+    def status_device(self, items=None, mutate=None):
+        def apply(cfg):
+            status_page(cfg, items)
+            if mutate:
+                mutate(cfg)
+        self.set_config(apply)
+        return self.device(allow_missing_wifi=True)
+
+    def items(self, count):
+        pool = ["anchor", "sog", "depth", "batt_low", "house_v", "awa", "bilge"]
+        extra = [f"x{n}" for n in range(9 - len(pool))]
+
+        def mutate(cfg):
+            for iid in extra:
+                cfg["instruments"][iid] = dict(cfg["instruments"]["sog"])
+        return (pool + extra)[:count], mutate
+
+    def test_grid_shape_and_cell_size_follow_the_item_count(self):
+        expected = {1: (2, 2, 167), 2: (2, 2, 167), 4: (2, 2, 167), 5: (3, 2, 109), 6: (3, 2, 109),
+                    7: (3, 3, 109), 8: (3, 3, 109), 9: (3, 3, 109)}
+        for count, (cols, rows, side) in expected.items():
+            items, mutate = self.items(count)
+            text = self.status_device(items, mutate)
+            self.assertIn(f"grid_rows: [{', '.join(['FR(1)'] * rows)}]\n", text, count)
+            self.assertIn(f"grid_columns: [{', '.join(['FR(1)'] * cols)}]\n", text, count)
+            self.assertIn("pad_row: 6\n              pad_column: 6", text)
+            self.assertIn("width: 340\n            height: 340", text)
+            self.assertEqual(text.count("grid_cell_row_pos:"), count)
+            width = render.status_cell_size(340, 340, count)
+            if rows == 2 and cols == 3:
+                self.assertEqual(width, (109, 167), count)
+            else:
+                self.assertEqual(width, (side, side), count)
+            font = "font_status_lg" if cols == 2 else "font_status_sm"
+            self.assertIn(f"text_font: {font}", text)
+            self.assertNotIn("font_status_sm" if cols == 2 else "font_status_lg", text)
+
+    def test_cells_are_placed_row_major(self):
+        items, mutate = self.items(7)
+        text = self.status_device(items, mutate)
+        cells = re.findall(r"grid_cell_row_pos: (\d)\n\s+grid_cell_column_pos: (\d)", text)
+        self.assertEqual(cells, [(str(i // 3), str(i % 3)) for i in range(7)])
+
+    def test_capacity_is_nine_and_one_is_enough(self):
+        self.assertEqual(schema.layout_specs(REGISTRY)["status-grid"], {
+            "capacity": 9, "min_items": 1, "shapes": ["round", "rect"], "types": ["instrument", "notification"]})
+        text = self.status_device(["anchor"])
+        self.assertEqual(text.count("grid_cell_row_pos:"), 1)
+
+    def test_notification_words_are_fixed_literals_chosen_by_generated_branches(self):
+        text = self.status_device()
+        for number, word in ((3, "ALARM"), (2, "WARN"), (1, "OK"), (0, "--")):
+            self.assertIn(f"== {number};'\n          then:\n            - lvgl.label.update:\n"
+                          f"                id: p0_anchor_value\n                text: !literal \"{word}\"", text)
+        self.assertEqual(render.STATUS_WORDS, {1: "OK", 2: "WARN", 3: "ALARM", 0: "--"})
+        # the gated severity is used, so stale/unknown/disconnected can only ever read "--"
+        branch = text.split("id(ins_anchor_sev) : 0) == 1;")[0].splitlines()[-1]
+        for gate in ("id(bridge_online)", "mqtt::global_mqtt_client->is_connected()", "id(ins_anchor_ok)",
+                     "(millis() - id(ins_anchor_seen)) < 15000UL"):
+            self.assertIn(gate, branch)
+
+    def test_notification_gate_is_three_heartbeats(self):
+        def mutate(cfg):
+            cfg["heartbeat_s"] = 7
+            for inst in cfg["instruments"].values():
+                inst["stale_after_s"] = 14
+        text = self.status_device(mutate=mutate)
+        self.assertIn("(millis() - id(ins_anchor_seen)) < 21000UL", text)
+        self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", 5), 15000)
+        self.assertIn("id(ins_sog_seen)) < 28000UL", text)  # instruments keep stale_after_s + 2 heartbeats
+
+    def test_notification_message_handler_and_globals(self):
+        text = self.status_device()
+        self.assertIn("topic: vesselstack/v1/notifications/anchor", text)
+        for suffix, kind in (("ok", "bool"), ("seen", "uint32_t"), ("sev", "uint8_t"), ("drawn_sev", "uint8_t")):
+            self.assertIn(f"id: ins_anchor_{suffix}, type: {kind}", text)
+        self.assertIn('id(ins_anchor_ok) = strcmp(st, "ok") == 0;', text)
+        self.assertNotIn("ins_anchor_val", text)
+        self.assertNotIn('x["v"]', text.split("notifications/anchor")[1].split("instruments/sog")[0])
+        for number, (bg, fg) in render.SEV_COLORS.items():
+            self.assertIn(f"0x{bg:06X}", text)
+
+    def test_colour_and_tile_for_every_notification_and_thresholded_instrument_only(self):
+        text = self.status_device()
+        for iid in ("anchor", "batt_low", "bilge", "depth", "house_v"):
+            self.assertIn(f"id: p0_{iid}_tile", text)
+            self.assertIn(f"lv_obj_set_style_bg_color(id(p0_{iid}_tile), lv_color_hex(bg), LV_PART_MAIN);", text)
+            self.assertIn(f"lv_obj_set_style_text_color(id(p0_{iid}_value), lv_color_hex(fg), LV_PART_MAIN);", text)
+        for iid in ("sog", "awa"):
+            self.assertNotIn(f"p0_{iid}_tile", text)
+            self.assertNotIn(f"ins_{iid}_sev", text)
+        self.assertEqual(text.count("ins_anchor_drawn_sev) = sev"), 1)
+
+    def test_instrument_cells_show_value_and_unit(self):
+        text = self.status_device()
+        self.assertIn("id: p0_sog_value, text: \"--\", text_font: font_status_sm", text)
+        self.assertIn('text: !literal "kn"', text)
+        self.assertRegex(text, r"instruments/house_v[\s\S]*?as<float>\(\), 2\)")
+        self.assertNotIn("lvgl.label.update:\n          id: p0_anchor_value\n          text: !lambda", text)
+
+    def test_hostile_notification_label_stays_literal_and_out_of_lambdas(self):
+        hostile = '$x ${y} "q" \\ #:'
+
+        def mutate(cfg):
+            cfg["notifications"]["anchor"]["label"] = hostile
+        text = self.status_device(mutate=mutate)
+        self.assertIn(f"text: !literal {render.yq(hostile)}", text)
+        for line in text.splitlines():
+            if "${y}" in line:
+                self.assertTrue(line.lstrip().startswith("- label:") or "glyphs:" in line, line)
+        self.assertNotIn("${y}", "".join(l for l in text.splitlines() if "lambda" in l or "lv_obj" in l))
+        self.assertEqual(text.count("!literal"), len(re.findall(r"!literal", text)))
+        # fixed words are literals too; no word is built at run time
+        self.assertNotIn("std::string(\"ALARM\")", text)
+
+    def test_glyphs_cover_the_fixed_words_and_values(self):
+        text = self.status_device()
+        bold = {chr(c) for c in render.font_coverage("bold")}
+        for word in render.STATUS_WORDS.values():
+            self.assertTrue(set(word) <= bold, word)
+        glyphs = json.loads(re.search(r"id: font_status_sm\n    size: 30\n    bpp: 4\n    glyphs: !literal (\".*\")",
+                                      text).group(1))
+        self.assertTrue(set("".join(render.STATUS_WORDS.values()) + render.VALUE_GLYPHS) <= set(glyphs))
+        self.assertEqual(len(glyphs), len(set(glyphs)))
+        # only the fixed words: a page of notifications needs no digits
+        only = self.status_device(["anchor", "bilge"])
+        only_glyphs = json.loads(re.search(r"id: font_status_lg\n    size: 48\n    bpp: 4\n    glyphs: !literal (\".*\")",
+                                           only).group(1))
+        self.assertEqual(set(only_glyphs), set("".join(render.STATUS_WORDS.values())))
+        small = json.loads(re.search(r"id: font_small\n    size: 20\n    bpp: 4\n    glyphs: !literal (\".*\")",
+                                     only).group(1))
+        self.assertTrue(set("Anchor" + "Bilge") <= set(small))
+
+    def test_unsupported_notification_label_glyph_is_reported(self):
+        def mutate(cfg):
+            cfg["notifications"]["anchor"]["label"] = "日本"
+        self.set_config(lambda cfg: (status_page(cfg), mutate(cfg)))
+        with self.assertRaises(render.RenderError) as caught:
+            self.collect(allow_missing_wifi=True)
+        self.assertIn("notifications.anchor.label", str(caught.exception))
+
+    def test_only_status_grid_pages_add_status_fonts(self):
+        self.set_config(None)
+        self.assertNotIn("font_status", self.device(allow_missing_wifi=True))
+
+    def test_status_grid_subscribes_to_used_notifications_only(self):
+        text = self.status_device(["anchor", "sog"])
+        self.assertIn("notifications/anchor", text)
+        self.assertNotIn("notifications/bilge", text)
+        self.assertNotIn("batt_low", text)
+
+    def test_status_page_with_navigation_and_other_layouts(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"].append(
+                {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth"]})
+        text = self.status_device(mutate=mutate)
+        self.assertEqual(text.count("lvgl.page.show"), 2)
+        self.assertIn("id: p1_depth_tile", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p0_depth_tile)", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p1_depth_tile)", text)
+
+    def test_status_subscriptions_are_readable_by_the_display_acl(self):
+        rules = mqtt_auth.render_acl([{"role": "display", "user": "vsdisp-helm", "password": "x"}])
+        self.assertIn("topic read vesselstack/v1/notifications/#", rules)
+        self.assertEqual([l for l in rules.splitlines() if l.startswith("topic write")],
+                         ["topic write vesselstack/v1/displays/vsdisp-helm/status"])
 
 
 class Secrets(Base):

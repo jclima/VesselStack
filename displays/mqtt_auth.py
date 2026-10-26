@@ -243,10 +243,12 @@ def render_acl(accounts: list[dict]) -> str:
             lines += ["topic readwrite #", "topic read $SYS/#"]
         elif account["role"] == "bridge":
             lines += [f"topic write {ROOT_TOPIC}/instruments/#",
+                      f"topic write {ROOT_TOPIC}/notifications/#",
                       f"topic write {ROOT_TOPIC}/bridge/#",
                       f"topic read {ROOT_TOPIC}/displays/+/status"]
         else:
             lines += [f"topic read {ROOT_TOPIC}/instruments/#",
+                      f"topic read {ROOT_TOPIC}/notifications/#",
                       f"topic read {ROOT_TOPIC}/bridge/#",
                       f"topic write {ROOT_TOPIC}/displays/{user}/status"]
         lines.append("")

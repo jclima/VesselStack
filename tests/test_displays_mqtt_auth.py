@@ -31,16 +31,19 @@ topic read $SYS/#
 
 user vesselstack-bridge
 topic write vesselstack/v1/instruments/#
+topic write vesselstack/v1/notifications/#
 topic write vesselstack/v1/bridge/#
 topic read vesselstack/v1/displays/+/status
 
 user vsdisp-aux
 topic read vesselstack/v1/instruments/#
+topic read vesselstack/v1/notifications/#
 topic read vesselstack/v1/bridge/#
 topic write vesselstack/v1/displays/vsdisp-aux/status
 
 user vsdisp-helm
 topic read vesselstack/v1/instruments/#
+topic read vesselstack/v1/notifications/#
 topic read vesselstack/v1/bridge/#
 topic write vesselstack/v1/displays/vsdisp-helm/status
 """

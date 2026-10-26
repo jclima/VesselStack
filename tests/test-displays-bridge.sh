@@ -60,13 +60,15 @@ COUNT=0
 fail() { echo "FAIL: $*" >&2; docker logs "$BRIDGE" >&2 2>&1 || true; exit 1; }
 pass() { COUNT=$((COUNT + 1)); }
 
-# One instrument, fast heartbeat and staleness so the test stays short.
+# One instrument and one notification, fast heartbeat and staleness so the test stays short.
 python3 - "$ROOT/config/displays.json" <<'PY'
 import json, sys
 cfg = json.load(open("displays/displays.example.json"))
 cfg["heartbeat_s"] = 1
 cfg["instruments"] = {"sog": dict(cfg["instruments"]["sog"], stale_after_s=3, min_interval_ms=100)}
-cfg["displays"]["helm"]["pages"] = [{"title": "Nav", "layout": "grid-2x2", "items": ["sog"]}]
+cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"}}
+cfg["displays"]["helm"]["pages"] = [{"title": "Nav", "layout": "grid-2x2", "items": ["sog"]},
+                                    {"title": "Status", "layout": "status-grid", "items": ["sog", "anchor"]}]
 json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 PY
 VESSELSTACK_ROOT="$ROOT" VESSELSTACK_DATA="$DATA" MQTT_USERNAME="$ADMIN_USER" \
@@ -182,14 +184,22 @@ run_bridge
 wait_for vesselstack/v1/bridge/status '^online$' 20
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 10
 wait_for vesselstack/v1/instruments/sog '"st":"missing"' 10
+wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"missing","sev":"unknown"' 10
 pass
 
 # 2. SignalK appears (requires the bearer token), streams 10 kn for ~8 s, then exits.
 docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
     -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
-    /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 8 --token "$SK_TOKEN" >/dev/null
+    /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 32 --alarm-at 8 --clear-at 18 --token "$SK_TOKEN" >/dev/null
 wait_for vesselstack/v1/bridge/signalk '^connected$' 40
 wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 15
+# The notification is "not raised" (ok) once SignalK is connected, then follows the fake's
+# alarm and clear; the message text never reaches MQTT.
+wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 15
+wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"alarm"' 15
+[ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor | grep -c 'Anchor alarm')" = 0 ] \
+    || fail "the notification message text was published"
+wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 25
 pass
 
 # 3. ACL: the bridge cannot publish to a display's status topic; the display can.
@@ -207,6 +217,7 @@ pass
 # plus one heartbeat), value cleared.
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 30
 wait_for vesselstack/v1/instruments/sog '"v":null,"u":"kn","st":"stale"' 15
+wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"stale","sev":"unknown"' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status)" = online ] \
     || fail "bridge status should stay online while only SignalK is down"
 pass

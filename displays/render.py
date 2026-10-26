@@ -56,7 +56,10 @@ PLACEHOLDER_NOTE = ("Wi-Fi credentials are not configured: wrote PLACEHOLDER val
                     "secrets.yaml. Do not flash this build.")
 FONT_FILES = {"bold": "RobotoCondensed-Bold.ttf", "regular": "RobotoCondensed-Regular.ttf"}
 FONT_LICENSE = "OFL.txt"
-FONT_SIZES = {"grid": 56, "single": 96, "small": 20}
+FONT_SIZES = {"grid": 56, "single": 96, "small": 20, "status_lg": 48, "status_sm": 30}
+STATUS_GAP = 6
+STATUS_WORDS = {1: "OK", 2: "WARN", 3: "ALARM", 0: "--"}  # sev number -> fixed word
+STATUS_FONTS = {"lg": "font_status_lg", "sm": "font_status_sm"}
 TAP_TIME = "0ms"
 WARNING_ARCHIVE_SECRETS = ("WARNING: the archive contains the Wi-Fi password and the display's MQTT, "
                            "OTA and API secrets. Treat it like a password: move it over SSH only, "
@@ -190,6 +193,10 @@ def check_glyphs(config: dict) -> list:
             value = inst.get(key)
             if isinstance(value, str):
                 errors.extend(_glyph_errors(f"$.instruments.{iid}.{key}", value))
+    for nid, note in config.get("notifications", {}).items():
+        value = note.get("label")
+        if isinstance(value, str):
+            errors.extend(_glyph_errors(f"$.notifications.{nid}.label", value))
     return errors
 
 
@@ -216,9 +223,23 @@ def stale_threshold_s(inst: dict, heartbeat_s: int) -> int:
     return inst["stale_after_s"] + 2 * heartbeat_s
 
 
+def is_notification(config: dict, iid: str) -> bool:
+    return iid in config.get("notifications", {}) and iid not in config["instruments"]
+
+
+def item_limit_ms(config: dict, iid: str, heartbeat_s: int) -> int:
+    """How long without a message before an item's tile is blanked (milliseconds)."""
+    if is_notification(config, iid):
+        return 3 * heartbeat_s * 1000
+    return stale_threshold_s(config["instruments"][iid], heartbeat_s) * 1000
+
+
 def _small_glyphs(config: dict, display: dict) -> str:
     chars = {" "}
     for iid in used_instruments(display):
+        if is_notification(config, iid):
+            chars.update(config["notifications"][iid]["label"])
+            continue
         inst = config["instruments"][iid]
         chars.update(inst["label"])
         chars.update(inst["unit"])
@@ -248,6 +269,65 @@ def tile_id(pi: int, iid: str, layout: str) -> str:
 
 
 FLEX_COLUMN = "layout: {type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: CENTER}"
+
+
+def status_grid_shape(count: int) -> tuple:
+    """(columns, rows) of the status-grid for this many items."""
+    if count <= 4:
+        return 2, 2
+    return (3, 2) if count <= 6 else (3, 3)
+
+
+def status_cell_size(box_width: int, box_height: int, count: int) -> tuple:
+    """(width, height) in pixels of one status-grid cell (gaps of STATUS_GAP between cells)."""
+    cols, rows = status_grid_shape(count)
+    return ((box_width - STATUS_GAP * (cols - 1)) // cols, (box_height - STATUS_GAP * (rows - 1)) // rows)
+
+
+def status_font(count: int) -> str:
+    """Large words in the 2-column grid, smaller ones where three cells share the width."""
+    return STATUS_FONTS["lg" if status_grid_shape(count)[0] == 2 else "sm"]
+
+
+def _status_glyphs(config: dict, display: dict) -> dict:
+    """font id -> sorted glyph string, for the status-grid fonts the display actually needs."""
+    glyphs: dict = {}
+    for page in display["pages"]:
+        if page["layout"] != "status-grid":
+            continue
+        chars = glyphs.setdefault(status_font(len(page["items"])), set())
+        for iid in page["items"]:
+            chars.update("".join(STATUS_WORDS.values()) if is_notification(config, iid) else VALUE_GLYPHS)
+    return {fid: "".join(sorted(chars)) for fid, chars in glyphs.items()}
+
+
+def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: int, cols: int) -> list:
+    """One status-grid cell: static label, then the state word (notification) or value + unit."""
+    notification = is_notification(config, iid)
+    lines = [f"{ind}- obj:"]
+    if notification or has_thresholds(config["instruments"][iid]):
+        lines.append(f"{ind}    id: {tile_id(pi, iid, 'status-grid')}")
+    lines += [
+        f"{ind}    styles: tile_style",
+        f"{ind}    grid_cell_row_pos: {index // cols}",
+        f"{ind}    grid_cell_column_pos: {index % cols}",
+        f"{ind}    grid_cell_x_align: STRETCH",
+        f"{ind}    grid_cell_y_align: STRETCH",
+        f"{ind}    scrollable: false",
+        f"{ind}    {FLEX_COLUMN}",
+        f"{ind}    widgets:",
+    ]
+    inner = ind + "      "
+    fit = "width: 100%, text_align: CENTER"
+    label = config["notifications"][iid]["label"] if notification else config["instruments"][iid]["label"]
+    lines.append(f"{inner}- label: {{text: {lit(label)}, text_font: font_small, text_color: 0x9AA5B1, "
+                 f"{fit}, long_mode: DOT}}")
+    lines.append(f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {font}, "
+                 f"text_color: 0xFFFFFF, {fit}, long_mode: CLIP}}")
+    if not notification:
+        lines.append(f"{inner}- label: {{text: {lit(config['instruments'][iid]['unit'])}, "
+                     f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
+    return lines
 
 
 def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page: dict) -> list:
@@ -304,6 +384,29 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             ]
             lines += _tile_widgets("                    ", pi, iid, config["instruments"][iid],
                                    "font_value_grid")
+    elif layout == "status-grid":
+        cols, rows = status_grid_shape(len(page["items"]))
+        lines += [
+            "        - obj:",
+            f"            id: p{pi}_content",
+            "            align: CENTER",
+            f"            width: {cw}",
+            f"            height: {ch}",
+            "            bg_opa: TRANSP",
+            "            border_width: 0",
+            "            pad_all: 0",
+            "            scrollable: false",
+            "            layout:",
+            "              type: GRID",
+            f"              pad_row: {STATUS_GAP}",
+            f"              pad_column: {STATUS_GAP}",
+            f"              grid_rows: [{', '.join(['FR(1)'] * rows)}]",
+            f"              grid_columns: [{', '.join(['FR(1)'] * cols)}]",
+            "            widgets:",
+        ]
+        font = status_font(len(page["items"]))
+        for index, iid in enumerate(page["items"]):
+            lines += _status_cell(config, "              ", pi, iid, font, index, cols)
     else:
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
     if n_pages > 1:
@@ -334,6 +437,10 @@ def _fonts_lines(display: dict, config: dict) -> list:
         fonts.append(("font_value_grid", "bold", FONT_SIZES["grid"], VALUE_GLYPHS))
     if "single" in layouts:
         fonts.append(("font_value_single", "bold", FONT_SIZES["single"], VALUE_GLYPHS))
+    status = _status_glyphs(config, display)
+    for key in ("lg", "sm"):
+        if STATUS_FONTS[key] in status:
+            fonts.append((STATUS_FONTS[key], "bold", FONT_SIZES[f"status_{key}"], status[STATUS_FONTS[key]]))
     fonts.append(("font_small", "regular", FONT_SIZES["small"], _small_glyphs(config, display)))
     lines = ["font:"]
     for fid, weight, size, glyphs in fonts:
@@ -368,9 +475,50 @@ def _json_handler(iid: str, decimals: int, with_sev: bool = False) -> list:
     ]
 
 
+def _notification_handler(iid: str) -> list:
+    return [
+        f"    - topic: {topics.notification_topic(iid)}",
+        "      then:",
+        "        - lambda: |-",
+        '            const char *st = x["st"] | "missing";',
+        f"            id(ins_{iid}_seen) = millis();",
+        f'            id(ins_{iid}_ok) = strcmp(st, "ok") == 0;',
+        '            const char *sv = x["sev"] | "unknown";',
+        f'            id(ins_{iid}_sev) = strcmp(sv, "ok") == 0 ? 1 : strcmp(sv, "warn") == 0 ? 2 : '
+        'strcmp(sv, "alarm") == 0 ? 3 : 0;',
+        "        - script.execute: render_tiles",
+    ]
+
+
+def _word_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
+    """Fixed state words for a notification, one if/then per severity (no runtime strings).
+
+    The condition re-derives the gated severity (0 when the item is not fresh), so a stale
+    or unknown notification always reads "--", never OK.
+    """
+    limit_ms = item_limit_ms(config, iid, heartbeat)
+    fresh = (f"id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_{iid}_ok)"
+             f" && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL")
+    lines = []
+    for pi, page in enumerate(display["pages"]):
+        if iid not in page["items"]:
+            continue
+        for number in (3, 2, 1, 0):
+            lines += [
+                "      - if:",
+                "          condition:",
+                f"            lambda: 'return (({fresh}) ? id(ins_{iid}_sev) : 0) == {number};'",
+                "          then:",
+                "            - lvgl.label.update:",
+                f"                id: p{pi}_{iid}_value",
+                f"                text: {lit(STATUS_WORDS[number])}",
+            ]
+    return lines
+
+
 def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     """Guarded colour update for one thresholded instrument, on every page that shows it."""
-    limit_ms = stale_threshold_s(config["instruments"][iid], heartbeat) * 1000
+    limit_ms = item_limit_ms(config, iid, heartbeat)
     sets = []
     for pi, page in enumerate(display["pages"]):
         if iid in page["items"]:
@@ -425,8 +573,12 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
               '  - {id: bridge_online, type: bool, initial_value: "false"}']
     for iid in used:
         lines += [f'  - {{id: ins_{iid}_ok, type: bool, initial_value: "false"}}',
-                  f'  - {{id: ins_{iid}_seen, type: uint32_t, initial_value: "0"}}',
-                  f"  - {{id: ins_{iid}_val, type: std::string, initial_value: '\"{BLANK_VALUE}\"'}}"]
+                  f'  - {{id: ins_{iid}_seen, type: uint32_t, initial_value: "0"}}']
+        if is_notification(config, iid):
+            lines += [f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}',
+                      f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}']
+            continue
+        lines.append(f"  - {{id: ins_{iid}_val, type: std::string, initial_value: '\"{BLANK_VALUE}\"'}}")
         if has_thresholds(config["instruments"][iid]):
             lines += [f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}',
                       f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}']
@@ -435,13 +587,18 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
               '        - lambda: \'id(bridge_online) = (x == "online");\'',
               "        - script.execute: render_tiles", "  on_json_message:"]
     for iid in used:
-        lines += _json_handler(iid, config["instruments"][iid]["precision"],
-                               has_thresholds(config["instruments"][iid]))
+        if is_notification(config, iid):
+            lines += _notification_handler(iid)
+        else:
+            lines += _json_handler(iid, config["instruments"][iid]["precision"],
+                                   has_thresholds(config["instruments"][iid]))
     lines += ["  on_disconnect:", "    - lambda: 'id(bridge_online) = false;'",
               "    - script.execute: render_tiles", "", "script:", "  - id: render_tiles",
               "    mode: restart", "    then:"]
     for pi, page in enumerate(display["pages"]):
         for iid in page["items"]:
+            if is_notification(config, iid):
+                continue  # drawn by the fixed-word branches below
             limit_ms = stale_threshold_s(config["instruments"][iid], heartbeat) * 1000
             lines += [
                 "      - lvgl.label.update:",
@@ -452,7 +609,10 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
                 f"            return fresh ? id(ins_{iid}_val) : std::string(\"{BLANK_VALUE}\");",
             ]
     for iid in used:
-        if has_thresholds(config["instruments"][iid]):
+        if is_notification(config, iid):
+            lines += _word_lines(config, display, iid, heartbeat)
+    for iid in used:
+        if is_notification(config, iid) or has_thresholds(config["instruments"][iid]):
             lines += _sev_lines(config, display, iid, heartbeat)
     lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles",
               "", "lvgl:", "  displays: [board_display]", "  touchscreens: [board_touch]",

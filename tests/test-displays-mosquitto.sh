@@ -223,7 +223,10 @@ expect_nowrite unlisted unlistedpw vesselstack/v1/instruments/sog
 # Display account.
 admin_put vesselstack/v1/instruments/sog '{"v":5}'
 admin_put vesselstack/v1/bridge/status online
+admin_put vesselstack/v1/notifications/anchor '{"v":null,"u":"","st":"ok","sev":"ok","ts":null,"age":null}'
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/instruments/sog
+expect_read "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor
+expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/notifications/forged
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status
 expect_noread "$HELM" "$HELM_PASS" homeassistant/test
 expect_noread "$HELM" "$HELM_PASS" '$SYS/broker/version'
@@ -237,6 +240,8 @@ expect_noread "$HELM" "$HELM_PASS" vesselstack/v1/displays/vsdisp-aux/status
 
 # Bridge account.
 expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/instruments/stw
+expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/notifications/bilge
+expect_noread "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/notifications/anchor
 expect_write "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/bridge/signalk
 expect_read "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/displays/vsdisp-helm/status
 expect_nowrite "$BRIDGE" "$BRIDGE_PASS" vesselstack/v1/displays/vsdisp-nav/status

@@ -102,8 +102,28 @@ def thresholds(cfg):
         {"title": "Big", "layout": "single", "items": ["house_v"]},
     ]
 
+def status(cfg):
+    inst = cfg["instruments"]
+    inst["depth"]["thresholds"] = {"alarm_below": 4, "warn_below": 8, "hysteresis": 0.5}
+    inst["house_v"]["thresholds"] = {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8,
+                                     "alarm_above": 15.2}
+    inst["sog"]["label"] = HOSTILE[:16]
+    cfg["notifications"] = {
+        "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
+        "batt_low": {"path": "notifications.electrical.batteries.house.voltage", "label": "<% 1+1 %>",
+                     "absent": "unknown"},
+        "bilge": {"path": "notifications.bilge.main", "label": "${y} Bilge"},
+    }
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Few", "layout": "status-grid", "items": ["anchor", "depth", "batt_low"]},
+        {"title": "Many", "layout": "status-grid",
+         "items": ["anchor", "sog", "depth", "batt_low", "house_v", "awa", "bilge"]},
+        {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "house_v"]},
+    ]
+
 variant("example")
 variant("thresholds", thresholds)
+variant("status", status)
 variant("complex", complex_, WIFI)
 PY
 
@@ -147,6 +167,14 @@ fi
 check complex helm
 check complex aux
 check thresholds helm
+check status helm
+for word in ALARM WARN OK; do
+    grep -qE "text: [\"']?$word[\"']?\$" "$WORK/status-helm.log" || { echo "status word $word missing from the validated config" >&2; fail=1; }
+done
+grep -q 'lv_obj_set_style_bg_color(id(p1_anchor_tile)' "$WORK/status-helm.log" \
+    || { echo "notification colour lambda missing from the validated status config" >&2; fail=1; }
+# shellcheck disable=SC2016
+grep -qF '${y} Bilge' "$WORK/status-helm.log" || { echo "hostile notification label was altered" >&2; fail=1; }
 grep -q 'lv_obj_set_style_bg_color(id(p1_content)' "$WORK/thresholds-helm.log" \
     || { echo "severity colour lambda missing from the validated thresholds config" >&2; fail=1; }
 
