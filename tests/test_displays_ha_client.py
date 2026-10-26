@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import queue
@@ -178,7 +179,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Closed code=1011", text)
         self.assertNotIn("FAKE LOG LINE", text)
         self.assertNotIn(TOKEN, text)
-        self.assertEqual(ha_client.describe(OSError(111, "refused\nx")), "OSError errno=111")
+        self.assertEqual(
+            ha_client.describe(OSError(errno.EIO, "refused\nx")), f"OSError errno={errno.EIO}"
+        )
+        self.assertEqual(
+            ha_client.describe(ConnectionRefusedError(errno.ECONNREFUSED, "x\ny")),
+            f"ConnectionRefusedError errno={errno.ECONNREFUSED}",
+        )
 
     def test_garbage_frames_are_ignored(self) -> None:
         items, _, _ = run_attempts([["not json", HELLO[0], {"type": "mystery"}] + HELLO[1:] + ["close"]])
