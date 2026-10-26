@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -149,7 +150,7 @@ class Bridge:
     """
 
     def __init__(self, config, publisher, connect, clock=time.monotonic,
-                 wait=None, rng=random.random):
+                 wait=None, rng=random.random, wall=None):
         self.engine = topics.Engine(config)
         self.events = topics.EventEngine(config)
         self.frame = json.dumps(topics.subscribe_frame(config), separators=(",", ":"))
@@ -158,6 +159,8 @@ class Bridge:
         self.clock = clock
         self._wait = wait or (lambda seconds, stop: stop.wait(seconds))
         self._rng = rng
+        self._wall = wall or (lambda: datetime.now(timezone.utc))
+        self._summary_sent = None   # (content, clock time) of the last summary published
         self.self_urn = None
         self.signalk_state = SIGNALK_DISCONNECTED
         self._next_tick = 0.0
@@ -179,7 +182,25 @@ class Bridge:
             self.signalk_state = state
             LOG.info("SignalK %s", state)
             self._send(self.events.source_state("signalk", state == SIGNALK_CONNECTED, self.clock()))
+            self._publish_summary(self.clock())
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, state, True, qos=1)
+
+    def _summary_ts(self):
+        return self._wall().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _publish_summary(self, now, items=None, force=False):
+        """Publish the retained alarm summary on change and every heartbeat; none when nothing counts."""
+        if items is None:
+            items = self.engine.summary_items() + self.events.summary_items(now)
+        payload = topics.alarm_summary(items, self._summary_ts())
+        if payload is None:
+            return
+        content = json.loads(payload)
+        content.pop("ts")
+        sent = self._summary_sent
+        if force or sent is None or sent[0] != content or now - sent[1] >= self.engine.heartbeat_s:
+            self._summary_sent = (content, now)
+            self.publisher.publish(topics.ALARM_SUMMARY_TOPIC, payload, True, qos=1)
 
     def _tick(self):
         now = self.clock()
@@ -187,6 +208,7 @@ class Bridge:
             self._next_tick = now + TICK_INTERVAL_S
             self._send(self.engine.tick(now))
             self._send(self.events.tick(now))
+            self._publish_summary(now)
 
     # -- loop -------------------------------------------------------------
     def run(self, stop) -> None:
@@ -293,10 +315,16 @@ class Bridge:
             now = self.clock()
             self._send(self.engine.update(path, value, ts, now))
             self._send(self.events.update(path, value, ts, now))
+        self._publish_summary(self.clock())
 
     def shutdown(self):
         if self.signalk_state != SIGNALK_DISCONNECTED:
             self._set_signalk(SIGNALK_DISCONNECTED)
+        # A clean stop must not leave a retained "ok" (or a stale "alarm"): publish every counted
+        # item as unknown. A crash cannot do this; displays then rely on the summary going stale.
+        now = self.clock()
+        self._publish_summary(now, [(i, "unknown") for i, _ in
+                                    self.engine.summary_items() + self.events.summary_items(now)], force=True)
         self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, True, qos=1)
         self.publisher.stop()
 

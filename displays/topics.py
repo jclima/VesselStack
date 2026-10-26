@@ -16,6 +16,8 @@ NOTIFICATION_PERIOD_MS = 1000
 # After (re)connecting, SignalK re-sends active notifications within about one period; until
 # then a notification nobody has reported on yet is "unknown", never a possibly false "ok".
 EVENT_SETTLE_S = 3.0
+ALARM_SUMMARY_TOPIC = f"{TOPIC_ROOT}/alarms/summary"
+SUMMARY_MAX_IDS = 16
 BRIDGE_STATUS_TOPIC = f"{TOPIC_ROOT}/bridge/status"
 BRIDGE_SIGNALK_TOPIC = f"{TOPIC_ROOT}/bridge/signalk"
 DISPLAY_STATUS_TOPIC = f"{TOPIC_ROOT}/displays/{{username}}/status"
@@ -117,6 +119,24 @@ class Engine:
                     out.append(self._emit(iid, now))
                 else:
                     st.dirty = True
+        return out
+
+    def summary_items(self) -> list:
+        """[(id, severity)] for the instruments that count towards the alarm summary.
+
+        An instrument counts when ``alarm`` is true (default: it has thresholds). Anything
+        not currently "ok" (stale, missing) is "unknown"; without thresholds a fresh value is "ok".
+        """
+        out = []
+        for iid, inst in self.instruments.items():
+            if not inst.get("alarm", "thresholds" in inst):
+                continue
+            st = self._state[iid]
+            if st.state != "ok":
+                sev = "unknown"
+            else:
+                sev = (st.sev or "unknown") if "thresholds" in inst else "ok"
+            out.append((iid, sev))
         return out
 
     def tick(self, now: float) -> list:
@@ -226,6 +246,11 @@ class EventEngine:
             out.extend(self.set(nid, value, ts, now))
         return out
 
+    def summary_items(self, now: float) -> list:
+        """[(id, severity)] for the notifications that count towards the alarm summary (``alarm``, default true)."""
+        return [(nid, self._sev(nid, now)) for nid, note in self.notifications.items()
+                if note.get("alarm", True)]
+
     def tick(self, now: float) -> list:
         out = []
         for nid in self.notifications:
@@ -234,6 +259,30 @@ class EventEngine:
                     or now - st.pub_time >= self.heartbeat_s:
                 out.append(self._emit(nid, now))
         return out
+
+
+SUMMARY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "alarm": 3}
+
+
+def alarm_summary(items, ts) -> str | None:
+    """Compact JSON for the retained alarm summary, or None when nothing is counted.
+
+    ``items`` is [(id, severity)] in config order (only items that count; any severity other
+    than ok/warn/alarm is treated as unknown). ``max`` is the highest of alarm > warn >
+    unknown > ok, so unknown outranks ok: a dead feed is never reported as all clear. ``ids``
+    lists alarm ids, then warn ids (each in config order), at most SUMMARY_MAX_IDS. Only ids
+    are published, never labels or message text.
+    """
+    items = [(iid, sev if sev in ("ok", "warn", "alarm") else "unknown") for iid, sev in items]
+    if not items:
+        return None
+    alarms = [iid for iid, sev in items if sev == "alarm"]
+    warns = [iid for iid, sev in items if sev == "warn"]
+    unknown = sum(1 for _, sev in items if sev == "unknown")
+    top = max((sev for _, sev in items), key=SUMMARY_RANK.__getitem__)
+    body = {"max": top, "na": len(alarms), "nw": len(warns), "nu": unknown,
+            "ids": (alarms + warns)[:SUMMARY_MAX_IDS], "ts": ts}
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
 def subscribe_frame(config: dict) -> dict:

@@ -228,6 +228,64 @@ class SeverityPayloadTests(unittest.TestCase):
         self.assertNotIn("sev", payload)
 
 
+
+class AlarmSummaryTests(unittest.TestCase):
+    def summary(self, items):
+        payload = topics.alarm_summary(items, "T")
+        return None if payload is None else json.loads(payload)
+
+    def test_nothing_counted_publishes_nothing(self) -> None:
+        self.assertIsNone(topics.alarm_summary([], "T"))
+
+    def test_max_ranks_alarm_warn_unknown_ok(self) -> None:
+        self.assertEqual(self.summary([("a", "ok"), ("b", "ok")])["max"], "ok")
+        self.assertEqual(self.summary([("a", "ok"), ("b", "unknown")])["max"], "unknown")
+        self.assertEqual(self.summary([("a", "unknown"), ("b", "warn")])["max"], "warn")
+        self.assertEqual(self.summary([("a", "warn"), ("b", "alarm"), ("c", "unknown")])["max"], "alarm")
+
+    def test_counts_and_id_order(self) -> None:
+        got = self.summary([("w1", "warn"), ("a1", "alarm"), ("u", "unknown"), ("ok", "ok"),
+                            ("a2", "alarm"), ("w2", "warn")])
+        self.assertEqual(got, {"max": "alarm", "na": 2, "nw": 2, "nu": 1,
+                               "ids": ["a1", "a2", "w1", "w2"], "ts": "T"})
+
+    def test_unrecognised_severity_is_unknown_and_ids_are_capped(self) -> None:
+        self.assertEqual(self.summary([("a", None)])["nu"], 1)
+        got = self.summary([(f"a{i}", "alarm") for i in range(20)] + [("w", "warn")])
+        self.assertEqual(got["na"], 20)
+        self.assertEqual(got["ids"], [f"a{i}" for i in range(16)])
+
+    def test_payload_is_compact_and_id_only(self) -> None:
+        payload = topics.alarm_summary([("a", "alarm")], "2026-01-01T00:00:00Z")
+        self.assertEqual(payload, '{"max":"alarm","na":1,"nw":0,"nu":0,"ids":["a"],'
+                                  '"ts":"2026-01-01T00:00:00Z"}')
+
+    def test_instrument_items_follow_alarm_flag_and_freshness(self) -> None:
+        cfg = {"heartbeat_s": 5, "instruments": {
+            "depth": {"path": "d", "convert": "none", "unit": "m", "precision": 1, "stale_after_s": 10,
+                      "thresholds": {"alarm_below": 4}},
+            "muted": {"path": "m", "convert": "none", "unit": "m", "precision": 1, "stale_after_s": 10,
+                      "thresholds": {"alarm_below": 4}, "alarm": False},
+            "plain": {"path": "p", "convert": "none", "unit": "m", "precision": 1, "stale_after_s": 10},
+            "forced": {"path": "f", "convert": "none", "unit": "m", "precision": 1, "stale_after_s": 10,
+                       "alarm": True}}}
+        engine = topics.Engine(cfg)
+        self.assertEqual(engine.summary_items(), [("depth", "unknown"), ("forced", "unknown")])
+        for path in "dmpf":
+            engine.update(path, 2.0, TS, 0.0)
+        self.assertEqual(engine.summary_items(), [("depth", "alarm"), ("forced", "ok")])
+        engine.tick(11.0)
+        self.assertEqual(engine.summary_items(), [("depth", "unknown"), ("forced", "unknown")])
+
+    def test_notification_items_default_to_counted(self) -> None:
+        cfg = {"notifications": {"a": {"path": "notifications.a", "label": "A"},
+                                 "b": {"path": "notifications.b", "label": "B", "alarm": False}}}
+        events = topics.EventEngine(cfg)
+        self.assertEqual(events.summary_items(0.0), [("a", "unknown")])
+        events.source_state("signalk", True, 0.0)
+        events.set("a", {"state": "alarm"}, TS, 0.5)
+        self.assertEqual(events.summary_items(0.5), [("a", "alarm")])
+
 if __name__ == "__main__":
     unittest.main()
 

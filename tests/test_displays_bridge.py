@@ -189,6 +189,54 @@ class NotificationBridgeTests(unittest.TestCase):
             self.assertIn("anchor", bridge.load_config(str(path))["notifications"])
 
 
+SUMMARY = topics.ALARM_SUMMARY_TOPIC
+
+
+class AlarmSummaryBridgeTests(unittest.TestCase):
+    def summaries(self, pub):
+        return [(json.loads(p), r, q) for t, p, r, q in pub.sent if t == SUMMARY]
+
+    def test_alarm_raise_clear_and_disconnect(self):
+        script = [("idle",)] * 4 + [("msg", note_delta({"state": "alarm", "message": "secret text"})),
+                                    ("idle",), ("msg", note_delta(None)), ("idle",), ("close",)]
+        pub = Harness([script], NOTE_CONFIG).run()
+        seen = []
+        for body, retain, _ in self.summaries(pub):
+            self.assertTrue(retain)
+            key = (body["max"], body["na"], body["nu"], tuple(body["ids"]))
+            if not seen or seen[-1] != key:
+                seen.append(key)
+        self.assertEqual(seen, [("unknown", 0, 1, ()), ("ok", 0, 0, ()), ("alarm", 1, 0, ("anchor",)),
+                                ("ok", 0, 0, ()), ("unknown", 0, 1, ())])
+        self.assertNotIn("secret text", json.dumps(pub.sent))
+
+    def test_instrument_without_thresholds_is_not_counted_and_nothing_published(self):
+        pub = Harness([[("msg", delta(10 * KN)), ("idle",), ("close",)]]).run()
+        self.assertEqual(self.summaries(pub), [])
+
+    def test_republished_each_heartbeat_but_not_on_every_tick(self):
+        pub = Harness([[("idle",)] * 14 + [("close",)]], NOTE_CONFIG).run()
+        times = [body["ts"] for body, _, _ in self.summaries(pub)]
+        self.assertGreaterEqual(len(times), 3)
+        self.assertLess(len(times), 8)
+
+    def test_clean_shutdown_publishes_unknown_last(self):
+        script = [("idle",)] * 4 + [("msg", note_delta({"state": "alarm"})), ("idle",)]
+        h = Harness([script], NOTE_CONFIG)
+        pub = h.run()
+        self.assertTrue(any(b["max"] == "alarm" for b, _, _ in self.summaries(pub)))
+        last, retain, qos = self.summaries(pub)[-1]
+        self.assertEqual((last["max"], last["na"], last["nu"], last["ids"]), ("unknown", 0, 1, []))
+        self.assertTrue(retain)
+        self.assertEqual(qos, 1)
+        self.assertEqual(pub.sent[-1][0], STATUS)
+        self.assertEqual(pub.sent[-1][1], "offline")
+
+    def test_timestamp_is_utc_iso(self):
+        pub = Harness([[("idle",), ("close",)]], NOTE_CONFIG).run()
+        self.assertRegex(self.summaries(pub)[0][0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+
+
 class BridgeLoopTests(unittest.TestCase):
     def test_startup_publishes_status_and_missing_instruments(self):
         pub = Harness([]).run()
