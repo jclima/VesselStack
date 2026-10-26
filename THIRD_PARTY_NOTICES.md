@@ -28,3 +28,17 @@ Open Font License, Version 1.1. The license text is kept next to the fonts in
 bitmaps rendered from these fonts; the firmware is built with ESPHome (GPLv3 and
 MIT components) and LVGL (MIT), which are downloaded at build time and not
 distributed by VesselStack.
+
+## Bundled icon font
+
+`displays/esphome/fonts/MaterialSymbols-subset.ttf` is derived from Material
+Symbols (Outlined), Copyright Google LLC, from the `google/material-design-icons`
+repository (<https://github.com/google/material-design-icons>), commit
+`10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7`
+(`variablefont/MaterialSymbolsOutlined[FILL,GRAD,opsz,wght].ttf`), licensed under
+the Apache License, Version 2.0. The license text is kept next to the font in
+`displays/esphome/fonts/LICENSE-MaterialSymbols.txt`. Modifications: one static
+instance was created from the variable font (FILL 1, wght 500, GRAD 0, opsz 48) and
+subset to the icons listed in `displays/esphome/fonts/icons.json` (layout features
+and hinting removed). `scripts/build-icon-font.py` reproduces the file from the
+upstream font.
