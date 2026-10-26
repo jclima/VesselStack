@@ -57,7 +57,7 @@ PLACEHOLDER_NOTE = ("Wi-Fi credentials are not configured: wrote PLACEHOLDER val
 FONT_FILES = {"bold": "RobotoCondensed-Bold.ttf", "regular": "RobotoCondensed-Regular.ttf"}
 FONT_LICENSE = "OFL.txt"
 FONT_SIZES = {"grid": 56, "single": 96, "small": 20, "status_lg": 48, "status_sm": 30,
-              "banner": 48, "banner_name": 28}
+              "banner": 48, "banner_name": 28, "bar": 36}
 STATUS_GAP = 6
 STATUS_WORDS = {1: "OK", 2: "WARN", 3: "ALARM", 0: "--"}  # sev number -> fixed word
 STATUS_FONTS = {"lg": "font_status_lg", "sm": "font_status_sm"}
@@ -85,6 +85,25 @@ NIGHT = {"tile": 0x000000, "name": 0x6A1600, "value": 0xB02400, "clock": 0xA0200
          "page_lo": 0x2A0A00}
 NIGHT_SEV_COLORS = {0: (0x000000, 0x5A1200), 1: (0x2A0800, 0xC02800), 2: (0x7A3E00, 0xF0B060),
                     3: (0xB00000, 0xFFB090)}
+# Bars and arcs (display dashboard slice S6). Indicator colours per state: 0 unknown/stale, 1 ok,
+# 2 warn, 3 alarm, 4 fresh but the instrument has no thresholds (neither green nor a warning).
+GAUGE_LAYOUTS = ("tank-bars", "gauge-arc")
+GAUGE_DAY = {0: 0x37474F, 1: 0x1E7B34, 2: 0xF2A900, 3: 0xC62828, 4: 0x2E86C1}
+GAUGE_NIGHT = {0: 0x2A0A00, 1: 0x6B3000, 2: 0xB06A00, 3: 0xC00000, 4: 0x8A4A00}
+GAUGE_NEUTRAL = 4
+TRACK_COLOR = {"day": 0x263238, "night": 0x1A0800}
+BAR_WIDTH = 60            # at most 60 px, whatever the number of bars
+BAR_HEIGHT = 210
+BAR_RANGE = 100
+BAR_PAD_ROW = 8
+ARC_RANGE = 1000
+ARC_WIDTH = 24
+ARC_SWEEP = 270
+ARC_MARGIN = 20           # gap between the arc and the screen edge
+ZONE_WIDTH = 6
+ZONE_GAP = 2              # between the arc track and the zone arcs, which sit just inside it
+ARC_START_GAP_BOTTOM = 135   # LVGL: 0 deg = 3 o'clock, clockwise; 135 -> 45 leaves the gap at the bottom
+ARC_START_GAP_TOP = 315      # with ui.header the 90 deg gap is at the top, where the header is
 WARNING_ARCHIVE_SECRETS = ("WARNING: the archive contains the Wi-Fi password and the display's MQTT, "
                            "OTA and API secrets. Treat it like a password: move it over SSH only, "
                            "do not commit or e-mail it, delete it after flashing.")
@@ -430,6 +449,280 @@ def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: in
     return lines
 
 
+# --- bars and arcs (tank-bars, gauge-arc) ------------------------------------------
+
+def gauge_pages(display: dict, iid: str) -> list:
+    """(page index, page) of the bar and arc pages that show this item."""
+    return [(pi, page) for pi, page in enumerate(display["pages"])
+            if page["layout"] in GAUGE_LAYOUTS and iid in page["items"]]
+
+
+def on_gauge_page(display: dict, iid: str) -> bool:
+    return bool(gauge_pages(display, iid))
+
+
+def on_tile_page(display: dict, iid: str) -> bool:
+    return any(page["layout"] not in GAUGE_LAYOUTS and iid in page["items"] for page in display["pages"])
+
+
+def severity_tile(config: dict, display: dict, iid: str) -> bool:
+    """True when a tile (not a bar or an arc) is coloured by the item's severity."""
+    if is_notification(config, iid):
+        return True
+    return has_thresholds(config["instruments"][iid]) and on_tile_page(display, iid)
+
+
+def cfloat(value) -> str:
+    """A C++ float literal for a finite number from the (validated) configuration."""
+    return repr(float(value)) + "f"
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return lo if not value > lo else (hi if value > hi else value)   # NaN becomes lo
+
+
+def bar_percent(value: float, lo: float, hi: float) -> int:
+    """0..100 for a reading between lo and hi; the firmware does the same with lroundf."""
+    scaled = _clamp(BAR_RANGE * (value - lo) / (hi - lo), 0.0, float(BAR_RANGE))
+    return int(scaled + 0.5)
+
+
+def arc_permille(value: float, lo: float, hi: float) -> int:
+    """0..1000 for a reading between lo and hi."""
+    scaled = _clamp(ARC_RANGE * (value - lo) / (hi - lo), 0.0, float(ARC_RANGE))
+    return int(scaled + 0.5)
+
+
+def bar_column_width(box_width: int, count: int) -> int:
+    return box_width // count
+
+
+def gauge_diameter(board: dict) -> int:
+    """The arc fills the round screen, ARC_MARGIN px from the edge."""
+    return min(board["width"], board["height"]) - 2 * ARC_MARGIN
+
+
+def arc_start_angle(display: dict) -> int:
+    """LVGL angles: 0 = 3 o'clock, clockwise. With the header the 90 deg gap sits at the top."""
+    return ARC_START_GAP_TOP if header_enabled(display) else ARC_START_GAP_BOTTOM
+
+
+def arc_end_angle(start: int) -> int:
+    return (start + ARC_SWEEP) % 360
+
+
+def arc_angle(start: int, value: float, lo: float, hi: float) -> int:
+    """Angle (whole degrees) of a reading on the arc that starts at ``start``."""
+    fraction = _clamp((value - lo) / (hi - lo), 0.0, 1.0)
+    return (start + int(ARC_SWEEP * fraction + 0.5)) % 360
+
+
+def zone_arcs(inst: dict, start: int) -> list:
+    """Static warn and alarm zones as (severity number, start angle, end angle), clockwise.
+
+    Built from the thresholds of the instrument and its min/max; zones outside the range or
+    shorter than a degree are dropped.
+    """
+    th, lo, hi = inst.get("thresholds", {}), inst["min"], inst["max"]
+    spans = []
+    if "alarm_below" in th:
+        spans.append((3, lo, th["alarm_below"]))
+    if "warn_below" in th:
+        spans.append((2, th.get("alarm_below", lo), th["warn_below"]))
+    if "warn_above" in th:
+        spans.append((2, th["warn_above"], th.get("alarm_above", hi)))
+    if "alarm_above" in th:
+        spans.append((3, th["alarm_above"], hi))
+    zones = []
+    for severity, a, b in spans:
+        a, b = _clamp(a, lo, hi), _clamp(b, lo, hi)
+        first, last = arc_angle(start, a, lo, hi), arc_angle(start, b, lo, hi)
+        if b > a and (last - first) % 360 > 0:
+            zones.append((severity, first, last))
+    return zones
+
+
+def arc_zone_diameter(diameter: int) -> int:
+    return diameter - 2 * (ARC_WIDTH + ZONE_GAP)
+
+
+def arc_text_box(diameter: int) -> tuple:
+    """(width, height) of the label, value and unit column in the middle of the arc."""
+    inner = arc_zone_diameter(diameter) // 2 - ZONE_WIDTH
+    side = int(inner * 1.4142) // 2 * 2
+    return side, side * 4 // 5
+
+
+BAR_COLUMN = (f"layout: {{type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, "
+              f"flex_align_cross: CENTER, pad_row: {BAR_PAD_ROW}}}")
+BOX_RESET = ["bg_opa: TRANSP", "border_width: 0", "pad_all: 0", "scrollable: false"]
+
+
+def _bar_column(ind: str, pi: int, iid: str, inst: dict, width: int, themed: bool) -> list:
+    fit = "width: 100%, text_align: CENTER"
+    inner = ind + "      "
+    lines = [f"{ind}- obj:", f"{ind}    width: {width}", f"{ind}    height: 100%"]
+    lines += [f"{ind}    {line}" for line in BOX_RESET]
+    lines += [f"{ind}    {BAR_COLUMN}", f"{ind}    widgets:"]
+    lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
+                 f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
+    lines += [
+        f"{inner}- bar:", f"{inner}    id: p{pi}_{iid}_bar", f"{inner}    width: {BAR_WIDTH}",
+        f"{inner}    height: {BAR_HEIGHT}", f"{inner}    min_value: 0", f"{inner}    max_value: {BAR_RANGE}",
+        f"{inner}    value: 0", f"{inner}    mode: NORMAL", f"{inner}    bg_color: 0x{TRACK_COLOR['day']:06X}",
+        f"{inner}    bg_opa: COVER", f"{inner}    border_width: 0", f"{inner}    radius: 8",
+        f"{inner}    indicator:", f"{inner}      bg_color: 0x{GAUGE_DAY[0]:06X}", f"{inner}      bg_opa: COVER",
+        f"{inner}      radius: 8",
+        f"{inner}- obj:", f"{inner}    width: 100%", f"{inner}    height: SIZE_CONTENT",
+    ]
+    lines += [f"{inner}    {line}" for line in BOX_RESET]
+    lines += [
+        f"{inner}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, "
+        "flex_align_cross: END, pad_column: 2}",
+        f"{inner}    widgets:",
+        f"{inner}      - label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_value_bar, "
+        f"text_color: 0x{DAY['value']:06X}, long_mode: CLIP}}",
+        f"{inner}      - label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
+        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
+    ]
+    return lines
+
+
+def _tank_bars_page(config: dict, board: dict, pi: int, page: dict, themed: bool) -> list:
+    cw, ch = board["content_width"], board["content_height"]
+    width = bar_column_width(cw, len(page["items"]))
+    lines = [
+        "        - obj:", f"            id: p{pi}_content", "            align: CENTER",
+        f"            width: {cw}", f"            height: {ch}",
+        *[f"            {line}" for line in BOX_RESET],
+        "            layout: {type: FLEX, flex_flow: ROW, flex_align_main: SPACE_EVENLY, "
+        "flex_align_cross: CENTER}",
+        "            widgets:",
+    ]
+    for iid in page["items"]:
+        lines += _bar_column("              ", pi, iid, config["instruments"][iid], width, themed)
+    return lines
+
+
+def _arc_style(width: int, color: int) -> list:
+    return [f"arc_width: {width}", f"arc_color: 0x{color:06X}", "arc_rounded: false"]
+
+
+def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool) -> list:
+    iid = page["items"][0]
+    inst = config["instruments"][iid]
+    diameter = gauge_diameter(board)
+    start = arc_start_angle(display)
+    track = f"0x{TRACK_COLOR['day']:06X}"
+    common = ["align: CENTER", "clickable: false", "scrollable: false", "min_value: 0",
+              f"max_value: {ARC_RANGE}", "value: 0", f"start_angle: {start}", f"end_angle: {arc_end_angle(start)}",
+              "rotation: 0", "adjustable: false", "mode: NORMAL", "bg_opa: TRANSP", "border_width: 0",
+              "pad_all: 0"]
+    lines = ["        - arc:", f"            id: p{pi}_arc", f"            width: {diameter}",
+             f"            height: {diameter}"]
+    lines += [f"            {line}" for line in common]
+    lines += [f"            arc_width: {ARC_WIDTH}", f"            arc_color: {track}", "            arc_rounded: false",
+              "            indicator:"]
+    lines += [f"              {line}" for line in _arc_style(ARC_WIDTH, GAUGE_DAY[0])]
+    lines += ["            knob:", "              bg_opa: TRANSP", "              pad_all: 0"]
+    zone_d = arc_zone_diameter(diameter)
+    for k, (severity, first, last) in enumerate(zone_arcs(inst, start)):
+        lines += ["        - arc:", f"            id: p{pi}_zone{k}", f"            width: {zone_d}",
+                  f"            height: {zone_d}"]
+        lines += [f"            {line}" for line in common if not line.startswith(("start_angle", "end_angle"))]
+        lines += [f"            start_angle: {first}", f"            end_angle: {last}",
+                  *[f"            {line}" for line in _arc_style(ZONE_WIDTH, GAUGE_DAY[severity])],
+                  "            indicator:", "              arc_opa: TRANSP", "            knob:",
+                  "              bg_opa: TRANSP", "              pad_all: 0"]
+    box_w, box_h = arc_text_box(diameter)
+    fit = "width: 100%, text_align: CENTER"
+    lines += [
+        "        - obj:", f"            id: p{pi}_content", "            align: CENTER", f"            width: {box_w}",
+        f"            height: {box_h}", *[f"            {line}" for line in BOX_RESET], f"            {FLEX_COLUMN}",
+        "            widgets:",
+        f"              - label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
+        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}",
+        f"              - label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_value_single, "
+        f"text_color: 0x{DAY['value']:06X}, {fit}, long_mode: CLIP}}",
+        f"              - label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
+        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}",
+    ]
+    return lines
+
+
+def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool) -> list:
+    """Bar level, arc angle and indicator colour for one instrument; colours only on change.
+
+    Not fresh means level 0 and the grey indicator; the text is "--" through render_tiles.
+    """
+    inst = config["instruments"][iid]
+    pages = gauge_pages(display, iid)
+    lo, hi = cfloat(inst["min"]), cfloat(inst["max"])
+    limit_ms = item_limit_ms(config, iid, heartbeat)
+    kinds = {page["layout"] for _, page in pages}
+    lines = [
+        "      - lambda: |-",
+        "          bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
+        f" && id(ins_{iid}_ok) && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL;",
+        f"          float n = id(ins_{iid}_num);",
+    ]
+    for layout, scale, var in (("tank-bars", BAR_RANGE, "pb"), ("gauge-arc", ARC_RANGE, "pa")):
+        if layout not in kinds:
+            continue
+        lines += [f"          float {var} = fresh ? {scale}.0f * (n - {lo}) / ({hi} - {lo}) : 0.0f;",
+                  f"          if (!({var} > 0.0f)) {var} = 0.0f;",
+                  f"          if ({var} > {scale}.0f) {var} = {scale}.0f;"]
+        for pi, page in pages:
+            if page["layout"] == layout:
+                setter = (f"lv_bar_set_value(id(p{pi}_{iid}_bar), lroundf({var}), LV_ANIM_OFF);"
+                          if layout == "tank-bars" else f"lv_arc_set_value(id(p{pi}_arc), lroundf({var}));")
+                lines.append(f"          {setter}")
+    state = f"id(ins_{iid}_sev)" if has_thresholds(inst) else str(GAUGE_NEUTRAL)
+    lines += [
+        f"          uint8_t g = fresh ? {state} : 0;",
+        f"          if (g != id(ins_{iid}_gdrawn)) {{",
+        f"            id(ins_{iid}_gdrawn) = g;",
+        f"            uint32_t c = 0x{GAUGE_DAY[0]:06X};",
+    ]
+    for number in (1, 2, 3, GAUGE_NEUTRAL):
+        lines.append(f"            if (g == {number}) c = 0x{GAUGE_DAY[number]:06X};")
+    if night:
+        lines.append("            if (id(night_active)) {")
+        lines.append(f"              c = 0x{GAUGE_NIGHT[0]:06X};")
+        for number in (1, 2, 3, GAUGE_NEUTRAL):
+            lines.append(f"              if (g == {number}) c = 0x{GAUGE_NIGHT[number]:06X};")
+        lines.append("            }")
+    for pi, page in pages:
+        if page["layout"] == "tank-bars":
+            lines.append(f"            lv_obj_set_style_bg_color(id(p{pi}_{iid}_bar), lv_color_hex(c), "
+                         "LV_PART_INDICATOR);")
+        else:
+            lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_arc), lv_color_hex(c), "
+                         "LV_PART_INDICATOR);")
+    lines.append("          }")
+    return lines
+
+
+def _gauge_night_lines(config: dict, display: dict, pi: int, page: dict) -> list:
+    """Night palette for the text, the tracks and the zone arcs of one bar or arc page."""
+    lines = []
+    for iid in page["items"]:
+        for part, key in (("name", "name"), ("value", "value"), ("unit", "name")):
+            lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_{part}), lv_color_hex("
+                         f"n ? 0x{NIGHT[key]:06X} : 0x{DAY[key]:06X}), LV_PART_MAIN);")
+        track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
+        if page["layout"] == "tank-bars":
+            lines.append(f"            lv_obj_set_style_bg_color(id(p{pi}_{iid}_bar), lv_color_hex({track}), "
+                         "LV_PART_MAIN);")
+            continue
+        lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_arc), lv_color_hex({track}), LV_PART_MAIN);")
+        start = arc_start_angle(display)
+        for k, (severity, _, _) in enumerate(zone_arcs(config["instruments"][iid], start)):
+            lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_zone{k}), lv_color_hex("
+                         f"n ? 0x{GAUGE_NIGHT[severity]:06X} : 0x{GAUGE_DAY[severity]:06X}), LV_PART_MAIN);")
+    return lines
+
+
 def _show_page(ind: str, target: int) -> list:
     return [f"{ind}- lvgl.page.show:", f"{ind}    id: page_{target}", f"{ind}    animation: NONE",
             f"{ind}    time: {TAP_TIME}"]
@@ -588,6 +881,10 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
         font = status_font(len(page["items"]))
         for index, iid in enumerate(page["items"]):
             lines += _status_cell(config, "              ", pi, iid, font, index, cols, themed)
+    elif layout == "tank-bars":
+        lines += _tank_bars_page(config, registry_board, pi, page, themed)
+    elif layout == "gauge-arc":
+        lines += _gauge_arc_page(config, registry_board, display, pi, page, themed)
     else:
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
     if header_enabled(display):
@@ -621,8 +918,10 @@ def _fonts_lines(display: dict, config: dict) -> list:
     fonts = []
     if "grid-2x2" in layouts:
         fonts.append(("font_value_grid", "bold", FONT_SIZES["grid"], VALUE_GLYPHS))
-    if "single" in layouts:
+    if "single" in layouts or "gauge-arc" in layouts:
         fonts.append(("font_value_single", "bold", FONT_SIZES["single"], VALUE_GLYPHS))
+    if "tank-bars" in layouts:
+        fonts.append(("font_value_bar", "bold", FONT_SIZES["bar"], VALUE_GLYPHS))
     status = _status_glyphs(config, display)
     for key in ("lg", "sm"):
         if STATUS_FONTS[key] in status:
@@ -638,7 +937,7 @@ def _fonts_lines(display: dict, config: dict) -> list:
     return lines
 
 
-def _json_handler(iid: str, decimals: int, with_sev: bool = False) -> list:
+def _json_handler(iid: str, decimals: int, with_sev: bool = False, numeric: bool = False) -> list:
     sev_lines = []
     if with_sev:
         sev_lines = [
@@ -658,6 +957,7 @@ def _json_handler(iid: str, decimals: int, with_sev: bool = False) -> list:
         "              char buf[VALUE_ACCURACY_MAX_LEN];",
         f'              value_accuracy_to_buf(buf, x["v"].as<float>(), {decimals});',
         f"              id(ins_{iid}_val) = buf;",
+        *([f'              id(ins_{iid}_num) = x["v"].as<float>();'] if numeric else []),
         "            }",
         *sev_lines,
         "        - script.execute: render_tiles",
@@ -710,7 +1010,7 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: boo
     limit_ms = item_limit_ms(config, iid, heartbeat)
     sets = []
     for pi, page in enumerate(display["pages"]):
-        if iid in page["items"]:
+        if iid in page["items"] and page["layout"] not in GAUGE_LAYOUTS:
             tile, value = tile_id(pi, iid, page["layout"]), f"p{pi}_{iid}_value"
             sets.append((tile, value))
     lines = [
@@ -1036,6 +1336,9 @@ def _night_script(config: dict, display: dict, used: list) -> list:
         "            id(night_dirty) = true;",
     ]
     for pi, page in enumerate(display["pages"]):
+        if page["layout"] in GAUGE_LAYOUTS:
+            lines += _gauge_night_lines(config, display, pi, page)
+            continue
         for iid in page["items"]:
             notification = is_notification(config, iid)
             tile = tile_id(pi, iid, page["layout"])
@@ -1051,8 +1354,10 @@ def _night_script(config: dict, display: dict, used: list) -> list:
                 lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_unit), lv_color_hex("
                              f"n ? 0x{NIGHT['name']:06X} : 0x{DAY['name']:06X}), LV_PART_MAIN);")
     for iid in used:   # the guarded severity colours must repaint with the new palette
-        if is_notification(config, iid) or has_thresholds(config["instruments"][iid]):
+        if severity_tile(config, display, iid):
             lines.append(f"            id(ins_{iid}_drawn_sev) = 255;")
+        if not is_notification(config, iid) and on_gauge_page(display, iid):
+            lines.append(f"            id(ins_{iid}_gdrawn) = 255;")
     lines += [
         "          }",
         "      - if:", "          condition:", "            lambda: 'return id(night_dirty);'", "          then:",
@@ -1136,8 +1441,12 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             continue
         lines.append(f"  - {{id: ins_{iid}_val, type: std::string, initial_value: '\"{BLANK_VALUE}\"'}}")
         if has_thresholds(config["instruments"][iid]):
-            lines += [f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}',
-                      f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}']
+            lines.append(f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}')
+        if severity_tile(config, display, iid):
+            lines.append(f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}')
+        if on_gauge_page(display, iid):
+            lines += [f'  - {{id: ins_{iid}_num, type: float, initial_value: "0"}}',
+                      f'  - {{id: ins_{iid}_gdrawn, type: uint8_t, initial_value: "255"}}']
     takeover = alarm_takeover_enabled(display)
     if takeover:
         lines += ALARM_GLOBALS
@@ -1154,7 +1463,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines += _notification_handler(iid)
         else:
             lines += _json_handler(iid, config["instruments"][iid]["precision"],
-                                   has_thresholds(config["instruments"][iid]))
+                                   has_thresholds(config["instruments"][iid]), on_gauge_page(display, iid))
     if takeover:
         lines += _alarm_handler(used, display)
     if clock_enabled(display):
@@ -1179,8 +1488,10 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         if is_notification(config, iid):
             lines += _word_lines(config, display, iid, heartbeat)
     for iid in used:
-        if is_notification(config, iid) or has_thresholds(config["instruments"][iid]):
+        if severity_tile(config, display, iid):
             lines += _sev_lines(config, display, iid, heartbeat, night_enabled(display))
+        if not is_notification(config, iid) and on_gauge_page(display, iid):
+            lines += _gauge_lines(config, display, iid, heartbeat, night_enabled(display))
     if takeover:
         lines += _alarm_script(config, used, heartbeat)
     if header_enabled(display):

@@ -144,7 +144,37 @@ def ui_single(cfg):
     cfg["displays"]["helm"]["pages"] = [{"title": "One", "layout": "single", "items": ["sog"]}]
     cfg["displays"]["helm"]["ui"] = {"night": "manual", "dim_after_s": 30, "header": True, "swipe": True}
 
+def gauges(cfg):
+    tank = {"convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "min": 0, "max": 100}
+    inst = cfg["instruments"]
+    inst["fuel"] = dict(tank, path="tanks.fuel.0.currentLevel", label=HOSTILE[:16], unit="${y}",
+                        thresholds={"alarm_below": 10, "warn_below": 25, "hysteresis": 2})
+    inst["water"] = dict(tank, path="tanks.freshWater.0.currentLevel", label="<% 1+1 %>",
+                         thresholds={"warn_below": 20})
+    inst["waste"] = dict(tank, path="tanks.blackWater.0.currentLevel", label="Waste",
+                         thresholds={"warn_above": 75, "alarm_above": 90, "hysteresis": 2})
+    inst["lpg"] = dict(tank, path="tanks.lpg.0.currentLevel", label="LPG")
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Tanks", "layout": "tank-bars", "items": ["fuel", "water", "waste", "lpg"]},
+        {"title": "Fuel", "layout": "gauge-arc", "items": ["fuel"]},
+        {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "fuel"]},
+    ]
+
+def gauges_ui(cfg):
+    gauges(cfg)
+    cfg["displays"]["helm"]["pages"][0]["title"] = '$x ${y} "q"'
+    cfg["displays"]["helm"]["ui"] = {"swipe": True, "header": True, "night": "schedule", "night_brightness": 15,
+                                     "dim_after_s": 120, "alarm_takeover": True}
+    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
+def gauges_one(cfg):
+    gauges(cfg)
+    cfg["displays"]["helm"]["pages"] = [{"title": "Tank", "layout": "tank-bars", "items": ["lpg"]}]
+
 variant("example")
+variant("gauges", gauges)
+variant("gaugesui", gauges_ui)
+variant("gaugesone", gauges_one)
 variant("thresholds", thresholds)
 variant("status", status)
 variant("alarm", alarm)
@@ -199,6 +229,26 @@ check alarm helm
 check ui helm
 check uimanual helm
 check uisingle helm
+check gauges helm
+check gaugesui helm
+check gaugesone helm
+# Bars and arcs: LVGL widgets, numeric levels from the payload, guarded colours, literal user text.
+for gauge in gauges gaugesui; do
+    log="$WORK/$gauge-helm.log"
+    for needle in 'lv_bar_set_value(id(p0_fuel_bar)' 'lv_arc_set_value(id(p1_arc)' \
+            'lv_obj_set_style_bg_color(id(p0_fuel_bar), lv_color_hex(c), LV_PART_INDICATOR)' \
+            'lv_obj_set_style_arc_color(id(p1_arc), lv_color_hex(c), LV_PART_INDICATOR)' 'ins_fuel_gdrawn'; do
+        grep -qF "$needle" "$log" || { echo "missing from the validated $gauge config: $needle" >&2; fail=1; }
+    done
+    # shellcheck disable=SC2016
+    grep -qF '${y}' "$log" || { echo "hostile gauge label or unit was altered ($gauge)" >&2; fail=1; }
+    grep -qF '<% 1+1 %>' "$log" || { echo "hostile gauge label was altered ($gauge)" >&2; fail=1; }
+done
+grep -qF 'lv_obj_set_style_arc_color(id(p1_zone0)' "$WORK/gaugesui-helm.log" \
+    || { echo "night recolouring of the zone arcs missing" >&2; fail=1; }
+for plain in example thresholds status alarm ui uimanual uisingle complex; do
+    if grep -qE 'lv_bar_set_value|lv_arc_set_value' "$WORK/$plain-helm.log"; then echo "bar or arc code present without a tank-bars or gauge-arc page ($plain)" >&2; fail=1; fi
+done
 for word in ALARM WARN OK; do
     grep -qE "text: [\"']?${word}[\"']?\$" "$WORK/status-helm.log" || { echo "status word $word missing from the validated config" >&2; fail=1; }
 done

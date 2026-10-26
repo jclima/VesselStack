@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+import math
 import os
 import re
 import stat
@@ -79,6 +80,36 @@ def dashboard_ui(cfg, **ui):
     options.update(ui)
     cfg["displays"]["helm"]["ui"].update(options)
     cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
+
+def tank(label, path, unit="%", **extra):
+    inst = {"path": path, "label": label, "convert": "ratio->%", "unit": unit, "precision": 0,
+            "stale_after_s": 60, "min": 0, "max": 100}
+    inst.update(extra)
+    return inst
+
+
+def gauge_pages(cfg, header=False, night=False):
+    """Four tanks on a tank-bars page and the fuel tank on a gauge-arc page."""
+    cfg["instruments"].update({
+        "fuel": tank("Fuel", "tanks.fuel.0.currentLevel",
+                     thresholds={"alarm_below": 10, "warn_below": 25, "hysteresis": 2}),
+        "water": tank("Water", "tanks.freshWater.0.currentLevel", thresholds={"warn_below": 20}),
+        "waste": tank("Waste", "tanks.blackWater.0.currentLevel",
+                      thresholds={"warn_above": 75, "alarm_above": 90}),
+        "lpg": tank("LPG", "tanks.lpg.0.currentLevel"),
+    })
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Tanks", "layout": "tank-bars", "items": ["fuel", "water", "waste", "lpg"]},
+        {"title": "Fuel", "layout": "gauge-arc", "items": ["fuel"]},
+    ]
+    ui = {}
+    if header:
+        ui.update(header=True, swipe=True)
+    if night:
+        ui.update(night="manual")
+    if ui:
+        cfg["displays"]["helm"]["ui"] = ui
 
 
 class Base(unittest.TestCase):
@@ -158,6 +189,10 @@ class GoldenAndDeterminism(Base):
     def test_dashboard_ui_matches_golden(self):
         self.set_config(dashboard_ui)
         self.check_golden("helm-ui.yaml", self.device(allow_missing_wifi=True))
+
+    def test_tank_bars_and_gauge_arc_match_golden(self):
+        self.set_config(gauge_pages)
+        self.check_golden("helm-gauges.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -872,6 +907,369 @@ class DashboardUi(Base):
         self.assertNotIn("mqtt.publish", self.ui_device())
         board = self.collect().files["helm/boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml"].decode()
         self.assertRegex(board, r"id: board_backlight\n\s+name: Backlight\n\s+internal: true")
+
+
+class Gauges(Base):
+    """tank-bars and gauge-arc (display dashboard slice S6)."""
+
+    def gauge_device(self, mutate=None, **kw):
+        def build(cfg):
+            gauge_pages(cfg, **kw)
+            if mutate:
+                mutate(cfg)
+        self.set_config(build)
+        return self.device(allow_missing_wifi=True)
+
+    def lambdas(self, text):
+        return "\n".join(l for l in text.splitlines() if "lambda" in l or "lv_" in l or "id(" in l)
+
+    def page(self, text, pi):
+        return text.split(f"- id: page_{pi}\n")[1].split("\n    - id: page_")[0]
+
+    def test_nothing_is_generated_without_the_layouts(self):
+        text = self.device(allow_missing_wifi=True)
+        for marker in ("lv_bar", "lv_arc", "font_value_bar", "_num,", "_gdrawn", "- bar:", "- arc:"):
+            self.assertNotIn(marker, text)
+
+    # -- scaling ------------------------------------------------------------------------------
+
+    def test_bar_percentage_rounds_half_away_and_clamps(self):
+        cases = [(0, 0), (100, 100), (62.4, 62), (62.5, 63), (62.6, 63), (-5, 0), (140, 100), (0.4, 0), (99.5, 100)]
+        for value, expected in cases:
+            self.assertEqual(render.bar_percent(value, 0, 100), expected, value)
+        self.assertEqual(render.bar_percent(12.0, 10, 16), 33)        # not 0..100: (12-10)/(16-10)
+        self.assertEqual(render.bar_percent(0, -10, 10), 50)
+        self.assertEqual(render.bar_percent(float("nan"), 0, 100), 0)
+        self.assertEqual(render.bar_percent(1e15, 0, 100), 100)
+        self.assertEqual(render.bar_percent(-1e15, 0, 100), 0)
+
+    def test_arc_permille_scales_to_1000_and_clamps(self):
+        for value, expected in [(0, 0), (100, 1000), (62.5, 625), (0.04, 0), (0.05, 1), (-3, 0), (101, 1000)]:
+            self.assertEqual(render.arc_permille(value, 0, 100), expected, value)
+        self.assertEqual(render.arc_permille(13, 10, 16), 500)
+
+    def test_firmware_uses_the_same_formula_with_float_constants(self):
+        text = self.gauge_device(lambda cfg: cfg["instruments"]["water"].update(min=-2.5, max=97.5))
+        lam = text.split("float n = id(ins_water_num);")[1].split("uint8_t g")[0]
+        self.assertIn("float pb = fresh ? 100.0f * (n - -2.5f) / (97.5f - -2.5f) : 0.0f;", lam)
+        self.assertIn("if (!(pb > 0.0f)) pb = 0.0f;", lam)
+        self.assertIn("if (pb > 100.0f) pb = 100.0f;", lam)
+        self.assertIn("lv_bar_set_value(id(p0_water_bar), lroundf(pb), LV_ANIM_OFF);", lam)
+        fuel = text.split("float n = id(ins_fuel_num);")[1].split("uint8_t g")[0]
+        self.assertIn("float pa = fresh ? 1000.0f * (n - 0.0f) / (100.0f - 0.0f) : 0.0f;", fuel)
+        self.assertIn("lv_arc_set_value(id(p1_arc), lroundf(pa));", fuel)
+        self.assertIn("lv_bar_set_value(id(p0_fuel_bar), lroundf(pb), LV_ANIM_OFF);", fuel)   # both on one instrument
+
+    def test_the_number_comes_from_the_payload_not_from_text(self):
+        text = self.gauge_device()
+        for iid in ("fuel", "water", "waste", "lpg"):
+            handler = text.split(f"instruments/{iid}\n")[1].split("    - topic:")[0]
+            self.assertIn(f'id(ins_{iid}_num) = x["v"].as<float>();', handler)
+            self.assertIn(f"{{id: ins_{iid}_num, type: float, initial_value: \"0\"}}", text)
+        self.assertNotIn("ins_sog_num", text)
+
+    # -- zones and geometry -------------------------------------------------------------------
+
+    def test_zone_angles_follow_thresholds_min_and_max(self):
+        both = {"thresholds": {"alarm_below": 10, "warn_below": 25}, "min": 0, "max": 100}
+        self.assertEqual(render.zone_arcs(both, 135), [(3, 135, 162), (2, 162, 203)])
+        self.assertEqual(render.zone_arcs(both, 315), [(3, 315, 342), (2, 342, 23)])
+        high = {"thresholds": {"warn_above": 75, "alarm_above": 90}, "min": 0, "max": 100}
+        self.assertEqual(render.zone_arcs(high, 135), [(2, 338, 18), (3, 18, 45)])    # wraps through 0
+        warn_only = {"thresholds": {"warn_below": 20}, "min": 0, "max": 100}
+        self.assertEqual(render.zone_arcs(warn_only, 135), [(2, 135, 189)])
+        window = {"thresholds": {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8,
+                                 "alarm_above": 15.2}, "min": 10, "max": 16}
+        self.assertEqual([z[0] for z in render.zone_arcs(window, 135)], [3, 2, 2, 3])
+        self.assertEqual(render.zone_arcs({"min": 0, "max": 100}, 135), [])           # no thresholds, no zones
+
+    def test_zones_outside_the_range_or_too_short_are_dropped(self):
+        inst = {"thresholds": {"alarm_below": -5, "warn_below": 0.1}, "min": 0, "max": 100}
+        self.assertEqual(render.zone_arcs(inst, 135), [])                              # 0.27 deg rounds to nothing
+        above = {"thresholds": {"warn_above": 120}, "min": 0, "max": 100}
+        self.assertEqual(render.zone_arcs(above, 135), [])
+        clipped = {"thresholds": {"warn_above": 80, "alarm_above": 400}, "min": 0, "max": 100}
+        self.assertEqual(render.zone_arcs(clipped, 135), [(2, 351, 45)])               # alarm zone has no length
+
+    def test_zone_arcs_are_generated_inside_the_track(self):
+        text = self.gauge_device()
+        page = self.page(text, 1)
+        self.assertEqual(re.findall(r"id: (p1_zone\d)", page), ["p1_zone0", "p1_zone1"])
+        self.assertIn("start_angle: 135\n            end_angle: 162\n            arc_width: 6\n"
+                      "            arc_color: 0xC62828", page)
+        zone = next(l for l in page.split("- arc:") if "p1_zone0" in l)
+        self.assertEqual(int(re.search(r"width: (\d+)", zone).group(1)),
+                         440 - 2 * (render.ARC_WIDTH + render.ZONE_GAP))
+        self.assertIn("arc_opa: TRANSP", zone)
+        self.assertIn("clickable: false", zone)
+
+    def test_arc_geometry_and_angles(self):
+        board = REGISTRY["boards"][BOARD]
+        self.assertEqual(render.gauge_diameter(board), 440)
+        page = self.page(self.gauge_device(), 1)
+        arc = page.split("- arc:")[1]
+        for line in ("id: p1_arc", "width: 440", "height: 440", "align: CENTER", "clickable: false",
+                     "min_value: 0", "max_value: 1000", "start_angle: 135", "end_angle: 45",
+                     "adjustable: false", "arc_width: 24"):
+            self.assertIn(line, arc)
+        knob = arc.split("knob:")[1]
+        self.assertIn("bg_opa: TRANSP", knob)
+        self.assertEqual((render.arc_start_angle({}), render.arc_end_angle(135)), (135, 45))
+        self.assertEqual(render.arc_end_angle(315), 225)
+        self.assertEqual(render.ARC_SWEEP, 270)
+
+    def band_points(self, start, outer=220.0, width=24):
+        """Points (x, y) on the screen of the arc band, sampled each degree of the sweep."""
+        pts = []
+        for step in range(render.ARC_SWEEP + 1):
+            angle = math.radians(start + step)
+            for radius in (outer, outer - width):
+                pts.append((240 + radius * math.cos(angle), 240 + radius * math.sin(angle)))
+        return pts
+
+    def header_regions(self):
+        ring = REGISTRY["boards"][BOARD]["ring"]
+        half = render.HEADER_TITLE_WIDTH / 2
+        return [(240 - half, ring["header_y"], 240 + half, ring["header_y"] + ring["header_h"]),    # clock, dots, title
+                (240 - 64, ring["footer_y"], 240 + 64, ring["footer_y"] + render.PAGE_DOT_SIZE + 2)]  # page dots
+
+    def test_with_the_header_the_gap_is_at_the_top_and_clears_it(self):
+        header = render.arc_start_angle({"ui": {"header": True}})
+        self.assertEqual(header, 315)
+        for x, y in self.band_points(header):
+            for x0, y0, x1, y1 in self.header_regions():
+                self.assertFalse(x0 <= x <= x1 and y0 <= y <= y1, (x, y))
+        # the outer edge stays on the 480 px screen
+        self.assertTrue(all(math.hypot(x - 240, y - 240) <= 220.01 for x, y in self.band_points(header)))
+        # the default orientation (gap at the bottom) would run straight through the header
+        hit = [(x, y) for x, y in self.band_points(135)
+               if self.header_regions()[0][0] <= x <= self.header_regions()[0][2]
+               and self.header_regions()[0][1] <= y <= self.header_regions()[0][3]]
+        self.assertTrue(hit)
+
+    def test_the_header_gap_is_wide_enough_for_the_title_row(self):
+        board = REGISTRY["boards"][BOARD]
+        ring = board["ring"]
+        lowest = ring["header_y"] + ring["header_h"]
+        for angle in (render.arc_end_angle(315), 315):                  # the two ends of the arc
+            outer_y = 240 + 220 * math.sin(math.radians(angle))
+            self.assertGreater(outer_y, lowest)
+
+    def test_header_and_gauge_arc_render_together(self):
+        text = self.gauge_device(header=True)
+        page = self.page(text, 1)
+        self.assertIn("start_angle: 315", page)
+        self.assertIn("end_angle: 225", page)
+        self.assertIn("id: p1_clock,", page)
+        self.assertLess(page.index("id: p1_arc"), page.index("id: p1_tap"))
+        self.assertEqual(self.page(self.gauge_device(), 1).count("start_angle: 135"), 2)   # the arc and the first zone
+
+    def test_bars_fit_the_content_box(self):
+        text = self.gauge_device()
+        page = self.page(text, 0)
+        self.assertEqual(page.count("- bar:"), 4)
+        widths = [int(w) for w in re.findall(r"- bar:\n\s+id: \S+\n\s+width: (\d+)", page)]
+        self.assertEqual(widths, [60] * 4)
+        heights = {int(h) for h in re.findall(r"- bar:\n\s+id: \S+\n\s+width: \d+\n\s+height: (\d+)", page)}
+        self.assertEqual(heights, {render.BAR_HEIGHT})
+        self.assertTrue(200 <= render.BAR_HEIGHT <= 220)
+        cols = [int(w) for w in re.findall(r"- obj:\n\s+width: (\d+)\n\s+height: 100%", page)]
+        self.assertEqual(cols, [85] * 4)
+        self.assertLessEqual(sum(cols), 340)
+        self.assertIn("flex_align_main: SPACE_EVENLY", page)
+        self.assertIn("id: p0_content\n            align: CENTER\n            width: 340\n            height: 340", page)
+        # label + bar + value row stack inside the 340 px column
+        stack = render.FONT_SIZES["small"] + render.FONT_SIZES["bar"] * 1.2 + render.BAR_HEIGHT + 2 * render.BAR_PAD_ROW
+        self.assertLess(stack, 340)
+        for count, width in ((1, 340), (2, 170), (3, 113), (4, 85)):
+            self.assertEqual(render.bar_column_width(340, count), width)
+            self.assertGreaterEqual(render.bar_column_width(340, count), render.BAR_WIDTH)
+
+    def test_one_bar_alone_is_laid_out_and_valid(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"][0]["items"] = ["fuel"]
+        text = self.gauge_device(mutate)
+        self.assertEqual(self.page(text, 0).count("- bar:"), 1)
+        self.assertIn("width: 340\n                  height: 100%", self.page(text, 0))
+
+    # -- colours, stale behaviour -------------------------------------------------------------
+
+    def test_indicator_colour_follows_severity_and_goes_grey_when_not_fresh(self):
+        text = self.gauge_device()
+        lam = text.split("float n = id(ins_fuel_num);")[1].split("          }\n")[0]
+        self.assertIn("uint8_t g = fresh ? id(ins_fuel_sev) : 0;", lam)
+        self.assertIn("if (g != id(ins_fuel_gdrawn)) {", lam)
+        self.assertIn("uint32_t c = 0x37474F;", lam)
+        for number, colour in ((1, "1E7B34"), (2, "F2A900"), (3, "C62828")):
+            self.assertIn(f"if (g == {number}) c = 0x{colour};", lam)
+        self.assertIn("lv_obj_set_style_bg_color(id(p0_fuel_bar), lv_color_hex(c), LV_PART_INDICATOR);", lam)
+        self.assertIn("lv_obj_set_style_arc_color(id(p1_arc), lv_color_hex(c), LV_PART_INDICATOR);", lam)
+        self.assertEqual(lam.count("0x1E7B34"), 1)               # green only for sev ok
+        fresh = text.split("float n = id(ins_fuel_num);")[0].rsplit("bool fresh = ", 1)[1].split(";")[0]
+        for term in ("id(bridge_online)", "mqtt::global_mqtt_client->is_connected()", "id(ins_fuel_ok)",
+                     "millis() - id(ins_fuel_seen)) < 70000UL"):
+            self.assertIn(term, fresh)
+        self.assertIn("fresh ?", lam.split("float pb")[1].split(";")[0])                  # level 0 when stale
+
+    def test_stale_text_is_the_existing_blank_and_the_unit_is_a_literal(self):
+        text = self.gauge_device()
+        tiles = text.split("  - id: render_tiles")[1].split("\n  - id:")[0]
+        self.assertIn("id: p0_fuel_value\n          text: !lambda", tiles)
+        self.assertIn("id: p1_fuel_value\n          text: !lambda", tiles)
+        self.assertIn('return fresh ? id(ins_fuel_val) : std::string("--");', tiles)
+        self.assertIn('id: p0_fuel_value, text: "--"', text)
+        self.assertIn('id: p1_fuel_value, text: "--"', text)
+
+    def test_without_thresholds_the_indicator_is_neutral_never_green(self):
+        text = self.gauge_device()
+        lam = text.split("float n = id(ins_lpg_num);")[1].split("          }\n")[0]
+        self.assertIn("uint8_t g = fresh ? 4 : 0;", lam)
+        self.assertIn("if (g == 4) c = 0x2E86C1;", lam)
+        self.assertNotIn("ins_lpg_sev", text)
+        self.assertNotIn("ins_lpg_drawn_sev", text)            # no tile colour either
+        self.assertNotEqual(render.GAUGE_DAY[render.GAUGE_NEUTRAL], render.GAUGE_DAY[1])
+        self.assertNotEqual(render.GAUGE_NIGHT[render.GAUGE_NEUTRAL], render.GAUGE_NIGHT[1])
+        self.assertEqual(len(set(render.GAUGE_DAY.values())), 5)
+        self.assertEqual(len(set(render.GAUGE_NIGHT.values())), 5)
+
+    def test_an_instrument_on_a_tile_and_a_bar_keeps_both_colour_paths_apart(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"].append({"title": "Tiles", "layout": "grid-2x2", "items": ["fuel", "water"]})
+        text = self.gauge_device(mutate)
+        sev = text.split("uint8_t sev = fresh ?")[1].split("          }\n")[0]
+        self.assertIn("id(p2_fuel_tile)", sev)
+        self.assertNotIn("_bar", sev)
+        self.assertNotIn("p0_", sev)
+        self.assertIn("ins_fuel_drawn_sev", text)
+        self.assertIn("ins_fuel_gdrawn", text)
+        ids = set(re.findall(r"\bid: (\w+)", text))
+        for ref in set(re.findall(r"id\((p\d+_\w+)\)", text)):
+            self.assertIn(ref, ids, ref)
+
+    def test_a_gauge_only_instrument_gets_no_tile_colour_code(self):
+        text = self.gauge_device()
+        self.assertNotIn("uint8_t sev = fresh", text)
+        self.assertNotIn("drawn_sev", text)
+        self.assertIn("ins_fuel_sev", text)                                    # still read by the gauge
+
+    def test_every_referenced_id_exists(self):
+        for kw in ({}, {"header": True, "night": True}):
+            text = self.gauge_device(**kw)
+            ids = set(re.findall(r"\bid: (\w+)", text)) | set(re.findall(r"\{id: (\w+)", text))
+            for ref in set(re.findall(r"id\((\w+)\)", text)) - {"board_backlight"}:   # the board package's
+                self.assertIn(ref, ids, ref)
+
+    # -- night, header ------------------------------------------------------------------------
+
+    def test_night_repaints_tracks_zones_text_and_indicators(self):
+        text = self.gauge_device(night=True)
+        script = text.split("  - id: apply_night")[1].split("\n  - id:")[0]
+        for needle in ("lv_obj_set_style_bg_color(id(p0_fuel_bar), lv_color_hex(n ? 0x1A0800 : 0x263238), LV_PART_MAIN);",
+                       "lv_obj_set_style_arc_color(id(p1_arc), lv_color_hex(n ? 0x1A0800 : 0x263238), LV_PART_MAIN);",
+                       "lv_obj_set_style_arc_color(id(p1_zone0), lv_color_hex(n ? 0xC00000 : 0xC62828), LV_PART_MAIN);",
+                       "lv_obj_set_style_arc_color(id(p1_zone1), lv_color_hex(n ? 0xB06A00 : 0xF2A900), LV_PART_MAIN);",
+                       "id(p0_lpg_name)", "id(p0_lpg_value)", "id(p0_lpg_unit)", "id(p1_fuel_name)",
+                       "id(p1_fuel_value)", "id(p1_fuel_unit)"):
+            self.assertIn(needle, script)
+        for iid in ("fuel", "water", "waste", "lpg"):
+            self.assertIn(f"id(ins_{iid}_gdrawn) = 255;", script)
+        self.assertNotIn("drawn_sev", script)
+        lam = text.split("float n = id(ins_fuel_num);")[1].split("          }\n")[0]
+        self.assertIn("if (id(night_active)) {", lam)
+        self.assertLess(lam.index("0xC62828"), lam.index("if (id(night_active))"))
+        self.assertIn("if (g == 3) c = 0xC00000;", lam)
+        self.assertIn("id: p0_fuel_name, ", text)                  # static labels reachable by the palette
+
+    def test_no_night_code_without_night(self):
+        text = self.gauge_device()
+        self.assertNotIn("night_active", text)
+        self.assertNotIn("id: p0_fuel_name", text)
+
+    def test_night_gauge_palette_has_no_blue_and_stays_dim(self):
+        for colour in list(render.GAUGE_NIGHT.values()) + [render.TRACK_COLOR["night"]]:
+            self.assertEqual(colour & 0xFF, 0)
+            self.assertLessEqual((colour >> 8) & 0xFF, 0x6A)
+
+    def test_bars_stay_inside_the_content_box_below_the_header(self):
+        text = self.gauge_device(header=True)
+        page = self.page(text, 0)
+        board = REGISTRY["boards"][BOARD]
+        top = (board["height"] - board["content_height"]) // 2
+        self.assertGreaterEqual(top, board["ring"]["header_y"] + board["ring"]["header_h"])
+        self.assertIn("id: p0_content\n            align: CENTER\n            width: 340", page)
+        self.assertEqual(page.count("id: p0_title,"), 1)
+        self.assertLess(page.index("id: p0_content"), page.index("id: p0_clock"))
+        self.assertLess(page.index("id: p0_pages"), page.index("id: p0_tap"))
+
+    # -- text ---------------------------------------------------------------------------------
+
+    def test_hostile_labels_and_units_stay_literal_and_out_of_lambdas(self):
+        hostile = {"fuel": ("$x ${y} \"q\" \\ #:", "${u}"), "water": ("<% 1+1 %>", "$$")}
+
+        def mutate(cfg):
+            for iid, (label, unit) in hostile.items():
+                cfg["instruments"][iid].update(label=label[:16], unit=unit)
+        text = self.gauge_device(mutate)
+        for iid, (label, unit) in hostile.items():
+            self.assertIn(f"text: !literal {render.yq(label[:16])}", text)
+            self.assertIn(f"text: !literal {render.yq(unit)}", text)
+        inside = "".join(l for l in text.splitlines() if "lambda" in l or "lv_" in l or "snprintf" in l)
+        for label, unit in hostile.values():
+            self.assertNotIn(label[:16], inside)
+            self.assertNotIn(unit, inside)
+        for line in text.splitlines():
+            if "${y}" in line or "<% 1+1" in line:
+                self.assertTrue(line.lstrip().startswith("- label:") or "glyphs:" in line, line)
+
+    def test_unsupported_glyph_in_a_gauge_label_is_still_reported(self):
+        self.set_config(lambda cfg: (gauge_pages(cfg), cfg["instruments"]["fuel"].update(label="Fuel \u2603")))
+        with self.assertRaises(render.RenderError) as caught:
+            self.collect(allow_missing_wifi=True)
+        self.assertIn("U+2603", str(caught.exception))
+
+    def test_fonts_exist_only_for_the_layouts_that_need_them(self):
+        both = self.gauge_device()
+        self.assertIn("id: font_value_bar\n    size: 36", both)
+        self.assertIn("id: font_value_single\n    size: 96", both)
+        for fid in ("font_value_bar", "font_value_single"):
+            glyphs = re.search(rf'id: {fid}\n    size: \d+\n    bpp: 4\n    glyphs: !literal (".*")', both)
+            self.assertEqual(json.loads(glyphs.group(1)), "0123456789.- ")
+        bold = {chr(c) for c in render.font_coverage("bold")}
+        self.assertTrue(set(render.VALUE_GLYPHS) <= bold)
+        self.assertNotIn("font_value_grid", both)
+        bars_only = self.gauge_device(lambda cfg: cfg["displays"]["helm"].update(pages=cfg["displays"]["helm"]["pages"][:1]))
+        self.assertIn("font_value_bar", bars_only)
+        self.assertNotIn("font_value_single", bars_only)
+        arc_only = self.gauge_device(lambda cfg: cfg["displays"]["helm"].update(pages=cfg["displays"]["helm"]["pages"][1:]))
+        self.assertNotIn("font_value_bar", arc_only)
+        self.assertIn("font_value_single", arc_only)
+        self.assertIn("id: font_small", both)
+        # the value row fits a 85 px column: "100" plus the unit
+        self.assertLess(3 * render.FONT_SIZES["bar"] * 0.5 + 25, render.bar_column_width(340, 4))
+
+    def test_gauge_page_in_a_larger_display_keeps_the_other_pages_unchanged(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"] = ([{"title": "Nav", "layout": "grid-2x2",
+                                                  "items": ["sog", "depth", "awa", "house_v"]}]
+                                                + cfg["displays"]["helm"]["pages"])
+        text = self.gauge_device(mutate)
+        base = self.device(allow_missing_wifi=True)
+        self.assertEqual(self.page(text, 0).replace("\n", ""), self.page(base, 0).replace("\n", ""))
+
+    def test_subscribes_to_the_gauge_instruments_only(self):
+        text = self.gauge_device()
+        self.assertEqual(sorted(re.findall(r"- topic: vesselstack/v1/instruments/(\w+)", text)),
+                         ["fuel", "lpg", "waste", "water"])
+
+    def test_registry_lists_the_new_layouts_and_keeps_the_default_page(self):
+        board = REGISTRY["boards"][BOARD]
+        self.assertEqual(board["layouts"][:3], ["single", "grid-2x2", "status-grid"])
+        self.assertEqual(REGISTRY["layouts"]["tank-bars"], {"capacity": 4, "min_items": 1,
+                                                            "shapes": ["round", "rect"], "types": ["instrument"]})
+        self.assertEqual(REGISTRY["layouts"]["gauge-arc"], {"capacity": 1, "min_items": 1,
+                                                            "shapes": ["round"], "types": ["instrument"]})
+        page = lifecycle.default_page(REGISTRY, EXAMPLE, BOARD)
+        self.assertEqual(page["layout"], "grid-2x2")           # tank-bars needs min/max: never a default
 
 
 class Secrets(Base):
