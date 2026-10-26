@@ -492,7 +492,8 @@ nano vesselstack.env
 | `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
 | `DISPLAYS_BRIDGE_MQTT_USERNAME` | Bridge account name, 1-64 letters, numbers, dot, underscore or hyphen; default `vesselstack-bridge`; must differ from `MQTT_USERNAME` (the Control Panel rejects a collision when displays are enabled, and the installer preflight rejects it) |
 | `DISPLAYS_SIGNALK_TOKEN` | Optional SignalK access token for the displays bridge, sent as `Authorization: Bearer`; leave empty unless SignalK security requires it; must not contain line breaks or any other control character (the Control Panel and the installer both refuse them) |
-| Terminal wizard and `--set` | The three `DISPLAYS_*` settings are asked under "Advanced settings" (the bridge user name and token only when displays are enabled; the token is hidden and optional) and can be set headless, for example `--set DISPLAYS_ENABLE=true`; they are kept when you re-run the wizard |
+| `DISPLAYS_HA_TOKEN` | Optional long-lived access token of a dedicated **non-admin** Home Assistant user, used only by the displays bridge for Home Assistant items (`ha` in `displays.json`, see [Home Assistant items](#home-assistant-items)); the bridge connects to `HOME_ASSISTANT_URL` (default `http://127.0.0.1:8123`). Stored only in the root-only 0600 `config/displays-bridge.env`, never logged; same rule as the SignalK token: no line breaks or other control characters. Different from `HOME_ASSISTANT_TOKEN` (Boat Chat) |
+| Terminal wizard and `--set` | The `DISPLAYS_*` settings are asked under "Advanced settings" (the bridge user name and the two tokens only when displays are enabled; the tokens are hidden and optional) and can be set headless, for example `--set DISPLAYS_ENABLE=true`; they are kept when you re-run the wizard |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
 under `/opt/vesselstack/config/` and are not printed.
@@ -1071,12 +1072,15 @@ working. With `DISPLAYS_ENABLE=true` these accounts are added:
 | Account | Read | Write |
 | --- | --- | --- |
 | `MQTT_USERNAME` (admin) | `#`, `$SYS/#` | `#` |
-| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/bridge/#` |
-| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
+| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/ha/#`, `vesselstack/v1/bridge/#` |
+| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/ha/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
 
-Display accounts are read-only for instrument, notification and alarm data and cannot
-read other MQTT topics such as `homeassistant/#`. Any other MQTT account is
-granted nothing.
+Display accounts are read-only for instrument, notification, alarm and Home Assistant
+item data and cannot read other MQTT topics such as `homeassistant/#`. Any other MQTT
+account is granted nothing. The `vesselstack/v1/ha/#` rule is new with Home Assistant
+items: the next installer run or `sudo vesselstackctl display sync-mqtt` rewrites the ACL
+on an existing install and signals the broker; until then the bridge cannot publish
+Home Assistant items and displays cannot read them (the other topics keep working).
 
 **Existing installations:** the `vesselstack/v1/notifications/#` rules were added
 with the display notifications feature. The ACL file is rewritten by the next
@@ -1306,7 +1310,14 @@ bridge is only started by `--start` or `vesselstackctl start`. The unit runs as 
 hardening as Boat Chat plus a read-only filesystem view; it only reads
 `displays.json`. The bridge MQTT account may only publish
 `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`,
-`vesselstack/v1/alarms/#` and `vesselstack/v1/bridge/#`.
+`vesselstack/v1/alarms/#`, `vesselstack/v1/ha/#` and `vesselstack/v1/bridge/#`.
+With Home Assistant items (`ha` in `displays.json`) the bridge also opens one
+websocket to `HOME_ASSISTANT_URL`; see [Home Assistant items](#home-assistant-items).
+The environment file then also holds `DISPLAYS_HA_TOKEN` and `HOME_ASSISTANT_URL`
+(written only when the token is set). The installer preflight (`--dry-run` too)
+warns, without failing, when `displays.json` defines `ha` items but
+`DISPLAYS_HA_TOKEN` is empty or `HOME_ASSISTANT_URL` is not a usable
+`http(s)://host:port` URL, and rejects a token with a line break or control character.
 
 Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
 `online` (and `offline` on a clean stop; Mosquitto publishes the retained last
@@ -1357,6 +1368,9 @@ Troubleshooting:
 - Every instrument is `stale` or `missing` while the bridge is online and
   connected: the SignalK `path` in `displays.json` is not being produced, or the
   token cannot read it.
+- `bridge/homeassistant` is `disabled` and Home Assistant items show `--`:
+  `DISPLAYS_HA_TOKEN` is empty or Home Assistant rejected it; see
+  [Home Assistant items](#home-assistant-items).
 
 Stop or remove: `sudo systemctl stop vesselstack-displays-bridge` stops it until
 the next `vesselstackctl start`/installer `--start`. Set `DISPLAYS_ENABLE=false`
@@ -1738,6 +1752,7 @@ The runtime configuration lives at `$VESSELSTACK_ROOT/config/displays.json`.
 Start from [`displays/displays.example.json`](displays/displays.example.json).
 It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
 `heartbeat_s` (1-60, default 5), `instruments`, optional `notifications`, optional
+`ha` (see [Home Assistant items](#home-assistant-items)), optional
 `night_schedule` and `displays`:
 
 - An instrument (`^[a-z][a-z0-9_]{0,31}$`) has a SignalK `path` for
@@ -1753,12 +1768,14 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
   supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6,
   `status-grid` holds 1-9, `tank-bars` holds 1-4, `gauge-arc` holds 1, `electrical` holds 3-5) and unique `items` naming existing instruments or,
-  on layouts that accept them (`status-grid`, and the shore slot of `electrical`), notifications. Each layout
-  declares the item types it accepts; `single`, `grid-2x2`, `tank-bars` and
-  `gauge-arc` take instruments only. On `electrical` the position of an item
+  on layouts that accept them (`status-grid`, and the shore slot of `electrical`), notifications and Home Assistant items. Each layout
+  declares the item types it accepts; `single`, `grid-2x2`, `list-6`, `tank-bars` and
+  `gauge-arc` take instruments and numeric Home Assistant items; only `status-grid` and the
+  shore slot of `electrical` take binary and state Home Assistant items. On `electrical` the position of an item
   in `items` decides its role (see [The `electrical` layout](#the-electrical-layout)).
 - A notification (see [Notifications](#notifications)) has the same id rules
-  as an instrument; ids are unique across instruments and notifications.
+  as an instrument; ids are unique across instruments, notifications and Home
+  Assistant items.
 - Conversions: `none`, `m/s->kn`, `m/s->km/h`, `m/s->mph`, `K->C`, `K->F`,
   `rad->deg`, `rad->deg_signed` (-180..180], `rad->deg_360` [0,360), `m->ft`,
   `m->fathom`, `m->nmi`, `ratio->%`, `Pa->hPa`, `Pa->bar`, `Pa->psi`, `m3->L`,
@@ -2011,7 +2028,11 @@ dots, left to right, are SignalK (bridge reports `connected`), the bridge
 (`bridge/status` `online`) and MQTT (the display's own connection): green is
 good, red is bad and grey is unknown. The SignalK dot is retained data, so it is
 only ever green while the bridge is online and MQTT is connected; a stopped
-bridge shows grey, never a stale green. Page titles are checked against the
+bridge shows grey, never a stale green. When `displays.json` has any `ha` item a
+fourth dot (Home Assistant, 14 px to the right of the MQTT dot) follows the retained
+`bridge/homeassistant`: green `connected`, red `disconnected`, grey `disabled` or not
+yet known; like the SignalK dot it is only coloured while the bridge is online. Without
+`ha` items nothing is generated for it. Page titles are checked against the
 bundled font like labels (`validate` and `display render` report a glyph the
 font lacks), but only when `header` is on.
 
@@ -2080,7 +2101,7 @@ previous firmware); the extra topic is harmless to older displays.
 
 #### The `status-grid` layout
 
-`status-grid` shows 1-9 instruments and notifications, one cell each, inside
+`status-grid` shows 1-9 instruments, notifications and Home Assistant items, one cell each, inside
 the board's content area (340 x 340 px on the Waveshare 2.8C) with 6 px gaps:
 
 | Items | Grid (columns x rows) | Cell size |
@@ -2094,7 +2115,9 @@ the fixed words **OK**, **WARN**, **ALARM** or **--** in a bold font and its
 background follows the severity (grey when stale, unknown or offline). An
 instrument cell shows the value and unit as on the other layouts and is
 coloured by its severity if it has `thresholds`, otherwise the plain tile
-colour. All text is fixed in the firmware; labels are `!literal` scalars and no
+colour. A binary or state Home Assistant cell shows its own fixed text and severity
+colour (see [Home Assistant items](#home-assistant-items)); a numeric one is an instrument cell.
+All text is fixed in the firmware; labels are `!literal` scalars and no
 text is built from MQTT data. Words are shown in a 48 px bold font in 2 x 2
 grids and 30 px otherwise. Nothing was measured on the hardware yet: long
 labels are clipped with an ellipsis.
@@ -2263,9 +2286,9 @@ default page of `display add`.
 
 [`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
 has an `Electrical` page: `house_v` (the voltage the Nav page already used),
-`batt_soc` (thresholds `warn_below` 30 / `alarm_below` 20), `batt_a`, a
-`shore_power` notification (`alarm: false`, so a lost shore connection does not
-raise the takeover banner; it is an example path, change or remove it) and
+`batt_soc` (thresholds `warn_below` 30 / `alarm_below` 20), `batt_a`, the
+`shore` Home Assistant binary item (`alarm: false`, so a lost shore connection does not
+raise the takeover banner; the entity is an example, change or remove it) and
 `solar_a`. To use it: add the instruments with the right `path`, `convert`,
 `min` and `max`, put them on a page in this order, run `vesselstackctl display
 validate`, then rebuild and reflash (`display build ID`, then `display flash ID
@@ -2275,11 +2298,130 @@ reflash, or flash the previous firmware (`display flash ID --previous ...`).
 Not verified on the hardware yet: how the page looks on the round panel, the
 row spacing and the 56 px digits against the ring.
 
+#### Home Assistant items
+
+Home Assistant (HA) entities, such as a bilge pump switch, a high water sensor, the
+shore power state or a summary sensor you built in HA, can be shown next to SignalK
+data. The bridge keeps one websocket open to HA, reads only the entities named in
+`ha`, and publishes a severity and a small index per item, never the state text. This
+is an optional extra: SignalK instruments and notifications work whether or not HA is
+reachable. It has been verified against a fake HA server in the integration tests, not
+yet against a real Home Assistant.
+
+**Create the token.** In HA create a dedicated **non-admin** user (Settings, People,
+Users) that can see the entities you want, sign in as that user and create a
+long-lived access token (Profile, Security, Long-lived access tokens). A long-lived
+token is *not* read-only: it carries every right of its user, which is why the user
+must not be an administrator, and why you should revoke the token in HA if it leaks.
+Then set it, with the URL if HA is not on the Pi:
+
+- `DISPLAYS_HA_TOKEN` in `/opt/vesselstack/config/vesselstack.env`, the Control Panel
+  (Displays section, hidden field) or the terminal wizard (advanced settings, hidden
+  input); and `HOME_ASSISTANT_URL` (default `http://127.0.0.1:8123`; `https://` is
+  used as `wss://`, credentials in the URL are refused).
+- Re-run the installer (or Control Panel Apply). The token is written only to the
+  root-only 0600 `config/displays-bridge.env` (included in backups, like the SignalK
+  token) and sent once in the websocket `auth` message; the bridge never logs it,
+  and removes it from any log text. With no token the bridge logs one warning,
+  does not connect, and the items show `--`.
+
+**Configure the items.** A top-level `ha` object in `displays.json`; ids follow the
+instrument id rules and are unique across instruments, notifications and `ha`:
+
+```json
+"ha": {
+  "bilge": {"entity_id": "binary_sensor.vesselstack_bilge_pump", "label": "Bilge", "kind": "binary",
+            "states": [{"match": "on", "sev": "warn", "text": "RUNNING"},
+                       {"match": "off", "sev": "ok", "text": "OFF"}]},
+  "engine": {"entity_id": "sensor.engine_alarm_status", "label": "Engine", "kind": "state",
+             "states": [{"match": "all clear", "sev": "ok", "text": "CLEAR"}],
+             "default": {"sev": "alarm", "text": "ALARM"}},
+  "watch": {"entity_id": "sensor.boat_watch_summary", "label": "Watch", "kind": "state",
+            "states": [{"prefix": "anchor: clear", "sev": "ok", "text": "CLEAR"}],
+            "default": {"sev": "warn", "text": "CHECK"}},
+  "cabin_t": {"entity_id": "sensor.cabin_temperature", "label": "Cabin", "kind": "numeric",
+              "unit": "C", "precision": 1, "thresholds": {"warn_above": 30, "alarm_above": 40},
+              "min": 0, "max": 50, "alarm": false}
+}
+```
+
+- `entity_id` (`domain.object_id`), `label` (1-16 printable characters in the
+  bundled font), `kind` (`binary`, `state` or `numeric`) and `alarm` (boolean,
+  default true: whether the item counts in the [alarm
+  summary](#alarm-summary-and-takeover)) are common.
+- `binary` and `state` items list 1-8 `states`; each has exactly one of `match` (the
+  whole state) or `prefix` (the start of it), a `sev` (`ok`, `warn` or `alarm`) and a
+  `text` of 1-10 printable characters shown in the cell. Comparison ignores case and
+  surrounding spaces, and the **first** matching entry wins. A state no entry matches
+  takes `default` (`sev` and `text`). `state` requires `default`; a `binary` item
+  without one shows `?` in amber (never green by accident). The `text` and `label` are
+  checked against the bundled font like other labels.
+- `numeric` items work like instruments: `unit` and `precision` are required, with
+  optional `thresholds`, `min` and `max` ([Thresholds and severity
+  colours](#thresholds-and-severity-colours)); the state must parse as a finite
+  number. They are accepted on every layout that accepts instruments (a bar or an arc
+  also needs `min` and `max`) and show the value and unit with threshold colours.
+- **Unknown values.** A state of `unknown`, `unavailable`, `none` or empty (and an
+  entity HA does not know, or a number that does not parse) is *missing*: the cell
+  shows grey `--` and the severity is `unknown`; those words cannot be used in
+  `match` or `prefix`. An unmatched state is not missing: it takes `default`.
+- Freshness: while the bridge is connected to HA the item is `ok` (or `missing`);
+  when the connection drops every item becomes `stale` and everything heard is
+  forgotten. A display greys a cell after 3 x `heartbeat_s` without a message, when the
+  bridge is offline or when MQTT is disconnected, like notifications.
+- Binary and state items are only accepted on `status-grid` and, for `binary` items, in
+  the `shore` slot of an `electrical` page, where the text appears in the pill. The
+  validator names the item and the layout otherwise.
+
+Home Assistant state strings are never displayed. The firmware only shows the
+`label` and the compile-time `text` that the item's index `k` selects (one generated
+`if` per index; `-1` is the default text), or a number for numeric items. Texts and
+labels are `!literal` scalars. Keep texts short: on a 3-column `status-grid` about 7 characters fit before they are
+clipped (not measured on the hardware). A cell, or the shore pill, uses the same
+guarded green/amber/red colours as notifications (day and night palettes), grey when
+unknown, stale or offline.
+
+**Topics.** Each item is published retained, at most once a second when only a number
+changes and every `heartbeat_s`, to `vesselstack/v1/ha/<id>` as
+`{"v":null,"k":0,"u":"","st":"ok","sev":"warn","ts":"...","age":1.2}`: `v` is the
+number of a numeric item (else `null`), `k` the index of the matched `states` entry
+(`-1`: the default; `null` for numeric and missing items), `st` is `ok`, `missing` or
+`stale`, and `ts` is the bridge's time of the last state received. The retained
+`vesselstack/v1/bridge/homeassistant` is `connected`, `disconnected` or `disabled`
+(the token is missing or HA rejected it). The ACL needs the new `vesselstack/v1/ha/#`
+rule (see [MQTT access control](#mqtt-access-control)). The bridge uses HA's
+`subscribe_entities` and falls back to `get_states` plus `state_changed` events on an
+HA that lacks it; it reconnects with a 1-30 s jittered backoff, and after
+`auth_invalid` retries every 5 minutes.
+
+**What changes.** Opt-in per item. The bridge process gains one outbound websocket
+to HA and one thread; Mosquitto's ACL gains `ha/#` (applied by the next installer or
+`vesselstackctl display sync-mqtt`). Display firmware must be rebuilt and reflashed
+(`display build`, `display flash`) to show `ha` items; firmware built earlier ignores
+them. The dashboard example adds seven items (bilge, high water, engine, shore, watch,
+weather, health) and reworks the Status page; on it the build report went from
+1199131 to 1212499 bytes of flash (+13.4 kB) and from 123835 to 127227 bytes of RAM
+(+3.4 kB) relative to the Electrical-page example. How the cells look on the panel is
+not verified on the hardware.
+
+**Troubleshooting.** `sudo vesselstackctl logs displays` shows `Home Assistant
+connected (entities)` (or the fallback line) when it works. `bridge/homeassistant`
+`disabled` with "rejected the access token" means the token is wrong, revoked or its
+user was deleted: create a new token and re-run the installer; `DISPLAYS_HA_TOKEN is
+empty` means it was never set. `disconnected` repeating means HA is unreachable at
+`HOME_ASSISTANT_URL` (check it from the Pi; the bridge runs on the host, so
+`127.0.0.1` is right only when HA listens there). An item stuck on `--` with the bridge
+`connected`: the `entity_id` is wrong, not visible to the token's user, or its state is
+`unknown`/`unavailable`. An unexpected word means the state matched an earlier entry or
+fell to `default`. Rollback: remove the `ha` items (or clear `DISPLAYS_HA_TOKEN`),
+re-run the installer, rebuild and reflash, or flash the previous firmware; the `ha/#`
+ACL rule is harmless.
+
 #### Board registry schema 2
 
 `displays/boards/registry.json` is now `schema` 2, where each layout is an
 object `{"capacity", "min_items", "shapes": ["round","rect"], "types":
-["instrument","notification"]}` (the allowed item types). `schema` 1
+["instrument","notification","ha"]}` (the allowed item types). `schema` 1
 registries (a layout is just an integer capacity) are still accepted and mean
 `min_items` 1, both shapes and instruments only. A layout may also have `slots`
 (used by `electrical`): a list with one `{"role", "types", "needs", "optional"}`
@@ -2307,7 +2449,8 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
 `vesselstack/v1/displays/<username>/status`.
 Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
-(see [Notifications](#notifications)); the combined alarm state is
+(see [Notifications](#notifications)), Home Assistant items `vesselstack/v1/ha/<id>` (see
+[Home Assistant items](#home-assistant-items)) and `vesselstack/v1/bridge/homeassistant`; the combined alarm state is
 `vesselstack/v1/alarms/summary` (see [Alarm summary and takeover](#alarm-summary-and-takeover)).
 
 - `sev` (optional): instruments that have `thresholds` also publish
