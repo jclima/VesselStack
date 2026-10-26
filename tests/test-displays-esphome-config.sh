@@ -231,7 +231,14 @@ def ha_items(cfg):
     cfg["displays"]["helm"]["ui"] = {"swipe": True, "header": True, "night": "schedule", "alarm_takeover": True}
     cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
 
+def dashboard_icons(cfg):
+    # The dashboard example with icons on instruments, notifications and Home Assistant items, in every layout.
+    cfg.clear()
+    cfg.update(json.loads((repo / "displays" / "displays.dashboard.example.json").read_text()))
+    assert any("icon" in item for item in cfg["instruments"].values())
+
 variant("example")
+variant("icons", dashboard_icons)
 variant("ha", ha_items)
 variant("electrical", electrical)
 variant("electricalui", electrical_ui)
@@ -304,6 +311,42 @@ check electrical helm
 check electricalui helm
 check electricalmin helm
 check ha helm
+check icons helm
+# Icons: the Material Symbols subset font at the two sizes, glyphs as private-use characters, static labels
+# repainted by the night palette; configurations without icons carry none of it.
+log="$WORK/icons-helm.log"
+for needle in 'path: /config/fonts/MaterialSymbols-subset.ttf' 'id: font_icons' 'text_font: font_icons' \
+        'id: p1_anchor_icon' 'lv_obj_set_style_text_color(id(p1_anchor_icon)' \
+        'lv_obj_set_style_text_color(id(p2_fuel_icon)' 'lv_obj_set_style_text_color(id(p4_batt_soc_icon)'; do
+    grep -qF "$needle" "$log" || { echo "missing from the validated icons config: $needle" >&2; fail=1; }
+done
+python3 -I - "$log" <<'PY' || fail=1
+# The dump lists the glyphs of a font as "- <chars>" and every icon label as "text: <char>": each label's
+# character must be one of the icon font's glyphs, and all of them are private-use characters.
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+glyphs, labels = set(), set()
+for i, line in enumerate(lines):
+    if re.match(r"\s+id: font_icons\w*$", line):
+        j = i + 1
+        while lines[j].strip() != "glyphs:":
+            j += 1
+        j += 1
+        while lines[j].startswith("      - "):
+            glyphs.update(lines[j][8:])
+            j += 1
+    if re.match(r"\s+id: p\d+_\w+_icon$", line):
+        match = re.match(r"\s+text: (.)$", lines[i + 1])
+        assert match, "icon label text is not a single character: %r" % lines[i + 1]
+        labels.add(match.group(1))
+assert glyphs and labels, "no icon glyphs or icon labels in the validated config"
+assert all("\ue000" <= ch <= "\uf8ff" for ch in glyphs | labels), "icon characters are not private-use"
+assert labels == glyphs, "icon font glyphs %r differ from the labels %r" % (sorted(glyphs), sorted(labels))
+print("icon fonts: %d glyphs, all used by icon labels" % len(glyphs))
+PY
+for plain in example status alarm ui electrical ha; do
+    if grep -qE 'MaterialSymbols|font_icons|_icon\b' "$WORK/$plain-helm.log"; then echo "icon code present without icons ($plain)" >&2; fail=1; fi
+done
 # Home Assistant items: a compile-time text per index k, literal user text, the connection dot, a numeric arc.
 log="$WORK/ha-helm.log"
 for needle in 'topic: vesselstack/v1/ha/bilge_pump' 'topic: vesselstack/v1/ha/cabin_t' 'ins_bilge_pump_k' \
