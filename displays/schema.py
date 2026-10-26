@@ -34,7 +34,8 @@ INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after
 THRESHOLD_BOUNDS = (("alarm_below", "low"), ("warn_below", "low"), ("warn_above", "high"), ("alarm_above", "high"))
 THRESHOLD_KEYS = {name for name, _ in THRESHOLD_BOUNDS} | {"hysteresis"}
 INSTRUMENT_REQUIRED = {"path", "label", "convert", "unit", "precision", "stale_after_s"}
-DISPLAY_KEYS = {"name", "board", "home_assistant_api", "pages"}
+DISPLAY_KEYS = {"name", "board", "home_assistant_api", "pages", "ui"}
+UI_KEYS = {"alarm_takeover", "alarm_page"}
 DISPLAY_REQUIRED = {"name", "board", "pages"}
 PAGE_KEYS = {"title", "layout", "items"}
 BOARD_KEYS = {"name", "width", "height", "shape", "safe_inset", "content_width", "content_height", "layouts",
@@ -109,6 +110,37 @@ def validate_thresholds(th, where: str, errors: list) -> None:
             errors.append(f"{where}.hysteresis: must be a finite number >= 0")
         elif gaps and h >= min(gaps):
             errors.append(f"{where}.hysteresis: must be less than the smallest gap between bounds ({min(gaps)})")
+
+
+def counts_for_alarm_summary(cfg: dict) -> bool:
+    """True when at least one item would be counted in the bridge's alarm summary."""
+    instruments = cfg.get("instruments")
+    notifications = cfg.get("notifications")
+    return any(isinstance(i, dict) and i.get("alarm", "thresholds" in i) is True
+               for i in (instruments.values() if isinstance(instruments, dict) else ())) \
+        or any(isinstance(n, dict) and n.get("alarm", True) is True
+               for n in (notifications.values() if isinstance(notifications, dict) else ()))
+
+
+def validate_ui(ui, where: str, pages, instruments, notifications, errors: list) -> None:
+    """Per-display ``ui`` options: ``alarm_takeover`` (bool) and ``alarm_page`` (index into pages)."""
+    if not isinstance(ui, dict):
+        errors.append(f"{where}: must be an object")
+        return
+    _unknown(ui, UI_KEYS, where, errors)
+    if "alarm_takeover" in ui and not isinstance(ui["alarm_takeover"], bool):
+        errors.append(f"{where}.alarm_takeover: must be true or false")
+    if "alarm_page" in ui:
+        count = len(pages) if isinstance(pages, list) else None
+        if not is_int(ui["alarm_page"]) or ui["alarm_page"] < 0:
+            errors.append(f"{where}.alarm_page: must be a page index (an integer >= 0)")
+        elif count is not None and ui["alarm_page"] >= count:
+            errors.append(f"{where}.alarm_page: page index {ui['alarm_page']} is out of range "
+                          f"(the display has {count} page(s))")
+    if ui.get("alarm_takeover") is True and not counts_for_alarm_summary(
+            {"instruments": instruments, "notifications": notifications}):
+        errors.append(f"{where}.alarm_takeover: nothing counts towards the alarm summary; add an "
+                      "instrument with thresholds (or alarm: true) or a notification")
 
 
 def _unknown(obj: dict, allowed: set, where: str, errors: list) -> None:
@@ -354,6 +386,8 @@ def validate_config(cfg, registry) -> list[str]:
                 if "board" in disp and board is None:
                     errors.append(f"{where}.board: unknown board {disp['board']!r}")
                 pages = disp.get("pages")
+                if "ui" in disp:
+                    validate_ui(disp["ui"], f"{where}.ui", pages, instruments, notifications, errors)
                 if "pages" not in disp:
                     continue
                 if not isinstance(pages, list) or not 1 <= len(pages) <= 8:

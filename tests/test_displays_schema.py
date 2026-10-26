@@ -373,3 +373,54 @@ class NotificationTests(unittest.TestCase):
         with_notes(cfg)
         errors = schema.validate_config(cfg, reg)
         self.assertTrue(any("needs at least 3" in e for e in errors), errors)
+
+
+class UiOptionTests(unittest.TestCase):
+    def assertError(self, mutate, fragment):
+        errors = errors_for(mutate)
+        self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
+
+    @staticmethod
+    def with_ui(**ui):
+        def mutate(cfg):
+            with_notes(cfg)
+            cfg["displays"]["helm"]["ui"] = ui
+        return mutate
+
+    def test_valid_ui(self) -> None:
+        self.assertEqual(errors_for(self.with_ui(alarm_takeover=True, alarm_page=1)), [])
+        self.assertEqual(errors_for(self.with_ui(alarm_takeover=False)), [])
+        self.assertEqual(errors_for(self.with_ui()), [])
+
+    def test_ui_keys_and_types(self) -> None:
+        w = "$.displays.helm.ui"
+        self.assertError(self.with_ui(extra=1), f"{w}.extra: unknown key")
+        self.assertError(self.with_ui(alarm_takeover="yes"), f"{w}.alarm_takeover")
+        self.assertError(self.with_ui(alarm_takeover=1), f"{w}.alarm_takeover")
+        self.assertError(lambda c: c["displays"]["helm"].update(ui=[]), f"{w}: must be an object")
+
+    def test_alarm_page_is_a_valid_page_index(self) -> None:
+        w = "$.displays.helm.ui.alarm_page"
+        for bad in (-1, "1", 1.5, True, None):
+            self.assertError(self.with_ui(alarm_page=bad), w)
+        self.assertError(self.with_ui(alarm_page=2), "out of range")
+
+    def test_takeover_needs_something_to_count(self) -> None:
+        def nothing(cfg):
+            cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True}
+        self.assertError(nothing, "nothing counts towards the alarm summary")
+
+        def thresholded(cfg):
+            inst(cfg)["thresholds"] = {"alarm_below": 1}
+            cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True}
+        self.assertEqual(errors_for(thresholded), [])
+
+        def muted(cfg):
+            thresholded(cfg)
+            inst(cfg)["alarm"] = False
+        self.assertError(muted, "nothing counts")
+
+        def forced(cfg):
+            nothing(cfg)
+            inst(cfg)["alarm"] = True
+        self.assertEqual(errors_for(forced), [])
