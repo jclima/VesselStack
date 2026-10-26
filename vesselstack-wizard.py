@@ -19,7 +19,7 @@ DEFAULTS = {
  "INFLUXDB_RAW_BUCKET":"signalk","INFLUXDB_HISTORY_BUCKET":"signalk_1m","INFLUXDB_HOME_ASSISTANT_BUCKET":"homeassistant","INFLUXDB_AIS_BUCKET":"ais","INFLUXDB_RAW_RETENTION":"","INFLUXDB_PASSWORD":"GENERATE","INFLUXDB_TOKEN":"GENERATE","GRAFANA_ADMIN_PASSWORD":"GENERATE",
  "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true",
  "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780",
- "DISPLAYS_ENABLE":"false","DISPLAYS_BRIDGE_MQTT_USERNAME":"vesselstack-bridge","DISPLAYS_SIGNALK_TOKEN":"",
+ "DISPLAYS_ENABLE":"false","DISPLAYS_BRIDGE_MQTT_USERNAME":"vesselstack-bridge","DISPLAYS_SIGNALK_TOKEN":"","DISPLAYS_HA_TOKEN":"",
 }
 
 def compose_available():
@@ -304,6 +304,7 @@ SECTIONS=[
   F("DISPLAYS_ENABLE","Run the instrument displays bridge?","Publishes the instruments configured in displays.json to MQTT for ESP32 displays (preview). Say no if you have no display. The displays themselves are managed with vesselstackctl display.","bool",advanced=True),
   F("DISPLAYS_BRIDGE_MQTT_USERNAME","Displays bridge MQTT user name","MQTT account the displays bridge uses; it must differ from the Home Assistant MQTT user name. Its password is generated during installation.",advanced=True,required=True,check=NAME,when=lambda s:s.values["DISPLAYS_ENABLE"]=="true"),
   F("DISPLAYS_SIGNALK_TOKEN","Signal K access token for the displays bridge (optional)","Only needed when your Signal K server requires a token to read data. Optional: press Enter to skip. Input is hidden and never printed.","secret",advanced=True,optional=True,check=TOKEN,generate=False,when=lambda s:s.values["DISPLAYS_ENABLE"]=="true"),
+  F("DISPLAYS_HA_TOKEN","Home Assistant access token for the displays bridge (optional)","Only needed to show Home Assistant items (the ha section of displays.json) on a display. Use a long-lived access token of a dedicated non-admin Home Assistant user; the token carries that user's rights and is not read-only. Optional: press Enter to skip. Input is hidden and never printed.","secret",advanced=True,optional=True,check=TOKEN,generate=False,when=lambda s:s.values["DISPLAYS_ENABLE"]=="true"),
   F("BOAT_CHAT_HOST","Boat Chat listens on","IP address Boat Chat binds to. 0.0.0.0 = every network (needs its access token); 127.0.0.1 = this device only.",advanced=True,required=True,check=_any_ip),
   F("BOAT_CHAT_PORT","Boat Chat port","TCP port of Boat Chat.",advanced=True,required=True,check=PORT),
   _secret("BOAT_CHAT_ACCESS_TOKEN","Boat Chat access token","Needed to open Boat Chat from another device."),

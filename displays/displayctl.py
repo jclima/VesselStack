@@ -16,6 +16,7 @@ import render  # noqa: E402
 import schema  # noqa: E402
 
 DEFAULT_CONFIG = schema.MODULE_DIR / "displays.example.json"
+DEFAULT_HA_URL = "http://127.0.0.1:8123"
 
 
 def cmd_validate(args) -> int:
@@ -81,8 +82,8 @@ def cmd_preflight(args) -> int:
         print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
         return 2
     env = {key: os.environ[key] for key in
-           ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
-            "DISPLAYS_BRIDGE_MQTT_USERNAME") if key in os.environ}
+           ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE", "DISPLAYS_BRIDGE_MQTT_USERNAME",
+            "DISPLAYS_HA_TOKEN", "HOME_ASSISTANT_URL") if key in os.environ}
     mode = "pull" if args.pull_image else "check" if args.check_image else "none"
     try:
         warnings = mqtt_auth.preflight(
@@ -121,6 +122,9 @@ def render_bridge_env(root: Path, env: dict, bridge_password: str) -> str:
         ("DISPLAYS_BRIDGE_MQTT_PASSWORD", bridge_password),
         ("DISPLAYS_SIGNALK_TOKEN", env.get("DISPLAYS_SIGNALK_TOKEN", "")),
     ]
+    if env.get("DISPLAYS_HA_TOKEN"):   # Home Assistant items are an opt-in extra: nothing is written without a token
+        values.append(("HOME_ASSISTANT_URL", env.get("HOME_ASSISTANT_URL") or DEFAULT_HA_URL))
+        values.append(("DISPLAYS_HA_TOKEN", env["DISPLAYS_HA_TOKEN"]))
     if env.get("BOAT_TIMEZONE"):  # the vessel's IANA zone: the bridge clock and night schedule follow it
         values.append(("BOAT_TIMEZONE", env["BOAT_TIMEZONE"]))
     return "".join(systemd_env_line(key, value) for key, value in values)
@@ -138,8 +142,8 @@ def cmd_bridge_env(args) -> int:
         return 2
     root = Path(root_text)
     env = {key: os.environ[key] for key in
-           ("SIGNALK_URL", "MQTT_PORT", "DISPLAYS_BRIDGE_MQTT_USERNAME",
-            "DISPLAYS_SIGNALK_TOKEN", "BOAT_TIMEZONE") if key in os.environ}
+           ("SIGNALK_URL", "MQTT_PORT", "DISPLAYS_BRIDGE_MQTT_USERNAME", "DISPLAYS_SIGNALK_TOKEN",
+            "DISPLAYS_HA_TOKEN", "HOME_ASSISTANT_URL", "BOAT_TIMEZONE") if key in os.environ}
     try:
         output = Path(args.output)
         with mqtt_auth.config_lock(root):

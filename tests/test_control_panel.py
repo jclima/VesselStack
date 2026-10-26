@@ -192,6 +192,8 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertEqual(panel.component_command("displays-bridge", "restart"),
                                  ["systemctl", "restart", "vesselstack-displays-bridge.service"])
         self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_SIGNALK_TOKEN"]["kind"], "secret")
+        self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]["kind"], "secret")
+        self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]["section"], "Displays")
 
     def test_displays_values_mirror_the_installer_checks(self) -> None:
         user = panel.FIELD_BY_KEY["DISPLAYS_BRIDGE_MQTT_USERNAME"]
@@ -209,6 +211,16 @@ class CommandAllowlistTests(unittest.TestCase):
         for bad in ("a\tb", "a\x01b", "a\x7fb", "a\x00b", "a\nb", "a\rb", "a\x1bb"):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 panel.validate_value(token, bad)
+
+    def test_ha_token_rejects_control_characters_and_is_never_echoed(self) -> None:
+        token = panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]
+        self.assertEqual(panel.validate_value(token, "eyJ.abc_-d"), "eyJ.abc_-d")
+        self.assertEqual(panel.validate_value(token, ""), "")
+        for bad in ("a\tb", "a\nb", "a\x7fb", "a\x00b", "a\rb"):
+            with self.assertRaises(ValueError, msg=repr(bad)) as caught:
+                panel.validate_value(token, bad)
+            self.assertTrue(str(caught.exception).startswith("Displays bridge Home Assistant token "))
+            self.assertNotIn(bad, str(caught.exception))
 
     def test_bridge_username_must_differ_from_the_mqtt_username(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

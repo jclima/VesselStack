@@ -601,6 +601,33 @@ def config_lock(root: Path, timeout: float = LOCK_TIMEOUT_S):
 
 # --- preflight ---------------------------------------------------------------
 
+def ha_warnings(config_path: Path | None, enabled: bool, env: dict) -> list[str]:
+    """Warnings for Home Assistant items (``ha``) the bridge could not serve; never an error.
+
+    The items are an optional extra: without a usable token and URL the bridge still runs and
+    publishes SignalK, and the Home Assistant items just show "--" on the displays.
+    """
+    if not enabled or config_path is None or not config_path.exists():
+        return []
+    try:
+        ha = schema.load_json(config_path).get("ha")
+    except (OSError, ValueError, AttributeError):
+        return []     # load_display_ids has already reported an unreadable or invalid file
+    if not ha:
+        return []
+    out = []
+    if not env.get("DISPLAYS_HA_TOKEN"):
+        out.append(f"{config_path} defines Home Assistant items but DISPLAYS_HA_TOKEN is empty: they will be "
+                   "disabled and show -- on the displays (SignalK items are not affected)")
+    url = env.get("HOME_ASSISTANT_URL") or "http://127.0.0.1:8123"
+    try:
+        import topics
+        topics.ha_websocket_url(url)
+    except ValueError as exc:
+        out.append(f"HOME_ASSISTANT_URL is not usable for Home Assistant items: {exc}")
+    return out
+
+
 def preflight(root: Path, env: dict, compose: Path | None = None,
               displays_config: Path | None = None, image: str | None = None,
               image_mode: str = "none", runner=default_runner) -> list[str]:
@@ -624,6 +651,7 @@ def preflight(root: Path, env: dict, compose: Path | None = None,
     if displays_config is None:
         displays_config = root / "config" / "displays.json"
     display_ids = load_display_ids(displays_config, enabled)
+    warnings.extend(ha_warnings(displays_config, enabled, env))
     placeholder = {"bridge": {"mqtt_password": "x"},
                    "displays": {i: {"mqtt_password": "x"} for i in display_ids}}
     build_accounts(admin_user, "x", enabled, bridge_user, display_ids, placeholder)

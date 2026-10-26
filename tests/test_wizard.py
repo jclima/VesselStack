@@ -11,6 +11,7 @@ from http.server import ThreadingHTTPServer
 import os
 import stat
 import subprocess
+import types
 import tempfile
 import unittest
 from pathlib import Path
@@ -566,6 +567,27 @@ class CliCommandTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             values = wizard.load_env(out2)
             self.assertEqual((values["BOAT_NAME"], values["VESSELSTACK_USER"], values["BOAT_TYPE"]), ("From Base", "daemon", "Yacht"))
+
+    def test_displays_ha_token_is_a_hidden_optional_secret_set_with_set(self):
+        field = wizard.FIELD_INDEX["DISPLAYS_HA_TOKEN"]
+        self.assertEqual((field["kind"], bool(field.get("advanced")), wizard.DEFAULTS["DISPLAYS_HA_TOKEN"]),
+                         ("secret", True, ""))
+        off, on = dict(wizard.DEFAULTS, DISPLAYS_ENABLE="false"), dict(wizard.DEFAULTS, DISPLAYS_ENABLE="true")
+        self.assertFalse(field["when"](types.SimpleNamespace(values=off)))     # asked only with displays on
+        self.assertTrue(field["when"](types.SimpleNamespace(values=on)))
+        self.assertEqual(wizard.describe(field, "tok"), "set (hidden)")
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = self.run_wizard("--defaults", "--set", "DISPLAYS_ENABLE=true", "--set",
+                                     "DISPLAYS_HA_TOKEN=eyJhbGciOi.payload_part-1.sig", "--output", str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(wizard.load_env(out)["DISPLAYS_HA_TOKEN"], "eyJhbGciOi.payload_part-1.sig")
+            self.assertNotIn("eyJhbGciOi", result.stdout + result.stderr)
+            self.assertEqual(self.run_wizard("--validate", str(out)).returncode, 0)
+            bad = self.run_wizard("--defaults", "--set", "DISPLAYS_HA_TOKEN=bad;tok", "--output",
+                                  str(Path(directory) / "bad.env"))
+            self.assertEqual(bad.returncode, 1)
+            self.assertNotIn("bad;tok", bad.stdout + bad.stderr)
 
     def test_invalid_set_writes_nothing_and_does_not_echo_the_value(self):
         with tempfile.TemporaryDirectory() as directory:

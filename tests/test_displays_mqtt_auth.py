@@ -570,6 +570,27 @@ class MqttAuthTests(unittest.TestCase):
         self.config.unlink()
         self.preflight()  # no file yet: nothing to validate
 
+    def test_preflight_warns_about_ha_items_without_a_token_or_with_a_bad_url(self):
+        cfg = json.loads(json.dumps(EXAMPLE))
+        cfg["ha"] = {"bilge": {"entity_id": "binary_sensor.bilge", "label": "Bilge", "kind": "binary",
+                               "states": [{"match": "on", "sev": "warn", "text": "ON"}]}}
+        self.config.write_text(json.dumps(cfg))
+        warnings = self.preflight()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("DISPLAYS_HA_TOKEN is empty", warnings[0])
+        self.assertIn("SignalK items are not affected", warnings[0])
+        self.assertEqual(self.preflight(DISPLAYS_HA_TOKEN="tok"), [])
+        self.assertEqual(self.preflight(DISPLAYS_HA_TOKEN="tok", HOME_ASSISTANT_URL="https://ha.local"), [])
+        bad = self.preflight(DISPLAYS_HA_TOKEN="tok", HOME_ASSISTANT_URL="ftp://ha.local")
+        self.assertEqual(len(bad), 1)
+        self.assertIn("HOME_ASSISTANT_URL", bad[0])
+        creds = self.preflight(DISPLAYS_HA_TOKEN="tok", HOME_ASSISTANT_URL="http://u" + ":pw-secret@ha.local")
+        self.assertEqual(len(creds), 1)
+        self.assertNotIn("pw-secret", creds[0])
+        self.assertEqual(self.preflight(enabled="false"), [])          # displays off: nothing to warn about
+        write_displays(self.config, ["helm"])
+        self.assertEqual(self.preflight(), [])                          # no ha items: silent as before
+
     def test_preflight_image_modes(self):
         class Absent(FakeRunner):
             registry = True

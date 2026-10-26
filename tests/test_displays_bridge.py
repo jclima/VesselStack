@@ -594,6 +594,44 @@ class BridgeEnvTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIn('BOAT_TIMEZONE="Europe/Oslo"\n', output.read_text())
 
+    def test_bridge_env_carries_the_ha_token_and_url_only_when_a_token_is_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "config" / "displays.secrets.json").write_text(json.dumps(
+                {"schema": 1, "bridge": {"mqtt_password": "pw"}, "displays": {}}))
+            output = root / "config" / "displays-bridge.env"
+            env = {"SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_BRIDGE_MQTT_USERNAME": "vesselstack-bridge"}
+            code, out, err = self.run_cmd(root, output, env)
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("HOME_ASSISTANT", output.read_text())
+            self.assertNotIn("DISPLAYS_HA_TOKEN", output.read_text())
+            code, out, err = self.run_cmd(root, output, {**env, "DISPLAYS_HA_TOKEN": 'ha"tok\\x',
+                                                         "HOME_ASSISTANT_URL": "http://ha.local:8123"})
+            self.assertEqual(code, 0, err)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            text = output.read_text()
+            self.assertIn('DISPLAYS_HA_TOKEN="ha\\"tok\\\\x"\n', text)
+            self.assertIn('HOME_ASSISTANT_URL="http://ha.local:8123"\n', text)
+            self.assertNotIn("ha\"tok", out + err)
+            values = {}
+            for line in text.splitlines():
+                key, raw = line.split("=", 1)
+                values[key] = json.loads(raw)
+            settings = bridge.load_settings(values)
+            self.assertEqual((settings.ha_token, settings.ha_url), ('ha"tok\\x', "http://ha.local:8123"))
+            # no URL given: the stack default, same as everywhere else
+            code, _, err = self.run_cmd(root, output, {**env, "DISPLAYS_HA_TOKEN": "tok"})
+            self.assertEqual(code, 0, err)
+            self.assertIn('HOME_ASSISTANT_URL="http://127.0.0.1:8123"\n', output.read_text())
+            # control characters in the token are refused and the old file is kept
+            before = output.read_text()
+            code, _, err = self.run_cmd(root, output, {**env, "DISPLAYS_HA_TOKEN": "bad\ntoken"})
+            self.assertEqual(code, 1)
+            self.assertIn("control characters", err)
+            self.assertNotIn("bad", err.replace("bridge-env failed", ""))
+            self.assertEqual(output.read_text(), before)
+
     def test_bridge_env_requires_a_generated_password(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

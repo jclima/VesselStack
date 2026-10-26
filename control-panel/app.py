@@ -122,6 +122,7 @@ FIELDS = [
     field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
     field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
     field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
+    field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", "Displays", kind="secret", description="Optional. A long-lived access token of a dedicated non-admin Home Assistant user, needed only for Home Assistant items (ha) in displays.json. Leave blank otherwise."),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
     field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),
@@ -253,11 +254,11 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         if address.version != 4:
             raise ValueError(f"{spec['label']} must be an IPv4 address")
     # Mirrors the installer: account names go into the Mosquitto password and ACL
-    # files, and the SignalK token into a systemd EnvironmentFile line.
+    # files, and the SignalK and Home Assistant tokens into a systemd EnvironmentFile line.
     if spec["key"] in {"MQTT_USERNAME", "DISPLAYS_BRIDGE_MQTT_USERNAME"} and text:
         if not MQTT_ACCOUNT_NAME.fullmatch(text):
             raise ValueError(f"{spec['label']} may contain 1-64 letters, numbers, dot, underscore, and hyphen")
-    if spec["key"] == "DISPLAYS_SIGNALK_TOKEN" and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+    if spec["key"] in {"DISPLAYS_SIGNALK_TOKEN", "DISPLAYS_HA_TOKEN"} and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
         raise ValueError(f"{spec['label']} must not contain control characters")
     if spec["key"] in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
         if not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*", text):

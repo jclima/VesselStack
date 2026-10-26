@@ -83,6 +83,7 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
 : "${DISPLAYS_SIGNALK_TOKEN:=}"
+: "${DISPLAYS_HA_TOKEN:=}"
 # Empty = unset: fresh InfluxDB setups get 30d on the raw bucket; existing buckets
 # are never changed unless a value is set explicitly (see README).
 : "${INFLUXDB_RAW_RETENTION:=}"
@@ -145,11 +146,13 @@ for key in MQTT_USERNAME DISPLAYS_BRIDGE_MQTT_USERNAME; do
         exit 1
     fi
 done
-# The optional SignalK token goes into a systemd EnvironmentFile line.
-if [[ "$DISPLAYS_SIGNALK_TOKEN" =~ [[:cntrl:]] ]]; then
-    echo "DISPLAYS_SIGNALK_TOKEN must not contain line breaks or control characters" >&2
-    exit 1
-fi
+# The optional SignalK and Home Assistant tokens go into a systemd EnvironmentFile line.
+for key in DISPLAYS_SIGNALK_TOKEN DISPLAYS_HA_TOKEN; do
+    if [[ "${!key}" =~ [[:cntrl:]] ]]; then
+        echo "$key must not contain line breaks or control characters" >&2
+        exit 1
+    fi
+done
 for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
     [[ "${!key}" =~ ^([0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*)?$ ]] || {
         echo "$key must be comma-separated ports or LOW:HIGH ranges, e.g. 22,5000:5100" >&2
@@ -357,6 +360,7 @@ displays_preflight() {
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="${MQTT_PASSWORD:-}" \
         DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
+        DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
         python3 "$SCRIPT_DIR/displays/displayctl.py" preflight \
         --root "$VESSELSTACK_ROOT" --compose "$MOSQUITTO_COMPOSE" "$@"
 }
@@ -760,6 +764,7 @@ if [ "$DISPLAYS_ENABLE" = true ]; then
         SIGNALK_URL="$SIGNALK_URL" MQTT_PORT="$MQTT_PORT" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
         DISPLAYS_SIGNALK_TOKEN="$DISPLAYS_SIGNALK_TOKEN" BOAT_TIMEZONE="$BOAT_TIMEZONE" \
+        DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
         python3 "$VESSELSTACK_ROOT/displays/displayctl.py" bridge-env \
         --root "$VESSELSTACK_ROOT" \
         --output "$VESSELSTACK_ROOT/config/displays-bridge.env" \
@@ -845,6 +850,7 @@ TELEMETRY_INDEXER_ENABLE
 DISPLAYS_ENABLE
 DISPLAYS_BRIDGE_MQTT_USERNAME
 DISPLAYS_SIGNALK_TOKEN
+DISPLAYS_HA_TOKEN
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
