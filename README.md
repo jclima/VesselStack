@@ -1176,8 +1176,12 @@ commands** (`vesselstackctl display list|add|remove|rotate|wifi|status`), the
 (`vesselstackctl display render|export|build|flash`, see [Firmware: generate, build and
 flash](#firmware-generate-build-and-flash)) exist today (`displays/`). With
 `DISPLAYS_ENABLE=true` the bridge publishes your configured instruments to
-Mosquitto. The generated firmware config validates and compiles but has not yet
-run on real display hardware. Building and flashing on the Pi is optional
+Mosquitto. The Waveshare 2.8C has been verified on real hardware: bring-up
+(colours, orientation, round safe area and touch coordinates) needed no knob
+changes, and the path SignalK, bridge, MQTT, screen worked end to end on a
+Raspberry Pi with a firmware built on the Pi and flashed over USB serial. Not
+yet verified on hardware: OTA updates, long-term stability and `.local` (mDNS)
+name resolution. Building and flashing on the Pi is optional
 (`vesselstackctl display build|flash`, see [Building and flashing on the
 Pi](#building-and-flashing-on-the-pi)); building on a laptop remains the
 primary documented path. The always-on Mosquitto ACL does affect existing installations
@@ -1657,9 +1661,11 @@ existing display.
 
 #### Hardware bring-up checklist (Waveshare ESP32-S3-Touch-LCD-2.8C)
 
-The configuration validates and compiles with the pinned ESPHome, but it has
-not been run on real hardware yet. On first boot, check in this order and turn
-only the matching knob in `boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml` of the
+The configuration validates and compiles with the pinned ESPHome, and it has
+been run on one real 2.8C unit: red, green, blue and white were correct,
+orientation, the round safe area and touch coordinates were consistent, and no
+knob needed changing. Other units (or a different hardware revision) may differ,
+so on first boot check in this order and turn only the matching knob in `boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml` of the
 exported project (or in `displays/esphome/boards/` for all future exports):
 
 | Symptom | Knob |
@@ -1739,7 +1745,7 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; flashing is untested without hardware); hardware unverified (see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 

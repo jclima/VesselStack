@@ -1,9 +1,11 @@
 # Waveshare ESP32-S3-Touch-LCD-2.8C: hardware only.
 # Contract ids: board_display, board_touch, board_backlight, board_i2c.
 # Values sourced from the Waveshare ESP-IDF demo (ST7701S.c/.h, GT911.c/.h, TCA9554PWR.c/.h).
-# STATUS: the configuration validates and compiles with the pinned ESPHome
-# version, but it has NOT been verified on real hardware yet. The README
-# ("Hardware bring-up checklist") lists the knobs to turn if the picture is wrong.
+# STATUS: verified on one real unit (colours R/G/B/W, orientation, round safe
+# area and touch coordinates correct, no knob changes needed; SignalK -> bridge
+# -> MQTT -> screen worked end to end). OTA, long-term stability and mDNS were
+# not verified. The README ("Hardware bring-up checklist") lists the knobs to
+# turn if another unit's picture is wrong.
 # The content box (inscribed square) and the layouts live in the board registry
 # and the generated UI, not here: this file is hardware only.
 substitutions:
