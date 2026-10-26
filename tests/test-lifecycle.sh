@@ -174,6 +174,38 @@ test -s "$DATA_ROOT/mosquitto/passwords" || {
 }
 grep -q 'RESULT healthy' <<<"$doctor_output"
 
+# Docker-mode SignalK: doctor names the root-owned bind-mount source, the symptom
+# and the one-line fix when the container is not running; other modes stay silent.
+if grep -q 'SignalK data directory' <<<"$doctor_output"; then
+    echo 'doctor reported SignalK data directory outside docker mode' >&2
+    exit 1
+fi
+DOCTOR_DATA="$TEST_ROOT/doctor-data"
+install -d "$DOCTOR_DATA/signalk"
+sed -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=$DOCTOR_DATA|" \
+    "$APP_ROOT/config/vesselstack.env" > "$TEST_ROOT/doctor.env"
+printf 'SIGNALK_MODE=docker\n' >> "$TEST_ROOT/doctor.env"
+run_doctor() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+        VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$TEST_ROOT/doctor.env" \
+        "$REPO_ROOT/scripts/vesselstackctl" doctor 2>&1 || true
+}
+if [ "$(id -u)" -eq 0 ]; then
+    chown 0:0 "$DOCTOR_DATA/signalk"
+    chmod 0755 "$DOCTOR_DATA/signalk"
+    broken_output=$(run_doctor)
+    grep -q 'FAIL SignalK container is not running and its data directory' <<<"$broken_output"
+    grep -Fq "sudo chown -R 1000:1000 $DOCTOR_DATA/signalk && docker restart vesselstack-signalk" <<<"$broken_output"
+    chown 1000:1000 "$DOCTOR_DATA/signalk"
+    chmod 0750 "$DOCTOR_DATA/signalk"
+    fixed_output=$(run_doctor)
+    grep -q 'OK   SignalK data directory is writable' <<<"$fixed_output"
+    if grep -q 'FAIL SignalK container' <<<"$fixed_output"; then
+        echo 'doctor still reports the fixed SignalK data directory' >&2
+        exit 1
+    fi
+fi
+
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"
 python3 - "$unsafe" "${APP_ROOT#/}" <<'PY'
 import io

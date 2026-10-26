@@ -151,9 +151,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.2/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.2 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.2
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.3/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.3 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.3
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -285,7 +285,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.2
+git checkout v0.4.3
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -426,7 +426,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.4.2
+git checkout v0.4.3
 ```
 
 ## 4. Configure the vessel
@@ -605,7 +605,8 @@ does not silently enable safety alerts or assume thresholds.
 ### SignalK and InfluxDB
 
 With `SIGNALK_MODE=docker`, VesselStack starts the official pinned SignalK
-image and persists its settings in `/opt/vesselstack-data/signalk`. With
+image and persists its settings in `/opt/vesselstack-data/signalk` (owned by
+uid/gid 1000, the image's `node` user, so the container can write it). With
 `SIGNALK_MODE=native`, it installs the pinned npm package under
 `/opt/vesselstack/signalk-server` and runs it as the locked VesselStack user.
 `SIGNALK_MODE=existing` never modifies SignalK. The managed modes use the same
@@ -809,7 +810,11 @@ descriptor).
 create, rename, replace or symlink anything directly in it. Only the leaf mount
 roots belong to the accounts that must write them: `influxdb` (uid/gid 1000),
 `grafana` (uid 472, gid 0) and `boat-chat` (service user; native SignalK state
-`signalk` likewise). Intermediate directories the installer writes through
+`signalk` likewise; with `SIGNALK_MODE=docker` `signalk` is uid/gid 1000, the
+`node` user of the signalk-server image, created before `compose up`; a
+root-owned one left by Docker is chowned to 1000:1000 on rerun, non-recursively
+when empty, otherwise recursively but never through symlinks, and the change is
+printed; a symlink inside it makes the installer refuse). Intermediate directories the installer writes through
 (`homeassistant`, `homeassistant/blueprints/...`) must be root-owned and not
 group/world-writable. Before touching anything the installer refuses, with a
 message naming the path, a symlink at any managed entry (`influxdb`, `grafana`,
@@ -1189,7 +1194,7 @@ Rollback of a completed upgrade is a restore of the pre-update backup that
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.2.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.3.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -1327,6 +1332,24 @@ sudo test -s /opt/vesselstack-data/mosquitto/passwords
 sudo docker logs vesselstack-mosquitto --tail 100
 ```
 
+### SignalK not running / EACCES on package.json
+
+Symptom (`SIGNALK_MODE=docker`): the `vesselstack-signalk` container restarts or
+exits and `sudo docker logs vesselstack-signalk` shows
+`EACCES: permission denied, open '/home/node/.signalk/package.json'`. The
+`signalk-server` image runs SignalK as its `node` user (uid/gid 1000, config
+directory `/home/node/.signalk`), but `<data>/signalk` was created by Docker as
+`root:root`. No release before 0.4.3 created it; 0.4.3 and later create it
+as `1000:1000` mode 0750 before `compose up` and repair a root-owned one on
+every installer run, so rerunning the installer (`sudo vesselstackctl update` or
+the installer from the release) fixes it. `sudo vesselstackctl doctor` also
+detects the condition and prints the fix. Manual fix (the data directory is
+`/opt/vesselstack-data` by default):
+
+```bash
+sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk
+```
+
 ### Container mount permissions fail
 
 Inspect the affected container log and mount. Do not recursively change all
@@ -1390,7 +1413,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-0.4.2.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-0.4.3.tar.gz.sha256)
 ```
 
 The package is produced by `git archive` of the committed `HEAD`, so untracked

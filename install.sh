@@ -461,6 +461,40 @@ done
 # Change only the mount root itself; never recursively rewrite existing data.
 install -d -m 0750 -o 1000 -g 1000 "$VESSELSTACK_DATA/influxdb"
 install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
+# The signalk-server image runs SignalK as its "node" user (uid/gid 1000, config
+# dir /home/node/.signalk). Without a pre-created, correctly owned source directory
+# Docker creates the bind mount as root:root and SignalK exits with
+# "EACCES: permission denied, open '/home/node/.signalk/package.json'".
+# Native mode keeps its own service-user-owned directory (install-signalk-native.sh).
+SIGNALK_CONTAINER_UID=1000
+SIGNALK_CONTAINER_GID=1000
+ensure_signalk_docker_dir() {
+    local dir="$VESSELSTACK_DATA/signalk" want="$SIGNALK_CONTAINER_UID:$SIGNALK_CONTAINER_GID" have
+    safe_data_path "$dir" leaf
+    if [ ! -e "$dir" ]; then
+        install -d -m 0750 -o "$SIGNALK_CONTAINER_UID" -g "$SIGNALK_CONTAINER_GID" "$dir"
+        return 0
+    fi
+    [ -d "$dir" ] || fail_data_path "$dir exists but is not a directory"
+    have=$(stat -c %u:%g "$dir")
+    [ "$have" != "$want" ] || return 0
+    # Created as root:root by Docker (or left by native mode): hand it to the
+    # container user. Never follow symlinks, never touch other filesystems.
+    if [ -n "$(find "$dir" -xdev -mindepth 1 -type l -print -quit)" ]; then
+        fail_data_path "$dir contains symlinks; refusing to change ownership (they may be legitimate, e.g. node_modules/.bin). Review them, then run: chown -R -h $want '$dir' and rerun"
+    fi
+    if [ -z "$(find "$dir" -mindepth 1 -print -quit)" ]; then
+        chown -h "$want" "$dir"
+        echo "Repaired SignalK data directory ownership: $dir $have -> $want (empty directory)"
+    else
+        chown -h "$want" "$dir"
+        find "$dir" -xdev -mindepth 1 -not -type l -exec chown -h "$want" {} +
+        echo "Repaired SignalK data directory ownership: $dir $have -> $want (recursive, no symlinks found)"
+    fi
+}
+if [ "$SIGNALK_MODE" = docker ]; then
+    ensure_signalk_docker_dir
+fi
 # Code and the Python virtualenv are root-owned; the service user may only write
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"

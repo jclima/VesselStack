@@ -106,4 +106,13 @@ if grep -nE '\beval\b|/tmp/' "$ROOT/scripts/get-vesselstack.sh" \
 fi
 test -x "$ROOT/tests/test-get-vesselstack.sh"
 "$ROOT/scripts/get-vesselstack.sh" --help | grep -q -- '--offline'
+# SignalK docker data directory: created for uid/gid 1000 only in docker mode and
+# before compose up (Docker would otherwise create the mount source as root:root).
+# shellcheck disable=SC2016  # Literal source text, not an expansion.
+grep -q '^if \[ "\$SIGNALK_MODE" = docker \]; then$' "$ROOT/install.sh"
+signalk_line=$(grep -n '^    ensure_signalk_docker_dir$' "$ROOT/install.sh" | cut -d: -f1)
+compose_line=$(grep -n '^        compose up -d$' "$ROOT/install.sh" | cut -d: -f1)
+[ -n "$signalk_line" ] && [ -n "$compose_line" ] && [ "$signalk_line" -lt "$compose_line" ] \
+    || { echo "install.sh must create the SignalK data directory before compose up" >&2; exit 1; }
+grep -q '^SIGNALK_CONTAINER_UID=1000$' "$ROOT/install.sh"
 echo "distribution static checks passed"

@@ -266,6 +266,29 @@ disk_usage_warning() {
     fi
 }
 
+# The signalk-server image runs as uid/gid 1000. A bind-mount source that Docker
+# created as root:root (or that is otherwise not writable by uid 1000) makes SignalK
+# exit with "EACCES: permission denied, open '/home/node/.signalk/package.json'".
+check_signalk_data_dir() {
+    local dir="$VESSELSTACK_DATA/signalk" uid gid mode running writable=0
+    [ "${SIGNALK_MODE:-existing}" = docker ] || return 0
+    [ -d "$dir" ] || { printf 'WARN SignalK data directory %s does not exist; rerun the installer\n' "$dir" >&2; return 0; }
+    read -r uid gid mode < <(stat -c '%u %g %a' "$dir")
+    if [ "$uid" = 1000 ] && [ $((8#$mode & 8#200)) -ne 0 ]; then writable=1; fi
+    if [ "$gid" = 1000 ] && [ $((8#$mode & 8#020)) -ne 0 ]; then writable=1; fi
+    if [ $((8#$mode & 8#002)) -ne 0 ]; then writable=1; fi
+    [ "$writable" -eq 0 ] || { printf 'OK   SignalK data directory is writable by the container user (uid 1000)\n'; return 0; }
+    # A crash-looping container flaps between restarting and running, so the
+    # container state does not change the verdict: SignalK cannot work here.
+    running=$("${COMPOSE[@]}" ps --status running --services 2>/dev/null || true)
+    if grep -Fxq signalk <<<"$running"; then state='is running or restarting'; else state='is not running'; fi
+    printf 'FAIL SignalK container %s and its data directory %s is owned by %s:%s (mode %s), not writable by the container user (uid 1000).\n' \
+        "$state" "$dir" "$uid" "$gid" "$mode" >&2
+    printf '     Typical log: EACCES: permission denied, open '"'"'/home/node/.signalk/package.json'"'"'\n' >&2
+    printf '     Fix: sudo chown -R 1000:1000 %s && docker restart vesselstack-signalk\n' "$dir" >&2
+    return 1
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -291,6 +314,7 @@ doctor_stack() {
         failed=1
     fi
     disk_usage_warning
+    check_signalk_data_dir || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'

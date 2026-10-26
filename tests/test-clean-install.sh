@@ -280,6 +280,16 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
     test "$(stat -c '%u:%g' "$DATA2/grafana")" = "472:0"
     test "$(stat -c '%U' "$DATA2/boat-chat")" = "$svc"
     test "$(stat -c '%u' "$DATA2/homeassistant")" = 0
+    # Native SignalK keeps its service-user-owned state directory (not 1000:1000).
+    NATIVE_BIN="$TEST_ROOT/native-bin"
+    install -d "$NATIVE_BIN"
+    printf '#!/bin/bash\necho 22\n' > "$NATIVE_BIN/node"
+    printf '#!/bin/bash\nexit 0\n' > "$NATIVE_BIN/npm"
+    chmod +x "$NATIVE_BIN/node" "$NATIVE_BIN/npm"
+    sed -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="native"|' "$CONFIG2" > "$TEST_ROOT/native.env"
+    env PATH="$NATIVE_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        "$REPO_ROOT/install.sh" --config "$TEST_ROOT/native.env" >/dev/null
+    test "$(stat -c '%U:%a' "$DATA2/signalk")" = "$svc:750"
     # The service user can write its state directory but cannot create, rename or
     # replace anything directly under the data root.
     runuser -u "$svc" -- touch "$DATA2/boat-chat/state-write-test"
@@ -322,5 +332,64 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
     fi
     rm -f -- "$QUARANTINE_ROOT"
 fi
+
+# Docker-mode SignalK: the bind-mount source is created for the container user
+# (uid/gid 1000 of the signalk-server image; the ordering before compose up is
+# checked statically in test-distribution.sh), a root:root directory
+# left by Docker is repaired, symlinks are refused and existing mode creates nothing.
+# Ownership assertions need root.
+APP3="$TEST_ROOT/opt3/vesselstack"
+DATA3="$TEST_ROOT/opt3/vesselstack-data"
+CONFIG3="$TEST_ROOT/signalk-docker.env"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$APP3\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$DATA3\"|" \
+    -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="docker"|' "$CONFIG" > "$CONFIG3"
+install_three() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        "$REPO_ROOT/install.sh" --config "$CONFIG3"
+}
+install_three >/dev/null
+test -d "$DATA3/signalk"
+test ! -e "$DATA_ROOT/signalk"
+if [ "$(id -u)" -eq 0 ]; then
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "1000:1000:750"
+    # Docker created the source as root:root on an earlier run: empty, repaired.
+    chown 0:0 "$DATA3/signalk"
+    chmod 0755 "$DATA3/signalk"
+    repair_output=$(install_three)
+    grep -q 'Repaired SignalK data directory ownership' <<<"$repair_output"
+    test "$(stat -c '%u:%g' "$DATA3/signalk")" = "1000:1000"
+    # A non-empty root-owned tree is repaired recursively.
+    install -d "$DATA3/signalk/plugin-config-data"
+    printf '{}\n' > "$DATA3/signalk/plugin-config-data/a.json"
+    chown -R 0:0 "$DATA3/signalk"
+    repair_output=$(install_three)
+    grep -q 'recursive' <<<"$repair_output"
+    test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "1000:1000"
+    # Already correct: nothing is printed or changed.
+    test -z "$(install_three | grep 'Repaired SignalK' || true)"
+    # A symlink inside the tree is refused and nothing is rewritten.
+    VICTIM3="$TEST_ROOT/victim3"
+    install -d -m 0755 "$VICTIM3"
+    ln -s "$VICTIM3" "$DATA3/signalk/escape"
+    chown -R 0:0 "$DATA3/signalk"
+    if install_three >/dev/null 2>"$TEST_ROOT/sk-inner.stderr"; then
+        echo "Installer repaired a SignalK directory containing a symlink" >&2
+        exit 1
+    fi
+    grep -q 'contains symlinks' "$TEST_ROOT/sk-inner.stderr"
+    test "$(stat -c '%u:%g' "$DATA3/signalk")" = "0:0"
+    test "$(stat -c '%u:%g' "$VICTIM3")" = "0:0"
+    rm -f -- "$DATA3/signalk/escape"
+fi
+# A symlink in place of the signalk directory itself is refused.
+rm -rf -- "$DATA3/signalk"
+ln -s "$TEST_ROOT" "$DATA3/signalk"
+if install_three >/dev/null 2>"$TEST_ROOT/sk-link.stderr"; then
+    echo "Installer followed a symlinked SignalK data directory" >&2
+    exit 1
+fi
+grep -q 'is a symlink' "$TEST_ROOT/sk-link.stderr"
+rm -f -- "$DATA3/signalk"
 
 echo "clean installation checks passed"
