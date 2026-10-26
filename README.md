@@ -1725,17 +1725,19 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
   supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6,
-  `status-grid` holds 1-9, `tank-bars` holds 1-4, `gauge-arc` holds 1) and unique `items` naming existing instruments or,
-  on layouts that accept them (`status-grid`), notifications. Each layout
+  `status-grid` holds 1-9, `tank-bars` holds 1-4, `gauge-arc` holds 1, `electrical` holds 3-5) and unique `items` naming existing instruments or,
+  on layouts that accept them (`status-grid`, and the shore slot of `electrical`), notifications. Each layout
   declares the item types it accepts; `single`, `grid-2x2`, `tank-bars` and
-  `gauge-arc` take instruments only.
+  `gauge-arc` take instruments only. On `electrical` the position of an item
+  in `items` decides its role (see [The `electrical` layout](#the-electrical-layout)).
 - A notification (see [Notifications](#notifications)) has the same id rules
   as an instrument; ids are unique across instruments and notifications.
 - Conversions: `none`, `m/s->kn`, `m/s->km/h`, `m/s->mph`, `K->C`, `K->F`,
   `rad->deg`, `rad->deg_signed` (-180..180], `rad->deg_360` [0,360), `m->ft`,
   `m->fathom`, `m->nmi`, `ratio->%`, `Pa->hPa`, `Pa->bar`, `Pa->psi`, `m3->L`,
   `m3->gal` (US), `m3/s->L/h`, `m3/s->gal/h`, `Hz->rpm`, `C->Ah`, `s->min`,
-  `s->h`.
+  `s->h`, `negate` (changes the sign; for a current sensor wired the wrong way
+  round, see [The `electrical` layout](#the-electrical-layout)).
 
 Unknown keys are rejected at every level, booleans are not accepted where
 integers are expected, and all errors are reported together with a JSON-path
@@ -2157,21 +2159,114 @@ the previous firmware (`display flash ID --previous ...`). Not verified on the
 hardware yet: how the bars and the arc look on the round panel, the column
 widths with long units, and the arc ends near the header.
 
+#### The `electrical` layout
+
+One page for the house battery on the round board: the state of charge as the
+outer ring, the voltage in big digits in the middle, then the SoC, the current
+with a fixed `CHG`/`DSG` word, an optional shore power pill and an optional
+solar line. `items` map **by position** to the slots below, so the order is
+fixed; the error names the role (`pages[2].items[1] (soc): instrument 'batt_soc'
+needs min and max on layout 'electrical'`).
+
+| Position | Role | Accepts | Needs | Shown as |
+| --- | --- | --- | --- | --- |
+| 1 | `voltage` | instrument | - | Label above, value in the 56 px bold digits of `grid-2x2`, unit beside it |
+| 2 | `soc` | instrument | `min` and `max` | The 440 px outer ring (the `gauge-arc` ring: same arc, zones, colours and angles) and a small line `label value unit` |
+| 3 | `current` | instrument | - | Small line `label value unit` plus the word `CHG` or `DSG` |
+| 4 (optional) | `shore` | instrument or notification | - | A pill at the bottom of the text column |
+| 5 (optional) | `solar` | instrument | - | Small line `label value unit` |
+
+A page has 3, 4 or 5 items. Optional slots are trailing: a `solar` item needs a
+`shore` item before it (use a shore notification or instrument even if you only
+want to see the solar line). The layout is round only (`electrical needs a
+round board; use grid-2x2` on a rectangular board). It is never chosen as the
+default page of `display add`.
+
+- **SignalK paths.** `electrical.batteries.<id>.voltage` (volts, `convert`
+  `none`, `unit` `V`, `precision` 2), `electrical.batteries.<id>.capacity.stateOfCharge`
+  (a **ratio 0 to 1**: `convert` `ratio->%`, `unit` `%`, `min` 0, `max` 100) and
+  `electrical.batteries.<id>.current` (amperes, `none`, `unit` `A`, `precision`
+  1). `<id>` is what your battery monitor plugin or N2K gateway reports (`house`,
+  `0`, ...); check the Data Browser in the SignalK admin UI (filter
+  `electrical`). Solar controllers usually publish
+  `electrical.solar.<id>.current`. For a shore pill see below.
+- **SoC ring.** The ring is the `gauge-arc` ring of the SoC instrument: the
+  indicator takes the severity colour of its `thresholds` (green, amber, red),
+  is neutral blue when it has none (never green) and the static zone arcs
+  follow the thresholds. With `ui.header` the gap moves to the top (arc 315 to
+  225 degrees) so the header and the page dots stay clear, as on `gauge-arc`.
+  Only the SoC colours the ring: thresholds on the voltage, current or solar
+  instruments still feed the alarm summary and banner but do not colour this page.
+- **Voltage and text column.** The text column is 300 px wide and 188 to
+  198 px high (3 to 5 items), centred on the screen and inside the free circle
+  of the ring (188 px radius); a unit test checks the corners against the circle
+  and the header and page-dot areas. The voltage uses the 56 px digits (the
+  font `grid-2x2` uses; a display with an `electrical` page gets it). Fonts,
+  glyph sets and the other layouts are otherwise unchanged. Estimated from font sizes, not measured on the panel.
+- **Current and sign convention.** SignalK reports the battery current as
+  positive while **charging** and negative while discharging; the value is shown
+  with a minus sign when negative. The word next to it is `CHG` above +0.05 A,
+  `DSG` below -0.05 A and empty inside that band (and when stale). It is built
+  from three fixed `!literal` branches of one freshness-gated state, never from
+  text. If your shunt is wired the other way, set `"convert": "negate"` on the
+  current instrument: the bridge flips the sign before rounding (never `-0.0`),
+  so the number, `CHG`/`DSG`, any `thresholds` and `alarm` all use the corrected
+  sign. `negate` works on any instrument.
+- **Shore pill.** With a **notification** (for example
+  `notifications.electrical.shorePower`, which you create with a SignalK rule or
+  plugin; the path in the example is a placeholder) the pill is coloured by
+  severity and shows `OK`, `WARN`, `ALARM` or `--` exactly like a `status-grid`
+  cell; use `"absent": "unknown"` unless a missing notification really means
+  shore power is fine. With an **instrument** (any number, for example a shore
+  current or power in amperes) the pill reads `ON` (green) when the value is
+  above 0.5, `OFF` (neutral blue) otherwise and `--` (grey) when stale; shore
+  power being absent is not an alarm. The pill only shows these fixed words and
+  the item's label is the text beside it.
+- **Stale, offline or unknown.** Every number blanks to `--` as on the other
+  layouts, the current word is empty, the ring is empty and grey, and the pill
+  is `--` and grey. The words and colours are derived from the same freshness
+  gate as the severity colours, so a stale reading never shows `CHG`, `DSG`,
+  `ON`, `OK` or green.
+- **Night.** With `ui.night` the text, the ring track, the zone arcs and the
+  pill follow the red/amber night palette through the same guarded repaint as
+  the other layouts.
+- **Cost.** Adding the Electrical page to the dashboard example (compared with
+  the same example without it) changed the ESPHome build report from 1183939
+  to 1199131 bytes of flash (+15.2 kB) and from 121739 to 123835 bytes of RAM (+2.1 kB).
+
+[`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
+has an `Electrical` page: `house_v` (the voltage the Nav page already used),
+`batt_soc` (thresholds `warn_below` 30 / `alarm_below` 20), `batt_a`, a
+`shore_power` notification (`alarm: false`, so a lost shore connection does not
+raise the takeover banner; it is an example path, change or remove it) and
+`solar_a`. To use it: add the instruments with the right `path`, `convert`,
+`min` and `max`, put them on a page in this order, run `vesselstackctl display
+validate`, then rebuild and reflash (`display build ID`, then `display flash ID
+--ota HOST` or `--serial DEVICE`); firmware built before this release cannot
+draw the layout. Rollback: remove the page (or change its layout), rebuild and
+reflash, or flash the previous firmware (`display flash ID --previous ...`).
+Not verified on the hardware yet: how the page looks on the round panel, the
+row spacing and the 56 px digits against the ring.
+
 #### Board registry schema 2
 
 `displays/boards/registry.json` is now `schema` 2, where each layout is an
 object `{"capacity", "min_items", "shapes": ["round","rect"], "types":
 ["instrument","notification"]}` (the allowed item types). `schema` 1
 registries (a layout is just an integer capacity) are still accepted and mean
-`min_items` 1, both shapes and instruments only. A board may only list layouts
+`min_items` 1, both shapes and instruments only. A layout may also have `slots`
+(used by `electrical`): a list with one `{"role", "types", "needs", "optional"}`
+entry per position of `items` (`needs` from `numeric`, `min_max`; `optional`
+slots are trailing; `capacity` must equal the number of slots and `min_items`
+the number of required ones), which the validator turns into the per-role errors. A board may only list layouts
 that support its `shape`. A board may also have an optional `ring`
 (`{"header_y", "header_h", "footer_y"}`, pixels): the bands that `ui.header` uses.
 The header band (at least 50 px high) must end above the content area and the
 10 px page indicator must lie between the content area and the bottom edge;
 the registry validator checks it. `vesselstackctl display add` still picks the largest
-layout that takes only instruments for the default page (`tank-bars` and
-`gauge-arc` are listed after `grid-2x2` so they never win a tie; they need
-`min` and `max`); `status-grid` is chosen only when nothing else fits.
+layout that takes only instruments for the default page (`tank-bars`,
+`gauge-arc` and `electrical` are listed after `grid-2x2` so they never win a tie; they need
+`min` and `max` or slots); `status-grid` is chosen only when nothing else fits.
 
 ### MQTT topics and freshness
 
@@ -2210,7 +2305,7 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc`, `electrical` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 
@@ -2223,7 +2318,7 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
   interface that can reach the Raspberry Pi's MQTT port.
 - The build path is exporting from the Pi and compiling on a laptop; building
   and flashing on the Pi (a Compose profile) is planned and not available yet.
-  Only the `single`, `grid-2x2`, `status-grid`, `tank-bars` and `gauge-arc` layouts are generated.
+  Only the `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc` and `electrical` layouts are generated.
 - The runtime `displays.json`, `displays.secrets.json`, ESPHome
   `secrets.yaml`, `.esphome/` and `displays/build/` output, `$VESSELSTACK_ROOT/build/` and firmware
   binaries (`.bin`, `.elf`, `.uf2`) are git-ignored and rejected by

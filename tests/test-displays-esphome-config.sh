@@ -171,7 +171,44 @@ def gauges_one(cfg):
     gauges(cfg)
     cfg["displays"]["helm"]["pages"] = [{"title": "Tank", "layout": "tank-bars", "items": ["lpg"]}]
 
+def electrical(cfg):
+    inst = cfg["instruments"]
+    inst["batt_v"] = {"path": "electrical.batteries.house.voltage", "label": HOSTILE[:16], "convert": "none",
+                      "unit": "${y}", "precision": 2, "stale_after_s": 30,
+                      "thresholds": {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8, "hysteresis": 0.05}}
+    inst["batt_soc"] = {"path": "electrical.batteries.house.capacity.stateOfCharge", "label": "<% 1+1 %>",
+                        "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "min": 0, "max": 100,
+                        "thresholds": {"alarm_below": 20, "warn_below": 30, "hysteresis": 2}}
+    inst["batt_a"] = {"path": "electrical.batteries.house.current", "label": "${y} Amps", "convert": "negate",
+                      "unit": "A", "precision": 1, "stale_after_s": 30}
+    inst["shore_a"] = {"path": "electrical.shore.current", "label": "$x Shore", "convert": "none", "unit": "A",
+                       "precision": 1, "stale_after_s": 30}
+    inst["solar_a"] = {"path": "electrical.solar.main.current", "label": "Solar", "convert": "none", "unit": "A",
+                       "precision": 1, "stale_after_s": 30}
+    cfg["notifications"] = {"shore": {"path": "notifications.electrical.shorePower", "label": "${y} Shore",
+                                      "absent": "unknown"}}
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Power", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a"]},
+        {"title": "Shore", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a", "shore_a"]},
+        {"title": "Full", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a", "shore", "solar_a"]},
+        {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "batt_v"]},
+    ]
+
+def electrical_ui(cfg):
+    electrical(cfg)
+    cfg["displays"]["helm"]["pages"][0]["title"] = '$x ${y} "q"'
+    cfg["displays"]["helm"]["ui"] = {"swipe": True, "header": True, "night": "schedule", "night_brightness": 15,
+                                     "dim_after_s": 120, "alarm_takeover": True}
+    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
+def electrical_min(cfg):
+    electrical(cfg)
+    cfg["displays"]["helm"]["pages"] = cfg["displays"]["helm"]["pages"][:1]
+
 variant("example")
+variant("electrical", electrical)
+variant("electricalui", electrical_ui)
+variant("electricalmin", electrical_min)
 variant("gauges", gauges)
 variant("gaugesui", gauges_ui)
 variant("gaugesone", gauges_one)
@@ -232,6 +269,34 @@ check uisingle helm
 check gauges helm
 check gaugesui helm
 check gaugesone helm
+check electrical helm
+check electricalui helm
+check electricalmin helm
+# Electrical page: SoC arc, fixed CHG / DSG and pill words as literals, guarded pill colours, literal user text.
+for elec in electrical electricalui electricalmin; do
+    log="$WORK/$elec-helm.log"
+    for needle in 'lv_arc_set_value(id(p0_arc)' 'id: p0_batt_a_word' 'ins_batt_a_num' 'ins_batt_soc_gdrawn' \
+            'lv_obj_set_style_arc_color(id(p0_arc), lv_color_hex(c), LV_PART_INDICATOR)'; do
+        grep -qF "$needle" "$log" || { echo "missing from the validated $elec config: $needle" >&2; fail=1; }
+    done
+    for word in CHG DSG; do
+        grep -qE "text: [\"']?${word}[\"']?\$" "$log" || { echo "current word $word missing ($elec)" >&2; fail=1; }
+    done
+    # shellcheck disable=SC2016
+    grep -qF '${y}' "$log" || { echo "hostile electrical label or unit was altered ($elec)" >&2; fail=1; }
+    grep -qF '<% 1+1 %>' "$log" || { echo "hostile electrical label was altered ($elec)" >&2; fail=1; }
+done
+for elec in electrical electricalui; do
+    log="$WORK/$elec-helm.log"
+    for needle in 'ins_shore_a_sdrawn' 'lv_obj_set_style_bg_color(id(p1_shore_a_tile)' \
+            'lv_obj_set_style_bg_color(id(p2_shore_tile)' 'id: p2_solar_a_value'; do
+        grep -qF "$needle" "$log" || { echo "missing from the validated $elec config: $needle" >&2; fail=1; }
+    done
+    grep -qE "text: [\"']?ON[\"']?\$" "$log" || { echo "shore word ON missing ($elec)" >&2; fail=1; }
+done
+grep -qF 'lv_obj_set_style_arc_color(id(p0_zone0)' "$WORK/electricalui-helm.log" \
+    || { echo "night recolouring of the SoC zone arcs missing" >&2; fail=1; }
+if grep -qE 'ins_shore_a_sdrawn|p0_batt_a_word' "$WORK/example-helm.log"; then echo "electrical code present without an electrical page" >&2; fail=1; fi
 # Bars and arcs: LVGL widgets, numeric levels from the payload, guarded colours, literal user text.
 for gauge in gauges gaugesui; do
     log="$WORK/$gauge-helm.log"
