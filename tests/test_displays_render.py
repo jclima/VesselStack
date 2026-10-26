@@ -145,6 +145,35 @@ def electrical_pages(cfg, header=False, night=False, pages=("min", "shore", "ful
         cfg["displays"]["helm"]["ui"] = ui
 
 
+def ha_dashboard(cfg, shore=True, header=True, night=True):
+    """Home Assistant items on a status-grid (binary, state, numeric) and a binary item in the shore slot."""
+    electrical_pages(cfg, pages=())
+    cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"}}
+    cfg["ha"] = {
+        "bilge_pump": {"entity_id": "binary_sensor.vesselstack_bilge_pump", "label": "Bilge pump", "kind": "binary",
+                       "states": [{"match": "on", "sev": "warn", "text": "RUNNING"},
+                                  {"match": "off", "sev": "ok", "text": "OFF"}]},
+        "engine": {"entity_id": "sensor.engine_alarm_status", "label": "Engine", "kind": "state", "alarm": True,
+                   "states": [{"match": "all clear", "sev": "ok", "text": "CLEAR"},
+                              {"prefix": "dock:", "sev": "ok", "text": "DOCK"}],
+                   "default": {"sev": "alarm", "text": "ALARM"}},
+        "cabin_t": {"entity_id": "sensor.cabin_temperature", "label": "Cabin", "kind": "numeric", "unit": "C",
+                    "precision": 1, "thresholds": {"warn_above": 30, "alarm_above": 40}, "min": 0, "max": 50},
+        "shore_ha": {"entity_id": "binary_sensor.vesselstack_shore_power", "label": "Shore", "kind": "binary",
+                     "alarm": False, "states": [{"match": "on", "sev": "ok", "text": "ON"},
+                                                {"match": "off", "sev": "ok", "text": "OFF"}]},
+    }
+    pages = [{"title": "Status", "layout": "status-grid",
+              "items": ["anchor", "bilge_pump", "engine", "cabin_t", "batt_v"]}]
+    if shore:
+        pages.append({"title": "Power", "layout": "electrical",
+                      "items": ["batt_v", "batt_soc", "batt_a", "shore_ha", "solar_a"]})
+    cfg["displays"]["helm"]["pages"] = pages
+    cfg["displays"]["helm"]["ui"] = {"header": header, "swipe": True, "alarm_takeover": True,
+                                     "night": "schedule" if night else "off"}
+    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -232,6 +261,10 @@ class GoldenAndDeterminism(Base):
             electrical_pages(cfg, header=True, night=True)
         self.set_config(mutate)
         self.check_golden("helm-electrical.yaml", self.device(allow_missing_wifi=True))
+
+    def test_home_assistant_matches_golden(self):
+        self.set_config(ha_dashboard)
+        self.check_golden("helm-ha.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -2391,3 +2424,107 @@ class Cli(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HomeAssistantItems(Base):
+    def ha_device(self, mutate=None, **kw):
+        def apply(cfg):
+            ha_dashboard(cfg, **kw)
+            if mutate:
+                mutate(cfg)
+        self.set_config(apply)
+        return self.device(allow_missing_wifi=True)
+
+    def test_state_texts_are_compile_time_branches_on_k(self):
+        text = self.ha_device()
+        self.assertIn("topic: vesselstack/v1/ha/bilge_pump", text)
+        self.assertIn('id(ins_bilge_pump_k) = x["k"] | -1;', text)
+        self.assertIn("{id: ins_bilge_pump_k, type: int", text)
+        for k in (-2, -1, 0, 1):
+            self.assertIn(f"== {k};'", text)
+        body = text.split("script:", 1)[1]
+        self.assertIn("id(ins_bilge_pump_k) >= -1 && id(ins_bilge_pump_k) < 2", body)
+        for word in ("RUNNING", "OFF", "?", "CLEAR", "DOCK", "ALARM"):
+            self.assertIn(f'text: !literal "{word}"', text)
+
+    def test_stale_and_unknown_read_blank_not_the_last_text(self):
+        text = self.ha_device()
+        selector = [line for line in text.splitlines() if "ins_engine_k) >= -1" in line]
+        self.assertTrue(selector)
+        for line in selector:
+            self.assertIn("id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_engine_ok)", line)
+            self.assertIn("< 15000UL", line)   # 3 x the example 5 s heartbeat
+
+    def test_severity_colours_use_the_guarded_mechanism_in_both_palettes(self):
+        text = self.ha_device()
+        self.assertIn("if (sev != id(ins_bilge_pump_drawn_sev))", text)
+        self.assertIn("if (id(night_active))", text)
+        self.assertIn("id(ins_bilge_pump_drawn_sev) = 255;", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p0_bilge_pump_tile)", text)
+
+    def test_no_runtime_string_reaches_a_label(self):
+        text = self.ha_device()
+        self.assertNotIn('x["state"]', text)
+        self.assertNotIn('x["text"]', text)
+        self.assertNotIn("as<const char*>", text)
+
+    def test_hostile_texts_are_literals(self):
+        def mutate(cfg):
+            cfg["ha"]["bilge_pump"]["states"][0]["text"] = "$x <%y"
+            cfg["ha"]["bilge_pump"]["label"] = "A\"B ${c}"
+        text = self.ha_device(mutate)
+        self.assertIn('text: !literal "$x <%y"', text)
+        self.assertIn('!literal "A\\"B ${c}"', text)
+        self.assertNotRegex(text, r"text: (?!!literal)[^\n]*\$x")
+
+    def test_numeric_ha_behaves_like_an_instrument(self):
+        text = self.ha_device()
+        self.assertIn("topic: vesselstack/v1/ha/cabin_t", text)
+        self.assertIn('value_accuracy_to_buf(buf, x["v"].as<float>(), 1);', text)
+        self.assertIn("id(ins_cabin_t_sev)", text)
+        self.assertNotIn("ins_cabin_t_k", text)
+        self.assertIn("p0_cabin_t_unit", text)
+        self.assertIn("< 15000UL", text)
+
+    def test_numeric_ha_on_a_gauge_layout(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"].append({"title": "Temp", "layout": "gauge-arc", "items": ["cabin_t"]})
+        text = self.ha_device(mutate)
+        self.assertIn("lv_arc_set_value(id(p2_arc)", text)
+
+    def test_shore_slot_takes_a_binary_ha_item(self):
+        text = self.ha_device()
+        self.assertIn("p1_shore_ha_tile", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p1_shore_ha_tile)", text)
+        self.assertIn("id: p1_shore_ha_value", text)
+
+    def test_header_has_a_home_assistant_dot_only_with_ha_items(self):
+        text = self.ha_device()
+        self.assertIn("topic: vesselstack/v1/bridge/homeassistant", text)
+        self.assertIn('id(ha_state) = (x == "connected") ? 1 : (x == "disconnected") ? 2 : 0;', text)
+        self.assertIn("id: p0_dot_ha", text)
+        self.assertIn("(dha << 7)", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p1_dot_ha)", text)
+        self.set_config(dashboard_ui)
+        plain = self.device(allow_missing_wifi=True)
+        self.assertNotIn("dot_ha", plain)
+        self.assertNotIn("ha_state", plain)
+
+    def test_no_header_dot_without_a_header(self):
+        text = self.ha_device(header=False)
+        self.assertNotIn("dot_ha", text)
+        self.assertNotIn("bridge/homeassistant", text)
+
+    def test_state_texts_have_glyphs(self):
+        def mutate(cfg):
+            cfg["ha"]["engine"]["default"]["text"] = "\u00bf\u4e2d"
+        self.set_config(lambda cfg: (ha_dashboard(cfg), mutate(cfg)))
+        with self.assertRaises(render.RenderError):
+            self.collect(allow_missing_wifi=True)
+
+    def test_status_font_carries_every_state_text(self):
+        text = self.ha_device()
+        fonts = text.split("font:", 1)[1].split("mqtt:", 1)[0]
+        status = fonts.split("id: font_status_sm")[1].split("bpp")[1]
+        for ch in "RUNNGOFCLEADKM?-":
+            self.assertIn(ch, status)

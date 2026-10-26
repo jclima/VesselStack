@@ -69,6 +69,7 @@ BANNER_COUNT_MAX = 99
 BANNER_FLASH_INTERVAL = "500ms"
 HEADER_CLOCK_X = -24      # clock label centre, relative to the screen's middle
 HEADER_DOT_X = (13, 27, 41)   # SignalK, bridge, MQTT status dots (centres, same reference)
+HEADER_DOT_HA_X = 55          # the Home Assistant dot, only when the configuration has ha items
 HEADER_DOT_SIZE = 10
 HEADER_TITLE_ROW = 26     # title row offset below header_y (the narrower clock row is above it)
 HEADER_TITLE_WIDTH = 200
@@ -256,6 +257,13 @@ def check_glyphs(config: dict) -> list:
         value = note.get("label")
         if isinstance(value, str):
             errors.extend(_glyph_errors(f"$.notifications.{nid}.label", value))
+    for hid, item in (config.get("ha") or {}).items():
+        for key in ("label", "unit"):
+            if isinstance(item.get(key), str):
+                errors.extend(_glyph_errors(f"$.ha.{hid}.{key}", item[key]))
+        if item.get("kind") in schema.HA_STATE_KINDS:
+            for k, text in ha_texts(item):
+                errors.extend(_glyph_errors(f"$.ha.{hid} text {text!r}", text))
     for did, display in config.get("displays", {}).items():
         if header_enabled(display):
             for pi, page in enumerate(display["pages"]):
@@ -290,9 +298,54 @@ def is_notification(config: dict, iid: str) -> bool:
     return iid in config.get("notifications", {}) and iid not in config["instruments"]
 
 
+def has_ha(config: dict) -> bool:
+    return bool(config.get("ha"))
+
+
+def is_ha_state(config: dict, iid: str) -> bool:
+    """True for a binary or state Home Assistant item (a word in a cell, never a number)."""
+    item = (config.get("ha") or {}).get(iid)
+    return isinstance(item, dict) and item.get("kind") in schema.HA_STATE_KINDS
+
+
+def is_word(config: dict, iid: str) -> bool:
+    """True when the item shows a fixed word, not a number: a notification or a binary / state HA item."""
+    return is_notification(config, iid) or is_ha_state(config, iid)
+
+
+def ha_texts(item: dict) -> list:
+    """(k, text) of every state a binary / state item can show: its ``states`` in order, then the default (-1)."""
+    texts = [(index, entry["text"]) for index, entry in enumerate(item.get("states", ()))]
+    return texts + [(-1, schema.ha_default(item)["text"])]
+
+
+def effective_config(config: dict) -> dict:
+    """The configuration the generator draws from: numeric Home Assistant items join the instruments.
+
+    A numeric ha item behaves like an instrument (value, unit, threshold colours, bars and arcs);
+    it is fresh for three heartbeats, like a notification. Binary and state items stay in ``ha``.
+    """
+    heartbeat = config.get("heartbeat_s", schema.DEFAULT_HEARTBEAT_S)
+    numeric = {}
+    for hid, item in (config.get("ha") or {}).items():
+        if item.get("kind") == "numeric":
+            virtual = {k: item[k] for k in ("label", "unit", "precision", "thresholds", "min", "max") if k in item}
+            virtual["stale_after_s"] = heartbeat
+            numeric[hid] = virtual
+    if not numeric:
+        return config
+    merged = dict(config)
+    merged["instruments"] = {**config["instruments"], **numeric}
+    return merged
+
+
+def item_topic(config: dict, iid: str) -> str:
+    return topics.ha_topic(iid) if iid in (config.get("ha") or {}) else topics.instrument_topic(iid)
+
+
 def item_limit_ms(config: dict, iid: str, heartbeat_s: int) -> int:
     """How long without a message before an item's tile is blanked (milliseconds)."""
-    if is_notification(config, iid):
+    if is_word(config, iid):
         return 3 * heartbeat_s * 1000
     return stale_threshold_s(config["instruments"][iid], heartbeat_s) * 1000
 
@@ -367,8 +420,11 @@ def _small_glyphs(config: dict, display: dict) -> str:
         for words in (CURRENT_WORDS, SHORE_WORDS, STATUS_WORDS):
             chars.update("".join(words.values()))
     for iid in used_instruments(display):
-        if is_notification(config, iid):
-            chars.update(config["notifications"][iid]["label"])
+        if is_word(config, iid):
+            chars.update(_item_label(config, iid))
+            if is_ha_state(config, iid) and electrical_roles(display, iid):   # the shore pill text is in font_small
+                for _, text in ha_texts(config["ha"][iid]):
+                    chars.update(text)
             continue
         inst = config["instruments"][iid]
         chars.update(inst["label"])
@@ -434,14 +490,19 @@ def _status_glyphs(config: dict, display: dict) -> dict:
             continue
         chars = glyphs.setdefault(status_font(len(page["items"])), set())
         for iid in page["items"]:
-            chars.update("".join(STATUS_WORDS.values()) if is_notification(config, iid) else VALUE_GLYPHS)
+            if is_ha_state(config, iid):
+                chars.update(BLANK_VALUE)
+                for _, text in ha_texts(config["ha"][iid]):
+                    chars.update(text)
+            else:
+                chars.update("".join(STATUS_WORDS.values()) if is_notification(config, iid) else VALUE_GLYPHS)
     return {fid: "".join(sorted(chars)) for fid, chars in glyphs.items()}
 
 
 def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: int, cols: int,
                  themed: bool = False) -> list:
     """One status-grid cell: static label, then the state word (notification) or value + unit."""
-    notification = is_notification(config, iid)
+    notification = is_word(config, iid)
     lines = [f"{ind}- obj:"]
     if notification or has_thresholds(config["instruments"][iid]) or themed:
         lines.append(f"{ind}    id: {tile_id(pi, iid, 'status-grid')}")
@@ -457,7 +518,7 @@ def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: in
     ]
     inner = ind + "      "
     fit = "width: 100%, text_align: CENTER"
-    label = config["notifications"][iid]["label"] if notification else config["instruments"][iid]["label"]
+    label = _item_label(config, iid)
     lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, "
                  f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
     lines.append(f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {font}, "
@@ -496,13 +557,13 @@ def gauge_kind(page: dict) -> str:
 
 def shore_instrument(config: dict, display: dict, iid: str) -> bool:
     """True when an instrument (not a notification) fills the shore slot of an electrical page."""
-    return not is_notification(config, iid) and any(role == "shore" for _, role in electrical_roles(display, iid))
+    return not is_word(config, iid) and any(role == "shore" for _, role in electrical_roles(display, iid))
 
 
 def keeps_number(config: dict, display: dict, iid: str) -> bool:
     """True when the firmware needs the raw number of this instrument, not only its text."""
     return on_gauge_page(display, iid) or any(
-        role == "current" or (role == "shore" and not is_notification(config, iid))
+        role == "current" or (role == "shore" and not is_word(config, iid))
         for _, role in electrical_roles(display, iid))
 
 
@@ -517,7 +578,7 @@ def on_tile_page(display: dict, iid: str) -> bool:
 
 def severity_tile(config: dict, display: dict, iid: str) -> bool:
     """True when a tile (not a bar or an arc) is coloured by the item's severity."""
-    if is_notification(config, iid):
+    if is_word(config, iid):
         return True
     return has_thresholds(config["instruments"][iid]) and on_tile_page(display, iid)
 
@@ -800,7 +861,7 @@ def _electrical_night_lines(config: dict, display: dict, pi: int, page: dict) ->
     lines = []
     for role, iid in electrical_slots(page).items():
         lines.append(_text_night(pi, iid, "name", "name"))
-        if is_notification(config, iid):
+        if is_word(config, iid):
             continue
         lines.append(_text_night(pi, iid, "value", "value"))
         if role != "shore":
@@ -846,8 +907,8 @@ def _elec_row(ind: str, pi: int, iid: str, inst: dict, themed: bool, word: bool 
 
 def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool) -> list:
     """The shore power pill: the item's label, then a rounded box holding a fixed word."""
-    notification = is_notification(config, iid)
-    label = config["notifications"][iid]["label"] if notification else config["instruments"][iid]["label"]
+    notification = is_word(config, iid)
+    label = _item_label(config, iid)
     grey, grey_text = SEV_COLORS[0] if notification else (GAUGE_DAY[0], DAY["value"])
     lines = [f"{ind}- obj:", f"{ind}    width: 100%", f"{ind}    height: SIZE_CONTENT"]
     lines += [f"{ind}    {line}" for line in BOX_RESET]
@@ -935,7 +996,7 @@ def _electrical_lines(config: dict, display: dict, iid: str, heartbeat: int, nig
         state = f"({fresh}) ? ({n} > {cfloat(CURRENT_DEADBAND)} ? 1 : {n} < -{cfloat(CURRENT_DEADBAND)} ? 2 : 0) : 0"
         lines += _state_branches(current, iid, "word", state, CURRENT_WORDS)
     shore = [pi for pi, role in roles if role == "shore"]
-    if shore and not is_notification(config, iid):
+    if shore and not is_word(config, iid):
         state = f"({fresh}) ? (id(ins_{iid}_num) > {cfloat(SHORE_ON_ABOVE)} ? 1 : 2) : 0"
         lines += _state_branches(shore, iid, "value", state, SHORE_WORDS)
         lines += [
@@ -997,7 +1058,7 @@ def _touch_layer(display: dict, pi: int) -> list:
     return lines
 
 
-def _header_lines(registry_board: dict, display: dict, pi: int, page: dict) -> list:
+def _header_lines(registry_board: dict, display: dict, pi: int, page: dict, ha: bool = False) -> list:
     """Clock and status dots in the narrow top row, the page title below, page dots at the bottom.
 
     Everything is static except colours and the clock digits, which render_header sets.
@@ -1008,7 +1069,8 @@ def _header_lines(registry_board: dict, display: dict, pi: int, page: dict) -> l
         f"        - label: {{id: p{pi}_clock, text: {yq('--:--')}, text_font: font_small, "
         f"text_color: 0x{DAY['clock']:06X}, align: TOP_MID, x: {HEADER_CLOCK_X}, y: {y}}}",
     ]
-    for name, x in zip(("sk", "bridge", "mqtt"), HEADER_DOT_X):
+    dots = list(zip(("sk", "bridge", "mqtt"), HEADER_DOT_X)) + ([("ha", HEADER_DOT_HA_X)] if ha else [])
+    for name, x in dots:
         lines += [
             "        - obj:", f"            id: p{pi}_dot_{name}", "            align: TOP_MID",
             f"            x: {x}", f"            y: {y + 6}", f"            width: {HEADER_DOT_SIZE}",
@@ -1127,7 +1189,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
     else:
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
     if header_enabled(display):
-        lines += _header_lines(registry_board, display, pi, page)
+        lines += _header_lines(registry_board, display, pi, page, has_ha(config))
     if touch_managed(display):
         if touch_layer_enabled(display):
             lines += _touch_layer(display, pi)
@@ -1176,7 +1238,8 @@ def _fonts_lines(display: dict, config: dict) -> list:
     return lines
 
 
-def _json_handler(iid: str, decimals: int, with_sev: bool = False, numeric: bool = False) -> list:
+def _json_handler(iid: str, decimals: int, with_sev: bool = False, numeric: bool = False,
+                  topic: str | None = None) -> list:
     sev_lines = []
     if with_sev:
         sev_lines = [
@@ -1185,7 +1248,7 @@ def _json_handler(iid: str, decimals: int, with_sev: bool = False, numeric: bool
             'strcmp(sv, "alarm") == 0 ? 3 : 0;',
         ]
     return [
-        f"    - topic: {topics.instrument_topic(iid)}",
+        f"    - topic: {topic or topics.instrument_topic(iid)}",
         "      then:",
         "        - lambda: |-",
         '            const char *st = x["st"] | "missing";',
@@ -1218,12 +1281,55 @@ def _notification_handler(iid: str) -> list:
     ]
 
 
+def _ha_state_handler(iid: str) -> list:
+    """A binary / state HA item: freshness, severity and the index k of the compile-time text (never a string)."""
+    return [
+        f"    - topic: {topics.ha_topic(iid)}",
+        "      then:",
+        "        - lambda: |-",
+        '            const char *st = x["st"] | "missing";',
+        f"            id(ins_{iid}_seen) = millis();",
+        f'            id(ins_{iid}_ok) = strcmp(st, "ok") == 0;',
+        f'            id(ins_{iid}_k) = x["k"] | -1;',
+        '            const char *sv = x["sev"] | "unknown";',
+        f'            id(ins_{iid}_sev) = strcmp(sv, "ok") == 0 ? 1 : strcmp(sv, "warn") == 0 ? 2 : '
+        'strcmp(sv, "alarm") == 0 ? 3 : 0;',
+        "        - script.execute: render_tiles",
+    ]
+
+
+def _ha_word_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
+    """The compile-time text of a binary / state HA item: one if/then per index k.
+
+    The selector is -2 unless the item is fresh and k is one of the known indices, so a stale,
+    missing or out-of-range item reads "--", never the last text. -1 is the default text.
+    """
+    fresh = _fresh_expr(config, iid, heartbeat)
+    texts = ha_texts(config["ha"][iid])
+    count = len(texts) - 1
+    selector = (f"(({fresh}) && id(ins_{iid}_k) >= -1 && id(ins_{iid}_k) < {count}) ? id(ins_{iid}_k) : -2")
+    cases = [(-2, BLANK_VALUE)] + [(k, text) for k, text in texts]
+    lines = []
+    for pi, page in enumerate(display["pages"]):
+        if iid not in page["items"]:
+            continue
+        for k, text in cases:
+            lines += [
+                "      - if:", "          condition:", f"            lambda: 'return ({selector}) == {k};'",
+                "          then:", "            - lvgl.label.update:", f"                id: p{pi}_{iid}_value",
+                f"                text: {lit(text)}",
+            ]
+    return lines
+
+
 def _word_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     """Fixed state words for a notification, one if/then per severity (no runtime strings).
 
     The condition re-derives the gated severity (0 when the item is not fresh), so a stale
     or unknown notification always reads "--", never OK.
     """
+    if is_ha_state(config, iid):
+        return _ha_word_lines(config, display, iid, heartbeat)
     limit_ms = item_limit_ms(config, iid, heartbeat)
     fresh = (f"id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_{iid}_ok)"
              f" && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL")
@@ -1250,7 +1356,7 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: boo
     sets = []
     for pi, page in enumerate(display["pages"]):
         if iid in page["items"] and page["layout"] not in GAUGE_LAYOUTS and (
-                page["layout"] != ELECTRICAL or is_notification(config, iid)):
+                page["layout"] != ELECTRICAL or is_word(config, iid)):
             tile, value = tile_id(pi, iid, page["layout"]), f"p{pi}_{iid}_value"
             sets.append((tile, value))
     lines = [
@@ -1352,7 +1458,11 @@ def _alarm_handler(used: list, display: dict) -> list:
 
 
 def _item_label(config: dict, iid: str) -> str:
-    return (config["notifications"] if is_notification(config, iid) else config["instruments"])[iid]["label"]
+    if is_notification(config, iid):
+        return config["notifications"][iid]["label"]
+    if is_ha_state(config, iid):
+        return config["ha"][iid]["label"]
+    return config["instruments"][iid]["label"]
 
 
 def _alarm_script(config: dict, used: list, heartbeat: int) -> list:
@@ -1430,7 +1540,7 @@ def _alarm_banner(board: dict) -> list:
     ]
 
 
-def _ui_globals(display: dict) -> list:
+def _ui_globals(display: dict, ha: bool = False) -> list:
     lines = []
     if touch_managed(display) and touch_layer_enabled(display):
         lines.append('  - {id: touch_ignore, type: bool, initial_value: "false"}')
@@ -1453,6 +1563,8 @@ def _ui_globals(display: dict) -> list:
         lines += ['  - {id: sk_state, type: uint8_t, initial_value: "0"}',   # 0 unknown, 1 connected, 2 down
                   '  - {id: clock_drawn, type: int, initial_value: "-2"}',
                   '  - {id: hdr_drawn, type: int, initial_value: "-1"}']
+        if ha:
+            lines.append('  - {id: ha_state, type: uint8_t, initial_value: "0"}')   # 0 unknown, 1 connected, 2 down
     return lines
 
 
@@ -1472,6 +1584,14 @@ def _signalk_message(display: dict) -> list:
     return [
         f"    - topic: {topics.BRIDGE_SIGNALK_TOPIC}", "      then:",
         '        - lambda: \'id(sk_state) = (x == "connected") ? 1 : (x == "disconnected") ? 2 : 0;\'',
+        "        - script.execute: render_header",
+    ]
+
+
+def _ha_message() -> list:
+    return [
+        f"    - topic: {topics.BRIDGE_HA_TOPIC}", "      then:",
+        '        - lambda: \'id(ha_state) = (x == "connected") ? 1 : (x == "disconnected") ? 2 : 0;\'',
         "        - script.execute: render_header",
     ]
 
@@ -1507,7 +1627,7 @@ def _color_expr(name: str, night: bool) -> str:
     return f"(nt ? 0x{NIGHT[name]:06X} : 0x{DAY[name]:06X})" if night else f"0x{DAY[name]:06X}"
 
 
-def _header_script(board: dict, display: dict, heartbeat: int) -> list:
+def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False) -> list:
     """Clock digits (generated with snprintf from two integers) and status colours, only on change."""
     night = night_enabled(display)
     pages = range(len(display["pages"]))
@@ -1532,8 +1652,9 @@ def _header_script(board: dict, display: dict, heartbeat: int) -> list:
         "          int dsk = !online ? 0 : (id(sk_state) == 1 ? 1 : (id(sk_state) == 2 ? 2 : 0));",
         "          int dbr = online ? 1 : 2;",
         "          int dmq = mq ? 1 : 2;",
+        *(["          int dha = !online ? 0 : (id(ha_state) == 1 ? 1 : (id(ha_state) == 2 ? 2 : 0));"] if ha else []),
         f"          bool nt = {'id(night_active)' if night else 'false'};",
-        "          int state = dsk | (dbr << 2) | (dmq << 4) | (nt ? 64 : 0);",
+        "          int state = dsk | (dbr << 2) | (dmq << 4) | (nt ? 64 : 0)" + (" | (dha << 7);" if ha else ";"),
         "          if (state != id(hdr_drawn)) {",
         "            id(hdr_drawn) = state;",
         f"            uint32_t good = {_color_expr('dot_ok', night)}, bad = {_color_expr('dot_bad', night)}, "
@@ -1542,12 +1663,14 @@ def _header_script(board: dict, display: dict, heartbeat: int) -> list:
         "            uint32_t sk = dsk == 1 ? good : (dsk == 2 ? bad : unk);",
         "            uint32_t br = dbr == 1 ? good : bad;",
         "            uint32_t mt = dmq == 1 ? good : bad;",
+        *(["            uint32_t hc = dha == 1 ? good : (dha == 2 ? bad : unk);"] if ha else []),
     ]
     for pi in pages:
         lines += [
             f"            lv_obj_set_style_bg_color(id(p{pi}_dot_sk), lv_color_hex(sk), LV_PART_MAIN);",
             f"            lv_obj_set_style_bg_color(id(p{pi}_dot_bridge), lv_color_hex(br), LV_PART_MAIN);",
             f"            lv_obj_set_style_bg_color(id(p{pi}_dot_mqtt), lv_color_hex(mt), LV_PART_MAIN);",
+            *([f"            lv_obj_set_style_bg_color(id(p{pi}_dot_ha), lv_color_hex(hc), LV_PART_MAIN);"] if ha else []),
             f"            lv_obj_set_style_text_color(id(p{pi}_clock), lv_color_hex({_color_expr('clock', night)}),"
             " LV_PART_MAIN);",
             f"            lv_obj_set_style_text_color(id(p{pi}_title), lv_color_hex({_color_expr('title', night)}),"
@@ -1583,7 +1706,7 @@ def _night_script(config: dict, display: dict, used: list) -> list:
             lines += _electrical_night_lines(config, display, pi, page)
             continue
         for iid in page["items"]:
-            notification = is_notification(config, iid)
+            notification = is_word(config, iid)
             tile = tile_id(pi, iid, page["layout"])
             lines += [
                 f"            lv_obj_set_style_bg_color(id({tile}), lv_color_hex("
@@ -1599,7 +1722,7 @@ def _night_script(config: dict, display: dict, used: list) -> list:
     for iid in used:   # the guarded severity colours must repaint with the new palette
         if severity_tile(config, display, iid):
             lines.append(f"            id(ins_{iid}_drawn_sev) = 255;")
-        if not is_notification(config, iid) and on_gauge_page(display, iid):
+        if not is_word(config, iid) and on_gauge_page(display, iid):
             lines.append(f"            id(ins_{iid}_gdrawn) = 255;")
         if shore_instrument(config, display, iid):
             lines.append(f"            id(ins_{iid}_sdrawn) = 255;")
@@ -1650,6 +1773,7 @@ def _dim_interval(display: dict) -> list:
 
 
 def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str) -> str:
+    config = effective_config(config)
     display = config["displays"][display_id]
     board = registry["boards"][display["board"]]
     heartbeat = config.get("heartbeat_s", schema.DEFAULT_HEARTBEAT_S)
@@ -1680,9 +1804,11 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     for iid in used:
         lines += [f'  - {{id: ins_{iid}_ok, type: bool, initial_value: "false"}}',
                   f'  - {{id: ins_{iid}_seen, type: uint32_t, initial_value: "0"}}']
-        if is_notification(config, iid):
+        if is_word(config, iid):
             lines += [f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}',
                       f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}']
+            if is_ha_state(config, iid):
+                lines.append(f'  - {{id: ins_{iid}_k, type: int, initial_value: "-1"}}')
             continue
         lines.append(f"  - {{id: ins_{iid}_val, type: std::string, initial_value: '\"{BLANK_VALUE}\"'}}")
         if has_thresholds(config["instruments"][iid]):
@@ -1698,20 +1824,25 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     takeover = alarm_takeover_enabled(display)
     if takeover:
         lines += ALARM_GLOBALS
-    lines += _ui_globals(display)
+    lines += _ui_globals(display, has_ha(config))
     lines += ["", *_fonts_lines(display, config), "", "mqtt:", "  on_message:",
               f"    - topic: {topics.BRIDGE_STATUS_TOPIC}", "      then:",
               '        - lambda: \'id(bridge_online) = (x == "online");\'',
               "        - script.execute: render_tiles"]
     if header_enabled(display):
         lines += ["        - script.execute: render_header", *_signalk_message(display)]
+        if has_ha(config):
+            lines += _ha_message()
     lines.append("  on_json_message:")
     for iid in used:
         if is_notification(config, iid):
             lines += _notification_handler(iid)
+        elif is_ha_state(config, iid):
+            lines += _ha_state_handler(iid)
         else:
             lines += _json_handler(iid, config["instruments"][iid]["precision"],
-                                   has_thresholds(config["instruments"][iid]), keeps_number(config, display, iid))
+                                   has_thresholds(config["instruments"][iid]), keeps_number(config, display, iid),
+                                   item_topic(config, iid))
     if takeover:
         lines += _alarm_handler(used, display)
     if clock_enabled(display):
@@ -1721,7 +1852,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
               "    mode: restart", "    then:"]
     for pi, page in enumerate(display["pages"]):
         for iid in page["items"]:
-            if is_notification(config, iid):
+            if is_word(config, iid):
                 continue  # drawn by the fixed-word branches below
             if page["layout"] == ELECTRICAL and electrical_slots(page).get("shore") == iid:
                 continue  # the pill shows ON / OFF / -- from the branches below, not the number
@@ -1735,19 +1866,19 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
                 f"            return fresh ? id(ins_{iid}_val) : std::string(\"{BLANK_VALUE}\");",
             ]
     for iid in used:
-        if is_notification(config, iid):
+        if is_word(config, iid):
             lines += _word_lines(config, display, iid, heartbeat)
     for iid in used:
         if severity_tile(config, display, iid):
             lines += _sev_lines(config, display, iid, heartbeat, night_enabled(display))
-        if not is_notification(config, iid) and on_gauge_page(display, iid):
+        if not is_word(config, iid) and on_gauge_page(display, iid):
             lines += _gauge_lines(config, display, iid, heartbeat, night_enabled(display))
-        if not is_notification(config, iid):
+        if not is_word(config, iid):
             lines += _electrical_lines(config, display, iid, heartbeat, night_enabled(display))
     if takeover:
         lines += _alarm_script(config, used, heartbeat)
     if header_enabled(display):
-        lines += _header_script(board, display, heartbeat)
+        lines += _header_script(board, display, heartbeat, has_ha(config))
     if night_enabled(display):
         lines += _night_script(config, display, used)
     if power_enabled(display):
