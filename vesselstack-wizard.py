@@ -18,7 +18,7 @@ DEFAULTS = {
  "HOME_ASSISTANT_URL":"http://127.0.0.1:8123","HOME_ASSISTANT_TOKEN":"","INFLUXDB_URL":"http://127.0.0.1:8086","INFLUXDB_PORT":"8086","INFLUXDB_CONTAINER_NAME":"vesselstack-influxdb","INFLUXDB_ORG":"vesselstack","INFLUXDB_USERNAME":"boatadmin",
  "INFLUXDB_RAW_BUCKET":"signalk","INFLUXDB_HISTORY_BUCKET":"signalk_1m","INFLUXDB_HOME_ASSISTANT_BUCKET":"homeassistant","INFLUXDB_AIS_BUCKET":"ais","INFLUXDB_RAW_RETENTION":"","INFLUXDB_PASSWORD":"GENERATE","INFLUXDB_TOKEN":"GENERATE","GRAFANA_ADMIN_PASSWORD":"GENERATE",
  "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true",
- "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780"
+ "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780"
 }
 
 def compose_available():
@@ -47,6 +47,7 @@ def validate(values):
     for key in ("VESSELSTACK_FIREWALL_ALLOW_TCP","VESSELSTACK_FIREWALL_ALLOW_UDP"):
         if result[key] and not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*",result[key]): raise ValueError(f"Invalid port list for {key}")
     if result["INFLUXDB_RAW_RETENTION"] and not re.fullmatch(r"0|[1-9][0-9]{0,4}[hdw]",result["INFLUXDB_RAW_RETENTION"]): raise ValueError("Invalid raw retention: use 0, or a duration such as 720h, 30d or 8w")
+    if not re.fullmatch(r"[1-9][0-9]{0,4}[hdw]",result["PROMETHEUS_RETENTION"]): raise ValueError("Invalid Prometheus retention: use a duration such as 720h, 30d or 8w")
     return result
 
 def load_env(path):
@@ -311,6 +312,7 @@ SECTIONS=[
   F("HEIMDALL_PORT","Heimdall web port","TCP port of the Heimdall start page (HTTP).",advanced=True,required=True,check=PORT),
   F("HEIMDALL_HTTPS_PORT","Heimdall HTTPS port","TCP port of the Heimdall start page (HTTPS).",advanced=True,required=True,check=PORT),
   F("PROMETHEUS_PORT","Prometheus port","TCP port of Prometheus.",advanced=True,required=True,check=PORT),
+  F("PROMETHEUS_RETENTION","Prometheus retention","How long Prometheus keeps metrics, for example 30d, 8w or 720h.",advanced=True,required=True),
   F("MQTT_PORT","MQTT port","TCP port of the MQTT broker.",advanced=True,required=True,check=PORT),
   F("MQTT_USERNAME","MQTT user name","User name Home Assistant uses on the MQTT broker.",advanced=True,required=True,check=NAME),
   _secret("MQTT_PASSWORD","MQTT password","The MQTT broker password.")]},
@@ -430,6 +432,7 @@ def normalize(field,raw,values):
         if not ALLOWED.fullmatch(value): return None,"Use only letters, digits, spaces and . , : / @ + ( ) - _"
         if key.startswith("VESSELSTACK_FIREWALL_ALLOW_") and not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*",value): return None,"Ports separated by commas, ranges as LOW:HIGH, for example 22,5000:5100."
         if key=="INFLUXDB_RAW_RETENTION" and not re.fullmatch(r"0|[1-9][0-9]{0,4}[hdw]",value): return None,"Use 0 (forever) or a duration such as 720h, 30d or 8w."
+        if key=="PROMETHEUS_RETENTION" and not re.fullmatch(r"[1-9][0-9]{0,4}[hdw]",value): return None,"Use a duration such as 720h, 30d or 8w."
         check=field.get("check")
         if check:
             message=check(value)

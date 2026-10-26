@@ -143,6 +143,8 @@ test -s "$DATA_ROOT/homeassistant/vesselstack-dashboard.example.yaml"
 test "$(stat -c '%u:%a' "$DATA_ROOT")" = "0:750"
 test "$(stat -c '%u:%g' "$DATA_ROOT/influxdb")" = "1000:1000"
 test "$(stat -c '%u:%g' "$DATA_ROOT/grafana")" = "472:0"
+test "$(stat -c '%u:%g:%a' "$DATA_ROOT/prometheus")" = "65534:65534:750"
+grep -q '^PROMETHEUS_RETENTION=30d$' "$APP_ROOT/config/vesselstack.env" || grep -q '^PROMETHEUS_RETENTION="30d"$' "$APP_ROOT/config/vesselstack.env"
 # Code, venv and generated facts are not writable by the service user; the
 # service user may write only under the state directory in the data tree.
 test "$(stat -c '%u' "$APP_ROOT/boat-chat")" = 0
@@ -428,6 +430,16 @@ if [ "$(id -u)" -eq 0 ]; then
     grep -q 'recursive' <<<"$repair_output"
     test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "1000:1000:755"
     test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "1000:1000"
+    # Prometheus (nobody, 65534): same helper; an empty root-owned directory is repaired.
+    test "$(stat -c '%u:%g:%a' "$DATA3/prometheus")" = "65534:65534:750"
+    chown 0:0 "$DATA3/prometheus"
+    repair_output=$(install_three)
+    grep -q 'Repaired Prometheus data directory ownership' <<<"$repair_output"
+    test "$(stat -c '%u:%g' "$DATA3/prometheus")" = "65534:65534"
+    { cat "$CONFIG3"; printf 'PROMETHEUS_RETENTION="0"\n'; } > "$CONFIG3.bad"
+    if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$CONFIG3.bad" >/dev/null 2>&1; then
+        echo 'PROMETHEUS_RETENTION=0 must be rejected' >&2; exit 1
+    fi
     # Already correct: nothing is printed or changed.
     test -z "$(install_three | grep 'Repaired SignalK' || true)"
     sk_refused() {

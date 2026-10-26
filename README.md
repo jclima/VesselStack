@@ -151,9 +151,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.3/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.3 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.3
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.4/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.4 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.4
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -286,7 +286,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.3
+git checkout v0.4.4
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -427,7 +427,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.4.3
+git checkout v0.4.4
 ```
 
 ## 4. Configure the vessel
@@ -470,6 +470,7 @@ nano vesselstack.env
 | `INFLUXDB_HISTORY_BUCKET` | One-minute retained history; default `signalk_1m` |
 | `INFLUXDB_HOME_ASSISTANT_BUCKET` | Home Assistant history bucket |
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
+| `PROMETHEUS_RETENTION` | Prometheus metrics retention: `720h`, `30d` or `8w`; default `30d`; see "Prometheus data and retention" |
 | `INFLUXDB_RAW_RETENTION` | Raw-bucket retention: `720h`, `30d`, `8w`, or `0` (forever). Empty (default) = `30d` on a new install and **no change** to an existing bucket; see "Raw data retention" |
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
@@ -651,6 +652,22 @@ argument. The one-minute downsample task averages **numeric fields only**
 (string and boolean fields such as navigation state or relay status are dropped
 before `mean()`, which would otherwise fail the whole run); an existing task from
 an older release is updated in place to this version.
+
+#### Prometheus data and retention
+
+Prometheus stores its metrics in `<data>/prometheus` (bind mount at `/prometheus`;
+the image runs as uid/gid 65534, so the installer creates it `65534:65534`, mode
+0750, before `compose up`). It survives container re-creation and is included in
+`vesselstackctl backup` and `restore` with the rest of the data directory.
+`PROMETHEUS_RETENTION` (default `30d`; `720h`, `30d` or `8w`; `0` is not accepted)
+sets `--storage.tsdb.retention.time`, so metrics older than the window are deleted
+automatically. `vesselstackctl doctor` fails when the directory is not writable by
+uid 65534 (fix: rerun the installer, or `sudo chown -R 65534:65534 <data>/prometheus`).
+Upgrade note: releases before 0.4.4 kept metrics in an anonymous Docker volume. That
+volume is left untouched; after updating, Prometheus starts with an empty store and the
+old history stays in the orphaned volume until you remove it with `docker volume prune`
+(nothing is copied or deleted automatically). Rollback: reinstall 0.4.3 (it uses the old
+volume again; new metrics stay in `<data>/prometheus`).
 
 #### Raw data retention
 

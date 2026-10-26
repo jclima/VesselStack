@@ -632,6 +632,22 @@ check_signalk_data_dir() {
     return 1
 }
 
+# The prom/prometheus image runs as nobody (65534). A bind-mount source that Docker
+# created as root:root makes Prometheus fail to open its TSDB ("permission denied").
+check_prometheus_data_dir() {
+    local dir="$VESSELSTACK_DATA/prometheus" uid gid mode writable=0
+    [ -d "$dir" ] || { printf 'WARN Prometheus data directory %s does not exist; rerun the installer\n' "$dir" >&2; return 0; }
+    read -r uid gid mode < <(stat -c '%u %g %a' "$dir")
+    if [ "$uid" = 65534 ] && [ $((8#$mode & 8#200)) -ne 0 ]; then writable=1; fi
+    if [ "$gid" = 65534 ] && [ $((8#$mode & 8#020)) -ne 0 ]; then writable=1; fi
+    if [ $((8#$mode & 8#002)) -ne 0 ]; then writable=1; fi
+    [ "$writable" -eq 0 ] || { printf 'OK   Prometheus data directory is writable by the container user (uid 65534)\n'; return 0; }
+    printf 'FAIL Prometheus data directory %s is owned by %s:%s (mode %s), not writable by the container user (uid 65534).\n' \
+        "$dir" "$uid" "$gid" "$mode" >&2
+    printf '     Fix: rerun the installer (it repairs an empty directory), or: sudo chown -R 65534:65534 %s && docker restart vesselstack-prometheus\n' "$dir" >&2
+    return 1
+}
+
 # Boat Chat reports itself "not ready" while its memory index has no chunks. Ask the
 # running service first (its /health readiness); if it does not answer, ask the helper,
 # which opens the database as the service user (root must never create SQLite files there).
@@ -688,6 +704,7 @@ doctor_stack() {
     fi
     disk_usage_warning
     check_signalk_data_dir || failed=1
+    check_prometheus_data_dir || failed=1
     check_memory_index || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then

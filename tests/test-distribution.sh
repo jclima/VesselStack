@@ -121,4 +121,15 @@ compose_line=$(grep -n '^        compose up -d$' "$ROOT/install.sh" | cut -d: -f
 [ -n "$signalk_line" ] && [ -n "$compose_line" ] && [ "$signalk_line" -lt "$compose_line" ] \
     || { echo "install.sh must create the SignalK data directory before compose up" >&2; exit 1; }
 grep -q '^SIGNALK_CONTAINER_UID=1000$' "$ROOT/install.sh"
+# shellcheck disable=SC2016 # literal compose syntax
+grep -qF '${VESSELSTACK_DATA}/prometheus:/prometheus' "$ROOT/templates/compose.yml"
+# shellcheck disable=SC2016
+grep -qF -- '--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}' "$ROOT/templates/compose.yml"
+grep -qF -- '--storage.tsdb.path=/prometheus' "$ROOT/templates/compose.yml"
+grep -qF 'config/prometheus.yml:/etc/prometheus/prometheus.yml:ro' "$ROOT/templates/compose.yml"
+grep -q '^PROMETHEUS_CONTAINER_UID=65534$' "$ROOT/install.sh"
+# shellcheck disable=SC2016
+prom_line=$(grep -n '^ensure_container_data_dir "$VESSELSTACK_DATA/prometheus"' "$ROOT/install.sh" | cut -d: -f1)
+[ -n "$prom_line" ] && [ "$prom_line" -lt "$compose_line" ] \
+    || { echo "install.sh must create the Prometheus data directory before compose up" >&2; exit 1; }
 echo "distribution static checks passed"

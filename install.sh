@@ -82,6 +82,8 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 # Empty = unset: fresh InfluxDB setups get 30d on the raw bucket; existing buckets
 # are never changed unless a value is set explicitly (see README).
 : "${INFLUXDB_RAW_RETENTION:=}"
+# Prometheus TSDB retention (time only; never 0, which Prometheus would treat as the default).
+: "${PROMETHEUS_RETENTION:=30d}"
 
 : "${VESSELSTACK_WHEELHOUSE:=$SCRIPT_DIR/offline/wheelhouse}"
 case "$OFFLINE" in
@@ -119,6 +121,10 @@ esac
 if [ -n "$INFLUXDB_RAW_RETENTION" ] && \
     ! [[ "$INFLUXDB_RAW_RETENTION" =~ ^(0|[1-9][0-9]{0,4}[hdw])$ ]]; then
     echo "INFLUXDB_RAW_RETENTION must be empty, 0 (keep forever), or a duration such as 720h, 30d or 8w" >&2
+    exit 1
+fi
+if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
+    echo "PROMETHEUS_RETENTION must be a duration such as 720h, 30d or 8w" >&2
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
@@ -458,7 +464,7 @@ install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 # it was service-owned): it stays traversable by the service group but is not
 # writable. Entries planted before this point are rejected by the checks below.
 install -d -m 0750 -o root -g "$VESSELSTACK_GID" "$VESSELSTACK_DATA"
-for managed in influxdb grafana boat-chat signalk mosquitto; do
+for managed in influxdb grafana prometheus boat-chat signalk mosquitto; do
     safe_data_path "$VESSELSTACK_DATA/$managed" leaf
 done
 # Official images run their data processes as these fixed container users.
@@ -472,11 +478,13 @@ install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
 # Native mode keeps its own service-user-owned directory (install-signalk-native.sh).
 SIGNALK_CONTAINER_UID=1000
 SIGNALK_CONTAINER_GID=1000
-ensure_signalk_docker_dir() {
-    local dir="$VESSELSTACK_DATA/signalk" want="$SIGNALK_CONTAINER_UID:$SIGNALK_CONTAINER_GID" have mode
+ensure_container_data_dir() {
+    # $1 dir, $2 uid, $3 gid, $4 label used in messages. Creates the directory, or
+    # repairs an existing wrongly-owned one only under the conservative rules below.
+    local dir=$1 uid=$2 gid=$3 label=$4 want="$2:$3" have mode
     safe_data_path "$dir" leaf
     if [ ! -e "$dir" ]; then
-        install -d -m 0750 -o "$SIGNALK_CONTAINER_UID" -g "$SIGNALK_CONTAINER_GID" "$dir"
+        install -d -m 0750 -o "$uid" -g "$gid" "$dir"
         return 0
     fi
     [ -d "$dir" ] || fail_data_path "$dir exists but is not a directory"
@@ -484,7 +492,7 @@ ensure_signalk_docker_dir() {
     [ "$have" != "$want" ] || return 0
     if [ -z "$(find "$dir" -mindepth 1 -print -quit)" ]; then
         chown -h "$want" "$dir"
-        echo "Repaired SignalK data directory ownership: $dir $have -> $want (empty directory)"
+        echo "Repaired $label data directory ownership: $dir $have -> $want (empty directory)"
         return 0
     fi
     # Populated. The only state repaired automatically is the known one: Docker created
@@ -513,11 +521,20 @@ ensure_signalk_docker_dir() {
     find -P "$dir" -xdev -mindepth 1 -exec chown -h "$want" {} +
     chown -h "$want" "$dir"
     chmod "$mode" "$dir"
-    echo "Repaired SignalK data directory ownership: $dir $have -> $want (recursive, locked during the change; no symlinks, hard links or special files found)"
+    echo "Repaired $label data directory ownership: $dir $have -> $want (recursive, locked during the change; no symlinks, hard links or special files found)"
+}
+ensure_signalk_docker_dir() {
+    ensure_container_data_dir "$VESSELSTACK_DATA/signalk" "$SIGNALK_CONTAINER_UID" "$SIGNALK_CONTAINER_GID" SignalK
 }
 if [ "$SIGNALK_MODE" = docker ]; then
     ensure_signalk_docker_dir
 fi
+# The prom/prometheus image runs as nobody (65534:65534) and keeps its TSDB in
+# /prometheus. Bind-mounting it here keeps metrics across container re-creation and
+# puts them inside the backed-up data directory. Created before compose up.
+PROMETHEUS_CONTAINER_UID=65534
+PROMETHEUS_CONTAINER_GID=65534
+ensure_container_data_dir "$VESSELSTACK_DATA/prometheus" "$PROMETHEUS_CONTAINER_UID" "$PROMETHEUS_CONTAINER_GID" Prometheus
 # Code and the Python virtualenv are root-owned; the service user may only write
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
@@ -722,6 +739,7 @@ GRAFANA_PORT
 HEIMDALL_PORT
 HEIMDALL_HTTPS_PORT
 PROMETHEUS_PORT
+PROMETHEUS_RETENTION
 MQTT_USERNAME
 MQTT_PASSWORD
 MQTT_PORT

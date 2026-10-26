@@ -146,7 +146,13 @@ run_ctl() {
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
 
+install -d -m 0750 -o 65534 -g 65534 "$DATA_ROOT/prometheus"
+printf 'tsdb\n' > "$DATA_ROOT/prometheus/lifecycle-marker"
 archive=$(run_ctl backup "$BACKUP_ROOT" | tail -n 1)
+tar -tzf "$archive" | grep -q '/prometheus/lifecycle-marker$' || {
+    echo 'Backup is missing the Prometheus data directory' >&2
+    exit 1
+}
 [ -s "$archive" ]
 [ -s "$archive.sha256" ]
 run_ctl verify-backup "$archive" | grep -q 'Backup verified'
