@@ -174,6 +174,40 @@ def ha_dashboard(cfg, shore=True, header=True, night=True):
     cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
 
 
+ICONS = {"sog": "speed", "depth": "water", "house_v": "battery_full", "awa": "air", "fuel": "local_gas_station",
+         "water": "water_drop", "waste": "oil_barrel", "batt_v": "bolt", "batt_soc": "battery_charging_full",
+         "solar_a": "solar_power"}
+NOTE_ICONS = {"anchor": "anchor", "shore": "power"}
+
+
+def icons_dashboard(cfg, icons=True, night=True):
+    """Every layout with icons: 2 x 2 and single tiles, 4 and 8 item status grids, bars, an arc, electrical.
+
+    lpg, batt_a and the low battery notification deliberately have no icon.
+    """
+    gauge_pages(cfg)
+    electrical_pages(cfg, pages=())
+    cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
+                            "shore": {"path": "notifications.electrical.shorePower", "label": "Shore",
+                                      "absent": "unknown"}}
+    if icons:
+        for iid, name in ICONS.items():
+            cfg["instruments"][iid]["icon"] = name
+        for iid, name in NOTE_ICONS.items():
+            cfg["notifications"][iid]["icon"] = name
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "house_v", "awa"]},
+        {"title": "Big", "layout": "single", "items": ["house_v"]},
+        {"title": "Status", "layout": "status-grid", "items": ["anchor", "sog", "depth", "awa"]},
+        {"title": "Many", "layout": "status-grid",
+         "items": ["anchor", "sog", "depth", "house_v", "awa", "fuel", "water", "lpg"]},
+        {"title": "Tanks", "layout": "tank-bars", "items": ["fuel", "water", "waste", "lpg"]},
+        {"title": "Fuel", "layout": "gauge-arc", "items": ["fuel"]},
+        {"title": "Power", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a", "shore", "solar_a"]},
+    ]
+    cfg["displays"]["helm"]["ui"] = {"header": True, "swipe": True, "night": "manual" if night else "off"}
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -265,6 +299,10 @@ class GoldenAndDeterminism(Base):
     def test_home_assistant_matches_golden(self):
         self.set_config(ha_dashboard)
         self.check_golden("helm-ha.yaml", self.device(allow_missing_wifi=True))
+
+    def test_icons_match_golden(self):
+        self.set_config(icons_dashboard)
+        self.check_golden("helm-icons.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -2420,6 +2458,156 @@ class Cli(Base):
         both = subprocess.run([sys.executable, str(ROOT / "displays" / "displayctl.py"), "export",
                                "helm", "--root", str(self.root)], capture_output=True)
         self.assertEqual(both.returncode, 2)  # argparse: one of --output/--stdout is required
+
+
+class Icons(Base):
+    """Optional item icons: a Material Symbols subset font, static glyph labels, per-layout placement."""
+
+    def text(self, mutate=icons_dashboard):
+        self.set_config(mutate)
+        return self.device(allow_missing_wifi=True)
+
+    def fonts(self, text):
+        return text.split("font:", 1)[1].split("mqtt:", 1)[0]
+
+    def icon_font(self, text, font_id):
+        block = self.fonts(text).split(f"id: {font_id}\n", 1)[1].split("glyphs:", 1)[1].split("\n", 1)[0]
+        return set(json.loads(block.replace("!literal", "").strip()))
+
+    def used(self, names):
+        return {chr(schema.icon_map()[name]) for name in names}
+
+    def test_no_icons_no_font_and_no_font_file(self):
+        self.set_config(None)
+        collected = self.collect(allow_missing_wifi=True)
+        text = collected.files["helm/helm.yaml"].decode()
+        self.assertNotIn("MaterialSymbols", text)
+        self.assertNotIn("font_icons", text)
+        self.assertNotIn("_icon", text)
+        self.assertNotIn("helm/fonts/MaterialSymbols-subset.ttf", collected.files)
+        self.assertNotIn("helm/fonts/LICENSE-MaterialSymbols.txt", collected.files)
+
+    def test_icons_dashboard_without_icons_matches_the_plain_layouts(self):
+        text = self.text(lambda cfg: icons_dashboard(cfg, icons=False))
+        self.assertNotIn("font_icons", text)
+        self.assertNotIn("_icon", text)
+
+    def test_font_files_ship_only_with_icons(self):
+        self.set_config(icons_dashboard)
+        files = self.collect(allow_missing_wifi=True).files
+        self.assertEqual(files["helm/fonts/MaterialSymbols-subset.ttf"],
+                         (ROOT / "displays" / "esphome" / "fonts" / "MaterialSymbols-subset.ttf").read_bytes())
+        self.assertIn("Apache License", files["helm/fonts/LICENSE-MaterialSymbols.txt"].decode())
+
+    def test_glyph_sets_are_exactly_the_used_codepoints(self):
+        text = self.text()
+        # 2 x 2 status page (anchor, sog, depth, awa) uses the large font; everything else the 28 px one.
+        self.assertEqual(self.icon_font(text, "font_icons_lg"), self.used(["anchor", "speed", "water", "air"]))
+        self.assertEqual(self.icon_font(text, "font_icons"), self.used([
+            "speed", "water", "battery_full", "air", "local_gas_station", "water_drop", "oil_barrel", "bolt",
+            "battery_charging_full", "solar_power", "anchor", "power"]))
+        self.assertEqual(text.count("file: fonts/MaterialSymbols-subset.ttf"), 2)
+        self.assertIn("size: 40", self.fonts(text).split("id: font_icons_lg")[1].split("glyphs")[0])
+        self.assertIn("size: 28", self.fonts(text).split("id: font_icons\n")[1].split("glyphs")[0])
+
+    def test_only_the_sizes_in_use_are_emitted(self):
+        def only_tanks(cfg):
+            icons_dashboard(cfg)
+            cfg["displays"]["helm"]["pages"] = [cfg["displays"]["helm"]["pages"][4]]
+        text = self.text(only_tanks)
+        self.assertNotIn("font_icons_lg", text)
+        self.assertEqual(self.icon_font(text, "font_icons"),
+                         self.used(["local_gas_station", "water_drop", "oil_barrel"]))
+
+    def test_icons_are_static_literal_glyph_labels(self):
+        text = self.text()
+        labels = [line for line in text.splitlines() if "_icon," in line and "label:" in line]
+        self.assertTrue(labels)
+        for line in labels:
+            self.assertRegex(line, r'text: !literal "\\uE?[0-9A-F]{3,4}", text_font: font_icons(_lg)?, '
+                                   r'text_color: 0x9AA5B1')
+        for glyph in re.findall(r'(\w+_icon)\b', text):
+            self.assertNotIn(f"id({glyph}), ", "".join(
+                line for line in text.splitlines() if "lv_label_set_text" in line))
+
+    def test_item_without_an_icon_has_no_icon_label(self):
+        text = self.text()
+        self.assertNotIn("p3_lpg_icon", text)
+        self.assertNotIn("p4_lpg_icon", text)
+        self.assertNotIn("p6_batt_a_icon", text)
+        self.assertIn("p3_fuel_icon", text)
+
+    def test_placement_per_layout(self):
+        text = self.text()
+
+        def window(marker, after=12):
+            lines = text.splitlines()
+            index = next(i for i, line in enumerate(lines) if marker in line)
+            return lines[index:index + after]
+
+        # grid-2x2 and single: icon and label side by side in a row
+        for marker in ("id: p0_sog_icon", "id: p1_house_v_icon"):
+            around = "\n".join(text.splitlines()[text.splitlines().index(next(
+                l for l in text.splitlines() if marker in l)) - 8:][:10])
+            self.assertIn("flex_flow: ROW", around)
+        self.assertLess(text.index("id: p0_sog_icon"), text.index("id: p0_sog_name"))
+        # 2 x 2 status: icon above the label, large, same column as the label
+        block = "\n".join(window("id: p2_sog_icon", 3))
+        self.assertIn("font_icons_lg", block)
+        self.assertIn("p2_sog_name", block)
+        self.assertNotIn("flex_flow: ROW", block)
+        # 3-row status grid: icon left of a label that is narrowed to the rest of the cell
+        row = "\n".join(window("id: p3_sog_icon", 2))
+        self.assertIn("font_icons,", row)
+        self.assertRegex(row, r"p3_sog_name.*width: \d+, text_align: LEFT")
+        # tank bars: icon above the label
+        bar = "\n".join(window("id: p4_fuel_icon", 3))
+        self.assertIn("p4_fuel_name", bar)
+        self.assertNotIn("flex_flow: ROW", bar)
+        # gauge-arc: icon left of the label inside the text column
+        arc = text.splitlines()
+        i = next(n for n, l in enumerate(arc) if "id: p5_fuel_icon" in l)
+        self.assertIn("flex_flow: ROW", "\n".join(arc[i - 8:i]))
+        self.assertIn("p5_fuel_name", arc[i + 1])
+        # electrical: icon slot first in every row, a spacer where an item has no icon
+        self.assertLess(text.index("id: p6_batt_soc_icon"), text.index("id: p6_batt_soc_name"))
+        self.assertRegex(text, r"- obj: \{width: 28, height: 1, bg_opa: TRANSP")
+        self.assertEqual(text.count("- obj: {width: 28, height: 1"), 1)   # only the current row lacks an icon
+
+    def test_night_palette_repaints_icons_with_their_labels(self):
+        text = self.text()
+        night = text.split("id: apply_night", 1)[1].split("id: render_header", 1)[0] \
+            if "id: render_header" in text else text.split("id: apply_night", 1)[1]
+        icon_ids = re.findall(r"id: (p\d+_\w+_icon)\b", text)
+        self.assertTrue(icon_ids)
+        for icon in icon_ids:
+            self.assertIn(f"lv_obj_set_style_text_color(id({icon}), lv_color_hex(n ? 0x6A1600 : 0x9AA5B1)", night)
+        name_paint = re.findall(r"id\((p\d+_\w+)_name\), lv_color_hex\(n \? 0x6A1600", night)
+        icon_paint = re.findall(r"id\((p\d+_\w+)_icon\), lv_color_hex\(n \? 0x6A1600", night)
+        self.assertEqual({f"{base}_icon" for base in icon_paint}, set(icon_ids))
+        self.assertTrue(set(icon_paint) <= set(name_paint))
+
+    def test_icon_ids_exist_only_where_the_night_palette_needs_them(self):
+        text = self.text(lambda cfg: icons_dashboard(cfg, night=False))
+        self.assertIn('text: !literal "\\uE9E4", text_font: font_icons,', text)
+        self.assertIsNone(re.search(r"_icon\b", text))   # no night palette, no ids: the labels stay static
+
+    def test_numeric_ha_item_icon(self):
+        def mutate(cfg):
+            ha_dashboard(cfg, shore=False)
+            cfg["ha"]["cabin_t"]["icon"] = "thermostat"
+            cfg["ha"]["bilge_pump"]["icon"] = "water_drop"
+        text = self.text(mutate)
+        self.assertEqual(self.icon_font(text, "font_icons"), self.used(["thermostat", "water_drop"]))
+
+    def test_icons_do_not_change_other_fonts_or_the_rest_of_the_file(self):
+        with_icons = self.text()
+        without = self.text(lambda cfg: icons_dashboard(cfg, icons=False))
+        strip = [l for l in with_icons.splitlines() if "_icon" not in l]
+        self.assertEqual(len(without.splitlines()) < len(with_icons.splitlines()), True)
+        plain_fonts = without.split("font:", 1)[1].split("id: font_icons", 1)[0]
+        self.assertTrue(with_icons.split("font:", 1)[1].startswith(plain_fonts.rstrip()[:200]))
+        self.assertTrue(strip)
 
 
 if __name__ == "__main__":

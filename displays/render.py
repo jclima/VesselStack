@@ -1365,7 +1365,7 @@ def _fonts_lines(display: dict, config: dict) -> list:
     for key in ("lg", "md"):   # only the sizes and glyphs the items actually use
         if ICON_FONTS[key] in icons:
             lines += [f"  - file: fonts/{ICON_FONT_FILE}", f"    id: {ICON_FONTS[key]}",
-                      f"    size: {ICON_SIZES[key]}", "    bpp: 4", f"    glyphs: {yq(icons[ICON_FONTS[key]])}"]
+                      f"    size: {ICON_SIZES[key]}", "    bpp: 4", f"    glyphs: {lit(icons[ICON_FONTS[key]])}"]
     return lines
 
 

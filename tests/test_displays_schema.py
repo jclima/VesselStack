@@ -919,3 +919,70 @@ class ElectricalLayoutTests(unittest.TestCase):
     def test_a_layout_without_slots_keeps_working(self) -> None:
         self.assertEqual(self.slot_errors(lambda l: l.pop("slots")), [])
         self.assertEqual(self.slot_errors(lambda l: None), [])
+
+
+class IconSchemaTests(unittest.TestCase):
+    FONTS = ROOT / "displays" / "esphome" / "fonts"
+
+    def errors(self, mutate):
+        return errors_for(mutate)
+
+    def test_icons_json_names_and_codepoints(self) -> None:
+        icons = json.loads((self.FONTS / "icons.json").read_text())
+        self.assertGreaterEqual(len(icons), 20)
+        self.assertEqual(len(set(icons.values())), len(icons))
+        for name, code in icons.items():
+            self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
+            self.assertRegex(code, r"^[0-9a-f]{4,5}$")
+            self.assertTrue(0xE000 <= int(code, 16) <= 0xF8FF or int(code, 16) >= 0xF0000, name)
+        self.assertEqual(schema.icon_map()["anchor"], int(icons["anchor"], 16))
+
+    def test_every_bundled_codepoint_is_in_the_font(self) -> None:
+        import struct
+        data = (self.FONTS / "MaterialSymbols-subset.ttf").read_bytes()
+        tables = {}
+        for i in range(struct.unpack_from(">H", data, 4)[0]):
+            tag, _, offset, length = struct.unpack_from(">4sIII", data, 12 + 16 * i)
+            tables[tag] = (offset, length)
+        cmap = tables[b"cmap"][0]
+        covered = set()
+        for i in range(struct.unpack_from(">H", data, cmap + 2)[0]):
+            platform, encoding, off = struct.unpack_from(">HHI", data, cmap + 4 + 8 * i)
+            base = cmap + off
+            fmt = struct.unpack_from(">H", data, base)[0]
+            if (platform, encoding) == (3, 1) and fmt == 4:
+                segx2 = struct.unpack_from(">H", data, base + 6)[0]
+                segs = segx2 // 2
+                ends = struct.unpack_from(f">{segs}H", data, base + 14)
+                starts = struct.unpack_from(f">{segs}H", data, base + 16 + segx2)
+                for start, end in zip(starts, ends):
+                    covered.update(range(start, end + 1))
+        for name, code in schema.icon_map().items():
+            self.assertIn(code, covered, f"icon {name} (U+{code:04X}) is not in MaterialSymbols-subset.ttf")
+        self.assertLess(len(data), 40 * 1024)
+
+    def test_icon_on_instruments_notifications_and_ha_items(self) -> None:
+        def mutate(cfg):
+            inst(cfg)["icon"] = "speed"
+            cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor",
+                                               "icon": "anchor"}}
+            cfg["ha"] = {"bilge": dict(copy.deepcopy(BILGE), icon="water_drop"),
+                         "temp": dict(copy.deepcopy(TEMP), icon="thermostat")}
+        self.assertEqual(self.errors(mutate), [])
+
+    def test_unknown_or_malformed_icon_names_are_refused(self) -> None:
+        for value in ("nope", "", "Anchor", "anchor ", 5, None, ["anchor"], {"a": 1}, True):
+            def mutate(cfg, value=value):
+                inst(cfg)["icon"] = value
+            errors = self.errors(mutate)
+            self.assertTrue(any("$.instruments.sog.icon: unknown icon" in e and "anchor" in e
+                                and "icons.json" in e for e in errors), (value, errors))
+
+            def note(cfg, value=value):
+                cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "A",
+                                                   "icon": value}}
+            self.assertTrue(any("$.notifications.anchor.icon" in e for e in self.errors(note)), value)
+
+            def ha(cfg, value=value):
+                cfg["ha"] = {"bilge": dict(copy.deepcopy(BILGE), icon=value)}
+            self.assertTrue(any("$.ha.bilge.icon" in e for e in self.errors(ha)), value)
