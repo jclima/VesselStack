@@ -105,8 +105,8 @@ installer stops before changing anything and lists these options. `--web-wizard`
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
 The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.2/get-vesselstack.sh`, or add
-`--version 0.4.2` (`| sudo bash -s -- --version 0.4.2`). It installs the Debian
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.3/get-vesselstack.sh`, or add
+`--version 0.4.3` (`| sudo bash -s -- --version 0.4.3`). It installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, asks the configuration questions in the terminal, then runs the installer dry run, the
@@ -211,7 +211,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.2
+git checkout v0.4.3
 python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
 # python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```
@@ -281,6 +281,52 @@ sudo vesselstackctl verify-backup /path/to/archive.tar.gz
 
 - Record the Pi hostname/IP, fuse location, power isolation point, CAN adapter,
   connector, installed version, backup location, and recovery owner.
+
+## Reaching VesselStack from other devices
+
+The wizard asks "Who should be able to reach the dashboards?": `local` (only this Pi; use an
+SSH tunnel), `dashboards` (recommended: Grafana, Heimdall and Boat Chat on your boat network;
+InfluxDB, Prometheus and MQTT stay on the Pi) or `all` (also MQTT, InfluxDB and Prometheus,
+which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later with
+`sudo vesselstackctl lan [local|dashboards|all] [--dry-run]` (`all` needs `--yes`). The
+Control Panel stays on the Pi in every preset. SignalK and Home Assistant are host-networked
+and not controlled by the presets; use the firewall's strict mode or Home Assistant's
+`http: server_host` to limit them.
+
+If `VESSELSTACK_FIREWALL_ENABLE=true` and the Pi is on your network over the untrusted
+interface (default `wlan0`), other devices are blocked from Grafana and the data services
+whatever the preset says; `vesselstackctl lan` warns and refuses (override:
+`--allow-firewall-conflict`). Test from a laptop on the same network:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://PI:43000/login   # 200 = Grafana reachable
+```
+
+See the README section "Reaching VesselStack from other devices" for the full table.
+
+## Troubleshooting: Boat Chat "not ready" (memory index empty)
+
+`vesselstackctl doctor` prints `FAIL Boat Chat memory index is empty` (or `/health`
+shows `readiness.layers.memory` with `chunks: 0`) on installs older than 0.4.3,
+which never built the index, or when the build failed. Fix it with
+`sudo vesselstackctl reindex` (it runs as the service user), then `sudo vesselstackctl
+doctor`. 0.4.3 and later build the index during installation, on upgrade and on
+`vesselstackctl start`. Details: README, "Memory index".
+
+## Troubleshooting: SignalK not running / EACCES on package.json
+
+With `SIGNALK_MODE=docker`, if the `vesselstack-signalk` container keeps restarting
+and `sudo docker logs vesselstack-signalk` shows
+`EACCES: permission denied, open '/home/node/.signalk/package.json'`, the data
+directory `<data>/signalk` is owned by root instead of uid/gid 1000 (the `node`
+user in the SignalK image). Release 0.4.3 and later create and repair it on every
+installer run (an empty or `root:root` directory only; a populated directory with symlinks,
+hard links, special files or another owner is left untouched with instructions), and
+`sudo vesselstackctl doctor` reports it. Manual fix:
+
+```bash
+sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk
+```
 
 ## Rollback and recovery
 

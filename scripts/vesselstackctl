@@ -17,8 +17,15 @@ Usage: vesselstackctl COMMAND [ARGUMENTS]
 Commands:
   status                       Show a concise service and endpoint summary
   doctor                       Validate config, dependencies, disk, and health
-  urls                         Print the configured service URLs
+  urls                         Show who can reach each service (real listening state) and the
+                               addresses to use from other devices
   version                      Print installed and command versions
+  lan [local|dashboards|all] [--dry-run] [--yes] [--allow-firewall-conflict]
+                               Show or change who on the network can reach the dashboards
+                               (rewrites the bind settings, re-applies; the control panel
+                               always stays on this device)
+  reindex                      Rebuild Boat Chat's memory index as the service user
+                               (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|containers|all]
                                Show recent diagnostic logs (default: all)
   start                        Start the stack
@@ -57,6 +64,21 @@ load_config() {
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
 }
 
+# Run the bundled memory-index helper (as the service user). Returns non-zero when it
+# is missing or fails; callers decide how loud to be.
+memory_index_helper() {
+    local helper="$VESSELSTACK_ROOT/installer/scripts/memory-index.sh"
+    [ -x "$helper" ] || { echo "Missing bundled memory index helper: $helper (rerun the installer)" >&2; return 1; }
+    "$helper" "$ENV_FILE" "$@"
+}
+
+ensure_memory_index() {
+    if ! memory_index_helper ensure; then
+        echo "WARN: the Boat Chat memory index could not be built; Boat Chat will report 'not ready'. Fix: sudo vesselstackctl reindex" >&2
+        return 1
+    fi
+}
+
 start_stack() {
     local installer_scripts="$VESSELSTACK_ROOT/installer/scripts"
     if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
@@ -85,6 +107,9 @@ start_stack() {
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
     fi
+    # Existing installs have no index until the first start after upgrading: build it
+    # (cheap when nothing changed) before Boat Chat starts. Never blocks the start.
+    ensure_memory_index || true
     systemctl start vesselstack-chat.service
     if [ "${TELEGRAM_ENABLE:-false}" = true ]; then
         systemctl start vesselstack-chat-telegram.service
@@ -196,34 +221,176 @@ env_file_value() {
     printf '%s' "$value"
 }
 
-bind_note() {
+# Classify a configured bind address: all | loopback | other.
+bind_kind() {
     case "$1" in
-        127.0.0.1|::1|localhost) printf 'this device only' ;;
-        0.0.0.0|::|'') printf 'ALL interfaces' ;;
-        *) printf 'interface %s' "$1" ;;
+        127.*|::1|localhost) printf loopback ;;
+        0.0.0.0|::|''|'*') printf all ;;
+        *) printf other ;;
     esac
+}
+
+# Listening TCP sockets as "address port" lines, from `ss -ltn`. Empty (and
+# LISTENERS_KNOWN=0) when ss is missing or fails, so callers fall back to configuration.
+LISTENERS=''
+LISTENERS_KNOWN=0
+collect_listeners() {
+    local raw
+    command -v ss >/dev/null 2>&1 || return 0
+    raw=$(ss -ltn 2>/dev/null) || return 0
+    LISTENERS=$(awk '$1 == "LISTEN" {
+        n = split($4, parts, ":"); port = parts[n]
+        addr = substr($4, 1, length($4) - length(port) - 1)
+        gsub(/[\[\]]/, "", addr); sub(/%.*/, "", addr)
+        if (addr == "*" || addr == "" || addr == "::") addr = "0.0.0.0"
+        if (addr == "::1") addr = "127.0.0.1"
+        print addr, port }' <<<"$raw")
+    [ -z "$LISTENERS" ] || LISTENERS_KNOWN=1
+}
+
+# Real bind state of a TCP port: sets BOUND_KIND (all|loopback|other|none) and
+# BOUND_ADDR (the specific address for "other").
+listening_state() {
+    local port=$1 addr p
+    BOUND_KIND=none
+    BOUND_ADDR=''
+    while read -r addr p; do
+        [ "$p" = "$port" ] || continue
+        case "$(bind_kind "$addr")" in
+            all) BOUND_KIND=all ;;
+            loopback) [ "$BOUND_KIND" = all ] || [ "$BOUND_KIND" = other ] || BOUND_KIND=loopback ;;
+            other) [ "$BOUND_KIND" = all ] || { BOUND_KIND=other; BOUND_ADDR=$addr; } ;;
+        esac
+    done <<<"$LISTENERS"
+}
+
+# Names and IPv4 addresses other devices can use to reach this machine: the mDNS name
+# plus every non-loopback address except container/virtual bridge interfaces.
+REACH_HOSTS=()
+REACH_NOTES=()
+collect_reachable() {
+    local name short iface cidr address
+    name=$(hostname 2>/dev/null || true)
+    short=${name%%.*}
+    if [ -n "$short" ]; then
+        REACH_HOSTS+=("$short.local")
+        REACH_NOTES+=("mDNS name; works where Avahi or Bonjour is available")
+    fi
+    if command -v ip >/dev/null 2>&1; then
+        while read -r iface cidr; do
+            case "$iface" in
+                lo|docker*|br-*|veth*|virbr*|cni*|flannel*|cali*|vxlan*|lxc*|lxd*) continue ;;
+            esac
+            address=${cidr%%/*}
+            case "$address" in 127.*|169.254.*|'') continue ;; esac
+            REACH_HOSTS+=("$address")
+            REACH_NOTES+=("interface $iface")
+        done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2, $4}')
+    fi
+}
+
+# One service: LABEL PORT SCHEME CONFIGURED_ADDRESS [HOST_NETWORK] [EXTRA_NOTE] [CHANGE_HINT]
+#   host-network services are not published by Docker, so without a real socket listing
+#   the configured address is unknown and they are assumed to listen on every interface.
+url_for() {
+    local scheme=$1 host=$2 port=$3
+    if [ "$scheme" = http ] && [ "$port" = 80 ]; then printf 'http://%s' "$host"
+    else printf '%s://%s:%s' "$scheme" "$host" "$port"; fi
+}
+
+show_service() {
+    local label=$1 port=$2 scheme=$3 configured=$4 host_network=${5:-no} extra=${6:-} hint=${7:-}
+    local kind addr='' source=listening state i
+    listening_state "$port"
+    kind=$BOUND_KIND
+    addr=$BOUND_ADDR
+    if [ "$LISTENERS_KNOWN" -eq 0 ] || [ "$kind" = none ]; then
+        if [ "$host_network" = yes ] && [ "$LISTENERS_KNOWN" -eq 0 ]; then
+            kind=all; source='assumed: host networking, not verified'
+        elif [ "$host_network" = yes ]; then
+            kind=none; source='not listening'
+        else
+            kind=$(bind_kind "$configured"); addr=$configured
+            if [ "$LISTENERS_KNOWN" -eq 0 ]; then source='from configuration'; else source='from configuration, not seen listening'; fi
+        fi
+    fi
+    case "$kind" in
+        all) state='ALL interfaces - reachable from other devices' ;;
+        loopback) state='this device only' ;;
+        other) state="interface $addr only" ;;
+        *) state='not listening' ;;
+    esac
+    [ "$source" = listening ] || state="$state ($source)"
+    printf '%-20s %s%s\n' "$label" "$state" "${extra:+; $extra}"
+    case "$kind" in
+        none) return 0 ;;
+        other) printf '%-20s %s\n' '' "  $(url_for "$scheme" "$addr" "$port")" ;;
+        *) printf '%-20s %s\n' '' "  $(url_for "$scheme" 127.0.0.1 "$port")   (on this device)" ;;
+    esac
+    if [ "$kind" = all ]; then
+        for i in "${!REACH_HOSTS[@]}"; do
+            printf '%-20s %s\n' '' "  $(url_for "$scheme" "${REACH_HOSTS[$i]}" "$port")   (from other devices: ${REACH_NOTES[$i]})"
+        done
+    fi
+    if [ "$kind" = loopback ] && [ -n "$hint" ]; then
+        printf '%-20s %s\n' '' "  $hint"
+    fi
+    return 0
+}
+
+# Host and port of a URL (no credentials expected): prints "HOST PORT".
+url_host_port() {
+    local rest=${1#*://} default=$2 hostport host port
+    hostport=${rest%%/*}
+    hostport=${hostport##*@}
+    host=${hostport%%:*}
+    port=${hostport##*:}
+    [ "$port" != "$hostport" ] || port=$default
+    printf '%s %s\n' "$host" "$port"
 }
 
 show_urls() {
     local chat_host panel_host data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
-    local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}
+    local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} host port i
     chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
     chat_host=${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_host=${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}
-    printf '%-20s %s  (bound: %s; access token required)\n' 'Boat Chat' \
-        "http://$chat_host:${BOAT_CHAT_PORT:-8765}" "$(bind_note "$chat_host")"
-    printf '%-20s %s  (bound: %s)\n' 'Control Panel' \
-        "http://$panel_host:${CONTROL_PANEL_PORT:-8780}" "$(bind_note "$panel_host")"
-    printf '%-20s %s\n' SignalK "$SIGNALK_URL"
-    printf '%-20s %s\n' 'Home Assistant' "$HOME_ASSISTANT_URL"
-    printf '%-20s %s  (bound: %s)\n' InfluxDB "$INFLUXDB_URL" "$(bind_note "$data_bind")"
-    printf '%-20s %s  (bound: %s)\n' Grafana \
-        "http://$web_bind:${GRAFANA_PORT:-43000}" "$(bind_note "$web_bind")"
-    printf '%-20s %s  (bound: %s)\n' Heimdall \
-        "http://$web_bind:${HEIMDALL_PORT:-80}" "$(bind_note "$web_bind")"
-    printf '%-20s %s  (bound: %s)\n' Prometheus \
-        "http://$data_bind:${PROMETHEUS_PORT:-9090}" "$(bind_note "$data_bind")"
+    collect_listeners
+    collect_reachable
+    printf 'Addresses other devices on this network can use to reach this machine:\n'
+    if [ "${#REACH_HOSTS[@]}" -eq 0 ]; then
+        printf '  (none found: no network address besides loopback)\n'
+    fi
+    for i in "${!REACH_HOSTS[@]}"; do
+        printf '  %-28s %s\n' "${REACH_HOSTS[$i]}" "${REACH_NOTES[$i]}"
+    done
+    if [ "$LISTENERS_KNOWN" -eq 0 ]; then
+        printf 'Note: listening sockets could not be inspected (ss unavailable); bind state is taken from the configuration.\n'
+    fi
+    printf '\n'
+    show_service 'Boat Chat' "${BOAT_CHAT_PORT:-8765}" http "$chat_host" no 'access token required' \
+        'to change: sudo vesselstackctl lan dashboards'
+    show_service 'Control Panel' "${CONTROL_PANEL_PORT:-8780}" http "$panel_host" no \
+        'root-level editor, loopback by design' \
+        "to reach it: ssh -L ${CONTROL_PANEL_PORT:-8780}:127.0.0.1:${CONTROL_PANEL_PORT:-8780} USER@HOST (SSH tunnel)"
+    if [ "${SIGNALK_MODE:-existing}" = existing ]; then
+        printf '%-20s %s\n' SignalK "existing server, not managed here: $SIGNALK_URL"
+    else
+        read -r host port < <(url_host_port "$SIGNALK_URL" 3000)
+        show_service SignalK "$port" http "$host" yes 'host-networked container; vesselstackctl lan does not change it'
+    fi
+    read -r host port < <(url_host_port "$HOME_ASSISTANT_URL" 8123)
+    case "$(bind_kind "$host")" in
+        loopback) show_service 'Home Assistant' "$port" http "$host" yes 'host-networked container; vesselstackctl lan does not change it' ;;
+        *) printf '%-20s %s\n' 'Home Assistant' "external server, not managed here: $HOME_ASSISTANT_URL" ;;
+    esac
+    show_service Grafana "${GRAFANA_PORT:-43000}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
+    show_service Heimdall "${HEIMDALL_PORT:-80}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
+    show_service InfluxDB "${INFLUXDB_PORT:-8086}" http "$data_bind" no 'API token required' 'to change: sudo vesselstackctl lan all'
+    show_service Prometheus "${PROMETHEUS_PORT:-9090}" http "$data_bind" no 'NO login' 'to change: sudo vesselstackctl lan all'
+    show_service MQTT "${MQTT_PORT:-1883}" mqtt "$data_bind" no 'password required' 'to change: sudo vesselstackctl lan all'
+    printf '\nChange who can reach the dashboards with: sudo vesselstackctl lan [local|dashboards|all]\n'
 }
 
 show_version() {
@@ -252,6 +419,182 @@ show_logs() {
     esac
 }
 
+# --- LAN access presets -------------------------------------------------------------
+# local:      everything this machine publishes listens on loopback only
+# dashboards: Grafana, Heimdall and Boat Chat on every interface; databases on loopback
+# all:        also InfluxDB, Prometheus and MQTT on every interface
+# The control panel (a root-level editor) is in no preset. Host-networked SignalK and
+# Home Assistant are not controlled by these settings.
+LAN_PRESET_NAMES='local dashboards all'
+
+lan_values() {
+    # Prints "WEB DATA CHAT" bind addresses of a preset.
+    case "$1" in
+        local) printf '127.0.0.1 127.0.0.1 127.0.0.1\n' ;;
+        dashboards) printf '0.0.0.0 127.0.0.1 0.0.0.0\n' ;;
+        all) printf '0.0.0.0 0.0.0.0 0.0.0.0\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+lan_current_chat_host() {
+    local host
+    host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
+    printf '%s' "${host:-0.0.0.0}"
+}
+
+lan_current_preset() {
+    local web=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} data=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1} chat name
+    chat=$(lan_current_chat_host)
+    for name in $LAN_PRESET_NAMES; do
+        if [ "$(lan_values "$name")" = "$web $data $chat" ]; then printf '%s' "$name"; return 0; fi
+    done
+    printf 'custom'
+}
+
+# Rewrite KEY=VALUE in FILE atomically (temporary file in the same directory, same owner
+# and mode, then rename), appending the key when absent. VALUE is one of the fixed preset
+# addresses, so no quoting is needed.
+set_env_key() {
+    local file=$1 key=$2 value=$3 temp
+    if [ ! -f "$file" ] || [ -L "$file" ]; then
+        echo "Refusing to edit $file (missing or a symlink)" >&2
+        return 1
+    fi
+    temp=$(mktemp "$(dirname "$file")/.$(basename "$file").XXXXXX")
+    if ! awk -v key="$key" -v value="$value" '
+            BEGIN { done = 0 }
+            index($0, key "=") == 1 { if (!done) { print key "=" value; done = 1 }; next }
+            { print }
+            END { if (!done) print key "=" value }' "$file" > "$temp" \
+        || ! chown --reference="$file" "$temp" || ! chmod --reference="$file" "$temp" \
+        || ! mv -f -- "$temp" "$file"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+
+lan_firewall_report() {
+    # $1 = target preset. Prints the firewall interplay; returns 1 when it conflicts.
+    local iface=${VESSELSTACK_UNTRUSTED_INTERFACE:-wlan0} strict=${VESSELSTACK_FIREWALL_STRICT:-false} route_if what
+    [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ] || return 0
+    [ "$1" != local ] || return 0
+    if [ "$strict" = true ]; then
+        what="everything except the allow-listed TCP ports (${VESSELSTACK_FIREWALL_ALLOW_TCP:-22})"
+    else
+        what="Grafana ${GRAFANA_PORT:-43000}, InfluxDB ${INFLUXDB_PORT:-8086}, Prometheus ${PROMETHEUS_PORT:-9090} and MQTT ${MQTT_PORT:-1883}"
+    fi
+    printf 'FIREWALL: the VesselStack firewall is enabled and treats %s as untrusted.\n' "$iface" >&2
+    printf '          Devices that reach this machine over %s (usually Wi-Fi) are blocked from %s,\n' "$iface" "$what" >&2
+    printf '          whatever the LAN setting says.\n' >&2
+    route_if=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}' | head -n 1 || true)
+    if [ "$route_if" = "$iface" ]; then
+        printf '          This machine reaches your network over %s itself, so other devices on it would be locked out.\n' "$iface" >&2
+    fi
+    printf '          Choose another untrusted interface or disable the firewall first (VESSELSTACK_FIREWALL_*), or pass --allow-firewall-conflict.\n' >&2
+    return 1
+}
+
+lan_stack() {
+    local preset='' dry_run=0 yes=0 allow_fw=0 argument web data chat cur_web cur_data cur_chat panel_host
+    for argument in "$@"; do
+        case "$argument" in
+            --dry-run) dry_run=1 ;;
+            --yes) yes=1 ;;
+            --allow-firewall-conflict) allow_fw=1 ;;
+            -*) echo "Unknown lan option: $argument" >&2; usage >&2; exit 2 ;;
+            *) [ -z "$preset" ] || { usage >&2; exit 2; }; preset=$argument ;;
+        esac
+    done
+    cur_web=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}
+    cur_data=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
+    cur_chat=$(lan_current_chat_host)
+    panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
+    panel_host=${panel_host:-127.0.0.1}
+    if [ -z "$preset" ]; then
+        printf 'Current LAN access: %s\n' "$(lan_current_preset)"
+        printf '  Grafana, Heimdall listen on     %s\n  InfluxDB, Prometheus, MQTT on   %s\n  Boat Chat listens on            %s\n' \
+            "$cur_web" "$cur_data" "$cur_chat"
+        printf '  Control panel                   %s (never changed by this command)\n\n' "$panel_host"
+        cat <<'EOF'
+Presets (sudo vesselstackctl lan PRESET [--dry-run]):
+  local       everything this machine publishes is limited to this device (use an SSH tunnel)
+  dashboards  Grafana, Heimdall and Boat Chat on the network; InfluxDB, Prometheus and MQTT
+              stay on this device (recommended)
+  all         also InfluxDB, Prometheus (NO login) and MQTT on the network; needs --yes
+SignalK (3000) and Home Assistant (8123) run in host-network containers and are not changed
+by these presets; 'vesselstackctl urls' shows how they really listen.
+EOF
+        return 0
+    fi
+    read -r web data chat < <(lan_values "$preset") || {
+        echo "Unknown LAN preset: $preset (use local, dashboards or all)" >&2; usage >&2; exit 2; }
+    printf 'LAN access: %s -> %s\n' "$(lan_current_preset)" "$preset"
+    printf '  %-34s %-12s -> %s\n' VESSELSTACK_WEB_BIND_ADDRESS "$cur_web" "$web" \
+        VESSELSTACK_DATA_BIND_ADDRESS "$cur_data" "$data" \
+        'BOAT_CHAT_HOST (boat-chat.env)' "$cur_chat" "$chat"
+    printf '  Control panel stays on %s (never changed by this command).\n' "$panel_host"
+    if [ "$preset" = all ]; then
+        echo "WARNING: Prometheus has no login and InfluxDB/MQTT would be open to every device on the network. Enable the firewall (VESSELSTACK_FIREWALL_ENABLE) and keep Ethernet or a VPN as your way in." >&2
+    fi
+    if [ "$preset" = local ]; then
+        echo "NOTE: SignalK (3000) and Home Assistant (8123) are host-networked and keep listening on every interface; use the firewall's strict mode or Home Assistant's http server_host setting to limit them." >&2
+    fi
+    local override
+    override=$(env_file_value "$VESSELSTACK_DATA/boat-chat/boat-chat.env" BOAT_CHAT_HOST)
+    if [ -n "$override" ] && [ "$override" != "$chat" ]; then
+        echo "WARNING: Boat Chat's Settings page overrides BOAT_CHAT_HOST with $override ($VESSELSTACK_DATA/boat-chat/boat-chat.env); that value wins. Clear it in the Boat Chat Settings page." >&2
+    fi
+    if ! lan_firewall_report "$preset"; then
+        if [ "$allow_fw" -ne 1 ]; then
+            echo "Refusing to change LAN access while the firewall would block it (see above)." >&2
+            exit 1
+        fi
+        echo "Continuing because --allow-firewall-conflict was given." >&2
+    fi
+    if [ "$preset" = all ] && [ "$dry_run" -eq 0 ] && [ "$yes" -ne 1 ]; then
+        echo "Refusing: 'all' exposes Prometheus (no login), InfluxDB and MQTT to the network; repeat with --yes to confirm." >&2
+        exit 1
+    fi
+    if [ "$dry_run" -eq 1 ]; then
+        echo "Dry run: nothing was changed. Run without --dry-run to apply."
+        return 0
+    fi
+    if [ "$(lan_current_preset)" = "$preset" ]; then
+        echo "Already set; nothing to change."
+        return 0
+    fi
+    local chat_file="$ROOT/config/boat-chat.env" backup
+    if [ ! -f "$chat_file" ] || [ -L "$chat_file" ]; then
+        echo "Missing or unsafe $chat_file; rerun the installer" >&2
+        exit 1
+    fi
+    backup=$(mktemp -d)
+    cp -p -- "$ENV_FILE" "$backup/vesselstack.env"
+    cp -p -- "$chat_file" "$backup/boat-chat.env"
+    if ! { set_env_key "$ENV_FILE" VESSELSTACK_WEB_BIND_ADDRESS "$web" \
+            && set_env_key "$ENV_FILE" VESSELSTACK_DATA_BIND_ADDRESS "$data" \
+            && set_env_key "$chat_file" BOAT_CHAT_HOST "$chat"; }; then
+        cp -p -- "$backup/vesselstack.env" "$ENV_FILE"
+        cp -p -- "$backup/boat-chat.env" "$chat_file"
+        rm -rf -- "$backup"
+        echo "Could not update the configuration; the previous files were restored." >&2
+        exit 1
+    fi
+    rm -rf -- "$backup"
+    echo "Configuration updated."
+    # Re-apply: compose recreates only the containers whose published ports changed.
+    if "${COMPOSE[@]}" ps --status running --quiet 2>/dev/null | grep -q .; then
+        "${COMPOSE[@]}" up -d
+    else
+        echo "The containers are not running; the new addresses apply at the next start."
+    fi
+    if systemctl is-active --quiet vesselstack-chat.service 2>/dev/null; then
+        systemctl restart vesselstack-chat.service
+    fi
+    echo "Done. Check the result with: sudo vesselstackctl urls"
+}
+
 # Warn (never fail) when the data filesystem is more than 80% full. Time-series
 # data grows without bound unless INFLUXDB_RAW_RETENTION is set.
 disk_usage_warning() {
@@ -264,6 +607,59 @@ disk_usage_warning() {
     else
         printf 'OK   data filesystem usage: %s%% (%s MiB in data directory)\n' "${used:-?}" "${data_size:-?}"
     fi
+}
+
+# The signalk-server image runs as uid/gid 1000. A bind-mount source that Docker
+# created as root:root (or that is otherwise not writable by uid 1000) makes SignalK
+# exit with "EACCES: permission denied, open '/home/node/.signalk/package.json'".
+check_signalk_data_dir() {
+    local dir="$VESSELSTACK_DATA/signalk" uid gid mode running writable=0
+    [ "${SIGNALK_MODE:-existing}" = docker ] || return 0
+    [ -d "$dir" ] || { printf 'WARN SignalK data directory %s does not exist; rerun the installer\n' "$dir" >&2; return 0; }
+    read -r uid gid mode < <(stat -c '%u %g %a' "$dir")
+    if [ "$uid" = 1000 ] && [ $((8#$mode & 8#200)) -ne 0 ]; then writable=1; fi
+    if [ "$gid" = 1000 ] && [ $((8#$mode & 8#020)) -ne 0 ]; then writable=1; fi
+    if [ $((8#$mode & 8#002)) -ne 0 ]; then writable=1; fi
+    [ "$writable" -eq 0 ] || { printf 'OK   SignalK data directory is writable by the container user (uid 1000)\n'; return 0; }
+    # A crash-looping container flaps between restarting and running, so the
+    # container state does not change the verdict: SignalK cannot work here.
+    running=$("${COMPOSE[@]}" ps --status running --services 2>/dev/null || true)
+    if grep -Fxq signalk <<<"$running"; then state='is running or restarting'; else state='is not running'; fi
+    printf 'FAIL SignalK container %s and its data directory %s is owned by %s:%s (mode %s), not writable by the container user (uid 1000).\n' \
+        "$state" "$dir" "$uid" "$gid" "$mode" >&2
+    printf '     Typical log: EACCES: permission denied, open '"'"'/home/node/.signalk/package.json'"'"'\n' >&2
+    printf '     Fix: sudo chown -R 1000:1000 %s && docker restart vesselstack-signalk\n' "$dir" >&2
+    return 1
+}
+
+# Boat Chat reports itself "not ready" while its memory index has no chunks. Ask the
+# running service first (its /health readiness); if it does not answer, ask the helper,
+# which opens the database as the service user (root must never create SQLite files there).
+check_memory_index() {
+    local body chunks=''
+    body=$(curl --connect-timeout 3 --max-time 10 --fail --silent \
+        "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" 2>/dev/null || true)
+    if [ -n "$body" ]; then
+        chunks=$(python3 -c '
+import json, sys
+try:
+    print(int(json.load(sys.stdin)["readiness"]["layers"]["memory"]["chunks"]))
+except (ValueError, TypeError, KeyError):
+    pass
+' <<<"$body" 2>/dev/null || true)
+    fi
+    if [ -z "$chunks" ]; then
+        chunks=$(memory_index_helper status 2>/dev/null || true)
+    fi
+    case "$chunks" in
+        '') printf 'WARN could not determine the Boat Chat memory index state (service not answering and the helper failed)\n' >&2; return 0 ;;
+        0)
+            printf 'FAIL Boat Chat memory index is empty (0 chunks), so Boat Chat reports "not ready".\n' >&2
+            printf '     Fix: sudo vesselstackctl reindex\n' >&2
+            return 1 ;;
+        *[!0-9]*) printf 'WARN unexpected memory index state: %s\n' "$chunks" >&2; return 0 ;;
+        *) printf 'OK   Boat Chat memory index: %s chunks\n' "$chunks" ;;
+    esac
 }
 
 doctor_stack() {
@@ -291,6 +687,8 @@ doctor_stack() {
         failed=1
     fi
     disk_usage_warning
+    check_signalk_data_dir || failed=1
+    check_memory_index || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
@@ -656,6 +1054,8 @@ case "$command" in
     urls) [ $# -eq 0 ] || { usage; exit 2; }; show_urls ;;
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
+    lan) lan_stack "$@" ;;
+    reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;

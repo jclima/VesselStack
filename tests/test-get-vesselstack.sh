@@ -608,9 +608,9 @@ expect_no_web_wizard() {
     refuse_out '[Bb]rowser wizard'; refuse_log '^runuser '; refuse_log '^useradd .*vesselstack-wizard'; expect_no_wizard_user
 }
 
-# Full walk with the default answer to every question (Enter): confirmation, 17 prompts, review, install.
+# Full walk with the default answer to every question (Enter): confirmation, 16 prompts, review, install.
 reset_state
-{ printf 'y\n'; blank 20; } > "$ANSWERS"
+{ printf 'y\n'; blank 19; } > "$ANSWERS"
 run_asking
 expect_rc 0 "terminal wizard, all defaults"
 expect_out "Review \\(secrets are never shown\\)"
@@ -647,7 +647,7 @@ SECRET=sekrit-token-value-123
     printf '%s\n' y ''                                           # AIS on, device
     printf '%s\n' '' '?' "$SECRET" 1 n                           # HA url, help, HA token, provider, telegram
     printf '%s\n' y '' n 22,8080 -                               # firewall on ...
-    printf '%s\n' 14d '' '' n                                    # retention, binds, no advanced
+    printf '%s\n' 14d '' n                                       # retention, LAN access, no advanced
     printf '%s\n' s y                                            # save, install
 } > "$ANSWERS"
 run_asking
@@ -683,7 +683,7 @@ expect_no_web_wizard
 
 # Quitting at the review, and input that ends early, install nothing.
 reset_state
-{ printf 'y\n'; blank 17; printf 'q\n'; } > "$ANSWERS"
+{ printf 'y\n'; blank 16; printf 'q\n'; } > "$ANSWERS"
 run_asking
 expect_rc 1 "quit at the review"
 expect_out "Quit without saving"
@@ -700,7 +700,7 @@ refuse_log "^install "
 
 # Edit a section from the review screen, then save.
 reset_state
-{ printf 'y\n'; blank 17; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
+{ printf 'y\n'; blank 16; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
 run_asking
 expect_rc 0 "edit a section at the review"
 expect_saved "BOAT_NAME='Edited Boat'"

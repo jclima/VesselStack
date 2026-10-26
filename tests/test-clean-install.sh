@@ -33,11 +33,22 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
 exit 0
 PIP
     chmod +x "$3/bin/pip"
+    # A usable interpreter in the venv (the memory index runs with it); omitted on
+    # request to exercise the failure path.
+    [ -n "${FAKE_VENV_NO_PYTHON:-}" ] || ln -s /usr/bin/python3 "$3/bin/python"
     exit 0
 fi
 exec /usr/bin/python3 "$@"
 EOF
-chmod +x "$FAKE_BIN/docker" "$FAKE_BIN/systemctl" "$FAKE_BIN/python3" "$FAKE_BIN/curl"
+# Records how the installer drops privileges, then really does it.
+cat > "$FAKE_BIN/runuser" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$TEST_ROOT/runuser.log"
+# Drop this stub's directory wherever it sits in PATH, or exec would find itself again.
+PATH=\$(printf '%s' "\$PATH" | tr ':' '\\n' | grep -vxF "$FAKE_BIN" | paste -sd:)
+exec runuser "\$@"
+EOF
+chmod +x "$FAKE_BIN/docker" "$FAKE_BIN/systemctl" "$FAKE_BIN/python3" "$FAKE_BIN/curl" "$FAKE_BIN/runuser"
 
 cat > "$CONFIG" <<EOF
 BOAT_NAME="Test Vessel"
@@ -163,10 +174,14 @@ panel_token_before=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/contr
 sed -i '/^BOAT_CHAT_PROVIDER=/d' "$APP_ROOT/config/boat-chat.env"
 printf '%s\n' 'BOAT_CHAT_PROVIDER=ollama' 'OPENAI_API_KEY=preserve-test-secret' \
     >> "$APP_ROOT/config/boat-chat.env"
+# A loopback BOAT_CHAT_HOST (`vesselstackctl lan local`) survives a re-render from the
+# installed configuration, which never carries that key.
+sed -i 's/^BOAT_CHAT_HOST=.*/BOAT_CHAT_HOST=127.0.0.1/' "$APP_ROOT/config/boat-chat.env"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$APP_ROOT/installer/install.sh" \
     --config "$APP_ROOT/config/vesselstack.env" >/dev/null
 grep -qx 'BOAT_CHAT_PROVIDER=ollama' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'BOAT_CHAT_HOST=127.0.0.1' "$APP_ROOT/config/boat-chat.env"
 grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
     "$panel_token_before"
@@ -189,6 +204,8 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
 for key in "${secret_keys[@]}"; do
     test "$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")" = "${secret_before[$key]}"
 done
+# A configuration that really sets BOAT_CHAT_HOST (here the wizard-style original) does apply it.
+grep -qx 'BOAT_CHAT_HOST=0.0.0.0' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$influx_token_chat_before"
 test "$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$settings_token_before"
 test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$access_token_before"
@@ -197,6 +214,42 @@ if grep -R 'GENERATE' "$APP_ROOT/config"; then
     echo "Re-render produced an ungenerated secret" >&2
     exit 1
 fi
+
+# Boat Chat's memory index: built by the installer (nothing else builds it), as the
+# service user with a minimal environment, idempotent, and a failure is loud but never
+# aborts the installation.
+memory_db="$DATA_ROOT/boat-chat/memory/boat_memory.sqlite"
+index_chunks() {
+    /usr/bin/python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from chunks").fetchone()[0])' "$1"
+}
+test -s "$memory_db"
+[ "$(index_chunks "$memory_db")" -gt 0 ] || { echo "Fresh install did not build the memory index" >&2; exit 1; }
+grep -q -- "^-u $(id -un) -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent PYTHONDONTWRITEBYTECODE=1 BOAT_CHAT_STATE_DIR=$DATA_ROOT/boat-chat BOAT_CHAT_ENV=$DATA_ROOT/boat-chat/boat-chat.env $APP_ROOT/boat-chat/.venv/bin/python $APP_ROOT/boat-chat/memory_index.py ensure\$" "$TEST_ROOT/runuser.log"
+# Idempotent: nothing changed, nothing rebuilt (and nothing printed as a warning).
+rerun_output=$(env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" 2>&1)
+grep -q 'memory index: unchanged' <<<"$rerun_output"
+if grep -q 'WARN: the Boat Chat memory index' <<<"$rerun_output"; then
+    echo "Idempotent re-run warned about the memory index" >&2
+    exit 1
+fi
+# An existing install without an index (the upgrade case) gets one.
+rm -f -- "$memory_db" "$memory_db-wal" "$memory_db-shm"
+rerun_output=$(env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" 2>&1)
+grep -q 'memory index: rebuilt' <<<"$rerun_output"
+[ "$(index_chunks "$memory_db")" -gt 0 ]
+# Failure path: no interpreter in the venv. The install still succeeds, prints the
+# WARN with the exact manual command, and leaves the index absent for doctor to report.
+rm -f -- "$memory_db" "$memory_db-wal" "$memory_db-shm"
+env PATH="$FAKE_BIN:$PATH" FAKE_VENV_NO_PYTHON=1 VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null 2>"$TEST_ROOT/index-fail.stderr"
+grep -q 'WARN: the Boat Chat memory index could not be built' "$TEST_ROOT/index-fail.stderr"
+grep -q 'WARN: build it manually with: sudo vesselstackctl reindex' "$TEST_ROOT/index-fail.stderr"
+test ! -e "$memory_db"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+[ "$(index_chunks "$memory_db")" -gt 0 ]
 
 # Retention: empty by default (no implicit change to existing buckets), validated.
 grep -q "^INFLUXDB_RAW_RETENTION=''\?$" "$APP_ROOT/config/vesselstack.env"
@@ -279,7 +332,23 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
     test "$(stat -c '%u:%g' "$DATA2/influxdb")" = "1000:1000"
     test "$(stat -c '%u:%g' "$DATA2/grafana")" = "472:0"
     test "$(stat -c '%U' "$DATA2/boat-chat")" = "$svc"
+    # The memory index is created by the service user, never by root, and root leaves no
+    # root-owned SQLite side files behind in the service-writable state directory.
+    test -s "$DATA2/boat-chat/memory/boat_memory.sqlite"
+    test "$(stat -c '%U' "$DATA2/boat-chat/memory/boat_memory.sqlite")" = "$svc"
+    test -z "$(find "$DATA2/boat-chat/memory" -not -user "$svc" -print -quit)"
+    grep -q -- "^-u $svc -- env -i " "$TEST_ROOT/runuser.log"
     test "$(stat -c '%u' "$DATA2/homeassistant")" = 0
+    # Native SignalK keeps its service-user-owned state directory (not 1000:1000).
+    NATIVE_BIN="$TEST_ROOT/native-bin"
+    install -d "$NATIVE_BIN"
+    printf '#!/bin/bash\necho 22\n' > "$NATIVE_BIN/node"
+    printf '#!/bin/bash\nexit 0\n' > "$NATIVE_BIN/npm"
+    chmod +x "$NATIVE_BIN/node" "$NATIVE_BIN/npm"
+    sed -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="native"|' "$CONFIG2" > "$TEST_ROOT/native.env"
+    env PATH="$NATIVE_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        "$REPO_ROOT/install.sh" --config "$TEST_ROOT/native.env" >/dev/null
+    test "$(stat -c '%U:%a' "$DATA2/signalk")" = "$svc:750"
     # The service user can write its state directory but cannot create, rename or
     # replace anything directly under the data root.
     runuser -u "$svc" -- touch "$DATA2/boat-chat/state-write-test"
@@ -322,5 +391,99 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
     fi
     rm -f -- "$QUARANTINE_ROOT"
 fi
+
+# Docker-mode SignalK: the bind-mount source is created for the container user
+# (uid/gid 1000 of the signalk-server image; the ordering before compose up is
+# checked statically in test-distribution.sh), a root:root directory
+# left by Docker is repaired, symlinks are refused and existing mode creates nothing.
+# Ownership assertions need root.
+APP3="$TEST_ROOT/opt3/vesselstack"
+DATA3="$TEST_ROOT/opt3/vesselstack-data"
+CONFIG3="$TEST_ROOT/signalk-docker.env"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$APP3\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$DATA3\"|" \
+    -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="docker"|' "$CONFIG" > "$CONFIG3"
+install_three() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        "$REPO_ROOT/install.sh" --config "$CONFIG3"
+}
+install_three >/dev/null
+test -d "$DATA3/signalk"
+test ! -e "$DATA_ROOT/signalk"
+if [ "$(id -u)" -eq 0 ]; then
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "1000:1000:750"
+    # Docker created the source as root:root on an earlier run: empty, repaired.
+    chown 0:0 "$DATA3/signalk"
+    chmod 0755 "$DATA3/signalk"
+    repair_output=$(install_three)
+    grep -q 'Repaired SignalK data directory ownership' <<<"$repair_output"
+    test "$(stat -c '%u:%g' "$DATA3/signalk")" = "1000:1000"
+    # A non-empty root-owned tree is repaired recursively, locked while it happens, and
+    # keeps its original mode.
+    install -d "$DATA3/signalk/plugin-config-data"
+    printf '{}\n' > "$DATA3/signalk/plugin-config-data/a.json"
+    chown -R 0:0 "$DATA3/signalk"
+    chmod 0755 "$DATA3/signalk"
+    repair_output=$(install_three)
+    grep -q 'recursive' <<<"$repair_output"
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "1000:1000:755"
+    test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "1000:1000"
+    # Already correct: nothing is printed or changed.
+    test -z "$(install_three | grep 'Repaired SignalK' || true)"
+    sk_refused() {
+        # $1 = expected stderr text. Nothing may change: owner, mode and contents.
+        if install_three >/dev/null 2>"$TEST_ROOT/sk-inner.stderr"; then
+            echo "Installer repaired a SignalK directory it must refuse ($1)" >&2
+            exit 1
+        fi
+        grep -q "$1" "$TEST_ROOT/sk-inner.stderr"
+    }
+    sk_reset_root() { chown -R -h 0:0 "$DATA3/signalk"; chmod 0755 "$DATA3/signalk"; }
+    # A symlink inside the tree is refused and nothing is rewritten.
+    VICTIM3="$TEST_ROOT/victim3"
+    install -d -m 0755 "$VICTIM3"
+    ln -s "$VICTIM3" "$DATA3/signalk/escape"
+    sk_reset_root
+    sk_refused 'contains symlinks'
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "0:0:755"
+    test "$(stat -c '%u:%g' "$VICTIM3")" = "0:0"
+    test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "0:0"
+    rm -f -- "$DATA3/signalk/escape"
+    # A file with a second hard link (possibly to a file outside) is refused.
+    VICTIM_FILE="$TEST_ROOT/victim3-file"
+    printf 'x\n' > "$VICTIM_FILE"
+    chown 0:0 "$VICTIM_FILE"
+    ln "$VICTIM_FILE" "$DATA3/signalk/plugin-config-data/linked.json"
+    sk_reset_root
+    sk_refused 'more than one hard link'
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "0:0:755"
+    test "$(stat -c '%u:%g' "$VICTIM_FILE")" = "0:0"
+    rm -f -- "$DATA3/signalk/plugin-config-data/linked.json"
+    # A special file (a FIFO) is refused.
+    mkfifo "$DATA3/signalk/pipe"
+    sk_reset_root
+    sk_refused 'special files'
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "0:0:755"
+    rm -f -- "$DATA3/signalk/pipe"
+    # A populated directory owned by somebody else is not the known Docker state:
+    # no change at all, with manual instructions.
+    sk_reset_root
+    chown -R 4242:4242 "$DATA3/signalk"
+    sk_refused 'owned by 4242:4242'
+    grep -q 'making no change' "$TEST_ROOT/sk-inner.stderr"
+    grep -q "chown -R -h 1000:1000" "$TEST_ROOT/sk-inner.stderr"
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "4242:4242:755"
+    test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "4242:4242"
+    chown -R 1000:1000 "$DATA3/signalk"
+fi
+# A symlink in place of the signalk directory itself is refused.
+rm -rf -- "$DATA3/signalk"
+ln -s "$TEST_ROOT" "$DATA3/signalk"
+if install_three >/dev/null 2>"$TEST_ROOT/sk-link.stderr"; then
+    echo "Installer followed a symlinked SignalK data directory" >&2
+    exit 1
+fi
+grep -q 'is a symlink' "$TEST_ROOT/sk-link.stderr"
+rm -f -- "$DATA3/signalk"
 
 echo "clean installation checks passed"

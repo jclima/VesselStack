@@ -151,9 +151,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.2/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.2 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.2
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.3/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.3 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.3
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -206,7 +206,8 @@ does anything beyond installing ordinary Debian packages:
    `VESSELSTACK_CAN_CREATE_VCAN`), AIS, Home Assistant (URL, optional hidden token), Boat
    Chat provider (default `local`) and Telegram, the firewall (untrusted interface, enable,
    strict mode, allowed ports), raw-data retention (`INFLUXDB_RAW_RETENTION`; empty means
-   30 days on a new install and no change to an existing database) and bind addresses.
+   30 days on a new install and no change to an existing database) and who can reach the
+   dashboards (`local`, `dashboards` or `all`; see "Reaching VesselStack from other devices").
    Ports, container and bucket names, folders, the service account and the generated
    secrets sit behind "Advanced settings? [y/N]". Passwords and tokens default to being
    generated during installation, are read without echo when you do type one and are
@@ -285,7 +286,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.2
+git checkout v0.4.3
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -426,7 +427,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.4.2
+git checkout v0.4.3
 ```
 
 ## 4. Configure the vessel
@@ -555,8 +556,11 @@ container cannot hide another that failed or stopped.
 `vesselstackctl start` is also a complete first-start path: it configures
 enabled hardware and firewall policy, creates the MQTT password file when
 missing, starts services, and idempotently provisions InfluxDB history.
-`doctor` adds dependency, Compose, free-space, service, and endpoint checks and
-finishes with either `RESULT healthy` or `RESULT attention required`. Use
+`doctor` adds dependency, Compose, free-space, service, memory-index and endpoint
+checks and finishes with either `RESULT healthy` or `RESULT attention required`.
+`urls` shows who can really reach each service (see "Reaching VesselStack from
+other devices"). If Boat Chat stays "not ready", `sudo vesselstackctl reindex`
+rebuilds its memory index (see Troubleshooting). Use
 `vesselstackctl logs chat`, `logs containers`, or `logs all` for recent
 diagnostic output without remembering systemd or Compose commands.
 
@@ -605,7 +609,8 @@ does not silently enable safety alerts or assume thresholds.
 ### SignalK and InfluxDB
 
 With `SIGNALK_MODE=docker`, VesselStack starts the official pinned SignalK
-image and persists its settings in `/opt/vesselstack-data/signalk`. With
+image and persists its settings in `/opt/vesselstack-data/signalk` (owned by
+uid/gid 1000, the image's `node` user, so the container can write it). With
 `SIGNALK_MODE=native`, it installs the pinned npm package under
 `/opt/vesselstack/signalk-server` and runs it as the locked VesselStack user.
 `SIGNALK_MODE=existing` never modifies SignalK. The managed modes use the same
@@ -794,10 +799,35 @@ the private SQLite memory database
 release packages. Settings values containing a newline, carriage return or NUL
 byte are rejected (HTTP 400, nothing written), matching the control panel.
 
-`vesselstackctl urls` prints the effective bind address of each service (read
-from `config/boat-chat.env`, `config/control-panel.env` and the Compose bind
-variables, never by sourcing service-writable files), e.g. whether Boat Chat is
-reachable on all interfaces or only this device.
+`vesselstackctl urls` reports the **real** bind state of each service from the
+listening sockets (`ss -ltn`), so the host-networked SignalK and Home Assistant
+containers show up as listening on every interface although their client URLs
+say `127.0.0.1`. It prints this machine's reachable addresses (`HOSTNAME.local`
+and every non-loopback IPv4 address, ignoring Docker bridges and veth links) as
+copy-pasteable URLs for the services that other devices can reach, marks
+loopback-only services "this device only" with a one-line hint on how to change
+that, and falls back to the configuration (read from `config/boat-chat.env`,
+`config/control-panel.env` and the Compose bind variables, never by sourcing
+service-writable files) when `ss` is unavailable or a published port is not
+visible to it, saying so on the line.
+
+**Memory index.** Boat Chat answers from a private SQLite index of its bundled
+knowledge files (`boat-chat/knowledge/*.md`, the facts file and the boat-chat
+documentation). Until that index has content `/health` reports
+`readiness.layers.memory = {ready: false, chunks: 0}` and Boat Chat is "not
+ready". The installer builds it (`scripts/memory-index.sh`, `memory_index.py
+ensure`) as the **service user** with the unit's minimal environment
+(`BOAT_CHAT_STATE_DIR`, `BOAT_CHAT_ENV`, plus `BOAT_CHAT_EMBEDDING_MODEL` and
+`BOAT_CHAT_MEMORY_DB` only if set in `config/boat-chat.env`, validated and never
+sourced), so the database is service-user-owned and root never creates SQLite
+side files in the state directory. `ensure` is idempotent: it rebuilds only when
+the index is missing, empty or the hash of the source documents changed. It runs
+on every installer run (including upgrades), on `vesselstackctl start`, and at
+the start of every telemetry-indexer run (so a release that changes the
+knowledge files refreshes the index within five minutes). A failed build prints
+a `WARN` with the exact manual command, never aborts the install, and
+`vesselstackctl doctor` fails until it is fixed. `sudo vesselstackctl reindex`
+rebuilds it on demand.
 
 Hardening of service-writable paths: the control panel clears stale Settings
 overrides without following symlinks (it refuses a symlinked override file,
@@ -809,7 +839,11 @@ descriptor).
 create, rename, replace or symlink anything directly in it. Only the leaf mount
 roots belong to the accounts that must write them: `influxdb` (uid/gid 1000),
 `grafana` (uid 472, gid 0) and `boat-chat` (service user; native SignalK state
-`signalk` likewise). Intermediate directories the installer writes through
+`signalk` likewise; with `SIGNALK_MODE=docker` `signalk` is uid/gid 1000, the
+`node` user of the signalk-server image, created before `compose up`; a
+root-owned one left by Docker is chowned to 1000:1000 on rerun, non-recursively
+when empty, otherwise recursively but never through symlinks, and the change is
+printed; a symlink inside it makes the installer refuse). Intermediate directories the installer writes through
 (`homeassistant`, `homeassistant/blueprints/...`) must be root-owned and not
 group/world-writable. Before touching anything the installer refuses, with a
 message naming the path, a symlink at any managed entry (`influxdb`, `grafana`,
@@ -937,6 +971,61 @@ continue to work while it is disabled.
 
 Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
 SignalK, Boat Chat, InfluxDB, and Prometheus.
+
+## Reaching VesselStack from other devices
+
+The installer asks "Who should be able to reach the dashboards?" (terminal wizard
+question in the "Who can reach what" section; `--set LAN_ACCESS=local|dashboards|all`
+for unattended installs) and `sudo vesselstackctl lan` changes it later. The answer is
+a preset that sets the real bind settings; `LAN_ACCESS` itself is never written to a file.
+
+| Preset | Grafana, Heimdall (`VESSELSTACK_WEB_BIND_ADDRESS`) | Boat Chat (`BOAT_CHAT_HOST`) | InfluxDB, Prometheus, MQTT (`VESSELSTACK_DATA_BIND_ADDRESS`) |
+| --- | --- | --- | --- |
+| `local` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` |
+| `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` |
+| `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
+
+The Control Panel (`CONTROL_PANEL_HOST`) stays on `127.0.0.1` in every preset: it is a
+root-level configuration editor; reach it through an SSH tunnel. `all` also opens
+Prometheus, which has **no login**, plus InfluxDB (token) and MQTT (password) to every
+device on the network; turn the firewall on and prefer Ethernet or a VPN as the way in.
+
+SignalK (3000) and Home Assistant (8123) run in host-network containers, so these
+presets do **not** control them: they listen on every interface in every preset
+(including `local`). Limit them with the firewall's strict mode
+(`VESSELSTACK_FIREWALL_STRICT=true`) or Home Assistant's own `http: server_host`
+setting. `sudo vesselstackctl urls` shows how every service really listens.
+
+```bash
+sudo vesselstackctl lan                      # show the current preset and the three values
+sudo vesselstackctl lan local --dry-run      # print what would change, change nothing
+sudo vesselstackctl lan dashboards           # apply (root); rewrites the keys atomically
+sudo vesselstackctl lan all --yes            # 'all' needs --yes
+```
+
+`lan` rewrites `VESSELSTACK_WEB_BIND_ADDRESS` and `VESSELSTACK_DATA_BIND_ADDRESS` in
+`config/vesselstack.env` and `BOAT_CHAT_HOST` in `config/boat-chat.env` (temporary file in
+the same directory, owner and mode kept, symlinks refused; a failure restores both files),
+then runs `compose up -d` (only containers whose published ports changed are recreated) and
+restarts `vesselstack-chat.service`. A `BOAT_CHAT_HOST` saved from Boat Chat's Settings page
+wins over `boat-chat.env`; `lan` warns when it differs. Rollback: run `lan` with the previous
+preset.
+
+**Firewall caveat (`wlan0`).** With `VESSELSTACK_FIREWALL_ENABLE=true` the interface
+`VESSELSTACK_UNTRUSTED_INTERFACE` (default `wlan0`) is untrusted: other devices that reach the
+Pi over it cannot open Grafana, InfluxDB, Prometheus or MQTT (in strict mode, anything except
+the allow-listed TCP ports), whatever the preset says. If the Pi is on your network over
+`wlan0`, that locks every other device out. `lan` and the wizard say so; `lan` refuses to open
+the network in that state unless you pass `--allow-firewall-conflict`. Pick another untrusted
+interface (for example a hotspot or modem) or leave the firewall off on a trusted network.
+
+Test from a laptop on the same network (replace `PI` with the address that
+`sudo vesselstackctl urls` prints):
+
+```bash
+curl -sS -o /dev/null -w 'grafana %{http_code}\n' http://PI:43000/login   # 200 when reachable
+curl -sS -m 5 -o /dev/null -w 'influx %{http_code}\n' http://PI:8086/health || echo 'influx: not reachable (expected unless preset all)'
+```
 
 ## Network security
 
@@ -1189,7 +1278,7 @@ Rollback of a completed upgrade is a restore of the pre-update backup that
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.2.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.4.3.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -1327,6 +1416,52 @@ sudo test -s /opt/vesselstack-data/mosquitto/passwords
 sudo docker logs vesselstack-mosquitto --tail 100
 ```
 
+### Boat Chat reports "not ready" (memory index empty)
+
+Symptom: `curl -fsS http://127.0.0.1:8765/health | jq .readiness` shows
+`layers.memory = {"ready": false, "chunks": 0}`, `vesselstackctl status` says
+`Boat Chat unavailable or not ready` and `vesselstackctl doctor` prints `FAIL Boat
+Chat memory index is empty`. Releases before 0.4.3 never built the index on a
+fresh install. 0.4.3 and later build it during installation, on upgrade and on
+`vesselstackctl start`. To fix an install that predates that, or one whose build
+failed (the installer printed `WARN: ... memory index could not be built`):
+
+```bash
+sudo vesselstackctl reindex      # builds it as the service user; prints "memory index: ... (N chunks)"
+sudo vesselstackctl doctor
+```
+
+If `reindex` itself fails, its message names the cause (missing Python
+environment: rerun the installer; state directory missing or a file owned by
+root: the `chown` command it prints).
+
+### SignalK not running / EACCES on package.json
+
+Symptom (`SIGNALK_MODE=docker`): the `vesselstack-signalk` container restarts or
+exits and `sudo docker logs vesselstack-signalk` shows
+`EACCES: permission denied, open '/home/node/.signalk/package.json'`. The
+`signalk-server` image runs SignalK as its `node` user (uid/gid 1000, config
+directory `/home/node/.signalk`), but `<data>/signalk` was created by Docker as
+`root:root`. No release before 0.4.3 created it; 0.4.3 and later create it
+as `1000:1000` mode 0750 before `compose up` and repair a root-owned one on
+every installer run, so rerunning the installer (`sudo vesselstackctl update` or
+the installer from the release) fixes it. `sudo vesselstackctl doctor` also
+detects the condition and prints the fix. Manual fix (the data directory is
+`/opt/vesselstack-data` by default):
+
+```bash
+sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk
+```
+
+The installer repairs only the known state conservatively, because a recursive `chown`
+by root over a tree its previous owner can still write could be redirected through symlink
+or hard-link swaps. An empty directory is chowned (`-h`, the directory only). A populated
+`root:root` directory is first locked (mode 0700, restored afterwards), refused if it holds
+any symlink, file with more than one hard link or special file, and otherwise chowned with a
+non-following walk on the same filesystem. A populated directory owned by anyone else is left
+untouched with manual instructions (the `chown -R -h 1000:1000` command above after you have
+stopped whatever uses it and reviewed the contents).
+
 ### Container mount permissions fail
 
 Inspect the affected container log and mount. Do not recursively change all
@@ -1390,7 +1525,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-0.4.2.tar.gz.sha256)
+(cd generated && sha256sum -c vesselstack-0.4.3.tar.gz.sha256)
 ```
 
 The package is produced by `git archive` of the committed `HEAD`, so untracked
