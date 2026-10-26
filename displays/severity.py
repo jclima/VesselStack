@@ -47,3 +47,23 @@ def numeric_sev(value, thresholds: dict, prev=None) -> str:
     if prev in ("warn", "alarm") and (below("warn_below", h) or above("warn_above", h)):
         return "warn"
     return "ok"
+
+
+NOTIFICATION_STATES = {"normal": "ok", "nominal": "ok", "alert": "warn", "warn": "warn",
+                       "alarm": "alarm", "emergency": "alarm"}
+
+
+def notification_sev(value, absent: str = "ok") -> str:
+    """Map a SignalK notification value to "ok", "warn", "alarm" or "unknown".
+
+    ``value`` is the delta value of a ``notifications.*`` path: an object with a ``state``.
+    ``None`` (a cleared notification, or one never raised) follows ``absent``: "ok" reads as
+    healthy, "unknown" as not known. An unrecognised state, or anything that is not such an
+    object, is "unknown" (never green). The ``message`` text is never read.
+    """
+    if value is None:
+        return "ok" if absent == "ok" else "unknown"
+    if not isinstance(value, dict):
+        return "unknown"
+    state = value.get("state")
+    return NOTIFICATION_STATES.get(state, "unknown") if isinstance(state, str) else "unknown"

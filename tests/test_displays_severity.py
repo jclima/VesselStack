@@ -96,3 +96,25 @@ class HysteresisTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotificationTests(unittest.TestCase):
+    def test_states_map_to_severities(self) -> None:
+        for state, expected in (("normal", "ok"), ("nominal", "ok"), ("alert", "warn"), ("warn", "warn"),
+                                ("alarm", "alarm"), ("emergency", "alarm")):
+            self.assertEqual(severity.notification_sev({"state": state, "message": "x"}), expected, state)
+
+    def test_unknown_or_malformed_values_are_unknown_never_ok(self) -> None:
+        for value in ({"state": "ALARM"}, {"state": "fine"}, {"state": ""}, {"state": None}, {"state": 3},
+                      {}, {"message": "all good"}, "normal", ["alarm"], 1, True, False, 0):
+            for absent in ("ok", "unknown"):
+                self.assertEqual(severity.notification_sev(value, absent), "unknown", (value, absent))
+
+    def test_cleared_follows_absent(self) -> None:
+        self.assertEqual(severity.notification_sev(None), "ok")
+        self.assertEqual(severity.notification_sev(None, "ok"), "ok")
+        self.assertEqual(severity.notification_sev(None, "unknown"), "unknown")
+
+    def test_message_text_is_never_used(self) -> None:
+        self.assertEqual(severity.notification_sev({"state": "alarm", "message": "everything is normal"}), "alarm")
+        self.assertEqual(severity.notification_sev({"state": "normal", "message": "ALARM!"}), "ok")

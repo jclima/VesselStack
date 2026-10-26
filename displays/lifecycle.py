@@ -294,11 +294,18 @@ def _bridge_note(ctx: Context) -> None:
 # --- commands --------------------------------------------------------------
 
 def default_page(registry: dict, config: dict, board_id: str) -> dict:
+    """First page of a new display: the board's largest layout for plain instruments.
+
+    Layouts that also take notifications (status-grid) are only a fallback: a page of bare
+    instruments is better served by the instrument layouts.
+    """
     board = registry["boards"][board_id]
-    caps = registry["layouts"]
-    layout = max(board["layouts"], key=lambda name: caps[name])
+    specs = schema.layout_specs(registry)
+    usable = [name for name in board["layouts"] if "instrument" in specs[name]["types"]]
+    plain = [name for name in usable if specs[name]["types"] == ["instrument"]]
+    layout = max(plain or usable, key=lambda name: specs[name]["capacity"])
     instruments = list(config["instruments"])
-    return {"title": "Main", "layout": layout, "items": instruments[:caps[layout]]}
+    return {"title": "Main", "layout": layout, "items": instruments[:specs[layout]["capacity"]]}
 
 
 def add(ctx: Context, display_id: str, board: str, name: str | None = None,

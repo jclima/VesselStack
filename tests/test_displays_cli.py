@@ -144,6 +144,15 @@ class CliTests(unittest.TestCase):
         page = lifecycle.default_page(registry, config, "big")
         self.assertEqual((page["layout"], len(page["items"])), ("list-6", 4))
 
+    def test_add_default_page_prefers_instrument_only_layouts_over_status_grid(self):
+        registry = lifecycle.load_registry()
+        config = json.loads(self.config.read_text())
+        self.assertIn("status-grid", registry["boards"][BOARD]["layouts"])
+        self.assertEqual(lifecycle.default_page(registry, config, BOARD)["layout"], "grid-2x2")
+        registry["boards"]["only"] = dict(registry["boards"][BOARD], layouts=["status-grid"])
+        page = lifecycle.default_page(registry, config, "only")
+        self.assertEqual((page["layout"], len(page["items"])), ("status-grid", 4))
+
     def test_add_duplicate_refused_and_nothing_changes(self):
         self.add("helm")
         before = self.config.read_text()

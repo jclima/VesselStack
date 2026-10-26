@@ -20,7 +20,14 @@ LAYOUT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SK_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z0-9_-]+)+$")
 HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
-TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "displays"}
+TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "notifications", "displays"}
+NOTIFICATION_KEYS = {"path", "label", "absent", "alarm"}
+NOTIFICATION_REQUIRED = {"path", "label"}
+NOTIFICATION_PREFIX = "notifications."
+ABSENT_MODES = ("ok", "unknown")
+ITEM_TYPES = ("instrument", "notification")
+SHAPES = ("round", "rect")
+LAYOUT_KEYS = {"capacity", "min_items", "shapes", "types"}
 INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms",
                    "thresholds", "min", "max", "alarm"}
 # Bounds in severity order; "low" bounds are checked with <, "high" bounds with >.
@@ -123,26 +130,72 @@ def _int_range(obj: dict, key: str, lo: int, hi: int, where: str, errors: list) 
     return True
 
 
+def _validate_layout(name, spec, version, errors: list):
+    """Validate one registry layout entry; return it normalised, or None when invalid."""
+    where = f"$.layouts.{name}"
+    if is_int(spec) and version != 2:  # schema 1: a bare capacity
+        if not 1 <= spec <= 64:
+            errors.append(f"{where}: capacity must be an integer 1..64")
+            return None
+        return normalise_layout(spec)
+    if not isinstance(spec, dict) or version == 1:
+        errors.append(f"{where}: " + ("must be an integer capacity in schema 1"
+                                      if version == 1 else "must be an object"))
+        return None
+    start = len(errors)
+    _unknown(spec, LAYOUT_KEYS, where, errors)
+    _missing(spec, {"capacity", "min_items", "shapes", "types"}, where, errors)
+    if "capacity" in spec and not (is_int(spec["capacity"]) and 1 <= spec["capacity"] <= 64):
+        errors.append(f"{where}: capacity must be an integer 1..64")
+    if "min_items" in spec and not (is_int(spec["min_items"]) and 1 <= spec["min_items"] <= 64):
+        errors.append(f"{where}.min_items: must be an integer 1..64")
+    if (is_int(spec.get("capacity")) and is_int(spec.get("min_items"))
+            and spec["min_items"] > spec["capacity"]):
+        errors.append(f"{where}.min_items: must not exceed capacity")
+    for key, allowed in (("shapes", SHAPES), ("types", ITEM_TYPES)):
+        if key in spec:
+            value = spec[key]
+            if not (isinstance(value, list) and value and len(set(map(str, value))) == len(value)
+                    and all(isinstance(v, str) and v in allowed for v in value)):
+                errors.append(f"{where}.{key}: must be a non-empty list of unique values from "
+                              f"{', '.join(allowed)}")
+    return normalise_layout(spec) if len(errors) == start else None
+
+
+def normalise_layout(spec) -> dict:
+    """The v2 form of a layout entry; a schema 1 integer is the capacity of an instrument layout."""
+    if isinstance(spec, dict):
+        return {"capacity": spec["capacity"], "min_items": spec["min_items"],
+                "shapes": list(spec["shapes"]), "types": list(spec["types"])}
+    return {"capacity": spec, "min_items": 1, "shapes": list(SHAPES), "types": ["instrument"]}
+
+
+def layout_specs(registry: dict) -> dict:
+    """Every layout of a (validated) registry in the normalised v2 form, whatever its schema."""
+    return {name: normalise_layout(spec) for name, spec in registry.get("layouts", {}).items()}
+
+
 def validate_registry(reg) -> list[str]:
     errors: list[str] = []
     if not isinstance(reg, dict):
         return ["$: registry must be an object"]
     _unknown(reg, {"schema", "layouts", "boards"}, "$", errors)
     _missing(reg, {"schema", "layouts", "boards"}, "$", errors)
-    if "schema" in reg and (not is_int(reg["schema"]) or reg["schema"] != 1):
-        errors.append("$.schema: must be 1")
+    version = reg.get("schema")
+    if "schema" in reg and (not is_int(version) or version not in (1, 2)):
+        errors.append("$.schema: must be 1 or 2")
+        version = None
     layouts = reg.get("layouts")
-    known: set = set()
+    known: dict = {}
     if "layouts" in reg:
         if not isinstance(layouts, dict) or not layouts:
             errors.append("$.layouts: must be a non-empty object")
         else:
-            for name, cap in layouts.items():
+            for name, spec in layouts.items():
                 if not LAYOUT_ID.fullmatch(str(name)):
                     errors.append(f"$.layouts.{name}: invalid layout id")
-                if not is_int(cap) or not 1 <= cap <= 64:
-                    errors.append(f"$.layouts.{name}: capacity must be an integer 1..64")
-                known.add(name)
+                normalised = _validate_layout(name, spec, version, errors)
+                known[name] = normalised
     boards = reg.get("boards")
     if "boards" in reg:
         if not isinstance(boards, dict) or not boards:
@@ -182,8 +235,12 @@ def validate_registry(reg) -> list[str]:
                         errors.append(f"{where}.layouts: must be a non-empty list")
                     else:
                         for i, name in enumerate(bl):
-                            if name not in known:
+                            if not isinstance(name, str) or name not in known:
                                 errors.append(f"{where}.layouts[{i}]: unknown layout {name!r}")
+                            elif (known[name] is not None and board.get("shape") in SHAPES
+                                  and board["shape"] not in known[name]["shapes"]):
+                                errors.append(f"{where}.layouts[{i}]: layout {name!r} does not support "
+                                              f"the {board['shape']} shape of this board")
     return errors
 
 
@@ -244,13 +301,42 @@ def validate_config(cfg, registry) -> list[str]:
                 if "alarm" in inst and not isinstance(inst["alarm"], bool):
                     errors.append(f"{where}.alarm: must be true or false")
 
+    notifications = cfg.get("notifications")
+    notification_ids: set = set()
+    if "notifications" in cfg:
+        if not isinstance(notifications, dict):
+            errors.append("$.notifications: must be an object")
+        else:
+            for nid, note in notifications.items():
+                where = f"$.notifications.{nid}"
+                if not INSTRUMENT_ID.fullmatch(str(nid)):
+                    errors.append(f"{where}: notification id must match ^[a-z][a-z0-9_]{{0,31}}$")
+                if nid in valid_ids:
+                    errors.append(f"{where}: id is already used by an instrument; ids must be unique")
+                if not isinstance(note, dict):
+                    errors.append(f"{where}: must be an object")
+                    continue
+                notification_ids.add(nid)
+                _unknown(note, NOTIFICATION_KEYS, where, errors)
+                _missing(note, NOTIFICATION_REQUIRED, where, errors)
+                if "path" in note and not (isinstance(note["path"], str) and SK_PATH.fullmatch(note["path"])
+                                           and note["path"].startswith(NOTIFICATION_PREFIX)):
+                    errors.append(f"{where}.path: must be a dotted SignalK path starting with "
+                                  f"{NOTIFICATION_PREFIX!r}")
+                if "label" in note and not _text(note["label"], 1, 16):
+                    errors.append(f"{where}.label: must be 1..16 printable characters")
+                if "absent" in note and not (isinstance(note["absent"], str) and note["absent"] in ABSENT_MODES):
+                    errors.append(f"{where}.absent: must be one of {', '.join(ABSENT_MODES)}")
+                if "alarm" in note and not isinstance(note["alarm"], bool):
+                    errors.append(f"{where}.alarm: must be true or false")
+
     displays = cfg.get("displays")
     if "displays" in cfg:
         if not isinstance(displays, dict):
             errors.append("$.displays: must be an object")
         else:
             boards = registry.get("boards", {})
-            caps = registry.get("layouts", {})
+            specs = layout_specs(registry)
             for did, disp in displays.items():
                 where = f"$.displays.{did}"
                 if not DISPLAY_ID.fullmatch(str(did)):
@@ -283,29 +369,43 @@ def validate_config(cfg, registry) -> list[str]:
                     if "title" in page and not _text(page["title"], 1, 16):
                         errors.append(f"{pw}.title: must be 1..16 printable characters")
                     layout = page.get("layout")
-                    capacity = None
+                    spec = None
                     if "layout" in page:
-                        if not isinstance(layout, str) or layout not in caps:
+                        if not isinstance(layout, str) or layout not in specs:
                             errors.append(f"{pw}.layout: unknown layout {layout!r}")
                         elif board is not None and layout not in board.get("layouts", []):
                             errors.append(f"{pw}.layout: {layout!r} is not supported by board {disp['board']!r}")
+                        elif board is not None and board.get("shape") not in specs[layout]["shapes"]:
+                            errors.append(f"{pw}.layout: {layout!r} does not support the "
+                                          f"{board.get('shape')} shape of board {disp['board']!r}")
                         else:
-                            capacity = caps[layout]
+                            spec = specs[layout]
                     items = page.get("items")
                     if "items" in page:
                         if not isinstance(items, list) or not items:
                             errors.append(f"{pw}.items: must be a non-empty list")
                             continue
-                        if capacity is not None and len(items) > capacity:
-                            errors.append(f"{pw}.items: {len(items)} items exceed layout capacity {capacity}")
+                        if spec is not None and len(items) > spec["capacity"]:
+                            errors.append(f"{pw}.items: {len(items)} items exceed layout capacity "
+                                          f"{spec['capacity']}")
+                        if spec is not None and len(items) < spec["min_items"]:
+                            errors.append(f"{pw}.items: layout {layout!r} needs at least "
+                                          f"{spec['min_items']} item(s)")
                         seen: set = set()
                         for ii, item in enumerate(items):
-                            if not isinstance(item, str) or item not in valid_ids:
-                                errors.append(f"{pw}.items[{ii}]: unknown instrument {item!r}")
+                            if not isinstance(item, str) or (item not in valid_ids
+                                                             and item not in notification_ids):
+                                errors.append(f"{pw}.items[{ii}]: unknown instrument or notification {item!r}"
+                                              if notification_ids else
+                                              f"{pw}.items[{ii}]: unknown instrument {item!r}")
                             elif item in seen:
-                                errors.append(f"{pw}.items[{ii}]: duplicate instrument {item!r}")
+                                errors.append(f"{pw}.items[{ii}]: duplicate item {item!r}")
                             else:
                                 seen.add(item)
+                                kind = "instrument" if item in valid_ids else "notification"
+                                if spec is not None and kind not in spec["types"]:
+                                    errors.append(f"{pw}.items[{ii}]: layout {layout!r} does not accept "
+                                                  f"{kind} items ({item!r})")
     return errors
 
 

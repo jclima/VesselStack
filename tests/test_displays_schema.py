@@ -147,7 +147,52 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(bad(lambda r: board(r).update(content_width=9999)))
         self.assertTrue(bad(lambda r: board(r).update(extra=1)))
         self.assertTrue(bad(lambda r: r["layouts"].update(single=0)))
-        self.assertTrue(bad(lambda r: r.update(schema=2)))
+        self.assertTrue(bad(lambda r: r.update(schema=3)))
+        self.assertTrue(bad(lambda r: r.update(schema=1)))  # objects are not schema 1
+
+    def test_registry_v1_integer_layouts_are_normalised(self) -> None:
+        v1 = {"schema": 1, "layouts": {"single": 1, "grid-2x2": 4},
+              "boards": {"b": dict(REGISTRY["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"],
+                                   layouts=["single", "grid-2x2"])}}
+        self.assertEqual(schema.validate_registry(v1), [])
+        self.assertEqual(schema.layout_specs(v1)["grid-2x2"], {
+            "capacity": 4, "min_items": 1, "shapes": ["round", "rect"], "types": ["instrument"]})
+        v1["layouts"]["single"] = 0
+        self.assertTrue(schema.validate_registry(v1))
+        # a v1 registry validates configurations exactly like the v2 one
+        v1["layouts"]["single"] = 1
+        v1["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"] = v1["boards"].pop("b")
+        self.assertEqual(schema.validate_config(EXAMPLE, v1), [])
+
+    def test_registry_v2_layout_rules(self) -> None:
+        def bad(mutate):
+            reg = copy.deepcopy(REGISTRY)
+            mutate(reg)
+            return schema.validate_registry(reg)
+        grid = lambda r: r["layouts"]["grid-2x2"]  # noqa: E731
+        self.assertEqual(schema.validate_registry(REGISTRY), [])
+        self.assertEqual(REGISTRY["schema"], 2)
+        for mutate in (lambda r: r["layouts"].update({"grid-2x2": 4}),
+                       lambda r: grid(r).update(capacity=0),
+                       lambda r: grid(r).update(capacity=True),
+                       lambda r: grid(r).update(min_items=5),
+                       lambda r: grid(r).pop("types"),
+                       lambda r: grid(r).update(types=[]),
+                       lambda r: grid(r).update(types=["instrument", "instrument"]),
+                       lambda r: grid(r).update(types=["ha"]),
+                       lambda r: grid(r).update(shapes=["oval"]),
+                       lambda r: grid(r).update(extra=1)):
+            self.assertTrue(bad(mutate))
+
+    def test_a_board_may_only_list_layouts_that_support_its_shape(self) -> None:
+        errors = None
+        reg = copy.deepcopy(REGISTRY)
+        reg["layouts"]["grid-2x2"]["shapes"] = ["rect"]
+        errors = schema.validate_registry(reg)
+        self.assertTrue(any("does not support the round shape" in e for e in errors), errors)
+        cfg = copy.deepcopy(EXAMPLE)
+        self.assertTrue(any("does not support the round shape" in e
+                            for e in schema.validate_config(cfg, reg)))
 
     def test_duplicate_json_keys_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,3 +293,83 @@ class ThresholdTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+NOTE = {"path": "notifications.navigation.anchor", "label": "Anchor"}
+
+
+def with_notes(cfg, **notes):
+    cfg["notifications"] = {"anchor": dict(NOTE), **notes}
+    cfg["displays"]["helm"]["pages"].append(
+        {"title": "Status", "layout": "status-grid", "items": ["sog", "anchor"]})
+
+
+class NotificationTests(unittest.TestCase):
+    def assertError(self, mutate, fragment):
+        errors = errors_for(mutate)
+        self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
+
+    def test_valid_notifications_and_status_grid(self) -> None:
+        def mutate(cfg):
+            with_notes(cfg, mooring={"path": "notifications.mooring", "label": "Moor",
+                                      "absent": "unknown", "alarm": False})
+        self.assertEqual(errors_for(mutate), [])
+
+    def test_notification_fields(self) -> None:
+        def note(**kw):
+            def mutate(cfg):
+                with_notes(cfg)
+                cfg["notifications"]["anchor"].update(kw)
+            return mutate
+        for path in ("navigation.anchor", "notification.x.y", "notifications", "notifications.", "notifications.a b",
+                     "notifications.x\n", 5):
+            self.assertError(note(path=path), "anchor.path")
+        for label in ("", "x" * 17, "a\nb", 5):
+            self.assertError(note(label=label), "anchor.label")
+        for absent in ("alarm", "", None, True):
+            self.assertError(note(absent=absent), "anchor.absent")
+        self.assertError(note(alarm="yes"), "anchor.alarm")
+        self.assertError(note(extra=1), "anchor.extra: unknown key")
+
+        def missing(cfg):
+            with_notes(cfg)
+            del cfg["notifications"]["anchor"]["label"]
+        self.assertError(missing, "anchor.label: required")
+        self.assertError(lambda c: c.update(notifications=[]), "$.notifications: must be an object")
+
+    def test_ids_are_unique_across_instruments_and_notifications(self) -> None:
+        def mutate(cfg):
+            cfg["notifications"] = {"sog": dict(NOTE)}
+        self.assertError(mutate, "already used by an instrument")
+        self.assertError(lambda c: c.update(notifications={"Bad-Id": dict(NOTE)}), "notification id must match")
+
+    def test_layouts_declare_which_item_types_they_accept(self) -> None:
+        def on_grid(cfg):
+            with_notes(cfg)
+            page(cfg)["items"] = ["sog", "anchor"]
+        self.assertError(on_grid, "does not accept notification items")
+
+        def unknown(cfg):
+            with_notes(cfg)
+            cfg["displays"]["helm"]["pages"][1]["items"] = ["sog", "nope"]
+        self.assertError(unknown, "unknown instrument or notification 'nope'")
+
+        def dup(cfg):
+            with_notes(cfg)
+            cfg["displays"]["helm"]["pages"][1]["items"] = ["anchor", "anchor"]
+        self.assertError(dup, "duplicate")
+
+        def over(cfg):
+            with_notes(cfg)
+            cfg["displays"]["helm"]["pages"][1]["items"] = [f"i{n}" for n in range(10)]
+            for n in range(10):
+                cfg["instruments"][f"i{n}"] = dict(inst(cfg))
+        self.assertError(over, "exceed layout capacity 9")
+
+    def test_min_items_is_enforced(self) -> None:
+        reg = copy.deepcopy(REGISTRY)
+        reg["layouts"]["status-grid"]["min_items"] = 3
+        cfg = copy.deepcopy(EXAMPLE)
+        with_notes(cfg)
+        errors = schema.validate_config(cfg, reg)
+        self.assertTrue(any("needs at least 3" in e for e in errors), errors)
