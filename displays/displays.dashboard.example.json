@@ -17,8 +17,16 @@
   },
   "notifications": {
     "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
-    "low_battery": {"path": "notifications.electrical.batteries.house.voltage", "label": "Low battery", "absent": "ok"},
-    "shore_power": {"path": "notifications.electrical.shorePower", "label": "Shore", "absent": "unknown", "alarm": false}
+    "low_battery": {"path": "notifications.electrical.batteries.house.voltage", "label": "Low battery", "absent": "ok"}
+  },
+  "ha": {
+    "bilge": {"entity_id": "binary_sensor.vesselstack_bilge_pump", "label": "Bilge", "kind": "binary", "states": [{"match": "on", "sev": "warn", "text": "RUNNING"}, {"match": "off", "sev": "ok", "text": "OFF"}]},
+    "high_water": {"entity_id": "binary_sensor.vesselstack_high_water", "label": "High water", "kind": "binary", "states": [{"match": "on", "sev": "alarm", "text": "HIGH"}, {"match": "off", "sev": "ok", "text": "DRY"}]},
+    "engine": {"entity_id": "sensor.engine_alarm_status", "label": "Engine", "kind": "state", "states": [{"match": "all clear", "sev": "ok", "text": "CLEAR"}, {"match": "normal", "sev": "ok", "text": "CLEAR"}], "default": {"sev": "alarm", "text": "ALARM"}},
+    "shore": {"entity_id": "binary_sensor.vesselstack_shore_power", "label": "Shore", "kind": "binary", "alarm": false, "states": [{"match": "on", "sev": "ok", "text": "ON"}, {"match": "off", "sev": "ok", "text": "OFF"}]},
+    "watch": {"entity_id": "sensor.boat_watch_summary", "label": "Watch", "kind": "state", "states": [{"match": "clear", "sev": "ok", "text": "CLEAR"}, {"prefix": "dock: clear", "sev": "ok", "text": "CLEAR"}, {"prefix": "anchor: clear", "sev": "ok", "text": "CLEAR"}, {"prefix": "away: clear", "sev": "ok", "text": "CLEAR"}], "default": {"sev": "warn", "text": "CHECK"}},
+    "weather": {"entity_id": "sensor.weather_risk_level", "label": "Weather", "kind": "state", "states": [{"match": "normal", "sev": "ok", "text": "NORMAL"}, {"match": "low", "sev": "ok", "text": "LOW"}], "default": {"sev": "warn", "text": "RISK"}},
+    "health": {"entity_id": "sensor.boat_health_summary", "label": "Health", "kind": "state", "states": [{"match": "ok", "sev": "ok", "text": "OK"}], "default": {"sev": "warn", "text": "CHECK"}}
   },
   "displays": {
     "helm": {
@@ -27,10 +35,10 @@
       "ui": {"alarm_takeover": true, "alarm_page": 1, "swipe": true, "header": true, "night": "schedule", "day_brightness": 100, "night_brightness": 15, "dim_after_s": 120},
       "pages": [
         {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "house_v", "start_v"]},
-        {"title": "Status", "layout": "status-grid", "items": ["anchor", "low_battery", "depth", "house_v", "start_v", "fuel", "water"]},
+        {"title": "Status", "layout": "status-grid", "items": ["anchor", "low_battery", "bilge", "high_water", "engine", "shore", "watch", "weather", "health"]},
         {"title": "Tanks", "layout": "tank-bars", "items": ["fuel", "water", "waste"]},
         {"title": "Fuel", "layout": "gauge-arc", "items": ["fuel"]},
-        {"title": "Electrical", "layout": "electrical", "items": ["house_v", "batt_soc", "batt_a", "shore_power", "solar_a"]}
+        {"title": "Electrical", "layout": "electrical", "items": ["house_v", "batt_soc", "batt_a", "shore", "solar_a"]}
       ]
     }
   }
