@@ -16,7 +16,7 @@ ota:
 logger:
   level: INFO
 
-# The display ACL only allows reading vesselstack/v1/{bridge,instruments}/# and
+# The display ACL only allows reading vesselstack/v1/{bridge,instruments,notifications,alarms}/# and
 # writing its own .../displays/<user>/status topic, so everything else is off.
 mqtt:
   broker: !secret mqtt_host

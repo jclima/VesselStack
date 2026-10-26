@@ -1044,10 +1044,10 @@ working. With `DISPLAYS_ENABLE=true` these accounts are added:
 | Account | Read | Write |
 | --- | --- | --- |
 | `MQTT_USERNAME` (admin) | `#`, `$SYS/#` | `#` |
-| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/bridge/#` |
-| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
+| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/bridge/#` |
+| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
 
-Display accounts are read-only for instrument and notification data and cannot
+Display accounts are read-only for instrument, notification and alarm data and cannot
 read other MQTT topics such as `homeassistant/#`. Any other MQTT account is
 granted nothing.
 
@@ -1057,6 +1057,15 @@ installer run (`install.sh`, `vesselstackctl update`) or by `sudo vesselstackctl
 display sync-mqtt`; until then the bridge cannot publish notifications and
 status-grid displays show `--` for them. The change only adds two rules; roll
 back by restoring the previous release and running `display sync-mqtt` again.
+
+The `vesselstack/v1/alarms/#` rules (bridge write, displays read) were added with the
+alarm summary. They are picked up the same way: the next installer run
+(`install.sh`, `vesselstackctl update`) or `sudo vesselstackctl display
+sync-mqtt` rewrites the ACL and signals the broker. Until then the bridge
+cannot publish `alarms/summary` (its publishes are refused, nothing else
+breaks) and a display with `ui.alarm_takeover` never shows the banner. The
+change only adds two rules; roll back by restoring the previous release and
+running `display sync-mqtt` again.
 
 Operational notes:
 
@@ -1269,8 +1278,8 @@ on the bridge so a running bridge picks up the rewritten environment; a stopped
 bridge is only started by `--start` or `vesselstackctl start`. The unit runs as the unprivileged service account with the same
 hardening as Boat Chat plus a read-only filesystem view; it only reads
 `displays.json`. The bridge MQTT account may only publish
-`vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#` and
-`vesselstack/v1/bridge/#`.
+`vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`,
+`vesselstack/v1/alarms/#` and `vesselstack/v1/bridge/#`.
 
 Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
 `online` (and `offline` on a clean stop; Mosquitto publishes the retained last
@@ -1711,7 +1720,8 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   `min_interval_ms` (100-60000, default 1000), `thresholds`, `min`, `max`
   and `alarm` (see [Thresholds and severity colours](#thresholds-and-severity-colours)).
 - A display (`^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$`: 1-24 characters, starting with a letter and not ending in a hyphen) has a `name`, a `board` from
-  `displays/boards/registry.json`, optional `home_assistant_api` (boolean) and
+  `displays/boards/registry.json`, optional `home_assistant_api` (boolean),
+  optional `ui` (see [Alarm summary and takeover](#alarm-summary-and-takeover)) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
   supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6,
   `status-grid` holds 1-9) and unique `items` naming existing instruments or,
@@ -1770,10 +1780,11 @@ are rejected):
   (not at 11.8). Getting more severe is immediate. After the value was
   `stale` or `missing` there is no memory: the first value is judged on the
   bounds alone.
-- `min` and `max` (finite, `min < max`) and `alarm` (boolean, meaning "this
-  instrument may raise an alarm", default true when `thresholds` is present)
-  are validated and stored now; widgets that use them (gauges, alarm
-  indications) come in later releases. They change nothing on the screen yet.
+- `alarm` (boolean, meaning "this instrument may raise an alarm", default true
+  when `thresholds` is present, false otherwise) decides whether the instrument
+  counts in the [alarm summary](#alarm-summary-and-takeover). `min` and `max`
+  (finite, `min < max`) are validated and stored; widgets that use them
+  (gauges) come in a later release and they change nothing on the screen yet.
 - Colours on the tile (background / value text): `ok` green `0x1E7B34` /
   white, `warn` amber `0xF2A900` / black, `alarm` red `0xC62828` / white. A
   tile that shows `--` (bridge offline, MQTT disconnected, `st` not `ok` or no
@@ -1807,7 +1818,8 @@ page. Add a top-level `notifications` object to `displays.json`:
 - `path` must start with `notifications.` (own vessel, SignalK path syntax),
   `label` is 1-16 printable characters in the bundled font (checked like
   instrument labels), `absent` is `ok` (default) or `unknown` and `alarm` is a
-  boolean (default true; stored for later alarm indications, no effect today).
+  boolean (default true) that decides whether the notification counts in the
+  [alarm summary](#alarm-summary-and-takeover).
   Ids use the instrument id rules and must not clash with an instrument id.
 - State mapping: the notification value is an object with a `state`.
   `normal` and `nominal` show **OK** (green), `alert` and `warn` show **WARN**
@@ -1839,6 +1851,79 @@ when the bridge is offline, or when MQTT is disconnected. The bridge subscribes
 to these paths with a 1000 ms period; instruments still only publish numeric
 values. The bridge needs the `notifications/#` ACL rule (see [MQTT access
 control](#mqtt-access-control)).
+
+#### Alarm summary and takeover
+
+The bridge condenses all alarm-relevant items into one retained message,
+`vesselstack/v1/alarms/summary`, and a display may use it to take over the
+screen with a flashing banner.
+
+```json
+{"max":"alarm","na":1,"nw":1,"nu":0,"ids":["anchor","depth"],"ts":"2026-01-01T00:00:00Z"}
+```
+
+- **What counts:** only items with `alarm: true`. Instruments default to true
+  when they have `thresholds` and to false otherwise; notifications default to
+  true. A stale or never-heard item counts as `unknown`.
+- `na`, `nw`, `nu` are the numbers of items that are `alarm`, `warn` and
+  `unknown`. `max` is the highest of `alarm` > `warn` > `unknown` > `ok`:
+  `unknown` ranks **above** `ok`, so a dead SignalK feed or stale sensor is never
+  reported as all clear. With no counted item at all the topic is not
+  published.
+- `ids` lists the alarm ids first, then the warn ids, each group in
+  `displays.json` order (instruments, then notifications), at most 16. Only
+  ids are published: never labels, units, values or notification messages.
+  `ts` is the bridge's UTC time.
+- Published (retained, QoS 1) on every change and every `heartbeat_s`. On a
+  clean stop (SIGTERM) the bridge publishes a last summary with every counted
+  item `unknown` (`max` `unknown`, `na` 0), so a stopped bridge never leaves a
+  retained `ok` or `alarm`. After a crash or power loss the retained message
+  stays, which is why displays also require `bridge/status` `online` and a
+  summary newer than 3 x `heartbeat_s`.
+- Needs the `alarms/#` ACL rule (see [MQTT access control](#mqtt-access-control)).
+
+Per-display option in `displays.json` (default off; nothing about the firmware
+changes without it):
+
+```json
+"ui": {"alarm_takeover": true, "alarm_page": 1}
+```
+
+- `alarm_takeover` (boolean, default false) turns the banner on. It is rejected
+  when nothing in the configuration counts towards the summary.
+- `alarm_page` (integer index into `pages`, default 0, validated) is the page
+  shown when an alarm starts. Unknown `ui` keys are rejected.
+
+Behaviour of a display with `alarm_takeover`:
+
+- The firmware subscribes to the summary (the display ACL allows reading it).
+  A red banner (0xC62828, 96 px high, as wide as the board's content area, 340
+  px on the Waveshare 2.8C, centred on top of every page) shows the alarm count
+  and the fixed word `ALARM` or `ALARMS` (`99+` above 99) and the name of the
+  first alarm. The name is chosen from the display's own items by compile-time
+  `!literal` branches (the summary carries ids only); an alarm that is not an
+  item of this display shows the count only. The banner flashes (500 ms).
+- It is shown only while the newest summary has `max` `alarm`, is fresher than
+  3 x `heartbeat_s`, the bridge is `online` and MQTT is connected. Otherwise it
+  is hidden (never green, never stuck).
+- Takeover is edge-triggered, when the alarm count rises or `max` changes to
+  `alarm` (also when the first summary after boot or after a stale period is an
+  alarm): the display switches to `alarm_page`, shows the banner and sets the
+  backlight to 100 %. You can still navigate away. Tapping the banner hides it
+  locally until the next such edge. Nothing is sent back: **there is no
+  acknowledgement in this version, the bridge and the alarm state are not
+  affected and displays stay read-only**; acknowledging from a display is a
+  possible future feature.
+- Glyphs for the banner are included in the generated fonts (about 16 kB more
+  flash and 1.4 kB RAM on the dashboard example).
+
+[`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
+enables it with `alarm_page` set to the Status page. **Upgrade:** update
+VesselStack, let the installer (or `sudo vesselstackctl display sync-mqtt`)
+rewrite the ACL, restart the bridge (the installer does), then `display build ID`
+and `display flash ID` for each display that gets the option. Existing firmware
+ignores the summary. **Rollback:** remove `ui`, rebuild and reflash (or flash
+the previous firmware); the bridge's extra topic is harmless to older displays.
 
 #### The `status-grid` layout
 
@@ -1887,7 +1972,8 @@ bridge received the value, measured on the bridge clock, not the SignalK
 timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/<username>/status`.
 Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
-(see [Notifications](#notifications)).
+(see [Notifications](#notifications)); the combined alarm state is
+`vesselstack/v1/alarms/summary` (see [Alarm summary and takeover](#alarm-summary-and-takeover)).
 
 - `sev` (optional): instruments that have `thresholds` also publish
   `"sev":"ok"|"warn"|"alarm"|"unknown"`, placed after `st` (for example

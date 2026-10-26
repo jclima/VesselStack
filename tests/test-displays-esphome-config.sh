@@ -188,6 +188,7 @@ log="$WORK/alarm-helm.log"
 grep -q 'id(alarm_banner)' "$log" || { echo "alarm banner missing from the validated alarm config" >&2; fail=1; }
 grep -q 'vesselstack/v1/alarms/summary' "$log" || { echo "alarm summary subscription missing" >&2; fail=1; }
 grep -q 'light.turn_on\|board_backlight' "$log" || { echo "backlight action missing from the alarm config" >&2; fail=1; }
+# shellcheck disable=SC2016
 grep -qF '${y} Bilge' "$log" || { echo "hostile label was altered in the alarm banner" >&2; fail=1; }
 for plain in example thresholds status complex; do
     if grep -q 'alarm_banner' "$WORK/$plain-helm.log"; then echo "alarm banner present without ui.alarm_takeover ($plain)" >&2; fail=1; fi
