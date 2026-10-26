@@ -1034,6 +1034,19 @@ Assistant (8123) run with `network_mode: host`, so Compose port bindings cannot 
   command; `vesselstackctl doctor` then warns until you do. An already-running container gets
   the new file checked with Home Assistant's `check_config` (the previous file is restored if
   it fails) and is the only container restarted. `dashboards` and `all` remove the block again.
+  *Security note:* the Home Assistant container runs as root and can write that directory
+  while VesselStack edits the file as root, so every read, write, restore and removal goes
+  through one small Python helper that opens the directory with `O_NOFOLLOW` (refusing
+  symlinked or group/world-writable directories), opens the file with `O_NOFOLLOW` and
+  requires a plain single-link regular file, and replaces it with a temporary file in the same
+  directory descriptor plus `rename(2)`, never following a link at the destination. A symlink,
+  hard link, unusual file or symlinked directory makes `sync` change nothing and print the
+  manual instructions (`ha-http status` shows `unsafe`). The pre-change backup is kept in the
+  root-only `/var/lib/vesselstack/ha-http-backup` (mode 0700, outside the container-writable
+  tree) and restored through the same helper; if the file or directory was swapped while
+  `check_config` ran, the restore is refused, the backup stays there and the message says so.
+  Rollback of this hardening: reinstall 0.4.3 (it has no helper; the managed block itself is
+  unchanged).
   Only the web/API port follows the setting; other Home Assistant listeners (for example
   discovery or HomeKit integrations you add) are outside it. Boat Chat, the telemetry indexer
   and the installer already reach it on `http://127.0.0.1:8123`, and Home Assistant reaches
