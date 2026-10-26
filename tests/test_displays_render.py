@@ -112,6 +112,39 @@ def gauge_pages(cfg, header=False, night=False):
         cfg["displays"]["helm"]["ui"] = ui
 
 
+def electrical_pages(cfg, header=False, night=False, pages=("min", "shore", "full")):
+    """House battery instruments plus up to three electrical pages (3, 4 and 5 items)."""
+    cfg["instruments"].update({
+        "batt_v": {"path": "electrical.batteries.house.voltage", "label": "House", "convert": "none", "unit": "V",
+                   "precision": 2, "stale_after_s": 30,
+                   "thresholds": {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8, "hysteresis": 0.05}},
+        "batt_soc": tank("SoC", "electrical.batteries.house.capacity.stateOfCharge",
+                         thresholds={"alarm_below": 20, "warn_below": 30, "hysteresis": 2}),
+        "batt_a": {"path": "electrical.batteries.house.current", "label": "Current", "convert": "none", "unit": "A",
+                   "precision": 1, "stale_after_s": 30},
+        "shore_a": {"path": "electrical.shore.current", "label": "Shore", "convert": "none", "unit": "A",
+                    "precision": 1, "stale_after_s": 30},
+        "solar_a": {"path": "electrical.solar.main.current", "label": "Solar", "convert": "none", "unit": "A",
+                    "precision": 1, "stale_after_s": 30},
+    })
+    cfg["notifications"] = {"shore": {"path": "notifications.electrical.shorePower", "label": "Shore",
+                                      "absent": "unknown"}}
+    choices = {
+        "min": {"title": "Power", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a"]},
+        "shore": {"title": "Shore", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a", "shore_a"]},
+        "full": {"title": "Full", "layout": "electrical",
+                 "items": ["batt_v", "batt_soc", "batt_a", "shore", "solar_a"]},
+    }
+    cfg["displays"]["helm"]["pages"] = [choices[name] for name in pages]
+    ui = {}
+    if header:
+        ui.update(header=True, swipe=True)
+    if night:
+        ui.update(night="manual")
+    if ui:
+        cfg["displays"]["helm"]["ui"] = ui
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -193,6 +226,12 @@ class GoldenAndDeterminism(Base):
     def test_tank_bars_and_gauge_arc_match_golden(self):
         self.set_config(gauge_pages)
         self.check_golden("helm-gauges.yaml", self.device(allow_missing_wifi=True))
+
+    def test_electrical_pages_match_golden(self):
+        def mutate(cfg):
+            electrical_pages(cfg, header=True, night=True)
+        self.set_config(mutate)
+        self.check_golden("helm-electrical.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -1270,6 +1309,355 @@ class Gauges(Base):
                                                             "shapes": ["round"], "types": ["instrument"]})
         page = lifecycle.default_page(REGISTRY, EXAMPLE, BOARD)
         self.assertEqual(page["layout"], "grid-2x2")           # tank-bars needs min/max: never a default
+
+
+class Electrical(Base):
+    """The electrical layout (display dashboard slice S7)."""
+
+    def elec_device(self, mutate=None, **kw):
+        def build(cfg):
+            electrical_pages(cfg, **kw)
+            if mutate:
+                mutate(cfg)
+        self.set_config(build)
+        return self.device(allow_missing_wifi=True)
+
+    def page(self, text, pi):
+        return text.split(f"- id: page_{pi}\n")[1].split("\n    - id: page_")[0]
+
+    def label(self, text, wid):
+        """The one-line label widget with this id."""
+        return next(l for l in text.splitlines() if f"id: {wid}," in l)
+
+    def test_nothing_is_generated_without_the_layout(self):
+        text = self.device(allow_missing_wifi=True)
+        for marker in ("CHG", "DSG", "_word", "_sdrawn", "- arc:", "_num,"):
+            self.assertNotIn(marker, text)
+
+    # -- slots ----------------------------------------------------------------------------------
+
+    def test_items_fill_the_slots_in_order(self):
+        text = self.elec_device()
+        minimal, shore, full = (self.page(text, i) for i in range(3))
+        self.assertIn("text_font: font_value_grid", self.label(minimal, "p0_batt_v_value"))      # voltage: big digits
+        for wid in ("p0_batt_soc_value", "p0_batt_a_value"):
+            self.assertIn("text_font: font_small", self.label(minimal, wid))
+        self.assertIn("id: p0_batt_a_word,", minimal)                                          # only the current has a word
+        self.assertNotIn("_word", minimal.replace("p0_batt_a_word", ""))
+        self.assertNotIn("_tile", minimal)                                                     # no pill without shore
+        self.assertIn("id: p1_shore_a_tile", shore)
+        self.assertIn("id: p2_shore_tile", full)
+        self.assertIn("id: p2_solar_a_value", full)
+        self.assertNotIn("solar", shore)
+        order = [full.index(f"id: p2_{iid}_value") for iid in ("batt_v", "batt_soc", "batt_a", "shore", "solar_a")]
+        self.assertEqual(order, sorted(order))                                                 # top to bottom
+
+    def test_the_ring_is_the_gauge_arc_ring_of_the_soc(self):
+        text = self.elec_device(pages=("min",))
+        arc = lambda t: "".join(t.split("- obj:")[0].split("widgets:\n")[1:])   # noqa: E731 - widgets before the first obj
+
+        def gauge(cfg):
+            cfg["displays"]["helm"]["pages"] = [{"title": "Power", "layout": "gauge-arc", "items": ["batt_soc"]}]
+        gtext = self.elec_device(gauge)
+        self.assertEqual(arc(self.page(text, 0)), arc(self.page(gtext, 0)))
+        self.assertEqual(re.findall(r"id: (p0_zone\d)", self.page(text, 0)), ["p0_zone0", "p0_zone1"])
+        self.assertIn("lv_arc_set_value(id(p0_arc), lroundf(pa));", text)
+        self.assertIn("float n = id(ins_batt_soc_num);", text)
+        self.assertNotIn("ins_batt_v_num", text)                                               # voltage needs only text
+        self.assertNotIn("ins_batt_v_gdrawn", text)
+        self.assertEqual(text.count("lv_arc_set_value"), 1)
+
+    def test_soc_ring_colours_follow_severity_and_neutral_blue_without_thresholds(self):
+        text = self.elec_device(pages=("min",))
+        lam = text.split("float n = id(ins_batt_soc_num);")[1].split("          }\n")[0]
+        self.assertIn("uint8_t g = fresh ? id(ins_batt_soc_sev) : 0;", lam)
+        self.assertIn("uint32_t c = 0x37474F;", lam)
+        self.assertEqual(lam.count("0x1E7B34"), 1)
+
+        def plain(cfg):
+            del cfg["instruments"]["batt_soc"]["thresholds"]
+        text = self.elec_device(plain, pages=("min",))
+        lam = text.split("float n = id(ins_batt_soc_num);")[1].split("          }\n")[0]
+        self.assertIn("uint8_t g = fresh ? 4 : 0;", lam)
+        self.assertNotIn("ins_batt_soc_sev", text)
+        self.assertNotIn("p0_zone0", text)
+
+    # -- current: CHG / DSG ---------------------------------------------------------------------
+
+    def current_branches(self, text):
+        return re.findall(r"return \((.*)\) == (\d);'\n\s+then:\n\s+- lvgl.label.update:\n\s+id: (p\d_batt_a_word)\n"
+                          r"\s+text: !literal \"(\w*)\"", text)
+
+    def test_chg_dsg_and_empty_are_three_exhaustive_literal_branches(self):
+        text = self.elec_device(pages=("min",))
+        branches = self.current_branches(text)
+        self.assertEqual([(n, w) for _, n, _, w in branches], [("1", "CHG"), ("2", "DSG"), ("0", "")])
+        self.assertEqual({cond for cond, _, _, _ in branches}.__len__(), 1)       # one gated state for all three
+        cond = branches[0][0]
+        self.assertIn("? (id(ins_batt_a_num) > 0.05f ? 1 : id(ins_batt_a_num) < -0.05f ? 2 : 0) : 0", cond)
+        self.assertEqual(render.CURRENT_DEADBAND, 0.05)
+        self.assertEqual(render.CURRENT_WORDS, {1: "CHG", 2: "DSG", 0: ""})
+        # the words are never built at run time
+        self.assertNotIn("snprintf", text.split("  - id: render_tiles")[1].split("\n  - id: apply_night")[0])
+
+    def test_the_current_word_is_gated_on_freshness_so_stale_means_empty(self):
+        cond = self.current_branches(self.elec_device(pages=("min",)))[0][0]
+        for term in ("id(bridge_online)", "mqtt::global_mqtt_client->is_connected()", "id(ins_batt_a_ok)",
+                     "(millis() - id(ins_batt_a_seen)) < 40000UL"):
+            self.assertIn(term, cond)
+        self.assertLess(cond.index("(millis()"), cond.index("id(ins_batt_a_num)"))
+        # the word shown when stale is the empty one, in the state-0 branch
+        self.assertIn("? ", cond)
+        self.assertTrue(cond.rstrip().endswith(": 0"))
+
+    def test_deadband_boundaries_match_the_firmware_expression(self):
+        def word(n):
+            return "CHG" if n > render.CURRENT_DEADBAND else ("DSG" if n < -render.CURRENT_DEADBAND else "")
+        self.assertEqual([word(n) for n in (0.06, 0.05, 0.0, -0.05, -0.06, 12.3, -40)],
+                         ["CHG", "", "", "", "DSG", "CHG", "DSG"])
+
+    def test_the_value_text_is_signed_and_blanks_when_stale(self):
+        text = self.elec_device(pages=("min",))
+        tiles = text.split("  - id: render_tiles")[1].split("\n  - id:")[0]
+        self.assertIn("id: p0_batt_a_value\n          text: !lambda", tiles)
+        self.assertIn('return fresh ? id(ins_batt_a_val) : std::string("--");', tiles)
+        self.assertIn('id: p0_batt_a_value, text: "--"', text)
+
+    def test_negate_is_a_valid_instrument_conversion_for_the_current(self):
+        def negate(cfg):
+            cfg["instruments"]["batt_a"]["convert"] = "negate"
+        text = self.elec_device(negate, pages=("min",))
+        self.assertIn("id: p0_batt_a_word", text)                          # the firmware never sees the sign flip
+        self.assertEqual(schema.validate_config(json.loads((self.root / "config" / "displays.json").read_text()),
+                                                REGISTRY), [])
+
+    # -- shore ----------------------------------------------------------------------------------
+
+    def test_a_notification_pill_reuses_the_severity_words_and_colours(self):
+        text = self.elec_device(pages=("full",))
+        sev = text.split("uint8_t sev = fresh ?")[1].split("          }\n")[0]
+        self.assertIn("lv_obj_set_style_bg_color(id(p0_shore_tile), lv_color_hex(bg), LV_PART_MAIN);", sev)
+        self.assertIn("lv_obj_set_style_text_color(id(p0_shore_value), lv_color_hex(fg), LV_PART_MAIN);", sev)
+        self.assertEqual(sev.count("0x1E7B34"), 1)
+        words = re.findall(r"== (\d);'\n\s+then:\n\s+- lvgl.label.update:\n\s+id: p0_shore_value\n\s+text: !literal \"([A-Z-]+)\"",
+                           text)
+        self.assertEqual(words, [("3", "ALARM"), ("2", "WARN"), ("1", "OK"), ("0", "--")])
+        self.assertIn("? id(ins_shore_sev) : 0) == 1", text)                     # OK only from a fresh severity
+        self.assertNotIn("ins_shore_sdrawn", text)                                # no instrument pill code
+        self.assertNotIn("ins_shore_num", text)
+
+    def test_an_instrument_pill_reads_on_above_the_threshold_and_off_otherwise(self):
+        text = self.elec_device(pages=("shore",))
+        self.assertEqual(render.SHORE_ON_ABOVE, 0.5)
+        words = re.findall(r"return \((.*)\) == (\d);'\n\s+then:\n\s+- lvgl.label.update:\n\s+id: p0_shore_a_value\n"
+                           r"\s+text: !literal \"([A-Z-]+)\"", text)
+        self.assertEqual([(n, w) for _, n, w in words], [("1", "ON"), ("2", "OFF"), ("0", "--")])
+        cond = words[0][0]
+        self.assertIn("? (id(ins_shore_a_num) > 0.5f ? 1 : 2) : 0", cond)
+        for term in ("id(bridge_online)", "id(ins_shore_a_ok)", "(millis() - id(ins_shore_a_seen)) < 40000UL"):
+            self.assertIn(term, cond)
+        # the number never reaches the pill text
+        tiles = text.split("  - id: render_tiles")[1].split("\n  - id:")[0]
+        self.assertNotIn("ins_shore_a_val", tiles)
+        self.assertNotIn("id: p0_shore_a_value\n          text: !lambda", tiles)
+
+    def test_the_instrument_pill_is_green_only_when_fresh_and_on(self):
+        text = self.elec_device(pages=("shore",))
+        lam = text.split("uint8_t s = fresh ?")[1].split("          }\n")[0]
+        self.assertIn("uint32_t c = 0x37474F;", lam)                       # stale: grey
+        self.assertIn("if (s == 1) c = 0x1E7B34;", lam)
+        self.assertIn("if (s == 2) c = 0x2E86C1;", lam)                    # off: neutral blue, not green
+        self.assertEqual(lam.count("0x1E7B34"), 1)
+        self.assertIn("if (s != id(ins_shore_a_sdrawn)) {", lam)
+        self.assertIn("{id: ins_shore_a_sdrawn, type: uint8_t, initial_value: \"255\"}", text)
+        self.assertIn("{id: ins_shore_a_num, type: float", text)
+        self.assertIn("uint8_t s = fresh ? (id(ins_shore_a_num) > 0.5f ? 1 : 2) : 0;", text)
+
+    def test_pill_geometry_and_names(self):
+        full = self.page(self.elec_device(pages=("full",)), 0)
+        pill = full.split("id: p0_shore_tile")[1].split("- label:")[0]
+        self.assertIn(f"width: {render.ELEC_PILL_WIDTH}", pill)
+        self.assertIn(f"radius: {render.ELEC_PILL_HEIGHT // 2}", pill)
+        self.assertLessEqual(render.ELEC_NAME_WIDTH + 6 + render.ELEC_PILL_WIDTH, render.ELEC_WIDTH)
+
+    # -- stale / unknown ------------------------------------------------------------------------
+
+    def test_every_derived_state_is_gated_on_freshness(self):
+        text = self.elec_device()
+        for lam in re.findall(r"return \((.*?)\) == \d;'", text):
+            self.assertIn("millis() - id(ins_", lam)
+        # nothing on the page reads a raw number outside a fresh guard
+        for match in re.finditer(r"id\(ins_(batt_a|shore_a|batt_soc)_num\)", text):
+            line = text[:match.start()].rsplit("\n", 1)[1] + text[match.start():].split("\n", 1)[0]
+            if 'x["v"].as<float>()' in line:      # the handler storing the payload number
+                continue
+            self.assertTrue("fresh" in line or "millis()" in line or "float n = id(" in line, line)
+        lam = text.split("float n = id(ins_batt_soc_num);")[0].rsplit("bool fresh", 1)[1]
+        self.assertIn("id(ins_batt_soc_ok)", lam)
+
+    # -- geometry, header -----------------------------------------------------------------------
+
+    def test_the_text_column_fits_inside_the_free_circle_of_the_ring(self):
+        board = REGISTRY["boards"][BOARD]
+        diameter = render.gauge_diameter(board)
+        free = render.arc_zone_diameter(diameter) // 2 - render.ZONE_WIDTH          # inner edge of the zone arcs
+        self.assertEqual(free, 188)
+        for pages in (("min",), ("shore",), ("full",)):
+            page = {"items": {"min": 3, "shore": 4, "full": 5}[pages[0]] * ["x"]}
+            height = render.electrical_stack_height(page)
+            self.assertLessEqual(math.hypot(render.ELEC_WIDTH / 2, height / 2), free, pages)
+        # the voltage digits at 56 px: six glyphs, a decimal point and the unit
+        self.assertLess(5 * 0.56 * render.FONT_SIZES["grid"] + 0.28 * render.FONT_SIZES["grid"]
+                        + 2 * render.FONT_SIZES["small"], render.ELEC_WIDTH)
+
+    def test_the_column_clears_the_header_and_the_page_dots(self):
+        board = REGISTRY["boards"][BOARD]
+        ring = board["ring"]
+        for count in (3, 4, 5):
+            height = render.electrical_stack_height({"items": ["x"] * count})
+            top, bottom = 240 - height / 2, 240 + height / 2
+            self.assertGreater(top, ring["header_y"] + ring["header_h"])
+            self.assertLess(bottom, ring["footer_y"])
+        for x in (-render.ELEC_WIDTH / 2, render.ELEC_WIDTH / 2):
+            self.assertGreaterEqual(240 + x, board["safe_inset"] - 70)
+
+    def test_header_orientation_moves_the_gap_to_the_top(self):
+        plain = self.page(self.elec_device(pages=("min",)), 0)
+        self.assertIn("start_angle: 135", plain)
+        self.assertIn("end_angle: 45", plain)
+        text = self.elec_device(header=True, pages=("min", "full"))
+        page = self.page(text, 0)
+        self.assertIn("start_angle: 315", page)
+        self.assertIn("end_angle: 225", page)
+        self.assertEqual(render.arc_start_angle({"ui": {"header": True}}), 315)
+        self.assertLess(page.index("id: p0_arc"), page.index("id: p0_content"))
+        self.assertLess(page.index("id: p0_content"), page.index("id: p0_clock"))
+        self.assertLess(page.index("id: p0_pages"), page.index("id: p0_tap"))
+        self.assertIn("id: p0_title,", page)
+
+    # -- night, ids -----------------------------------------------------------------------------
+
+    def test_night_repaints_text_ring_and_resets_the_guards(self):
+        text = self.elec_device(night=True)
+        script = text.split("  - id: apply_night")[1].split("\n  - id:")[0]
+        for needle in ("lv_obj_set_style_arc_color(id(p0_arc), lv_color_hex(n ? 0x1A0800 : 0x263238), LV_PART_MAIN);",
+                       "id(p0_batt_v_name)", "id(p0_batt_v_value)", "id(p0_batt_v_unit)", "id(p0_batt_soc_value)",
+                       "id(p0_batt_a_word)", "id(p1_shore_a_name)", "id(p1_shore_a_value)", "id(p2_solar_a_unit)",
+                       "id(p2_shore_name)", "id(p0_zone0)"):
+            self.assertIn(needle, script)
+        for guard in ("id(ins_batt_soc_gdrawn) = 255;", "id(ins_shore_a_sdrawn) = 255;",
+                      "id(ins_shore_drawn_sev) = 255;"):
+            self.assertIn(guard, script)
+        self.assertNotIn("p2_shore_value", script)                       # a notification pill's text is severity-coloured
+        self.assertNotIn("_tile)", script)
+        pill = text.split("uint8_t s = fresh ?")[1].split("          }\n")[0]
+        self.assertIn("if (id(night_active)) {", pill)
+        self.assertIn("if (s == 1) c = 0x6B3000;", pill)
+        self.assertNotIn("drawn_sev", pill)
+
+    def test_without_night_there_is_no_theming_code(self):
+        text = self.elec_device()
+        self.assertNotIn("night_active", text)
+        self.assertNotIn("id: p0_batt_v_name", text)
+
+    def test_every_referenced_id_exists(self):
+        for kw in ({}, {"header": True}, {"night": True}, {"header": True, "night": True},
+                   {"pages": ("min",)}, {"pages": ("shore",), "night": True}, {"pages": ("full",), "night": True}):
+            text = self.elec_device(**kw)
+            ids = set(re.findall(r"\bid: (\w+)", text)) | set(re.findall(r"\{id: (\w+)", text))
+            for ref in set(re.findall(r"id\((\w+)\)", text)) - {"board_backlight"}:
+                self.assertIn(ref, ids, (kw, ref))
+
+    def test_a_thresholded_voltage_on_the_page_gets_no_tile_colour_code(self):
+        text = self.elec_device()
+        self.assertNotIn("ins_batt_v_drawn_sev", text)
+        self.assertNotIn("p0_batt_v_tile", text)
+        self.assertIn("ins_batt_v_sev", text)                            # still published for the alarm summary
+
+    def test_the_same_instrument_on_a_tile_page_keeps_its_own_colour_path(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"].append({"title": "Tiles", "layout": "grid-2x2",
+                                                     "items": ["batt_v", "batt_soc"]})
+        text = self.elec_device(mutate, pages=("min",))
+        sev = text.split("uint8_t sev = fresh ?")[1].split("          }\n")[0]
+        self.assertIn("id(p1_batt_v_tile)", sev)
+        self.assertNotIn("p0_", sev)
+        ids = set(re.findall(r"\bid: (\w+)", text))
+        for ref in set(re.findall(r"id\((p\d+_\w+)\)", text)):
+            self.assertIn(ref, ids, ref)
+
+    # -- text -----------------------------------------------------------------------------------
+
+    def test_hostile_labels_and_units_stay_literal_and_out_of_lambdas(self):
+        hostile = {"batt_v": ("$x ${y} \"q\" \\ #:", "${u}"), "batt_soc": ("<% 1+1 %>", "$$"),
+                   "batt_a": ("${y}", "<%"), "shore_a": ("$x", "#"), "solar_a": ("'s", "\\")}
+
+        def mutate(cfg):
+            for iid, (label, unit) in hostile.items():
+                cfg["instruments"][iid].update(label=label[:16], unit=unit)
+            cfg["notifications"]["shore"]["label"] = "${y} Shore"
+        text = self.elec_device(mutate, night=True)
+        for iid, (label, unit) in hostile.items():
+            self.assertIn(f"text: !literal {render.yq(label[:16])}", text)
+            if iid != "shore_a":                     # the pill shows a word, not the unit
+                self.assertIn(f"text: !literal {render.yq(unit)}", text)
+        self.assertIn(f"text: !literal {render.yq('${y} Shore')}", text)
+        inside = "".join(l for l in text.splitlines() if "lambda" in l or "lv_" in l or "snprintf" in l)
+        for label, unit in hostile.values():
+            self.assertNotIn(label[:16], inside)
+        for line in text.splitlines():
+            if "${y}" in line or "<% 1+1" in line:
+                self.assertTrue(line.lstrip().startswith("- label:") or "glyphs:" in line, line)
+
+    def test_unsupported_glyph_in_an_electrical_label_is_reported(self):
+        self.set_config(lambda cfg: (electrical_pages(cfg), cfg["instruments"]["batt_a"].update(label="A \u2603")))
+        with self.assertRaises(render.RenderError) as caught:
+            self.collect(allow_missing_wifi=True)
+        self.assertIn("U+2603", str(caught.exception))
+
+    def test_fixed_words_and_values_are_in_the_glyph_sets_of_their_fonts(self):
+        text = self.elec_device()
+        glyphs = {fid: json.loads(g) for fid, g in re.findall(
+            r'id: (font_\w+)\n    size: \d+\n    bpp: 4\n    glyphs: !literal (".*")', text)}
+        self.assertEqual(glyphs["font_value_grid"], "0123456789.- ")
+        small = set(glyphs["font_small"])
+        regular = {chr(c) for c in render.font_coverage("regular")}
+        needed = set(render.VALUE_GLYPHS) | set("CHGDSGONFALRMW-")
+        for words in (render.CURRENT_WORDS, render.SHORE_WORDS, render.STATUS_WORDS):
+            for word in words.values():
+                needed |= set(word)
+        self.assertTrue(needed <= small, needed - small)
+        self.assertTrue(needed <= regular, needed - regular)
+        for font, label in (("font_value_grid", "p0_batt_v_value"), ("font_small", "p0_batt_soc_value"),
+                            ("font_small", "p0_batt_a_word"), ("font_small", "p1_shore_a_value"),
+                            ("font_small", "p2_shore_value")):
+            self.assertIn(f"text_font: {font}", self.label(text, label), label)
+
+    def test_fonts_only_appear_with_the_layouts_that_need_them(self):
+        text = self.elec_device(pages=("min",))
+        self.assertIn("id: font_value_grid\n    size: 56", text)
+        self.assertNotIn("font_value_single", text)
+        self.assertNotIn("font_value_bar", text)
+
+    def test_an_electrical_page_leaves_the_other_pages_unchanged(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"] = ([{"title": "Nav", "layout": "grid-2x2",
+                                                  "items": ["sog", "depth", "awa", "house_v"]}]
+                                                + cfg["displays"]["helm"]["pages"])
+        text = self.elec_device(mutate, pages=("min",))
+        self.assertEqual(self.page(text, 0).replace("\n", ""),
+                         self.page(self.device(allow_missing_wifi=True), 0).replace("\n", ""))
+
+    def test_subscribes_to_the_electrical_items_only(self):
+        text = self.elec_device()
+        topics_ = re.findall(r"- topic: vesselstack/v1/(instruments|notifications)/(\w+)", text)
+        self.assertEqual(sorted(t for _, t in topics_), ["batt_a", "batt_soc", "batt_v", "shore", "shore_a", "solar_a"])
+
+    def test_registry_keeps_the_default_page(self):
+        board = REGISTRY["boards"][BOARD]
+        self.assertEqual(board["layouts"][-1], "electrical")
+        page = lifecycle.default_page(REGISTRY, EXAMPLE, BOARD)
+        self.assertEqual(page["layout"], "grid-2x2")
 
 
 class Secrets(Base):

@@ -116,6 +116,18 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(out[0][1]["ts"])
 
 
+    def test_negate_flips_a_reversed_shunt_and_severity_follows_the_flipped_value(self) -> None:
+        path = "electrical.batteries.house.current"
+        base = {"path": path, "convert": "none", "unit": "A", "precision": 1, "stale_after_s": 30}
+        plain = topics.Engine({"instruments": {"a": dict(base)}})
+        flipped = topics.Engine({"instruments": {"a": dict(base, convert="negate", thresholds={"warn_below": -20})}})
+        self.assertEqual(decode(plain.update(path, 12.34, TS, 0.0))[0][1]["v"], 12.3)
+        out = decode(flipped.update(path, 25.04, TS, 0.0))[0][1]                      # reversed: +25 A is a discharge
+        self.assertEqual((out["v"], out["sev"]), (-25.0, "warn"))
+        raw = flipped.update(path, 0.0, TS, 1.0)[0][1]                                 # never "-0.0"
+        self.assertIn('"v":0.0,', raw)
+
+
 class SignalKHelperTests(unittest.TestCase):
     def test_subscribe_frame(self) -> None:
         frame = topics.subscribe_frame(CONFIG)

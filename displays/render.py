@@ -104,6 +104,22 @@ ZONE_WIDTH = 6
 ZONE_GAP = 2              # between the arc track and the zone arcs, which sit just inside it
 ARC_START_GAP_BOTTOM = 135   # LVGL: 0 deg = 3 o'clock, clockwise; 135 -> 45 leaves the gap at the bottom
 ARC_START_GAP_TOP = 315      # with ui.header the 90 deg gap is at the top, where the header is
+# Electrical page (display dashboard slice S7): one SoC ring, the battery voltage in the middle, and
+# rows for the state of charge, the current (with a fixed CHG / DSG word), the shore power pill and solar.
+ELECTRICAL = "electrical"
+ELECTRICAL_ROLES = ("voltage", "soc", "current", "shore", "solar")
+CURRENT_DEADBAND = 0.05      # amperes: inside +-0.05 A the word is empty
+SHORE_ON_ABOVE = 0.5         # an instrument-backed shore pill reads ON above this value
+CURRENT_WORDS = {1: "CHG", 2: "DSG", 0: ""}          # sign convention: SignalK current is positive while charging
+SHORE_WORDS = {1: "ON", 2: "OFF", 0: BLANK_VALUE}    # instrument-backed pill: 0 is stale or unknown
+SHORE_STATE_COLOR = {0: 0, 1: 1, 2: 4}               # pill state -> GAUGE palette entry (stale grey, on green, off blue)
+ELEC_WIDTH = 300             # the text column, inside the 376 px free circle of the arc
+ELEC_PAD_ROW = 2
+ELEC_NAME_WIDTH = 88
+ELEC_WORD_WIDTH = 48
+ELEC_PILL_WIDTH = 92
+ELEC_PILL_HEIGHT = 30
+ELEC_VOLTAGE_ROW = 66        # line height of the 56 px bold digits
 WARNING_ARCHIVE_SECRETS = ("WARNING: the archive contains the Wi-Fi password and the display's MQTT, "
                            "OTA and API secrets. Treat it like a password: move it over SSH only, "
                            "do not commit or e-mail it, delete it after flashing.")
@@ -346,6 +362,10 @@ def _small_glyphs(config: dict, display: dict) -> str:
         chars.update(CLOCK_GLYPHS)
         for page in display["pages"]:
             chars.update(page["title"])
+    if any(page["layout"] == ELECTRICAL for page in display["pages"]):   # values and fixed words in font_small
+        chars.update(VALUE_GLYPHS)
+        for words in (CURRENT_WORDS, SHORE_WORDS, STATUS_WORDS):
+            chars.update("".join(words.values()))
     for iid in used_instruments(display):
         if is_notification(config, iid):
             chars.update(config["notifications"][iid]["label"])
@@ -451,10 +471,39 @@ def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: in
 
 # --- bars and arcs (tank-bars, gauge-arc) ------------------------------------------
 
+def electrical_slots(page: dict) -> dict:
+    """role -> item id for an electrical page (items fill the slots in order)."""
+    return dict(zip(ELECTRICAL_ROLES, page["items"]))
+
+
+def electrical_roles(display: dict, iid: str) -> list:
+    """(page index, role) for every electrical page that shows this item."""
+    return [(pi, role) for pi, page in enumerate(display["pages"]) if page["layout"] == ELECTRICAL
+            for role, item in electrical_slots(page).items() if item == iid]
+
+
 def gauge_pages(display: dict, iid: str) -> list:
-    """(page index, page) of the bar and arc pages that show this item."""
+    """(page index, page) of the bar and arc pages that show this item (the SoC on an electrical page)."""
     return [(pi, page) for pi, page in enumerate(display["pages"])
-            if page["layout"] in GAUGE_LAYOUTS and iid in page["items"]]
+            if (page["layout"] in GAUGE_LAYOUTS and iid in page["items"])
+            or (page["layout"] == ELECTRICAL and electrical_slots(page).get("soc") == iid)]
+
+
+def gauge_kind(page: dict) -> str:
+    """Which scaling a page needs: an electrical page scales its SoC like a gauge-arc."""
+    return "gauge-arc" if page["layout"] == ELECTRICAL else page["layout"]
+
+
+def shore_instrument(config: dict, display: dict, iid: str) -> bool:
+    """True when an instrument (not a notification) fills the shore slot of an electrical page."""
+    return not is_notification(config, iid) and any(role == "shore" for _, role in electrical_roles(display, iid))
+
+
+def keeps_number(config: dict, display: dict, iid: str) -> bool:
+    """True when the firmware needs the raw number of this instrument, not only its text."""
+    return on_gauge_page(display, iid) or any(
+        role == "current" or (role == "shore" and not is_notification(config, iid))
+        for _, role in electrical_roles(display, iid))
 
 
 def on_gauge_page(display: dict, iid: str) -> bool:
@@ -462,7 +511,8 @@ def on_gauge_page(display: dict, iid: str) -> bool:
 
 
 def on_tile_page(display: dict, iid: str) -> bool:
-    return any(page["layout"] not in GAUGE_LAYOUTS and iid in page["items"] for page in display["pages"])
+    return any(page["layout"] not in GAUGE_LAYOUTS and page["layout"] != ELECTRICAL and iid in page["items"]
+               for page in display["pages"])
 
 
 def severity_tile(config: dict, display: dict, iid: str) -> bool:
@@ -608,9 +658,8 @@ def _arc_style(width: int, color: int) -> list:
     return [f"arc_width: {width}", f"arc_color: 0x{color:06X}", "arc_rounded: false"]
 
 
-def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool) -> list:
-    iid = page["items"][0]
-    inst = config["instruments"][iid]
+def _arc_widgets(board: dict, display: dict, pi: int, inst: dict) -> list:
+    """The track arc and the static warn and alarm zone arcs of a page (gauge-arc and electrical)."""
     diameter = gauge_diameter(board)
     start = arc_start_angle(display)
     track = f"0x{TRACK_COLOR['day']:06X}"
@@ -634,7 +683,14 @@ def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dic
                   *[f"            {line}" for line in _arc_style(ZONE_WIDTH, GAUGE_DAY[severity])],
                   "            indicator:", "              arc_opa: TRANSP", "            knob:",
                   "              bg_opa: TRANSP", "              pad_all: 0"]
-    box_w, box_h = arc_text_box(diameter)
+    return lines
+
+
+def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool) -> list:
+    iid = page["items"][0]
+    inst = config["instruments"][iid]
+    lines = _arc_widgets(board, display, pi, inst)
+    box_w, box_h = arc_text_box(gauge_diameter(board))
     fit = "width: 100%, text_align: CENTER"
     lines += [
         "        - obj:", f"            id: p{pi}_content", "            align: CENTER", f"            width: {box_w}",
@@ -659,7 +715,7 @@ def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: b
     pages = gauge_pages(display, iid)
     lo, hi = cfloat(inst["min"]), cfloat(inst["max"])
     limit_ms = item_limit_ms(config, iid, heartbeat)
-    kinds = {page["layout"] for _, page in pages}
+    kinds = {gauge_kind(page) for _, page in pages}
     lines = [
         "      - lambda: |-",
         "          bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
@@ -673,7 +729,7 @@ def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: b
                   f"          if (!({var} > 0.0f)) {var} = 0.0f;",
                   f"          if ({var} > {scale}.0f) {var} = {scale}.0f;"]
         for pi, page in pages:
-            if page["layout"] == layout:
+            if gauge_kind(page) == layout:
                 setter = (f"lv_bar_set_value(id(p{pi}_{iid}_bar), lroundf({var}), LV_ANIM_OFF);"
                           if layout == "tank-bars" else f"lv_arc_set_value(id(p{pi}_arc), lroundf({var}));")
                 lines.append(f"          {setter}")
@@ -710,16 +766,197 @@ def _gauge_night_lines(config: dict, display: dict, pi: int, page: dict) -> list
         for part, key in (("name", "name"), ("value", "value"), ("unit", "name")):
             lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_{part}), lv_color_hex("
                          f"n ? 0x{NIGHT[key]:06X} : 0x{DAY[key]:06X}), LV_PART_MAIN);")
-        track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
         if page["layout"] == "tank-bars":
+            track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
             lines.append(f"            lv_obj_set_style_bg_color(id(p{pi}_{iid}_bar), lv_color_hex({track}), "
                          "LV_PART_MAIN);")
             continue
-        lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_arc), lv_color_hex({track}), LV_PART_MAIN);")
-        start = arc_start_angle(display)
-        for k, (severity, _, _) in enumerate(zone_arcs(config["instruments"][iid], start)):
-            lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_zone{k}), lv_color_hex("
-                         f"n ? 0x{GAUGE_NIGHT[severity]:06X} : 0x{GAUGE_DAY[severity]:06X}), LV_PART_MAIN);")
+        lines += _arc_night_lines(config, display, pi, iid)
+    return lines
+
+
+def _arc_night_lines(config: dict, display: dict, pi: int, iid: str) -> list:
+    """Night palette for the track and the zone arcs of the arc that shows this instrument."""
+    track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
+    lines = [f"            lv_obj_set_style_arc_color(id(p{pi}_arc), lv_color_hex({track}), LV_PART_MAIN);"]
+    start = arc_start_angle(display)
+    for k, (severity, _, _) in enumerate(zone_arcs(config["instruments"][iid], start)):
+        lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_zone{k}), lv_color_hex("
+                     f"n ? 0x{GAUGE_NIGHT[severity]:06X} : 0x{GAUGE_DAY[severity]:06X}), LV_PART_MAIN);")
+    return lines
+
+
+def _text_night(pi: int, iid: str, part: str, key: str) -> str:
+    return (f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_{part}), lv_color_hex("
+            f"n ? 0x{NIGHT[key]:06X} : 0x{DAY[key]:06X}), LV_PART_MAIN);")
+
+
+def _electrical_night_lines(config: dict, display: dict, pi: int, page: dict) -> list:
+    """Night palette for the text, the SoC ring and its zones of one electrical page.
+
+    The shore pill background and a notification pill's text are repainted by the guarded
+    severity and pill colour code, which the night script resets to run again.
+    """
+    lines = []
+    for role, iid in electrical_slots(page).items():
+        lines.append(_text_night(pi, iid, "name", "name"))
+        if is_notification(config, iid):
+            continue
+        lines.append(_text_night(pi, iid, "value", "value"))
+        if role != "shore":
+            lines.append(_text_night(pi, iid, "unit", "name"))
+        if role == "current":
+            lines.append(_text_night(pi, iid, "word", "value"))
+    lines += _arc_night_lines(config, display, pi, electrical_slots(page)["soc"])
+    return lines
+
+
+def electrical_stack_height(page: dict) -> int:
+    """Height in pixels of the electrical text column: name, voltage, SoC, current, then optional rows."""
+    small = FONT_SIZES["small"] + 3          # one 20 px text line
+    rows = [small, ELEC_VOLTAGE_ROW, small, small]
+    if "shore" in electrical_slots(page):
+        rows.append(ELEC_PILL_HEIGHT)
+    if "solar" in electrical_slots(page):
+        rows.append(small)
+    return sum(rows) + ELEC_PAD_ROW * (len(rows) - 1)
+
+
+def _elec_row(ind: str, pi: int, iid: str, inst: dict, themed: bool, word: bool = False) -> list:
+    """name, value, unit (and a fixed-width state word) on one line."""
+    lines = [f"{ind}- obj:", f"{ind}    width: 100%", f"{ind}    height: SIZE_CONTENT"]
+    lines += [f"{ind}    {line}" for line in BOX_RESET]
+    lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
+              "pad_column: 6}", f"{ind}    widgets:"]
+    inner = ind + "      "
+    lines += [
+        f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, text_font: font_small, "
+        f"text_color: 0x{DAY['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
+        f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_small, "
+        f"text_color: 0x{DAY['value']:06X}, long_mode: CLIP}}",
+        f"{inner}- label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, text_font: font_small, "
+        f"text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
+    ]
+    if word:
+        lines.append(f"{inner}- label: {{id: p{pi}_{iid}_word, text: {lit('')}, text_font: font_small, "
+                     f"text_color: 0x{DAY['value']:06X}, width: {ELEC_WORD_WIDTH}, text_align: LEFT, "
+                     "long_mode: CLIP}")
+    return lines
+
+
+def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool) -> list:
+    """The shore power pill: the item's label, then a rounded box holding a fixed word."""
+    notification = is_notification(config, iid)
+    label = config["notifications"][iid]["label"] if notification else config["instruments"][iid]["label"]
+    grey, grey_text = SEV_COLORS[0] if notification else (GAUGE_DAY[0], DAY["value"])
+    lines = [f"{ind}- obj:", f"{ind}    width: 100%", f"{ind}    height: SIZE_CONTENT"]
+    lines += [f"{ind}    {line}" for line in BOX_RESET]
+    lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
+              "pad_column: 6}", f"{ind}    widgets:"]
+    inner = ind + "      "
+    lines += [
+        f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, text_font: font_small, "
+        f"text_color: 0x{DAY['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
+        f"{inner}- obj:", f"{inner}    id: {tile_id(pi, iid, ELECTRICAL)}", f"{inner}    width: {ELEC_PILL_WIDTH}",
+        f"{inner}    height: {ELEC_PILL_HEIGHT}", f"{inner}    radius: {ELEC_PILL_HEIGHT // 2}",
+        f"{inner}    bg_color: 0x{grey:06X}", f"{inner}    bg_opa: COVER", f"{inner}    border_width: 0",
+        f"{inner}    pad_all: 0", f"{inner}    scrollable: false", f"{inner}    {FLEX_COLUMN}",
+        f"{inner}    widgets:",
+        f"{inner}      - label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_small, "
+        f"text_color: 0x{grey_text:06X}, long_mode: CLIP}}",
+    ]
+    return lines
+
+
+def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool) -> list:
+    """SoC ring (the gauge-arc ring), voltage in the middle, SoC and current rows, shore pill, solar row."""
+    slots = electrical_slots(page)
+    inst = config["instruments"]
+    volt = inst[slots["voltage"]]
+    lines = _arc_widgets(board, display, pi, inst[slots["soc"]])
+    fit = "width: 100%, text_align: CENTER"
+    lines += [
+        "        - obj:", f"            id: p{pi}_content", "            align: CENTER", f"            width: {ELEC_WIDTH}",
+        "            height: SIZE_CONTENT", *[f"            {line}" for line in BOX_RESET],
+        f"            layout: {{type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: CENTER, "
+        f"pad_row: {ELEC_PAD_ROW}}}",
+        "            widgets:",
+        f"              - label: {{{_label_id(pi, slots['voltage'], 'name', themed)}text: {lit(volt['label'])}, "
+        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}",
+        "              - obj:", "                  width: 100%", "                  height: SIZE_CONTENT",
+        *[f"                  {line}" for line in BOX_RESET],
+        "                  layout: {type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: END, "
+        "pad_column: 4}",
+        "                  widgets:",
+        f"                    - label: {{id: p{pi}_{slots['voltage']}_value, text: {yq(BLANK_VALUE)}, "
+        f"text_font: font_value_grid, text_color: 0x{DAY['value']:06X}, long_mode: CLIP}}",
+        f"                    - label: {{{_label_id(pi, slots['voltage'], 'unit', themed)}text: {lit(volt['unit'])}, "
+        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
+    ]
+    lines += _elec_row("              ", pi, slots["soc"], inst[slots["soc"]], themed)
+    lines += _elec_row("              ", pi, slots["current"], inst[slots["current"]], themed, word=True)
+    if "shore" in slots:
+        lines += _elec_shore_row("              ", config, pi, slots["shore"], themed)
+    if "solar" in slots:
+        lines += _elec_row("              ", pi, slots["solar"], inst[slots["solar"]], themed)
+    return lines
+
+
+def _fresh_expr(config: dict, iid: str, heartbeat: int) -> str:
+    return (f"id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_{iid}_ok)"
+            f" && (millis() - id(ins_{iid}_seen)) < {item_limit_ms(config, iid, heartbeat)}UL")
+
+
+def _state_branches(pages: list, iid: str, part: str, state: str, words: dict) -> list:
+    """One if/then per state: a fixed word (no runtime strings) on every page, from one gated state."""
+    lines = []
+    for pi in pages:
+        for number, word in words.items():
+            lines += [
+                "      - if:", "          condition:", f"            lambda: 'return ({state}) == {number};'",
+                "          then:", "            - lvgl.label.update:", f"                id: p{pi}_{iid}_{part}",
+                f"                text: {lit(word)}",
+            ]
+    return lines
+
+
+def _electrical_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool) -> list:
+    """CHG / DSG for the current and the ON / OFF pill for an instrument-backed shore slot.
+
+    Both read a state gated on freshness, so a stale or unknown reading gives an empty word and
+    the grey "--" pill, never the last direction or a green ON.
+    """
+    roles = electrical_roles(display, iid)
+    fresh = _fresh_expr(config, iid, heartbeat)
+    lines = []
+    current = [pi for pi, role in roles if role == "current"]
+    if current:
+        n = f"id(ins_{iid}_num)"
+        state = f"({fresh}) ? ({n} > {cfloat(CURRENT_DEADBAND)} ? 1 : {n} < -{cfloat(CURRENT_DEADBAND)} ? 2 : 0) : 0"
+        lines += _state_branches(current, iid, "word", state, CURRENT_WORDS)
+    shore = [pi for pi, role in roles if role == "shore"]
+    if shore and not is_notification(config, iid):
+        state = f"({fresh}) ? (id(ins_{iid}_num) > {cfloat(SHORE_ON_ABOVE)} ? 1 : 2) : 0"
+        lines += _state_branches(shore, iid, "value", state, SHORE_WORDS)
+        lines += [
+            "      - lambda: |-",
+            f"          bool fresh = {fresh};",
+            f"          uint8_t s = fresh ? (id(ins_{iid}_num) > {cfloat(SHORE_ON_ABOVE)} ? 1 : 2) : 0;",
+            f"          if (s != id(ins_{iid}_sdrawn)) {{",
+            f"            id(ins_{iid}_sdrawn) = s;",
+            f"            uint32_t c = 0x{GAUGE_DAY[SHORE_STATE_COLOR[0]]:06X};",
+        ]
+        for number in (1, 2):
+            lines.append(f"            if (s == {number}) c = 0x{GAUGE_DAY[SHORE_STATE_COLOR[number]]:06X};")
+        if night:
+            lines += ["            if (id(night_active)) {", f"              c = 0x{GAUGE_NIGHT[SHORE_STATE_COLOR[0]]:06X};"]
+            for number in (1, 2):
+                lines.append(f"              if (s == {number}) c = 0x{GAUGE_NIGHT[SHORE_STATE_COLOR[number]]:06X};")
+            lines.append("            }")
+        for pi in shore:
+            lines.append(f"            lv_obj_set_style_bg_color(id({tile_id(pi, iid, ELECTRICAL)}), "
+                         "lv_color_hex(c), LV_PART_MAIN);")
+        lines.append("          }")
     return lines
 
 
@@ -885,6 +1122,8 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
         lines += _tank_bars_page(config, registry_board, pi, page, themed)
     elif layout == "gauge-arc":
         lines += _gauge_arc_page(config, registry_board, display, pi, page, themed)
+    elif layout == ELECTRICAL:
+        lines += _electrical_page(config, registry_board, display, pi, page, themed)
     else:
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
     if header_enabled(display):
@@ -916,7 +1155,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
 def _fonts_lines(display: dict, config: dict) -> list:
     layouts = {page["layout"] for page in display["pages"]}
     fonts = []
-    if "grid-2x2" in layouts:
+    if "grid-2x2" in layouts or ELECTRICAL in layouts:
         fonts.append(("font_value_grid", "bold", FONT_SIZES["grid"], VALUE_GLYPHS))
     if "single" in layouts or "gauge-arc" in layouts:
         fonts.append(("font_value_single", "bold", FONT_SIZES["single"], VALUE_GLYPHS))
@@ -1010,7 +1249,8 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: boo
     limit_ms = item_limit_ms(config, iid, heartbeat)
     sets = []
     for pi, page in enumerate(display["pages"]):
-        if iid in page["items"] and page["layout"] not in GAUGE_LAYOUTS:
+        if iid in page["items"] and page["layout"] not in GAUGE_LAYOUTS and (
+                page["layout"] != ELECTRICAL or is_notification(config, iid)):
             tile, value = tile_id(pi, iid, page["layout"]), f"p{pi}_{iid}_value"
             sets.append((tile, value))
     lines = [
@@ -1339,6 +1579,9 @@ def _night_script(config: dict, display: dict, used: list) -> list:
         if page["layout"] in GAUGE_LAYOUTS:
             lines += _gauge_night_lines(config, display, pi, page)
             continue
+        if page["layout"] == ELECTRICAL:
+            lines += _electrical_night_lines(config, display, pi, page)
+            continue
         for iid in page["items"]:
             notification = is_notification(config, iid)
             tile = tile_id(pi, iid, page["layout"])
@@ -1358,6 +1601,8 @@ def _night_script(config: dict, display: dict, used: list) -> list:
             lines.append(f"            id(ins_{iid}_drawn_sev) = 255;")
         if not is_notification(config, iid) and on_gauge_page(display, iid):
             lines.append(f"            id(ins_{iid}_gdrawn) = 255;")
+        if shore_instrument(config, display, iid):
+            lines.append(f"            id(ins_{iid}_sdrawn) = 255;")
     lines += [
         "          }",
         "      - if:", "          condition:", "            lambda: 'return id(night_dirty);'", "          then:",
@@ -1444,9 +1689,12 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines.append(f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}')
         if severity_tile(config, display, iid):
             lines.append(f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}')
+        if keeps_number(config, display, iid):
+            lines.append(f'  - {{id: ins_{iid}_num, type: float, initial_value: "0"}}')
         if on_gauge_page(display, iid):
-            lines += [f'  - {{id: ins_{iid}_num, type: float, initial_value: "0"}}',
-                      f'  - {{id: ins_{iid}_gdrawn, type: uint8_t, initial_value: "255"}}']
+            lines.append(f'  - {{id: ins_{iid}_gdrawn, type: uint8_t, initial_value: "255"}}')
+        if shore_instrument(config, display, iid):
+            lines.append(f'  - {{id: ins_{iid}_sdrawn, type: uint8_t, initial_value: "255"}}')
     takeover = alarm_takeover_enabled(display)
     if takeover:
         lines += ALARM_GLOBALS
@@ -1463,7 +1711,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines += _notification_handler(iid)
         else:
             lines += _json_handler(iid, config["instruments"][iid]["precision"],
-                                   has_thresholds(config["instruments"][iid]), on_gauge_page(display, iid))
+                                   has_thresholds(config["instruments"][iid]), keeps_number(config, display, iid))
     if takeover:
         lines += _alarm_handler(used, display)
     if clock_enabled(display):
@@ -1475,6 +1723,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         for iid in page["items"]:
             if is_notification(config, iid):
                 continue  # drawn by the fixed-word branches below
+            if page["layout"] == ELECTRICAL and electrical_slots(page).get("shore") == iid:
+                continue  # the pill shows ON / OFF / -- from the branches below, not the number
             limit_ms = stale_threshold_s(config["instruments"][iid], heartbeat) * 1000
             lines += [
                 "      - lvgl.label.update:",
@@ -1492,6 +1742,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines += _sev_lines(config, display, iid, heartbeat, night_enabled(display))
         if not is_notification(config, iid) and on_gauge_page(display, iid):
             lines += _gauge_lines(config, display, iid, heartbeat, night_enabled(display))
+        if not is_notification(config, iid):
+            lines += _electrical_lines(config, display, iid, heartbeat, night_enabled(display))
     if takeover:
         lines += _alarm_script(config, used, heartbeat)
     if header_enabled(display):
