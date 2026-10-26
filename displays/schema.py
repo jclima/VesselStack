@@ -11,6 +11,7 @@ import conversions
 
 MODULE_DIR = Path(__file__).resolve().parent
 DEFAULT_REGISTRY = MODULE_DIR / "boards" / "registry.json"
+ICONS_FILE = MODULE_DIR / "esphome" / "fonts" / "icons.json"   # bundled icon font: name -> hex codepoint
 
 INSTRUMENT_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 DISPLAY_ID = re.compile(r"^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$")
@@ -24,7 +25,7 @@ TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "notifications"
             "night_schedule"}
 NIGHT_SCHEDULE_KEYS = {"start", "end"}
 HHMM = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
-NOTIFICATION_KEYS = {"path", "label", "absent", "alarm"}
+NOTIFICATION_KEYS = {"path", "label", "absent", "alarm", "icon"}
 NOTIFICATION_REQUIRED = {"path", "label"}
 NOTIFICATION_PREFIX = "notifications."
 ABSENT_MODES = ("ok", "unknown")
@@ -32,7 +33,7 @@ ITEM_TYPES = ("instrument", "notification", "ha")
 # Home Assistant items: a numeric sensor, or a binary / multi-valued state mapped to a severity and a fixed text.
 HA_ENTITY_ID = re.compile(r"^[a-z_]+\.[a-z0-9_]{1,64}$")
 HA_KEYS = {"entity_id", "label", "kind", "unit", "precision", "thresholds", "min", "max", "states", "default",
-           "alarm"}
+           "alarm", "icon"}
 HA_REQUIRED = {"entity_id", "label", "kind"}
 HA_KINDS = ("binary", "state", "numeric")
 HA_NUMERIC_ONLY = {"unit", "precision", "thresholds", "min", "max"}
@@ -58,7 +59,7 @@ RANGE_LAYOUTS = ("tank-bars", "gauge-arc")
 LAYOUT_HINTS = {"gauge-arc": "gauge-arc needs a round board; use single",
                 "electrical": "electrical needs a round board; use grid-2x2"}
 INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms",
-                   "thresholds", "min", "max", "alarm"}
+                   "thresholds", "min", "max", "alarm", "icon"}
 # Bounds in severity order; "low" bounds are checked with <, "high" bounds with >.
 THRESHOLD_BOUNDS = (("alarm_below", "low"), ("warn_below", "low"), ("warn_above", "high"), ("alarm_above", "high"))
 THRESHOLD_KEYS = {name for name, _ in THRESHOLD_BOUNDS} | {"hysteresis"}
@@ -105,6 +106,26 @@ def valid_host(value) -> bool:
     if not all(HOST_LABEL.fullmatch(label) for label in labels):
         return False
     return not labels[-1].isdigit()  # numeric last label means a malformed IPv4 literal
+
+
+_ICONS: dict = {}
+
+
+def icon_map() -> dict:
+    """Name -> codepoint (int) of every bundled icon (the committed icons.json)."""
+    if not _ICONS:
+        _ICONS.update({name: int(code, 16) for name, code in json.loads(ICONS_FILE.read_text()).items()})
+    return _ICONS
+
+
+def validate_icon(obj: dict, where: str, errors: list) -> None:
+    """Optional ``icon``: the name of a bundled Material Symbols icon."""
+    if "icon" not in obj:
+        return
+    icons = icon_map()
+    if not (isinstance(obj["icon"], str) and obj["icon"] in icons):
+        errors.append(f"{where}.icon: unknown icon (some valid names: {', '.join(sorted(icons)[:6])}, ...; "
+                      f"see displays/esphome/fonts/icons.json)")
 
 
 def finite_number(value) -> bool:
@@ -217,6 +238,7 @@ def validate_ha_item(item, where: str, heartbeat: int, errors: list) -> None:
         errors.append(f"{where}.label: must be 1..16 printable characters")
     if "alarm" in item and not isinstance(item["alarm"], bool):
         errors.append(f"{where}.alarm: must be true or false")
+    validate_icon(item, where, errors)
     kind = item.get("kind")
     if "kind" in item and not (isinstance(kind, str) and kind in HA_KINDS):
         errors.append(f"{where}.kind: must be one of {', '.join(HA_KINDS)}")
@@ -608,6 +630,7 @@ def validate_config(cfg, registry) -> list[str]:
                     errors.append(f"{where}.min: must be less than max")
                 if "alarm" in inst and not isinstance(inst["alarm"], bool):
                     errors.append(f"{where}.alarm: must be true or false")
+                validate_icon(inst, where, errors)
 
     notifications = cfg.get("notifications")
     notification_ids: set = set()
@@ -637,6 +660,7 @@ def validate_config(cfg, registry) -> list[str]:
                     errors.append(f"{where}.absent: must be one of {', '.join(ABSENT_MODES)}")
                 if "alarm" in note and not isinstance(note["alarm"], bool):
                     errors.append(f"{where}.alarm: must be true or false")
+                validate_icon(note, where, errors)
 
     ha = cfg.get("ha")
     ha_ids: set = set()

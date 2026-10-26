@@ -56,6 +56,11 @@ PLACEHOLDER_NOTE = ("Wi-Fi credentials are not configured: wrote PLACEHOLDER val
                     "secrets.yaml. Do not flash this build.")
 FONT_FILES = {"bold": "RobotoCondensed-Bold.ttf", "regular": "RobotoCondensed-Regular.ttf"}
 FONT_LICENSE = "OFL.txt"
+ICON_FONT_FILE = "MaterialSymbols-subset.ttf"       # copied into a project only when an item has an icon
+ICON_FONT_LICENSE = "LICENSE-MaterialSymbols.txt"
+ICON_SIZES = {"lg": 40, "md": 28}                   # 40 px in a 2 x 2 status cell, 28 px everywhere else
+ICON_FONTS = {"lg": "font_icons_lg", "md": "font_icons"}
+ICON_GAP = 4                                        # between an icon and the label it sits next to
 FONT_SIZES = {"grid": 56, "single": 96, "small": 20, "status_lg": 48, "status_sm": 30,
               "banner": 48, "banner_name": 28, "bar": 36}
 STATUS_GAP = 6
@@ -329,7 +334,8 @@ def effective_config(config: dict) -> dict:
     numeric = {}
     for hid, item in (config.get("ha") or {}).items():
         if item.get("kind") == "numeric":
-            virtual = {k: item[k] for k in ("label", "unit", "precision", "thresholds", "min", "max") if k in item}
+            virtual = {k: item[k] for k in ("label", "unit", "precision", "thresholds", "min", "max", "icon")
+                       if k in item}
             virtual["stale_after_s"] = heartbeat
             numeric[hid] = virtual
     if not numeric:
@@ -409,6 +415,68 @@ def touch_layer_enabled(display: dict) -> bool:
     return len(display["pages"]) > 1 or night_enabled(display)
 
 
+# --- icons (Material Symbols glyphs from the bundled subset font) -------------------
+
+def item_icon(config: dict, iid: str) -> str | None:
+    """The icon name of an item (instrument, notification or Home Assistant item), if it has one."""
+    for key in ("instruments", "notifications", "ha"):
+        item = (config.get(key) or {}).get(iid)
+        if isinstance(item, dict) and item.get("icon"):
+            return item["icon"]
+    return None
+
+
+def icon_char(name: str) -> str:
+    return chr(schema.icon_map()[name])
+
+
+def icon_size_key(page: dict) -> str:
+    """"lg" in the 2 x 2 status grid, where the cells are large; "md" on every other page."""
+    if page["layout"] == "status-grid" and status_grid_shape(len(page["items"])) == (2, 2):
+        return "lg"
+    return "md"
+
+
+def icon_in_row(page: dict) -> bool:
+    """A 3-row status grid is too short for a stacked icon: it sits left of the label instead."""
+    return page["layout"] == "status-grid" and status_grid_shape(len(page["items"]))[1] == 3
+
+
+def icon_glyphs(config: dict, display: dict) -> dict:
+    """font id -> sorted glyph string of the icon fonts this display needs (empty without icons)."""
+    chars: dict = {}
+    for page in display["pages"]:
+        key = icon_size_key(page)
+        for iid in page["items"]:
+            name = item_icon(config, iid)
+            if name:
+                chars.setdefault(ICON_FONTS[key], set()).add(icon_char(name))
+    return {fid: "".join(sorted(group)) for fid, group in chars.items()}
+
+
+def display_has_icons(config: dict, display: dict) -> bool:
+    return bool(icon_glyphs(config, display))
+
+
+def _icon_label(ind: str, pi: int, iid: str, config: dict, key: str, themed: bool, extra: str = "") -> str:
+    return (f"{ind}- label: {{{_label_id(pi, iid, 'icon', themed)}text: {lit(icon_char(item_icon(config, iid)))}, "
+            f"text_font: {ICON_FONTS[key]}, text_color: 0x{DAY['name']:06X}{extra}}}")
+
+
+def _icon_row(ind: str, width: str = "SIZE_CONTENT") -> list:
+    """The head of a centred row that holds an icon and a label; its children go at ind + 6 spaces."""
+    lines = [f"{ind}- obj:", f"{ind}    width: {width}", f"{ind}    height: SIZE_CONTENT"]
+    lines += [f"{ind}    {line}" for line in BOX_RESET]
+    lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
+              f"pad_column: {ICON_GAP}}}", f"{ind}    widgets:"]
+    return lines
+
+
+def _icon_night(config: dict, pi: int, iid: str) -> list:
+    """The icon follows the colour of its label (nothing for an item without an icon)."""
+    return [_text_night(pi, iid, "icon", "name")] if item_icon(config, iid) else []
+
+
 def _small_glyphs(config: dict, display: dict) -> str:
     chars = {" "}
     if header_enabled(display):
@@ -437,10 +505,15 @@ def _label_id(pi: int, iid: str, part: str, themed: bool) -> str:
     return f"id: p{pi}_{iid}_{part}, " if themed else ""
 
 
-def _tile_widgets(ind: str, pi: int, iid: str, inst: dict, value_font: str, themed: bool = False) -> list:
+def _tile_widgets(ind: str, pi: int, iid: str, inst: dict, value_font: str, themed: bool = False,
+                  config: dict | None = None) -> list:
+    name = [f"{ind}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
+            "text_font: font_small, text_color: 0x9AA5B1}"]
+    if config is not None and item_icon(config, iid):   # icon and label side by side
+        inner = ind + "      "
+        name = [*_icon_row(ind), _icon_label(inner, pi, iid, config, "md", themed), f"{inner}{name[0][len(ind):]}"]
     return [
-        f"{ind}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
-        "text_font: font_small, text_color: 0x9AA5B1}",
+        *name,
         f"{ind}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {value_font}, "
         "text_color: 0xFFFFFF}",
         f"{ind}- label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
@@ -500,7 +573,7 @@ def _status_glyphs(config: dict, display: dict) -> dict:
 
 
 def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: int, cols: int,
-                 themed: bool = False) -> list:
+                 themed: bool = False, icon_key: str = "lg", name_width: int | None = None) -> list:
     """One status-grid cell: static label, then the state word (notification) or value + unit."""
     notification = is_word(config, iid)
     lines = [f"{ind}- obj:"]
@@ -519,8 +592,18 @@ def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: in
     inner = ind + "      "
     fit = "width: 100%, text_align: CENTER"
     label = _item_label(config, iid)
-    lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, "
-                 f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
+    icon = item_icon(config, iid)
+    name = (f"- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, "
+            f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
+    if icon and name_width is not None:      # 3-row grid: icon left of the label
+        name = name.replace(fit, f"width: {name_width}, text_align: LEFT")
+        lines += _icon_row(inner, "100%")
+        lines.append(_icon_label(inner + "      ", pi, iid, config, icon_key, themed))
+        lines.append(f"{inner}      {name}")
+    else:
+        if icon:                             # icon above the label
+            lines.append(_icon_label(inner, pi, iid, config, icon_key, themed, f", {fit}"))
+        lines.append(f"{inner}{name}")
     lines.append(f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {font}, "
                  f"text_color: 0xFFFFFF, {fit}, long_mode: CLIP}}")
     if not notification:
@@ -669,12 +752,15 @@ BAR_COLUMN = (f"layout: {{type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER
 BOX_RESET = ["bg_opa: TRANSP", "border_width: 0", "pad_all: 0", "scrollable: false"]
 
 
-def _bar_column(ind: str, pi: int, iid: str, inst: dict, width: int, themed: bool) -> list:
+def _bar_column(ind: str, pi: int, iid: str, inst: dict, width: int, themed: bool,
+                config: dict | None = None) -> list:
     fit = "width: 100%, text_align: CENTER"
     inner = ind + "      "
     lines = [f"{ind}- obj:", f"{ind}    width: {width}", f"{ind}    height: 100%"]
     lines += [f"{ind}    {line}" for line in BOX_RESET]
     lines += [f"{ind}    {BAR_COLUMN}", f"{ind}    widgets:"]
+    if config is not None and item_icon(config, iid):   # icon above the label
+        lines.append(_icon_label(inner, pi, iid, config, "md", themed, f", {fit}"))
     lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
                  f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
     lines += [
@@ -711,7 +797,7 @@ def _tank_bars_page(config: dict, board: dict, pi: int, page: dict, themed: bool
         "            widgets:",
     ]
     for iid in page["items"]:
-        lines += _bar_column("              ", pi, iid, config["instruments"][iid], width, themed)
+        lines += _bar_column("              ", pi, iid, config["instruments"][iid], width, themed, config)
     return lines
 
 
@@ -757,8 +843,16 @@ def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dic
         "        - obj:", f"            id: p{pi}_content", "            align: CENTER", f"            width: {box_w}",
         f"            height: {box_h}", *[f"            {line}" for line in BOX_RESET], f"            {FLEX_COLUMN}",
         "            widgets:",
-        f"              - label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
-        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}",
+    ]
+    name = (f"- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
+            f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
+    if item_icon(config, iid):   # icon left of the label
+        lines += [*_icon_row("              ", "100%"),
+                  _icon_label("                    ", pi, iid, config, "md", themed),
+                  f"                    {name.replace(f'{fit}, ', '')}"]
+    else:
+        lines.append(f"              {name}")
+    lines += [
         f"              - label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_value_single, "
         f"text_color: 0x{DAY['value']:06X}, {fit}, long_mode: CLIP}}",
         f"              - label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
@@ -827,6 +921,8 @@ def _gauge_night_lines(config: dict, display: dict, pi: int, page: dict) -> list
         for part, key in (("name", "name"), ("value", "value"), ("unit", "name")):
             lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_{part}), lv_color_hex("
                          f"n ? 0x{NIGHT[key]:06X} : 0x{DAY[key]:06X}), LV_PART_MAIN);")
+            if part == "name":
+                lines += _icon_night(config, pi, iid)
         if page["layout"] == "tank-bars":
             track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
             lines.append(f"            lv_obj_set_style_bg_color(id(p{pi}_{iid}_bar), lv_color_hex({track}), "
@@ -861,6 +957,7 @@ def _electrical_night_lines(config: dict, display: dict, pi: int, page: dict) ->
     lines = []
     for role, iid in electrical_slots(page).items():
         lines.append(_text_night(pi, iid, "name", "name"))
+        lines += _icon_night(config, pi, iid)
         if is_word(config, iid):
             continue
         lines.append(_text_night(pi, iid, "value", "value"))
@@ -883,13 +980,26 @@ def electrical_stack_height(page: dict) -> int:
     return sum(rows) + ELEC_PAD_ROW * (len(rows) - 1)
 
 
-def _elec_row(ind: str, pi: int, iid: str, inst: dict, themed: bool, word: bool = False) -> list:
+def _elec_icon(inner: str, config: dict | None, pi: int, iid: str, themed: bool, iconic: bool) -> list:
+    """The icon slot at the start of an electrical row: the icon, or a same-width spacer so the
+    names stay aligned when only some rows of the page have an icon."""
+    if not iconic:
+        return []
+    if item_icon(config, iid):
+        return [_icon_label(inner, pi, iid, config, "md", themed, f", width: {ICON_SIZES['md']}, text_align: CENTER")]
+    return [f"{inner}- obj: {{width: {ICON_SIZES['md']}, height: 1, bg_opa: TRANSP, border_width: 0, "
+            "pad_all: 0, scrollable: false}"]
+
+
+def _elec_row(ind: str, pi: int, iid: str, inst: dict, themed: bool, word: bool = False,
+              config: dict | None = None, iconic: bool = False) -> list:
     """name, value, unit (and a fixed-width state word) on one line."""
     lines = [f"{ind}- obj:", f"{ind}    width: 100%", f"{ind}    height: SIZE_CONTENT"]
     lines += [f"{ind}    {line}" for line in BOX_RESET]
     lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
               "pad_column: 6}", f"{ind}    widgets:"]
     inner = ind + "      "
+    lines += _elec_icon(inner, config, pi, iid, themed, iconic)
     lines += [
         f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, text_font: font_small, "
         f"text_color: 0x{DAY['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
@@ -905,7 +1015,7 @@ def _elec_row(ind: str, pi: int, iid: str, inst: dict, themed: bool, word: bool 
     return lines
 
 
-def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool) -> list:
+def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool, iconic: bool = False) -> list:
     """The shore power pill: the item's label, then a rounded box holding a fixed word."""
     notification = is_word(config, iid)
     label = _item_label(config, iid)
@@ -915,6 +1025,7 @@ def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool) -> 
     lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
               "pad_column: 6}", f"{ind}    widgets:"]
     inner = ind + "      "
+    lines += _elec_icon(inner, config, pi, iid, themed, iconic)
     lines += [
         f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, text_font: font_small, "
         f"text_color: 0x{DAY['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
@@ -936,14 +1047,23 @@ def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: di
     volt = inst[slots["voltage"]]
     lines = _arc_widgets(board, display, pi, inst[slots["soc"]])
     fit = "width: 100%, text_align: CENTER"
+    iconic = any(item_icon(config, iid) for iid in page["items"])
     lines += [
         "        - obj:", f"            id: p{pi}_content", "            align: CENTER", f"            width: {ELEC_WIDTH}",
         "            height: SIZE_CONTENT", *[f"            {line}" for line in BOX_RESET],
         f"            layout: {{type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: CENTER, "
         f"pad_row: {ELEC_PAD_ROW}}}",
         "            widgets:",
-        f"              - label: {{{_label_id(pi, slots['voltage'], 'name', themed)}text: {lit(volt['label'])}, "
-        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}",
+    ]
+    name = (f"- label: {{{_label_id(pi, slots['voltage'], 'name', themed)}text: {lit(volt['label'])}, "
+            f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
+    if item_icon(config, slots["voltage"]):   # icon left of the voltage label
+        lines += [*_icon_row("              ", "100%"),
+                  _icon_label("                    ", pi, slots["voltage"], config, "md", themed),
+                  f"                    {name.replace(f'{fit}, ', '')}"]
+    else:
+        lines.append(f"              {name}")
+    lines += [
         "              - obj:", "                  width: 100%", "                  height: SIZE_CONTENT",
         *[f"                  {line}" for line in BOX_RESET],
         "                  layout: {type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: END, "
@@ -954,12 +1074,14 @@ def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: di
         f"                    - label: {{{_label_id(pi, slots['voltage'], 'unit', themed)}text: {lit(volt['unit'])}, "
         f"text_font: font_small, text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
     ]
-    lines += _elec_row("              ", pi, slots["soc"], inst[slots["soc"]], themed)
-    lines += _elec_row("              ", pi, slots["current"], inst[slots["current"]], themed, word=True)
+    lines += _elec_row("              ", pi, slots["soc"], inst[slots["soc"]], themed, config=config, iconic=iconic)
+    lines += _elec_row("              ", pi, slots["current"], inst[slots["current"]], themed, word=True,
+                       config=config, iconic=iconic)
     if "shore" in slots:
-        lines += _elec_shore_row("              ", config, pi, slots["shore"], themed)
+        lines += _elec_shore_row("              ", config, pi, slots["shore"], themed, iconic)
     if "solar" in slots:
-        lines += _elec_row("              ", pi, slots["solar"], inst[slots["solar"]], themed)
+        lines += _elec_row("              ", pi, slots["solar"], inst[slots["solar"]], themed, config=config,
+                           iconic=iconic)
     return lines
 
 
@@ -1121,7 +1243,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             "            widgets:",
         ]
         lines += _tile_widgets("              ", pi, iid, config["instruments"][iid], "font_value_single",
-                               themed)
+                               themed, config)
     elif layout == "grid-2x2":
         lines += [
             "        - obj:",
@@ -1156,7 +1278,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
                 "                  widgets:",
             ]
             lines += _tile_widgets("                    ", pi, iid, config["instruments"][iid],
-                                   "font_value_grid", themed)
+                                   "font_value_grid", themed, config)
     elif layout == "status-grid":
         cols, rows = status_grid_shape(len(page["items"]))
         lines += [
@@ -1178,8 +1300,12 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             "            widgets:",
         ]
         font = status_font(len(page["items"]))
+        name_width = None
+        if icon_in_row(page):   # cell width less the tile padding, the icon and the gap
+            name_width = (status_cell_size(cw, ch, len(page["items"]))[0] - 8 - ICON_SIZES["md"] - ICON_GAP)
         for index, iid in enumerate(page["items"]):
-            lines += _status_cell(config, "              ", pi, iid, font, index, cols, themed)
+            lines += _status_cell(config, "              ", pi, iid, font, index, cols, themed,
+                                  icon_size_key(page), name_width)
     elif layout == "tank-bars":
         lines += _tank_bars_page(config, registry_board, pi, page, themed)
     elif layout == "gauge-arc":
@@ -1235,6 +1361,11 @@ def _fonts_lines(display: dict, config: dict) -> list:
     for fid, weight, size, glyphs in fonts:
         lines += [f"  - file: fonts/{FONT_FILES[weight]}", f"    id: {fid}", f"    size: {size}",
                   "    bpp: 4", f"    glyphs: {lit(glyphs)}"]
+    icons = icon_glyphs(config, display)
+    for key in ("lg", "md"):   # only the sizes and glyphs the items actually use
+        if ICON_FONTS[key] in icons:
+            lines += [f"  - file: fonts/{ICON_FONT_FILE}", f"    id: {ICON_FONTS[key]}",
+                      f"    size: {ICON_SIZES[key]}", "    bpp: 4", f"    glyphs: {yq(icons[ICON_FONTS[key]])}"]
     return lines
 
 
@@ -1713,6 +1844,7 @@ def _night_script(config: dict, display: dict, used: list) -> list:
                 f"n ? 0x{NIGHT['tile']:06X} : 0x{DAY['tile']:06X}), LV_PART_MAIN);",
                 f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_name), lv_color_hex("
                 f"n ? 0x{NIGHT['name']:06X} : 0x{DAY['name']:06X}), LV_PART_MAIN);",
+                *_icon_night(config, pi, iid),
                 f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_value), lv_color_hex("
                 f"n ? 0x{NIGHT['value']:06X} : 0x{DAY['value']:06X}), LV_PART_MAIN);",
             ]
@@ -1986,7 +2118,10 @@ def collect(ctx, display_id: str, allow_missing_wifi: bool = False) -> Rendered:
     files[f"{prefix}/app/vesselstack.yaml"] = _read_package("app/vesselstack.yaml")
     if display.get("home_assistant_api", False):
         files[f"{prefix}/app/api.yaml"] = _read_package("app/api.yaml")
-    for font in sorted(FONT_FILES.values()) + [FONT_LICENSE]:
+    fonts = sorted(FONT_FILES.values()) + [FONT_LICENSE]
+    if display_has_icons(effective_config(config), display):
+        fonts += [ICON_FONT_FILE, ICON_FONT_LICENSE]
+    for font in fonts:
         files[f"{prefix}/fonts/{font}"] = _read_package(f"fonts/{font}")
     device = render_device_yaml(config, registry, display_id, board_package=package)
     files[f"{prefix}/{display_id}.yaml"] = device.encode("utf-8")
