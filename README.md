@@ -213,6 +213,15 @@ does anything beyond installing ordinary Debian packages:
    generated during installation, are read without echo when you do type one and are
    never printed or logged. It detects the architecture, Docker, `can0` and the network
    interface names to inform defaults and hints; it never turns hardware on by itself.
+   The browser wizard asks the same "Who should be able to reach the dashboards?" question
+   (`local`, `dashboards` default, `all`) on its network step. The page sends only the
+   preset name (`LAN_ACCESS`); the server validates it (an unknown name is refused with HTTP 400,
+   nothing is written) and expands it with the terminal wizard's `LAN_PRESETS` mapping
+   into `VESSELSTACK_WEB_BIND_ADDRESS`, `VESSELSTACK_DATA_BIND_ADDRESS` and `BOAT_CHAT_HOST`;
+   the preset wins over explicit bind values, `LAN_ACCESS` is never written to the env file
+   and the control panel stays on 127.0.0.1. Choosing `all` shows the warning that Prometheus
+   has no login and recommends the firewall. The loopback, Host/Origin, URL-fragment token
+   and content-type protections are unchanged.
    The terminal wizard has no network surface (no web server, no token, no URL), so it
    runs as root directly, in a private root-only `0700` directory; its output is then
    treated exactly like the browser wizard's: copied once into the root-only staging

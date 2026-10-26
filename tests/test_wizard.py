@@ -96,6 +96,49 @@ class WizardHttpTests(unittest.TestCase):
         self.assertIn("BOAT_NAME=Test", self.output.read_text())
         self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
 
+    def test_lan_access_presets_expand_through_the_save_api(self):
+        expected = {
+            "local": ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
+            "dashboards": ("0.0.0.0", "127.0.0.1", "0.0.0.0"),
+            "all": ("0.0.0.0", "0.0.0.0", "0.0.0.0"),
+        }
+        for preset, (web, data, chat) in expected.items():
+            with self.subTest(preset=preset):
+                status, _ = self.request("POST", "/api/save", {"values": {"LAN_ACCESS": preset}}, self.good())
+                self.assertEqual(status, 200)
+                saved = wizard.load_env(self.output)
+                self.assertEqual(saved["VESSELSTACK_WEB_BIND_ADDRESS"], web)
+                self.assertEqual(saved["VESSELSTACK_DATA_BIND_ADDRESS"], data)
+                self.assertEqual(saved["BOAT_CHAT_HOST"], chat)
+                self.assertNotIn("LAN_ACCESS", saved)
+                self.assertNotIn("LAN_ACCESS", self.output.read_text())
+                self.assertEqual(saved["CONTROL_PANEL_HOST"], "127.0.0.1")
+
+    def test_lan_access_preset_overrides_explicit_binds_and_matches_the_cli_mapping(self):
+        status, _ = self.request("POST", "/api/save", {"values": {
+            "LAN_ACCESS": "local", "VESSELSTACK_DATA_BIND_ADDRESS": "0.0.0.0", "CONTROL_PANEL_HOST": "127.0.0.1"}}, self.good())
+        self.assertEqual(status, 200)
+        saved = wizard.load_env(self.output)
+        for key, value in wizard.LAN_PRESETS["local"].items():
+            self.assertEqual(saved[key], value)
+
+    def test_invalid_lan_access_is_rejected_without_writing(self):
+        for bad in ("everyone", "", "ALL", 1, None, ["all"]):
+            with self.subTest(bad=bad):
+                status, _ = self.request("POST", "/api/save", {"values": {"LAN_ACCESS": bad}}, self.good())
+                self.assertEqual(status, 400)
+                self.assertFalse(self.output.exists())
+
+    def test_wizard_page_asks_the_lan_question_with_the_all_warning(self):
+        source = (ROOT / "wizard" / "app.js").read_text()
+        self.assertIn("Who should be able to reach the dashboards?", source)
+        for preset in wizard.LAN_PRESETS:
+            self.assertIn(f"['{preset}'", source)
+        self.assertIn("Prometheus (NO login at all)", source)
+        self.assertIn("Turn on the firewall", source)
+        self.assertIn("control panel always stays on this Pi only", source)
+        self.assertNotIn("CONTROL_PANEL_HOST", source)
+
     def test_missing_or_wrong_token_is_rejected(self):
         for token in (None, "wrong"):
             headers = {"Content-Type": "application/json"}
