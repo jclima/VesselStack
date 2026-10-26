@@ -223,17 +223,21 @@ PY
 
 fail=0
 check() {
+    # stdout (the dumped configuration the content assertions grep) and stderr (ESPHome's INFO and
+    # WARNING lines) go to separate files: through one pipe the two streams interleave at buffer
+    # boundaries, and a status line can land in the middle of a dumped line and split it.
     local variant=$1 display=$2 dir="$WORK/$1/build/displays/$2/project"
+    local out="$WORK/$variant-$display.log" err="$WORK/$variant-$display.err"
     echo "== esphome config: $variant/$display"
     if ! docker run --rm "${CONTAINER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$dir":/config "$IMAGE" \
-            config --show-secrets /config/"$display".yaml > "$WORK/$variant-$display.log" 2>&1; then
-        sed -n '1,60p' "$WORK/$variant-$display.log" >&2
+            config --show-secrets /config/"$display".yaml > "$out" 2> "$err"; then
+        sed -n '1,60p' "$err" "$out" >&2
         fail=1
         return
     fi
-    grep -q 'Configuration is valid' "$WORK/$variant-$display.log" || { cat "$WORK/$variant-$display.log" >&2; fail=1; }
+    grep -q 'Configuration is valid' "$err" "$out" || { cat "$err" "$out" >&2; fail=1; }
     # Anything ESPHome warns about the generated project (except two known upstream notices) is a bug.
-    if grep -E '^WARNING' "$WORK/$variant-$display.log" | grep -vE "transparency_key|'ota' password wastes"; then
+    if grep -hE '^WARNING' "$err" "$out" | grep -vE "transparency_key|'ota' password wastes"; then
         echo "unexpected ESPHome warning for $variant/$display" >&2
         fail=1
     fi
@@ -252,9 +256,9 @@ else  # the chown helper needs CAP_CHOWN, so it runs without the hardening flags
 fi
 if ! docker run --rm "${CONTAINER_FLAGS[@]}" "${UPLOAD_SCRATCH_FLAGS[@]}" \
         -v "$FLASH_PROJECT":/config:ro "$IMAGE" \
-        config /config/helm.yaml > "$WORK/flash-flags.log" 2>&1 \
-        || ! grep -q 'Configuration is valid' "$WORK/flash-flags.log"; then
-    cat "$WORK/flash-flags.log" >&2
+        config /config/helm.yaml > "$WORK/flash-flags.log" 2> "$WORK/flash-flags.err" \
+        || ! grep -q 'Configuration is valid' "$WORK/flash-flags.err" "$WORK/flash-flags.log"; then
+    cat "$WORK/flash-flags.err" "$WORK/flash-flags.log" >&2
     echo "config failed with the flash container flags" >&2
     fail=1
 fi
