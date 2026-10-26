@@ -282,6 +282,15 @@ sudo vesselstackctl verify-backup /path/to/archive.tar.gz
 - Record the Pi hostname/IP, fuse location, power isolation point, CAN adapter,
   connector, installed version, backup location, and recovery owner.
 
+## Troubleshooting: Boat Chat "not ready" (memory index empty)
+
+`vesselstackctl doctor` prints `FAIL Boat Chat memory index is empty` (or `/health`
+shows `readiness.layers.memory` with `chunks: 0`) on installs older than 0.4.3,
+which never built the index, or when the build failed. Fix it with
+`sudo vesselstackctl reindex` (it runs as the service user), then `sudo vesselstackctl
+doctor`. 0.4.3 and later build the index during installation, on upgrade and on
+`vesselstackctl start`. Details: README, "Memory index".
+
 ## Troubleshooting: SignalK not running / EACCES on package.json
 
 With `SIGNALK_MODE=docker`, if the `vesselstack-signalk` container keeps restarting

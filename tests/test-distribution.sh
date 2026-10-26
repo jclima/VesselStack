@@ -6,7 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
-    "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
+    "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
     "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
@@ -16,7 +16,7 @@ python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
-    "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/tests/test-migrations.sh" \
+    "$ROOT/scripts/migrate.sh" "$ROOT/scripts/mosquitto-credentials.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/scripts/prepare-offline-bundle.sh" \
     "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
@@ -44,6 +44,12 @@ test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)"
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"
 "$ROOT/scripts/vesselstackctl" --help | grep -q 'backup \[--allow-unmounted\] \[DIRECTORY\]'
+"$ROOT/scripts/vesselstackctl" --help | grep -q 'reindex  *Rebuild Boat Chat'
+test -x "$ROOT/scripts/memory-index.sh"
+# The memory index must be built by the installer (Boat Chat is not ready without it), and as
+# the service user, never by root directly.
+grep -qF 'scripts/memory-index.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" ensure' "$ROOT/install.sh"
+grep -qF 'runuser -u "$VESSELSTACK_USER"' "$ROOT/scripts/memory-index.sh"
 if grep -RInE --exclude=test-distribution.sh \
     --exclude-dir=.git --exclude-dir=generated \
     '(BOAT_MMSI="[1-9][0-9]+"|BOAT_CALLSIGN="[A-Z0-9]+"|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' "$ROOT"; then

@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 import app
+import memory_index
 import telemetry_cache
 
 
@@ -56,6 +57,8 @@ def refresh_item(category: str, key: str, func, results: list[dict[str, Any]]) -
 def summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for key in [
+        "action",
+        "chunks",
         "direction",
         "label",
         "current_state",
@@ -110,6 +113,11 @@ def refresh_all() -> dict[str, Any]:
     started = time.monotonic()
     results: list[dict[str, Any]] = []
     engine_keys: set[str] = set()
+
+    # The memory index backs Boat Chat's readiness. Cheap hash comparison; rebuilds
+    # only when it is missing, empty or the bundled knowledge files changed. A failure
+    # is recorded here and never stops the telemetry refresh below.
+    refresh_item("memory_index", "documents", memory_index.ensure, results)
 
     for direction in ["first", "last"]:
         key = app.engine_run_cache_key(direction, 365, app.ENGINE_RUNNING_RPM)

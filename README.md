@@ -555,8 +555,11 @@ container cannot hide another that failed or stopped.
 `vesselstackctl start` is also a complete first-start path: it configures
 enabled hardware and firewall policy, creates the MQTT password file when
 missing, starts services, and idempotently provisions InfluxDB history.
-`doctor` adds dependency, Compose, free-space, service, and endpoint checks and
-finishes with either `RESULT healthy` or `RESULT attention required`. Use
+`doctor` adds dependency, Compose, free-space, service, memory-index and endpoint
+checks and finishes with either `RESULT healthy` or `RESULT attention required`.
+`urls` shows who can really reach each service (see "Reaching VesselStack from
+other devices"). If Boat Chat stays "not ready", `sudo vesselstackctl reindex`
+rebuilds its memory index (see Troubleshooting). Use
 `vesselstackctl logs chat`, `logs containers`, or `logs all` for recent
 diagnostic output without remembering systemd or Compose commands.
 
@@ -795,10 +798,35 @@ the private SQLite memory database
 release packages. Settings values containing a newline, carriage return or NUL
 byte are rejected (HTTP 400, nothing written), matching the control panel.
 
-`vesselstackctl urls` prints the effective bind address of each service (read
-from `config/boat-chat.env`, `config/control-panel.env` and the Compose bind
-variables, never by sourcing service-writable files), e.g. whether Boat Chat is
-reachable on all interfaces or only this device.
+`vesselstackctl urls` reports the **real** bind state of each service from the
+listening sockets (`ss -ltn`), so the host-networked SignalK and Home Assistant
+containers show up as listening on every interface although their client URLs
+say `127.0.0.1`. It prints this machine's reachable addresses (`HOSTNAME.local`
+and every non-loopback IPv4 address, ignoring Docker bridges and veth links) as
+copy-pasteable URLs for the services that other devices can reach, marks
+loopback-only services "this device only" with a one-line hint on how to change
+that, and falls back to the configuration (read from `config/boat-chat.env`,
+`config/control-panel.env` and the Compose bind variables, never by sourcing
+service-writable files) when `ss` is unavailable or a published port is not
+visible to it, saying so on the line.
+
+**Memory index.** Boat Chat answers from a private SQLite index of its bundled
+knowledge files (`boat-chat/knowledge/*.md`, the facts file and the boat-chat
+documentation). Until that index has content `/health` reports
+`readiness.layers.memory = {ready: false, chunks: 0}` and Boat Chat is "not
+ready". The installer builds it (`scripts/memory-index.sh`, `memory_index.py
+ensure`) as the **service user** with the unit's minimal environment
+(`BOAT_CHAT_STATE_DIR`, `BOAT_CHAT_ENV`, plus `BOAT_CHAT_EMBEDDING_MODEL` and
+`BOAT_CHAT_MEMORY_DB` only if set in `config/boat-chat.env`, validated and never
+sourced), so the database is service-user-owned and root never creates SQLite
+side files in the state directory. `ensure` is idempotent: it rebuilds only when
+the index is missing, empty or the hash of the source documents changed. It runs
+on every installer run (including upgrades), on `vesselstackctl start`, and at
+the start of every telemetry-indexer run (so a release that changes the
+knowledge files refreshes the index within five minutes). A failed build prints
+a `WARN` with the exact manual command, never aborts the install, and
+`vesselstackctl doctor` fails until it is fixed. `sudo vesselstackctl reindex`
+rebuilds it on demand.
 
 Hardening of service-writable paths: the control panel clears stale Settings
 overrides without following symlinks (it refuses a symlinked override file,
@@ -1331,6 +1359,25 @@ Confirm SignalK and InfluxDB values in
 sudo test -s /opt/vesselstack-data/mosquitto/passwords
 sudo docker logs vesselstack-mosquitto --tail 100
 ```
+
+### Boat Chat reports "not ready" (memory index empty)
+
+Symptom: `curl -fsS http://127.0.0.1:8765/health | jq .readiness` shows
+`layers.memory = {"ready": false, "chunks": 0}`, `vesselstackctl status` says
+`Boat Chat unavailable or not ready` and `vesselstackctl doctor` prints `FAIL Boat
+Chat memory index is empty`. Releases before 0.4.3 never built the index on a
+fresh install. 0.4.3 and later build it during installation, on upgrade and on
+`vesselstackctl start`. To fix an install that predates that, or one whose build
+failed (the installer printed `WARN: ... memory index could not be built`):
+
+```bash
+sudo vesselstackctl reindex      # builds it as the service user; prints "memory index: ... (N chunks)"
+sudo vesselstackctl doctor
+```
+
+If `reindex` itself fails, its message names the cause (missing Python
+environment: rerun the installer; state directory missing or a file owned by
+root: the `chown` command it prints).
 
 ### SignalK not running / EACCES on package.json
 

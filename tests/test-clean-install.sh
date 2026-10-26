@@ -33,11 +33,22 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
 exit 0
 PIP
     chmod +x "$3/bin/pip"
+    # A usable interpreter in the venv (the memory index runs with it); omitted on
+    # request to exercise the failure path.
+    [ -n "${FAKE_VENV_NO_PYTHON:-}" ] || ln -s /usr/bin/python3 "$3/bin/python"
     exit 0
 fi
 exec /usr/bin/python3 "$@"
 EOF
-chmod +x "$FAKE_BIN/docker" "$FAKE_BIN/systemctl" "$FAKE_BIN/python3" "$FAKE_BIN/curl"
+# Records how the installer drops privileges, then really does it.
+cat > "$FAKE_BIN/runuser" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$TEST_ROOT/runuser.log"
+# Drop this stub's directory wherever it sits in PATH, or exec would find itself again.
+PATH=\$(printf '%s' "\$PATH" | tr ':' '\\n' | grep -vxF "$FAKE_BIN" | paste -sd:)
+exec runuser "\$@"
+EOF
+chmod +x "$FAKE_BIN/docker" "$FAKE_BIN/systemctl" "$FAKE_BIN/python3" "$FAKE_BIN/curl" "$FAKE_BIN/runuser"
 
 cat > "$CONFIG" <<EOF
 BOAT_NAME="Test Vessel"
@@ -198,6 +209,42 @@ if grep -R 'GENERATE' "$APP_ROOT/config"; then
     exit 1
 fi
 
+# Boat Chat's memory index: built by the installer (nothing else builds it), as the
+# service user with a minimal environment, idempotent, and a failure is loud but never
+# aborts the installation.
+memory_db="$DATA_ROOT/boat-chat/memory/boat_memory.sqlite"
+index_chunks() {
+    /usr/bin/python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("select count(*) from chunks").fetchone()[0])' "$1"
+}
+test -s "$memory_db"
+[ "$(index_chunks "$memory_db")" -gt 0 ] || { echo "Fresh install did not build the memory index" >&2; exit 1; }
+grep -q -- "^-u $(id -un) -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent PYTHONDONTWRITEBYTECODE=1 BOAT_CHAT_STATE_DIR=$DATA_ROOT/boat-chat BOAT_CHAT_ENV=$DATA_ROOT/boat-chat/boat-chat.env $APP_ROOT/boat-chat/.venv/bin/python $APP_ROOT/boat-chat/memory_index.py ensure\$" "$TEST_ROOT/runuser.log"
+# Idempotent: nothing changed, nothing rebuilt (and nothing printed as a warning).
+rerun_output=$(env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" 2>&1)
+grep -q 'memory index: unchanged' <<<"$rerun_output"
+if grep -q 'WARN: the Boat Chat memory index' <<<"$rerun_output"; then
+    echo "Idempotent re-run warned about the memory index" >&2
+    exit 1
+fi
+# An existing install without an index (the upgrade case) gets one.
+rm -f -- "$memory_db" "$memory_db-wal" "$memory_db-shm"
+rerun_output=$(env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" 2>&1)
+grep -q 'memory index: rebuilt' <<<"$rerun_output"
+[ "$(index_chunks "$memory_db")" -gt 0 ]
+# Failure path: no interpreter in the venv. The install still succeeds, prints the
+# WARN with the exact manual command, and leaves the index absent for doctor to report.
+rm -f -- "$memory_db" "$memory_db-wal" "$memory_db-shm"
+env PATH="$FAKE_BIN:$PATH" FAKE_VENV_NO_PYTHON=1 VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null 2>"$TEST_ROOT/index-fail.stderr"
+grep -q 'WARN: the Boat Chat memory index could not be built' "$TEST_ROOT/index-fail.stderr"
+grep -q 'WARN: build it manually with: sudo vesselstackctl reindex' "$TEST_ROOT/index-fail.stderr"
+test ! -e "$memory_db"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+[ "$(index_chunks "$memory_db")" -gt 0 ]
+
 # Retention: empty by default (no implicit change to existing buckets), validated.
 grep -q "^INFLUXDB_RAW_RETENTION=''\?$" "$APP_ROOT/config/vesselstack.env"
 BAD_RETENTION_CONFIG="$TEST_ROOT/bad-retention.env"
@@ -279,6 +326,12 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
     test "$(stat -c '%u:%g' "$DATA2/influxdb")" = "1000:1000"
     test "$(stat -c '%u:%g' "$DATA2/grafana")" = "472:0"
     test "$(stat -c '%U' "$DATA2/boat-chat")" = "$svc"
+    # The memory index is created by the service user, never by root, and root leaves no
+    # root-owned SQLite side files behind in the service-writable state directory.
+    test -s "$DATA2/boat-chat/memory/boat_memory.sqlite"
+    test "$(stat -c '%U' "$DATA2/boat-chat/memory/boat_memory.sqlite")" = "$svc"
+    test -z "$(find "$DATA2/boat-chat/memory" -not -user "$svc" -print -quit)"
+    grep -q -- "^-u $svc -- env -i " "$TEST_ROOT/runuser.log"
     test "$(stat -c '%u' "$DATA2/homeassistant")" = 0
     # Native SignalK keeps its service-user-owned state directory (not 1000:1000).
     NATIVE_BIN="$TEST_ROOT/native-bin"

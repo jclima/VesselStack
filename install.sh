@@ -68,6 +68,10 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_ALLOW_UDP=}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
+# Whether the INPUT configuration really sets BOAT_CHAT_HOST: the installed vesselstack.env
+# never carries it (it lives in config/boat-chat.env), so a re-render from it must keep
+# the installed value (for example one set by `vesselstackctl lan local`), not reset it.
+BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${BOAT_CHAT_HOST:=0.0.0.0}"
 : "${VESSELSTACK_DATA_BIND_ADDRESS:=127.0.0.1}"
 : "${VESSELSTACK_WEB_BIND_ADDRESS:=0.0.0.0}"
@@ -721,7 +725,9 @@ for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN 
     sed -i "/^${key}=/d" "$boat_chat_temp"
 done
 for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
-    if [ -n "${!key+x}" ]; then
+    key_given=${!key+x}
+    [ "$key" != BOAT_CHAT_HOST ] || key_given=$BOAT_CHAT_HOST_FROM_CONFIG
+    if [ -n "$key_given" ]; then
         sed -i "/^${key}=/d" "$boat_chat_temp"
         printf '%s=%q\n' "$key" "${!key}" >> "$boat_chat_temp"
     elif ! grep -q "^${key}=" "$boat_chat_temp"; then
@@ -816,6 +822,16 @@ compose config --quiet
 
 if [ "$SIGNALK_MODE" = native ]; then
     "$SCRIPT_DIR/scripts/install-signalk-native.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+fi
+
+# Boat Chat reports "not ready" until its memory index has content, and nothing else
+# builds it. Do it here, after the code, facts file and virtualenv are in place and the
+# state directory exists, as the service user (see scripts/memory-index.sh). `ensure` is
+# idempotent, so a re-run or an upgrade only rebuilds when the bundled knowledge changed.
+# A failure is loud but never aborts the installation (doctor reports it too).
+if ! "$SCRIPT_DIR/scripts/memory-index.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" ensure; then
+    echo "WARN: the Boat Chat memory index could not be built, so Boat Chat will report 'not ready' (and 'vesselstackctl doctor' will fail)." >&2
+    echo "WARN: build it manually with: sudo vesselstackctl reindex" >&2
 fi
 
 if [ "$START" -eq 1 ]; then

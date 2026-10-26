@@ -238,6 +238,17 @@ def chunk_hash(chunk: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def source_hash(paths: list[Path] | None = None) -> str:
+    """Fingerprint of the documents the index is built from (paths and contents)."""
+    digest = hashlib.sha256()
+    for doc_path in paths or DEFAULT_DOC_PATHS:
+        if doc_path.exists() and doc_path.is_file():
+            digest.update(str(doc_path).encode("utf-8") + b"\0")
+            digest.update(doc_path.read_bytes() + b"\0")
+    digest.update(embedding_backend().encode("utf-8"))
+    return digest.hexdigest()
+
+
 def rebuild(paths: list[Path] | None = None, path: Path | None = None) -> dict[str, Any]:
     conn = connect(path)
     has_vec = init_schema(conn)
@@ -276,6 +287,7 @@ def rebuild(paths: list[Path] | None = None, path: Path | None = None) -> dict[s
             "insert or replace into index_meta (key, value) values (?, ?)",
             ("last_rebuild", json.dumps({"time": now, "chunks": len(chunks), "sqlite_vec": has_vec, "embedding_backend": embedding_backend()})),
         )
+        conn.execute("insert or replace into index_meta (key, value) values (?, ?)", ("source_hash", source_hash(docs)))
     conn.close()
     return {"chunks": len(chunks), "sqlite_vec": has_vec, "embedding_backend": embedding_backend(), "path": str(path or db_path())}
 
@@ -377,15 +389,50 @@ def status(path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def ensure(path: Path | None = None) -> dict[str, Any]:
+    """Build the index when it is missing, empty or older than the documents.
+
+    Idempotent and cheap when nothing changed: it only compares a hash. Used by the
+    installer, `vesselstackctl start` and the telemetry indexer so a fresh install
+    (and every upgrade that changes the bundled knowledge files) gets a usable index.
+    """
+    target = path or db_path()
+    reason = ""
+    if not target.exists():
+        reason = "missing"
+    else:
+        conn = connect(target)
+        try:
+            init_schema(conn)
+            chunks = conn.execute("select count(*) from chunks").fetchone()[0]
+            row = conn.execute("select value from index_meta where key = 'source_hash'").fetchone()
+        finally:
+            conn.close()
+        if chunks == 0:
+            reason = "empty"
+        elif row is None or row["value"] != source_hash():
+            reason = "documents changed"
+    if not reason:
+        current = status(target)
+        return {"action": "unchanged", "chunks": current["chunks"], "path": str(target)}
+    result = rebuild(path=path)
+    result.update(action="rebuilt", reason=reason)
+    if result["chunks"] == 0:
+        raise RuntimeError(f"memory index rebuilt but no documents were found to index ({target})")
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build and query the Boat Chat memory index.")
-    parser.add_argument("command", choices=["rebuild", "search", "status"])
+    parser.add_argument("command", choices=["rebuild", "ensure", "search", "status"])
     parser.add_argument("query", nargs="?", default="")
     parser.add_argument("--limit", type=int, default=8)
     args = parser.parse_args()
 
     if args.command == "rebuild":
         print(json.dumps(rebuild(), indent=2, sort_keys=True))
+    elif args.command == "ensure":
+        print(json.dumps(ensure(), indent=2, sort_keys=True))
     elif args.command == "search":
         print(json.dumps(search(args.query, args.limit), indent=2, sort_keys=True))
     else:

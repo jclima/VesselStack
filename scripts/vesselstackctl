@@ -17,8 +17,11 @@ Usage: vesselstackctl COMMAND [ARGUMENTS]
 Commands:
   status                       Show a concise service and endpoint summary
   doctor                       Validate config, dependencies, disk, and health
-  urls                         Print the configured service URLs
+  urls                         Show who can reach each service (real listening state) and the
+                               addresses to use from other devices
   version                      Print installed and command versions
+  reindex                      Rebuild Boat Chat's memory index as the service user
+                               (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|containers|all]
                                Show recent diagnostic logs (default: all)
   start                        Start the stack
@@ -57,6 +60,21 @@ load_config() {
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
 }
 
+# Run the bundled memory-index helper (as the service user). Returns non-zero when it
+# is missing or fails; callers decide how loud to be.
+memory_index_helper() {
+    local helper="$VESSELSTACK_ROOT/installer/scripts/memory-index.sh"
+    [ -x "$helper" ] || { echo "Missing bundled memory index helper: $helper (rerun the installer)" >&2; return 1; }
+    "$helper" "$ENV_FILE" "$@"
+}
+
+ensure_memory_index() {
+    if ! memory_index_helper ensure; then
+        echo "WARN: the Boat Chat memory index could not be built; Boat Chat will report 'not ready'. Fix: sudo vesselstackctl reindex" >&2
+        return 1
+    fi
+}
+
 start_stack() {
     local installer_scripts="$VESSELSTACK_ROOT/installer/scripts"
     if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
@@ -85,6 +103,9 @@ start_stack() {
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
     fi
+    # Existing installs have no index until the first start after upgrading: build it
+    # (cheap when nothing changed) before Boat Chat starts. Never blocks the start.
+    ensure_memory_index || true
     systemctl start vesselstack-chat.service
     if [ "${TELEGRAM_ENABLE:-false}" = true ]; then
         systemctl start vesselstack-chat-telegram.service
@@ -196,34 +217,176 @@ env_file_value() {
     printf '%s' "$value"
 }
 
-bind_note() {
+# Classify a configured bind address: all | loopback | other.
+bind_kind() {
     case "$1" in
-        127.0.0.1|::1|localhost) printf 'this device only' ;;
-        0.0.0.0|::|'') printf 'ALL interfaces' ;;
-        *) printf 'interface %s' "$1" ;;
+        127.*|::1|localhost) printf loopback ;;
+        0.0.0.0|::|''|'*') printf all ;;
+        *) printf other ;;
     esac
+}
+
+# Listening TCP sockets as "address port" lines, from `ss -ltn`. Empty (and
+# LISTENERS_KNOWN=0) when ss is missing or fails, so callers fall back to configuration.
+LISTENERS=''
+LISTENERS_KNOWN=0
+collect_listeners() {
+    local raw
+    command -v ss >/dev/null 2>&1 || return 0
+    raw=$(ss -ltn 2>/dev/null) || return 0
+    LISTENERS=$(awk '$1 == "LISTEN" {
+        n = split($4, parts, ":"); port = parts[n]
+        addr = substr($4, 1, length($4) - length(port) - 1)
+        gsub(/[\[\]]/, "", addr); sub(/%.*/, "", addr)
+        if (addr == "*" || addr == "" || addr == "::") addr = "0.0.0.0"
+        if (addr == "::1") addr = "127.0.0.1"
+        print addr, port }' <<<"$raw")
+    [ -z "$LISTENERS" ] || LISTENERS_KNOWN=1
+}
+
+# Real bind state of a TCP port: sets BOUND_KIND (all|loopback|other|none) and
+# BOUND_ADDR (the specific address for "other").
+listening_state() {
+    local port=$1 addr p
+    BOUND_KIND=none
+    BOUND_ADDR=''
+    while read -r addr p; do
+        [ "$p" = "$port" ] || continue
+        case "$(bind_kind "$addr")" in
+            all) BOUND_KIND=all ;;
+            loopback) [ "$BOUND_KIND" = all ] || [ "$BOUND_KIND" = other ] || BOUND_KIND=loopback ;;
+            other) [ "$BOUND_KIND" = all ] || { BOUND_KIND=other; BOUND_ADDR=$addr; } ;;
+        esac
+    done <<<"$LISTENERS"
+}
+
+# Names and IPv4 addresses other devices can use to reach this machine: the mDNS name
+# plus every non-loopback address except container/virtual bridge interfaces.
+REACH_HOSTS=()
+REACH_NOTES=()
+collect_reachable() {
+    local name short iface cidr address
+    name=$(hostname 2>/dev/null || true)
+    short=${name%%.*}
+    if [ -n "$short" ]; then
+        REACH_HOSTS+=("$short.local")
+        REACH_NOTES+=("mDNS name; works where Avahi or Bonjour is available")
+    fi
+    if command -v ip >/dev/null 2>&1; then
+        while read -r iface cidr; do
+            case "$iface" in
+                lo|docker*|br-*|veth*|virbr*|cni*|flannel*|cali*|vxlan*|lxc*|lxd*) continue ;;
+            esac
+            address=${cidr%%/*}
+            case "$address" in 127.*|169.254.*|'') continue ;; esac
+            REACH_HOSTS+=("$address")
+            REACH_NOTES+=("interface $iface")
+        done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2, $4}')
+    fi
+}
+
+# One service: LABEL PORT SCHEME CONFIGURED_ADDRESS [HOST_NETWORK] [EXTRA_NOTE] [CHANGE_HINT]
+#   host-network services are not published by Docker, so without a real socket listing
+#   the configured address is unknown and they are assumed to listen on every interface.
+url_for() {
+    local scheme=$1 host=$2 port=$3
+    if [ "$scheme" = http ] && [ "$port" = 80 ]; then printf 'http://%s' "$host"
+    else printf '%s://%s:%s' "$scheme" "$host" "$port"; fi
+}
+
+show_service() {
+    local label=$1 port=$2 scheme=$3 configured=$4 host_network=${5:-no} extra=${6:-} hint=${7:-}
+    local kind addr='' source=listening state i
+    listening_state "$port"
+    kind=$BOUND_KIND
+    addr=$BOUND_ADDR
+    if [ "$LISTENERS_KNOWN" -eq 0 ] || [ "$kind" = none ]; then
+        if [ "$host_network" = yes ] && [ "$LISTENERS_KNOWN" -eq 0 ]; then
+            kind=all; source='assumed: host networking, not verified'
+        elif [ "$host_network" = yes ]; then
+            kind=none; source='not listening'
+        else
+            kind=$(bind_kind "$configured"); addr=$configured
+            if [ "$LISTENERS_KNOWN" -eq 0 ]; then source='from configuration'; else source='from configuration, not seen listening'; fi
+        fi
+    fi
+    case "$kind" in
+        all) state='ALL interfaces - reachable from other devices' ;;
+        loopback) state='this device only' ;;
+        other) state="interface $addr only" ;;
+        *) state='not listening' ;;
+    esac
+    [ "$source" = listening ] || state="$state ($source)"
+    printf '%-20s %s%s\n' "$label" "$state" "${extra:+; $extra}"
+    case "$kind" in
+        none) return 0 ;;
+        other) printf '%-20s %s\n' '' "  $(url_for "$scheme" "$addr" "$port")" ;;
+        *) printf '%-20s %s\n' '' "  $(url_for "$scheme" 127.0.0.1 "$port")   (on this device)" ;;
+    esac
+    if [ "$kind" = all ]; then
+        for i in "${!REACH_HOSTS[@]}"; do
+            printf '%-20s %s\n' '' "  $(url_for "$scheme" "${REACH_HOSTS[$i]}" "$port")   (from other devices: ${REACH_NOTES[$i]})"
+        done
+    fi
+    if [ "$kind" = loopback ] && [ -n "$hint" ]; then
+        printf '%-20s %s\n' '' "  $hint"
+    fi
+    return 0
+}
+
+# Host and port of a URL (no credentials expected): prints "HOST PORT".
+url_host_port() {
+    local rest=${1#*://} default=$2 hostport host port
+    hostport=${rest%%/*}
+    hostport=${hostport##*@}
+    host=${hostport%%:*}
+    port=${hostport##*:}
+    [ "$port" != "$hostport" ] || port=$default
+    printf '%s %s\n' "$host" "$port"
 }
 
 show_urls() {
     local chat_host panel_host data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
-    local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}
+    local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} host port i
     chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
     chat_host=${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_host=${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}
-    printf '%-20s %s  (bound: %s; access token required)\n' 'Boat Chat' \
-        "http://$chat_host:${BOAT_CHAT_PORT:-8765}" "$(bind_note "$chat_host")"
-    printf '%-20s %s  (bound: %s)\n' 'Control Panel' \
-        "http://$panel_host:${CONTROL_PANEL_PORT:-8780}" "$(bind_note "$panel_host")"
-    printf '%-20s %s\n' SignalK "$SIGNALK_URL"
-    printf '%-20s %s\n' 'Home Assistant' "$HOME_ASSISTANT_URL"
-    printf '%-20s %s  (bound: %s)\n' InfluxDB "$INFLUXDB_URL" "$(bind_note "$data_bind")"
-    printf '%-20s %s  (bound: %s)\n' Grafana \
-        "http://$web_bind:${GRAFANA_PORT:-43000}" "$(bind_note "$web_bind")"
-    printf '%-20s %s  (bound: %s)\n' Heimdall \
-        "http://$web_bind:${HEIMDALL_PORT:-80}" "$(bind_note "$web_bind")"
-    printf '%-20s %s  (bound: %s)\n' Prometheus \
-        "http://$data_bind:${PROMETHEUS_PORT:-9090}" "$(bind_note "$data_bind")"
+    collect_listeners
+    collect_reachable
+    printf 'Addresses other devices on this network can use to reach this machine:\n'
+    if [ "${#REACH_HOSTS[@]}" -eq 0 ]; then
+        printf '  (none found: no network address besides loopback)\n'
+    fi
+    for i in "${!REACH_HOSTS[@]}"; do
+        printf '  %-28s %s\n' "${REACH_HOSTS[$i]}" "${REACH_NOTES[$i]}"
+    done
+    if [ "$LISTENERS_KNOWN" -eq 0 ]; then
+        printf 'Note: listening sockets could not be inspected (ss unavailable); bind state is taken from the configuration.\n'
+    fi
+    printf '\n'
+    show_service 'Boat Chat' "${BOAT_CHAT_PORT:-8765}" http "$chat_host" no 'access token required' \
+        'to change: sudo vesselstackctl lan dashboards'
+    show_service 'Control Panel' "${CONTROL_PANEL_PORT:-8780}" http "$panel_host" no \
+        'root-level editor, loopback by design' \
+        "to reach it: ssh -L ${CONTROL_PANEL_PORT:-8780}:127.0.0.1:${CONTROL_PANEL_PORT:-8780} USER@HOST (SSH tunnel)"
+    if [ "${SIGNALK_MODE:-existing}" = existing ]; then
+        printf '%-20s %s\n' SignalK "existing server, not managed here: $SIGNALK_URL"
+    else
+        read -r host port < <(url_host_port "$SIGNALK_URL" 3000)
+        show_service SignalK "$port" http "$host" yes 'host-networked container; vesselstackctl lan does not change it'
+    fi
+    read -r host port < <(url_host_port "$HOME_ASSISTANT_URL" 8123)
+    case "$(bind_kind "$host")" in
+        loopback) show_service 'Home Assistant' "$port" http "$host" yes 'host-networked container; vesselstackctl lan does not change it' ;;
+        *) printf '%-20s %s\n' 'Home Assistant' "external server, not managed here: $HOME_ASSISTANT_URL" ;;
+    esac
+    show_service Grafana "${GRAFANA_PORT:-43000}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
+    show_service Heimdall "${HEIMDALL_PORT:-80}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
+    show_service InfluxDB "${INFLUXDB_PORT:-8086}" http "$data_bind" no 'API token required' 'to change: sudo vesselstackctl lan all'
+    show_service Prometheus "${PROMETHEUS_PORT:-9090}" http "$data_bind" no 'NO login' 'to change: sudo vesselstackctl lan all'
+    show_service MQTT "${MQTT_PORT:-1883}" mqtt "$data_bind" no 'password required' 'to change: sudo vesselstackctl lan all'
+    printf '\nChange who can reach the dashboards with: sudo vesselstackctl lan [local|dashboards|all]\n'
 }
 
 show_version() {
@@ -289,6 +452,36 @@ check_signalk_data_dir() {
     return 1
 }
 
+# Boat Chat reports itself "not ready" while its memory index has no chunks. Ask the
+# running service first (its /health readiness); if it does not answer, ask the helper,
+# which opens the database as the service user (root must never create SQLite files there).
+check_memory_index() {
+    local body chunks=''
+    body=$(curl --connect-timeout 3 --max-time 10 --fail --silent \
+        "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" 2>/dev/null || true)
+    if [ -n "$body" ]; then
+        chunks=$(python3 -c '
+import json, sys
+try:
+    print(int(json.load(sys.stdin)["readiness"]["layers"]["memory"]["chunks"]))
+except (ValueError, TypeError, KeyError):
+    pass
+' <<<"$body" 2>/dev/null || true)
+    fi
+    if [ -z "$chunks" ]; then
+        chunks=$(memory_index_helper status 2>/dev/null || true)
+    fi
+    case "$chunks" in
+        '') printf 'WARN could not determine the Boat Chat memory index state (service not answering and the helper failed)\n' >&2; return 0 ;;
+        0)
+            printf 'FAIL Boat Chat memory index is empty (0 chunks), so Boat Chat reports "not ready".\n' >&2
+            printf '     Fix: sudo vesselstackctl reindex\n' >&2
+            return 1 ;;
+        *[!0-9]*) printf 'WARN unexpected memory index state: %s\n' "$chunks" >&2; return 0 ;;
+        *) printf 'OK   Boat Chat memory index: %s chunks\n' "$chunks" ;;
+    esac
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -315,6 +508,7 @@ doctor_stack() {
     fi
     disk_usage_warning
     check_signalk_data_dir || failed=1
+    check_memory_index || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
@@ -680,6 +874,7 @@ case "$command" in
     urls) [ $# -eq 0 ] || { usage; exit 2; }; show_urls ;;
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
+    reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
