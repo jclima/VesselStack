@@ -424,3 +424,105 @@ class UiOptionTests(unittest.TestCase):
             nothing(cfg)
             inst(cfg)["alarm"] = True
         self.assertEqual(errors_for(forced), [])
+
+
+class DashboardUiOptionTests(unittest.TestCase):
+    """swipe, header, night, brightness and dim_after_s (display dashboard slice S4)."""
+
+    def check(self, ui, schedule=None, registry=REGISTRY):
+        cfg = copy.deepcopy(EXAMPLE)
+        cfg["displays"]["helm"]["ui"] = ui
+        if schedule is not None:
+            cfg["night_schedule"] = schedule
+        return schema.validate_config(cfg, registry)
+
+    def assertError(self, errors, fragment):
+        self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
+
+    def test_valid_combinations(self) -> None:
+        sched = {"start": "21:30", "end": "06:15"}
+        self.assertEqual(self.check({"swipe": True, "header": True, "night": "schedule",
+                                     "day_brightness": 90, "night_brightness": 10, "dim_after_s": 120},
+                                    sched), [])
+        self.assertEqual(self.check({"swipe": False, "header": False, "night": "off",
+                                     "dim_after_s": 0}), [])
+        self.assertEqual(self.check({"night": "manual", "night_brightness": 5}), [])
+
+    def test_booleans(self) -> None:
+        for key in ("swipe", "header"):
+            for bad in ("yes", 1, None):
+                self.assertError(self.check({key: bad}), f"ui.{key}: must be true or false")
+
+    def test_night_mode(self) -> None:
+        for bad in ("on", True, 1, "SCHEDULE", None):
+            self.assertError(self.check({"night": bad}), "ui.night: must be one of off, manual, schedule")
+
+    def test_night_schedule_mode_requires_the_top_level_schedule(self) -> None:
+        self.assertError(self.check({"night": "schedule"}), "needs a top-level night_schedule")
+        self.assertError(self.check({"night": "schedule"}, {"start": "25:00", "end": "06:00"}),
+                         "needs a top-level night_schedule")  # an invalid schedule does not count
+        self.assertEqual(self.check({"night": "manual"}), [])  # manual needs none
+        self.assertEqual(self.check({"night": "off"}, {"start": "22:00", "end": "06:00"}), [])
+
+    def test_night_schedule_rules(self) -> None:
+        for good in ({"start": "00:00", "end": "23:59"}, {"start": "21:30", "end": "06:15"},
+                     {"start": "06:00", "end": "07:00"}):
+            self.assertEqual(self.check({}, good), [])
+        for bad in ({"start": "9:00", "end": "10:00"}, {"start": "24:00", "end": "01:00"},
+                    {"start": "12:60", "end": "13:00"}, {"start": "12:00\n", "end": "13:00"},
+                    {"start": 1200, "end": "13:00"}, {"start": "12:00", "end": None}):
+            self.assertError(self.check({}, bad), "night_schedule")
+        self.assertError(self.check({}, {"start": "12:00", "end": "12:00"}), "start and end must differ")
+        self.assertError(self.check({}, {"start": "12:00"}), "night_schedule.end: required")
+        self.assertError(self.check({}, {"start": "12:00", "end": "13:00", "tz": "UTC"}), "tz: unknown key")
+        self.assertError(self.check({}, "21:00-06:00"), "night_schedule: must be an object")
+
+    def test_brightness_ranges(self) -> None:
+        for key in ("day_brightness", "night_brightness"):
+            for bad in (4, 101, 0, -1, 50.5, "50", True):
+                self.assertError(self.check({key: bad}), f"ui.{key}: must be an integer 5..100")
+            for good in (5, 100):
+                self.assertEqual(self.check({key: good}), [])
+
+    def test_night_brightness_must_not_exceed_day_brightness(self) -> None:
+        self.assertError(self.check({"day_brightness": 30, "night_brightness": 40}),
+                         "night_brightness: must not exceed day_brightness (30)")
+        self.assertEqual(self.check({"day_brightness": 30, "night_brightness": 30}), [])
+        self.assertEqual(self.check({"night_brightness": 100}), [])
+
+    def test_dim_after_s_range(self) -> None:
+        for bad in (-1, 3601, 1.5, "60", True):
+            self.assertError(self.check({"dim_after_s": bad}), "ui.dim_after_s: must be an integer 0..3600")
+        for good in (0, 1, 3600):
+            self.assertEqual(self.check({"dim_after_s": good}), [])
+
+    def test_unknown_ui_keys_are_still_rejected(self) -> None:
+        self.assertError(self.check({"nightmode": True}), "ui.nightmode: unknown key")
+
+    def test_header_needs_a_board_with_a_ring(self) -> None:
+        reg = copy.deepcopy(REGISTRY)
+        del reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["ring"]
+        self.assertEqual(schema.validate_registry(reg), [])
+        self.assertError(self.check({"header": True}, registry=reg), "ui.header: the board has no header band")
+        self.assertEqual(self.check({"header": False}, registry=reg), [])
+        self.assertEqual(self.check({"header": True}), [])
+
+    def test_ring_geometry_is_validated(self) -> None:
+        def errors(ring):
+            reg = copy.deepcopy(REGISTRY)
+            reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["ring"] = ring
+            return schema.validate_registry(reg)
+        self.assertEqual(errors({"header_y": 14, "header_h": 52, "footer_y": 414}), [])
+        self.assertError(errors("x"), "ring: must be an object")
+        self.assertError(errors({"header_y": 14, "header_h": 52}), "ring.footer_y: required")
+        self.assertError(errors({"header_y": 14, "header_h": 52, "footer_y": 414, "x": 1}), "ring.x: unknown key")
+        self.assertError(errors({"header_y": 14, "header_h": "52", "footer_y": 414}), "ring.header_h")
+        self.assertError(errors({"header_y": 14, "header_h": 40, "footer_y": 414}), "at least 50")
+        self.assertError(errors({"header_y": 30, "header_h": 52, "footer_y": 414}), "overlaps the content box")
+        self.assertError(errors({"header_y": 14, "header_h": 52, "footer_y": 400}), "footer_y")
+        self.assertError(errors({"header_y": 14, "header_h": 52, "footer_y": 475}), "footer_y")
+
+    def test_ring_is_optional_in_the_registry(self) -> None:
+        reg = copy.deepcopy(REGISTRY)
+        del reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["ring"]
+        self.assertEqual(schema.validate_registry(reg), [])

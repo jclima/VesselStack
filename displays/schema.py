@@ -20,7 +20,9 @@ LAYOUT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SK_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z0-9_-]+)+$")
 HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
-TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "notifications", "displays"}
+TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "notifications", "displays", "night_schedule"}
+NIGHT_SCHEDULE_KEYS = {"start", "end"}
+HHMM = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 NOTIFICATION_KEYS = {"path", "label", "absent", "alarm"}
 NOTIFICATION_REQUIRED = {"path", "label"}
 NOTIFICATION_PREFIX = "notifications."
@@ -35,11 +37,20 @@ THRESHOLD_BOUNDS = (("alarm_below", "low"), ("warn_below", "low"), ("warn_above"
 THRESHOLD_KEYS = {name for name, _ in THRESHOLD_BOUNDS} | {"hysteresis"}
 INSTRUMENT_REQUIRED = {"path", "label", "convert", "unit", "precision", "stale_after_s"}
 DISPLAY_KEYS = {"name", "board", "home_assistant_api", "pages", "ui"}
-UI_KEYS = {"alarm_takeover", "alarm_page"}
+UI_KEYS = {"alarm_takeover", "alarm_page", "swipe", "header", "night", "day_brightness",
+           "night_brightness", "dim_after_s"}
+UI_BOOLEANS = ("alarm_takeover", "swipe", "header")
+NIGHT_MODES = ("off", "manual", "schedule")
+DEFAULT_DAY_BRIGHTNESS = 100
+DEFAULT_NIGHT_BRIGHTNESS = 20
+DIM_BRIGHTNESS = 10          # used by dim_after_s when night_brightness is not set
 DISPLAY_REQUIRED = {"name", "board", "pages"}
 PAGE_KEYS = {"title", "layout", "items"}
-BOARD_KEYS = {"name", "width", "height", "shape", "safe_inset", "content_width", "content_height", "layouts",
-              "esphome_package"}
+BOARD_REQUIRED = {"name", "width", "height", "shape", "safe_inset", "content_width", "content_height", "layouts",
+                  "esphome_package"}
+BOARD_KEYS = BOARD_REQUIRED | {"ring"}
+RING_KEYS = {"header_y", "header_h", "footer_y"}
+RING_MIN_HEADER_H = 50
 
 DEFAULT_HEARTBEAT_S = 5
 DEFAULT_MIN_INTERVAL_MS = 1000
@@ -122,14 +133,36 @@ def counts_for_alarm_summary(cfg: dict) -> bool:
                for n in (notifications.values() if isinstance(notifications, dict) else ()))
 
 
-def validate_ui(ui, where: str, pages, instruments, notifications, errors: list) -> None:
-    """Per-display ``ui`` options: ``alarm_takeover`` (bool) and ``alarm_page`` (index into pages)."""
+def validate_night_schedule(value, where: str, errors: list) -> bool:
+    """``{"start": "HH:MM", "end": "HH:MM"}`` in 24 h local time; the window may cross midnight."""
+    if not isinstance(value, dict):
+        errors.append(f"{where}: must be an object with start and end (HH:MM)")
+        return False
+    start = len(errors)
+    _unknown(value, NIGHT_SCHEDULE_KEYS, where, errors)
+    _missing(value, NIGHT_SCHEDULE_KEYS, where, errors)
+    for key in sorted(NIGHT_SCHEDULE_KEYS & set(value)):
+        if not (isinstance(value[key], str) and HHMM.fullmatch(value[key])):
+            errors.append(f"{where}.{key}: must be a 24-hour time such as 21:30")
+    if len(errors) == start and value["start"] == value["end"]:
+        errors.append(f"{where}: start and end must differ")
+    return len(errors) == start
+
+
+def ui_header_enabled(ui) -> bool:
+    return isinstance(ui, dict) and ui.get("header") is True
+
+
+def validate_ui(ui, where: str, pages, instruments, notifications, errors: list, board=None,
+                night_schedule=None) -> None:
+    """Per-display ``ui`` options (see UI_KEYS); absent keys keep the firmware exactly as it was."""
     if not isinstance(ui, dict):
         errors.append(f"{where}: must be an object")
         return
     _unknown(ui, UI_KEYS, where, errors)
-    if "alarm_takeover" in ui and not isinstance(ui["alarm_takeover"], bool):
-        errors.append(f"{where}.alarm_takeover: must be true or false")
+    for key in UI_BOOLEANS:
+        if key in ui and not isinstance(ui[key], bool):
+            errors.append(f"{where}.{key}: must be true or false")
     if "alarm_page" in ui:
         count = len(pages) if isinstance(pages, list) else None
         if not is_int(ui["alarm_page"]) or ui["alarm_page"] < 0:
@@ -141,6 +174,25 @@ def validate_ui(ui, where: str, pages, instruments, notifications, errors: list)
             {"instruments": instruments, "notifications": notifications}):
         errors.append(f"{where}.alarm_takeover: nothing counts towards the alarm summary; add an "
                       "instrument with thresholds (or alarm: true) or a notification")
+    if ui.get("header") is True and isinstance(board, dict) and "ring" not in board:
+        errors.append(f"{where}.header: the board has no header band (its registry entry has no "
+                      "'ring' geometry)")
+    night = ui.get("night", "off")
+    if "night" in ui and not (isinstance(night, str) and night in NIGHT_MODES):
+        errors.append(f"{where}.night: must be one of {', '.join(NIGHT_MODES)}")
+    elif night == "schedule" and night_schedule is None:
+        errors.append(f"{where}.night: 'schedule' needs a top-level night_schedule "
+                      '({"start": "HH:MM", "end": "HH:MM"})')
+    for key in ("day_brightness", "night_brightness"):
+        if key in ui and not (is_int(ui[key]) and 5 <= ui[key] <= 100):
+            errors.append(f"{where}.{key}: must be an integer 5..100 (percent)")
+    if "dim_after_s" in ui and not (is_int(ui["dim_after_s"]) and 0 <= ui["dim_after_s"] <= 3600):
+        errors.append(f"{where}.dim_after_s: must be an integer 0..3600 (0 = never dim)")
+    day = ui.get("day_brightness", DEFAULT_DAY_BRIGHTNESS)
+    dark = ui.get("night_brightness", DEFAULT_NIGHT_BRIGHTNESS)
+    if (is_int(day) and is_int(dark) and 5 <= day <= 100 and 5 <= dark <= 100
+            and "night_brightness" in ui and dark > day):
+        errors.append(f"{where}.night_brightness: must not exceed day_brightness ({day})")
 
 
 def _unknown(obj: dict, allowed: set, where: str, errors: list) -> None:
@@ -207,6 +259,31 @@ def layout_specs(registry: dict) -> dict:
     return {name: normalise_layout(spec) for name, spec in registry.get("layouts", {}).items()}
 
 
+def _validate_ring(board: dict, where: str, dims_ok: bool, errors: list) -> None:
+    """Optional header/footer bands, in pixels: they must lie outside the content box."""
+    ring = board["ring"]
+    rw = f"{where}.ring"
+    if not isinstance(ring, dict):
+        errors.append(f"{rw}: must be an object")
+        return
+    _unknown(ring, RING_KEYS, rw, errors)
+    _missing(ring, RING_KEYS, rw, errors)
+    good = all(_int_range(ring, key, 0, 4096, rw, errors) for key in sorted(RING_KEYS & set(ring)))
+    if not good or set(ring) != RING_KEYS:
+        return
+    if ring["header_h"] < RING_MIN_HEADER_H:
+        errors.append(f"{rw}.header_h: must be at least {RING_MIN_HEADER_H} pixels (two text rows)")
+    if not (dims_ok and is_int(board.get("content_height")) and is_int(board.get("height"))):
+        return
+    top = (board["height"] - board["content_height"]) // 2
+    if ring["header_y"] + ring["header_h"] > top:
+        errors.append(f"{rw}: the header band (y {ring['header_y']}..{ring['header_y'] + ring['header_h']}) "
+                      f"overlaps the content box that starts at y {top}")
+    if ring["footer_y"] < top + board["content_height"] or ring["footer_y"] + 10 > board["height"]:
+        errors.append(f"{rw}.footer_y: the page indicator (10 px high) must lie between the content "
+                      f"box (ends at y {top + board['content_height']}) and the bottom edge")
+
+
 def validate_registry(reg) -> list[str]:
     errors: list[str] = []
     if not isinstance(reg, dict):
@@ -241,7 +318,7 @@ def validate_registry(reg) -> list[str]:
                     errors.append(f"{where}: must be an object")
                     continue
                 _unknown(board, BOARD_KEYS, where, errors)
-                _missing(board, BOARD_KEYS, where, errors)
+                _missing(board, BOARD_REQUIRED, where, errors)
                 if "name" in board and not _text(board["name"], 1, 64):
                     errors.append(f"{where}.name: must be 1..64 printable characters")
                 dims_ok = True
@@ -261,6 +338,8 @@ def validate_registry(reg) -> list[str]:
                     if key in board and _int_range(board, key, 1, 4096, where, errors):
                         if dims_ok and board[key] > board[dim]:
                             errors.append(f"{where}.{key}: must not exceed {dim}")
+                if "ring" in board:
+                    _validate_ring(board, where, dims_ok, errors)
                 bl = board.get("layouts")
                 if "layouts" in board:
                     if not isinstance(bl, list) or not bl:
@@ -362,6 +441,10 @@ def validate_config(cfg, registry) -> list[str]:
                 if "alarm" in note and not isinstance(note["alarm"], bool):
                     errors.append(f"{where}.alarm: must be true or false")
 
+    night_ok = None
+    if "night_schedule" in cfg and validate_night_schedule(cfg["night_schedule"], "$.night_schedule", errors):
+        night_ok = cfg["night_schedule"]
+
     displays = cfg.get("displays")
     if "displays" in cfg:
         if not isinstance(displays, dict):
@@ -387,7 +470,8 @@ def validate_config(cfg, registry) -> list[str]:
                     errors.append(f"{where}.board: unknown board {disp['board']!r}")
                 pages = disp.get("pages")
                 if "ui" in disp:
-                    validate_ui(disp["ui"], f"{where}.ui", pages, instruments, notifications, errors)
+                    validate_ui(disp["ui"], f"{where}.ui", pages, instruments, notifications, errors,
+                                board=board, night_schedule=night_ok)
                 if "pages" not in disp:
                     continue
                 if not isinstance(pages, list) or not 1 <= len(pages) <= 8:
