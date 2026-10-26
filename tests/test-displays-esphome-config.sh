@@ -205,7 +205,34 @@ def electrical_min(cfg):
     electrical(cfg)
     cfg["displays"]["helm"]["pages"] = cfg["displays"]["helm"]["pages"][:1]
 
+def ha_items(cfg):
+    electrical(cfg)
+    cfg["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"}}
+    cfg["ha"] = {
+        "bilge_pump": {"entity_id": "binary_sensor.vesselstack_bilge_pump", "label": "<% 1+1 %>", "kind": "binary",
+                       "states": [{"match": "on", "sev": "warn", "text": "$x ${y}"},
+                                  {"match": "off", "sev": "ok", "text": "OFF"}]},
+        "engine": {"entity_id": "sensor.engine_alarm_status", "label": "${y} Engine", "kind": "state",
+                   "states": [{"match": "all clear", "sev": "ok", "text": "CLEAR"},
+                              {"prefix": "dock:", "sev": "ok", "text": "<% 2 %>"}],
+                   "default": {"sev": "alarm", "text": "ALARM"}},
+        "cabin_t": {"entity_id": "sensor.cabin_temperature", "label": "Cabin", "kind": "numeric", "unit": "${y}",
+                    "precision": 1, "thresholds": {"warn_above": 30, "alarm_above": 40}, "min": 0, "max": 50},
+        "shore_ha": {"entity_id": "binary_sensor.vesselstack_shore_power", "label": "$x Shore", "kind": "binary",
+                     "alarm": False, "states": [{"match": "on", "sev": "ok", "text": "ON"},
+                                                {"match": "off", "sev": "ok", "text": "OFF"}]},
+    }
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Status", "layout": "status-grid",
+         "items": ["anchor", "bilge_pump", "engine", "cabin_t", "batt_v"]},
+        {"title": "Power", "layout": "electrical", "items": ["batt_v", "batt_soc", "batt_a", "shore_ha", "solar_a"]},
+        {"title": "Temp", "layout": "gauge-arc", "items": ["cabin_t"]},
+    ]
+    cfg["displays"]["helm"]["ui"] = {"swipe": True, "header": True, "night": "schedule", "alarm_takeover": True}
+    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
 variant("example")
+variant("ha", ha_items)
 variant("electrical", electrical)
 variant("electricalui", electrical_ui)
 variant("electricalmin", electrical_min)
@@ -276,6 +303,25 @@ check gaugesone helm
 check electrical helm
 check electricalui helm
 check electricalmin helm
+check ha helm
+# Home Assistant items: a compile-time text per index k, literal user text, the connection dot, a numeric arc.
+log="$WORK/ha-helm.log"
+for needle in 'topic: vesselstack/v1/ha/bilge_pump' 'topic: vesselstack/v1/ha/cabin_t' 'ins_bilge_pump_k' \
+        'topic: vesselstack/v1/bridge/homeassistant' 'id(ha_state)' 'id: p0_dot_ha' \
+        'lv_obj_set_style_bg_color(id(p0_bilge_pump_tile)' 'lv_obj_set_style_bg_color(id(p1_shore_ha_tile)' \
+        'lv_arc_set_value(id(p2_arc)'; do
+    grep -qF "$needle" "$log" || { echo "missing from the validated ha config: $needle" >&2; fail=1; }
+done
+# shellcheck disable=SC2016
+for needle in '$x ${y}' '<% 1+1 %>' '${y} Engine' '<% 2 %>'; do
+    grep -qF "$needle" "$log" || { echo "hostile Home Assistant text was altered: $needle" >&2; fail=1; }
+done
+for word in OFF CLEAR ALARM; do
+    grep -qE "text: [\"']?${word}[\"']?\$" "$log" || { echo "Home Assistant text $word missing" >&2; fail=1; }
+done
+for plain in example status alarm ui electrical; do
+    if grep -qE 'bridge/homeassistant|ha_state|vesselstack/v1/ha/' "$WORK/$plain-helm.log"; then echo "Home Assistant code present without ha items ($plain)" >&2; fail=1; fi
+done
 # Electrical page: SoC arc, fixed CHG / DSG and pill words as literals, guarded pill colours, literal user text.
 for elec in electrical electricalui electricalmin; do
     log="$WORK/$elec-helm.log"
