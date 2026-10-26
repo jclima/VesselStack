@@ -151,9 +151,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.3/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.3 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.3
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.4/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.4 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.4
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -213,6 +213,15 @@ does anything beyond installing ordinary Debian packages:
    generated during installation, are read without echo when you do type one and are
    never printed or logged. It detects the architecture, Docker, `can0` and the network
    interface names to inform defaults and hints; it never turns hardware on by itself.
+   The browser wizard asks the same "Who should be able to reach the dashboards?" question
+   (`local`, `dashboards` default, `all`) on its network step. The page sends only the
+   preset name (`LAN_ACCESS`); the server validates it (an unknown name is refused with HTTP 400,
+   nothing is written) and expands it with the terminal wizard's `LAN_PRESETS` mapping
+   into `VESSELSTACK_WEB_BIND_ADDRESS`, `VESSELSTACK_DATA_BIND_ADDRESS`, `BOAT_CHAT_HOST` and `HOMEASSISTANT_BIND_ADDRESS`;
+   the preset wins over explicit bind values, `LAN_ACCESS` is never written to the env file
+   and the control panel stays on 127.0.0.1. Choosing `all` shows the warning that Prometheus
+   has no login and recommends the firewall. The loopback, Host/Origin, URL-fragment token
+   and content-type protections are unchanged.
    The terminal wizard has no network surface (no web server, no token, no URL), so it
    runs as root directly, in a private root-only `0700` directory; its output is then
    treated exactly like the browser wizard's: copied once into the root-only staging
@@ -286,7 +295,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.3
+git checkout v0.4.4
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -428,7 +437,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.4.3
+git checkout v0.4.4
 ```
 
 ## 4. Configure the vessel
@@ -447,6 +456,7 @@ nano vesselstack.env
 | `*_PORT` | Host ports for Grafana, Heimdall HTTP/HTTPS, InfluxDB, Prometheus, MQTT, and AIS |
 | `VESSELSTACK_DATA_BIND_ADDRESS` | IPv4 address InfluxDB, Prometheus and MQTT publish on; default `127.0.0.1` (this device only) |
 | `VESSELSTACK_WEB_BIND_ADDRESS` | IPv4 address Grafana and Heimdall publish on; default `0.0.0.0` (LAN dashboards), `127.0.0.1` to restrict |
+| `HOMEASSISTANT_BIND_ADDRESS` | IPv4 address Home Assistant (host-networked, `8123`) listens on; default `0.0.0.0`. Any other value makes the installer manage one delimited `http:` block in `${VESSELSTACK_DATA}/homeassistant/configuration.yaml` (see "Reaching VesselStack from other devices"). SignalK has no equivalent setting |
 | `BOAT_CHAT_ACCESS_TOKEN` | `GENERATE` (default) creates a random token, preserved on re-install; required for chat, status and data APIs |
 | `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
@@ -471,6 +481,7 @@ nano vesselstack.env
 | `INFLUXDB_HISTORY_BUCKET` | One-minute retained history; default `signalk_1m` |
 | `INFLUXDB_HOME_ASSISTANT_BUCKET` | Home Assistant history bucket |
 | `INFLUXDB_AIS_BUCKET` | Short-retention AIS history bucket |
+| `PROMETHEUS_RETENTION` | Prometheus metrics retention: `720h`, `30d` or `8w`; default `30d`; see "Prometheus data and retention" |
 | `INFLUXDB_RAW_RETENTION` | Raw-bucket retention: `720h`, `30d`, `8w`, or `0` (forever). Empty (default) = `30d` on a new install and **no change** to an existing bucket; see "Raw data retention" |
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
@@ -661,6 +672,22 @@ argument. The one-minute downsample task averages **numeric fields only**
 before `mean()`, which would otherwise fail the whole run); an existing task from
 an older release is updated in place to this version.
 
+#### Prometheus data and retention
+
+Prometheus stores its metrics in `<data>/prometheus` (bind mount at `/prometheus`;
+the image runs as uid/gid 65534, so the installer creates it `65534:65534`, mode
+0750, before `compose up`). It survives container re-creation and is included in
+`vesselstackctl backup` and `restore` with the rest of the data directory.
+`PROMETHEUS_RETENTION` (default `30d`; `720h`, `30d` or `8w`; `0` is not accepted)
+sets `--storage.tsdb.retention.time`, so metrics older than the window are deleted
+automatically. `vesselstackctl doctor` fails when the directory is not writable by
+uid 65534 (fix: rerun the installer, or `sudo chown -R 65534:65534 <data>/prometheus`).
+Upgrade note: releases before 0.4.4 kept metrics in an anonymous Docker volume. That
+volume is left untouched; after updating, Prometheus starts with an empty store and the
+old history stays in the orphaned volume until you remove it with `docker volume prune`
+(nothing is copied or deleted automatically). Rollback: reinstall 0.4.3 (it uses the old
+volume again; new metrics stay in `<data>/prometheus`).
+
 #### Raw data retention
 
 The full-resolution bucket (`INFLUXDB_RAW_BUCKET`) used to keep data forever,
@@ -809,9 +836,9 @@ release packages. Settings values containing a newline, carriage return or NUL
 byte are rejected (HTTP 400, nothing written), matching the control panel.
 
 `vesselstackctl urls` reports the **real** bind state of each service from the
-listening sockets (`ss -ltn`), so the host-networked SignalK and Home Assistant
-containers show up as listening on every interface although their client URLs
-say `127.0.0.1`. It prints this machine's reachable addresses (`HOSTNAME.local`
+listening sockets (`ss -ltn`), so the host-networked SignalK (always) and Home Assistant
+(unless limited by `HOMEASSISTANT_BIND_ADDRESS`) show up as listening on every interface
+although their client URLs say `127.0.0.1`. It prints this machine's reachable addresses (`HOSTNAME.local`
 and every non-loopback IPv4 address, ignoring Docker bridges and veth links) as
 copy-pasteable URLs for the services that other devices can reach, marks
 loopback-only services "this device only" with a one-line hint on how to change
@@ -2331,37 +2358,83 @@ question in the "Who can reach what" section; `--set LAN_ACCESS=local|dashboards
 for unattended installs) and `sudo vesselstackctl lan` changes it later. The answer is
 a preset that sets the real bind settings; `LAN_ACCESS` itself is never written to a file.
 
-| Preset | Grafana, Heimdall (`VESSELSTACK_WEB_BIND_ADDRESS`) | Boat Chat (`BOAT_CHAT_HOST`) | InfluxDB, Prometheus, MQTT (`VESSELSTACK_DATA_BIND_ADDRESS`) |
-| --- | --- | --- | --- |
-| `local` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` |
-| `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` |
-| `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
+| Preset | Grafana, Heimdall (`VESSELSTACK_WEB_BIND_ADDRESS`) | Boat Chat (`BOAT_CHAT_HOST`) | InfluxDB, Prometheus, MQTT (`VESSELSTACK_DATA_BIND_ADDRESS`) | Home Assistant (`HOMEASSISTANT_BIND_ADDRESS`) |
+| --- | --- | --- | --- | --- |
+| `local` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` |
+| `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` | `0.0.0.0` |
+| `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
 
 The Control Panel (`CONTROL_PANEL_HOST`) stays on `127.0.0.1` in every preset: it is a
 root-level configuration editor; reach it through an SSH tunnel. `all` also opens
 Prometheus, which has **no login**, plus InfluxDB (token) and MQTT (password) to every
 device on the network; turn the firewall on and prefer Ethernet or a VPN as the way in.
 
-SignalK (3000) and Home Assistant (8123) run in host-network containers, so these
-presets do **not** control them: they listen on every interface in every preset
-(including `local`). Limit them with the firewall's strict mode
-(`VESSELSTACK_FIREWALL_STRICT=true`) or Home Assistant's own `http: server_host`
-setting. `sudo vesselstackctl urls` shows how every service really listens.
+**What is enforced and what is not (host-networked containers).** SignalK (3000) and Home
+Assistant (8123) run with `network_mode: host`, so Compose port bindings cannot restrict them.
+
+- **Home Assistant: enforced by `local`.** Home Assistant binds the address in
+  `http: server_host`. With `HOMEASSISTANT_BIND_ADDRESS=127.0.0.1` the installer (and
+  `vesselstackctl lan`/`ha-http sync`) adds one block to
+  `${VESSELSTACK_DATA}/homeassistant/configuration.yaml`, delimited by the lines
+  `# BEGIN VESSELSTACK MANAGED http bind ...` and `# END VESSELSTACK MANAGED http bind`,
+  containing `http:` / `server_host: 127.0.0.1`. Nothing outside those markers is ever
+  changed. On a fresh data directory the file is created with Home Assistant's stock content
+  (plus empty `automations.yaml`, `scripts.yaml`, `scenes.yaml`). Home Assistant rejects a
+  second top-level `http:` key, so if your `configuration.yaml` already has its **own**
+  `http:` section VesselStack changes nothing in it, still applies the other settings, and
+  prints the exact line to add inside your section (`server_host: 127.0.0.1`) and the restart
+  command; `vesselstackctl doctor` then warns until you do. An already-running container gets
+  the new file checked with Home Assistant's `check_config` (the previous file is restored if
+  it fails) and is the only container restarted. `dashboards` and `all` remove the block again.
+  *Security note:* the Home Assistant container runs as root and can write that directory
+  while VesselStack edits the file as root, so every read, write, restore and removal goes
+  through one small Python helper that opens the directory with `O_NOFOLLOW` (refusing
+  symlinked or group/world-writable directories), opens the file with `O_NOFOLLOW` and
+  requires a plain single-link regular file, and replaces it with a temporary file in the same
+  directory descriptor plus `rename(2)`, never following a link at the destination. A symlink,
+  hard link, unusual file or symlinked directory makes `sync` change nothing and print the
+  manual instructions (`ha-http status` shows `unsafe`). The pre-change backup is kept in the
+  root-only `/var/lib/vesselstack/ha-http-backup` (mode 0700, outside the container-writable
+  tree) and restored through the same helper; if the file or directory was swapped while
+  `check_config` ran, the restore is refused, the backup stays there and the message says so.
+  Rollback of this hardening: reinstall 0.4.3 (it has no helper; the managed block itself is
+  unchanged).
+  Only the web/API port follows the setting; other Home Assistant listeners (for example
+  discovery or HomeKit integrations you add) are outside it. Boat Chat, the telemetry indexer
+  and the installer already reach it on `http://127.0.0.1:8123`, and Home Assistant reaches
+  MQTT and InfluxDB on loopback, so nothing else depends on the LAN address.
+- **SignalK: NOT restricted by any preset (documented limitation).** Verified against the
+  pinned image (`signalk-server` v2.27.0): the server starts its HTTP/WebSocket listener with
+  `server.listen(port)` and logs `signalk-server running at 0.0.0.0:3000`; there is no
+  environment variable, `settings.json` key or command-line option for the bind address (only
+  the optional TCP stream has `TCPSTREAMADDRESS`). Running it in a bridge network would
+  restrict the port but breaks SocketCAN and local NMEA feeds, so it is not done. The only
+  VesselStack control is the firewall's strict mode (`VESSELSTACK_FIREWALL_STRICT=true`),
+  which drops port 3000 on the untrusted interface only; it is not enabled by a preset. On
+  a trusted network, or with the firewall off, SignalK stays reachable by other devices
+  even under `local`. `sudo vesselstackctl urls` shows how every service really listens.
 
 ```bash
-sudo vesselstackctl lan                      # show the current preset and the three values
+sudo vesselstackctl lan                      # show the current preset and its values
+sudo vesselstackctl ha-http status           # Home Assistant bind setting and configuration.yaml state
+sudo vesselstackctl ha-http sync             # re-apply HOMEASSISTANT_BIND_ADDRESS (repair drift)
 sudo vesselstackctl lan local --dry-run      # print what would change, change nothing
 sudo vesselstackctl lan dashboards           # apply (root); rewrites the keys atomically
 sudo vesselstackctl lan all --yes            # 'all' needs --yes
 ```
 
-`lan` rewrites `VESSELSTACK_WEB_BIND_ADDRESS` and `VESSELSTACK_DATA_BIND_ADDRESS` in
-`config/vesselstack.env` and `BOAT_CHAT_HOST` in `config/boat-chat.env` (temporary file in
+`lan` rewrites `VESSELSTACK_WEB_BIND_ADDRESS`, `VESSELSTACK_DATA_BIND_ADDRESS` and
+`HOMEASSISTANT_BIND_ADDRESS` in `config/vesselstack.env` and `BOAT_CHAT_HOST` in `config/boat-chat.env` (temporary file in
 the same directory, owner and mode kept, symlinks refused; a failure restores both files),
 then runs `compose up -d` (only containers whose published ports changed are recreated) and
-restarts `vesselstack-chat.service`. A `BOAT_CHAT_HOST` saved from Boat Chat's Settings page
+restarts `vesselstack-chat.service`; `--dry-run` prints the planned Home Assistant file action too.
+A `BOAT_CHAT_HOST` saved from Boat Chat's Settings page
 wins over `boat-chat.env`; `lan` warns when it differs. Rollback: run `lan` with the previous
-preset.
+preset (`dashboards` removes the managed Home Assistant block). Manual rollback: delete the
+lines between the BEGIN/END markers in `configuration.yaml`, set
+`HOMEASSISTANT_BIND_ADDRESS=0.0.0.0` in `config/vesselstack.env`, and `docker restart
+vesselstack-homeassistant`. The installer re-applies the setting on every run and
+upgrade: with the default `0.0.0.0` it only removes a block it previously added.
 
 **Firewall caveat (`wlan0`).** With `VESSELSTACK_FIREWALL_ENABLE=true` the interface
 `VESSELSTACK_UNTRUSTED_INTERFACE` (default `wlan0`) is untrusted: other devices that reach the

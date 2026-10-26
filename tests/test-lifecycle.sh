@@ -72,6 +72,10 @@ fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --quiet "* ]]; then
     echo fake-container-id
 fi
+if [ "${1:-}" = compose ] && [[ " $* " == *" --script check_config "* ]]; then
+    [ -z "${FAKE_HA_CHECK_HOOK:-}" ] || eval "$FAKE_HA_CHECK_HOOK"
+    [ -z "${FAKE_HA_CHECK_FAIL:-}" ] || exit 1
+fi
 if [ "${1:-}" = run ]; then
     for argument in "$@"; do
         case "$argument" in
@@ -160,7 +164,13 @@ run_ctl() {
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
 
+install -d -m 0750 -o 65534 -g 65534 "$DATA_ROOT/prometheus"
+printf 'tsdb\n' > "$DATA_ROOT/prometheus/lifecycle-marker"
 archive=$(run_ctl backup "$BACKUP_ROOT" | tail -n 1)
+tar -tzf "$archive" | grep -q '/prometheus/lifecycle-marker$' || {
+    echo 'Backup is missing the Prometheus data directory' >&2
+    exit 1
+}
 [ -s "$archive" ]
 [ -s "$archive.sha256" ]
 run_ctl verify-backup "$archive" | grep -q 'Backup verified'
@@ -418,6 +428,12 @@ run_lan() {
         VESSELSTACK_ENV="${LAN_ENV:-$LAN_ROOT/config/vesselstack.env}" FAKE_CALL_LOG="$TEST_ROOT/lan-calls.log" \
         "$REPO_ROOT/scripts/vesselstackctl" lan "$@"
 }
+run_lan_ha() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$LAN_ROOT" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        VESSELSTACK_ENV="$LAN_ROOT/config/vesselstack.env" FAKE_CALL_LOG="$TEST_ROOT/lan-calls.log" \
+        "$REPO_ROOT/scripts/vesselstackctl" ha-http "$@"
+}
+run_ctl_ha() { run_lan_ha "$@"; }
 lan_value() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
 lan_files_digest() { sha256sum "$LAN_ROOT"/config/*.env | sha256sum; }
 : > "$TEST_ROOT/lan-calls.log"
@@ -430,7 +446,11 @@ grep -q 'LAN access: dashboards -> local' <<<"$dry_output"
 grep -Eq 'VESSELSTACK_WEB_BIND_ADDRESS +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
 grep -Eq 'BOAT_CHAT_HOST \(boat-chat.env\) +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
 grep -q 'Dry run: nothing was changed' <<<"$dry_output"
-grep -q 'SignalK (3000) and Home Assistant (8123) are host-networked' <<<"$dry_output"
+grep -Eq 'HOMEASSISTANT_BIND_ADDRESS +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
+grep -q 'Home Assistant configuration.yaml: add the managed http block (server_host: 127.0.0.1)' <<<"$dry_output"
+grep -q 'SignalK (3000) is host-networked and its server has no bind-address setting' <<<"$dry_output"
+HA_CFG="$LAN_ROOT/data/homeassistant/configuration.yaml"
+test ! -e "$HA_CFG"
 [ "$(lan_files_digest)" = "$before" ] || { echo 'lan --dry-run changed the configuration' >&2; exit 1; }
 test ! -s "$TEST_ROOT/lan-calls.log"
 # local: all three bind settings move to loopback, other keys, mode and owner stay, and the
@@ -450,13 +470,133 @@ grep -q ' up -d' "$TEST_ROOT/lan-calls.log"
 grep -q 'systemctl restart vesselstack-chat.service' "$TEST_ROOT/lan-calls.log"
 grep -qx 'CONTROL_PANEL_HOST=127.0.0.1' "$LAN_ROOT/config/control-panel.env"
 grep -q 'Current LAN access: local' <<<"$(run_lan)"
+# Home Assistant: local creates the stock configuration plus exactly one delimited http block,
+# checks it inside the container and restarts only that container.
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" HOMEASSISTANT_BIND_ADDRESS)" = 127.0.0.1
+grep -qx 'default_config:' "$HA_CFG"
+grep -qx '  server_host: 127.0.0.1' "$HA_CFG"
+test "$(grep -c '^http:' "$HA_CFG")" -eq 1
+test "$(grep -c 'BEGIN VESSELSTACK MANAGED http bind' "$HA_CFG")" -eq 1
+test -f "$LAN_ROOT/data/homeassistant/automations.yaml"
+grep -q 'exec -T homeassistant python3 -m homeassistant --script check_config' "$TEST_ROOT/lan-calls.log"
+grep -q 'restart homeassistant' "$TEST_ROOT/lan-calls.log"
+grep -qx 'configuration.yaml: managed:127.0.0.1' <<<"$(run_ctl_ha status)"
 : > "$TEST_ROOT/lan-calls.log"
 grep -q 'Already set' <<<"$(run_lan local 2>&1)"
 test ! -s "$TEST_ROOT/lan-calls.log"
+ha_before=$(sha256sum "$HA_CFG")
+run_lan_ha sync >/dev/null 2>&1
+test "$(sha256sum "$HA_CFG")" = "$ha_before"
+test ! -s "$TEST_ROOT/lan-calls.log"
+printf '\n# my own\nlogger:\n  default: warning\n' >> "$HA_CFG"
 # dashboards restores the recommended state; the control panel is untouched throughout.
 run_lan dashboards >/dev/null 2>&1
+# The managed block is gone again; the owner's own lines and the stock content stay.
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" HOMEASSISTANT_BIND_ADDRESS)" = 0.0.0.0
+if grep -q 'VESSELSTACK\|server_host' "$HA_CFG"; then echo "unexpected content in $HA_CFG" >&2; exit 1; fi
+grep -qx 'logger:' "$HA_CFG"
+grep -qx 'default_config:' "$HA_CFG"
 test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_WEB_BIND_ADDRESS)" = 0.0.0.0
 test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_DATA_BIND_ADDRESS)" = 127.0.0.1
+# An owner-managed http: section is never touched: the other settings still apply, nothing is
+# written to configuration.yaml, and the exact manual step is printed.
+printf 'http:\n  server_port: 8123\n' >> "$HA_CFG"
+ha_before=$(sha256sum "$HA_CFG")
+run_lan local >/dev/null 2>"$TEST_ROOT/lan.stderr"
+test "$(sha256sum "$HA_CFG")" = "$ha_before"
+grep -q 'made NO change\|VesselStack made NO change' "$TEST_ROOT/lan.stderr"
+grep -q '    server_host: 127.0.0.1' "$TEST_ROOT/lan.stderr"
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_WEB_BIND_ADDRESS)" = 127.0.0.1
+grep -qx 'configuration.yaml: conflict' <<<"$(run_ctl_ha status)"
+run_lan dashboards >/dev/null 2>&1
+test "$(sha256sum "$HA_CFG")" = "$ha_before"
+sed -i '/^http:/,/^  server_port/d' "$HA_CFG"
+if grep -q '^http:' "$HA_CFG"; then echo "unexpected content in $HA_CFG" >&2; exit 1; fi
+
+# Hardening against the Home Assistant container (root, writes the same directory): every file
+# operation refuses symlinks, hard links and unusual files, never follows a link at the
+# destination, and keeps its backup in a root-only directory outside that tree.
+HA_DIR="$LAN_ROOT/data/homeassistant"
+HA_BACKUP="$SYSTEM_ROOT/var/lib/vesselstack/ha-http-backup"
+HA_VICTIM="$TEST_ROOT/ha-victim"
+HA_ENV="$LAN_ROOT/config/vesselstack.env"
+ha_want() { sed -i "s/^HOMEASSISTANT_BIND_ADDRESS=.*/HOMEASSISTANT_BIND_ADDRESS=$1/" "$HA_ENV"; }
+ha_fail() { echo "ha-http hardening: $1" >&2; exit 1; }
+ha_victim_intact() { [ "$(cat "$HA_VICTIM")" = 'victim-secret-line' ] || ha_fail "victim file changed ($1)"; }
+ha_no_leak() { if grep -rqF 'victim-secret-line' "$HA_DIR" "$HA_BACKUP" 2>/dev/null; then ha_fail "victim content leaked ($1)"; fi; }
+printf 'victim-secret-line\n' > "$HA_VICTIM"
+ha_want 127.0.0.1
+# 1. symlink planted at configuration.yaml: refused, victim neither read nor written.
+original_cfg=$(cat "$HA_CFG")
+rm -f "$HA_CFG"; ln -s "$HA_VICTIM" "$HA_CFG"
+run_lan_ha sync >/dev/null 2>"$TEST_ROOT/ha.stderr" || ha_fail 'sync with a symlink should refuse without failing'
+grep -q 'made NO change\|NO change' "$TEST_ROOT/ha.stderr" || ha_fail 'no refusal message for a symlink'
+[ -L "$HA_CFG" ] || ha_fail 'symlink was replaced'
+ha_victim_intact symlink; ha_no_leak symlink
+test "$(run_ctl_ha status | sed -n 's/^configuration.yaml: //p')" = unsafe
+rm -f "$HA_CFG"; printf '%s\n' "$original_cfg" > "$HA_CFG"; chmod 0640 "$HA_CFG"
+# 2. hard-linked file refused.
+ln "$HA_CFG" "$TEST_ROOT/ha-hardlink"
+run_lan_ha sync >/dev/null 2>&1 || ha_fail 'sync with a hard link should refuse without failing'
+if grep -q VESSELSTACK "$HA_CFG"; then ha_fail 'hard-linked file was modified'; fi
+test "$(run_ctl_ha status | sed -n 's/^configuration.yaml: //p')" = unsafe
+rm -f "$TEST_ROOT/ha-hardlink"
+# 3. symlinked homeassistant directory refused.
+mv "$HA_DIR" "$HA_DIR.away"; ln -s "$HA_DIR.away" "$HA_DIR"
+run_lan_ha sync >/dev/null 2>&1 || ha_fail 'sync with a symlinked directory should refuse without failing'
+if grep -q VESSELSTACK "$HA_DIR.away/configuration.yaml"; then ha_fail 'symlinked directory target was modified'; fi
+test "$(run_ctl_ha status | sed -n 's/^configuration.yaml: //p')" = unsafe
+rm -f "$HA_DIR"; mv "$HA_DIR.away" "$HA_DIR"
+# A group/world-writable directory is refused too.
+chmod 0777 "$HA_DIR"
+run_lan_ha sync >/dev/null 2>&1 || ha_fail 'sync with a writable directory should refuse without failing'
+if grep -q VESSELSTACK "$HA_CFG"; then ha_fail 'writable directory was edited'; fi
+chmod 0755 "$HA_DIR"
+# 4. failing check_config: the previous file (content, mode, owner) comes back; the backup
+# lives outside the Home Assistant directory with root-only mode while the check runs.
+if [ "$(id -u)" -eq 0 ]; then chown 1234:1234 "$HA_CFG"; fi
+before_sum=$(sha256sum < "$HA_CFG"); before_meta=$(stat -c '%a %u:%g' "$HA_CFG")
+if FAKE_HA_CHECK_FAIL=1 FAKE_HA_CHECK_HOOK="stat -c %a '$HA_BACKUP' > '$TEST_ROOT/ha-backup-mode'; ls -A '$HA_BACKUP' > '$TEST_ROOT/ha-backup-list'; ls -A '$HA_DIR' > '$TEST_ROOT/ha-dir-list'" \
+    run_lan_ha sync >/dev/null 2>"$TEST_ROOT/ha.stderr"; then ha_fail 'sync should fail when check_config rejects'; fi
+grep -q 'previous file was restored' "$TEST_ROOT/ha.stderr" || ha_fail 'no restore message'
+[ "$(sha256sum < "$HA_CFG")" = "$before_sum" ] || ha_fail 'content not restored'
+[ "$(stat -c '%a %u:%g' "$HA_CFG")" = "$before_meta" ] || ha_fail 'mode/owner not restored'
+[ "$(cat "$TEST_ROOT/ha-backup-mode")" = 700 ] || ha_fail 'backup directory is not mode 0700'
+grep -q 'configuration.yaml.orig' "$TEST_ROOT/ha-backup-list" || ha_fail 'backup not in the root-only directory'
+if grep -q 'orig\|absent\|meta' "$TEST_ROOT/ha-dir-list"; then ha_fail 'backup written inside the Home Assistant directory'; fi
+if [ -n "$(ls -A "$HA_BACKUP")" ]; then ha_fail 'backup not cleaned up after restore'; fi
+# 5. a symlink swapped in during the check: restore refuses, victim untouched, backup kept.
+if FAKE_HA_CHECK_FAIL=1 FAKE_HA_CHECK_HOOK="rm -f '$HA_CFG'; ln -s '$HA_VICTIM' '$HA_CFG'" \
+    run_lan_ha sync >/dev/null 2>"$TEST_ROOT/ha.stderr"; then ha_fail 'sync should fail (swap during check)'; fi
+grep -q 'could NOT be restored' "$TEST_ROOT/ha.stderr" || ha_fail 'no manual-restore message after a swap'
+ha_victim_intact swap; ha_no_leak swap
+[ -L "$HA_CFG" ] || ha_fail 'swapped symlink was followed or replaced'
+[ -f "$HA_BACKUP/configuration.yaml.orig" ] || ha_fail 'backup was not kept after a refused restore'
+test "$(stat -c %a "$HA_BACKUP")" = 700
+rm -f "$HA_CFG" "$HA_BACKUP"/*
+# ... and the same with the directory swapped for a symlink.
+printf '%s\n' "$original_cfg" > "$HA_CFG"
+if FAKE_HA_CHECK_FAIL=1 FAKE_HA_CHECK_HOOK="mv '$HA_DIR' '$HA_DIR.away'; ln -s '$TEST_ROOT/ha-decoy' '$HA_DIR'" \
+    run_lan_ha sync >/dev/null 2>"$TEST_ROOT/ha.stderr"; then ha_fail 'sync should fail (directory swap)'; fi
+grep -q 'could NOT be restored' "$TEST_ROOT/ha.stderr" || ha_fail 'no manual-restore message after a directory swap'
+rm -f "$HA_DIR"; mv "$HA_DIR.away" "$HA_DIR"; rm -f "$HA_BACKUP"/*
+# 6. originally missing file + failing check: removed again (by name, relative to the directory).
+rm -f "$HA_CFG"
+if FAKE_HA_CHECK_FAIL=1 run_lan_ha sync >/dev/null 2>&1; then ha_fail 'sync should fail (created file)'; fi
+[ ! -e "$HA_CFG" ] || ha_fail 'created file was not removed after a failing check'
+# 7. normal replace/remove keeps the owner's lines, mode and owner.
+printf '%s\n' "$original_cfg" > "$HA_CFG"; chmod 0640 "$HA_CFG"
+if [ "$(id -u)" -eq 0 ]; then chown 1234:1234 "$HA_CFG"; fi
+meta=$(stat -c '%a %u:%g' "$HA_CFG")
+run_lan_ha sync >/dev/null 2>&1
+grep -qx '  server_host: 127.0.0.1' "$HA_CFG"
+[ "$(stat -c '%a %u:%g' "$HA_CFG")" = "$meta" ] || ha_fail 'mode/owner changed by sync'
+ha_want 0.0.0.0
+run_lan_ha sync >/dev/null 2>&1
+if grep -q 'VESSELSTACK\|server_host' "$HA_CFG"; then ha_fail 'block not removed'; fi
+[ "$(stat -c '%a %u:%g' "$HA_CFG")" = "$meta" ] || ha_fail 'mode/owner changed by removal'
+[ "$(cat "$HA_CFG")" = "$original_cfg" ] || ha_fail 'user content changed'
+ha_victim_intact final
 test "$(lan_value "$LAN_ROOT/config/boat-chat.env" BOAT_CHAT_HOST)" = 0.0.0.0
 grep -q 'Current LAN access: dashboards' <<<"$(run_lan)"
 # all needs --yes (it opens Prometheus, which has no login); the dry run does not.
