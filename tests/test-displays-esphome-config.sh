@@ -91,7 +91,19 @@ def complex_(cfg):
     cfg["displays"]["aux"] = {"name": "Aux", "board": "waveshare-esp32-s3-touch-lcd-2.8c",
                               "pages": [{"title": "One", "layout": "single", "items": ["depth"]}]}
 
+def thresholds(cfg):
+    inst = cfg["instruments"]
+    inst["depth"]["thresholds"] = {"alarm_below": 4, "warn_below": 8, "hysteresis": 0.5}
+    inst["house_v"]["thresholds"] = {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8,
+                                     "alarm_above": 15.2}
+    inst["sog"]["label"] = HOSTILE[:16]
+    cfg["displays"]["helm"]["pages"] = [
+        {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "house_v"]},
+        {"title": "Big", "layout": "single", "items": ["house_v"]},
+    ]
+
 variant("example")
+variant("thresholds", thresholds)
 variant("complex", complex_, WIFI)
 PY
 
@@ -134,6 +146,9 @@ if ! docker run --rm "${CONTAINER_FLAGS[@]}" "${UPLOAD_SCRATCH_FLAGS[@]}" \
 fi
 check complex helm
 check complex aux
+check thresholds helm
+grep -q 'lv_obj_set_style_bg_color(id(p1_content)' "$WORK/thresholds-helm.log" \
+    || { echo "severity colour lambda missing from the validated thresholds config" >&2; fail=1; }
 
 # User text and the Wi-Fi password must arrive in the validated configuration unchanged.
 log="$WORK/complex-helm.log"

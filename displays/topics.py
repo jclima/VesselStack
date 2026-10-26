@@ -6,6 +6,7 @@ import math
 from urllib.parse import urlsplit, urlunsplit
 
 import conversions
+import severity
 from schema import DEFAULT_HEARTBEAT_S, DEFAULT_MIN_INTERVAL_MS
 
 TOPIC_ROOT = "vesselstack/v1"
@@ -23,9 +24,13 @@ def display_status_topic(username: str) -> str:
     return DISPLAY_STATUS_TOPIC.format(username=username)
 
 
-def build_payload(value, unit, state, ts, age) -> str:
-    return json.dumps({"v": value, "u": unit, "st": state, "ts": ts, "age": age},
-                      separators=(",", ":"), ensure_ascii=False)
+def build_payload(value, unit, state, ts, age, sev=None) -> str:
+    """JSON payload; ``sev`` is added (after ``st``) only when not None."""
+    body = {"v": value, "u": unit, "st": state}
+    if sev is not None:
+        body["sev"] = sev
+    body.update({"ts": ts, "age": age})
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
 def numeric(value):
@@ -44,6 +49,8 @@ class _State:
         self.state = "missing"     # current freshness
         self.pub_value = None
         self.pub_state = None
+        self.sev = None            # severity of the latest ok value (hysteresis memory); None unless ok
+        self.pub_sev = None
         self.pub_time = None
         self.dirty = False
 
@@ -70,7 +77,11 @@ class Engine:
         ok = st.state == "ok"
         age = None if st.received is None else round(max(0.0, now - st.received), 1)
         st.pub_value, st.pub_state, st.pub_time, st.dirty = st.value if ok else None, st.state, now, False
-        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age)
+        sev = None
+        if "thresholds" in inst:
+            sev = st.sev if ok and st.sev is not None else "unknown"
+            st.pub_sev = sev
+        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev)
         return (instrument_topic(iid), payload, True)
 
     def update(self, path: str, value, ts, now: float) -> list:
@@ -85,12 +96,14 @@ class Engine:
             if rounded is None:
                 continue
             st.value = rounded
+            if "thresholds" in inst:  # on the rounded value, so the colour matches the digits
+                st.sev = severity.numeric_sev(rounded, inst["thresholds"], st.sev if st.state == "ok" else None)
             st.ts = ts if isinstance(ts, str) else None
             st.received = now
             st.state = "ok"
             if st.pub_state != "ok":
                 out.append(self._emit(iid, now))
-            elif st.value != st.pub_value:
+            elif st.value != st.pub_value or st.sev != st.pub_sev:
                 if now - st.pub_time >= self._min_interval(iid):
                     out.append(self._emit(iid, now))
                 else:
@@ -103,6 +116,7 @@ class Engine:
             st = self._state[iid]
             if st.state == "ok" and now - st.received > inst["stale_after_s"]:
                 st.state = "stale"
+                st.sev = None
                 out.append(self._emit(iid, now))
             elif st.pub_time is None or st.pub_state != st.state:
                 out.append(self._emit(iid, now))

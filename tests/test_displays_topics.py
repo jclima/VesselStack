@@ -153,5 +153,80 @@ class SignalKHelperTests(unittest.TestCase):
         self.assertEqual(topics.parse_delta({"name": "hello", "version": "1"}), [])
 
 
+SEV_CONFIG = {
+    "heartbeat_s": 5,
+    "instruments": {
+        "house": {"path": "electrical.batteries.house.voltage", "convert": "none", "unit": "V", "precision": 1,
+                  "stale_after_s": 10, "min_interval_ms": 1000,
+                  "thresholds": {"alarm_below": 11.0, "warn_below": 12.0, "hysteresis": 0.5}},
+        "plain": {"path": "x.y", "convert": "none", "unit": "V", "precision": 1, "stale_after_s": 10},
+    },
+}
+HOUSE = "electrical.batteries.house.voltage"
+
+
+class SeverityPayloadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = topics.Engine(SEV_CONFIG)
+
+    def test_build_payload_field_order(self) -> None:
+        self.assertEqual(topics.build_payload(1.5, "V", "ok", TS, 0.0),
+                         '{"v":1.5,"u":"V","st":"ok","ts":"%s","age":0.0}' % TS)
+        self.assertEqual(topics.build_payload(1.5, "V", "ok", TS, 0.0, "warn"),
+                         '{"v":1.5,"u":"V","st":"ok","sev":"warn","ts":"%s","age":0.0}' % TS)
+
+    def test_sev_only_for_instruments_with_thresholds(self) -> None:
+        msgs = decode(self.engine.update(HOUSE, 13.0, TS, 100.0) + self.engine.update("x.y", 13.0, TS, 100.0))
+        self.assertEqual(msgs[0][1]["sev"], "ok")
+        self.assertNotIn("sev", msgs[1][1])
+        self.assertEqual(list(msgs[0][1]), ["v", "u", "st", "sev", "ts", "age"])
+
+    def test_sev_uses_the_rounded_value(self) -> None:
+        # 11.96 rounds to 12.0 (precision 1): not below warn_below 12.0, so ok.
+        msgs = decode(self.engine.update(HOUSE, 11.96, TS, 100.0))
+        self.assertEqual((msgs[0][1]["v"], msgs[0][1]["sev"]), (12.0, "ok"))
+
+    def test_sev_change_alone_publishes_respecting_the_rate_limit(self) -> None:
+        self.engine.update(HOUSE, 12.0, TS, 100.0)               # ok, 12.0
+        self.engine.update(HOUSE, 11.9, TS, 101.0)               # warn
+        self.assertEqual(self.engine.update(HOUSE, 11.4, TS, 102.0)[0][1].count('"warn"'), 1)  # still warn
+        msgs = decode(self.engine.update(HOUSE, 10.9, TS, 103.0))
+        self.assertEqual(msgs[0][1]["sev"], "alarm")
+        # Rate limited: a sev change inside min_interval is deferred to tick.
+        self.assertEqual(self.engine.update(HOUSE, 12.9, TS, 103.2), [])
+        house = lambda msgs: [m for m in decode(msgs) if m[0].endswith("/house")]  # noqa: E731
+        self.assertEqual(house(self.engine.tick(103.5)), [])
+        out = house(self.engine.tick(104.1))
+        self.assertEqual((out[0][1]["v"], out[0][1]["sev"]), (12.9, "ok"))
+
+    def test_hysteresis_applies_across_updates(self) -> None:
+        self.engine.update(HOUSE, 10.9, TS, 100.0)               # alarm
+        msgs = decode(self.engine.update(HOUSE, 11.3, TS, 101.5))  # inside hold zone (< 11.5)
+        self.assertEqual(msgs[0][1]["sev"], "alarm")
+        msgs = decode(self.engine.update(HOUSE, 11.6, TS, 103.0))
+        self.assertEqual(msgs[0][1]["sev"], "warn")
+
+    def test_stale_and_missing_are_unknown(self) -> None:
+        first = decode(self.engine.tick(100.0))
+        self.assertEqual(first[0][1]["st"], "missing")
+        self.assertEqual(first[0][1]["sev"], "unknown")
+        self.assertNotIn("sev", first[1][1])
+        self.engine.update(HOUSE, 13.0, TS, 101.0)
+        stale = decode(self.engine.tick(120.0))
+        house = [m for m in stale if m[0].endswith("/house")][0][1]
+        self.assertEqual((house["st"], house["v"], house["sev"]), ("stale", None, "unknown"))
+
+    def test_recovery_after_stale_has_no_hysteresis_memory(self) -> None:
+        self.engine.update(HOUSE, 10.9, TS, 100.0)               # alarm
+        self.engine.tick(120.0)                                  # stale
+        msgs = decode(self.engine.update(HOUSE, 11.3, TS, 121.0))
+        self.assertEqual(msgs[0][1]["sev"], "warn")
+
+    def test_existing_payloads_are_unchanged_without_thresholds(self) -> None:
+        engine = topics.Engine(CONFIG)
+        topic, payload, _ = engine.update(SOG, 6.4 * KN, TS, 100.0)[0]
+        self.assertNotIn("sev", payload)
+
+
 if __name__ == "__main__":
     unittest.main()

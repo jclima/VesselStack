@@ -33,6 +33,12 @@ WIFI = {"ssid": "boat-wifi", "password": "wifi-pass-123"}
 MQTT_PW = "mqtt-secret-value"
 
 
+def with_thresholds(cfg):
+    cfg["instruments"]["depth"]["thresholds"] = {"alarm_below": 4, "warn_below": 8, "hysteresis": 0.5}
+    cfg["instruments"]["house_v"]["thresholds"] = {
+        "alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8, "alarm_above": 15.2}
+
+
 def multipage(cfg):
     cfg["displays"]["helm"]["pages"] = [
         {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa"]},
@@ -102,6 +108,10 @@ class GoldenAndDeterminism(Base):
                 inst["stale_after_s"] = 14
         self.set_config(mutate)
         self.check_golden("helm-multipage-api.yaml", self.device())
+
+    def test_thresholds_match_golden(self):
+        self.set_config(with_thresholds)
+        self.check_golden("helm-thresholds.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -212,6 +222,54 @@ class Content(Base):
                 self.assertTrue(line.lstrip().startswith(("- label:", "glyphs:", "text:")) or "glyphs:" in line,
                                 line)
         self.assertNotIn("lambda", "".join(l for l in text.splitlines() if "${y}" in l))
+
+    def test_thresholds_only_touch_the_instruments_that_have_them(self):
+        base = self.device(allow_missing_wifi=True)
+        self.set_config(with_thresholds)
+        text = self.device(allow_missing_wifi=True)
+        for iid in ("sog", "awa"):
+            self.assertNotIn(f"ins_{iid}_sev", text)
+            self.assertNotIn(f"p0_{iid}_tile", text)
+        for iid in ("depth", "house_v"):
+            self.assertIn(f"ins_{iid}_sev, type: uint8_t", text)
+            self.assertIn(f"ins_{iid}_drawn_sev", text)
+            self.assertIn(f"id: p0_{iid}_tile", text)
+        self.assertNotIn("sev", base)
+
+    def test_colour_lambda_is_gated_guarded_and_literal_only(self):
+        self.set_config(with_thresholds)
+        text = self.device(allow_missing_wifi=True)
+        self.assertIn("uint8_t sev = fresh ? id(ins_depth_sev) : 0;", text)
+        self.assertIn("if (sev != id(ins_depth_drawn_sev))", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p0_depth_tile), lv_color_hex(bg), LV_PART_MAIN);", text)
+        self.assertIn("lv_obj_set_style_text_color(id(p0_depth_value), lv_color_hex(fg), LV_PART_MAIN);", text)
+        self.assertIn("(millis() - id(ins_depth_seen)) < 20000UL", text.split("uint8_t sev = fresh")[0].splitlines()[-2])
+        self.assertIn('strcmp(sv, "alarm") == 0 ? 3', text)
+        for colour in ("0x1E7B34", "0xF2A900", "0xC62828", "0x37474F", "0x9AA5B1"):
+            self.assertIn(colour, text)
+
+    def test_single_layout_colours_the_content_tile_and_every_page(self):
+        def mutate(cfg):
+            with_thresholds(cfg)
+            multipage(cfg)
+        self.set_config(mutate)
+        text = self.device()
+        self.assertIn("lv_obj_set_style_bg_color(id(p1_content), lv_color_hex(bg), LV_PART_MAIN);", text)
+        self.assertIn("lv_obj_set_style_bg_color(id(p2_house_v_tile), lv_color_hex(bg), LV_PART_MAIN);", text)
+        self.assertIn("lv_obj_set_style_text_color(id(p2_house_v_value), lv_color_hex(fg), LV_PART_MAIN);", text)
+        self.assertEqual(text.count("id: p1_content"), 1)
+        self.assertEqual(text.count("ins_house_v_drawn_sev) = sev"), 1)  # one guard for all pages
+
+    def test_hostile_label_with_thresholds_stays_literal(self):
+        hostile = '$x ${y} "q" \\ #:'
+
+        def mutate(cfg):
+            with_thresholds(cfg)
+            cfg["instruments"]["depth"]["label"] = hostile
+        self.set_config(mutate)
+        text = self.device(allow_missing_wifi=True)
+        self.assertIn(f"text: !literal {render.yq(hostile)}", text)
+        self.assertNotIn("${y}", "".join(l for l in text.splitlines() if "lambda" in l or "lv_obj" in l))
 
     def test_schema_rejects_newlines_in_labels(self):
         cfg = copy.deepcopy(EXAMPLE)

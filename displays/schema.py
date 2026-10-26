@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
 from pathlib import Path
 
@@ -20,7 +21,11 @@ SK_PATH = re.compile(r"^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z0-9_-]+)+$")
 HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 TOP_KEYS = {"schema", "mqtt_host", "heartbeat_s", "instruments", "displays"}
-INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms"}
+INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms",
+                   "thresholds", "min", "max", "alarm"}
+# Bounds in severity order; "low" bounds are checked with <, "high" bounds with >.
+THRESHOLD_BOUNDS = (("alarm_below", "low"), ("warn_below", "low"), ("warn_above", "high"), ("alarm_above", "high"))
+THRESHOLD_KEYS = {name for name, _ in THRESHOLD_BOUNDS} | {"hysteresis"}
 INSTRUMENT_REQUIRED = {"path", "label", "convert", "unit", "precision", "stale_after_s"}
 DISPLAY_KEYS = {"name", "board", "home_assistant_api", "pages"}
 DISPLAY_REQUIRED = {"name", "board", "pages"}
@@ -54,6 +59,49 @@ def valid_host(value) -> bool:
     if not all(HOST_LABEL.fullmatch(label) for label in labels):
         return False
     return not labels[-1].isdigit()  # numeric last label means a malformed IPv4 literal
+
+
+def finite_number(value) -> bool:
+    """True for int/float (not bool) that is finite."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def validate_thresholds(th, where: str, errors: list) -> None:
+    if not isinstance(th, dict):
+        errors.append(f"{where}: must be an object")
+        return
+    _unknown(th, THRESHOLD_KEYS, where, errors)
+    bounds = []
+    for name, side in THRESHOLD_BOUNDS:
+        if name not in th:
+            continue
+        if not finite_number(th[name]):
+            errors.append(f"{where}.{name}: must be a finite number")
+        else:
+            bounds.append((name, side, th[name]))
+    if not any(name in th for name, _ in THRESHOLD_BOUNDS):
+        errors.append(f"{where}: needs at least one of alarm_below, warn_below, warn_above, alarm_above")
+    if len(bounds) != sum(1 for name, _ in THRESHOLD_BOUNDS if name in th):
+        return  # a bound is not a number: ordering cannot be checked
+    gaps = []
+    for (n1, s1, v1), (n2, s2, v2) in zip(bounds, bounds[1:]):
+        if s1 == s2:
+            if v1 > v2:
+                errors.append(f"{where}: {n1} must not be greater than {n2}")
+        elif v1 >= v2:
+            errors.append(f"{where}: {n1} must be less than {n2}")
+        gaps.append(v2 - v1)
+    if "hysteresis" in th:
+        h = th["hysteresis"]
+        if not finite_number(h) or h < 0:
+            errors.append(f"{where}.hysteresis: must be a finite number >= 0")
+        elif gaps and h >= min(gaps):
+            errors.append(f"{where}.hysteresis: must be less than the smallest gap between bounds ({min(gaps)})")
 
 
 def _unknown(obj: dict, allowed: set, where: str, errors: list) -> None:
@@ -185,6 +233,16 @@ def validate_config(cfg, registry) -> list[str]:
                         errors.append(f"{where}.stale_after_s: must be at least 2 x heartbeat_s ({2 * heartbeat})")
                 if "min_interval_ms" in inst:
                     _int_range(inst, "min_interval_ms", 100, 60000, where, errors)
+                if "thresholds" in inst:
+                    validate_thresholds(inst["thresholds"], f"{where}.thresholds", errors)
+                for key in ("min", "max"):
+                    if key in inst and not finite_number(inst[key]):
+                        errors.append(f"{where}.{key}: must be a finite number")
+                if (finite_number(inst.get("min")) and finite_number(inst.get("max"))
+                        and inst["min"] >= inst["max"]):
+                    errors.append(f"{where}.min: must be less than max")
+                if "alarm" in inst and not isinstance(inst["alarm"], bool):
+                    errors.append(f"{where}.alarm: must be true or false")
 
     displays = cfg.get("displays")
     if "displays" in cfg:

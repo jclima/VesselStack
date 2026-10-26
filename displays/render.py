@@ -234,6 +234,19 @@ def _tile_widgets(ind: str, pi: int, iid: str, inst: dict, value_font: str) -> l
     ]
 
 
+# Severity palette: sev number -> (tile background, value text colour). 0 is unknown/stale.
+SEV_COLORS = {0: (0x37474F, 0x9AA5B1), 1: (0x1E7B34, 0xFFFFFF), 2: (0xF2A900, 0x000000),
+              3: (0xC62828, 0xFFFFFF)}
+
+
+def has_thresholds(inst: dict) -> bool:
+    return "thresholds" in inst
+
+
+def tile_id(pi: int, iid: str, layout: str) -> str:
+    return f"p{pi}_content" if layout == "single" else f"p{pi}_{iid}_tile"
+
+
 FLEX_COLUMN = "layout: {type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: CENTER}"
 
 
@@ -276,8 +289,10 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             "            widgets:",
         ]
         for index, iid in enumerate(page["items"]):
+            lines += ["              - obj:"]
+            if has_thresholds(config["instruments"][iid]):
+                lines += [f"                  id: {tile_id(pi, iid, 'grid-2x2')}"]
             lines += [
-                "              - obj:",
                 "                  styles: tile_style",
                 f"                  grid_cell_row_pos: {index // 2}",
                 f"                  grid_cell_column_pos: {index % 2}",
@@ -327,7 +342,14 @@ def _fonts_lines(display: dict, config: dict) -> list:
     return lines
 
 
-def _json_handler(iid: str, decimals: int) -> list:
+def _json_handler(iid: str, decimals: int, with_sev: bool = False) -> list:
+    sev_lines = []
+    if with_sev:
+        sev_lines = [
+            '            const char *sv = x["sev"] | "unknown";',
+            f'            id(ins_{iid}_sev) = strcmp(sv, "ok") == 0 ? 1 : strcmp(sv, "warn") == 0 ? 2 : '
+            'strcmp(sv, "alarm") == 0 ? 3 : 0;',
+        ]
     return [
         f"    - topic: {topics.instrument_topic(iid)}",
         "      then:",
@@ -341,8 +363,36 @@ def _json_handler(iid: str, decimals: int) -> list:
         f'              value_accuracy_to_buf(buf, x["v"].as<float>(), {decimals});',
         f"              id(ins_{iid}_val) = buf;",
         "            }",
+        *sev_lines,
         "        - script.execute: render_tiles",
     ]
+
+
+def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
+    """Guarded colour update for one thresholded instrument, on every page that shows it."""
+    limit_ms = stale_threshold_s(config["instruments"][iid], heartbeat) * 1000
+    sets = []
+    for pi, page in enumerate(display["pages"]):
+        if iid in page["items"]:
+            tile, value = tile_id(pi, iid, page["layout"]), f"p{pi}_{iid}_value"
+            sets.append((tile, value))
+    lines = [
+        "      - lambda: |-",
+        "          bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
+        f" && id(ins_{iid}_ok) && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL;",
+        f"          uint8_t sev = fresh ? id(ins_{iid}_sev) : 0;",
+        f"          if (sev != id(ins_{iid}_drawn_sev)) {{",
+        f"            id(ins_{iid}_drawn_sev) = sev;",
+        "            uint32_t bg = 0x%06X, fg = 0x%06X;" % (SEV_COLORS[0][0], SEV_COLORS[0][1]),
+    ]
+    for number in (1, 2, 3):
+        bg, fg = SEV_COLORS[number]
+        lines.append(f"            if (sev == {number}) {{ bg = 0x{bg:06X}; fg = 0x{fg:06X}; }}")
+    for tile, value in sets:
+        lines += [f"            lv_obj_set_style_bg_color(id({tile}), lv_color_hex(bg), LV_PART_MAIN);",
+                  f"            lv_obj_set_style_text_color(id({value}), lv_color_hex(fg), LV_PART_MAIN);"]
+    lines.append("          }")
+    return lines
 
 
 def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str) -> str:
@@ -377,12 +427,16 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         lines += [f'  - {{id: ins_{iid}_ok, type: bool, initial_value: "false"}}',
                   f'  - {{id: ins_{iid}_seen, type: uint32_t, initial_value: "0"}}',
                   f"  - {{id: ins_{iid}_val, type: std::string, initial_value: '\"{BLANK_VALUE}\"'}}"]
+        if has_thresholds(config["instruments"][iid]):
+            lines += [f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}',
+                      f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}']
     lines += ["", *_fonts_lines(display, config), "", "mqtt:", "  on_message:",
               f"    - topic: {topics.BRIDGE_STATUS_TOPIC}", "      then:",
               '        - lambda: \'id(bridge_online) = (x == "online");\'',
               "        - script.execute: render_tiles", "  on_json_message:"]
     for iid in used:
-        lines += _json_handler(iid, config["instruments"][iid]["precision"])
+        lines += _json_handler(iid, config["instruments"][iid]["precision"],
+                               has_thresholds(config["instruments"][iid]))
     lines += ["  on_disconnect:", "    - lambda: 'id(bridge_online) = false;'",
               "    - script.execute: render_tiles", "", "script:", "  - id: render_tiles",
               "    mode: restart", "    then:"]
@@ -397,6 +451,9 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
                 f" && id(ins_{iid}_ok) && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL;",
                 f"            return fresh ? id(ins_{iid}_val) : std::string(\"{BLANK_VALUE}\");",
             ]
+    for iid in used:
+        if has_thresholds(config["instruments"][iid]):
+            lines += _sev_lines(config, display, iid, heartbeat)
     lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles",
               "", "lvgl:", "  displays: [board_display]", "  touchscreens: [board_touch]",
               "  buffer_size: 100%", "  style_definitions:", "    - id: tile_style",

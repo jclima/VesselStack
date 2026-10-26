@@ -2,7 +2,9 @@
 # Optional (not in CI): renders the example display with placeholder Wi-Fi values and
 # runs a full "esphome compile" with the pinned image. The first run downloads the
 # ESP-IDF toolchain (about 2 GB) into CACHE_DIR; the build adds about 600 MB.
-# Usage: tests/compile-display-firmware.sh [CACHE_DIR]   (default: a Docker volume)
+# Usage: [DISPLAYS_COMPILE_CONFIG=FILE] tests/compile-display-firmware.sh [CACHE_DIR]
+#   (default cache: a Docker volume; default config: displays/displays.example.json, e.g. set
+#   DISPLAYS_COMPILE_CONFIG=displays/displays.dashboard.example.json to compile with thresholds)
 
 set -euo pipefail
 
@@ -18,14 +20,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 -I - "$REPO_ROOT" "$WORK" <<'PY'
+python3 -I - "$REPO_ROOT" "$WORK" "${DISPLAYS_COMPILE_CONFIG:-$REPO_ROOT/displays/displays.example.json}" <<'PY'
 import json, shutil, sys
 from pathlib import Path
-repo, work = Path(sys.argv[1]), Path(sys.argv[2])
+repo, work, source = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 sys.path.insert(0, str(repo / "displays"))
 import lifecycle, render
 (work / "config").mkdir()
-shutil.copy(repo / "displays" / "displays.example.json", work / "config" / "displays.json")
+shutil.copy(source, work / "config" / "displays.json")
 (work / "config" / "displays.secrets.json").write_text(json.dumps(
     {"schema": 1, "bridge": {}, "displays": {"helm": {"mqtt_password": "compile-test"}}}))
 ctx = lifecycle.Context(root=work, require_root=False, out=lambda text: None)

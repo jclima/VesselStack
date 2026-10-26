@@ -1698,7 +1698,8 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   `vessels.self` (numeric scalar values only), `label` (1-16 characters),
   `convert` (one named conversion), `unit` (up to 8 characters), `precision`
   (0-3), `stale_after_s` (1-3600 and at least 2 x `heartbeat_s`) and optional
-  `min_interval_ms` (100-60000, default 1000).
+  `min_interval_ms` (100-60000, default 1000), `thresholds`, `min`, `max`
+  and `alarm` (see [Thresholds and severity colours](#thresholds-and-severity-colours)).
 - A display (`^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$`: 1-24 characters, starting with a letter and not ending in a hyphen) has a `name`, a `board` from
   `displays/boards/registry.json`, optional `home_assistant_api` (boolean) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
@@ -1722,6 +1723,58 @@ python3 displays/displayctl.py validate /path/to/displays.json
 Exit status is `0` valid, `1` validation errors (nothing is written), `2`
 usage, file or JSON parse errors.
 
+#### Thresholds and severity colours
+
+An instrument may carry optional `thresholds` so its tile changes colour with
+the value. All numbers are in **display units** (after `convert`, for example
+knots or feet, not SignalK SI units) and must be finite JSON numbers (booleans
+are rejected):
+
+```json
+"house_v": {"path": "electrical.batteries.house.voltage", "label": "House", "convert": "none",
+            "unit": "V", "precision": 2, "stale_after_s": 30,
+            "thresholds": {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8,
+                           "alarm_above": 15.2, "hysteresis": 0.1},
+            "min": 10, "max": 16}
+```
+
+- `thresholds` holds at least one of `alarm_below`, `warn_below`, `warn_above`
+  and `alarm_above`, plus an optional `hysteresis`. The bounds present must be
+  ordered `alarm_below <= warn_below < warn_above <= alarm_above`, and
+  `hysteresis` is `0 <=` it `<` the smallest gap between the bounds present
+  (equal bounds therefore allow only `0`). Any single bound is allowed, for
+  example only `warn_below` for a fresh-water tank.
+- A value below `warn_below` is `warn`, below `alarm_below` is `alarm`; above
+  `warn_above` is `warn`, above `alarm_above` is `alarm`; otherwise `ok`. A
+  value exactly on a bound is still on the safe side. The alarm bounds are
+  checked first. The value tested is the **rounded** published value, so the
+  colour always matches the digits on screen.
+- Hysteresis applies only when the severity gets less severe: leaving `alarm`
+  (or `warn`) needs the value to clear the bound by `hysteresis`. With
+  `alarm_below: 11.8` and `hysteresis: 0.1` an `alarm` ends at 11.9 or above
+  (not at 11.8). Getting more severe is immediate. After the value was
+  `stale` or `missing` there is no memory: the first value is judged on the
+  bounds alone.
+- `min` and `max` (finite, `min < max`) and `alarm` (boolean, meaning "this
+  instrument may raise an alarm", default true when `thresholds` is present)
+  are validated and stored now; widgets that use them (gauges, alarm
+  indications) come in later releases. They change nothing on the screen yet.
+- Colours on the tile (background / value text): `ok` green `0x1E7B34` /
+  white, `warn` amber `0xF2A900` / black, `alarm` red `0xC62828` / white. A
+  tile that shows `--` (bridge offline, MQTT disconnected, `st` not `ok` or no
+  message within the staleness threshold) is always grey `0x37474F` / `0x9AA5B1`,
+  never green. Instruments without `thresholds` keep the plain `0x101820`
+  tile and their generated firmware is unchanged.
+- The `single` and `grid-2x2` layouts support colours. Only the tile background
+  and the value digits change; the label and unit keep their grey.
+
+[`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
+is an example with thresholds on depth, battery voltages and tank levels
+(two grid pages). New firmware is needed to see colours: `vesselstackctl
+display build ID` and then `display flash ID --ota HOST` or `--serial DEVICE`.
+Rollback: remove `thresholds` from the instruments and rebuild and reflash, or
+flash the previous firmware (`display flash ID --previous ...`).
+
 ### MQTT topics and freshness
 
 Values are published retained to `vesselstack/v1/instruments/<instrument_id>`
@@ -1732,6 +1785,15 @@ bridge received the value, measured on the bridge clock, not the SignalK
 timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/<username>/status`.
 
+- `sev` (optional): instruments that have `thresholds` also publish
+  `"sev":"ok"|"warn"|"alarm"|"unknown"`, placed after `st` (for example
+  `{"v":12.1,"u":"V","st":"ok","sev":"warn","ts":"...","age":0.4}`). It is
+  `unknown` whenever `st` is not `ok`. Instruments without `thresholds` have no
+  `sev` field and their payloads are byte-for-byte unchanged, so this is
+  backward compatible: firmware built before this feature ignores `sev` and
+  keeps working, but new firmware (a rebuild and reflash) is needed to show the
+  colours. A change of `sev` is published like a value change (at most once per
+  `min_interval_ms`).
 - `ok`: a value was received within `stale_after_s`.
 - `stale`: nothing received for more than `stale_after_s`; published
   immediately on the transition, with `v` null.

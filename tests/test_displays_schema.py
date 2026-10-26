@@ -185,5 +185,66 @@ class CliTests(unittest.TestCase):
             self.assertEqual(self.run_cli("validate", str(path)).returncode, 2)
 
 
+class ThresholdTests(unittest.TestCase):
+    def assertError(self, mutate, fragment):
+        errors = errors_for(mutate)
+        self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
+
+    def ok(self, **extra):
+        def mutate(cfg):
+            inst(cfg).update(extra)
+        self.assertEqual(errors_for(mutate), [])
+
+    def th(self, **bounds):
+        return lambda cfg: inst(cfg).update(thresholds=bounds)
+
+    def test_valid_shapes(self) -> None:
+        self.ok(thresholds={"alarm_below": 1, "warn_below": 2, "warn_above": 8.5, "alarm_above": 9, "hysteresis": 0.4})
+        self.ok(thresholds={"warn_below": 2})
+        self.ok(thresholds={"alarm_above": 2, "hysteresis": 100})
+        self.ok(thresholds={"alarm_below": 2, "warn_below": 2})
+        self.ok(thresholds={"alarm_below": -5, "alarm_above": 5}, min=-10, max=10, alarm=False)
+        self.assertEqual(schema.validate_config(
+            schema.load_json(ROOT / "displays" / "displays.dashboard.example.json"), REGISTRY), [])
+
+    def test_thresholds_must_be_a_non_empty_object_with_a_bound(self) -> None:
+        self.assertError(lambda c: inst(c).update(thresholds=[]), "thresholds: must be an object")
+        self.assertError(self.th(), "needs at least one")
+        self.assertError(self.th(hysteresis=1), "needs at least one")
+        self.assertError(self.th(warn_below=1, bogus=2), "thresholds.bogus: unknown key")
+
+    def test_numbers_are_finite_and_not_bool(self) -> None:
+        for bad in (True, "1", None, float("nan"), float("inf"), 10 ** 400):
+            self.assertError(self.th(warn_below=bad), "warn_below: must be a finite number")
+            self.assertError(self.th(warn_below=1, hysteresis=bad), "hysteresis: must be a finite number")
+            self.assertError(lambda c, b=bad: inst(c).update(min=b), "min: must be a finite number")
+            self.assertError(lambda c, b=bad: inst(c).update(max=b), "max: must be a finite number")
+
+    def test_ordering(self) -> None:
+        self.assertError(self.th(alarm_below=3, warn_below=2), "alarm_below must not be greater than warn_below")
+        self.assertError(self.th(warn_above=3, alarm_above=2), "warn_above must not be greater than alarm_above")
+        self.assertError(self.th(warn_below=3, warn_above=3), "warn_below must be less than warn_above")
+        self.assertError(self.th(warn_below=4, warn_above=3), "warn_below must be less than warn_above")
+        self.assertError(self.th(alarm_below=5, alarm_above=4), "alarm_below must be less than alarm_above")
+        self.assertError(self.th(alarm_below=1, warn_above=1), "alarm_below must be less than warn_above")
+
+    def test_hysteresis(self) -> None:
+        self.assertError(self.th(warn_below=1, hysteresis=-0.1), "hysteresis: must be a finite number >= 0")
+        self.assertError(self.th(warn_below=1, warn_above=2, hysteresis=1), "smallest gap")
+        self.assertError(self.th(alarm_below=1, warn_below=1.5, warn_above=9, hysteresis=0.5), "smallest gap")
+        self.assertError(self.th(alarm_below=2, warn_below=2, hysteresis=0.1), "smallest gap")
+        self.ok(thresholds={"warn_below": 1, "warn_above": 2, "hysteresis": 0.99})
+
+    def test_min_max_alarm(self) -> None:
+        self.assertError(lambda c: inst(c).update(min=5, max=5), "min: must be less than max")
+        self.assertError(lambda c: inst(c).update(min=6, max=5), "min: must be less than max")
+        self.assertError(lambda c: inst(c).update(alarm=1), "alarm: must be true or false")
+        self.assertError(lambda c: inst(c).update(alarm="true"), "alarm: must be true or false")
+        self.ok(min=0, max=1)
+
+    def test_unknown_instrument_keys_still_rejected(self) -> None:
+        self.assertError(lambda c: inst(c).update(threshold={"warn_below": 1}), "threshold: unknown key")
+
+
 if __name__ == "__main__":
     unittest.main()
