@@ -68,6 +68,7 @@ if grep -vE '^$|^#|^[A-Za-z0-9._-]+==[0-9][0-9.]* \\$|^    --hash=sha256:[0-9a-f
 fi
 grep -q -- '--require-hashes' "$ROOT/scripts/install-displays-venv.sh"
 grep -q '^RestartPreventExitStatus=2 3$' "$ROOT/systemd/vesselstack-displays-bridge.service.in"
+grep -q '^MemoryMax=128M$' "$ROOT/systemd/vesselstack-displays-bridge.service.in"
 test -s "$ROOT/docs/INSTALLATION.md"
 test -s "$ROOT/docs/BOM.md"
 test -s "$ROOT/wizard/index.html"

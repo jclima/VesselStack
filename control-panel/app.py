@@ -122,7 +122,7 @@ FIELDS = [
     field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
     field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
     field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
-    field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", "Displays", kind="secret", description="Optional. A long-lived access token of a dedicated non-admin Home Assistant user, needed only for Home Assistant items (ha) in displays.json. Leave blank otherwise."),
+    field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", "Displays", kind="secret", description="Optional, only for Home Assistant items (ha) in displays.json; leave blank otherwise. A leaked token can operate every device in your Home Assistant; a non-admin user only prevents configuration changes. Keep it on the Pi (root-only), never reuse it, and revoke it in Home Assistant (Profile -> Security) if it leaks."),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
     field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),

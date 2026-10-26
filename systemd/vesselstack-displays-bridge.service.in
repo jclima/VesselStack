@@ -32,6 +32,9 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictRealtime=true
 SystemCallArchitectures=native
+# A runaway bridge is stopped (and restarted by Restart=) before it can starve the Pi.
+MemoryHigh=96M
+MemoryMax=128M
 
 [Install]
 WantedBy=multi-user.target

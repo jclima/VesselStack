@@ -625,7 +625,28 @@ def ha_warnings(config_path: Path | None, enabled: bool, env: dict) -> list[str]
         topics.ha_websocket_url(url)
     except ValueError as exc:
         out.append(f"HOME_ASSISTANT_URL is not usable for Home Assistant items: {exc}")
+    else:
+        if cleartext_remote(url):
+            out.append("HOME_ASSISTANT_URL uses http:// to a non-loopback host: the access token is sent in "
+                       "clear text over the network; use https:// (wss), or run the bridge on the Home "
+                       "Assistant host (loopback)")
     return out
+
+
+def cleartext_remote(url: str) -> bool:
+    """True for an http:// / ws:// URL whose host is not loopback (localhost, 127.0.0.0/8, ::1)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ("http", "ws"):
+        return False
+    host = (parts.hostname or "").rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True        # a name other than localhost
 
 
 def preflight(root: Path, env: dict, compose: Path | None = None,

@@ -492,7 +492,7 @@ nano vesselstack.env
 | `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
 | `DISPLAYS_BRIDGE_MQTT_USERNAME` | Bridge account name, 1-64 letters, numbers, dot, underscore or hyphen; default `vesselstack-bridge`; must differ from `MQTT_USERNAME` (the Control Panel rejects a collision when displays are enabled, and the installer preflight rejects it) |
 | `DISPLAYS_SIGNALK_TOKEN` | Optional SignalK access token for the displays bridge, sent as `Authorization: Bearer`; leave empty unless SignalK security requires it; must not contain line breaks or any other control character (the Control Panel and the installer both refuse them) |
-| `DISPLAYS_HA_TOKEN` | Optional long-lived access token of a dedicated **non-admin** Home Assistant user, used only by the displays bridge for Home Assistant items (`ha` in `displays.json`, see [Home Assistant items](#home-assistant-items)); the bridge connects to `HOME_ASSISTANT_URL` (default `http://127.0.0.1:8123`). Stored only in the root-only 0600 `config/displays-bridge.env`, never logged; same rule as the SignalK token: no line breaks or other control characters. Different from `HOME_ASSISTANT_TOKEN` (Boat Chat) |
+| `DISPLAYS_HA_TOKEN` | Optional long-lived access token of a dedicated Home Assistant user (a leaked token can operate every device in that Home Assistant; see [Home Assistant items](#home-assistant-items)), used only by the displays bridge for Home Assistant items (`ha` in `displays.json`, see [Home Assistant items](#home-assistant-items)); the bridge connects to `HOME_ASSISTANT_URL` (default `http://127.0.0.1:8123`). Stored only in the root-only 0600 `config/displays-bridge.env`, never logged; same rule as the SignalK token: no line breaks or other control characters. Different from `HOME_ASSISTANT_TOKEN` (Boat Chat) |
 | Terminal wizard and `--set` | The `DISPLAYS_*` settings are asked under "Advanced settings" (the bridge user name and the two tokens only when displays are enabled; the tokens are hidden and optional) and can be set headless, for example `--set DISPLAYS_ENABLE=true`; they are kept when you re-run the wizard |
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
@@ -2309,17 +2309,32 @@ is an optional extra: SignalK instruments and notifications work whether or not 
 reachable. It has been verified against a fake HA server in the integration tests, not
 yet against a real Home Assistant.
 
-**Create the token.** In HA create a dedicated **non-admin** user (Settings, People,
-Users) that can see the entities you want, sign in as that user and create a
-long-lived access token (Profile, Security, Long-lived access tokens). A long-lived
-token is *not* read-only: it carries every right of its user, which is why the user
-must not be an administrator, and why you should revoke the token in HA if it leaks.
+**Create the token.** In HA create a dedicated user (Settings, People, Users), sign in
+as that user and create a long-lived access token (Profile, Security, Long-lived
+access tokens). **HA has no per-entity permissions:** a long-lived token is not
+read-only and not limited to the entities you list in `ha`. A leaked token can read
+every entity and call every service, so it can operate every device in your HA (locks,
+switches, alarm panels). A non-admin user only prevents configuration changes
+(users, integrations, add-ons); it does not restrict devices. Keep the token on the
+Pi (root-only), never reuse it elsewhere, and revoke it in HA (Profile, Security) if it
+leaks. The bridge itself only reads: it subscribes to the configured entities and never
+calls a service.
 Then set it, with the URL if HA is not on the Pi:
 
 - `DISPLAYS_HA_TOKEN` in `/opt/vesselstack/config/vesselstack.env`, the Control Panel
   (Displays section, hidden field) or the terminal wizard (advanced settings, hidden
   input); and `HOME_ASSISTANT_URL` (default `http://127.0.0.1:8123`; `https://` is
   used as `wss://`, credentials in the URL are refused).
+- **Cleartext warning.** The token is sent in the first websocket message. Over
+  `http://` (`ws://`) to a host that is not loopback (`localhost`, `127.0.0.0/8`,
+  `::1`) it crosses the network unencrypted; the installer preflight
+  (`displayctl.py preflight`, `--dry-run` too) warns about it, without failing. Use
+  `https://`, or keep HA on the Pi. `wss://` verifies the certificate against the
+  system trust store; there is no custom-CA option. For a self-signed HA, point the bridge
+  at HA on loopback or add the CA to the Pi's system store.
+- **Redirects are refused.** The HA (and SignalK) websocket upgrade does not follow HTTP
+  redirects (websockets 17.3 would follow them, even to another host, which would
+  hand the token to that host); point `HOME_ASSISTANT_URL` at the final address.
 - Re-run the installer (or Control Panel Apply). The token is written only to the
   root-only 0600 `config/displays-bridge.env` (included in backups, like the SignalK
   token) and sent once in the websocket `auth` message; the bridge never logs it,
@@ -2395,6 +2410,27 @@ rule (see [MQTT access control](#mqtt-access-control)). The bridge uses HA's
 HA that lacks it; it reconnects with a 1-30 s jittered backoff, and after
 `auth_invalid` retries every 5 minutes.
 
+**Limits and flooding.** One HA websocket message may be at most 2 MiB (larger frames
+close the connection and it reconnects). `subscribe_entities` only sends the entities
+named in `ha`, so this is ample; the `get_states` fallback (an HA from before 2022 that lacks
+`subscribe_entities`) returns every entity of the installation, so a very large
+installation can exceed 2 MiB there and will not connect: upgrade HA to use
+`subscribe_entities`. The client keeps only the latest state per configured entity
+(a repeated or flapping entity, or a hostile frame, cannot grow memory or the work per
+pass) and the bridge applies the queued states once per 0.25 s pass and re-evaluates the
+alarm summary once per pass. A state that came and went inside one pass is not published
+separately; the item topic, the summary and the takeover always show the current state.
+The systemd unit sets `MemoryHigh=96M` and `MemoryMax=128M` so a runaway bridge is
+restarted instead of starving the Pi.
+
+**One item can make the boat-wide summary `unknown`.** An item counts in the
+[alarm summary](#alarm-summary-and-takeover) unless it has `"alarm": false`. While HA
+is down or restarting, or when `DISPLAYS_HA_TOKEN` is missing or rejected, every
+counted HA item is `unknown`, so the summary `max` is at least `unknown` (never
+`ok`). Set `"alarm": false` on informational items (cabin temperature, weather,
+health) so an HA restart does not change the boat-wide state; keep the default for items
+you want a dead feed to flag.
+
 **What changes.** Opt-in per item. The bridge process gains one outbound websocket
 to HA and one thread; Mosquitto's ACL gains `ha/#` (applied by the next installer or
 `vesselstackctl display sync-mqtt`). Display firmware must be rebuilt and reflashed
@@ -2413,7 +2449,7 @@ empty` means it was never set. `disconnected` repeating means HA is unreachable 
 `HOME_ASSISTANT_URL` (check it from the Pi; the bridge runs on the host, so
 `127.0.0.1` is right only when HA listens there). An item stuck on `--` with the bridge
 `connected`: the `entity_id` is wrong, not visible to the token's user, or its state is
-`unknown`/`unavailable`. An unexpected word means the state matched an earlier entry or
+`unknown`/`unavailable`. Close reasons and exception text from HA are never logged (class name and numeric code only). An unexpected word means the state matched an earlier entry or
 fell to `default`. Rollback: remove the `ha` items (or clear `DISPLAYS_HA_TOKEN`),
 re-run the installer, rebuild and reflash, or flash the previous firmware; the `ha/#`
 ACL rule is harmless.

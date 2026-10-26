@@ -587,6 +587,14 @@ class MqttAuthTests(unittest.TestCase):
         creds = self.preflight(DISPLAYS_HA_TOKEN="tok", HOME_ASSISTANT_URL="http://u" + ":pw-secret@ha.local")
         self.assertEqual(len(creds), 1)
         self.assertNotIn("pw-secret", creds[0])
+        for url in ("http://127.0.0.1:8123", "http://127.5.5.5", "http://localhost:8123", "ws://[::1]:8123",
+                    "https://ha.example"):
+            self.assertEqual(self.preflight(DISPLAYS_HA_TOKEN="tok", HOME_ASSISTANT_URL=url), [], url)
+        for url in ("http://203.0.113.7:8123", "http://homeassistant.local:8123", "ws://ha.example"):
+            clear = self.preflight(DISPLAYS_HA_TOKEN="tok", HOME_ASSISTANT_URL=url)
+            self.assertEqual(len(clear), 1, url)
+            self.assertIn("clear text", clear[0])
+            self.assertNotIn("tok", clear[0].replace("token", ""))
         self.assertEqual(self.preflight(enabled="false"), [])          # displays off: nothing to warn about
         write_displays(self.config, ["helm"])
         self.assertEqual(self.preflight(), [])                          # no ha items: silent as before
