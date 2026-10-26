@@ -1699,6 +1699,7 @@ Security and behaviour decisions:
   labels and units plus digits, `.`, `-` and space. A character the font lacks
   is rejected by `render`, `export` and `displayctl.py validate` with the
   instrument and code point.
+  Icons use a second bundled font, see [Icons](#icons).
 - **`mqtt_host` and mDNS.** The generated MQTT client uses lwIP's resolver
   (`esphome/components/mqtt/mqtt_client.cpp`, `start_dnslookup_`). On ESP-IDF
   ESPHome enables `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES` by default
@@ -1760,7 +1761,7 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   `convert` (one named conversion), `unit` (up to 8 characters), `precision`
   (0-3), `stale_after_s` (1-3600 and at least 2 x `heartbeat_s`) and optional
   `min_interval_ms` (100-60000, default 1000), `thresholds`, `min`, `max`
-  and `alarm` (see [Thresholds and severity colours](#thresholds-and-severity-colours)).
+  and `alarm` (see [Thresholds and severity colours](#thresholds-and-severity-colours)). Instruments, notifications and Home Assistant items also take an optional `icon` (see [Icons](#icons)).
 - A display (`^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$`: 1-24 characters, starting with a letter and not ending in a hyphen) has a `name`, a `board` from
   `displays/boards/registry.json`, optional `home_assistant_api` (boolean),
   optional `ui` (see [Alarm summary and takeover](#alarm-summary-and-takeover) and
@@ -2416,6 +2417,57 @@ empty` means it was never set. `disconnected` repeating means HA is unreachable 
 fell to `default`. Rollback: remove the `ha` items (or clear `DISPLAYS_HA_TOKEN`),
 re-run the installer, rebuild and reflash, or flash the previous firmware; the `ha/#`
 ACL rule is harmless.
+
+#### Icons
+
+An instrument, a notification or a Home Assistant item may carry an optional
+`"icon": "<name>"`, drawn next to its label. The name must be one of the Material
+Symbols (Outlined) icons bundled with VesselStack; `displayctl.py validate`,
+`render` and `build` reject anything else and list a few valid names. The bundled
+names are the keys of `displays/esphome/fonts/icons.json` (name to Unicode code
+point):
+
+`air`, `anchor`, `battery_alert`, `battery_charging_full`, `battery_full`, `bolt`, `check_circle`, `directions_boat`, `electrical_services`, `engineering`, `error`, `explore`, `home`, `local_gas_station`, `location_on`, `navigation`, `notifications`, `oil_barrel`, `power`, `sailing`, `sensors`, `settings`, `solar_power`, `speed`, `thermostat`, `warning`, `water`, `water_drop`, `wifi`.
+
+```json
+"fuel": {"path": "tanks.fuel.0.currentLevel", "label": "Fuel", "icon": "local_gas_station", ...}
+```
+
+- **Placement.** `grid-2x2` and `single` tiles, `gauge-arc` and `electrical` rows
+  show the icon (28 px) left of the label (an `electrical` page keeps the names
+  aligned by reserving the icon column in every row once one item has an icon);
+  `tank-bars` columns show it above the label (28 px); a `status-grid` of up to
+  six items shows it above the label (40 px with 2 x 2 cells, 28 px with 3 x 2),
+  a 3 x 3 grid (7-9 items) left of the label (28 px) with the label narrowed to
+  the rest of the cell. Items without an icon render exactly as before.
+- **Colour.** An icon has the colour of its label (grey by day, dark red in the
+  night palette, repainted by the existing night script) and never changes with
+  severity. Icons are static glyph labels written at render time (`!literal`
+  Unicode escapes); nothing from MQTT is shown through them.
+- **Firmware cost.** The font is only added to a display's project when an item on
+  one of its pages has an icon (the render then also copies
+  `MaterialSymbols-subset.ttf` and its license into the project and the export
+  archive), with one 4 bpp font per size in use (`font_icons` at 28 px,
+  `font_icons_lg` at 40 px) holding exactly the used glyphs. Without icons the
+  generated files are byte-identical to earlier releases. `displays.dashboard.example.json`
+  uses 18 different icons: the example firmware grows from 1212499 to 1221991 bytes of flash (+9492, about 9.3 kB) and from 127227 to 127459 bytes of RAM (+232).
+- **Licence.** The font is a subset of Google's Material Symbols (Apache License
+  2.0). `displays/esphome/fonts/LICENSE-MaterialSymbols.txt` carries the licence
+  text and `THIRD_PARTY_NOTICES.md` the source (the upstream commit) and the
+  modifications.
+- **Regenerating the subset.** `scripts/build-icon-font.py` rebuilds
+  `MaterialSymbols-subset.ttf` and `icons.json` from the upstream variable font
+  (one static instance: FILL 1, wght 500, GRAD 0, opsz 48, then subset to the
+  names listed in the script). It needs `fontTools` in a throw-away virtual
+  environment and the upstream `MaterialSymbolsOutlined[FILL,GRAD,opsz,wght].ttf`
+  and `.codepoints` files from the commit named in `THIRD_PARTY_NOTICES.md`; it is
+  not run at install time or in CI, and the tests only check that every code
+  point in `icons.json` is in the committed font. To add an icon, add its name to
+  `ICONS` in the script, run it, and commit the three regenerated files.
+- **Limits and rollback.** Hardware appearance (legibility of the 28 px icons,
+  alignment in the round corners) is not verified on a device. Firmware must be
+  rebuilt and reflashed to show icons. Rollback: remove the `icon` keys, rebuild
+  and reflash, or flash the previous firmware.
 
 #### Board registry schema 2
 
