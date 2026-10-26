@@ -57,7 +57,9 @@ HA_DISABLED = "disabled"
 DEFAULT_HA_URL = "http://127.0.0.1:8123"
 HA_TICK_INTERVAL_S = 0.25       # with Home Assistant items the loop looks at the queue four times a second
 HA_DRAIN_LIMIT = 1000
-HA_MAX_MESSAGE_BYTES = 32 * 1024 * 1024    # a get_states fallback returns every entity of the instance
+HA_MAX_MESSAGE_BYTES = 2 * 1024 * 1024     # one websocket message from Home Assistant; subscribe_entities only
+                                           # sends the configured entities, so this is ample (a get_states
+                                           # fallback on a very large installation can exceed it: see the README)
 
 
 class SettingsError(Exception):
@@ -65,7 +67,7 @@ class SettingsError(Exception):
 
 
 class SourceClosed(Exception):
-    """The SignalK connection ended (cleanly or not)."""
+    """The SignalK connection ended (cleanly or not). The text never carries the peer's close reason."""
 
 
 @dataclass(frozen=True)
@@ -241,9 +243,29 @@ class Bridge:
             self.publisher.publish(topics.BRIDGE_HA_TOPIC, state, True, qos=1)
 
     def _drain_ha(self):
-        """Apply what the Home Assistant thread queued; the main thread is the only one touching engines."""
+        """Apply what the Home Assistant thread queued; the main thread is the only one touching engines.
+
+        States are coalesced per drain (the latest one per entity between two connection events wins)
+        and the alarm summary is evaluated once per drain, so a flapping sensor or a flood costs one
+        engine update per entity per pass. The item topic and the summary always reflect the latest
+        state; a state that came and went within one pass (at most HA_TICK_INTERVAL_S, and only after
+        the client thread has already collapsed it) is not published separately.
+        """
         if self._ha is None:
             return
+        pending: dict = {}
+        touched = False
+
+        def flush():
+            nonlocal touched
+            for entity_id, state in pending.items():
+                try:
+                    self._send(self.has.set_state(entity_id, state, self._summary_ts(), self.clock()))
+                    touched = True
+                except Exception as exc:  # one bad queue item must not cost the SignalK stream
+                    LOG.warning("dropped an unprocessable Home Assistant update: %s", type(exc).__name__)
+            pending.clear()
+
         for _ in range(HA_DRAIN_LIMIT):
             try:
                 item = self._ha.queue.get_nowait()
@@ -251,12 +273,17 @@ class Bridge:
                 break
             try:
                 if item[0] == "update":
-                    self._send(self.has.set_state(item[1], item[2], self._summary_ts(), self.clock()))
-                    self._publish_summary(self.clock())
+                    if not isinstance(item[1], str) or len(item) != 3:
+                        raise ValueError("malformed update")
+                    pending[item[1]] = item[2]
                 elif item[0] in (HA_CONNECTED, HA_DISCONNECTED, HA_DISABLED):
+                    flush()
                     self._set_ha(item[0])
-            except Exception as exc:  # one bad queue item must not cost the SignalK stream
+            except Exception as exc:
                 LOG.warning("dropped an unprocessable Home Assistant update: %s", type(exc).__name__)
+        flush()
+        if touched:
+            self._publish_summary(self.clock())
 
     def _summary_ts(self):
         return self._wall().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -431,6 +458,29 @@ class Bridge:
 
 
 # -- real adapters ----------------------------------------------------------
+def closed_text(exc) -> str:
+    """"connection closed (code N)": the close code only, never the peer-controlled reason text."""
+    received = getattr(exc, "rcvd", None)
+    code = getattr(received, "code", None)
+    return f"connection closed (code {code})" if isinstance(code, int) else "connection closed"
+
+
+def open_without_redirects(connect, url, **options):
+    """websockets' sync connect() that refuses HTTP redirects during the upgrade.
+
+    websockets 17 follows up to 10 redirects, cross-origin ones included (it only forbids a TLS
+    downgrade and strips Authorization/Cookie headers). Home Assistant's token travels in a message
+    after the upgrade, so a redirect to another host would receive it: any 3xx is an error instead.
+    """
+    connecter = connect(url, legacy=False, **options)
+    if not callable(getattr(connecter, "process_redirect", None)):
+        raise RuntimeError("unsupported websockets version: cannot disable redirects")
+    connecter.process_redirect = lambda exc: exc      # "not a redirect": the InvalidStatus is raised as is
+    connection = connecter.connect()
+    connection.pending_legacy_warning = False
+    return connection
+
+
 class WebsocketSource:
     def __init__(self, connection, closed_exc):
         self._ws = connection
@@ -440,7 +490,7 @@ class WebsocketSource:
         try:
             self._ws.send(text)
         except self._closed_exc as exc:
-            raise SourceClosed(str(exc)) from None
+            raise SourceClosed(closed_text(exc)) from None
 
     def recv(self, timeout):
         try:
@@ -448,7 +498,7 @@ class WebsocketSource:
         except TimeoutError:
             return None
         except self._closed_exc as exc:
-            raise SourceClosed(str(exc)) from None
+            raise SourceClosed(closed_text(exc)) from None
 
     def close(self):
         self._ws.close()
@@ -462,11 +512,9 @@ def websocket_connector(base_url, token):
     headers = signalk_headers(token)
 
     def open_connection():
-        # legacy=True is websockets' documented "return the connection directly" mode
-        # (the default today, but deprecated without the explicit flag).
-        connection = connect(url, additional_headers=headers or None, proxy=None,
-                             compression=None, open_timeout=10, close_timeout=3,
-                             ping_interval=20, ping_timeout=20, legacy=True)
+        connection = open_without_redirects(connect, url, additional_headers=headers or None, proxy=None,
+                                            compression=None, open_timeout=10, close_timeout=3,
+                                            ping_interval=20, ping_timeout=20)
         return WebsocketSource(connection, ConnectionClosed)
 
     return open_connection
@@ -480,8 +528,9 @@ def ha_connector(base_url):
     url = topics.ha_websocket_url(base_url)
 
     def open_connection():
-        connection = connect(url, proxy=None, compression=None, open_timeout=10, close_timeout=3,
-                             ping_interval=20, ping_timeout=20, max_size=HA_MAX_MESSAGE_BYTES, legacy=True)
+        connection = open_without_redirects(connect, url, proxy=None, compression=None, open_timeout=10,
+                                            close_timeout=3, ping_interval=20, ping_timeout=20,
+                                            max_size=HA_MAX_MESSAGE_BYTES)
         return WebsocketSource(connection, ConnectionClosed)
 
     return open_connection
@@ -507,7 +556,7 @@ def make_ha_client(settings: Settings, config: dict):
     except ImportError as exc:
         LOG.warning("Home Assistant is disabled: missing Python dependency (%s)", exc)
         return None
-    runner = ha_client.HaRunner(settings.ha_token, topics.HaEngine(config).entity_ids(), queue.Queue(), connect)
+    runner = ha_client.HaRunner(settings.ha_token, topics.HaEngine(config).entity_ids(), ha_client.make_queue(), connect)
     return ha_client.HaThread(runner)
 
 

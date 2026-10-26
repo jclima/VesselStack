@@ -224,5 +224,30 @@ class NoRetentionTests(unittest.TestCase):
         self.assertNotIn(marker, repr(vars(s)))
 
 
+class BoundedUpdateTests(unittest.TestCase):
+    def test_a_huge_removed_list_collapses_to_one_update_per_configured_entity(self) -> None:
+        s = authed()
+        s.feed(result(1))
+        flood = [BILGE, WATCH, "light.other"] * 200_000
+        _, updates, _ = s.feed(entities_event(r=flood))
+        self.assertEqual(sorted(updates), [(BILGE, None), (WATCH, None)])
+
+    def test_repeated_changes_in_one_frame_keep_only_the_last_value(self) -> None:
+        s = authed()
+        s.feed(result(1))
+        frame = {"id": 1, "type": "event", "event": {"a": {BILGE: {"s": "on"}}, "c": {BILGE: {"+": {"s": "off"}}}}}
+        _, updates, _ = s.feed(frame)
+        self.assertEqual(updates, [(BILGE, "off")])
+
+    def test_repeated_get_states_entries_collapse(self) -> None:
+        s = authed()
+        s.feed(result(1, False))
+        s.feed(result(2))
+        rows = [{"entity_id": BILGE, "state": str(i % 2)} for i in range(100_000)] + [{"entity_id": ["x"]}]
+        _, updates, events = s.feed(result(3, True, rows))
+        self.assertEqual(updates, [(BILGE, "1")])
+        self.assertIn(("ready", "events"), events)
+
+
 if __name__ == "__main__":
     unittest.main()

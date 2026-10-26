@@ -10,7 +10,9 @@ and returns ``(frames, updates, events)``:
 
 * ``frames``: objects to send back, in order (the caller JSON-encodes them);
 * ``updates``: ``[(entity_id, state)]`` for the configured entities only, where ``state`` is the
-  state string, or None when the entity is gone or its state is not a string;
+  state string, or None when the entity is gone or its state is not a string. Each entity appears
+  at most once per frame, with its last value (a frame can repeat an entity thousands of times;
+  the result is therefore bounded by the number of configured entities, never by the frame);
 * ``events``: ``("auth_ok",)``, ``("auth_invalid",)``, ``("fallback",)``, ``("ready", mode)`` when
   the subscription is established (mode "entities" or "events"), ``("failed", reason)`` when
   Home Assistant refused the subscription (``reason`` is a short fixed word, never server text).
@@ -55,11 +57,11 @@ class HaSession:
     # -- input -----------------------------------------------------------------
     def feed(self, message) -> tuple:
         frames: list = []
-        updates: list = []
+        updates: dict = {}      # entity_id -> last state in this frame: bounded by the configured entities
         events: list = []
         data = self._decode(message)
         if data is None or self.phase == PHASE_FAILED:
-            return frames, updates, events
+            return frames, [], events
         kind = data.get("type")
         if kind == "auth_required":
             if self.phase == PHASE_NEW:
@@ -78,7 +80,7 @@ class HaSession:
             self._result(data, frames, updates, events)
         elif kind == "event":
             self._event(data, updates)
-        return frames, updates, events
+        return frames, list(updates.items()), events
 
     @staticmethod
     def _decode(message):
@@ -95,7 +97,7 @@ class HaSession:
         return message if isinstance(message, dict) else None
 
     # -- results ---------------------------------------------------------------
-    def _result(self, data: dict, frames: list, updates: list, events: list) -> None:
+    def _result(self, data: dict, frames: list, updates: dict, events: list) -> None:
         if self.phase != PHASE_SUBSCRIBING:
             return
         ident, success = data.get("id"), data.get("success") is True
@@ -118,15 +120,16 @@ class HaSession:
             if ident == ID_GET_STATES:
                 result = data.get("result")
                 for item in result if isinstance(result, list) else ():
-                    if isinstance(item, dict) and item.get("entity_id") in self._entities:
+                    if isinstance(item, dict) and isinstance(item.get("entity_id"), str) \
+                            and item["entity_id"] in self._entities:
                         state = item.get("state")
-                        updates.append((item["entity_id"], state if isinstance(state, str) else None))
+                        updates[item["entity_id"]] = state if isinstance(state, str) else None
             if not self._pending:
                 self.phase = PHASE_READY
                 events.append(("ready", "events"))
 
     # -- events ----------------------------------------------------------------
-    def _event(self, data: dict, updates: list) -> None:
+    def _event(self, data: dict, updates: dict) -> None:
         if self.phase not in (PHASE_SUBSCRIBING, PHASE_READY):
             return
         event = data.get("event")
@@ -137,13 +140,13 @@ class HaSession:
         elif self.mode == "events" and data.get("id") == ID_EVENTS:
             self._state_changed(event, updates)
 
-    def _compressed(self, event: dict, updates: list) -> None:
+    def _compressed(self, event: dict, updates: dict) -> None:
         initial = event.get("a")
         if isinstance(initial, dict):
             for eid, body in initial.items():
                 if eid in self._entities and isinstance(body, dict):
                     state = body.get("s")
-                    updates.append((eid, state if isinstance(state, str) else None))
+                    updates[eid] = state if isinstance(state, str) else None
         changes = event.get("c")
         if isinstance(changes, dict):
             for eid, body in changes.items():
@@ -152,14 +155,14 @@ class HaSession:
                 added = body.get("+")
                 if isinstance(added, dict) and "s" in added:   # attribute-only changes carry no "s"
                     state = added["s"]
-                    updates.append((eid, state if isinstance(state, str) else None))
+                    updates[eid] = state if isinstance(state, str) else None
         removed = event.get("r")
         if isinstance(removed, list):
             for eid in removed:
                 if isinstance(eid, str) and eid in self._entities:
-                    updates.append((eid, None))
+                    updates[eid] = None
 
-    def _state_changed(self, event: dict, updates: list) -> None:
+    def _state_changed(self, event: dict, updates: dict) -> None:
         if event.get("event_type") != "state_changed":
             return
         body = event.get("data")
@@ -170,4 +173,4 @@ class HaSession:
             return
         new = body.get("new_state")
         state = new.get("state") if isinstance(new, dict) else None
-        updates.append((eid, state if isinstance(state, str) else None))
+        updates[eid] = state if isinstance(state, str) else None

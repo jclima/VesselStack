@@ -823,6 +823,30 @@ class HomeAssistantBridgeTests(unittest.TestCase):
         self.assertEqual([p for p, _ in pub.on(HA_STATUS)], ["disconnected", "connected", "disabled"])
         self.assertEqual(self.body(pub)[-1]["sev"], "unknown")
 
+    def test_a_flood_of_states_is_coalesced_per_drain_and_summarised_once(self):
+        import ha_client
+        ha = FakeHa()
+        ha.queue = ha_client.HaMailbox()
+        for i in range(200_000):
+            ha.queue.put(("update", "binary_sensor.bilge", "on" if i % 2 else "off"))
+            ha.queue.put(("update", "binary_sensor.high_water", "HIGH" if i % 2 else "dry"))
+        script = [ha.put("connected"), ("idle",), ("idle",), ("close",)]
+        h = Harness([script], HA_CONFIG, ha=ha)
+        with mock.patch.object(h.bridge, "_publish_summary") as summary:
+            pub = h.run()
+        bilge = [b for b in self.body(pub) if b["st"] == "ok"]
+        self.assertLessEqual(len(bilge), 2)
+        self.assertEqual(ha.queue.qsize(), 0)
+        self.assertLess(summary.call_count, 20)
+
+    def test_a_malformed_update_does_not_stop_the_others_in_the_same_drain(self):
+        ha = FakeHa()
+        script = [ha.put("connected"), ha.put("update", ["unhashable"], "on"), ha.put("update", "binary_sensor.bilge"),
+                  ha.put("update", "binary_sensor.bilge", "on"), ("idle",), ("idle",), ("close",)]
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING"):
+            pub = Harness([script], HA_CONFIG, ha=ha).run()
+        self.assertIn(("ok", "warn"), {(b["st"], b["sev"]) for b in self.body(pub)})
+
     def test_updates_are_applied_while_signalk_is_down(self):
         ha = FakeHa()
         h = Harness([ConnectionError("down"), [("close",)]], HA_CONFIG, ha=ha)
@@ -895,6 +919,70 @@ class HomeAssistantSettingsTests(unittest.TestCase):
 
     def test_bridge_env_passthrough_is_not_in_this_module(self):
         self.assertNotIn("DISPLAYS_HA_TOKEN", bridge.Settings.__dataclass_fields__)   # the field is ha_token
+
+
+class WebsocketAdapterTests(unittest.TestCase):
+    """The real adapters with websockets replaced by fakes (the package is not needed to run the tests)."""
+
+    def fake_websockets(self):
+        calls = []
+
+        class Connecter:
+            def __init__(self):
+                self.followed = []
+
+            def process_redirect(self, exc):
+                self.followed.append(exc)
+                return "ws://elsewhere/"
+
+            def connect(self):
+                # what websockets does on a 3xx: ask process_redirect and raise unless it returns an exception
+                exc = RuntimeError("HTTP 302")
+                self.outcome = self.process_redirect(exc)
+                if isinstance(self.outcome, Exception):
+                    raise self.outcome
+                return mock.Mock(pending_legacy_warning=True)
+
+        def connect(url, **options):
+            calls.append((url, options))
+            return Connecter()
+
+        sync_client = mock.Mock(connect=connect)
+        exceptions = mock.Mock(ConnectionClosed=type("ConnectionClosed", (Exception,), {}))
+        modules = {"websockets": mock.Mock(), "websockets.sync": mock.Mock(), "websockets.sync.client": sync_client,
+                   "websockets.exceptions": exceptions}
+        return calls, modules
+
+    def test_home_assistant_connection_is_capped_at_2_mib_and_never_follows_redirects(self):
+        calls, modules = self.fake_websockets()
+        self.assertEqual(bridge.HA_MAX_MESSAGE_BYTES, 2 * 1024 * 1024)
+        with mock.patch.dict(sys.modules, modules):
+            opener = bridge.ha_connector("https://ha.example:8123")
+            with self.assertRaises(RuntimeError):         # the redirect surfaced as the original error
+                opener()
+        url, options = calls[0]
+        self.assertEqual(url, "wss://ha.example:8123/api/websocket")
+        self.assertEqual(options["max_size"], 2 * 1024 * 1024)
+        self.assertIs(options["legacy"], False)
+        self.assertIsNone(options["proxy"])
+        self.assertNotIn("additional_headers", options)
+
+    def test_signalk_connection_does_not_follow_redirects_either(self):
+        calls, modules = self.fake_websockets()
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(RuntimeError):
+                bridge.websocket_connector("http://127.0.0.1:3000", "")()
+        self.assertEqual(len(calls), 1)
+
+    def test_an_unknown_websockets_api_fails_closed(self):
+        with self.assertRaises(RuntimeError):
+            bridge.open_without_redirects(lambda url, **kw: object(), "ws://x/")
+
+    def test_close_text_has_the_code_but_never_the_peer_reason(self):
+        exc = Exception("bye\nFAKE LOG LINE tok")
+        exc.rcvd = mock.Mock(code=1008, reason="line1\nline2 SECRET")
+        self.assertEqual(bridge.closed_text(exc), "connection closed (code 1008)")
+        self.assertEqual(bridge.closed_text(Exception("x\ny")), "connection closed")
 
 
 if __name__ == "__main__":
