@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import random
 import signal
 import sys
@@ -30,6 +31,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import ha_client  # noqa: E402
 import schema  # noqa: E402
 import topics  # noqa: E402
 
@@ -49,6 +51,13 @@ STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
 SIGNALK_CONNECTED = "connected"
 SIGNALK_DISCONNECTED = "disconnected"
+HA_CONNECTED = "connected"
+HA_DISCONNECTED = "disconnected"
+HA_DISABLED = "disabled"
+DEFAULT_HA_URL = "http://127.0.0.1:8123"
+HA_TICK_INTERVAL_S = 0.25       # with Home Assistant items the loop looks at the queue four times a second
+HA_DRAIN_LIMIT = 1000
+HA_MAX_MESSAGE_BYTES = 32 * 1024 * 1024    # a get_states fallback returns every entity of the instance
 
 
 class SettingsError(Exception):
@@ -69,9 +78,11 @@ class Settings:
     mqtt_username: str
     mqtt_password: str
     timezone: str = ""
+    ha_url: str = ""
+    ha_token: str = ""
 
     def secrets(self) -> list:
-        return [value for value in (self.signalk_token, self.mqtt_password) if value]
+        return [value for value in (self.signalk_token, self.mqtt_password, self.ha_token) if value]
 
 
 def load_settings(env) -> Settings:
@@ -100,6 +111,8 @@ def load_settings(env) -> Settings:
         mqtt_username=required("DISPLAYS_BRIDGE_MQTT_USERNAME"),
         mqtt_password=required("DISPLAYS_BRIDGE_MQTT_PASSWORD"),
         timezone=(env.get("BOAT_TIMEZONE") or "").strip(),
+        ha_url=(env.get("HOME_ASSISTANT_URL") or "").strip(),
+        ha_token=(env.get("DISPLAYS_HA_TOKEN") or "").strip(),
     )
 
 
@@ -116,7 +129,7 @@ def load_config(path) -> dict:
     errors = schema.validate_config(config, registry)
     if errors:
         raise ValueError(f"{path} is invalid: " + "; ".join(errors))
-    if not config["instruments"] and not config.get("notifications"):
+    if not config["instruments"] and not config.get("notifications") and not config.get("ha"):
         raise ValueError(f"{path} defines no instruments; add instruments to publish")
     return config
 
@@ -171,9 +184,13 @@ class Bridge:
     """
 
     def __init__(self, config, publisher, connect, clock=time.monotonic,
-                 wait=None, rng=random.random, wall=None, local=None):
+                 wait=None, rng=random.random, wall=None, local=None, ha=None):
         self.engine = topics.Engine(config)
         self.events = topics.EventEngine(config)
+        self.has = topics.HaEngine(config)
+        self._ha = ha                       # None: no Home Assistant client (no token or URL): items stay "--"
+        self._ha_wanted = bool(config.get("ha"))
+        self.ha_state = HA_DISCONNECTED if ha is not None else HA_DISABLED
         self.frame = json.dumps(topics.subscribe_frame(config), separators=(",", ":"))
         self.publisher = publisher
         self._connect = connect
@@ -201,6 +218,8 @@ class Bridge:
         """Called on every (re)connection to the broker, possibly from its thread."""
         self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_ONLINE, True, qos=1)
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, self.signalk_state, True, qos=1)
+        if self._ha_wanted:
+            self.publisher.publish(topics.BRIDGE_HA_TOPIC, self.ha_state, True, qos=1)
         if self._clock_wanted:
             self.publisher.publish(topics.BRIDGE_CLOCK_TOPIC, topics.clock_payload(
                 topics.clock_state(self._local(), self._night_schedule), self._summary_ts()), True, qos=1)
@@ -213,13 +232,39 @@ class Bridge:
             self._publish_summary(self.clock())
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, state, True, qos=1)
 
+    def _set_ha(self, state):
+        if state != self.ha_state:
+            self.ha_state = state
+            LOG.info("Home Assistant %s", state)
+            self._send(self.has.source_state(state == HA_CONNECTED, self.clock()))
+            self._publish_summary(self.clock())
+            self.publisher.publish(topics.BRIDGE_HA_TOPIC, state, True, qos=1)
+
+    def _drain_ha(self):
+        """Apply what the Home Assistant thread queued; the main thread is the only one touching engines."""
+        if self._ha is None:
+            return
+        for _ in range(HA_DRAIN_LIMIT):
+            try:
+                item = self._ha.queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if item[0] == "update":
+                    self._send(self.has.set_state(item[1], item[2], self._summary_ts(), self.clock()))
+                    self._publish_summary(self.clock())
+                elif item[0] in (HA_CONNECTED, HA_DISCONNECTED, HA_DISABLED):
+                    self._set_ha(item[0])
+            except Exception as exc:  # one bad queue item must not cost the SignalK stream
+                LOG.warning("dropped an unprocessable Home Assistant update: %s", type(exc).__name__)
+
     def _summary_ts(self):
         return self._wall().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _publish_summary(self, now, items=None, force=False):
         """Publish the retained alarm summary on change and every heartbeat; none when nothing counts."""
         if items is None:
-            items = self.engine.summary_items() + self.events.summary_items(now)
+            items = self.engine.summary_items() + self.events.summary_items(now) + self.has.summary_items()
         payload = topics.alarm_summary(items, self._summary_ts())
         if payload is None:
             return
@@ -248,11 +293,14 @@ class Bridge:
             self._publish_clock(now)
             self._send(self.engine.tick(now))
             self._send(self.events.tick(now))
+            self._send(self.has.tick(now))
             self._publish_summary(now)
 
     # -- loop -------------------------------------------------------------
     def run(self, stop) -> None:
         self.publisher.start(self.on_mqtt_connected)
+        if self._ha is not None:
+            self._ha.start()
         try:
             self._set_signalk(SIGNALK_DISCONNECTED)
             self._loop(stop)
@@ -306,17 +354,22 @@ class Bridge:
         """Wait while still ticking the Engine; True if stop was requested."""
         deadline = self.clock() + seconds
         while True:
+            self._drain_ha()
             self._tick()
             remaining = deadline - self.clock()
             if remaining <= 0:
                 return stop.is_set()
-            if self._wait(min(TICK_INTERVAL_S, remaining), stop):
+            if self._wait(min(self._tick_interval(), remaining), stop):
                 return True
+
+    def _tick_interval(self):
+        return HA_TICK_INTERVAL_S if self._ha is not None else TICK_INTERVAL_S
 
     def _pump(self, source, stop):
         while not stop.is_set():
+            self._drain_ha()
             self._tick()
-            timeout = max(0.05, min(TICK_INTERVAL_S, self._next_tick - self.clock()))
+            timeout = max(0.05, min(self._tick_interval(), self._next_tick - self.clock()))
             message = source.recv(timeout)
             if message is not None:
                 self._handle_safely(message)
@@ -358,13 +411,21 @@ class Bridge:
         self._publish_summary(self.clock())
 
     def shutdown(self):
+        if self._ha is not None:
+            try:
+                self._ha.stop()
+            except Exception as exc:  # stopping must always get as far as the offline message
+                LOG.warning("stopping the Home Assistant client failed: %s", type(exc).__name__)
+        if self.ha_state == HA_CONNECTED:
+            self._set_ha(HA_DISCONNECTED)
         if self.signalk_state != SIGNALK_DISCONNECTED:
             self._set_signalk(SIGNALK_DISCONNECTED)
         # A clean stop must not leave a retained "ok" (or a stale "alarm"): publish every counted
         # item as unknown. A crash cannot do this; displays then rely on the summary going stale.
         now = self.clock()
         self._publish_summary(now, [(i, "unknown") for i, _ in
-                                    self.engine.summary_items() + self.events.summary_items(now)], force=True)
+                                    self.engine.summary_items() + self.events.summary_items(now)
+                                    + self.has.summary_items()], force=True)
         self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, True, qos=1)
         self.publisher.stop()
 
@@ -409,6 +470,45 @@ def websocket_connector(base_url, token):
         return WebsocketSource(connection, ConnectionClosed)
 
     return open_connection
+
+
+def ha_connector(base_url):
+    """() -> a websocket source for Home Assistant's /api/websocket (the token is sent as a message, not here)."""
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.client import connect
+
+    url = topics.ha_websocket_url(base_url)
+
+    def open_connection():
+        connection = connect(url, proxy=None, compression=None, open_timeout=10, close_timeout=3,
+                             ping_interval=20, ping_timeout=20, max_size=HA_MAX_MESSAGE_BYTES, legacy=True)
+        return WebsocketSource(connection, ConnectionClosed)
+
+    return open_connection
+
+
+def make_ha_client(settings: Settings, config: dict):
+    """The Home Assistant thread, or None (with one warning) when it cannot run.
+
+    Home Assistant is an extra: whatever is wrong here, the SignalK side keeps working and the
+    Home Assistant items just show "--".
+    """
+    if not config.get("ha"):
+        return None
+    if not settings.ha_token:
+        LOG.warning("Home Assistant items are configured but DISPLAYS_HA_TOKEN is empty: they are disabled and "
+                    "show --; create a long-lived access token (see the README) and set DISPLAYS_HA_TOKEN")
+        return None
+    try:
+        connect = ha_connector(settings.ha_url or DEFAULT_HA_URL)
+    except ValueError as exc:
+        LOG.warning("Home Assistant is disabled: HOME_ASSISTANT_URL is invalid: %s", exc)
+        return None
+    except ImportError as exc:
+        LOG.warning("Home Assistant is disabled: missing Python dependency (%s)", exc)
+        return None
+    runner = ha_client.HaRunner(settings.ha_token, topics.HaEngine(config).entity_ids(), queue.Queue(), connect)
+    return ha_client.HaThread(runner)
 
 
 class MqttPublisher:
@@ -492,7 +592,10 @@ def main(env=None) -> int:
     LOG.info("starting: %d instrument(s), %d notification(s), SignalK %s, MQTT %s:%s as %s",
              len(config["instruments"]), len(config.get("notifications", {})), settings.signalk_url, settings.mqtt_host,
              settings.mqtt_port, settings.mqtt_username)
-    Bridge(config, publisher, connect, local=local_time_source(settings.timezone)).run(stop)
+    if config.get("ha"):
+        LOG.info("%d Home Assistant item(s)", len(config["ha"]))
+    ha = make_ha_client(settings, config)
+    Bridge(config, publisher, connect, local=local_time_source(settings.timezone), ha=ha).run(stop)
     LOG.info("stopped")
     return EXIT_OK
 

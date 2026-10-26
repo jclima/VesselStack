@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import stat
 import subprocess
 import sys
@@ -107,7 +108,7 @@ class FakeSource:
 class Harness:
     """Runs a Bridge against scripted connection attempts; stops when they run out."""
 
-    def __init__(self, attempts, config=CONFIG):
+    def __init__(self, attempts, config=CONFIG, ha=None):
         self.clock = FakeClock()
         self.publisher = FakePublisher()
         self.stop = threading.Event()
@@ -134,7 +135,7 @@ class Harness:
             return stop.is_set()
 
         self.bridge = bridge.Bridge(config, self.publisher, connect, clock=self.clock,
-                                    wait=wait, rng=lambda: 0.5)
+                                    wait=wait, rng=lambda: 0.5, ha=ha)
 
     def run(self):
         self.bridge.run(self.stop)
@@ -695,6 +696,167 @@ class LocalTimeSourceTests(unittest.TestCase):
         env = SettingsAndConfigTests.ENV
         self.assertEqual(bridge.load_settings(env).timezone, "")
         self.assertEqual(bridge.load_settings({**env, "BOAT_TIMEZONE": " Europe/Oslo "}).timezone, "Europe/Oslo")
+
+
+HA_TOPIC = "vesselstack/v1/ha/bilge"
+HA_STATUS = topics.BRIDGE_HA_TOPIC
+HA_CONFIG = dict(CONFIG, ha={
+    "bilge": {"entity_id": "binary_sensor.bilge", "label": "Bilge", "kind": "binary",
+              "states": [{"match": "on", "sev": "warn", "text": "RUNNING"},
+                         {"match": "off", "sev": "ok", "text": "OFF"}]},
+    "high": {"entity_id": "binary_sensor.high_water", "label": "High water", "kind": "binary",
+             "states": [{"match": "high", "sev": "alarm", "text": "HIGH"}, {"match": "dry", "sev": "ok", "text": "DRY"}]},
+})
+
+
+class FakeHa:
+    """Stands in for ha_client.HaThread: a queue the main loop drains, start/stop recorded."""
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.started = self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def put(self, *item):
+        return ("call", lambda: self.queue.put(item))
+
+
+class HomeAssistantBridgeTests(unittest.TestCase):
+    def body(self, pub, topic=HA_TOPIC):
+        return [json.loads(p) for p, _ in pub.on(topic)]
+
+    def test_without_a_client_items_are_missing_status_is_disabled_and_signalk_keeps_working(self):
+        pub = Harness([[("msg", delta(10 * KN)), ("idle",), ("idle",), ("close",)]], HA_CONFIG).run()
+        self.assertEqual({p for p, _ in pub.on(HA_STATUS)}, {"disabled"})
+        self.assertTrue(all(r for _, r in pub.on(HA_STATUS)))
+        self.assertEqual({(b["st"], b["sev"]) for b in self.body(pub)}, {("missing", "unknown")})
+        self.assertIn("ok", pub.states(SOG_TOPIC))
+        qos = {q for t, _, _, q in pub.sent if t == HA_STATUS}
+        self.assertEqual(qos, {1})
+
+    def test_no_homeassistant_output_without_ha_items(self):
+        pub = Harness([[("idle",), ("close",)]]).run()
+        self.assertEqual([t for t, *_ in pub.sent if "/ha/" in t or t == HA_STATUS], [])
+
+    def test_connected_updates_publish_index_severity_and_feed_the_summary(self):
+        ha = FakeHa()
+        script = [ha.put("connected"), ("idle",), ha.put("update", "binary_sensor.bilge", "on"),
+                  ha.put("update", "binary_sensor.high_water", "dry"), ("idle",), ("idle",),
+                  ha.put("update", "binary_sensor.high_water", "HIGH"), ("idle",), ("idle",), ("close",)]
+        h = Harness([script], HA_CONFIG, ha=ha)
+        pub = h.run()
+        self.assertTrue(ha.started and ha.stopped)
+        self.assertEqual([p for p, _ in pub.on(HA_STATUS)][:2], ["disconnected", "connected"])
+        bilge = [(b["st"], b["sev"], b["k"], b["v"]) for b in self.body(pub)]
+        self.assertIn(("ok", "warn", 0, None), bilge)
+        high = [(b["st"], b["sev"], b["k"]) for b in self.body(pub, "vesselstack/v1/ha/high")]
+        self.assertIn(("ok", "ok", 1), high)
+        self.assertIn(("ok", "alarm", 0), high)
+        summaries = [json.loads(p) for p, _ in pub.on(SUMMARY)]
+        self.assertTrue(any(x["max"] == "alarm" and x["ids"] == ["high", "bilge"] for x in summaries), summaries)
+        self.assertNotIn("RUNNING", json.dumps(pub.sent))
+        self.assertNotIn("binary_sensor", json.dumps([m for m in pub.sent if m[0].startswith("vesselstack/v1/ha/")]))
+
+    def test_ha_disconnect_goes_stale_while_signalk_items_stay_ok(self):
+        ha = FakeHa()
+        script = [ha.put("connected"), ha.put("update", "binary_sensor.bilge", "off"), ("msg", delta(10 * KN)),
+                  ("idle",), ("idle",), ha.put("disconnected"), ("msg", delta(10 * KN)), ("idle",), ("idle",),
+                  ("msg", delta(10 * KN)), ("idle",), ("close",)]
+        pub = Harness([script], HA_CONFIG, ha=ha).run()
+        seq = []
+        for b in self.body(pub):
+            if not seq or seq[-1] != (b["st"], b["sev"]):
+                seq.append((b["st"], b["sev"]))
+        self.assertEqual(seq[:3], [("missing", "unknown"), ("ok", "ok"), ("stale", "unknown")])
+        self.assertEqual(pub.states(SOG_TOPIC)[-1], "ok")
+        sk = [json.loads(p) for p, _ in pub.on(SUMMARY)]
+        self.assertTrue(any(x["max"] == "unknown" for x in sk))
+
+    def test_disabled_event_publishes_disabled_and_blanks_items(self):
+        ha = FakeHa()
+        script = [ha.put("connected"), ha.put("update", "binary_sensor.bilge", "on"), ("idle",),
+                  ha.put("disabled"), ("idle",), ("idle",), ("close",)]
+        pub = Harness([script], HA_CONFIG, ha=ha).run()
+        self.assertEqual([p for p, _ in pub.on(HA_STATUS)], ["disconnected", "connected", "disabled"])
+        self.assertEqual(self.body(pub)[-1]["sev"], "unknown")
+
+    def test_updates_are_applied_while_signalk_is_down(self):
+        ha = FakeHa()
+        h = Harness([ConnectionError("down"), [("close",)]], HA_CONFIG, ha=ha)
+        ha.queue.put(("connected",))
+        ha.queue.put(("update", "binary_sensor.bilge", "on"))
+        pub = h.run()
+        self.assertIn(("ok", "warn"), {(b["st"], b["sev"]) for b in self.body(pub)})
+
+    def test_unprocessable_queue_items_are_dropped_and_logged_without_content(self):
+        ha = FakeHa()
+        script = [ha.put("connected"), ha.put("update", "binary_sensor.bilge", object()), ha.put("bogus"), ha.put(),
+                  ha.put("update", "binary_sensor.bilge", "on"), ("idle",), ("idle",), ("close",)]
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING") as logs:
+            pub = Harness([script], HA_CONFIG, ha=ha).run()
+        self.assertIn(("ok", "warn"), {(b["st"], b["sev"]) for b in self.body(pub)})
+        self.assertNotIn("binary_sensor", "\n".join(logs.output))
+
+    def test_a_failing_stop_still_publishes_offline(self):
+        ha = FakeHa()
+        ha.stop = lambda: (_ for _ in ()).throw(RuntimeError("stuck"))
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING"):
+            pub = Harness([[("close",)]], HA_CONFIG, ha=ha).run()
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+
+    def test_clean_stop_publishes_every_counted_ha_item_as_unknown(self):
+        ha = FakeHa()
+        script = [ha.put("connected"), ha.put("update", "binary_sensor.high_water", "high"), ("idle",), ("idle",),
+                  ("close",)]
+        pub = Harness([script], HA_CONFIG, ha=ha).run()
+        last = json.loads(pub.on(SUMMARY)[-1][0])
+        self.assertEqual((last["max"], last["na"], last["ids"]), ("unknown", 0, []))
+
+    def test_ha_only_config_is_loadable(self):
+        cfg = json.loads((ROOT / "displays" / "displays.example.json").read_text())
+        cfg["instruments"], cfg["displays"] = {}, {}
+        cfg["ha"] = HA_CONFIG["ha"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "displays.json"
+            path.write_text(json.dumps(cfg))
+            self.assertIn("bilge", bridge.load_config(str(path))["ha"])
+
+
+class HomeAssistantSettingsTests(unittest.TestCase):
+    ENV = SettingsAndConfigTests.ENV
+
+    def test_settings_read_url_and_token_and_redact_the_token(self):
+        s = bridge.load_settings({**self.ENV, "HOME_ASSISTANT_URL": " http://ha:8123 ", "DISPLAYS_HA_TOKEN": " ha-tok "})
+        self.assertEqual((s.ha_url, s.ha_token), ("http://ha:8123", "ha-tok"))
+        self.assertIn("ha-tok", s.secrets())
+        self.assertEqual(bridge.load_settings(self.ENV).ha_token, "")
+
+    def test_make_ha_client_variants(self):
+        settings = lambda **kw: bridge.load_settings({**self.ENV, **kw})  # noqa: E731
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING") as logs:
+            self.assertIsNone(bridge.make_ha_client(settings(), HA_CONFIG))
+        self.assertIn("DISPLAYS_HA_TOKEN is empty", "\n".join(logs.output))
+        self.assertIsNone(bridge.make_ha_client(settings(DISPLAYS_HA_TOKEN="t"), CONFIG))     # no ha items: silent
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING") as logs:
+            self.assertIsNone(bridge.make_ha_client(settings(DISPLAYS_HA_TOKEN="secret-ha-tok",
+                                                             HOME_ASSISTANT_URL="ftp://nope"), HA_CONFIG))
+        self.assertNotIn("secret-ha-tok", "\n".join(logs.output))
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING") as logs:
+            self.assertIsNone(bridge.make_ha_client(settings(DISPLAYS_HA_TOKEN="t",
+                                                             HOME_ASSISTANT_URL="http://u" + ":pw-secret@h:8123"), HA_CONFIG))
+        self.assertNotIn("pw-secret", "\n".join(logs.output))
+        with mock.patch.object(bridge, "ha_connector", return_value=lambda: None) as connector:
+            client = bridge.make_ha_client(settings(DISPLAYS_HA_TOKEN="t"), HA_CONFIG)
+        connector.assert_called_once_with("http://127.0.0.1:8123")
+        self.assertEqual(sorted(client.runner._entities), ["binary_sensor.bilge", "binary_sensor.high_water"])
+
+    def test_bridge_env_passthrough_is_not_in_this_module(self):
+        self.assertNotIn("DISPLAYS_HA_TOKEN", bridge.Settings.__dataclass_fields__)   # the field is ha_token
 
 
 if __name__ == "__main__":

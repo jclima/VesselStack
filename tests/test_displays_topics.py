@@ -298,6 +298,132 @@ class AlarmSummaryTests(unittest.TestCase):
         events.set("a", {"state": "alarm"}, TS, 0.5)
         self.assertEqual(events.summary_items(0.5), [("a", "alarm")])
 
+HA_CONFIG = {
+    "heartbeat_s": 5,
+    "instruments": {},
+    "ha": {
+        "bilge": {"entity_id": "binary_sensor.bilge", "label": "Bilge", "kind": "binary",
+                  "states": [{"match": "on", "sev": "warn", "text": "RUNNING"},
+                             {"match": "off", "sev": "ok", "text": "OFF"}]},
+        "shore": {"entity_id": "binary_sensor.shore", "label": "Shore", "kind": "binary", "alarm": False,
+                  "states": [{"match": "on", "sev": "ok", "text": "ON"}]},
+        "temp": {"entity_id": "sensor.temp", "label": "Temp", "kind": "numeric", "unit": "C", "precision": 1,
+                 "thresholds": {"warn_above": 30, "alarm_above": 40, "hysteresis": 2}},
+    },
+}
+
+
+class HaEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = topics.HaEngine(HA_CONFIG)
+
+    def payloads(self, msgs):
+        return {t.rsplit("/", 1)[1]: json.loads(p) for t, p, _ in msgs}
+
+    def connect(self, now=0.0):
+        return self.payloads(self.engine.source_state(True, now))
+
+    def test_topics_and_entities(self) -> None:
+        self.assertEqual(topics.ha_topic("bilge"), "vesselstack/v1/ha/bilge")
+        self.assertEqual(topics.BRIDGE_HA_TOPIC, "vesselstack/v1/bridge/homeassistant")
+        self.assertEqual(sorted(self.engine.entity_ids()),
+                         ["binary_sensor.bilge", "binary_sensor.shore", "sensor.temp"])
+
+    def test_missing_until_connected_and_every_item_is_retained(self) -> None:
+        msgs = self.engine.tick(0.0)
+        self.assertEqual(len(msgs), 3)
+        self.assertTrue(all(r is True for _, _, r in msgs))
+        for body in self.payloads(msgs).values():
+            self.assertEqual((body["st"], body["sev"], body["v"], body["k"]), ("missing", "unknown", None, None))
+
+    def test_payload_has_index_not_text_and_a_number_for_numeric(self) -> None:
+        self.connect()
+        out = self.payloads(self.engine.set_state("binary_sensor.bilge", "ON", "2026-01-01T00:00:00Z", 1.0))
+        self.assertEqual(out["bilge"], {"v": None, "k": 0, "u": "", "st": "ok", "sev": "warn",
+                                         "ts": "2026-01-01T00:00:00Z", "age": 0.0})
+        out = self.payloads(self.engine.set_state("sensor.temp", "31.26", "t", 1.0))
+        self.assertEqual((out["temp"]["v"], out["temp"]["k"], out["temp"]["u"], out["temp"]["sev"]),
+                         (31.3, None, "C", "warn"))
+        self.assertNotIn("RUNNING", json.dumps(out))
+        body = self.payloads(self.engine.set_state("binary_sensor.bilge", "weird text", "t", 5.0))["bilge"]
+        self.assertEqual((body["k"], body["sev"], body["st"]), (-1, "warn", "ok"))
+        self.assertNotIn("weird", json.dumps(body))
+
+    def test_connected_but_unreported_or_no_value_is_missing_never_ok(self) -> None:
+        out = self.connect()
+        self.assertEqual({b["st"] for b in out.values()}, {"missing"})
+        self.engine.set_state("binary_sensor.bilge", "off", "t", 1.0)
+        body = self.payloads(self.engine.set_state("binary_sensor.bilge", "unavailable", "t", 5.0))["bilge"]
+        self.assertEqual((body["st"], body["sev"], body["k"]), ("missing", "unknown", None))
+        self.assertEqual(self.engine.set_state("binary_sensor.bilge", None, "t", 9.0), [])   # still the same view
+
+    def test_disconnect_makes_everything_stale_and_forgets_values(self) -> None:
+        self.connect()
+        self.engine.set_state("binary_sensor.bilge", "on", "t", 1.0)
+        out = self.payloads(self.engine.source_state(False, 10.0))
+        self.assertEqual({(b["st"], b["sev"], b["v"], b["k"]) for b in out.values()},
+                         {("stale", "unknown", None, None)})
+        self.assertEqual(self.engine.source_state(False, 11.0), [])
+        out = self.connect(20.0)                     # reconnected: nothing remembered, nothing ok
+        self.assertEqual({b["st"] for b in out.values()}, {"missing"})
+
+    def test_rate_limit_and_flush_on_tick(self) -> None:
+        self.connect(0.0)
+        self.assertEqual(len(self.engine.set_state("sensor.temp", "20", "t", 0.2)), 1)
+        self.assertEqual(self.engine.set_state("sensor.temp", "21", "t", 0.5), [])          # only the number changed
+        self.assertEqual(self.engine.tick(0.6), [])
+        flushed = self.payloads(self.engine.tick(1.3))
+        self.assertEqual(flushed["temp"]["v"], 21.0)
+        # a change of severity (or of the matched state) is never held back
+        self.assertEqual(len(self.engine.set_state("sensor.temp", "45", "t", 1.4)), 1)
+        self.engine.set_state("binary_sensor.bilge", "off", "t", 1.5)
+        self.assertEqual(len(self.engine.set_state("binary_sensor.bilge", "on", "t", 1.6)), 1)
+
+    def test_unchanged_view_publishes_nothing_until_the_heartbeat(self) -> None:
+        self.connect(0.0)
+        self.engine.set_state("binary_sensor.bilge", "off", "t", 0.0)
+        self.assertEqual(self.engine.set_state("binary_sensor.bilge", "OFF", "t", 3.0), [])
+        self.assertEqual(self.engine.tick(3.0), [])
+        beat = self.payloads(self.engine.tick(5.0))
+        self.assertIn("bilge", beat)
+        self.assertEqual(beat["bilge"]["age"], 2.0)
+
+    def test_numeric_hysteresis_uses_the_previous_severity(self) -> None:
+        self.connect()
+        self.engine.set_state("sensor.temp", "31", "t", 0.0)
+        out = self.payloads(self.engine.set_state("sensor.temp", "29", "t", 2.0))
+        self.assertEqual(out["temp"]["sev"], "warn")            # 29 > 30 - 2
+        out = self.payloads(self.engine.set_state("sensor.temp", "27", "t", 4.0))
+        self.assertEqual(out["temp"]["sev"], "ok")
+
+    def test_summary_counts_alarm_items_and_unknown_when_not_ok(self) -> None:
+        self.assertEqual(self.engine.summary_items(), [("bilge", "unknown"), ("temp", "unknown")])
+        self.connect()
+        self.engine.set_state("binary_sensor.bilge", "on", "t", 0.0)
+        self.engine.set_state("sensor.temp", "41", "t", 0.0)
+        self.assertEqual(self.engine.summary_items(), [("bilge", "warn"), ("temp", "alarm")])
+        self.engine.source_state(False, 1.0)
+        self.assertEqual(self.engine.summary_items(), [("bilge", "unknown"), ("temp", "unknown")])
+        summary = json.loads(topics.alarm_summary(self.engine.summary_items(), "t"))
+        self.assertEqual(summary["max"], "unknown")             # a dead feed is never all clear
+
+    def test_websocket_url(self) -> None:
+        self.assertEqual(topics.ha_websocket_url("http://127.0.0.1:8123"), "ws://127.0.0.1:8123/api/websocket")
+        self.assertEqual(topics.ha_websocket_url("https://ha.example.org/"), "wss://ha.example.org/api/websocket")
+        self.assertEqual(topics.ha_websocket_url("http://ha.local:8123/prefix/"),
+                         "ws://ha.local:8123/prefix/api/websocket")
+        for bad in ("ftp://x", "ha.local:8123", "http://", "", "http://u" + ":p@h:8123", "http://tok@h"):
+            with self.assertRaises(ValueError):
+                topics.ha_websocket_url(bad)
+        with self.assertRaises(ValueError) as caught:
+            topics.ha_websocket_url("http://user" + ":secretpw@h")
+        self.assertNotIn("secretpw", str(caught.exception))
+
+    def test_no_ha_config_is_an_empty_engine(self) -> None:
+        engine = topics.HaEngine(CONFIG)
+        self.assertEqual((engine.tick(0.0), engine.summary_items(), engine.entity_ids()), ([], [], []))
+
+
 if __name__ == "__main__":
     unittest.main()
 

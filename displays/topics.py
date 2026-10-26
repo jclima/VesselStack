@@ -16,11 +16,14 @@ NOTIFICATION_PERIOD_MS = 1000
 # After (re)connecting, SignalK re-sends active notifications within about one period; until
 # then a notification nobody has reported on yet is "unknown", never a possibly false "ok".
 EVENT_SETTLE_S = 3.0
+HA_TOPIC_PREFIX = f"{TOPIC_ROOT}/ha/"
+HA_MIN_INTERVAL_S = 1.0       # a Home Assistant item changes the retained topic at most once a second
 ALARM_SUMMARY_TOPIC = f"{TOPIC_ROOT}/alarms/summary"
 SUMMARY_MAX_IDS = 16
 BRIDGE_STATUS_TOPIC = f"{TOPIC_ROOT}/bridge/status"
 BRIDGE_SIGNALK_TOPIC = f"{TOPIC_ROOT}/bridge/signalk"
 BRIDGE_CLOCK_TOPIC = f"{TOPIC_ROOT}/bridge/clock"
+BRIDGE_HA_TOPIC = f"{TOPIC_ROOT}/bridge/homeassistant"
 DISPLAY_STATUS_TOPIC = f"{TOPIC_ROOT}/displays/{{username}}/status"
 
 
@@ -30,6 +33,10 @@ def instrument_topic(instrument_id: str) -> str:
 
 def notification_topic(notification_id: str) -> str:
     return NOTIFICATION_TOPIC_PREFIX + notification_id
+
+
+def ha_topic(item_id: str) -> str:
+    return HA_TOPIC_PREFIX + item_id
 
 
 def display_status_topic(username: str) -> str:
@@ -260,6 +267,120 @@ class EventEngine:
                     or now - st.pub_time >= self.heartbeat_s:
                 out.append(self._emit(nid, now))
         return out
+
+
+class HaEngine:
+    """Home Assistant items: numeric sensors and mapped binary / multi-valued states.
+
+    Freshness follows the Home Assistant connection, as for notifications: while connected an
+    item is "ok" when its last state is usable, "missing" when HA reports no value ("unknown",
+    "unavailable", gone, or not a finite number) or has not reported the entity yet; when the
+    connection is down it is "stale" (or "missing" before the first connection), severity
+    "unknown", and every value heard is forgotten. Nothing is ever "ok" unless a state matched
+    or a number was read. Every item is republished each ``heartbeat_s``; a changed item at most
+    once per ``HA_MIN_INTERVAL_S`` when only its number changes. Payload: ``{"v","k","u","st","sev","ts","age"}`` where ``v``
+    is the number (numeric items), ``k`` the index of the matched ``states`` entry (-1: the
+    ``default``) and never any state text. Times are seconds from an injected clock.
+    """
+
+    def __init__(self, config: dict):
+        self.heartbeat_s = config.get("heartbeat_s", DEFAULT_HEARTBEAT_S)
+        self.items = config.get("ha", {})
+        self._state = {hid: _HaState() for hid in self.items}
+        self._by_entity: dict[str, list[str]] = {}
+        for hid, item in self.items.items():
+            self._by_entity.setdefault(item["entity_id"], []).append(hid)
+        self.connected = False
+        self._ever_connected = False
+
+    def entity_ids(self):
+        return list(self._by_entity)
+
+    def _freshness(self, hid) -> str:
+        st = self._state[hid]
+        if self.connected:
+            return "ok" if st.result is not None and st.result[0] == "ok" else "missing"
+        return "stale" if self._ever_connected else "missing"
+
+    def _view(self, hid) -> tuple:
+        """(st, sev, k, v) as it would be published now."""
+        st = self._state[hid]
+        fresh = self._freshness(hid)
+        if fresh != "ok":
+            return (fresh, "unknown", None, None)
+        return st.result
+
+    def _emit(self, hid, now):
+        st, item = self._state[hid], self.items[hid]
+        view = self._view(hid)
+        age = None if st.received is None else round(max(0.0, now - st.received), 1)
+        st.pub, st.pub_time = view, now
+        body = {"v": view[3], "k": view[2], "u": item.get("unit", ""), "st": view[0], "sev": view[1],
+                "ts": st.ts, "age": age}
+        return (ha_topic(hid), json.dumps(body, separators=(",", ":"), ensure_ascii=False), True)
+
+    def source_state(self, connected: bool, now: float) -> list:
+        """The Home Assistant connection went up or down; returns [(topic, payload, retain)]."""
+        if connected == self.connected:
+            return []
+        self.connected = connected
+        if connected:
+            self._ever_connected = True
+        else:
+            for st in self._state.values():
+                st.result = st.ts = st.received = None
+        return [self._emit(hid, now) for hid in self.items]
+
+    def set_state(self, entity_id: str, state, ts, now: float) -> list:
+        """A state string (or None: the entity is gone) for an entity."""
+        out = []
+        for hid in self._by_entity.get(entity_id, ()):
+            item, st = self.items[hid], self._state[hid]
+            prev = st.result[1] if st.result is not None and st.result[0] == "ok" else None
+            st.result = severity.ha_state(state, item["kind"], item, prev)
+            st.ts = ts if isinstance(ts, str) else None
+            st.received = now
+            view = self._view(hid)
+            if view == st.pub:
+                continue
+            # A new state, severity or index goes out at once; only a changing number is rate limited.
+            if st.pub is None or view[:3] != st.pub[:3] or now - st.pub_time >= HA_MIN_INTERVAL_S:
+                out.append(self._emit(hid, now))      # otherwise the next tick publishes it
+        return out
+
+    def summary_items(self) -> list:
+        """[(id, severity)] for the items that count towards the alarm summary (``alarm``, default true)."""
+        return [(hid, self._view(hid)[1]) for hid, item in self.items.items() if item.get("alarm", True)]
+
+    def tick(self, now: float) -> list:
+        out = []
+        for hid in self.items:
+            st = self._state[hid]
+            changed = st.pub is None or st.pub != self._view(hid)
+            if st.pub_time is None or (changed and now - st.pub_time >= HA_MIN_INTERVAL_S) \
+                    or now - st.pub_time >= self.heartbeat_s:
+                out.append(self._emit(hid, now))
+        return out
+
+
+class _HaState:
+    def __init__(self):
+        self.result = None     # (st, sev, k, v) from severity.ha_state for the latest state
+        self.ts = None
+        self.received = None
+        self.pub = None
+        self.pub_time = None
+
+
+def ha_websocket_url(base: str) -> str:
+    """The ``/api/websocket`` URL of a Home Assistant base URL (http->ws, https->wss; no credentials)."""
+    parts = urlsplit(base.strip())
+    scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}.get(parts.scheme)
+    if scheme is None or not parts.netloc:
+        raise ValueError("unsupported Home Assistant URL (expected http://host:port or https://host:port)")
+    if "@" in parts.netloc:
+        raise ValueError("the Home Assistant URL must not embed credentials")
+    return urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + "/api/websocket", "", ""))
 
 
 SUMMARY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "alarm": 3}
