@@ -228,8 +228,8 @@ expect_read "$HELM" "$HELM_PASS" vesselstack/v1/instruments/sog
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor
 admin_put vesselstack/v1/alarms/summary '{"max":"ok","na":0,"nw":0,"nu":0,"ids":[],"ts":"2026-01-01T00:00:00Z"}'
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary
-expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary
 expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/alarms/forged
+expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary2
 expect_nowrite "$HELM" "$HELM_PASS" vesselstack/v1/notifications/forged
 expect_read "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status
 expect_noread "$HELM" "$HELM_PASS" homeassistant/test
