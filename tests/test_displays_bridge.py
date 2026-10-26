@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -575,6 +576,23 @@ class BridgeEnvTests(unittest.TestCase):
                 values[key] = json.loads(raw)
             self.assertEqual(bridge.load_settings(values).mqtt_password, 'pa"ss')
 
+    def test_bridge_env_carries_boat_timezone_only_when_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").mkdir()
+            (root / "config" / "displays.secrets.json").write_text(json.dumps(
+                {"schema": 1, "bridge": {"mqtt_password": "pw"}, "displays": {}}))
+            output = root / "config" / "displays-bridge.env"
+            env = {"SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_BRIDGE_MQTT_USERNAME": "vesselstack-bridge"}
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("BOAT_TIMEZONE", None)
+                code, _, err = self.run_cmd(root, output, env)
+                self.assertEqual(code, 0, err)
+                self.assertNotIn("BOAT_TIMEZONE", output.read_text())
+                code, _, err = self.run_cmd(root, output, {**env, "BOAT_TIMEZONE": "Europe/Oslo"})
+            self.assertEqual(code, 0, err)
+            self.assertIn('BOAT_TIMEZONE="Europe/Oslo"\n', output.read_text())
+
     def test_bridge_env_requires_a_generated_password(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -584,6 +602,99 @@ class BridgeEnvTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("bridge-env failed", err)
             self.assertFalse(output.exists())
+
+
+CLOCK_TOPIC = topics.BRIDGE_CLOCK_TOPIC
+HEADER_CONFIG = dict(CONFIG, displays={"helm": {"ui": {"header": True}}})
+SCHEDULE_CONFIG = dict(CONFIG, displays={"helm": {"ui": {"night": "schedule"}}},
+                       night_schedule={"start": "21:30", "end": "06:15"})
+
+
+class FakeLocal:
+    """A local wall clock the test can move; naive datetimes are fine for strftime."""
+
+    def __init__(self, hour, minute):
+        self.value = datetime(2026, 10, 25, hour, minute, 30)
+
+    def __call__(self):
+        return self.value
+
+
+class ClockBridgeTests(unittest.TestCase):
+    def run_bridge(self, config, local, script):
+        h = Harness([script], config)
+        h.bridge._local = local
+        h.bridge._wall = lambda: datetime(2026, 10, 25, 21, 5, 30, tzinfo=timezone.utc)
+        return h.run()
+
+    def clocks(self, pub):
+        return [(json.loads(p), r) for t, p, r, _ in pub.sent if t == CLOCK_TOPIC]
+
+    def test_nothing_is_published_when_no_display_needs_it(self):
+        pub = self.run_bridge(CONFIG, FakeLocal(14, 5), [("idle",)] * 8 + [("close",)])
+        self.assertEqual(self.clocks(pub), [])
+        pub = self.run_bridge(dict(CONFIG, displays={"helm": {"ui": {"night": "manual", "swipe": True}}}),
+                              FakeLocal(14, 5), [("idle",)] * 3 + [("close",)])
+        self.assertEqual(self.clocks(pub), [])
+
+    def test_payload_shape_retained_and_exact_keys(self):
+        pub = self.run_bridge(HEADER_CONFIG, FakeLocal(14, 5), [("idle",)] * 2 + [("close",)])
+        body, retain = self.clocks(pub)[0]
+        self.assertTrue(retain)
+        self.assertEqual(list(body), ["hm", "night", "ts"])
+        self.assertEqual(body, {"hm": "14:05", "night": False, "ts": "2026-10-25T21:05:30Z"})
+        qos = [q for t, _, _, q in pub.sent if t == CLOCK_TOPIC]
+        self.assertTrue(all(q == 1 for q in qos))
+
+    def test_published_on_connect_and_republished_each_heartbeat_not_each_tick(self):
+        pub = self.run_bridge(HEADER_CONFIG, FakeLocal(14, 5), [("idle",)] * 14 + [("close",)])
+        count = len(self.clocks(pub))
+        self.assertGreaterEqual(count, 3)   # connect, then about every 5 s
+        self.assertLess(count, 8)
+
+    def test_minute_change_publishes_at_once(self):
+        local = FakeLocal(14, 5)
+        steps = [("idle",), ("call", lambda: setattr(local, "value", datetime(2026, 10, 25, 14, 6, 0))),
+                 ("idle",), ("close",)]
+        pub = self.run_bridge(HEADER_CONFIG, local, steps)
+        self.assertEqual([b["hm"] for b, _ in self.clocks(pub)][0], "14:05")
+        self.assertIn("14:06", [b["hm"] for b, _ in self.clocks(pub)])
+        self.assertLess(len(self.clocks(pub)), 6)
+
+    def test_night_flag_follows_the_schedule_across_midnight(self):
+        for hour, minute, expected in ((22, 0, True), (3, 0, True), (6, 14, True), (6, 15, False),
+                                       (12, 0, False), (21, 29, False), (21, 30, True)):
+            pub = self.run_bridge(SCHEDULE_CONFIG, FakeLocal(hour, minute), [("idle",), ("close",)])
+            self.assertEqual(self.clocks(pub)[0][0]["night"], expected, (hour, minute))
+
+    def test_night_is_false_without_a_schedule(self):
+        pub = self.run_bridge(HEADER_CONFIG, FakeLocal(2, 0), [("idle",), ("close",)])
+        self.assertFalse(self.clocks(pub)[0][0]["night"])
+
+
+class LocalTimeSourceTests(unittest.TestCase):
+    def test_boat_timezone_is_used_when_known(self):
+        try:
+            import zoneinfo
+            zoneinfo.ZoneInfo("Europe/Oslo")
+        except Exception:
+            self.skipTest("no tz database on this machine")
+        now = bridge.local_time_source("Europe/Oslo")()
+        self.assertEqual(now.tzinfo.key, "Europe/Oslo")
+
+    def test_unknown_zone_falls_back_to_the_system_zone_with_a_warning(self):
+        with self.assertLogs("vesselstack.displays.bridge", level="WARNING") as logs:
+            now = bridge.local_time_source("Mars/Olympus")()
+        self.assertIsNotNone(now.tzinfo)
+        self.assertIn("unusable", "\n".join(logs.output))
+
+    def test_system_zone_when_unset(self):
+        self.assertIsNotNone(bridge.local_time_source("")().tzinfo)
+
+    def test_settings_carry_boat_timezone(self):
+        env = SettingsAndConfigTests.ENV
+        self.assertEqual(bridge.load_settings(env).timezone, "")
+        self.assertEqual(bridge.load_settings({**env, "BOAT_TIMEZONE": " Europe/Oslo "}).timezone, "Europe/Oslo")
 
 
 if __name__ == "__main__":

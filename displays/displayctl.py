@@ -121,6 +121,8 @@ def render_bridge_env(root: Path, env: dict, bridge_password: str) -> str:
         ("DISPLAYS_BRIDGE_MQTT_PASSWORD", bridge_password),
         ("DISPLAYS_SIGNALK_TOKEN", env.get("DISPLAYS_SIGNALK_TOKEN", "")),
     ]
+    if env.get("BOAT_TIMEZONE"):  # the vessel's IANA zone: the bridge clock and night schedule follow it
+        values.append(("BOAT_TIMEZONE", env["BOAT_TIMEZONE"]))
     return "".join(systemd_env_line(key, value) for key, value in values)
 
 
@@ -137,7 +139,7 @@ def cmd_bridge_env(args) -> int:
     root = Path(root_text)
     env = {key: os.environ[key] for key in
            ("SIGNALK_URL", "MQTT_PORT", "DISPLAYS_BRIDGE_MQTT_USERNAME",
-            "DISPLAYS_SIGNALK_TOKEN") if key in os.environ}
+            "DISPLAYS_SIGNALK_TOKEN", "BOAT_TIMEZONE") if key in os.environ}
     try:
         output = Path(args.output)
         with mqtt_auth.config_lock(root):

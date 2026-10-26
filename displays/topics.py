@@ -20,6 +20,7 @@ ALARM_SUMMARY_TOPIC = f"{TOPIC_ROOT}/alarms/summary"
 SUMMARY_MAX_IDS = 16
 BRIDGE_STATUS_TOPIC = f"{TOPIC_ROOT}/bridge/status"
 BRIDGE_SIGNALK_TOPIC = f"{TOPIC_ROOT}/bridge/signalk"
+BRIDGE_CLOCK_TOPIC = f"{TOPIC_ROOT}/bridge/clock"
 DISPLAY_STATUS_TOPIC = f"{TOPIC_ROOT}/displays/{{username}}/status"
 
 
@@ -283,6 +284,51 @@ def alarm_summary(items, ts) -> str | None:
     body = {"max": top, "na": len(alarms), "nw": len(warns), "nu": unknown,
             "ids": (alarms + warns)[:SUMMARY_MAX_IDS], "ts": ts}
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+
+def hhmm_minutes(text: str) -> int:
+    """Minutes since local midnight for a validated "HH:MM" (ValueError otherwise)."""
+    if (not isinstance(text, str) or len(text) != 5 or text[2] != ":"
+            or not (text[:2] + text[3:]).isdigit() or not text.isascii()):
+        raise ValueError(f"not an HH:MM time: {text!r}")
+    hours, minutes = int(text[:2]), int(text[3:])
+    if hours > 23 or minutes > 59:
+        raise ValueError(f"not an HH:MM time: {text!r}")
+    return hours * 60 + minutes
+
+
+def in_night_window(minute_of_day: int, schedule) -> bool:
+    """True from ``start`` (inclusive) to ``end`` (exclusive) on the local wall clock.
+
+    A window whose start is later than its end crosses midnight (22:00 -> 06:00). With no
+    schedule it is never night. Only wall-clock minutes are compared, so a daylight saving
+    change moves the window with the clock instead of shifting it by an hour.
+    """
+    if not schedule:
+        return False
+    start, end = hhmm_minutes(schedule["start"]), hhmm_minutes(schedule["end"])
+    if start < end:
+        return start <= minute_of_day < end
+    return minute_of_day >= start or minute_of_day < end
+
+
+def clock_state(local, schedule) -> tuple:
+    """(``HH:MM`` text, night flag) for an aware or naive local datetime."""
+    return local.strftime("%H:%M"), in_night_window(local.hour * 60 + local.minute, schedule)
+
+
+def clock_payload(state: tuple, ts: str) -> str:
+    """Compact JSON for the retained bridge clock: ``{"hm","night","ts"}``."""
+    return json.dumps({"hm": state[0], "night": state[1], "ts": ts}, separators=(",", ":"))
+
+
+def clock_wanted(config: dict) -> bool:
+    """The clock is only published when a display shows it (header) or follows the schedule."""
+    for display in config.get("displays", {}).values():
+        ui = display.get("ui", {}) if isinstance(display, dict) else {}
+        if ui.get("header") is True or ui.get("night") == "schedule":
+            return True
+    return False
 
 
 def subscribe_frame(config: dict) -> dict:

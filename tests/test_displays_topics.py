@@ -426,3 +426,69 @@ class EventEngineTests(unittest.TestCase):
         engine = topics.Engine({"instruments": {"n": {"path": ANCHOR, "convert": "none", "unit": "",
                                                        "precision": 0, "stale_after_s": 10}}})
         self.assertEqual(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.0), [])
+
+
+class ClockTests(unittest.TestCase):
+    SCHEDULE = {"start": "21:30", "end": "06:15"}   # crosses midnight
+
+    @staticmethod
+    def minute(text):
+        return topics.hhmm_minutes(text)
+
+    def test_hhmm_parsing(self) -> None:
+        self.assertEqual(topics.hhmm_minutes("00:00"), 0)
+        self.assertEqual(topics.hhmm_minutes("23:59"), 1439)
+        for bad in ("24:00", "12:60", "1:00", "12:0", "12-00", "ab:cd", "", None, 1200, "12:00\n", "١٢:٠٠"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                topics.hhmm_minutes(bad)
+
+    def test_window_crossing_midnight(self) -> None:
+        night = lambda hm: topics.in_night_window(self.minute(hm), self.SCHEDULE)  # noqa: E731
+        self.assertTrue(night("21:30"))      # start is inclusive
+        self.assertTrue(night("23:59"))
+        self.assertTrue(night("00:00"))
+        self.assertTrue(night("06:14"))
+        self.assertFalse(night("06:15"))     # end is exclusive
+        self.assertFalse(night("12:00"))
+        self.assertFalse(night("21:29"))
+
+    def test_window_inside_one_day(self) -> None:
+        schedule = {"start": "13:00", "end": "14:30"}
+        night = lambda hm: topics.in_night_window(self.minute(hm), schedule)  # noqa: E731
+        self.assertEqual([night(t) for t in ("12:59", "13:00", "14:29", "14:30", "23:00", "00:00")],
+                         [False, True, True, False, False, False])
+
+    def test_no_schedule_is_never_night(self) -> None:
+        for schedule in (None, {}):
+            self.assertFalse(topics.in_night_window(0, schedule))
+            self.assertFalse(topics.in_night_window(720, schedule))
+
+    def test_wall_clock_only_so_dst_changes_cannot_shift_the_window(self) -> None:
+        # The flag depends on the local hour and minute alone; a clock that jumps (spring
+        # forward 01:59 -> 03:00) or repeats (fall back 02:59 -> 02:00) moves with the window.
+        from datetime import datetime
+        schedule = {"start": "02:30", "end": "03:30"}
+        for hm, expected in (("01:59", False), ("03:00", True), ("02:59", True), ("02:00", False)):
+            hour, minute = map(int, hm.split(":"))
+            state = topics.clock_state(datetime(2026, 3, 29, hour, minute), schedule)
+            self.assertEqual(state, (hm, expected), hm)
+
+    def test_clock_state_and_payload_shape(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        local = datetime(2026, 10, 25, 14, 5, 59, tzinfo=timezone(timedelta(hours=-7)))
+        self.assertEqual(topics.clock_state(local, self.SCHEDULE), ("14:05", False))
+        payload = topics.clock_payload(("14:05", False), "2026-10-25T21:05:59Z")
+        self.assertEqual(payload, '{"hm":"14:05","night":false,"ts":"2026-10-25T21:05:59Z"}')
+        self.assertEqual(json.loads(topics.clock_payload(("23:00", True), "t"))["night"], True)
+
+    def test_clock_is_only_wanted_for_header_or_schedule_displays(self) -> None:
+        def cfg(**ui):
+            return {"displays": {"helm": {"ui": ui}}}
+        self.assertFalse(topics.clock_wanted({"displays": {}}))
+        self.assertFalse(topics.clock_wanted(cfg()))
+        self.assertFalse(topics.clock_wanted(cfg(night="manual", swipe=True, header=False)))
+        self.assertTrue(topics.clock_wanted(cfg(header=True)))
+        self.assertTrue(topics.clock_wanted(cfg(night="schedule")))
+        self.assertTrue(topics.clock_wanted({"displays": {"a": {}, "b": {"ui": {"header": True}}}}))
+
+

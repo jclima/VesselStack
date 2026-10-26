@@ -68,6 +68,7 @@ class Settings:
     mqtt_port: int
     mqtt_username: str
     mqtt_password: str
+    timezone: str = ""
 
     def secrets(self) -> list:
         return [value for value in (self.signalk_token, self.mqtt_password) if value]
@@ -98,6 +99,7 @@ def load_settings(env) -> Settings:
         mqtt_port=int(port_text),
         mqtt_username=required("DISPLAYS_BRIDGE_MQTT_USERNAME"),
         mqtt_password=required("DISPLAYS_BRIDGE_MQTT_PASSWORD"),
+        timezone=(env.get("BOAT_TIMEZONE") or "").strip(),
     )
 
 
@@ -117,6 +119,25 @@ def load_config(path) -> dict:
     if not config["instruments"] and not config.get("notifications"):
         raise ValueError(f"{path} defines no instruments; add instruments to publish")
     return config
+
+
+def local_time_source(timezone_name: str = ""):
+    """() -> aware local datetime: BOAT_TIMEZONE (IANA) when set and known, else the system zone.
+
+    The system zone comes from the C library (TZ, then /etc/localtime), so it is whatever the
+    Pi is set to; the bridge never sets or guesses a zone itself.
+    """
+    zone = None
+    if timezone_name:
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(timezone_name)
+        except Exception as exc:  # unknown zone, missing tzdata
+            LOG.warning("BOAT_TIMEZONE %r is unusable (%s: %s); using the system time zone",
+                        timezone_name, type(exc).__name__, exc)
+    if zone is not None:
+        return lambda: datetime.now(zone)
+    return lambda: datetime.now().astimezone()
 
 
 def signalk_headers(token: str) -> dict:
@@ -150,7 +171,7 @@ class Bridge:
     """
 
     def __init__(self, config, publisher, connect, clock=time.monotonic,
-                 wait=None, rng=random.random, wall=None):
+                 wait=None, rng=random.random, wall=None, local=None):
         self.engine = topics.Engine(config)
         self.events = topics.EventEngine(config)
         self.frame = json.dumps(topics.subscribe_frame(config), separators=(",", ":"))
@@ -160,6 +181,10 @@ class Bridge:
         self._wait = wait or (lambda seconds, stop: stop.wait(seconds))
         self._rng = rng
         self._wall = wall or (lambda: datetime.now(timezone.utc))
+        self._local = local or local_time_source()
+        self._night_schedule = config.get("night_schedule")
+        self._clock_wanted = topics.clock_wanted(config)
+        self._clock_sent = None     # (state, clock time) of the last bridge clock published
         self._summary_sent = None   # (content, clock time) of the last summary published
         self.self_urn = None
         self.signalk_state = SIGNALK_DISCONNECTED
@@ -176,6 +201,9 @@ class Bridge:
         """Called on every (re)connection to the broker, possibly from its thread."""
         self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_ONLINE, True, qos=1)
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, self.signalk_state, True, qos=1)
+        if self._clock_wanted:
+            self.publisher.publish(topics.BRIDGE_CLOCK_TOPIC, topics.clock_payload(
+                topics.clock_state(self._local(), self._night_schedule), self._summary_ts()), True, qos=1)
 
     def _set_signalk(self, state):
         if state != self.signalk_state:
@@ -202,10 +230,22 @@ class Bridge:
             self._summary_sent = (content, now)
             self.publisher.publish(topics.ALARM_SUMMARY_TOPIC, payload, True, qos=1)
 
+    def _publish_clock(self, now):
+        """Retained local wall clock and night flag: on a minute (or flag) change and every heartbeat."""
+        if not self._clock_wanted:
+            return
+        state = topics.clock_state(self._local(), self._night_schedule)
+        sent = self._clock_sent
+        if sent is None or sent[0] != state or now - sent[1] >= self.engine.heartbeat_s:
+            self._clock_sent = (state, now)
+            self.publisher.publish(topics.BRIDGE_CLOCK_TOPIC, topics.clock_payload(state, self._summary_ts()),
+                                   True, qos=1)
+
     def _tick(self):
         now = self.clock()
         if now >= self._next_tick:
             self._next_tick = now + TICK_INTERVAL_S
+            self._publish_clock(now)
             self._send(self.engine.tick(now))
             self._send(self.events.tick(now))
             self._publish_summary(now)
@@ -452,7 +492,7 @@ def main(env=None) -> int:
     LOG.info("starting: %d instrument(s), %d notification(s), SignalK %s, MQTT %s:%s as %s",
              len(config["instruments"]), len(config.get("notifications", {})), settings.signalk_url, settings.mqtt_host,
              settings.mqtt_port, settings.mqtt_username)
-    Bridge(config, publisher, connect).run(stop)
+    Bridge(config, publisher, connect, local=local_time_source(settings.timezone)).run(stop)
     LOG.info("stopped")
     return EXIT_OK
 
