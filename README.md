@@ -151,9 +151,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.4.4/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.4.4 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.4.4
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.0/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.0 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.0
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -295,7 +295,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.4
+git checkout v0.5.0
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -437,7 +437,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.4.4
+git checkout v0.5.0
 ```
 
 ## 4. Configure the vessel
