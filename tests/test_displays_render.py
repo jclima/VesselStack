@@ -71,6 +71,16 @@ def alarm_takeover(cfg, page=1, labels=None):
         (cfg["notifications"] if iid in cfg["notifications"] else cfg["instruments"])[iid]["label"] = label
 
 
+def dashboard_ui(cfg, **ui):
+    """The alarm takeover display plus a Tanks page, swipe, header, a night schedule and idle dimming."""
+    alarm_takeover(cfg)
+    cfg["displays"]["helm"]["pages"].append({"title": "Tanks", "layout": "single", "items": ["house_v"]})
+    options = {"swipe": True, "header": True, "night": "schedule", "night_brightness": 15, "dim_after_s": 120}
+    options.update(ui)
+    cfg["displays"]["helm"]["ui"].update(options)
+    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -144,6 +154,10 @@ class GoldenAndDeterminism(Base):
     def test_alarm_takeover_matches_golden(self):
         self.set_config(alarm_takeover)
         self.check_golden("helm-alarm.yaml", self.device(allow_missing_wifi=True))
+
+    def test_dashboard_ui_matches_golden(self):
+        self.set_config(dashboard_ui)
+        self.check_golden("helm-ui.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -454,6 +468,408 @@ class AlarmTakeover(Base):
         self.assertEqual(rules["write"], ["vesselstack/v1/displays/vsdisp-helm/status"])
 
     def test_backlight_stays_internal_so_nothing_is_published(self):
+        board = self.collect().files["helm/boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml"].decode()
+        self.assertRegex(board, r"id: board_backlight\n\s+name: Backlight\n\s+internal: true")
+
+
+class DashboardUi(Base):
+    """swipe, header, night and dimming (display dashboard slice S4)."""
+
+    def ui_device(self, **ui):
+        self.set_config(lambda cfg: dashboard_ui(cfg, **ui))
+        return self.device(allow_missing_wifi=True)
+
+    def plain_device(self, **ui):
+        def mutate(cfg):
+            multipage(cfg)
+            if ui:
+                cfg["displays"]["helm"]["ui"] = ui
+                if ui.get("night") == "schedule":
+                    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+        self.set_config(mutate)
+        return self.device(allow_missing_wifi=True)
+
+    MARKERS = ("touch_ignore", "dim_idle", "bl_drawn", "night_", "render_header", "apply_night",
+               "apply_power", "clock_", "sk_state", "bridge/clock", "bridge/signalk", "on_swipe",
+               "on_short_click", "on_long_press", "on_press", "p0_clock", "p0_title", "p0_pages",
+               "p0_sog_name", "lvgl.is_idle", "lv_display")
+
+    def test_nothing_is_generated_without_the_keys(self):
+        for text in (self.plain_device(), self.plain_device(swipe=False, header=False, night="off",
+                                                            dim_after_s=0),
+                     self.plain_device(alarm_takeover=False)):
+            for marker in self.MARKERS:
+                self.assertNotIn(marker, text, marker)
+            self.assertIn("on_click:", text)
+            self.assertEqual(text.count("on_click:"), 3)
+
+    def test_each_key_only_adds_its_own_part(self):
+        only = {"swipe": ("on_swipe_left", "touch_ignore"), "header": ("render_header", "bridge/clock"),
+                "night": ("apply_night", "on_long_press"), "dim_after_s": ("lvgl.is_idle", "dim_idle"),
+                "day_brightness": ("apply_power", "bl_drawn")}
+        values = {"swipe": True, "header": True, "night": "manual", "dim_after_s": 60, "day_brightness": 70}
+        for key, wanted in only.items():
+            text = self.plain_device(**{key: values[key]})
+            for marker in wanted:
+                self.assertIn(marker, text, (key, marker))
+            others = [m for k, w in only.items() if k != key for m in w if m not in wanted]
+            for marker in others:
+                if marker in ("apply_power", "bl_drawn") and key in ("night", "dim_after_s"):
+                    continue   # night and dimming drive the backlight too
+                if marker == "touch_ignore" and key in ("night", "dim_after_s"):
+                    continue   # they share the gesture-aware touch layer
+                self.assertNotIn(marker, text, (key, marker))
+
+    def test_swipe_pages_with_computed_ids_and_a_short_click_fallback(self):
+        text = self.ui_device()
+        tap0 = text.split("id: p0_tap")[1].split("- obj:")[0]
+        self.assertIn("on_swipe_left:", tap0)
+        self.assertIn("on_swipe_right:", tap0)
+        self.assertIn("on_short_click:", tap0)
+        self.assertNotIn("on_click:", tap0)
+        shows = re.findall(r"on_(short_click|swipe_left|swipe_right):.*?id: page_(\d)", tap0, re.S)
+        self.assertEqual(shows, [("short_click", "1"), ("swipe_left", "1"), ("swipe_right", "2")])
+        tap2 = text.split("id: p2_tap")[1]
+        self.assertEqual(re.findall(r"on_(short_click|swipe_left|swipe_right):.*?id: page_(\d)", tap2, re.S),
+                         [("short_click", "0"), ("swipe_left", "0"), ("swipe_right", "1")])
+        self.assertNotIn("page.next", text)
+        self.assertNotIn("page.previous", text)
+
+    def test_a_gesture_that_acted_cannot_act_twice(self):
+        tap = self.ui_device().split("id: p0_tap")[1].split("- obj:")[0]
+        self.assertIn("on_press:\n              - lambda: 'id(touch_ignore) = id(dim_idle);'", tap)
+        self.assertEqual(tap.count("lambda: 'return !id(touch_ignore);'"), 4)   # click, 2 swipes, long press
+        for event in ("on_swipe_left:", "on_swipe_right:", "on_long_press:"):
+            body = tap.split(event)[1].split("\n            on_")[0]
+            self.assertIn("- lambda: 'id(touch_ignore) = true;'", body, event)
+        # a plain tap only pages; the flag is never set by it
+        click = tap.split("on_short_click:")[1].split("\n            on_")[0]
+        self.assertNotIn("= true", click)
+
+    def test_without_dimming_a_press_never_ignores(self):
+        text = self.plain_device(swipe=True)
+        self.assertIn("id(touch_ignore) = false;", text)
+        self.assertNotIn("dim_idle", text)
+
+    def test_swipe_on_a_single_page_display_adds_nothing_to_swipe(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"] = [{"title": "One", "layout": "single", "items": ["sog"]}]
+            cfg["displays"]["helm"]["ui"] = {"swipe": True}
+        self.set_config(mutate)
+        text = self.device(allow_missing_wifi=True)
+        self.assertNotIn("p0_tap", text)
+        self.assertNotIn("on_swipe", text)
+
+    def test_long_press_on_a_single_page_display_gets_a_tap_layer_without_paging(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"] = [{"title": "One", "layout": "single", "items": ["sog"]}]
+            cfg["displays"]["helm"]["ui"] = {"night": "manual"}
+        self.set_config(mutate)
+        text = self.device(allow_missing_wifi=True)
+        tap = text.split("id: p0_tap")[1]
+        self.assertIn("on_long_press:", tap)
+        self.assertNotIn("page.show", tap)
+        self.assertNotIn("on_short_click", tap)
+
+    def test_night_uses_short_click_so_a_long_press_does_not_page(self):
+        tap = self.plain_device(night="manual").split("id: p0_tap")[1].split("- obj:")[0]
+        self.assertIn("on_short_click:", tap)
+        self.assertNotIn("on_click:", tap)
+        self.assertNotIn("on_swipe", tap)
+        self.assertIn("on_long_press:", tap)
+
+    def test_header_stays_inside_the_ring_and_outside_the_content_box(self):
+        text = self.ui_device()
+        board = REGISTRY["boards"][BOARD]
+        ring = board["ring"]
+        top = (board["height"] - board["content_height"]) // 2
+        for pi in range(3):
+            page = text.split(f"- id: page_{pi}\n")[1].split("\n    - id: page_")[0]
+            page = page.split(f"id: p{pi}_tap")[0]
+            ys = [int(v) for v in re.findall(r"\by: (\d+)", page)]
+            self.assertTrue(ys and min(ys) >= ring["header_y"], ys)
+            self.assertLessEqual(max(y for y in ys if y < 100) + 24, top)   # title row ends above the content
+            self.assertIn(f"y: {ring['footer_y']}\n", page)
+            self.assertGreaterEqual(ring["footer_y"], top + board["content_height"])
+            self.assertIn(f"id: p{pi}_content\n            align: CENTER", page)
+            for name in ("sk", "bridge", "mqtt"):
+                self.assertEqual(page.count(f"id: p{pi}_dot_{name}\n"), 1)
+            self.assertEqual(page.count(f"id: p{pi}_clock,"), 1)
+            self.assertEqual(page.count(f"id: p{pi}_title,"), 1)
+            # the touch layer stays last, above the header, so swipes work over the whole screen
+            self.assertEqual(len(re.findall(r"- obj: \{width: 8, height: 8", page)), 3)
+
+    def test_the_touch_layer_is_the_last_widget_of_every_page(self):
+        text = self.ui_device()
+        for pi in range(3):
+            page = text.split(f"- id: page_{pi}\n")[1].split("\n    - id: page_")[0]
+            self.assertLess(page.index(f"id: p{pi}_title,"), page.index(f"id: p{pi}_tap"))
+            self.assertLess(page.index(f"id: p{pi}_pages"), page.index(f"id: p{pi}_tap"))
+            self.assertEqual(page.count("- obj:\n            id: p%d_tap" % pi), 1)
+            self.assertNotIn("\n        - ", page.split(f"id: p{pi}_tap")[1])   # nothing after it
+
+    def test_round_geometry_fits_the_chord_of_the_circle(self):
+        # width available at a y on a 480 px circle; the clock row is the narrowest
+        import math
+        def chord(y):
+            return 2 * math.sqrt(240 ** 2 - (240 - y) ** 2)
+        y = REGISTRY["boards"][BOARD]["ring"]["header_y"]
+        row = render.HEADER_CLOCK_X - 22, render.HEADER_DOT_X[-1] + render.HEADER_DOT_SIZE // 2
+        self.assertLess(row[1] - row[0], chord(y))
+        self.assertLessEqual(max(abs(row[0]), abs(row[1])) * 2, chord(y))
+        self.assertLess(render.HEADER_TITLE_WIDTH, chord(y + render.HEADER_TITLE_ROW))
+        footer = REGISTRY["boards"][BOARD]["ring"]["footer_y"] + render.PAGE_DOT_SIZE + 2
+        self.assertLess(8 * (render.PAGE_DOT_SIZE + render.PAGE_DOT_GAP), chord(480 - footer))
+
+    def test_page_dots_highlight_the_current_page_and_are_absent_for_one_page(self):
+        text = self.ui_device()
+        for pi in range(3):
+            block = text.split(f"id: p{pi}_pages")[1].split("- label:")[0].split("- obj:\n")[0]
+            colours = re.findall(r"bg_color: (0x[0-9A-F]{6})", block)
+            self.assertEqual(colours, ["0xFFFFFF" if j == pi else "0x37474F" for j in range(3)])
+        def one(cfg):
+            cfg["displays"]["helm"]["pages"] = [{"title": "One", "layout": "single", "items": ["sog"]}]
+            cfg["displays"]["helm"]["ui"] = {"header": True}
+        self.set_config(one)
+        text = self.device(allow_missing_wifi=True)
+        self.assertIn("id: p0_title", text)
+        self.assertNotIn("_pages", text)
+
+    def test_page_titles_are_literal_and_never_in_lambdas(self):
+        hostile = '$x ${y} <% 1 %>"\\'
+        def mutate(cfg):
+            dashboard_ui(cfg)
+            cfg["displays"]["helm"]["pages"][0]["title"] = hostile[:16]
+        self.set_config(mutate)
+        text = self.device(allow_missing_wifi=True)
+        self.assertIn('id: p0_title, text: !literal "' + hostile[:16].replace("\\", "\\\\").replace('"', '\\"'), text)
+        for lam in re.findall(r"lambda: [^\n]*|- lambda: \|-\n(?:\s{10,}[^\n]*\n)+", text):
+            self.assertNotIn("${y}", lam)
+            self.assertNotIn("<% 1 %>", lam)
+
+    def test_unsupported_title_glyph_is_reported_only_with_a_header(self):
+        def mutate(cfg, header):
+            dashboard_ui(cfg, header=header)
+            cfg["displays"]["helm"]["pages"][1]["title"] = "日本"
+        self.set_config(lambda cfg: mutate(cfg, True))
+        with self.assertRaises(render.RenderError) as ctx:
+            self.collect(allow_missing_wifi=True)
+        self.assertIn("pages[1].title", str(ctx.exception))
+        self.set_config(lambda cfg: mutate(cfg, False))
+        self.collect(allow_missing_wifi=True)   # titles are never drawn without a header
+
+    def test_font_covers_clock_digits_and_titles_only_with_the_header(self):
+        def glyphs(text):
+            return re.search(r"id: font_small\n    size: 20\n    bpp: 4\n    glyphs: !literal \"(.*)\"", text).group(1)
+        self.assertTrue(set("0123456789:-") <= set(glyphs(self.ui_device())))
+        self.assertTrue(set("Tanks") <= set(glyphs(self.ui_device())))
+        without = glyphs(self.plain_device())
+        self.assertNotIn(":", without)
+        self.assertNotIn("T", without)
+
+    def test_clock_is_generated_digits_from_two_integers_and_gated(self):
+        text = self.ui_device()
+        handler = text.split("topic: vesselstack/v1/bridge/clock")[1].split("  on_disconnect:")[0]
+        self.assertIn("int h = -1, m = -1;", handler)
+        self.assertIn("if (h > 23 || m > 59) { h = -1; m = -1; }", handler)
+        script = text.split("id: render_header")[1].split("\n  - id:")[0].split("\ninterval:")[0]
+        self.assertIn('snprintf(buf, sizeof(buf), "%02d:%02d", hm / 60, hm % 60);', script)
+        self.assertIn("(millis() - id(clock_seen)) < 15000UL", script)
+        self.assertIn("bool online = id(bridge_online) && mq;", script)
+        self.assertEqual(script.count("lv_label_set_text("), 3)
+        self.assertNotIn("hm)", script.replace("hm / 60", "").replace("hm % 60", "").replace(
+            "(hm != id", "").replace("hm < 0", "").replace("hm =", ""))
+        # the clock text is only ever set from buf, never from the payload string
+        self.assertNotIn("lv_label_set_text(id(p0_clock), hm", text)
+
+    def test_clock_staleness_follows_the_heartbeat(self):
+        def mutate(cfg):
+            dashboard_ui(cfg)
+            cfg["heartbeat_s"] = 7
+            for inst in cfg["instruments"].values():
+                inst["stale_after_s"] = 30
+        self.set_config(mutate)
+        self.assertIn("< 21000UL", self.device(allow_missing_wifi=True).split("id: render_header")[1][:600])
+
+    def test_dots_are_good_only_when_everything_behind_them_is(self):
+        script = self.ui_device().split("id: render_header")[1].split("\n  - id:")[0]
+        self.assertIn("int dsk = !online ? 0 :", script)    # a retained SignalK flag needs a live bridge
+        self.assertIn("int dbr = online ? 1 : 2;", script)
+        self.assertIn("int dmq = mq ? 1 : 2;", script)
+        self.assertIn("uint32_t sk = dsk == 1 ? good : (dsk == 2 ? bad : unk);", script)
+
+    def test_header_subscriptions_fit_the_display_acl(self):
+        rules = AclConsistency.acl_rules(None, "vsdisp-helm")
+        text = self.ui_device()
+        for topic in ("vesselstack/v1/bridge/clock", "vesselstack/v1/bridge/signalk"):
+            self.assertEqual(text.count(f"topic: {topic}\n"), 1, topic)
+            self.assertTrue(any(AclConsistency.matches(r, topic) for r in rules["read"]), topic)
+            self.assertFalse(any(AclConsistency.matches(r, topic) for r in rules["write"]), topic)
+        self.assertEqual(rules["write"], ["vesselstack/v1/displays/vsdisp-helm/status"])
+
+    def test_clock_is_subscribed_for_a_schedule_without_a_header_but_signalk_is_not(self):
+        text = self.plain_device(night="schedule")
+        self.assertIn("topic: vesselstack/v1/bridge/clock", text)
+        self.assertNotIn("bridge/signalk", text)
+        self.assertNotIn("render_header", text)
+        manual = self.plain_device(night="manual")
+        self.assertNotIn("bridge/clock", manual)
+        self.assertNotIn("night_sched", manual)
+
+    def test_only_known_top_level_components_are_used(self):
+        for text in (self.ui_device(), self.plain_device(night="manual", dim_after_s=30)):
+            keys = set(re.findall(r"(?m)^([a-z_]+):", text))
+            self.assertLessEqual(keys, {"substitutions", "esphome", "packages", "globals", "font", "mqtt",
+                                        "script", "interval", "lvgl"})
+            self.assertNotIn("mqtt.publish", text)
+        self.assertEqual(self.ui_device().count("\n  top_layer:"), 1)   # the banner's, not a second one
+
+    # -- night --------------------------------------------------------------------------------
+
+    def test_night_palette_is_dark_red_and_keeps_states_apart(self):
+        self.assertEqual(set(render.NIGHT_SEV_COLORS), {0, 1, 2, 3})
+        for palette in (render.SEV_COLORS, render.NIGHT_SEV_COLORS):
+            self.assertNotEqual(palette[0], palette[1])           # unknown is never drawn like ok
+            self.assertEqual(len({palette[n][0] for n in range(4)}), 4)
+        for name, colour in render.NIGHT.items():
+            self.assertEqual(colour & 0xFF, 0, name)               # no blue at night
+            self.assertLessEqual((colour >> 8) & 0xFF, 0x30, name)  # and next to no green
+        for bg, fg in render.NIGHT_SEV_COLORS.values():
+            self.assertEqual(bg & 0xFF, 0)
+            self.assertLessEqual((bg >> 8) & 0xFF, 0x3E)
+        bg, _ = render.NIGHT_SEV_COLORS[3]
+        self.assertGreaterEqual(bg >> 16, 0xB0)                    # an alarm tile is still clearly red
+        self.assertEqual(bg & 0xFFFF, 0)
+        self.assertLess(max(render.NIGHT["tile"], render.NIGHT_SEV_COLORS[1][0]), 0x300000)
+
+    def test_severity_lambdas_use_the_night_palette_only_when_night_is_enabled(self):
+        day = self.plain_device(swipe=True)
+        self.assertNotIn("night_active", day)
+        text = self.ui_device()
+        sev = text.split("uint8_t sev = fresh ?")[1].split("          }\n")[0]
+        self.assertIn("if (id(night_active)) {", sev)
+        self.assertIn("if (sev == 3) { bg = 0xB00000;", sev)
+        self.assertLess(sev.index("0xC62828"), sev.index("if (id(night_active))"))
+
+    def test_palette_flip_repaints_everything_once(self):
+        text = self.ui_device()
+        script = text.split("  - id: apply_night")[1].split("\n  - id:")[0]
+        self.assertIn("if (n != (id(night_drawn) == 1)) {", script)
+        self.assertIn("id(night_dirty) = true;", script)
+        for iid in ("depth", "house_v", "anchor", "batt_low", "bilge"):
+            self.assertIn(f"id(ins_{iid}_drawn_sev) = 255;", script)
+        self.assertNotIn("ins_sog_drawn_sev", script)     # no thresholds: no severity colour
+        self.assertIn("- script.execute: render_tiles", script)
+        # every tile, name, value and unit of every page is reached through an id
+        for pi, iid in ((0, "sog"), (1, "anchor"), (2, "house_v")):
+            self.assertIn(f"id(p{pi}_{iid}_name)", script)
+            self.assertIn(f"id(p{pi}_{iid}_value)", script)
+        self.assertNotIn("p1_anchor_unit", script)
+        for tile in re.findall(r"set_style_bg_color\(id\((\w+)\)", script):
+            self.assertRegex(text, rf"id: {tile}\b")
+
+    def test_the_banner_is_never_themed(self):
+        text = self.ui_device()
+        self.assertNotIn("alarm_banner", text.split("  - id: apply_night")[1].split("\n  - id:")[0])
+        self.assertIn("bg_color: 0xC62828", text.split("top_layer:")[1])
+        self.assertIn("text_color: 0xFFFFFF", text.split("top_layer:")[1])
+
+    def test_manual_override_lasts_until_the_schedule_flag_changes(self):
+        text = self.ui_device()
+        self.assertIn("bool n = id(night_override) >= 0 ? id(night_override) == 1 : base;",
+                      text)
+        self.assertIn("bool base = id(night_sched);", text)
+        clock = text.split("topic: vesselstack/v1/bridge/clock")[1].split("  on_disconnect:")[0]
+        self.assertIn("if (n != id(night_sched)) { id(night_sched) = n; id(night_override) = -1; }", clock)
+        self.assertIn('x["night"].is<bool>()', clock)
+        self.assertIn("id(night_override) = id(night_active) ? 0 : 1;", text)
+        # the flag is only trusted together with a valid time
+        self.assertIn("if (h >= 0 && x[", clock)
+
+    def test_manual_mode_ignores_the_schedule(self):
+        text = self.plain_device(night="manual")
+        self.assertIn("bool base = false;", text)
+        self.assertNotIn("night_sched", text)
+
+    def test_stale_clock_keeps_the_last_night_state(self):
+        # the night flag is held, not reset, when the clock goes stale (documented behaviour)
+        script = self.ui_device().split("  - id: apply_night")[1].split("\n  - id:")[0]
+        self.assertNotIn("clock_seen", script)
+        self.assertNotIn("millis()", script)
+
+    # -- backlight ----------------------------------------------------------------------------
+
+    def power(self, text):
+        return text.split("  - id: apply_power")[1].split("\n  - id:")[0].split("\ninterval:")[0]
+
+    def test_one_controller_orders_day_night_dim_and_banner(self):
+        script = self.power(self.ui_device())
+        order = [script.index(s) for s in ("int target = 100;", "if (id(night_active)) target = 15;",
+                                           "if (id(dim_idle) && target > 15) target = 15;",
+                                           "LV_OBJ_FLAG_HIDDEN)) target = 100;", "if (target != id(bl_drawn))")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("call.set_brightness(target / 100.0f);", script)
+
+    def test_default_brightness_values(self):
+        script = self.power(self.plain_device(night="manual", dim_after_s=10))
+        self.assertIn("int target = 100;", script)
+        self.assertIn("target = 20;", script)                     # night_brightness default
+        self.assertIn("target > 10) target = 10;", script)        # dimming without night_brightness: 10 %
+        custom = self.power(self.plain_device(night="manual", day_brightness=80, night_brightness=7,
+                                              dim_after_s=10))
+        self.assertIn("int target = 80;", custom)
+        self.assertIn("target = 7;", custom)
+        self.assertIn("target > 7) target = 7;", custom)
+
+    def test_no_banner_term_without_takeover(self):
+        script = self.power(self.plain_device(night="manual"))
+        self.assertNotIn("alarm_banner", script)
+        self.assertNotIn("dim_idle", script)
+
+    def test_takeover_keeps_the_controller_in_step_with_its_direct_100_percent(self):
+        text = self.ui_device()
+        handler = text.split("topic: vesselstack/v1/alarms/summary")[1].split("on_disconnect")[0]
+        self.assertIn("brightness: 100%\n              - lambda: 'id(bl_drawn) = 100;'", handler)
+        plain = self.alarm_text()
+        self.assertNotIn("bl_drawn", plain)
+        self.assertIn("brightness: 100%\n        - script.execute: render_alarm", plain)
+
+    def alarm_text(self):
+        self.set_config(alarm_takeover)
+        return self.device(allow_missing_wifi=True)
+
+    def test_dimming_polls_the_touch_idle_time_and_never_pauses_lvgl(self):
+        text = self.ui_device()
+        self.assertIn("  - interval: 250ms\n    then:\n      - if:\n          condition:\n"
+                      "            lvgl.is_idle:\n              timeout: 120s\n", text)
+        self.assertNotIn("lvgl.pause", text)
+        self.assertNotIn("lvgl.resume", text)
+        self.assertNotIn("on_idle", text)
+        self.assertEqual(text.count("interval: 250ms"), 1)
+        self.assertNotIn("interval: 250ms", self.plain_device(night="manual"))
+
+    def test_controller_runs_each_second_and_after_every_change(self):
+        text = self.ui_device()
+        tick = text.split("  - interval: 1s")[1].split("  - interval: 500ms")[0]
+        for step in ("render_tiles", "render_alarm", "apply_night", "render_header", "apply_power"):
+            self.assertIn(f"- script.execute: {step}", tick, step)
+        self.assertEqual(text.count("  - interval: 1s"), 1)
+        clock = text.split("topic: vesselstack/v1/bridge/clock")[1].split("  on_disconnect:")[0]
+        for step in ("apply_night", "render_header", "apply_power"):
+            self.assertIn(f"- script.execute: {step}", clock, step)
+        press = text.split("on_long_press:")[1].split("\n        - obj:")[0]
+        self.assertIn("- script.execute: apply_night", press)
+        self.assertIn("- script.execute: apply_power", press)
+
+    def test_only_changes_reach_lvgl(self):
+        text = self.ui_device()
+        self.assertIn("if (hm != id(clock_drawn)) {", text)
+        self.assertIn("if (state != id(hdr_drawn)) {", text)
+        self.assertIn("if (target != id(bl_drawn)) {", text)
+        self.assertIn("if (n != (id(night_drawn) == 1)) {", text)
+
+    def test_backlight_still_publishes_nothing(self):
+        self.assertNotIn("mqtt.publish", self.ui_device())
         board = self.collect().files["helm/boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml"].decode()
         self.assertRegex(board, r"id: board_backlight\n\s+name: Backlight\n\s+internal: true")
 

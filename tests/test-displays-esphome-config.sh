@@ -127,10 +127,30 @@ def alarm(cfg):
     cfg["instruments"]["sog"]["label"] = HOSTILE[:16]
     cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True, "alarm_page": 1}
 
+def ui_full(cfg):
+    alarm(cfg)
+    cfg["notifications"]["bilge"]["label"] = "Bilge"
+    cfg["displays"]["helm"]["pages"][0]["title"] = '$x ${y} "q"'
+    cfg["displays"]["helm"]["pages"].append({"title": "Tanks", "layout": "single", "items": ["house_v"]})
+    cfg["displays"]["helm"]["ui"].update(swipe=True, header=True, night="schedule", night_brightness=15,
+                                         dim_after_s=120)
+    cfg["night_schedule"] = {"start": "21:30", "end": "06:15"}
+
+def ui_manual(cfg):
+    thresholds(cfg)
+    cfg["displays"]["helm"]["ui"] = {"night": "manual", "day_brightness": 80}
+
+def ui_single(cfg):
+    cfg["displays"]["helm"]["pages"] = [{"title": "One", "layout": "single", "items": ["sog"]}]
+    cfg["displays"]["helm"]["ui"] = {"night": "manual", "dim_after_s": 30, "header": True, "swipe": True}
+
 variant("example")
 variant("thresholds", thresholds)
 variant("status", status)
 variant("alarm", alarm)
+variant("ui", ui_full)
+variant("uimanual", ui_manual)
+variant("uisingle", ui_single)
 variant("complex", complex_, WIFI)
 PY
 
@@ -176,6 +196,9 @@ check complex aux
 check thresholds helm
 check status helm
 check alarm helm
+check ui helm
+check uimanual helm
+check uisingle helm
 for word in ALARM WARN OK; do
     grep -qE "text: [\"']?${word}[\"']?\$" "$WORK/status-helm.log" || { echo "status word $word missing from the validated config" >&2; fail=1; }
 done

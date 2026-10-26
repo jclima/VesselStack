@@ -67,6 +67,24 @@ BANNER_HEIGHT = 96
 BANNER_GLYPHS = "0123456789+ ALRMS"   # "<n> ALARM(S)" and "99+": the only text the banner composes
 BANNER_COUNT_MAX = 99
 BANNER_FLASH_INTERVAL = "500ms"
+HEADER_CLOCK_X = -24      # clock label centre, relative to the screen's middle
+HEADER_DOT_X = (13, 27, 41)   # SignalK, bridge, MQTT status dots (centres, same reference)
+HEADER_DOT_SIZE = 10
+HEADER_TITLE_ROW = 26     # title row offset below header_y (the narrower clock row is above it)
+HEADER_TITLE_WIDTH = 200
+PAGE_DOT_SIZE = 8
+PAGE_DOT_GAP = 8
+CLOCK_GLYPHS = "0123456789:-"
+# Day and night palettes (RGB). Night keeps to the red/amber end of the spectrum so night vision
+# survives; only an alarm tile's text is deliberately bright. The alarm banner is never themed.
+DAY = {"tile": 0x101820, "name": 0x9AA5B1, "value": 0xFFFFFF, "clock": 0xFFFFFF, "title": 0x9AA5B1,
+       "dot_ok": 0x1E7B34, "dot_bad": 0xC62828, "dot_unknown": 0x37474F, "page_hi": 0xFFFFFF,
+       "page_lo": 0x37474F}
+NIGHT = {"tile": 0x000000, "name": 0x6A1600, "value": 0xB02400, "clock": 0xA02000, "title": 0x6A1600,
+         "dot_ok": 0x6B3000, "dot_bad": 0xB00000, "dot_unknown": 0x2A0A00, "page_hi": 0xA02000,
+         "page_lo": 0x2A0A00}
+NIGHT_SEV_COLORS = {0: (0x000000, 0x5A1200), 1: (0x2A0800, 0xC02800), 2: (0x7A3E00, 0xF0B060),
+                    3: (0xB00000, 0xFFB090)}
 WARNING_ARCHIVE_SECRETS = ("WARNING: the archive contains the Wi-Fi password and the display's MQTT, "
                            "OTA and API secrets. Treat it like a password: move it over SSH only, "
                            "do not commit or e-mail it, delete it after flashing.")
@@ -203,6 +221,10 @@ def check_glyphs(config: dict) -> list:
         value = note.get("label")
         if isinstance(value, str):
             errors.extend(_glyph_errors(f"$.notifications.{nid}.label", value))
+    for did, display in config.get("displays", {}).items():
+        if header_enabled(display):
+            for pi, page in enumerate(display["pages"]):
+                errors.extend(_glyph_errors(f"$.displays.{did}.pages[{pi}].title", page["title"]))
     return errors
 
 
@@ -240,8 +262,71 @@ def item_limit_ms(config: dict, iid: str, heartbeat_s: int) -> int:
     return stale_threshold_s(config["instruments"][iid], heartbeat_s) * 1000
 
 
+def _ui(display: dict) -> dict:
+    return display.get("ui", {})
+
+
+def swipe_enabled(display: dict) -> bool:
+    return _ui(display).get("swipe", False) is True
+
+
+def header_enabled(display: dict) -> bool:
+    return _ui(display).get("header", False) is True
+
+
+def night_mode(display: dict) -> str:
+    return _ui(display).get("night", "off")
+
+
+def night_enabled(display: dict) -> bool:
+    return night_mode(display) != "off"
+
+
+def dim_after_s(display: dict) -> int:
+    return _ui(display).get("dim_after_s", 0)
+
+
+def dim_enabled(display: dict) -> bool:
+    return dim_after_s(display) > 0
+
+
+def power_enabled(display: dict) -> bool:
+    """A backlight controller is generated only when a brightness, night or dim key asks for it."""
+    return night_enabled(display) or dim_enabled(display) or "day_brightness" in _ui(display)
+
+
+def day_brightness(display: dict) -> int:
+    return _ui(display).get("day_brightness", schema.DEFAULT_DAY_BRIGHTNESS)
+
+
+def night_brightness(display: dict) -> int:
+    return _ui(display).get("night_brightness", schema.DEFAULT_NIGHT_BRIGHTNESS)
+
+
+def dim_brightness(display: dict) -> int:
+    """Idle dimming goes to night_brightness when the display sets it, else to 10 %."""
+    return _ui(display).get("night_brightness", schema.DIM_BRIGHTNESS)
+
+
+def clock_enabled(display: dict) -> bool:
+    return header_enabled(display) or night_mode(display) == "schedule"
+
+
+def touch_managed(display: dict) -> bool:
+    """Swipe, night long-press and idle dimming need the gesture-aware tap layer."""
+    return swipe_enabled(display) or night_enabled(display) or dim_enabled(display)
+
+
+def touch_layer_enabled(display: dict) -> bool:
+    return len(display["pages"]) > 1 or night_enabled(display)
+
+
 def _small_glyphs(config: dict, display: dict) -> str:
     chars = {" "}
+    if header_enabled(display):
+        chars.update(CLOCK_GLYPHS)
+        for page in display["pages"]:
+            chars.update(page["title"])
     for iid in used_instruments(display):
         if is_notification(config, iid):
             chars.update(config["notifications"][iid]["label"])
@@ -252,12 +337,19 @@ def _small_glyphs(config: dict, display: dict) -> str:
     return "".join(sorted(chars))
 
 
-def _tile_widgets(ind: str, pi: int, iid: str, inst: dict, value_font: str) -> list:
+def _label_id(pi: int, iid: str, part: str, themed: bool) -> str:
+    """``id: pN_ID_name, `` for the static labels, which only the night palette needs to reach."""
+    return f"id: p{pi}_{iid}_{part}, " if themed else ""
+
+
+def _tile_widgets(ind: str, pi: int, iid: str, inst: dict, value_font: str, themed: bool = False) -> list:
     return [
-        f"{ind}- label: {{text: {lit(inst['label'])}, text_font: font_small, text_color: 0x9AA5B1}}",
+        f"{ind}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
+        "text_font: font_small, text_color: 0x9AA5B1}",
         f"{ind}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {value_font}, "
         "text_color: 0xFFFFFF}",
-        f"{ind}- label: {{text: {lit(inst['unit'])}, text_font: font_small, text_color: 0x9AA5B1}}",
+        f"{ind}- label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
+        "text_font: font_small, text_color: 0x9AA5B1}",
     ]
 
 
@@ -307,11 +399,12 @@ def _status_glyphs(config: dict, display: dict) -> dict:
     return {fid: "".join(sorted(chars)) for fid, chars in glyphs.items()}
 
 
-def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: int, cols: int) -> list:
+def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: int, cols: int,
+                 themed: bool = False) -> list:
     """One status-grid cell: static label, then the state word (notification) or value + unit."""
     notification = is_notification(config, iid)
     lines = [f"{ind}- obj:"]
-    if notification or has_thresholds(config["instruments"][iid]):
+    if notification or has_thresholds(config["instruments"][iid]) or themed:
         lines.append(f"{ind}    id: {tile_id(pi, iid, 'status-grid')}")
     lines += [
         f"{ind}    styles: tile_style",
@@ -326,13 +419,93 @@ def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: in
     inner = ind + "      "
     fit = "width: 100%, text_align: CENTER"
     label = config["notifications"][iid]["label"] if notification else config["instruments"][iid]["label"]
-    lines.append(f"{inner}- label: {{text: {lit(label)}, text_font: font_small, text_color: 0x9AA5B1, "
-                 f"{fit}, long_mode: DOT}}")
+    lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, "
+                 f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
     lines.append(f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {font}, "
                  f"text_color: 0xFFFFFF, {fit}, long_mode: CLIP}}")
     if not notification:
-        lines.append(f"{inner}- label: {{text: {lit(config['instruments'][iid]['unit'])}, "
+        lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'unit', themed)}"
+                     f"text: {lit(config['instruments'][iid]['unit'])}, "
                      f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
+    return lines
+
+
+def _show_page(ind: str, target: int) -> list:
+    return [f"{ind}- lvgl.page.show:", f"{ind}    id: page_{target}", f"{ind}    animation: NONE",
+            f"{ind}    time: {TAP_TIME}"]
+
+
+def _touch_layer(display: dict, pi: int) -> list:
+    """The full-screen touch object of a display with swipe, night or dimming.
+
+    Paging uses ``on_short_click`` (a long press must not also turn the page) and every action
+    first checks ``touch_ignore``: set by a press that only woke a dimmed screen, and by a swipe
+    or long press that already acted, so neither can be followed by a stray page change.
+    """
+    n_pages = len(display["pages"])
+    nxt, prev = (pi + 1) % n_pages, (pi - 1) % n_pages
+    gate = ["              - if:", "                  condition:",
+            "                    lambda: 'return !id(touch_ignore);'", "                  then:"]
+    done = "              - lambda: 'id(touch_ignore) = true;'"
+    wake = "id(dim_idle)" if dim_enabled(display) else "false"
+    lines = [
+        "        - obj:", f"            id: p{pi}_tap", "            x: 0", "            y: 0",
+        "            width: 100%", "            height: 100%", "            bg_opa: TRANSP",
+        "            border_width: 0", "            scrollable: false",
+        "            on_press:", f"              - lambda: 'id(touch_ignore) = {wake};'",
+    ]
+    if n_pages > 1:
+        lines += ["            on_short_click:", *gate, *_show_page("                    ", nxt)]
+        if swipe_enabled(display):
+            lines += ["            on_swipe_left:", *gate, *_show_page("                    ", nxt), done,
+                      "            on_swipe_right:", *gate, *_show_page("                    ", prev), done]
+    if night_enabled(display):
+        lines += ["            on_long_press:", *gate,
+                  "                    - lambda: 'id(night_override) = id(night_active) ? 0 : 1;'",
+                  "                    - script.execute: apply_night",
+                  "                    - script.execute: apply_power", done]
+    return lines
+
+
+def _header_lines(registry_board: dict, display: dict, pi: int, page: dict) -> list:
+    """Clock and status dots in the narrow top row, the page title below, page dots at the bottom.
+
+    Everything is static except colours and the clock digits, which render_header sets.
+    """
+    ring = registry_board["ring"]
+    y, n_pages = ring["header_y"], len(display["pages"])
+    lines = [
+        f"        - label: {{id: p{pi}_clock, text: {yq('--:--')}, text_font: font_small, "
+        f"text_color: 0x{DAY['clock']:06X}, align: TOP_MID, x: {HEADER_CLOCK_X}, y: {y}}}",
+    ]
+    for name, x in zip(("sk", "bridge", "mqtt"), HEADER_DOT_X):
+        lines += [
+            "        - obj:", f"            id: p{pi}_dot_{name}", "            align: TOP_MID",
+            f"            x: {x}", f"            y: {y + 6}", f"            width: {HEADER_DOT_SIZE}",
+            f"            height: {HEADER_DOT_SIZE}", f"            radius: {HEADER_DOT_SIZE // 2}",
+            f"            bg_color: 0x{DAY['dot_unknown']:06X}", "            bg_opa: COVER",
+            "            border_width: 0", "            pad_all: 0", "            scrollable: false",
+        ]
+    lines.append(
+        f"        - label: {{id: p{pi}_title, text: {lit(page['title'])}, text_font: font_small, "
+        f"text_color: 0x{DAY['title']:06X}, align: TOP_MID, y: {y + HEADER_TITLE_ROW}, "
+        f"width: {HEADER_TITLE_WIDTH}, text_align: CENTER, long_mode: DOT}}")
+    if n_pages > 1:
+        lines += [
+            "        - obj:", f"            id: p{pi}_pages", "            align: TOP_MID",
+            f"            y: {ring['footer_y']}",
+            f"            width: {n_pages * (PAGE_DOT_SIZE + PAGE_DOT_GAP)}",
+            f"            height: {PAGE_DOT_SIZE + 2}", "            bg_opa: TRANSP", "            border_width: 0",
+            "            pad_all: 0", "            scrollable: false",
+            f"            layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, "
+            f"flex_align_cross: CENTER, pad_column: {PAGE_DOT_GAP}}}",
+            "            widgets:",
+        ]
+        for j in range(n_pages):
+            color = DAY["page_hi"] if j == pi else DAY["page_lo"]
+            lines.append(f"              - obj: {{width: {PAGE_DOT_SIZE}, height: {PAGE_DOT_SIZE}, "
+                         f"radius: {PAGE_DOT_SIZE // 2}, bg_color: 0x{color:06X}, bg_opa: COVER, "
+                         "border_width: 0, pad_all: 0}")
     return lines
 
 
@@ -340,6 +513,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
     n_pages = len(display["pages"])
     cw, ch = registry_board["content_width"], registry_board["content_height"]
     layout = page["layout"]
+    themed = night_enabled(display)
     lines = [f"    - id: page_{pi}", "      bg_color: 0x000000", "      widgets:"]
     if layout == "single":
         iid = page["items"][0]
@@ -354,7 +528,8 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             f"            {FLEX_COLUMN}",
             "            widgets:",
         ]
-        lines += _tile_widgets("              ", pi, iid, config["instruments"][iid], "font_value_single")
+        lines += _tile_widgets("              ", pi, iid, config["instruments"][iid], "font_value_single",
+                               themed)
     elif layout == "grid-2x2":
         lines += [
             "        - obj:",
@@ -376,7 +551,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
         ]
         for index, iid in enumerate(page["items"]):
             lines += ["              - obj:"]
-            if has_thresholds(config["instruments"][iid]):
+            if has_thresholds(config["instruments"][iid]) or themed:
                 lines += [f"                  id: {tile_id(pi, iid, 'grid-2x2')}"]
             lines += [
                 "                  styles: tile_style",
@@ -389,7 +564,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
                 "                  widgets:",
             ]
             lines += _tile_widgets("                    ", pi, iid, config["instruments"][iid],
-                                   "font_value_grid")
+                                   "font_value_grid", themed)
     elif layout == "status-grid":
         cols, rows = status_grid_shape(len(page["items"]))
         lines += [
@@ -412,10 +587,15 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
         ]
         font = status_font(len(page["items"]))
         for index, iid in enumerate(page["items"]):
-            lines += _status_cell(config, "              ", pi, iid, font, index, cols)
+            lines += _status_cell(config, "              ", pi, iid, font, index, cols, themed)
     else:
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
-    if n_pages > 1:
+    if header_enabled(display):
+        lines += _header_lines(registry_board, display, pi, page)
+    if touch_managed(display):
+        if touch_layer_enabled(display):
+            lines += _touch_layer(display, pi)
+    elif n_pages > 1:
         # A transparent full-screen object on top: a tap anywhere shows the next page.
         lines += [
             "        - obj:",
@@ -525,7 +705,7 @@ def _word_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     return lines
 
 
-def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
+def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool = False) -> list:
     """Guarded colour update for one thresholded instrument, on every page that shows it."""
     limit_ms = item_limit_ms(config, iid, heartbeat)
     sets = []
@@ -545,6 +725,13 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     for number in (1, 2, 3):
         bg, fg = SEV_COLORS[number]
         lines.append(f"            if (sev == {number}) {{ bg = 0x{bg:06X}; fg = 0x{fg:06X}; }}")
+    if night:
+        lines.append("            if (id(night_active)) {")
+        lines.append("              bg = 0x%06X; fg = 0x%06X;" % NIGHT_SEV_COLORS[0])
+        for number in (1, 2, 3):
+            bg, fg = NIGHT_SEV_COLORS[number]
+            lines.append(f"              if (sev == {number}) {{ bg = 0x{bg:06X}; fg = 0x{fg:06X}; }}")
+        lines.append("            }")
     for tile, value in sets:
         lines += [f"            lv_obj_set_style_bg_color(id({tile}), lv_color_hex(bg), LV_PART_MAIN);",
                   f"            lv_obj_set_style_text_color(id({value}), lv_color_hex(fg), LV_PART_MAIN);"]
@@ -617,8 +804,10 @@ def _alarm_handler(used: list, display: dict) -> list:
         "              - light.turn_on:",
         "                  id: board_backlight",
         "                  brightness: 100%",
-        "        - script.execute: render_alarm",
     ]
+    if power_enabled(display):  # the brightness controller must know the backlight is at 100 %
+        lines.append("              - lambda: 'id(bl_drawn) = 100;'")
+    lines.append("        - script.execute: render_alarm")
     return lines
 
 
@@ -701,6 +890,215 @@ def _alarm_banner(board: dict) -> list:
     ]
 
 
+def _ui_globals(display: dict) -> list:
+    lines = []
+    if touch_managed(display) and touch_layer_enabled(display):
+        lines.append('  - {id: touch_ignore, type: bool, initial_value: "false"}')
+    if dim_enabled(display):
+        lines.append('  - {id: dim_idle, type: bool, initial_value: "false"}')
+    if power_enabled(display):
+        lines.append('  - {id: bl_drawn, type: int, initial_value: "-1"}')
+    if night_enabled(display):
+        lines += ['  - {id: night_override, type: int, initial_value: "-1"}',   # -1 none, 0 day, 1 night
+                  '  - {id: night_active, type: bool, initial_value: "false"}',
+                  '  - {id: night_drawn, type: int, initial_value: "-1"}',
+                  '  - {id: night_dirty, type: bool, initial_value: "false"}']
+    if night_mode(display) == "schedule":
+        lines.append('  - {id: night_sched, type: bool, initial_value: "false"}')
+    if clock_enabled(display):
+        lines += ['  - {id: clock_h, type: int, initial_value: "-1"}',
+                  '  - {id: clock_m, type: int, initial_value: "-1"}',
+                  '  - {id: clock_seen, type: uint32_t, initial_value: "0"}']
+    if header_enabled(display):
+        lines += ['  - {id: sk_state, type: uint8_t, initial_value: "0"}',   # 0 unknown, 1 connected, 2 down
+                  '  - {id: clock_drawn, type: int, initial_value: "-2"}',
+                  '  - {id: hdr_drawn, type: int, initial_value: "-1"}']
+    return lines
+
+
+def _after_ui_change(display: dict, indent: str = "        ") -> list:
+    """The actions that follow a change of clock, night state or connectivity."""
+    lines = []
+    if night_enabled(display):
+        lines.append(f"{indent}- script.execute: apply_night")
+    if header_enabled(display):
+        lines.append(f"{indent}- script.execute: render_header")
+    if power_enabled(display):
+        lines.append(f"{indent}- script.execute: apply_power")
+    return lines
+
+
+def _signalk_message(display: dict) -> list:
+    return [
+        f"    - topic: {topics.BRIDGE_SIGNALK_TOPIC}", "      then:",
+        '        - lambda: \'id(sk_state) = (x == "connected") ? 1 : (x == "disconnected") ? 2 : 0;\'',
+        "        - script.execute: render_header",
+    ]
+
+
+def _clock_handler(display: dict) -> list:
+    """The bridge clock: two integers parsed from ``hm`` (the text itself is never shown) and the flag."""
+    lines = [
+        f"    - topic: {topics.BRIDGE_CLOCK_TOPIC}", "      then:", "        - lambda: |-",
+        '            const char *hm = x["hm"] | "";',
+        "            int h = -1, m = -1;",
+        "            if (strlen(hm) == 5 && hm[2] == ':' && isdigit((unsigned char) hm[0])"
+        " && isdigit((unsigned char) hm[1]) && isdigit((unsigned char) hm[3])"
+        " && isdigit((unsigned char) hm[4])) {",
+        "              h = (hm[0] - '0') * 10 + (hm[1] - '0');",
+        "              m = (hm[3] - '0') * 10 + (hm[4] - '0');",
+        "              if (h > 23 || m > 59) { h = -1; m = -1; }",
+        "            }",
+        "            id(clock_h) = h;",
+        "            id(clock_m) = m;",
+        "            id(clock_seen) = millis();",
+    ]
+    if night_mode(display) == "schedule":
+        lines += [
+            '            if (h >= 0 && x["night"].is<bool>()) {',
+            '              bool n = x["night"].as<bool>();',
+            "              if (n != id(night_sched)) { id(night_sched) = n; id(night_override) = -1; }",
+            "            }",
+        ]
+    return lines + _after_ui_change(display)
+
+
+def _color_expr(name: str, night: bool) -> str:
+    return f"(nt ? 0x{NIGHT[name]:06X} : 0x{DAY[name]:06X})" if night else f"0x{DAY[name]:06X}"
+
+
+def _header_script(board: dict, display: dict, heartbeat: int) -> list:
+    """Clock digits (generated with snprintf from two integers) and status colours, only on change."""
+    night = night_enabled(display)
+    pages = range(len(display["pages"]))
+    limit = summary_stale_ms(heartbeat)
+    lines = [
+        "  - id: render_header", "    mode: restart", "    then:", "      - lambda: |-",
+        "          bool mq = mqtt::global_mqtt_client->is_connected();",
+        "          bool online = id(bridge_online) && mq;",
+        f"          bool fresh = online && id(clock_h) >= 0 && (millis() - id(clock_seen)) < {limit}UL;",
+        "          int hm = fresh ? id(clock_h) * 60 + id(clock_m) : -1;",
+        "          if (hm != id(clock_drawn)) {",
+        "            id(clock_drawn) = hm;",
+        "            char buf[8];",
+        '            if (hm < 0) snprintf(buf, sizeof(buf), "--:--");',
+        '            else snprintf(buf, sizeof(buf), "%02d:%02d", hm / 60, hm % 60);',
+    ]
+    lines += [f"            lv_label_set_text(id(p{pi}_clock), buf);" for pi in pages]
+    lines += [
+        "          }",
+        "          // 0 unknown (grey), 1 good, 2 bad; the SignalK flag is retained, so it only counts"
+        " while the bridge is online",
+        "          int dsk = !online ? 0 : (id(sk_state) == 1 ? 1 : (id(sk_state) == 2 ? 2 : 0));",
+        "          int dbr = online ? 1 : 2;",
+        "          int dmq = mq ? 1 : 2;",
+        f"          bool nt = {'id(night_active)' if night else 'false'};",
+        "          int state = dsk | (dbr << 2) | (dmq << 4) | (nt ? 64 : 0);",
+        "          if (state != id(hdr_drawn)) {",
+        "            id(hdr_drawn) = state;",
+        f"            uint32_t good = {_color_expr('dot_ok', night)}, bad = {_color_expr('dot_bad', night)}, "
+        f"unk = {_color_expr('dot_unknown', night)};",
+        f"            uint32_t hi = {_color_expr('page_hi', night)}, lo = {_color_expr('page_lo', night)};",
+        "            uint32_t sk = dsk == 1 ? good : (dsk == 2 ? bad : unk);",
+        "            uint32_t br = dbr == 1 ? good : bad;",
+        "            uint32_t mt = dmq == 1 ? good : bad;",
+    ]
+    for pi in pages:
+        lines += [
+            f"            lv_obj_set_style_bg_color(id(p{pi}_dot_sk), lv_color_hex(sk), LV_PART_MAIN);",
+            f"            lv_obj_set_style_bg_color(id(p{pi}_dot_bridge), lv_color_hex(br), LV_PART_MAIN);",
+            f"            lv_obj_set_style_bg_color(id(p{pi}_dot_mqtt), lv_color_hex(mt), LV_PART_MAIN);",
+            f"            lv_obj_set_style_text_color(id(p{pi}_clock), lv_color_hex({_color_expr('clock', night)}),"
+            " LV_PART_MAIN);",
+            f"            lv_obj_set_style_text_color(id(p{pi}_title), lv_color_hex({_color_expr('title', night)}),"
+            " LV_PART_MAIN);",
+        ]
+        if len(display["pages"]) > 1:
+            lines += [
+                f"            for (int j = 0; j < {len(display['pages'])}; j++)"
+                f" lv_obj_set_style_bg_color(lv_obj_get_child(id(p{pi}_pages), j),"
+                f" lv_color_hex(j == {pi} ? hi : lo), LV_PART_MAIN);",
+            ]
+    lines.append("          }")
+    return lines
+
+
+def _night_script(config: dict, display: dict, used: list) -> list:
+    """Resolve night (schedule flag or manual, with the override) and repaint the palette on change."""
+    schedule = night_mode(display) == "schedule"
+    lines = [
+        "  - id: apply_night", "    mode: restart", "    then:", "      - lambda: |-",
+        f"          bool base = {'id(night_sched)' if schedule else 'false'};",
+        "          bool n = id(night_override) >= 0 ? id(night_override) == 1 : base;",
+        "          id(night_active) = n;",
+        "          if (n != (id(night_drawn) == 1)) {",
+        "            id(night_drawn) = n ? 1 : 0;",
+        "            id(night_dirty) = true;",
+    ]
+    for pi, page in enumerate(display["pages"]):
+        for iid in page["items"]:
+            notification = is_notification(config, iid)
+            tile = tile_id(pi, iid, page["layout"])
+            lines += [
+                f"            lv_obj_set_style_bg_color(id({tile}), lv_color_hex("
+                f"n ? 0x{NIGHT['tile']:06X} : 0x{DAY['tile']:06X}), LV_PART_MAIN);",
+                f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_name), lv_color_hex("
+                f"n ? 0x{NIGHT['name']:06X} : 0x{DAY['name']:06X}), LV_PART_MAIN);",
+                f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_value), lv_color_hex("
+                f"n ? 0x{NIGHT['value']:06X} : 0x{DAY['value']:06X}), LV_PART_MAIN);",
+            ]
+            if not notification:
+                lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_unit), lv_color_hex("
+                             f"n ? 0x{NIGHT['name']:06X} : 0x{DAY['name']:06X}), LV_PART_MAIN);")
+    for iid in used:   # the guarded severity colours must repaint with the new palette
+        if is_notification(config, iid) or has_thresholds(config["instruments"][iid]):
+            lines.append(f"            id(ins_{iid}_drawn_sev) = 255;")
+    lines += [
+        "          }",
+        "      - if:", "          condition:", "            lambda: 'return id(night_dirty);'", "          then:",
+        "            - lambda: 'id(night_dirty) = false;'", "            - script.execute: render_tiles",
+    ]
+    if header_enabled(display):
+        lines.append("            - script.execute: render_header")
+    if power_enabled(display):
+        lines.append("            - script.execute: apply_power")
+    return lines
+
+
+def _power_script(display: dict) -> list:
+    """One backlight controller: banner 100 %, else idle dim, else night, else day; only on change."""
+    lines = [
+        "  - id: apply_power", "    mode: restart", "    then:", "      - lambda: |-",
+        f"          int target = {day_brightness(display)};",
+    ]
+    if night_enabled(display):
+        lines.append(f"          if (id(night_active)) target = {night_brightness(display)};")
+    if dim_enabled(display):
+        lines.append(f"          if (id(dim_idle) && target > {dim_brightness(display)}) "
+                     f"target = {dim_brightness(display)};")
+    if alarm_takeover_enabled(display):
+        lines.append("          if (!lv_obj_has_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN)) target = 100;")
+    lines += [
+        "          if (target != id(bl_drawn)) {",
+        "            id(bl_drawn) = target;",
+        "            auto call = id(board_backlight).turn_on();",
+        "            call.set_brightness(target / 100.0f);",
+        "            call.perform();",
+        "          }",
+    ]
+    return lines
+
+
+def _dim_interval(display: dict) -> list:
+    """Four times a second: has the touchscreen been idle for dim_after_s? Then re-apply the backlight."""
+    return [
+        "  - interval: 250ms", "    then:", "      - if:", "          condition:", "            lvgl.is_idle:",
+        f"              timeout: {dim_after_s(display)}s", "          then:",
+        "            - lambda: 'id(dim_idle) = true;'", "          else:",
+        "            - lambda: 'id(dim_idle) = false;'", "      - script.execute: apply_power",
+    ]
+
+
 def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str) -> str:
     display = config["displays"][display_id]
     board = registry["boards"][display["board"]]
@@ -743,10 +1141,14 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     takeover = alarm_takeover_enabled(display)
     if takeover:
         lines += ALARM_GLOBALS
+    lines += _ui_globals(display)
     lines += ["", *_fonts_lines(display, config), "", "mqtt:", "  on_message:",
               f"    - topic: {topics.BRIDGE_STATUS_TOPIC}", "      then:",
               '        - lambda: \'id(bridge_online) = (x == "online");\'',
-              "        - script.execute: render_tiles", "  on_json_message:"]
+              "        - script.execute: render_tiles"]
+    if header_enabled(display):
+        lines += ["        - script.execute: render_header", *_signalk_message(display)]
+    lines.append("  on_json_message:")
     for iid in used:
         if is_notification(config, iid):
             lines += _notification_handler(iid)
@@ -755,6 +1157,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
                                    has_thresholds(config["instruments"][iid]))
     if takeover:
         lines += _alarm_handler(used, display)
+    if clock_enabled(display):
+        lines += _clock_handler(display)
     lines += ["  on_disconnect:", "    - lambda: 'id(bridge_online) = false;'",
               "    - script.execute: render_tiles", "", "script:", "  - id: render_tiles",
               "    mode: restart", "    then:"]
@@ -776,17 +1180,27 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines += _word_lines(config, display, iid, heartbeat)
     for iid in used:
         if is_notification(config, iid) or has_thresholds(config["instruments"][iid]):
-            lines += _sev_lines(config, display, iid, heartbeat)
+            lines += _sev_lines(config, display, iid, heartbeat, night_enabled(display))
     if takeover:
         lines += _alarm_script(config, used, heartbeat)
+    if header_enabled(display):
+        lines += _header_script(board, display, heartbeat)
+    if night_enabled(display):
+        lines += _night_script(config, display, used)
+    if power_enabled(display):
+        lines += _power_script(display)
     lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles"]
     if takeover:
-        lines += ["      - script.execute: render_alarm",
-                  f"  - interval: {BANNER_FLASH_INTERVAL}", "    then:", "      - lambda: |-",
+        lines.append("      - script.execute: render_alarm")
+    lines += _after_ui_change(display, "      ")
+    if takeover:
+        lines += [f"  - interval: {BANNER_FLASH_INTERVAL}", "    then:", "      - lambda: |-",
                   "          if (lv_obj_has_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN)) return;",
                   "          id(alarm_flash) = !id(alarm_flash);",
                   "          lv_obj_set_style_bg_opa(id(alarm_banner), id(alarm_flash) ? LV_OPA_40 : LV_OPA_COVER,"
                   " LV_PART_MAIN);"]
+    if dim_enabled(display):
+        lines += _dim_interval(display)
     lines += ["", "lvgl:", "  displays: [board_display]", "  touchscreens: [board_touch]",
               "  buffer_size: 100%", "  style_definitions:", "    - id: tile_style",
               "      bg_color: 0x101820", "      bg_opa: COVER", "      border_width: 0",
