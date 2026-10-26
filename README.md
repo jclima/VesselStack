@@ -1044,11 +1044,19 @@ working. With `DISPLAYS_ENABLE=true` these accounts are added:
 | Account | Read | Write |
 | --- | --- | --- |
 | `MQTT_USERNAME` (admin) | `#`, `$SYS/#` | `#` |
-| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/bridge/#` |
-| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
+| `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/bridge/#` |
+| `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
 
-Display accounts are read-only for instrument data and cannot read other MQTT
-topics such as `homeassistant/#`. Any other MQTT account is granted nothing.
+Display accounts are read-only for instrument and notification data and cannot
+read other MQTT topics such as `homeassistant/#`. Any other MQTT account is
+granted nothing.
+
+**Existing installations:** the `vesselstack/v1/notifications/#` rules were added
+with the display notifications feature. The ACL file is rewritten by the next
+installer run (`install.sh`, `vesselstackctl update`) or by `sudo vesselstackctl
+display sync-mqtt`; until then the bridge cannot publish notifications and
+status-grid displays show `--` for them. The change only adds two rules; roll
+back by restoring the previous release and running `display sync-mqtt` again.
 
 Operational notes:
 
@@ -1261,7 +1269,8 @@ on the bridge so a running bridge picks up the rewritten environment; a stopped
 bridge is only started by `--start` or `vesselstackctl start`. The unit runs as the unprivileged service account with the same
 hardening as Boat Chat plus a read-only filesystem view; it only reads
 `displays.json`. The bridge MQTT account may only publish
-`vesselstack/v1/instruments/#` and `vesselstack/v1/bridge/#`.
+`vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#` and
+`vesselstack/v1/bridge/#`.
 
 Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
 `online` (and `offline` on a clean stop; Mosquitto publishes the retained last
@@ -1692,7 +1701,8 @@ Please report the settings that worked on your unit.
 The runtime configuration lives at `$VESSELSTACK_ROOT/config/displays.json`.
 Start from [`displays/displays.example.json`](displays/displays.example.json).
 It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
-`heartbeat_s` (1-60, default 5), `instruments` and `displays`:
+`heartbeat_s` (1-60, default 5), `instruments`, optional `notifications` and
+`displays`:
 
 - An instrument (`^[a-z][a-z0-9_]{0,31}$`) has a SignalK `path` for
   `vessels.self` (numeric scalar values only), `label` (1-16 characters),
@@ -1703,8 +1713,13 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
 - A display (`^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$`: 1-24 characters, starting with a letter and not ending in a hyphen) has a `name`, a `board` from
   `displays/boards/registry.json`, optional `home_assistant_api` (boolean) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
-  supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6) and
-  unique `items` naming existing instruments.
+  supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6,
+  `status-grid` holds 1-9) and unique `items` naming existing instruments or,
+  on layouts that accept them (`status-grid`), notifications. Each layout
+  declares the item types it accepts; `single` and `grid-2x2` take instruments
+  only.
+- A notification (see [Notifications](#notifications)) has the same id rules
+  as an instrument; ids are unique across instruments and notifications.
 - Conversions: `none`, `m/s->kn`, `m/s->km/h`, `m/s->mph`, `K->C`, `K->F`,
   `rad->deg`, `rad->deg_signed` (-180..180], `rad->deg_360` [0,360), `m->ft`,
   `m->fathom`, `m->nmi`, `ratio->%`, `Pa->hPa`, `Pa->bar`, `Pa->psi`, `m3->L`,
@@ -1775,6 +1790,93 @@ display build ID` and then `display flash ID --ota HOST` or `--serial DEVICE`.
 Rollback: remove `thresholds` from the instruments and rebuild and reflash, or
 flash the previous firmware (`display flash ID --previous ...`).
 
+#### Notifications
+
+A SignalK notification (an alarm or warning such as the anchor alarm or a low
+battery notification) can be shown as a coloured status cell on a `status-grid`
+page. Add a top-level `notifications` object to `displays.json`:
+
+```json
+"notifications": {
+  "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
+  "low_battery": {"path": "notifications.electrical.batteries.house.voltage",
+                  "label": "Low battery", "absent": "ok", "alarm": true}
+}
+```
+
+- `path` must start with `notifications.` (own vessel, SignalK path syntax),
+  `label` is 1-16 printable characters in the bundled font (checked like
+  instrument labels), `absent` is `ok` (default) or `unknown` and `alarm` is a
+  boolean (default true; stored for later alarm indications, no effect today).
+  Ids use the instrument id rules and must not clash with an instrument id.
+- State mapping: the notification value is an object with a `state`.
+  `normal` and `nominal` show **OK** (green), `alert` and `warn` show **WARN**
+  (amber), `alarm` and `emergency` show **ALARM** (red). A cleared
+  notification (value `null`) follows `absent`. Any other state string, or a
+  value that is not such an object, is `unknown` and shows grey `--`. The
+  notification `message` text is never read, published or shown.
+- `absent`: SignalK only reports a notification while it exists, so silence
+  means either "nothing is wrong" or "the source is not running". `absent:
+  "ok"` treats a notification that has not been raised, or has been cleared, as
+  healthy (right for alarms SignalK itself generates, such as the anchor alarm);
+  `absent: "unknown"` shows grey `--` instead (right when a missing notification
+  could just as well mean the monitoring plugin is not running). Either way,
+  while SignalK is disconnected every notification is `stale` and grey, and
+  nothing is ever green on a stale or unknown state.
+- After SignalK (re)connects, notifications that nobody has reported on stay
+  `unknown` for 3 s so that an alarm that is still active is shown red as soon
+  as SignalK re-sends it instead of flashing green first.
+
+Topic: each notification is published retained to
+`vesselstack/v1/notifications/<id>` as compact JSON,
+`{"v":null,"u":"","st":"ok","sev":"alarm","ts":"2026-01-01T00:00:00.000Z","age":0.4}`
+(`v` is always `null` and `u` empty; `sev` is always present). `st` is `ok`
+while SignalK is connected, `stale` once it disconnects (everything heard is
+forgotten and SignalK re-sends active notifications on reconnect) and `missing`
+before the first connection. Items are republished every `heartbeat_s`; the
+display blanks a cell (grey `--`) after 3 x `heartbeat_s` without a message,
+when the bridge is offline, or when MQTT is disconnected. The bridge subscribes
+to these paths with a 1000 ms period; instruments still only publish numeric
+values. The bridge needs the `notifications/#` ACL rule (see [MQTT access
+control](#mqtt-access-control)).
+
+#### The `status-grid` layout
+
+`status-grid` shows 1-9 instruments and notifications, one cell each, inside
+the board's content area (340 x 340 px on the Waveshare 2.8C) with 6 px gaps:
+
+| Items | Grid (columns x rows) | Cell size |
+| --- | --- | --- |
+| 1-4 | 2 x 2 | 167 x 167 px |
+| 5-6 | 3 x 2 | 109 x 167 px |
+| 7-9 | 3 x 3 | 109 x 109 px |
+
+Every cell has the item label (small font). A notification cell shows one of
+the fixed words **OK**, **WARN**, **ALARM** or **--** in a bold font and its
+background follows the severity (grey when stale, unknown or offline). An
+instrument cell shows the value and unit as on the other layouts and is
+coloured by its severity if it has `thresholds`, otherwise the plain tile
+colour. All text is fixed in the firmware; labels are `!literal` scalars and no
+text is built from MQTT data. Words are shown in a 48 px bold font in 2 x 2
+grids and 30 px otherwise. Nothing was measured on the hardware yet: long
+labels are clipped with an ellipsis.
+[`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
+has a `Status` page. A rebuild and reflash (`display build` and `display flash`)
+is needed; firmware built before this release ignores notification topics.
+Rollback: remove the `status-grid` pages and the `notifications` and reflash,
+or flash the previous firmware.
+
+#### Board registry schema 2
+
+`displays/boards/registry.json` is now `schema` 2, where each layout is an
+object `{"capacity", "min_items", "shapes": ["round","rect"], "types":
+["instrument","notification"]}` (the allowed item types). `schema` 1
+registries (a layout is just an integer capacity) are still accepted and mean
+`min_items` 1, both shapes and instruments only. A board may only list layouts
+that support its `shape`. `vesselstackctl display add` still picks the largest
+layout that takes only instruments for the default page; `status-grid` is
+chosen only when nothing else fits.
+
 ### MQTT topics and freshness
 
 Values are published retained to `vesselstack/v1/instruments/<instrument_id>`
@@ -1784,6 +1886,8 @@ as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","a
 bridge received the value, measured on the bridge clock, not the SignalK
 timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/<username>/status`.
+Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
+(see [Notifications](#notifications)).
 
 - `sev` (optional): instruments that have `thresholds` also publish
   `"sev":"ok"|"warn"|"alarm"|"unknown"`, placed after `st` (for example
@@ -1807,7 +1911,7 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area | `single`, `grid-2x2`, `status-grid` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 
@@ -1820,7 +1924,7 @@ timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
   interface that can reach the Raspberry Pi's MQTT port.
 - The build path is exporting from the Pi and compiling on a laptop; building
   and flashing on the Pi (a Compose profile) is planned and not available yet.
-  Only the `single` and `grid-2x2` layouts are generated.
+  Only the `single`, `grid-2x2` and `status-grid` layouts are generated.
 - The runtime `displays.json`, `displays.secrets.json`, ESPHome
   `secrets.yaml`, `.esphome/` and `displays/build/` output, `$VESSELSTACK_ROOT/build/` and firmware
   binaries (`.bin`, `.elf`, `.uf2`) are git-ignored and rejected by

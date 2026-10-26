@@ -38,7 +38,9 @@ def cmd_validate(args) -> int:
             print(f"{args.file}: {err}", file=sys.stderr)
         print(f"{len(errors)} error(s); nothing written", file=sys.stderr)
         return 1
-    print(f"OK: {args.file}: {len(config['instruments'])} instrument(s), "
+    notes = config.get("notifications")
+    extra = f"{len(notes)} notification(s), " if notes else ""
+    print(f"OK: {args.file}: {len(config['instruments'])} instrument(s), {extra}"
           f"{len(config['displays'])} display(s)")
     return 0
 

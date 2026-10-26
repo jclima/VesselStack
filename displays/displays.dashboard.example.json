@@ -10,12 +10,17 @@
     "fuel": {"path": "tanks.fuel.0.currentLevel", "label": "Fuel", "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "thresholds": {"alarm_below": 10, "warn_below": 25, "hysteresis": 2}, "min": 0, "max": 100},
     "water": {"path": "tanks.freshWater.0.currentLevel", "label": "Water", "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "thresholds": {"warn_below": 20, "hysteresis": 2}, "min": 0, "max": 100}
   },
+  "notifications": {
+    "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
+    "low_battery": {"path": "notifications.electrical.batteries.house.voltage", "label": "Low battery", "absent": "ok"}
+  },
   "displays": {
     "helm": {
       "name": "Helm",
       "board": "waveshare-esp32-s3-touch-lcd-2.8c",
       "pages": [
         {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "house_v", "start_v"]},
+        {"title": "Status", "layout": "status-grid", "items": ["anchor", "low_battery", "depth", "house_v", "start_v", "fuel", "water"]},
         {"title": "Tanks", "layout": "grid-2x2", "items": ["fuel", "water"]}
       ]
     }

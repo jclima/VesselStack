@@ -169,7 +169,7 @@ check complex aux
 check thresholds helm
 check status helm
 for word in ALARM WARN OK; do
-    grep -qE "text: [\"']?$word[\"']?\$" "$WORK/status-helm.log" || { echo "status word $word missing from the validated config" >&2; fail=1; }
+    grep -qE "text: [\"']?${word}[\"']?\$" "$WORK/status-helm.log" || { echo "status word $word missing from the validated config" >&2; fail=1; }
 done
 grep -q 'lv_obj_set_style_bg_color(id(p1_anchor_tile)' "$WORK/status-helm.log" \
     || { echo "notification colour lambda missing from the validated status config" >&2; fail=1; }
