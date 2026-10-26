@@ -26,6 +26,7 @@ SUFFIX="$$-$RANDOM"
 NETWORK="vs-bridge-test-$SUFFIX"
 BROKER="vs-bridge-broker-$SUFFIX"
 SIGNALK="vs-bridge-signalk-$SUFFIX"
+HA="vs-bridge-ha-$SUFFIX"
 BRIDGE="vs-bridge-bridge-$SUFFIX"
 VENV_VOL="vs-bridge-venv-$SUFFIX"
 TEST_ROOT=$(mktemp -d)
@@ -42,7 +43,7 @@ install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto/mo
 if [ "$IS_ROOT" -eq 1 ]; then AUTH_SRC="$MDIR"; else AUTH_SRC="$BROKER-auth"; fi
 
 cleanup() {
-    docker rm -f "$BROKER" "$SIGNALK" "$BRIDGE" >/dev/null 2>&1 || true
+    docker rm -f "$BROKER" "$SIGNALK" "$HA" "$BRIDGE" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
     docker volume rm "$VENV_VOL" >/dev/null 2>&1 || true
     [ "$IS_ROOT" -eq 1 ] || docker volume rm "$AUTH_SRC" >/dev/null 2>&1 || true
@@ -56,6 +57,8 @@ trap cleanup EXIT
 ADMIN_USER=boatadmin
 ADMIN_PASS=$(openssl rand -hex 16)
 SK_TOKEN=$(openssl rand -hex 16)
+HA_TOKEN=$(openssl rand -hex 16)
+HA_BAD_TOKEN=$(openssl rand -hex 16)
 COUNT=0
 fail() { echo "FAIL: $*" >&2; docker logs "$BRIDGE" >&2 2>&1 || true; exit 1; }
 pass() { COUNT=$((COUNT + 1)); }
@@ -179,11 +182,12 @@ with open(sys.argv[2], "w") as out:
 PY
 chmod 0600 "$DOCKER_ENV"
 
+# run_bridge [ENV_FILE [CONFIG_FILE]]
 run_bridge() {
     docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
-    docker run -d --name "$BRIDGE" --network "$NETWORK" --env-file "$DOCKER_ENV" "${UNPRIV[@]}" \
+    docker run -d --name "$BRIDGE" --network "$NETWORK" --env-file "${1:-$DOCKER_ENV}" "${UNPRIV[@]}" \
         -e PYTHONDONTWRITEBYTECODE=1 -e "TZ=$BRIDGE_TZ" \
-        -v "$REPO_ROOT/displays:/app/displays:ro" -v "$ROOT/config/displays.json:/cfg/displays.json:ro" \
+        -v "$REPO_ROOT/displays:/app/displays:ro" -v "${2:-$ROOT/config/displays.json}:/cfg/displays.json:ro" \
         -v "$VENV_VOL:/venv:ro" "$PYIMAGE" /venv/bin/python /app/displays/bridge.py >/dev/null
 }
 
@@ -305,6 +309,108 @@ out=$(docker run --rm "${UNPRIV[@]}" --env-file "$DOCKER_ENV" -e DISPLAYS_CONFIG
     -v "$VENV_VOL:/venv:ro" "$PYIMAGE" /venv/bin/python -B /app/displays/bridge.py 2>&1) || code=$?
 [ "$code" -eq 2 ] || fail "invalid config exited $code, expected 2"
 grep -q 'invalid displays configuration' <<<"$out" || fail "invalid config message missing"
+pass
+
+# 9. Home Assistant items, against a fake Home Assistant websocket server (not a real one). The
+# configuration gains two binary items; SignalK keeps running throughout.
+HA_CONFIG="$TEST_ROOT/displays-ha.json"
+python3 - "$ROOT/config/displays.json" "$HA_CONFIG" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["ha"] = {
+    "bilge": {"entity_id": "binary_sensor.vesselstack_bilge_pump", "label": "Bilge", "kind": "binary",
+              "states": [{"match": "on", "sev": "warn", "text": "RUNNING"}, {"match": "off", "sev": "ok", "text": "OFF"}]},
+    "high_water": {"entity_id": "binary_sensor.vesselstack_high_water", "label": "High water", "kind": "binary",
+                   "states": [{"match": "on", "sev": "alarm", "text": "HIGH"}, {"match": "off", "sev": "ok", "text": "DRY"}]},
+}
+cfg["displays"]["helm"]["pages"][1]["items"] = ["sog", "anchor", "bilge", "high_water"]
+json.dump(cfg, open(sys.argv[2], "w"), indent=2)
+PY
+ha_env() { # ha_env FILE TOKEN : the bridge environment with the Home Assistant settings appended
+    cp "$DOCKER_ENV" "$1"
+    printf 'HOME_ASSISTANT_URL=http://%s:8123\nDISPLAYS_HA_TOKEN=%s\n' "$HA" "$2" >> "$1"
+    chmod 0600 "$1"
+}
+start_signalk() {
+    docker rm -f "$SIGNALK" >/dev/null 2>&1 || true
+    docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
+        -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
+        /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 400 --alarm-at 1000 --clear-at 1001 \
+        --token "$SK_TOKEN" >/dev/null
+}
+start_ha() { # start_ha [fake_homeassistant.py options...]
+    docker rm -f "$HA" >/dev/null 2>&1 || true
+    docker run -d --name "$HA" --network "$NETWORK" "${UNPRIV[@]}" \
+        -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
+        /venv/bin/python /fx/fake_homeassistant.py --port 8123 --token "$HA_TOKEN" "$@" >/dev/null
+}
+start_signalk
+
+# 9a. A wrong token: Home Assistant is "disabled", the bridge keeps running, SignalK items stay ok,
+# and neither token is ever logged.
+start_ha --state binary_sensor.vesselstack_bilge_pump=on
+ha_env "$TEST_ROOT/ha-bad.env" "$HA_BAD_TOKEN"
+run_bridge "$TEST_ROOT/ha-bad.env" "$HA_CONFIG"
+wait_for vesselstack/v1/bridge/homeassistant '^disabled$' 40
+wait_for vesselstack/v1/bridge/signalk '^connected$' 40
+wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 15
+wait_for vesselstack/v1/ha/bilge '"v":null,"k":null,"u":"","st":"missing","sev":"unknown"' 10
+[ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status)" = online ] || fail "the bridge went offline after a bad Home Assistant token"
+logs=$(docker logs "$BRIDGE" 2>&1)
+grep -q 'rejected the access token' <<<"$logs" || fail "the bad token was not reported"
+for secret in "$HA_BAD_TOKEN" "$HA_TOKEN" "$SK_TOKEN" "$BRIDGE_PASS"; do
+    ! grep -Fq "$secret" <<<"$logs" || fail "a secret appeared in the bridge log (bad token)"
+    ! docker logs "$HA" 2>&1 | grep -Fq "$secret" || fail "a secret appeared in the fake Home Assistant log"
+done
+pass
+
+# 9b. A good token: the bilge pump runs (warn, k 0) and stops (ok, k 1); the high water switch
+# trips later and the alarm summary counts it; then Home Assistant goes away (stale) while the
+# SignalK items stay ok.
+start_ha --state binary_sensor.vesselstack_bilge_pump=on --state binary_sensor.vesselstack_bilge_pump=off@20 \
+    --state binary_sensor.vesselstack_high_water=off --state binary_sensor.vesselstack_high_water=on@40 \
+    --duration 62
+ha_env "$TEST_ROOT/ha-good.env" "$HA_TOKEN"
+docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
+start_signalk   # the fake SignalK serves one connection, then stops: a fresh one for every bridge run
+run_bridge "$TEST_ROOT/ha-good.env" "$HA_CONFIG"
+wait_for vesselstack/v1/bridge/homeassistant '^connected$' 40
+wait_for vesselstack/v1/bridge/signalk '^connected$' 40
+wait_for vesselstack/v1/ha/bilge '"v":null,"k":0,"u":"","st":"ok","sev":"warn"' 20
+wait_for vesselstack/v1/ha/high_water '"k":1,"u":"","st":"ok","sev":"ok"' 20
+[ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/ha/bilge | grep -ci 'RUNNING\|binary_sensor\|"on"')" = 0 ] \
+    || fail "a Home Assistant state or text was published"
+wait_for vesselstack/v1/ha/bilge '"k":1,"u":"","st":"ok","sev":"ok"' 30
+wait_for vesselstack/v1/ha/high_water '"k":0,"u":"","st":"ok","sev":"alarm"' 30
+# (d) the alarm summary includes the Home Assistant alarm
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"ids":\["high_water"\]' 15
+# (c) Home Assistant stops: its items are stale, SignalK is untouched
+wait_for vesselstack/v1/bridge/homeassistant '^disconnected$' 40
+wait_for vesselstack/v1/ha/bilge '"v":null,"k":null,"u":"","st":"stale","sev":"unknown"' 15
+wait_for vesselstack/v1/ha/high_water '"st":"stale","sev":"unknown"' 15
+wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 10
+wait_for vesselstack/v1/alarms/summary '"max":"unknown"' 15
+logs=$(docker logs "$BRIDGE" 2>&1)
+for secret in "$HA_TOKEN" "$SK_TOKEN" "$BRIDGE_PASS"; do
+    ! grep -Fq "$secret" <<<"$logs" || fail "a secret appeared in the bridge log (good token)"
+done
+pass
+
+# 9c. A Home Assistant without subscribe_entities: the client falls back to get_states + state_changed events.
+start_ha --no-subscribe-entities --state binary_sensor.vesselstack_bilge_pump=on \
+    --state binary_sensor.vesselstack_bilge_pump=off@20 --state binary_sensor.vesselstack_high_water=off --duration 50
+docker rm -f "$BRIDGE" >/dev/null 2>&1 || true
+start_signalk
+run_bridge "$TEST_ROOT/ha-good.env" "$HA_CONFIG"
+wait_for vesselstack/v1/bridge/homeassistant '^connected$' 40
+wait_for vesselstack/v1/ha/bilge '"k":0,"u":"","st":"ok","sev":"warn"' 20
+wait_for vesselstack/v1/ha/bilge '"k":1,"u":"","st":"ok","sev":"ok"' 30
+hlogs=$(docker logs "$HA" 2>&1)
+grep -q 'subscribe_entities (refused)' <<<"$hlogs" || fail "the fallback test did not refuse subscribe_entities"
+grep -q 'command: get_states' <<<"$hlogs" || fail "the client did not fall back to get_states"
+grep -q 'command: subscribe_events (state_changed)' <<<"$hlogs" || fail "the client did not subscribe to state_changed events"
+docker stop -t 15 "$BRIDGE" >/dev/null
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$BRIDGE")" = 0 ] || fail "SIGTERM with Home Assistant items did not exit 0"
 pass
 
 echo "displays bridge integration checks passed ($COUNT groups)"
