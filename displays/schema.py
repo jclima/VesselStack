@@ -30,6 +30,9 @@ ABSENT_MODES = ("ok", "unknown")
 ITEM_TYPES = ("instrument", "notification")
 SHAPES = ("round", "rect")
 LAYOUT_KEYS = {"capacity", "min_items", "shapes", "types"}
+# Layouts that scale a reading into a bar or an arc: every instrument on them needs a min and a max.
+RANGE_LAYOUTS = ("tank-bars", "gauge-arc")
+LAYOUT_HINTS = {"gauge-arc": "gauge-arc needs a round board; use single"}
 INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms",
                    "thresholds", "min", "max", "alarm"}
 # Bounds in severity order; "low" bounds are checked with <, "high" bounds with >.
@@ -193,6 +196,14 @@ def validate_ui(ui, where: str, pages, instruments, notifications, errors: list,
     if (is_int(day) and is_int(dark) and 5 <= day <= 100 and 5 <= dark <= 100
             and "night_brightness" in ui and dark > day):
         errors.append(f"{where}.night_brightness: must not exceed day_brightness ({day})")
+
+
+def _layout_hint(layout, board: dict, specs: dict) -> str:
+    """The fix for a layout the board cannot show, when the layout knows one (rect board, gauge-arc)."""
+    hint = LAYOUT_HINTS.get(layout)
+    if hint and board.get("shape") not in specs[layout]["shapes"]:
+        return f"; {hint}"
+    return ""
 
 
 def _unknown(obj: dict, allowed: set, where: str, errors: list) -> None:
@@ -492,10 +503,12 @@ def validate_config(cfg, registry) -> list[str]:
                         if not isinstance(layout, str) or layout not in specs:
                             errors.append(f"{pw}.layout: unknown layout {layout!r}")
                         elif board is not None and layout not in board.get("layouts", []):
-                            errors.append(f"{pw}.layout: {layout!r} is not supported by board {disp['board']!r}")
+                            errors.append(f"{pw}.layout: {layout!r} is not supported by board {disp['board']!r}"
+                                          + _layout_hint(layout, board, specs))
                         elif board is not None and board.get("shape") not in specs[layout]["shapes"]:
                             errors.append(f"{pw}.layout: {layout!r} does not support the "
-                                          f"{board.get('shape')} shape of board {disp['board']!r}")
+                                          f"{board.get('shape')} shape of board {disp['board']!r}"
+                                          + _layout_hint(layout, board, specs))
                         else:
                             spec = specs[layout]
                     items = page.get("items")
@@ -524,6 +537,11 @@ def validate_config(cfg, registry) -> list[str]:
                                 if spec is not None and kind not in spec["types"]:
                                     errors.append(f"{pw}.items[{ii}]: layout {layout!r} does not accept "
                                                   f"{kind} items ({item!r})")
+                                elif (layout in RANGE_LAYOUTS and kind == "instrument"
+                                      and isinstance(instruments.get(item), dict)
+                                      and not all(finite_number(instruments[item].get(k)) for k in ("min", "max"))):
+                                    errors.append(f"{pw}.items[{ii}]: instrument {item!r} needs min and max "
+                                                  f"on layout {layout!r}")
     return errors
 
 

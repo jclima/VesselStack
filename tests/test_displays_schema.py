@@ -366,6 +366,97 @@ class NotificationTests(unittest.TestCase):
                 cfg["instruments"][f"i{n}"] = dict(inst(cfg))
         self.assertError(over, "exceed layout capacity 9")
 
+    # -- tank-bars and gauge-arc (display dashboard slice S6) --------------------------------
+
+    def gauge_cfg(self, layout="tank-bars", items=("fuel",), **inst_extra):
+        cfg = copy.deepcopy(EXAMPLE)
+        cfg["instruments"]["fuel"] = {"path": "tanks.fuel.0.currentLevel", "label": "Fuel", "convert": "ratio->%",
+                                      "unit": "%", "precision": 0, "stale_after_s": 60, "min": 0, "max": 100}
+        cfg["instruments"]["fuel"].update(inst_extra)
+        cfg["instruments"]["water"] = dict(cfg["instruments"]["fuel"], label="Water")
+        cfg["displays"]["helm"]["pages"] = [{"title": "T", "layout": layout, "items": list(items)}]
+        return cfg
+
+    def test_range_layouts_are_in_the_registry(self) -> None:
+        specs = schema.layout_specs(REGISTRY)
+        self.assertEqual(specs["tank-bars"]["capacity"], 4)
+        self.assertEqual(specs["tank-bars"]["shapes"], ["round", "rect"])
+        self.assertEqual(specs["gauge-arc"]["capacity"], 1)
+        self.assertEqual(specs["gauge-arc"]["shapes"], ["round"])
+        self.assertEqual(specs["gauge-arc"]["types"], ["instrument"])
+        self.assertEqual(schema.RANGE_LAYOUTS, ("tank-bars", "gauge-arc"))
+
+    def test_valid_tank_bars_and_gauge_arc_pages(self) -> None:
+        self.assertEqual(schema.validate_config(self.gauge_cfg("tank-bars", ["fuel", "water"]), REGISTRY), [])
+        self.assertEqual(schema.validate_config(self.gauge_cfg("gauge-arc", ["fuel"]), REGISTRY), [])
+        dashboard = schema.load_json(ROOT / "displays" / "displays.dashboard.example.json")
+        self.assertEqual(schema.validate_config(dashboard, REGISTRY), [])
+
+    def test_min_and_max_are_required_and_the_error_names_item_and_layout(self) -> None:
+        for layout in ("tank-bars", "gauge-arc"):
+            for missing in ("min", "max"):
+                cfg = self.gauge_cfg(layout)
+                del cfg["instruments"]["fuel"][missing]
+                errors = schema.validate_config(cfg, REGISTRY)
+                self.assertTrue(any("pages[0].items[0]: instrument 'fuel' needs min and max on layout "
+                                    f"'{layout}'" in e for e in errors), errors)
+        cfg = self.gauge_cfg("tank-bars", ["fuel", "water"])
+        del cfg["instruments"]["water"]["max"]
+        errors = schema.validate_config(cfg, REGISTRY)
+        self.assertEqual([e for e in errors if "needs min and max" in e],
+                         ["$.displays.helm.pages[0].items[1]: instrument 'water' needs min and max on layout 'tank-bars'"])
+
+    def test_min_and_max_are_not_required_on_the_other_layouts(self) -> None:
+        cfg = self.gauge_cfg("single")
+        del cfg["instruments"]["fuel"]["min"], cfg["instruments"]["fuel"]["max"]
+        self.assertEqual(schema.validate_config(cfg, REGISTRY), [])
+
+    def test_range_layout_capacity_types_and_a_bad_range(self) -> None:
+        over = self.gauge_cfg("tank-bars", ["fuel", "water", "sog", "depth", "awa"])
+        for iid in ("sog", "depth", "awa"):
+            over["instruments"][iid].update(min=0, max=10)
+        self.assertTrue(any("exceed layout capacity 4" in e for e in schema.validate_config(over, REGISTRY)))
+        arc = self.gauge_cfg("gauge-arc", ["fuel", "water"])
+        self.assertTrue(any("exceed layout capacity 1" in e for e in schema.validate_config(arc, REGISTRY)))
+        notes = self.gauge_cfg("gauge-arc", ["anchor"])
+        notes["notifications"] = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"}}
+        self.assertTrue(any("does not accept notification items" in e for e in schema.validate_config(notes, REGISTRY)))
+        flat = self.gauge_cfg("tank-bars", min=5, max=5)
+        self.assertTrue(any("min: must be less than max" in e for e in schema.validate_config(flat, REGISTRY)))
+
+    def rect_registry(self):
+        reg = copy.deepcopy(REGISTRY)
+        board = copy.deepcopy(reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"])
+        board.update(shape="rect", layouts=["single", "grid-2x2", "tank-bars"])
+        del board["ring"]
+        reg["boards"]["rect-board"] = board
+        return reg
+
+    def test_gauge_arc_needs_a_round_board(self) -> None:
+        reg = self.rect_registry()
+        self.assertEqual(schema.validate_registry(reg), [])
+        cfg = self.gauge_cfg("gauge-arc")
+        cfg["displays"]["helm"]["board"] = "rect-board"
+        errors = schema.validate_config(cfg, reg)
+        self.assertTrue(any("pages[0].layout: 'gauge-arc' is not supported by board 'rect-board'; "
+                            "gauge-arc needs a round board; use single" in e for e in errors), errors)
+        # a registry that lists it for the rect board is rejected outright
+        reg["boards"]["rect-board"]["layouts"].append("gauge-arc")
+        self.assertTrue(any("does not support the rect shape" in e for e in schema.validate_registry(reg)))
+        # and a config page that still names it gets the same hint from the shape check
+        errors = schema.validate_config(cfg, reg)
+        self.assertTrue(any("gauge-arc needs a round board; use single" in e for e in errors), errors)
+
+    def test_tank_bars_work_on_a_rect_board_and_other_layouts_get_no_hint(self) -> None:
+        reg = self.rect_registry()
+        cfg = self.gauge_cfg("tank-bars")
+        cfg["displays"]["helm"]["board"] = "rect-board"
+        self.assertEqual(schema.validate_config(cfg, reg), [])
+        cfg = self.gauge_cfg("list-6")
+        cfg["displays"]["helm"]["board"] = "rect-board"
+        errors = schema.validate_config(cfg, reg)
+        self.assertTrue(errors and not any("use single" in e for e in errors), errors)
+
     def test_min_items_is_enforced(self) -> None:
         reg = copy.deepcopy(REGISTRY)
         reg["layouts"]["status-grid"]["min_items"] = 3
