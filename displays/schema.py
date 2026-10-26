@@ -44,6 +44,8 @@ HA_MAX_STATES = 8
 HA_TEXT_MAX = 10
 HA_PATTERN_MAX = 64
 # A binary item without an explicit ``default`` reads "?" as a warning: never green by accident.
+# Home Assistant states that mean "no value" (kept in step with severity.HA_NO_VALUE).
+HA_NO_VALUE = frozenset({"", "unknown", "unavailable", "none"})
 HA_BINARY_DEFAULT = {"sev": "warn", "text": "?"}
 SHAPES = ("round", "rect")
 LAYOUT_KEYS = {"capacity", "min_items", "shapes", "types", "slots"}
@@ -176,6 +178,9 @@ def _validate_ha_states(item: dict, where: str, errors: list) -> None:
                         and value.isprintable()):
                     errors.append(f"{w}.{key}: must be 1..{HA_PATTERN_MAX} printable characters "
                                   "(not only spaces)")
+                elif value.strip().casefold() in HA_NO_VALUE:
+                    errors.append(f"{w}.{key}: {value!r} is never matched: unknown, unavailable, none and "
+                                  "empty states always read as no value")
             _validate_ha_outcome(entry, w, errors)
     default = item.get("default")
     if "default" not in item:

@@ -11,6 +11,9 @@ sys.path.insert(0, str(ROOT / "displays"))
 
 import severity  # noqa: E402
 
+sys.path.insert(0, str(ROOT / "boat-chat"))
+import status_model  # noqa: E402
+
 sev = severity.numeric_sev
 FULL = {"alarm_below": 11.0, "warn_below": 12.0, "warn_above": 14.5, "alarm_above": 15.0}
 
@@ -94,27 +97,91 @@ class HysteresisTests(unittest.TestCase):
         self.assertEqual(sev(12.0, th, "warn"), "ok")
 
 
+def ok(text):
+    return {"sev": "ok", "text": text}
+
+
+BINARY = {"kind": "binary", "states": [{"match": "on", "sev": "warn", "text": "RUNNING"},
+                                       {"match": "off", "sev": "ok", "text": "OFF"}]}
+NUMERIC = {"kind": "numeric", "unit": "C", "precision": 1, "thresholds": {"warn_above": 30, "alarm_above": 40}}
+
+
+class HaStateTests(unittest.TestCase):
+    def test_no_value_states_are_missing_and_unknown_never_ok(self) -> None:
+        for kind, cfg in (("binary", BINARY), ("state", BINARY), ("numeric", NUMERIC)):
+            for state in ("unknown", "unavailable", "", "  ", "UNKNOWN", " Unavailable ", "none", "None", None):
+                self.assertEqual(severity.ha_state(state, kind, cfg), ("missing", "unknown", None, None),
+                                 (kind, state))
+        for bad in (1, 1.5, True, [], {}, b"on"):
+            self.assertEqual(severity.ha_state(bad, "binary", BINARY), ("missing", "unknown", None, None))
+
+    def test_binary_matches_by_index_case_insensitively_after_trimming(self) -> None:
+        self.assertEqual(severity.ha_state("on", "binary", BINARY), ("ok", "warn", 0, None))
+        self.assertEqual(severity.ha_state("  OFF\n", "binary", BINARY), ("ok", "ok", 1, None))
+        self.assertEqual(severity.ha_state("On", "binary", BINARY), ("ok", "warn", 0, None))
+
+    def test_unmatched_takes_the_default_and_a_binary_default_is_warn(self) -> None:
+        self.assertEqual(severity.ha_state("maybe", "binary", BINARY), ("ok", "warn", -1, None))
+        cfg = dict(BINARY, default={"sev": "alarm", "text": "BAD"})
+        self.assertEqual(severity.ha_state("maybe", "binary", cfg), ("ok", "alarm", -1, None))
+        cfg = dict(BINARY, default={"sev": "ok", "text": "fine"})   # an explicit choice is honoured
+        self.assertEqual(severity.ha_state("maybe", "binary", cfg), ("ok", "ok", -1, None))
+        self.assertEqual(severity.ha_state("onn", "binary", BINARY)[:2], ("ok", "warn"))   # no substring match
+
+    def test_first_match_wins_and_prefix_matches_the_start_only(self) -> None:
+        cfg = {"kind": "state", "states": [{"prefix": "dock: clear", "sev": "ok", "text": "A"},
+                                           {"prefix": "dock", "sev": "warn", "text": "B"},
+                                           {"match": "dock: clear", "sev": "alarm", "text": "C"}],
+               "default": {"sev": "warn", "text": "?"}}
+        self.assertEqual(severity.ha_state("Dock: clear, dock 5.2 ft", "state", cfg)[1:3], ("ok", 0))
+        self.assertEqual(severity.ha_state("dock: drifting", "state", cfg)[1:3], ("warn", 1))
+        self.assertEqual(severity.ha_state("at dock", "state", cfg)[1:3], ("warn", -1))
+        self.assertEqual(severity.ha_state("dock: clear", "state", cfg)[1:3], ("ok", 0))   # not the later match
+
+    def test_numeric_parses_finite_numbers_only(self) -> None:
+        self.assertEqual(severity.ha_state("21.46", "numeric", NUMERIC), ("ok", "ok", None, 21.5))
+        self.assertEqual(severity.ha_state(" 35 ", "numeric", NUMERIC), ("ok", "warn", None, 35.0))
+        self.assertEqual(severity.ha_state("41", "numeric", NUMERIC)[1], "alarm")
+        self.assertEqual(severity.ha_state("1e1", "numeric", NUMERIC)[3], 10.0)
+        self.assertEqual(severity.ha_state("-5", "numeric", NUMERIC)[3], -5.0)
+        for bad in ("nan", "NaN", "inf", "-inf", "Infinity", "1e999", "1_0", "on", "12 C", "0x10", "--1", "1,5"):
+            self.assertEqual(severity.ha_state(bad, "numeric", NUMERIC), ("missing", "unknown", None, None), bad)
+
+    def test_numeric_without_thresholds_is_ok_and_hysteresis_follows_prev(self) -> None:
+        plain = {"kind": "numeric", "unit": "V", "precision": 2}
+        self.assertEqual(severity.ha_state("12.345", "numeric", plain), ("ok", "ok", None, 12.35))
+        cfg = {"kind": "numeric", "unit": "V", "precision": 1,
+               "thresholds": {"warn_below": 12.0, "hysteresis": 0.5}}
+        self.assertEqual(severity.ha_state("12.2", "numeric", cfg, prev="warn")[1], "warn")
+        self.assertEqual(severity.ha_state("12.2", "numeric", cfg)[1], "ok")
+
+    def test_reproduces_boat_chat_classify_on_its_vocabulary(self) -> None:
+        """An equivalent ``states`` config gives the same verdict as boat-chat's status_model.classify."""
+        configs = {
+            "Boat health": {"states": [{"match": "ok", "sev": "ok", "text": "OK"}]},
+            "Engine alarms": {"states": [{"match": "all clear", "sev": "ok", "text": "CLEAR"},
+                                         {"match": "normal", "sev": "ok", "text": "OK"}]},
+            "Weather risk": {"states": [{"match": "normal", "sev": "ok", "text": "OK"},
+                                        {"match": "low", "sev": "ok", "text": "LOW"}]},
+            "Boat watch": {"states": [{"match": "clear", "sev": "ok", "text": "CLEAR"},
+                                      {"prefix": "dock: clear", "sev": "ok", "text": "DOCK"},
+                                      {"prefix": "away: clear", "sev": "ok", "text": "AWAY"},
+                                      {"prefix": "anchor: clear", "sev": "ok", "text": "ANCHOR"}]},
+        }
+        vocabulary = ["ok", "OK", " Ok ", "healthy", "all clear", "All Clear", "normal", "Normal", "low", "LOW",
+                      "clear", "Clear", "dock: clear", "Dock: Clear", "away: clear", "anchor: clear",
+                      "anchor: clear, drift 12.5 ft", "dock: clear, dock 3.1 ft", "away: clear",
+                      "high", "elevated", "alarm", "warning", "problem", "dock: drifting", "anchor: dragging",
+                      "unknown", "unavailable", "none", "None", "", "   ", "on", "off", "degraded",
+                      "Unknown", "UNAVAILABLE"]
+        verdict = {"ok": "ok", "warning": "warn", "unknown": "unknown"}
+        for label, cfg in configs.items():
+            cfg = dict(cfg, default={"sev": "warn", "text": "CHECK"})
+            for value in vocabulary:
+                expected = verdict[status_model.classify(label, value)]
+                got = severity.ha_state(value, "state", cfg)[1]
+                self.assertEqual(got, expected, (label, value))
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-class NotificationTests(unittest.TestCase):
-    def test_states_map_to_severities(self) -> None:
-        for state, expected in (("normal", "ok"), ("nominal", "ok"), ("alert", "warn"), ("warn", "warn"),
-                                ("alarm", "alarm"), ("emergency", "alarm")):
-            self.assertEqual(severity.notification_sev({"state": state, "message": "x"}), expected, state)
-
-    def test_unknown_or_malformed_values_are_unknown_never_ok(self) -> None:
-        for value in ({"state": "ALARM"}, {"state": "fine"}, {"state": ""}, {"state": None}, {"state": 3},
-                      {}, {"message": "all good"}, "normal", ["alarm"], 1, True, False, 0):
-            for absent in ("ok", "unknown"):
-                self.assertEqual(severity.notification_sev(value, absent), "unknown", (value, absent))
-
-    def test_cleared_follows_absent(self) -> None:
-        self.assertEqual(severity.notification_sev(None), "ok")
-        self.assertEqual(severity.notification_sev(None, "ok"), "ok")
-        self.assertEqual(severity.notification_sev(None, "unknown"), "unknown")
-
-    def test_message_text_is_never_used(self) -> None:
-        self.assertEqual(severity.notification_sev({"state": "alarm", "message": "everything is normal"}), "alarm")
-        self.assertEqual(severity.notification_sev({"state": "normal", "message": "ALARM!"}), "ok")

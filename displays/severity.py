@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 LEVELS = ("ok", "warn", "alarm")
 
@@ -67,3 +68,55 @@ def notification_sev(value, absent: str = "ok") -> str:
         return "unknown"
     state = value.get("state")
     return NOTIFICATION_STATES.get(state, "unknown") if isinstance(state, str) else "unknown"
+
+
+# Home Assistant ----------------------------------------------------------------------
+# States that mean "HA has no value": shown as "--", severity unknown, never matched against
+# the configured states (so a ``match`` of one of these words would be dead configuration).
+HA_NO_VALUE = frozenset({"", "unknown", "unavailable", "none"})
+_HA_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def ha_normalise(text) -> str:
+    """Trimmed, case-folded state text, the form every comparison uses."""
+    return text.strip().casefold()
+
+
+def ha_state(state_str, kind: str, cfg: dict, prev=None) -> tuple:
+    """Map a Home Assistant state string to ``(st, sev, k, v)``.
+
+    ``st`` is "ok" for a usable value and "missing" otherwise; ``sev`` is "ok", "warn", "alarm" or
+    "unknown"; ``k`` is the index of the matching ``states`` entry (-1: the default, None for a
+    numeric item or a missing value); ``v`` is the rounded number of a numeric item. An
+    "unknown" / "unavailable" / "none" / empty state, a missing state, or a numeric item whose
+    state is not a finite number is "missing" with severity "unknown". Matching is case-insensitive
+    after trimming and the first matching entry wins; a state no entry matches takes the
+    configured ``default`` (for a binary item without one: warn). It never maps to "ok" by accident.
+    ``prev`` is the previous severity of a numeric item, for the hysteresis.
+    """
+    if not isinstance(state_str, str) or ha_normalise(state_str) in HA_NO_VALUE:
+        return ("missing", "unknown", None, None)
+    if kind == "numeric":
+        text = state_str.strip()
+        if not _HA_NUMBER.fullmatch(text):
+            return ("missing", "unknown", None, None)
+        try:
+            value = float(text)
+        except (ValueError, OverflowError):
+            return ("missing", "unknown", None, None)
+        if not math.isfinite(value):
+            return ("missing", "unknown", None, None)
+        value = round(value, cfg.get("precision", 0))
+        thresholds = cfg.get("thresholds")
+        sev = numeric_sev(value, thresholds, prev) if thresholds else "ok"
+        return ("ok", sev, None, value)
+    state = ha_normalise(state_str)
+    for index, entry in enumerate(cfg.get("states", ())):
+        if "match" in entry:
+            hit = state == ha_normalise(entry["match"])
+        else:
+            hit = state.startswith(ha_normalise(entry["prefix"]))
+        if hit:
+            return ("ok", entry["sev"], index, None)
+    default = cfg.get("default") or {"sev": "warn"}
+    return ("ok", default["sev"], -1, None)
