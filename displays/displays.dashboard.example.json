@@ -18,6 +18,7 @@
     "helm": {
       "name": "Helm",
       "board": "waveshare-esp32-s3-touch-lcd-2.8c",
+      "ui": {"alarm_takeover": true, "alarm_page": 1},
       "pages": [
         {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "house_v", "start_v"]},
         {"title": "Status", "layout": "status-grid", "items": ["anchor", "low_battery", "depth", "house_v", "start_v", "fuel", "water"]},

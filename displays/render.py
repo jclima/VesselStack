@@ -56,11 +56,17 @@ PLACEHOLDER_NOTE = ("Wi-Fi credentials are not configured: wrote PLACEHOLDER val
                     "secrets.yaml. Do not flash this build.")
 FONT_FILES = {"bold": "RobotoCondensed-Bold.ttf", "regular": "RobotoCondensed-Regular.ttf"}
 FONT_LICENSE = "OFL.txt"
-FONT_SIZES = {"grid": 56, "single": 96, "small": 20, "status_lg": 48, "status_sm": 30}
+FONT_SIZES = {"grid": 56, "single": 96, "small": 20, "status_lg": 48, "status_sm": 30,
+              "banner": 48, "banner_name": 28}
 STATUS_GAP = 6
 STATUS_WORDS = {1: "OK", 2: "WARN", 3: "ALARM", 0: "--"}  # sev number -> fixed word
 STATUS_FONTS = {"lg": "font_status_lg", "sm": "font_status_sm"}
 TAP_TIME = "0ms"
+BANNER_COLOR = 0xC62828
+BANNER_HEIGHT = 96
+BANNER_GLYPHS = "0123456789+ ALRMS"   # "<n> ALARM(S)" and "99+": the only text the banner composes
+BANNER_COUNT_MAX = 99
+BANNER_FLASH_INTERVAL = "500ms"
 WARNING_ARCHIVE_SECRETS = ("WARNING: the archive contains the Wi-Fi password and the display's MQTT, "
                            "OTA and API secrets. Treat it like a password: move it over SSH only, "
                            "do not commit or e-mail it, delete it after flashing.")
@@ -442,6 +448,9 @@ def _fonts_lines(display: dict, config: dict) -> list:
         if STATUS_FONTS[key] in status:
             fonts.append((STATUS_FONTS[key], "bold", FONT_SIZES[f"status_{key}"], status[STATUS_FONTS[key]]))
     fonts.append(("font_small", "regular", FONT_SIZES["small"], _small_glyphs(config, display)))
+    if alarm_takeover_enabled(display):
+        fonts.append(("font_banner", "bold", FONT_SIZES["banner"], BANNER_GLYPHS))
+        fonts.append(("font_banner_name", "bold", FONT_SIZES["banner_name"], _small_glyphs(config, display)))
     lines = ["font:"]
     for fid, weight, size, glyphs in fonts:
         lines += [f"  - file: fonts/{FONT_FILES[weight]}", f"    id: {fid}", f"    size: {size}",
@@ -543,6 +552,155 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     return lines
 
 
+def alarm_takeover_enabled(display: dict) -> bool:
+    return display.get("ui", {}).get("alarm_takeover", False) is True
+
+
+def alarm_page_index(display: dict) -> int:
+    return display.get("ui", {}).get("alarm_page", 0)
+
+
+def summary_stale_ms(heartbeat: int) -> int:
+    """The alarm summary is republished every heartbeat; three missed ones make it stale."""
+    return 3 * heartbeat * 1000
+
+
+ALARM_GLOBALS = [
+    '  - {id: summary_max, type: uint8_t, initial_value: "0"}',      # 0 unknown, 1 ok, 2 warn, 3 alarm
+    '  - {id: summary_na, type: int, initial_value: "0"}',
+    '  - {id: summary_seen, type: uint32_t, initial_value: "0"}',
+    '  - {id: summary_valid, type: bool, initial_value: "false"}',
+    '  - {id: summary_first, type: int, initial_value: "-1"}',       # index of ids[0] among this display\'s items
+    '  - {id: alarm_rising, type: bool, initial_value: "false"}',
+    '  - {id: alarm_dismissed, type: bool, initial_value: "false"}',
+    '  - {id: alarm_idx, type: int, initial_value: "-1"}',           # item whose name the banner should show
+    '  - {id: alarm_drawn_idx, type: int, initial_value: "-2"}',     # item whose name the banner shows
+    '  - {id: alarm_flash, type: bool, initial_value: "false"}',
+]
+
+
+def _alarm_handler(used: list, display: dict) -> list:
+    """The alarm summary message: store it, find the first alarm's item, detect a rising edge."""
+    lines = [
+        f"    - topic: {topics.ALARM_SUMMARY_TOPIC}",
+        "      then:",
+        "        - lambda: |-",
+        '            const char *mx = x["max"] | "unknown";',
+        '            uint8_t m = strcmp(mx, "ok") == 0 ? 1 : strcmp(mx, "warn") == 0 ? 2 : '
+        'strcmp(mx, "alarm") == 0 ? 3 : 0;',
+        '            int na = x["na"] | 0;',
+        '            const char *id0 = x["ids"][0] | "";',
+        "            int first = -1;",
+    ]
+    for index, iid in enumerate(used):
+        lines.append(f'            {"" if index == 0 else "else "}if (strcmp(id0, "{iid}") == 0) first = {index};')
+    lines += [
+        "            bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));",
+        "            id(summary_max) = m;",
+        "            id(summary_na) = na;",
+        "            id(summary_first) = first;",
+        "            id(summary_seen) = millis();",
+        "            id(summary_valid) = true;",
+        "            if (rising) {",
+        "              id(alarm_rising) = true;",
+        "              id(alarm_dismissed) = false;",
+        "            }",
+        "        - if:",
+        "            condition:",
+        "              lambda: 'return id(alarm_rising);'",
+        "            then:",
+        "              - lambda: 'id(alarm_rising) = false;'",
+        "              - lvgl.page.show:",
+        f"                  id: page_{alarm_page_index(display)}",
+        "                  animation: NONE",
+        f"                  time: {TAP_TIME}",
+        "              - light.turn_on:",
+        "                  id: board_backlight",
+        "                  brightness: 100%",
+        "        - script.execute: render_alarm",
+    ]
+    return lines
+
+
+def _item_label(config: dict, iid: str) -> str:
+    return (config["notifications"] if is_notification(config, iid) else config["instruments"])[iid]["label"]
+
+
+def _alarm_script(config: dict, used: list, heartbeat: int) -> list:
+    """Show or hide the banner; the first alarm's name comes from fixed !literal branches."""
+    lines = [
+        "  - id: render_alarm",
+        "    mode: restart",
+        "    then:",
+        "      - lambda: |-",
+        "          bool seen = id(summary_valid) && (millis() - id(summary_seen)) < "
+        f"{summary_stale_ms(heartbeat)}UL;",
+        "          if (!seen) {",
+        "            id(summary_max) = 0;",
+        "            id(summary_na) = 0;",
+        "          }",
+        "          bool show = seen && id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
+        " && id(summary_max) == 3 && id(summary_na) > 0 && !id(alarm_dismissed);",
+        "          id(alarm_idx) = show ? id(summary_first) : -1;",
+        "          if (show) {",
+        "            char buf[16];",
+        f"            snprintf(buf, sizeof(buf), \"%d%s %s\", id(summary_na) > {BANNER_COUNT_MAX} ? "
+        f"{BANNER_COUNT_MAX} : id(summary_na), id(summary_na) > {BANNER_COUNT_MAX} ? \"+\" : \"\", "
+        "id(summary_na) == 1 ? \"ALARM\" : \"ALARMS\");",
+        "            if (strcmp(lv_label_get_text(id(alarm_banner_count)), buf) != 0)"
+        " lv_label_set_text(id(alarm_banner_count), buf);",
+        "            lv_obj_clear_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN);",
+        "          } else {",
+        "            lv_obj_add_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN);",
+        "            lv_obj_set_style_bg_opa(id(alarm_banner), LV_OPA_COVER, LV_PART_MAIN);",
+        "            id(alarm_flash) = false;",
+        "          }",
+    ]
+    for index in range(-1, len(used)):
+        text = yq("") if index < 0 else lit(_item_label(config, used[index]))
+        lines += [
+            "      - if:",
+            "          condition:",
+            f"            lambda: 'return id(alarm_idx) == {index} && id(alarm_drawn_idx) != {index};'",
+            "          then:",
+            "            - lvgl.label.update:",
+            "                id: alarm_banner_name",
+            f"                text: {text}",
+            f"            - lambda: 'id(alarm_drawn_idx) = {index};'",
+        ]
+    return lines
+
+
+def _alarm_banner(board: dict) -> list:
+    """Banner on LVGL's top layer: above every page, one object, never covered by the tap layer."""
+    fit = "width: 100%, text_align: CENTER, long_mode: DOT"
+    return [
+        "  top_layer:",
+        "    widgets:",
+        "      - obj:",
+        "          id: alarm_banner",
+        "          align: CENTER",
+        f"          width: {board['content_width']}",
+        f"          height: {BANNER_HEIGHT}",
+        f"          bg_color: 0x{BANNER_COLOR:06X}",
+        "          bg_opa: COVER",
+        "          border_width: 0",
+        "          radius: 14",
+        "          pad_all: 4",
+        "          hidden: true",
+        "          scrollable: false",
+        f"          {FLEX_COLUMN}",
+        "          on_click:",
+        "            - lambda: 'id(alarm_dismissed) = true;'",
+        "            - script.execute: render_alarm",
+        "          widgets:",
+        f"            - label: {{id: alarm_banner_count, text: {yq('')}, text_font: font_banner, "
+        f"text_color: 0xFFFFFF, {fit}}}",
+        f"            - label: {{id: alarm_banner_name, text: {yq('')}, text_font: font_banner_name, "
+        f"text_color: 0xFFFFFF, {fit}}}",
+    ]
+
+
 def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str) -> str:
     display = config["displays"][display_id]
     board = registry["boards"][display["board"]]
@@ -582,6 +740,9 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         if has_thresholds(config["instruments"][iid]):
             lines += [f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}',
                       f'  - {{id: ins_{iid}_drawn_sev, type: uint8_t, initial_value: "255"}}']
+    takeover = alarm_takeover_enabled(display)
+    if takeover:
+        lines += ALARM_GLOBALS
     lines += ["", *_fonts_lines(display, config), "", "mqtt:", "  on_message:",
               f"    - topic: {topics.BRIDGE_STATUS_TOPIC}", "      then:",
               '        - lambda: \'id(bridge_online) = (x == "online");\'',
@@ -592,6 +753,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         else:
             lines += _json_handler(iid, config["instruments"][iid]["precision"],
                                    has_thresholds(config["instruments"][iid]))
+    if takeover:
+        lines += _alarm_handler(used, display)
     lines += ["  on_disconnect:", "    - lambda: 'id(bridge_online) = false;'",
               "    - script.execute: render_tiles", "", "script:", "  - id: render_tiles",
               "    mode: restart", "    then:"]
@@ -614,13 +777,24 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     for iid in used:
         if is_notification(config, iid) or has_thresholds(config["instruments"][iid]):
             lines += _sev_lines(config, display, iid, heartbeat)
-    lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles",
-              "", "lvgl:", "  displays: [board_display]", "  touchscreens: [board_touch]",
+    if takeover:
+        lines += _alarm_script(config, used, heartbeat)
+    lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles"]
+    if takeover:
+        lines += ["      - script.execute: render_alarm",
+                  f"  - interval: {BANNER_FLASH_INTERVAL}", "    then:", "      - lambda: |-",
+                  "          if (lv_obj_has_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN)) return;",
+                  "          id(alarm_flash) = !id(alarm_flash);",
+                  "          lv_obj_set_style_bg_opa(id(alarm_banner), id(alarm_flash) ? LV_OPA_40 : LV_OPA_COVER,"
+                  " LV_PART_MAIN);"]
+    lines += ["", "lvgl:", "  displays: [board_display]", "  touchscreens: [board_touch]",
               "  buffer_size: 100%", "  style_definitions:", "    - id: tile_style",
               "      bg_color: 0x101820", "      bg_opa: COVER", "      border_width: 0",
               "      radius: 14", "      pad_all: 4", "  pages:"]
     for pi, page in enumerate(display["pages"]):
         lines += _page_lines(config, board, display, pi, page)
+    if takeover:
+        lines += _alarm_banner(board)
     return "\n".join(lines) + "\n"
 
 

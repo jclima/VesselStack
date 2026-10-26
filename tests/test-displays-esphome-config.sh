@@ -121,9 +121,16 @@ def status(cfg):
         {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "house_v"]},
     ]
 
+def alarm(cfg):
+    status(cfg)
+    cfg["notifications"]["bilge"]["label"] = "${y} Bilge"
+    cfg["instruments"]["sog"]["label"] = HOSTILE[:16]
+    cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True, "alarm_page": 1}
+
 variant("example")
 variant("thresholds", thresholds)
 variant("status", status)
+variant("alarm", alarm)
 variant("complex", complex_, WIFI)
 PY
 
@@ -168,6 +175,7 @@ check complex helm
 check complex aux
 check thresholds helm
 check status helm
+check alarm helm
 for word in ALARM WARN OK; do
     grep -qE "text: [\"']?${word}[\"']?\$" "$WORK/status-helm.log" || { echo "status word $word missing from the validated config" >&2; fail=1; }
 done
@@ -175,6 +183,15 @@ grep -q 'lv_obj_set_style_bg_color(id(p1_anchor_tile)' "$WORK/status-helm.log" \
     || { echo "notification colour lambda missing from the validated status config" >&2; fail=1; }
 # shellcheck disable=SC2016
 grep -qF '${y} Bilge' "$WORK/status-helm.log" || { echo "hostile notification label was altered" >&2; fail=1; }
+# The takeover banner: top layer object, summary subscription, backlight, fixed word, literal names.
+log="$WORK/alarm-helm.log"
+grep -q 'id(alarm_banner)' "$log" || { echo "alarm banner missing from the validated alarm config" >&2; fail=1; }
+grep -q 'vesselstack/v1/alarms/summary' "$log" || { echo "alarm summary subscription missing" >&2; fail=1; }
+grep -q 'light.turn_on\|board_backlight' "$log" || { echo "backlight action missing from the alarm config" >&2; fail=1; }
+grep -qF '${y} Bilge' "$log" || { echo "hostile label was altered in the alarm banner" >&2; fail=1; }
+for plain in example thresholds status complex; do
+    if grep -q 'alarm_banner' "$WORK/$plain-helm.log"; then echo "alarm banner present without ui.alarm_takeover ($plain)" >&2; fail=1; fi
+done
 grep -q 'lv_obj_set_style_bg_color(id(p1_content)' "$WORK/thresholds-helm.log" \
     || { echo "severity colour lambda missing from the validated thresholds config" >&2; fail=1; }
 

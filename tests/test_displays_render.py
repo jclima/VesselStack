@@ -61,6 +61,16 @@ def status_page(cfg, items=None, title="Status"):
          "items": items or ["anchor", "sog", "depth", "batt_low", "house_v", "awa", "bilge"]}]
 
 
+def alarm_takeover(cfg, page=1, labels=None):
+    """Thresholds, notifications, a Nav and a Status page, and the alarm takeover banner."""
+    status_page(cfg)
+    pages = cfg["displays"]["helm"]["pages"]
+    pages.insert(0, {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "house_v"]})
+    cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True, "alarm_page": page}
+    for iid, label in (labels or {}).items():
+        (cfg["notifications"] if iid in cfg["notifications"] else cfg["instruments"])[iid]["label"] = label
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -130,6 +140,10 @@ class GoldenAndDeterminism(Base):
     def test_status_grid_matches_golden(self):
         self.set_config(status_page)
         self.check_golden("helm-status.yaml", self.device(allow_missing_wifi=True))
+
+    def test_alarm_takeover_matches_golden(self):
+        self.set_config(alarm_takeover)
+        self.check_golden("helm-alarm.yaml", self.device(allow_missing_wifi=True))
 
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
@@ -313,6 +327,135 @@ class StatusGrid(Base):
         self.assertIn("topic read vesselstack/v1/notifications/#", rules)
         self.assertEqual([l for l in rules.splitlines() if l.startswith("topic write")],
                          ["topic write vesselstack/v1/displays/vsdisp-helm/status"])
+
+
+class AlarmTakeover(Base):
+    def alarm_device(self, mutate=None, **kw):
+        def both(cfg):
+            alarm_takeover(cfg)
+            if mutate:
+                mutate(cfg)
+        self.set_config(both)
+        return self.device(allow_missing_wifi=True, **kw)
+
+    def test_nothing_is_generated_without_the_option(self):
+        for mutate in (None, status_page, lambda c: (status_page(c), c["displays"]["helm"].update(ui={}),
+                                                       c["displays"]["helm"]["ui"].update(alarm_takeover=False))):
+            self.set_config(mutate)
+            text = self.device(allow_missing_wifi=True)
+            for needle in ("alarms/summary", "alarm_banner", "top_layer", "summary_max", "render_alarm",
+                           "board_backlight", "font_banner", "500ms"):
+                self.assertNotIn(needle, text, needle)
+
+    def test_banner_subscription_and_top_layer(self):
+        text = self.alarm_device()
+        self.assertEqual(text.count("topic: vesselstack/v1/alarms/summary"), 1)
+        self.assertEqual(text.count("  top_layer:\n"), 1)
+        self.assertIn("id: alarm_banner\n", text)
+        self.assertIn("bg_color: 0xC62828", text)
+        self.assertIn("width: 340", text)    # the board content box, centred
+        self.assertIn("height: 96", text)
+        self.assertIn("align: CENTER", text.split("top_layer:")[1])
+        self.assertIn("hidden: true", text)
+        self.assertIn("- interval: 500ms", text)
+        self.assertIn("LV_OPA_40 : LV_OPA_COVER", text)
+        self.assertIn("- script.execute: render_alarm", text.split("- interval: 1s")[1].split("lvgl:")[0])
+
+    def test_ids_map_to_compile_time_item_indexes(self):
+        text = self.alarm_device()
+        mapping = re.findall(r'(?:else )?if \(strcmp\(id0, "(\w+)"\) == 0\) first = (\d+);', text)
+        self.assertEqual(mapping, [("sog", "0"), ("depth", "1"), ("awa", "2"), ("house_v", "3"),
+                                   ("anchor", "4"), ("batt_low", "5"), ("bilge", "6")])
+        self.assertIn("int first = -1;", text)
+        names = re.findall(r"alarm_idx\) == (-?\d+) && .*\n\s+then:\n\s+- lvgl.label.update:\n\s+id: "
+                           r"alarm_banner_name\n\s+text: (.*)", text)
+        self.assertEqual(names, [("-1", '""'), ("0", '!literal "SOG"'), ("1", '!literal "Depth"'),
+                                 ("2", '!literal "AWA"'), ("3", '!literal "House"'),
+                                 ("4", '!literal "Anchor"'), ("5", '!literal "Low battery"'),
+                                 ("6", '!literal "Bilge"')])
+
+    def test_only_this_displays_items_are_mapped(self):
+        def mutate(cfg):
+            cfg["displays"]["helm"]["pages"] = [
+                {"title": "Status", "layout": "status-grid", "items": ["anchor", "depth"]}]
+            cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True}
+        text = self.alarm_device(mutate)
+        self.assertEqual(re.findall(r'strcmp\(id0, "(\w+)"\)', text), ["anchor", "depth"])
+        self.assertNotIn("bilge", text)
+
+    def test_alarm_page_and_default(self):
+        self.assertIn("lvgl.page.show:\n                  id: page_1\n", self.alarm_device())
+
+        def default(cfg):
+            cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True}
+        text = self.alarm_device(default)
+        self.assertRegex(text, r"- lvgl.page.show:\n\s+id: page_0\n\s+animation: NONE\n\s+time: 0ms\n"
+                               r"\s+- light.turn_on:\n\s+id: board_backlight\n\s+brightness: 100%")
+
+    def test_edge_detection_staleness_and_dismissal(self):
+        text = self.alarm_device()
+        self.assertIn("bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));", text)
+        self.assertIn("(millis() - id(summary_seen)) < 15000UL", text)   # 3 x heartbeat_s (5 s)
+        show = re.search(r"bool show = (.*);", text).group(1)
+        for guard in ("seen", "id(bridge_online)", "mqtt::global_mqtt_client->is_connected()",
+                      "id(summary_max) == 3", "!id(alarm_dismissed)"):
+            self.assertIn(guard, show)
+        self.assertIn("on_click:\n            - lambda: 'id(alarm_dismissed) = true;'", text)
+        self.assertNotIn("mqtt.publish", text)
+
+    def test_staleness_follows_heartbeat(self):
+        def mutate(cfg):
+            cfg["heartbeat_s"] = 7
+            for inst in cfg["instruments"].values():
+                inst["stale_after_s"] = 14
+        self.assertIn("< 21000UL;", self.alarm_device(mutate).split("id: render_alarm")[1][:400])
+
+    def test_hostile_labels_stay_literal_and_out_of_lambdas(self):
+        hostile = {"anchor": '$x ${y} "q" \\ #:', "depth": "<% 1+1 %>"}
+        text = self.alarm_device(lambda cfg: [(cfg["notifications"] if k in cfg["notifications"]
+                                               else cfg["instruments"])[k].update(label=v)
+                                              for k, v in hostile.items()])
+        for label in hostile.values():
+            self.assertIn(f"text: !literal {render.yq(label)}", text)
+        for line in text.splitlines():
+            if any(label in line for label in hostile.values()):
+                self.assertTrue(line.lstrip().startswith(("text:", "- label:")) or "glyphs:" in line, line)
+        inside = "".join(l for l in text.splitlines() if "lambda" in l or "lv_" in l or "snprintf" in l)
+        for label in hostile.values():
+            self.assertNotIn(label, inside)
+        # the only composed text is the count and the two fixed words
+        composed = next(l for l in text.splitlines() if "snprintf" in l)
+        self.assertEqual(re.findall(r'"(ALARMS?)"', composed), ["ALARM", "ALARMS"])
+
+    def test_banner_glyphs_cover_the_fixed_text_and_labels(self):
+        text = self.alarm_device()
+        bold = {chr(c) for c in render.font_coverage("bold")}
+        self.assertTrue(set(render.BANNER_GLYPHS) <= bold)
+        banner = json.loads(re.search(r"id: font_banner\n    size: 48\n    bpp: 4\n    glyphs: !literal (\".*\")",
+                                      text).group(1))
+        self.assertTrue(set("0123456789+ ALARMS") <= set(banner))
+        name = json.loads(re.search(r"id: font_banner_name\n    size: 28\n    bpp: 4\n    glyphs: !literal (\".*\")",
+                                    text).group(1))
+        self.assertTrue(set("SOGDepthAWAHouseAnchorLow batteryBilge") <= set(name))
+
+    def test_unsupported_label_glyph_is_still_reported(self):
+        def mutate(cfg):
+            alarm_takeover(cfg)
+            cfg["notifications"]["bilge"]["label"] = "日本"
+        self.set_config(mutate)
+        with self.assertRaises(render.RenderError):
+            self.collect(allow_missing_wifi=True)
+
+    def test_summary_subscription_fits_the_display_acl(self):
+        rules = AclConsistency.acl_rules(None, "vsdisp-helm")
+        topic = "vesselstack/v1/alarms/summary"
+        self.assertTrue(any(AclConsistency.matches(r, topic) for r in rules["read"]))
+        self.assertFalse(any(AclConsistency.matches(r, topic) for r in rules["write"]))
+        self.assertEqual(rules["write"], ["vesselstack/v1/displays/vsdisp-helm/status"])
+
+    def test_backlight_stays_internal_so_nothing_is_published(self):
+        board = self.collect().files["helm/boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml"].decode()
+        self.assertRegex(board, r"id: board_backlight\n\s+name: Backlight\n\s+internal: true")
 
 
 class Secrets(Base):
