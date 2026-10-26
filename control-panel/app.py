@@ -98,6 +98,7 @@ FIELDS = [
     field("INFLUXDB_URL", "InfluxDB URL", "InfluxDB", kind="url"),
     field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services bind address", "Network", description="InfluxDB, Prometheus and MQTT publish on this IPv4 address. Keep 127.0.0.1 unless external devices must connect over a trusted network."),
     field("VESSELSTACK_WEB_BIND_ADDRESS", "Web UI bind address", "Network", description="Grafana and Heimdall publish on this IPv4 address (0.0.0.0 = every interface, 127.0.0.1 = this device only)."),
+    field("HOMEASSISTANT_BIND_ADDRESS", "Home Assistant bind address", "Network", description="0.0.0.0 = every interface, 127.0.0.1 = this device only. Applied through a managed http block in Home Assistant's configuration.yaml by the installer or `vesselstackctl lan`; SignalK has no such setting."),
     field("INFLUXDB_PORT", "Published port", "InfluxDB", kind="port"),
     field("INFLUXDB_CONTAINER_NAME", "Container name", "InfluxDB"),
     field("INFLUXDB_ORG", "Organization", "InfluxDB"),
@@ -107,6 +108,7 @@ FIELDS = [
     field("INFLUXDB_HOME_ASSISTANT_BUCKET", "Home Assistant bucket", "InfluxDB"),
     field("INFLUXDB_AIS_BUCKET", "AIS bucket", "InfluxDB"),
     field("INFLUXDB_RAW_RETENTION", "Raw bucket retention", "InfluxDB", description="Duration such as 720h, 30d or 8w, or 0 to keep forever. Empty = 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply/start and permanently deletes raw data older than the window."),
+    field("PROMETHEUS_RETENTION", "Prometheus retention", "Prometheus", description="Duration such as 720h, 30d or 8w. Empty = 30d. Metrics older than this are deleted by Prometheus."),
     field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB")),
     field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB") + " Boat Chat and Grafana also use this token."),
     field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="Grafana")),
@@ -235,7 +237,7 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     if kind == "port" and text:
         if not text.isdigit() or not 1 <= int(text) <= 65535:
             raise ValueError(f"{spec['label']} must be an integer from 1 to 65535")
-    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS"} and text:
+    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
         except ValueError as exc:
@@ -245,6 +247,8 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     if spec["key"] in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
         if not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*", text):
             raise ValueError(f"{spec['label']} must be comma-separated ports or LOW:HIGH ranges")
+    if spec["key"] == "PROMETHEUS_RETENTION" and text and not re.fullmatch(r"[1-9][0-9]{0,4}[hdw]", text):
+        raise ValueError("Use a duration such as 720h, 30d or 8w.")
     if spec["key"] == "INFLUXDB_RAW_RETENTION" and text and not re.fullmatch(r"0|[1-9][0-9]{0,4}[hdw]", text):
         raise ValueError(f"{spec['label']} must be 0, or a duration such as 720h, 30d or 8w")
     if kind == "path" and text and not text.startswith("/"):

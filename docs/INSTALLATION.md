@@ -105,8 +105,8 @@ installer stops before changing anything and lists these options. `--web-wizard`
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
 The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.3/get-vesselstack.sh`, or add
-`--version 0.4.3` (`| sudo bash -s -- --version 0.4.3`). It installs the Debian
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.4.4/get-vesselstack.sh`, or add
+`--version 0.4.4` (`| sudo bash -s -- --version 0.4.4`). It installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, asks the configuration questions in the terminal, then runs the installer dry run, the
@@ -211,7 +211,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.4.3
+git checkout v0.4.4
 python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
 # python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```
@@ -289,9 +289,11 @@ SSH tunnel), `dashboards` (recommended: Grafana, Heimdall and Boat Chat on your 
 InfluxDB, Prometheus and MQTT stay on the Pi) or `all` (also MQTT, InfluxDB and Prometheus,
 which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later with
 `sudo vesselstackctl lan [local|dashboards|all] [--dry-run]` (`all` needs `--yes`). The
-Control Panel stays on the Pi in every preset. SignalK and Home Assistant are host-networked
-and not controlled by the presets; use the firewall's strict mode or Home Assistant's
-`http: server_host` to limit them.
+Control Panel stays on the Pi in every preset. `local` also limits Home Assistant (8123) to the
+Pi through a delimited `http:` block the installer manages in its `configuration.yaml` (it never
+touches an `http:` section you wrote yourself and prints the manual step instead). SignalK (3000)
+has no bind-address setting, so no preset restricts it; only the firewall's strict mode can
+(see the README, "Reaching VesselStack from other devices").
 
 If `VESSELSTACK_FIREWALL_ENABLE=true` and the Pi is on your network over the untrusted
 interface (default `wlan0`), other devices are blocked from Grafana and the data services
@@ -314,6 +316,12 @@ doctor`. 0.4.3 and later build the index during installation, on upgrade and on
 `vesselstackctl start`. Details: README, "Memory index".
 
 ## Troubleshooting: SignalK not running / EACCES on package.json
+
+Prometheus metrics live in `<data>/prometheus` (owned by uid/gid 65534, created by the
+installer, included in backups) and are kept for `PROMETHEUS_RETENTION` (default `30d`).
+Releases before 0.4.4 used an anonymous Docker volume that is left untouched on upgrade;
+the old history stays there until `docker volume prune`. See the README section
+"Prometheus data and retention".
 
 With `SIGNALK_MODE=docker`, if the `vesselstack-signalk` container keeps restarting
 and `sudo docker logs vesselstack-signalk` shows

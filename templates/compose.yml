@@ -82,8 +82,16 @@ services:
       - "${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Overriding command replaces the image defaults, so they are repeated here.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
     volumes:
       - ${VESSELSTACK_ROOT}/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${VESSELSTACK_DATA}/prometheus:/prometheus
 
   mosquitto:
     image: eclipse-mosquitto:2.1.2-alpine

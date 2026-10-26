@@ -24,6 +24,8 @@ Commands:
                                Show or change who on the network can reach the dashboards
                                (rewrites the bind settings, re-applies; the control panel
                                always stays on this device)
+  ha-http sync|status          Re-apply or show the managed Home Assistant http bind block
+                               (HOMEASSISTANT_BIND_ADDRESS); used by the installer and lan
   reindex                      Rebuild Boat Chat's memory index as the service user
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|containers|all]
@@ -378,11 +380,11 @@ show_urls() {
         printf '%-20s %s\n' SignalK "existing server, not managed here: $SIGNALK_URL"
     else
         read -r host port < <(url_host_port "$SIGNALK_URL" 3000)
-        show_service SignalK "$port" http "$host" yes 'host-networked container; vesselstackctl lan does not change it'
+        show_service SignalK "$port" http "$host" yes 'host-networked; the server has no bind setting, no LAN preset restricts it (firewall strict mode can)'
     fi
     read -r host port < <(url_host_port "$HOME_ASSISTANT_URL" 8123)
     case "$(bind_kind "$host")" in
-        loopback) show_service 'Home Assistant' "$port" http "$host" yes 'host-networked container; vesselstackctl lan does not change it' ;;
+        loopback) show_service 'Home Assistant' "$port" http "$host" yes "host-networked; HOMEASSISTANT_BIND_ADDRESS=${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0} ($(ha_http_state))" 'to change: sudo vesselstackctl lan local|dashboards' ;;
         *) printf '%-20s %s\n' 'Home Assistant' "external server, not managed here: $HOME_ASSISTANT_URL" ;;
     esac
     show_service Grafana "${GRAFANA_PORT:-43000}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
@@ -423,16 +425,18 @@ show_logs() {
 # local:      everything this machine publishes listens on loopback only
 # dashboards: Grafana, Heimdall and Boat Chat on every interface; databases on loopback
 # all:        also InfluxDB, Prometheus and MQTT on every interface
-# The control panel (a root-level editor) is in no preset. Host-networked SignalK and
-# Home Assistant are not controlled by these settings.
+# The control panel (a root-level editor) is in no preset. Home Assistant (host-networked)
+# follows HOMEASSISTANT_BIND_ADDRESS through a managed http block in its configuration.yaml
+# (see ha_http_*). SignalK (host-networked) has no bind-address setting in the server, so no
+# preset can restrict it.
 LAN_PRESET_NAMES='local dashboards all'
 
 lan_values() {
-    # Prints "WEB DATA CHAT" bind addresses of a preset.
+    # Prints "WEB DATA CHAT HOMEASSISTANT" bind addresses of a preset.
     case "$1" in
-        local) printf '127.0.0.1 127.0.0.1 127.0.0.1\n' ;;
-        dashboards) printf '0.0.0.0 127.0.0.1 0.0.0.0\n' ;;
-        all) printf '0.0.0.0 0.0.0.0 0.0.0.0\n' ;;
+        local) printf '127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1\n' ;;
+        dashboards) printf '0.0.0.0 127.0.0.1 0.0.0.0 0.0.0.0\n' ;;
+        all) printf '0.0.0.0 0.0.0.0 0.0.0.0 0.0.0.0\n' ;;
         *) return 1 ;;
     esac
 }
@@ -445,9 +449,10 @@ lan_current_chat_host() {
 
 lan_current_preset() {
     local web=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} data=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1} chat name
+    local ha=${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0}
     chat=$(lan_current_chat_host)
     for name in $LAN_PRESET_NAMES; do
-        if [ "$(lan_values "$name")" = "$web $data $chat" ]; then printf '%s' "$name"; return 0; fi
+        if [ "$(lan_values "$name")" = "$web $data $chat $ha" ]; then printf '%s' "$name"; return 0; fi
     done
     printf 'custom'
 }
@@ -474,6 +479,364 @@ set_env_key() {
     fi
 }
 
+# --- Home Assistant http bind (managed block) ----------------------------------------
+# Home Assistant (host network) binds the address in `http: server_host`. For a loopback-only
+# preset the installer adds ONE clearly delimited block to its configuration.yaml. Home
+# Assistant rejects a second top-level `http:` key, so when the owner already has one outside
+# our block we change nothing and print manual instructions. Everything outside the markers is
+# never touched; `lan dashboards|all` removes the block again.
+HA_BLOCK_BEGIN='# BEGIN VESSELSTACK MANAGED http bind - do not edit; remove with: sudo vesselstackctl lan dashboards'
+HA_BLOCK_END='# END VESSELSTACK MANAGED http bind'
+
+ha_config_file() { printf '%s/homeassistant/configuration.yaml' "$VESSELSTACK_DATA"; }
+HA_BACKUP_DIR="$SYSTEM_ROOT/var/lib/vesselstack/ha-http-backup"
+
+# The Home Assistant container runs as root and can write the directory this command edits as
+# root, so every access goes through this helper: it opens the directory component by
+# component with O_NOFOLLOW (refusing symlinks and group/world-writable directories), opens the
+# file with O_NOFOLLOW and requires a plain single-link regular file, and replaces it with a
+# temporary file in the same directory descriptor plus rename(2) (never following a link at the
+# destination). The pre-change backup lives in a root-only directory outside that tree.
+# Exit codes: 0 ok, 10 missing, 11 refused (unsafe), 1 other error.
+HA_TOOL=$(cat <<'PY'
+import errno
+import os
+import secrets
+import stat
+import sys
+
+MAX = 1 << 20
+
+
+class Unsafe(Exception):
+    pass
+
+
+class Missing(Exception):
+    pass
+
+
+def open_dir(root, parts, create=False):
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        raise Missing(root)
+    try:
+        for part in parts:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                nfd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise Missing(part)
+                os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, flags, dir_fd=fd)
+                os.fchmod(nfd, 0o755)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise Unsafe("%s is a symlink or not a directory" % part)
+                raise
+            os.close(fd)
+            fd = nfd
+            if os.fstat(fd).st_mode & 0o022:
+                raise Unsafe("%s is group- or world-writable" % part)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def open_file(dirfd, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise Unsafe("%s is a symlink" % name)
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX:
+            raise Unsafe("%s is not a plain single-link regular file of sane size" % name)
+        data = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX:
+                raise Unsafe("%s is too large" % name)
+    finally:
+        os.close(fd)
+    return data, info
+
+
+def write_atomic(dirfd, name, data, mode, owner=None):
+    tmp = ".%s.%s" % (name, secrets.token_hex(8))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
+        if owner is not None:
+            os.fchown(fd, owner[0], owner[1])
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    os.fsync(dirfd)
+
+
+def open_backup(path):
+    os.makedirs(os.path.dirname(path), 0o755, exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Unsafe("%s is a symlink or not a directory" % path)
+        raise
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise Unsafe("%s must be owned by the current user with mode 0700" % path)
+    return fd
+
+
+def unlink_quiet(dirfd, name):
+    try:
+        os.unlink(name, dir_fd=dirfd)
+    except FileNotFoundError:
+        pass
+
+
+def drop(bfd, name):
+    for suffix in (".orig", ".absent", ".meta"):
+        unlink_quiet(bfd, name + suffix)
+
+
+def main():
+    op, root, name = sys.argv[1:4]
+    parts = ["homeassistant"]
+    if op == "get":
+        dfd = open_dir(root, parts)
+        data, _ = open_file(dfd, name)
+        if data is None:
+            raise Missing(name)
+        sys.stdout.buffer.write(data)
+    elif op == "touch":
+        dfd = open_dir(root, parts, create=True)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        except FileExistsError:
+            return
+        os.fchmod(fd, 0o644)
+        os.close(fd)
+    elif op == "put":
+        new = sys.stdin.buffer.read(MAX + 1)
+        if len(new) > MAX:
+            raise Unsafe("new content is too large")
+        bfd = open_backup(sys.argv[4])
+        dfd = open_dir(root, parts, create=True)
+        cur, info = open_file(dfd, name)
+        drop(bfd, name)
+        if cur is None:
+            write_atomic(bfd, name + ".absent", b"", 0o600)
+            mode, owner = 0o644, None
+        else:
+            meta = ("%o %d %d\n" % (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)).encode()
+            write_atomic(bfd, name + ".orig", cur, 0o600)
+            write_atomic(bfd, name + ".meta", meta, 0o600)
+            mode, owner = stat.S_IMODE(info.st_mode), (info.st_uid, info.st_gid)
+        write_atomic(dfd, name, new, mode, owner)
+    elif op == "restore":
+        bfd = open_backup(sys.argv[4])
+        dfd = open_dir(root, parts)
+        cur, _ = open_file(dfd, name)
+        orig, _ = open_file(bfd, name + ".orig")
+        if orig is not None:
+            meta, _ = open_file(bfd, name + ".meta")
+            mode, uid, gid = (meta or b"644 0 0").split()
+            write_atomic(dfd, name, orig, int(mode, 8), (int(uid), int(gid)))
+        elif open_file(bfd, name + ".absent")[0] is not None:
+            if cur is not None:
+                os.unlink(name, dir_fd=dfd)
+        else:
+            raise OSError("no backup of %s" % name)
+        drop(bfd, name)
+    elif op == "drop":
+        drop(open_backup(sys.argv[4]), name)
+    else:
+        raise SystemExit(2)
+
+
+try:
+    main()
+except Missing:
+    sys.exit(10)
+except Unsafe as exc:
+    sys.stderr.write("refused: %s\n" % exc)
+    sys.exit(11)
+except OSError as exc:
+    sys.stderr.write("error: %s\n" % exc)
+    sys.exit(1)
+PY
+)
+ha_tool() { python3 -I -c "$HA_TOOL" "$1" "$VESSELSTACK_DATA" "$2" "${@:3}"; }
+
+# Prints one of: missing (no configuration.yaml), none (no http: at all), managed:ADDRESS,
+# conflict (an http: key that is not ours), unsafe (symlink, hard link, unusual file or
+# directory), broken (unbalanced markers).
+ha_http_state() {
+    local content rc=0
+    content=$(ha_tool get configuration.yaml 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 10 ]; then printf missing; else printf unsafe; fi
+        return 0
+    fi
+    printf '%s\n' "$content" | awk -v begin="$HA_BLOCK_BEGIN" -v end="$HA_BLOCK_END" '
+        $0 == begin { if (inb) bad = 1; inb = 1; nb++; next }
+        $0 == end { if (!inb) bad = 1; inb = 0; next }
+        inb { if ($1 == "server_host:") { addr = $2; gsub(/["'"'"']/, "", addr) } ; next }
+        /^http[ \t]*:/ { user = 1 }
+        END {
+            if (bad || inb || nb > 1) print "broken"
+            else if (user) print "conflict"
+            else if (nb == 1) print "managed:" addr
+            else print "none"
+        }' | tr -d '\n'
+}
+
+# What applying ADDRESS would do: prints "noop", "add", "replace", "remove", "create" or
+# "conflict" / "unsafe" / "broken".
+ha_http_plan() {
+    local want=$1 state
+    state=$(ha_http_state)
+    case "$state" in
+        unsafe|broken) printf '%s' "$state" ;;
+        conflict) if [ "$want" = 0.0.0.0 ]; then printf noop; else printf conflict; fi ;;
+        missing) if [ "$want" = 0.0.0.0 ]; then printf noop; else printf create; fi ;;
+        none) if [ "$want" = 0.0.0.0 ]; then printf noop; else printf add; fi ;;
+        managed:*)
+            if [ "$want" = 0.0.0.0 ]; then printf remove
+            elif [ "${state#managed:}" = "$want" ]; then printf noop
+            else printf replace; fi ;;
+        *) printf broken ;;
+    esac
+}
+
+ha_http_manual_help() {
+    # $1 = address
+    cat >&2 <<EOF
+Home Assistant: your configuration.yaml already has its own top-level 'http:' section, so
+VesselStack made NO change to it (Home Assistant rejects a second 'http:' key). To limit
+Home Assistant to this device, add this line inside YOUR http: section, then restart it
+(docker restart vesselstack-homeassistant):
+    server_host: $1
+File: $(ha_config_file)
+Until then Home Assistant (8123) keeps listening on every interface.
+EOF
+}
+
+ha_http_manual_help_broken() {
+    cat >&2 <<EOF
+Home Assistant: $(ha_config_file) is a symlink, a hard link, not a plain file (or its directory is a symlink or writable by others) or contains damaged VesselStack markers
+('$HA_BLOCK_BEGIN' / '$HA_BLOCK_END'), so VesselStack made NO change. Fix or remove the
+markers by hand; Home Assistant keeps its current bind address until then.
+EOF
+}
+
+# Apply HOMEASSISTANT_BIND_ADDRESS (or $1). Changes only configuration.yaml, and restarts the
+# Home Assistant container only when that file changed. Returns 0 (done / nothing to do),
+# 3 (refused: owner-managed http section or unsafe file; nothing changed) or 1 (failure; the
+# previous file was restored where possible).
+ha_http_apply() {
+    local want=${1:-${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0}} plan cur new base name rc
+    plan=$(ha_http_plan "$want")
+    case "$plan" in
+        noop) return 0 ;;
+        conflict) ha_http_manual_help "$want"; return 3 ;;
+        unsafe|broken) ha_http_manual_help_broken; return 3 ;;
+        *) ;;
+    esac
+    if [ "$plan" = create ]; then
+        # Same text Home Assistant writes for a new installation, so its UI editors keep working.
+        cur=$(printf '%s\n' '# Loads default set of integrations. Do not remove.' 'default_config:' '' \
+            '# Load frontend themes from the themes folder' 'frontend:' '  themes: !include_dir_merge_named themes' '' \
+            'automation: !include automations.yaml' 'script: !include scripts.yaml' 'scene: !include scenes.yaml'; printf x)
+        cur=${cur%x}
+    else
+        if ! cur=$(ha_tool get configuration.yaml && printf x); then
+            ha_http_manual_help_broken; return 3
+        fi
+        cur=${cur%x}
+    fi
+    new=$cur
+    if [ "$plan" = remove ] || [ "$plan" = replace ]; then
+        new=$(printf '%s' "$cur" | awk -v begin="$HA_BLOCK_BEGIN" -v end="$HA_BLOCK_END" '
+            $0 == begin { skip = 1; next }
+            $0 == end { skip = 0; next }
+            !skip { print }'; printf x)
+        new=${new%x}
+    fi
+    if [ "$plan" != remove ]; then
+        base=$new
+        if [ -n "$base" ] && [ "${base: -1}" != $'\n' ]; then base=$base$'\n'; fi
+        new=$base$(printf '%s\nhttp:\n  server_host: %s\n%s\n' "$HA_BLOCK_BEGIN" "$want" "$HA_BLOCK_END"; printf x)
+        new=${new%x}
+    fi
+    rc=0
+    printf '%s' "$new" | ha_tool put configuration.yaml "$HA_BACKUP_DIR" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 11 ]; then ha_http_manual_help_broken; return 3; fi
+        return 1
+    fi
+    if [ "$plan" = create ]; then
+        for name in automations.yaml scripts.yaml scenes.yaml; do
+            ha_tool touch "$name" || true
+        done
+    fi
+    echo "Home Assistant: configuration.yaml updated ($plan, bind $want)."
+    if "${COMPOSE[@]}" ps --status running --services 2>/dev/null | grep -Fxq homeassistant; then
+        if ! "${COMPOSE[@]}" exec -T homeassistant python3 -m homeassistant --script check_config -c /config >/dev/null 2>&1; then
+            if ha_tool restore configuration.yaml "$HA_BACKUP_DIR"; then
+                echo "Home Assistant rejected the new configuration; the previous file was restored and nothing was restarted." >&2
+            else
+                echo "Home Assistant rejected the new configuration and the previous file could NOT be restored automatically (the file or its directory changed unexpectedly); the backup is in $HA_BACKUP_DIR (root-only). Nothing was restarted." >&2
+            fi
+            return 1
+        fi
+        "${COMPOSE[@]}" restart homeassistant >/dev/null
+        echo "Home Assistant restarted."
+    else
+        echo "Home Assistant is not running; the new bind address applies at its next start."
+    fi
+    ha_tool drop configuration.yaml "$HA_BACKUP_DIR" || true
+}
+
+ha_http_command() {
+    case "${1:-}" in
+        sync) ha_http_apply || { [ "$?" -eq 3 ] && return 0; return 1; } ;;
+        status)
+            printf 'HOMEASSISTANT_BIND_ADDRESS=%s\nconfiguration.yaml: %s\n' \
+                "${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0}" "$(ha_http_state)" ;;
+        *) echo "Usage: vesselstackctl ha-http sync|status" >&2; exit 2 ;;
+    esac
+}
+
 lan_firewall_report() {
     # $1 = target preset. Prints the firewall interplay; returns 1 when it conflicts.
     local iface=${VESSELSTACK_UNTRUSTED_INTERFACE:-wlan0} strict=${VESSELSTACK_FIREWALL_STRICT:-false} route_if what
@@ -496,7 +859,7 @@ lan_firewall_report() {
 }
 
 lan_stack() {
-    local preset='' dry_run=0 yes=0 allow_fw=0 argument web data chat cur_web cur_data cur_chat panel_host
+    local preset='' dry_run=0 yes=0 allow_fw=0 argument web data chat ha cur_web cur_data cur_chat cur_ha panel_host ha_plan
     for argument in "$@"; do
         case "$argument" in
             --dry-run) dry_run=1 ;;
@@ -509,12 +872,13 @@ lan_stack() {
     cur_web=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}
     cur_data=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
     cur_chat=$(lan_current_chat_host)
+    cur_ha=${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0}
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_host=${panel_host:-127.0.0.1}
     if [ -z "$preset" ]; then
         printf 'Current LAN access: %s\n' "$(lan_current_preset)"
-        printf '  Grafana, Heimdall listen on     %s\n  InfluxDB, Prometheus, MQTT on   %s\n  Boat Chat listens on            %s\n' \
-            "$cur_web" "$cur_data" "$cur_chat"
+        printf '  Grafana, Heimdall listen on     %s\n  InfluxDB, Prometheus, MQTT on   %s\n  Boat Chat listens on            %s\n  Home Assistant listens on       %s\n' \
+            "$cur_web" "$cur_data" "$cur_chat" "$cur_ha"
         printf '  Control panel                   %s (never changed by this command)\n\n' "$panel_host"
         cat <<'EOF'
 Presets (sudo vesselstackctl lan PRESET [--dry-run]):
@@ -522,23 +886,34 @@ Presets (sudo vesselstackctl lan PRESET [--dry-run]):
   dashboards  Grafana, Heimdall and Boat Chat on the network; InfluxDB, Prometheus and MQTT
               stay on this device (recommended)
   all         also InfluxDB, Prometheus (NO login) and MQTT on the network; needs --yes
-SignalK (3000) and Home Assistant (8123) run in host-network containers and are not changed
-by these presets; 'vesselstackctl urls' shows how they really listen.
+Home Assistant (8123) follows the preset (managed http block in its configuration.yaml).
+SignalK (3000) has no bind-address setting and listens on every interface in every preset;
+see the README. 'vesselstackctl urls' shows how everything really listens.
 EOF
         return 0
     fi
-    read -r web data chat < <(lan_values "$preset") || {
+    read -r web data chat ha < <(lan_values "$preset") || {
         echo "Unknown LAN preset: $preset (use local, dashboards or all)" >&2; usage >&2; exit 2; }
     printf 'LAN access: %s -> %s\n' "$(lan_current_preset)" "$preset"
     printf '  %-34s %-12s -> %s\n' VESSELSTACK_WEB_BIND_ADDRESS "$cur_web" "$web" \
         VESSELSTACK_DATA_BIND_ADDRESS "$cur_data" "$data" \
-        'BOAT_CHAT_HOST (boat-chat.env)' "$cur_chat" "$chat"
+        'BOAT_CHAT_HOST (boat-chat.env)' "$cur_chat" "$chat" \
+        HOMEASSISTANT_BIND_ADDRESS "$cur_ha" "$ha"
+    ha_plan=$(ha_http_plan "$ha")
+    case "$ha_plan" in
+        noop) printf '  Home Assistant configuration.yaml: no change\n' ;;
+        add|create) printf '  Home Assistant configuration.yaml: add the managed http block (server_host: %s); Home Assistant restarts\n' "$ha" ;;
+        replace) printf '  Home Assistant configuration.yaml: update the managed http block (server_host: %s); Home Assistant restarts\n' "$ha" ;;
+        remove) printf '  Home Assistant configuration.yaml: remove the managed http block; Home Assistant restarts\n' ;;
+        conflict) printf '  Home Assistant configuration.yaml: has your own http: section; NOT changed (manual step printed when applying)\n' ;;
+        *) printf '  Home Assistant configuration.yaml: %s; NOT changed\n' "$ha_plan" ;;
+    esac
     printf '  Control panel stays on %s (never changed by this command).\n' "$panel_host"
     if [ "$preset" = all ]; then
         echo "WARNING: Prometheus has no login and InfluxDB/MQTT would be open to every device on the network. Enable the firewall (VESSELSTACK_FIREWALL_ENABLE) and keep Ethernet or a VPN as your way in." >&2
     fi
     if [ "$preset" = local ]; then
-        echo "NOTE: SignalK (3000) and Home Assistant (8123) are host-networked and keep listening on every interface; use the firewall's strict mode or Home Assistant's http server_host setting to limit them." >&2
+        echo "NOTE: SignalK (3000) is host-networked and its server has no bind-address setting, so it keeps listening on every interface; the firewall's strict mode is the only way to limit it. Home Assistant (8123) is limited to this device by the managed http block." >&2
     fi
     local override
     override=$(env_file_value "$VESSELSTACK_DATA/boat-chat/boat-chat.env" BOAT_CHAT_HOST)
@@ -561,7 +936,11 @@ EOF
         return 0
     fi
     if [ "$(lan_current_preset)" = "$preset" ]; then
-        echo "Already set; nothing to change."
+        # The settings already match; still repair a Home Assistant file that drifted from them.
+        case "$ha_plan" in
+            add|create|replace|remove) ha_http_apply "$ha" || true ;;
+            *) echo "Already set; nothing to change." ;;
+        esac
         return 0
     fi
     local chat_file="$ROOT/config/boat-chat.env" backup
@@ -574,6 +953,7 @@ EOF
     cp -p -- "$chat_file" "$backup/boat-chat.env"
     if ! { set_env_key "$ENV_FILE" VESSELSTACK_WEB_BIND_ADDRESS "$web" \
             && set_env_key "$ENV_FILE" VESSELSTACK_DATA_BIND_ADDRESS "$data" \
+            && set_env_key "$ENV_FILE" HOMEASSISTANT_BIND_ADDRESS "$ha" \
             && set_env_key "$chat_file" BOAT_CHAT_HOST "$chat"; }; then
         cp -p -- "$backup/vesselstack.env" "$ENV_FILE"
         cp -p -- "$backup/boat-chat.env" "$chat_file"
@@ -591,6 +971,11 @@ EOF
     fi
     if systemctl is-active --quiet vesselstack-chat.service 2>/dev/null; then
         systemctl restart vesselstack-chat.service
+    fi
+    local ha_status=0
+    ha_http_apply "$ha" || ha_status=$?
+    if [ "$ha_status" -eq 1 ]; then
+        echo "Home Assistant was left unchanged; the other settings were applied. Details above." >&2
     fi
     echo "Done. Check the result with: sudo vesselstackctl urls"
 }
@@ -629,6 +1014,38 @@ check_signalk_data_dir() {
         "$state" "$dir" "$uid" "$gid" "$mode" >&2
     printf '     Typical log: EACCES: permission denied, open '"'"'/home/node/.signalk/package.json'"'"'\n' >&2
     printf '     Fix: sudo chown -R 1000:1000 %s && docker restart vesselstack-signalk\n' "$dir" >&2
+    return 1
+}
+
+# HOMEASSISTANT_BIND_ADDRESS only means something when configuration.yaml carries our block.
+check_homeassistant_bind() {
+    local want=${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0} state
+    state=$(ha_http_state)
+    if [ "$want" = 0.0.0.0 ]; then
+        case "$state" in
+            managed:*) printf 'WARN Home Assistant still has the managed http block (%s) although HOMEASSISTANT_BIND_ADDRESS=0.0.0.0. Fix: sudo vesselstackctl ha-http sync\n' "$state" >&2 ;;
+            *) printf 'OK   Home Assistant listens on every interface (HOMEASSISTANT_BIND_ADDRESS=0.0.0.0)\n' ;;
+        esac
+    elif [ "$state" = "managed:$want" ]; then
+        printf 'OK   Home Assistant is limited to %s by the managed http block\n' "$want"
+    else
+        printf 'WARN Home Assistant is meant to listen on %s only but configuration.yaml says: %s. Fix: sudo vesselstackctl ha-http sync (a conflict with your own http: section needs the manual step it prints)\n' "$want" "$state" >&2
+    fi
+}
+
+# The prom/prometheus image runs as nobody (65534). A bind-mount source that Docker
+# created as root:root makes Prometheus fail to open its TSDB ("permission denied").
+check_prometheus_data_dir() {
+    local dir="$VESSELSTACK_DATA/prometheus" uid gid mode writable=0
+    [ -d "$dir" ] || { printf 'WARN Prometheus data directory %s does not exist; rerun the installer\n' "$dir" >&2; return 0; }
+    read -r uid gid mode < <(stat -c '%u %g %a' "$dir")
+    if [ "$uid" = 65534 ] && [ $((8#$mode & 8#200)) -ne 0 ]; then writable=1; fi
+    if [ "$gid" = 65534 ] && [ $((8#$mode & 8#020)) -ne 0 ]; then writable=1; fi
+    if [ $((8#$mode & 8#002)) -ne 0 ]; then writable=1; fi
+    [ "$writable" -eq 0 ] || { printf 'OK   Prometheus data directory is writable by the container user (uid 65534)\n'; return 0; }
+    printf 'FAIL Prometheus data directory %s is owned by %s:%s (mode %s), not writable by the container user (uid 65534).\n' \
+        "$dir" "$uid" "$gid" "$mode" >&2
+    printf '     Fix: rerun the installer (it repairs an empty directory), or: sudo chown -R 65534:65534 %s && docker restart vesselstack-prometheus\n' "$dir" >&2
     return 1
 }
 
@@ -688,6 +1105,8 @@ doctor_stack() {
     fi
     disk_usage_warning
     check_signalk_data_dir || failed=1
+    check_homeassistant_bind
+    check_prometheus_data_dir || failed=1
     check_memory_index || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
@@ -1055,6 +1474,7 @@ case "$command" in
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
     lan) lan_stack "$@" ;;
+    ha-http) ha_http_command "$@" ;;
     reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
