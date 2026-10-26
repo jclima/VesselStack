@@ -174,10 +174,14 @@ panel_token_before=$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/contr
 sed -i '/^BOAT_CHAT_PROVIDER=/d' "$APP_ROOT/config/boat-chat.env"
 printf '%s\n' 'BOAT_CHAT_PROVIDER=ollama' 'OPENAI_API_KEY=preserve-test-secret' \
     >> "$APP_ROOT/config/boat-chat.env"
+# A loopback BOAT_CHAT_HOST (`vesselstackctl lan local`) survives a re-render from the
+# installed configuration, which never carries that key.
+sed -i 's/^BOAT_CHAT_HOST=.*/BOAT_CHAT_HOST=127.0.0.1/' "$APP_ROOT/config/boat-chat.env"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$APP_ROOT/installer/install.sh" \
     --config "$APP_ROOT/config/vesselstack.env" >/dev/null
 grep -qx 'BOAT_CHAT_PROVIDER=ollama' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'BOAT_CHAT_HOST=127.0.0.1' "$APP_ROOT/config/boat-chat.env"
 grep -qx 'OPENAI_API_KEY=preserve-test-secret' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^CONTROL_PANEL_TOKEN=//p' "$APP_ROOT/config/control-panel.env")" = \
     "$panel_token_before"
@@ -200,6 +204,8 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
 for key in "${secret_keys[@]}"; do
     test "$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")" = "${secret_before[$key]}"
 done
+# A configuration that really sets BOAT_CHAT_HOST (here the wizard-style original) does apply it.
+grep -qx 'BOAT_CHAT_HOST=0.0.0.0' "$APP_ROOT/config/boat-chat.env"
 test "$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$influx_token_chat_before"
 test "$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$settings_token_before"
 test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")" = "$access_token_before"
@@ -412,28 +418,63 @@ if [ "$(id -u)" -eq 0 ]; then
     repair_output=$(install_three)
     grep -q 'Repaired SignalK data directory ownership' <<<"$repair_output"
     test "$(stat -c '%u:%g' "$DATA3/signalk")" = "1000:1000"
-    # A non-empty root-owned tree is repaired recursively.
+    # A non-empty root-owned tree is repaired recursively, locked while it happens, and
+    # keeps its original mode.
     install -d "$DATA3/signalk/plugin-config-data"
     printf '{}\n' > "$DATA3/signalk/plugin-config-data/a.json"
     chown -R 0:0 "$DATA3/signalk"
+    chmod 0755 "$DATA3/signalk"
     repair_output=$(install_three)
     grep -q 'recursive' <<<"$repair_output"
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "1000:1000:755"
     test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "1000:1000"
     # Already correct: nothing is printed or changed.
     test -z "$(install_three | grep 'Repaired SignalK' || true)"
+    sk_refused() {
+        # $1 = expected stderr text. Nothing may change: owner, mode and contents.
+        if install_three >/dev/null 2>"$TEST_ROOT/sk-inner.stderr"; then
+            echo "Installer repaired a SignalK directory it must refuse ($1)" >&2
+            exit 1
+        fi
+        grep -q "$1" "$TEST_ROOT/sk-inner.stderr"
+    }
+    sk_reset_root() { chown -R -h 0:0 "$DATA3/signalk"; chmod 0755 "$DATA3/signalk"; }
     # A symlink inside the tree is refused and nothing is rewritten.
     VICTIM3="$TEST_ROOT/victim3"
     install -d -m 0755 "$VICTIM3"
     ln -s "$VICTIM3" "$DATA3/signalk/escape"
-    chown -R 0:0 "$DATA3/signalk"
-    if install_three >/dev/null 2>"$TEST_ROOT/sk-inner.stderr"; then
-        echo "Installer repaired a SignalK directory containing a symlink" >&2
-        exit 1
-    fi
-    grep -q 'contains symlinks' "$TEST_ROOT/sk-inner.stderr"
-    test "$(stat -c '%u:%g' "$DATA3/signalk")" = "0:0"
+    sk_reset_root
+    sk_refused 'contains symlinks'
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "0:0:755"
     test "$(stat -c '%u:%g' "$VICTIM3")" = "0:0"
+    test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "0:0"
     rm -f -- "$DATA3/signalk/escape"
+    # A file with a second hard link (possibly to a file outside) is refused.
+    VICTIM_FILE="$TEST_ROOT/victim3-file"
+    printf 'x\n' > "$VICTIM_FILE"
+    chown 0:0 "$VICTIM_FILE"
+    ln "$VICTIM_FILE" "$DATA3/signalk/plugin-config-data/linked.json"
+    sk_reset_root
+    sk_refused 'more than one hard link'
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "0:0:755"
+    test "$(stat -c '%u:%g' "$VICTIM_FILE")" = "0:0"
+    rm -f -- "$DATA3/signalk/plugin-config-data/linked.json"
+    # A special file (a FIFO) is refused.
+    mkfifo "$DATA3/signalk/pipe"
+    sk_reset_root
+    sk_refused 'special files'
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "0:0:755"
+    rm -f -- "$DATA3/signalk/pipe"
+    # A populated directory owned by somebody else is not the known Docker state:
+    # no change at all, with manual instructions.
+    sk_reset_root
+    chown -R 4242:4242 "$DATA3/signalk"
+    sk_refused 'owned by 4242:4242'
+    grep -q 'making no change' "$TEST_ROOT/sk-inner.stderr"
+    grep -q "chown -R -h 1000:1000" "$TEST_ROOT/sk-inner.stderr"
+    test "$(stat -c '%u:%g:%a' "$DATA3/signalk")" = "4242:4242:755"
+    test "$(stat -c '%u:%g' "$DATA3/signalk/plugin-config-data/a.json")" = "4242:4242"
+    chown -R 1000:1000 "$DATA3/signalk"
 fi
 # A symlink in place of the signalk directory itself is refused.
 rm -rf -- "$DATA3/signalk"

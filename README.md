@@ -206,7 +206,8 @@ does anything beyond installing ordinary Debian packages:
    `VESSELSTACK_CAN_CREATE_VCAN`), AIS, Home Assistant (URL, optional hidden token), Boat
    Chat provider (default `local`) and Telegram, the firewall (untrusted interface, enable,
    strict mode, allowed ports), raw-data retention (`INFLUXDB_RAW_RETENTION`; empty means
-   30 days on a new install and no change to an existing database) and bind addresses.
+   30 days on a new install and no change to an existing database) and who can reach the
+   dashboards (`local`, `dashboards` or `all`; see "Reaching VesselStack from other devices").
    Ports, container and bucket names, folders, the service account and the generated
    secrets sit behind "Advanced settings? [y/N]". Passwords and tokens default to being
    generated during installation, are read without echo when you do type one and are
@@ -971,6 +972,61 @@ continue to work while it is disabled.
 Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
 SignalK, Boat Chat, InfluxDB, and Prometheus.
 
+## Reaching VesselStack from other devices
+
+The installer asks "Who should be able to reach the dashboards?" (terminal wizard
+question in the "Who can reach what" section; `--set LAN_ACCESS=local|dashboards|all`
+for unattended installs) and `sudo vesselstackctl lan` changes it later. The answer is
+a preset that sets the real bind settings; `LAN_ACCESS` itself is never written to a file.
+
+| Preset | Grafana, Heimdall (`VESSELSTACK_WEB_BIND_ADDRESS`) | Boat Chat (`BOAT_CHAT_HOST`) | InfluxDB, Prometheus, MQTT (`VESSELSTACK_DATA_BIND_ADDRESS`) |
+| --- | --- | --- | --- |
+| `local` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` |
+| `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` |
+| `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
+
+The Control Panel (`CONTROL_PANEL_HOST`) stays on `127.0.0.1` in every preset: it is a
+root-level configuration editor; reach it through an SSH tunnel. `all` also opens
+Prometheus, which has **no login**, plus InfluxDB (token) and MQTT (password) to every
+device on the network; turn the firewall on and prefer Ethernet or a VPN as the way in.
+
+SignalK (3000) and Home Assistant (8123) run in host-network containers, so these
+presets do **not** control them: they listen on every interface in every preset
+(including `local`). Limit them with the firewall's strict mode
+(`VESSELSTACK_FIREWALL_STRICT=true`) or Home Assistant's own `http: server_host`
+setting. `sudo vesselstackctl urls` shows how every service really listens.
+
+```bash
+sudo vesselstackctl lan                      # show the current preset and the three values
+sudo vesselstackctl lan local --dry-run      # print what would change, change nothing
+sudo vesselstackctl lan dashboards           # apply (root); rewrites the keys atomically
+sudo vesselstackctl lan all --yes            # 'all' needs --yes
+```
+
+`lan` rewrites `VESSELSTACK_WEB_BIND_ADDRESS` and `VESSELSTACK_DATA_BIND_ADDRESS` in
+`config/vesselstack.env` and `BOAT_CHAT_HOST` in `config/boat-chat.env` (temporary file in
+the same directory, owner and mode kept, symlinks refused; a failure restores both files),
+then runs `compose up -d` (only containers whose published ports changed are recreated) and
+restarts `vesselstack-chat.service`. A `BOAT_CHAT_HOST` saved from Boat Chat's Settings page
+wins over `boat-chat.env`; `lan` warns when it differs. Rollback: run `lan` with the previous
+preset.
+
+**Firewall caveat (`wlan0`).** With `VESSELSTACK_FIREWALL_ENABLE=true` the interface
+`VESSELSTACK_UNTRUSTED_INTERFACE` (default `wlan0`) is untrusted: other devices that reach the
+Pi over it cannot open Grafana, InfluxDB, Prometheus or MQTT (in strict mode, anything except
+the allow-listed TCP ports), whatever the preset says. If the Pi is on your network over
+`wlan0`, that locks every other device out. `lan` and the wizard say so; `lan` refuses to open
+the network in that state unless you pass `--allow-firewall-conflict`. Pick another untrusted
+interface (for example a hotspot or modem) or leave the firewall off on a trusted network.
+
+Test from a laptop on the same network (replace `PI` with the address that
+`sudo vesselstackctl urls` prints):
+
+```bash
+curl -sS -o /dev/null -w 'grafana %{http_code}\n' http://PI:43000/login   # 200 when reachable
+curl -sS -m 5 -o /dev/null -w 'influx %{http_code}\n' http://PI:8086/health || echo 'influx: not reachable (expected unless preset all)'
+```
+
 ## Network security
 
 Compose now publishes InfluxDB `8086`, Prometheus `9090`, and MQTT `1883` on
@@ -1396,6 +1452,15 @@ detects the condition and prints the fix. Manual fix (the data directory is
 ```bash
 sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk
 ```
+
+The installer repairs only the known state conservatively, because a recursive `chown`
+by root over a tree its previous owner can still write could be redirected through symlink
+or hard-link swaps. An empty directory is chowned (`-h`, the directory only). A populated
+`root:root` directory is first locked (mode 0700, restored afterwards), refused if it holds
+any symlink, file with more than one hard link or special file, and otherwise chowned with a
+non-following walk on the same filesystem. A populated directory owned by anyone else is left
+untouched with manual instructions (the `chown -R -h 1000:1000` command above after you have
+stopped whatever uses it and reviewed the contents).
 
 ### Container mount permissions fail
 

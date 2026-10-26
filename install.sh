@@ -473,7 +473,7 @@ install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
 SIGNALK_CONTAINER_UID=1000
 SIGNALK_CONTAINER_GID=1000
 ensure_signalk_docker_dir() {
-    local dir="$VESSELSTACK_DATA/signalk" want="$SIGNALK_CONTAINER_UID:$SIGNALK_CONTAINER_GID" have
+    local dir="$VESSELSTACK_DATA/signalk" want="$SIGNALK_CONTAINER_UID:$SIGNALK_CONTAINER_GID" have mode
     safe_data_path "$dir" leaf
     if [ ! -e "$dir" ]; then
         install -d -m 0750 -o "$SIGNALK_CONTAINER_UID" -g "$SIGNALK_CONTAINER_GID" "$dir"
@@ -482,19 +482,38 @@ ensure_signalk_docker_dir() {
     [ -d "$dir" ] || fail_data_path "$dir exists but is not a directory"
     have=$(stat -c %u:%g "$dir")
     [ "$have" != "$want" ] || return 0
-    # Created as root:root by Docker (or left by native mode): hand it to the
-    # container user. Never follow symlinks, never touch other filesystems.
-    if [ -n "$(find "$dir" -xdev -mindepth 1 -type l -print -quit)" ]; then
-        fail_data_path "$dir contains symlinks; refusing to change ownership (they may be legitimate, e.g. node_modules/.bin). Review them, then run: chown -R -h $want '$dir' and rerun"
-    fi
     if [ -z "$(find "$dir" -mindepth 1 -print -quit)" ]; then
         chown -h "$want" "$dir"
         echo "Repaired SignalK data directory ownership: $dir $have -> $want (empty directory)"
-    else
-        chown -h "$want" "$dir"
-        find "$dir" -xdev -mindepth 1 -not -type l -exec chown -h "$want" {} +
-        echo "Repaired SignalK data directory ownership: $dir $have -> $want (recursive, no symlinks found)"
+        return 0
     fi
+    # Populated. The only state repaired automatically is the known one: Docker created
+    # the bind-mount source as root:root. A directory owned by anyone else may still be
+    # written by that owner while a root-run chown walks it (symlink and hard-link
+    # swaps), so it is left untouched.
+    if [ "$have" != 0:0 ]; then
+        fail_data_path "$dir is not empty and is owned by $have (neither root:root nor $want); making no change. Stop whatever uses it, review the contents, then run: chown -R -h $want '$dir' and rerun"
+    fi
+    # Lock the top directory first (root-only, no traversal) so no other user can swap
+    # entries during the walk, then refuse anything a chown could be tricked through.
+    mode=$(stat -c %a "$dir")
+    chmod 0700 "$dir"
+    local problem=''
+    if [ -n "$(find -P "$dir" -xdev -mindepth 1 -type l -print -quit)" ]; then
+        problem="contains symlinks (they may be legitimate, e.g. node_modules/.bin)"
+    elif [ -n "$(find -P "$dir" -xdev -mindepth 1 -type f -links +1 -print -quit)" ]; then
+        problem="contains files with more than one hard link"
+    elif [ -n "$(find -P "$dir" -xdev -mindepth 1 -not -type f -not -type d -print -quit)" ]; then
+        problem="contains special files (devices, sockets or pipes)"
+    fi
+    if [ -n "$problem" ]; then
+        chmod "$mode" "$dir"
+        fail_data_path "$dir $problem; refusing to change ownership. Review it, then run: chown -R -h $want '$dir' and rerun"
+    fi
+    find -P "$dir" -xdev -mindepth 1 -exec chown -h "$want" {} +
+    chown -h "$want" "$dir"
+    chmod "$mode" "$dir"
+    echo "Repaired SignalK data directory ownership: $dir $have -> $want (recursive, locked during the change; no symlinks, hard links or special files found)"
 }
 if [ "$SIGNALK_MODE" = docker ]; then
     ensure_signalk_docker_dir

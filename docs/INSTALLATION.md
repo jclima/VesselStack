@@ -282,6 +282,28 @@ sudo vesselstackctl verify-backup /path/to/archive.tar.gz
 - Record the Pi hostname/IP, fuse location, power isolation point, CAN adapter,
   connector, installed version, backup location, and recovery owner.
 
+## Reaching VesselStack from other devices
+
+The wizard asks "Who should be able to reach the dashboards?": `local` (only this Pi; use an
+SSH tunnel), `dashboards` (recommended: Grafana, Heimdall and Boat Chat on your boat network;
+InfluxDB, Prometheus and MQTT stay on the Pi) or `all` (also MQTT, InfluxDB and Prometheus,
+which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later with
+`sudo vesselstackctl lan [local|dashboards|all] [--dry-run]` (`all` needs `--yes`). The
+Control Panel stays on the Pi in every preset. SignalK and Home Assistant are host-networked
+and not controlled by the presets; use the firewall's strict mode or Home Assistant's
+`http: server_host` to limit them.
+
+If `VESSELSTACK_FIREWALL_ENABLE=true` and the Pi is on your network over the untrusted
+interface (default `wlan0`), other devices are blocked from Grafana and the data services
+whatever the preset says; `vesselstackctl lan` warns and refuses (override:
+`--allow-firewall-conflict`). Test from a laptop on the same network:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://PI:43000/login   # 200 = Grafana reachable
+```
+
+See the README section "Reaching VesselStack from other devices" for the full table.
+
 ## Troubleshooting: Boat Chat "not ready" (memory index empty)
 
 `vesselstackctl doctor` prints `FAIL Boat Chat memory index is empty` (or `/health`
@@ -298,7 +320,9 @@ and `sudo docker logs vesselstack-signalk` shows
 `EACCES: permission denied, open '/home/node/.signalk/package.json'`, the data
 directory `<data>/signalk` is owned by root instead of uid/gid 1000 (the `node`
 user in the SignalK image). Release 0.4.3 and later create and repair it on every
-installer run, and `sudo vesselstackctl doctor` reports it. Manual fix:
+installer run (an empty or `root:root` directory only; a populated directory with symlinks,
+hard links, special files or another owner is left untouched with instructions), and
+`sudo vesselstackctl doctor` reports it. Manual fix:
 
 ```bash
 sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk

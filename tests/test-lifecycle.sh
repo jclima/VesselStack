@@ -50,6 +50,7 @@ done
 for command in docker systemctl curl; do
 cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
+[ -z "${FAKE_CALL_LOG:-}" ] || printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALL_LOG"
 if [ "$(basename "$0")" = curl ]; then
     if [ -n "${FAKE_MEMORY_CHUNKS:-}" ]; then
         printf '{"ok":true,"ready":true,"readiness":{"layers":{"memory":{"ready":true,"chunks":%s}}}}\n' "$FAKE_MEMORY_CHUNKS"
@@ -99,6 +100,10 @@ cat "${FAKE_SS_FILE:?}"
 EOF
 cat > "$FAKE_BIN/ip" <<'EOF'
 #!/bin/bash
+if [[ " $* " == *" route "* ]]; then
+    echo "default via 192.0.2.1 dev ${FAKE_DEFAULT_ROUTE_IF:-eth0}"
+    exit 0
+fi
 cat <<'IPS'
 1: lo    inet 127.0.0.1/8 scope host lo
 2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0
@@ -316,6 +321,123 @@ if run_ctl reindex >/dev/null 2>"$TEST_ROOT/reindex.stderr"; then
 fi
 grep -q 'the Python environment is missing' "$TEST_ROOT/reindex.stderr"
 mv "$APP_ROOT/boat-chat/.venv/bin/python.away" "$APP_ROOT/boat-chat/.venv/bin/python"
+
+# `vesselstackctl lan`: presets map to the real bind settings, the files are rewritten
+# atomically with owner and mode kept, the control panel is never touched, and the risky or
+# conflicting cases are refused. Uses its own installation tree.
+LAN_ROOT="$TEST_ROOT/lan"
+install -d "$LAN_ROOT/config" "$LAN_ROOT/data/boat-chat"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=$LAN_ROOT|" -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=$LAN_ROOT/data|" \
+    "$APP_ROOT/config/vesselstack.env" > "$LAN_ROOT/config/vesselstack.env"
+printf 'BOAT_CHAT_HOST=0.0.0.0\nBOAT_CHAT_PORT=9876\nOPENAI_API_KEY=keep-this-secret\n' > "$LAN_ROOT/config/boat-chat.env"
+printf 'CONTROL_PANEL_HOST=127.0.0.1\nCONTROL_PANEL_PORT=8780\nCONTROL_PANEL_TOKEN=panel-token\n' > "$LAN_ROOT/config/control-panel.env"
+printf 'services: {}\n' > "$LAN_ROOT/compose.yml"
+chmod 0600 "$LAN_ROOT"/config/*.env
+if [ "$(id -u)" -eq 0 ]; then chown 1234:1234 "$LAN_ROOT/config/boat-chat.env"; fi
+run_lan() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$LAN_ROOT" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        VESSELSTACK_ENV="${LAN_ENV:-$LAN_ROOT/config/vesselstack.env}" FAKE_CALL_LOG="$TEST_ROOT/lan-calls.log" \
+        "$REPO_ROOT/scripts/vesselstackctl" lan "$@"
+}
+lan_value() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
+lan_files_digest() { sha256sum "$LAN_ROOT"/config/*.env | sha256sum; }
+: > "$TEST_ROOT/lan-calls.log"
+grep -q 'Current LAN access: dashboards' <<<"$(run_lan)"
+grep -Fq 'Control panel                   127.0.0.1 (never changed by this command)' <<<"$(run_lan)"
+# Dry run: prints the plan, changes and starts nothing.
+before=$(lan_files_digest)
+dry_output=$(run_lan local --dry-run 2>&1)
+grep -q 'LAN access: dashboards -> local' <<<"$dry_output"
+grep -Eq 'VESSELSTACK_WEB_BIND_ADDRESS +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
+grep -Eq 'BOAT_CHAT_HOST \(boat-chat.env\) +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
+grep -q 'Dry run: nothing was changed' <<<"$dry_output"
+grep -q 'SignalK (3000) and Home Assistant (8123) are host-networked' <<<"$dry_output"
+[ "$(lan_files_digest)" = "$before" ] || { echo 'lan --dry-run changed the configuration' >&2; exit 1; }
+test ! -s "$TEST_ROOT/lan-calls.log"
+# local: all three bind settings move to loopback, other keys, mode and owner stay, and the
+# stack is re-applied (compose up, chat restart).
+run_lan local >/dev/null 2>&1
+for pair in VESSELSTACK_WEB_BIND_ADDRESS=127.0.0.1 VESSELSTACK_DATA_BIND_ADDRESS=127.0.0.1; do
+    test "$(lan_value "$LAN_ROOT/config/vesselstack.env" "${pair%%=*}")" = "${pair#*=}"
+done
+test "$(lan_value "$LAN_ROOT/config/boat-chat.env" BOAT_CHAT_HOST)" = 127.0.0.1
+grep -qx 'OPENAI_API_KEY=keep-this-secret' "$LAN_ROOT/config/boat-chat.env"
+grep -qx 'BOAT_CHAT_PORT=9876' "$LAN_ROOT/config/boat-chat.env"
+test "$(stat -c %a "$LAN_ROOT/config/boat-chat.env")" = 600
+test "$(stat -c %a "$LAN_ROOT/config/vesselstack.env")" = 600
+if [ "$(id -u)" -eq 0 ]; then test "$(stat -c %u:%g "$LAN_ROOT/config/boat-chat.env")" = 1234:1234; fi
+test "$(grep -c '^VESSELSTACK_WEB_BIND_ADDRESS=' "$LAN_ROOT/config/vesselstack.env")" -eq 1
+grep -q ' up -d' "$TEST_ROOT/lan-calls.log"
+grep -q 'systemctl restart vesselstack-chat.service' "$TEST_ROOT/lan-calls.log"
+grep -qx 'CONTROL_PANEL_HOST=127.0.0.1' "$LAN_ROOT/config/control-panel.env"
+grep -q 'Current LAN access: local' <<<"$(run_lan)"
+: > "$TEST_ROOT/lan-calls.log"
+grep -q 'Already set' <<<"$(run_lan local 2>&1)"
+test ! -s "$TEST_ROOT/lan-calls.log"
+# dashboards restores the recommended state; the control panel is untouched throughout.
+run_lan dashboards >/dev/null 2>&1
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_WEB_BIND_ADDRESS)" = 0.0.0.0
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_DATA_BIND_ADDRESS)" = 127.0.0.1
+test "$(lan_value "$LAN_ROOT/config/boat-chat.env" BOAT_CHAT_HOST)" = 0.0.0.0
+grep -q 'Current LAN access: dashboards' <<<"$(run_lan)"
+# all needs --yes (it opens Prometheus, which has no login); the dry run does not.
+before=$(lan_files_digest)
+if run_lan all >/dev/null 2>"$TEST_ROOT/lan.stderr"; then echo 'lan all ran without --yes' >&2; exit 1; fi
+grep -q "repeat with --yes" "$TEST_ROOT/lan.stderr"
+grep -q 'Prometheus has no login' "$TEST_ROOT/lan.stderr"
+[ "$(lan_files_digest)" = "$before" ]
+run_lan all --dry-run >/dev/null 2>&1
+run_lan all --yes >/dev/null 2>&1
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_DATA_BIND_ADDRESS)" = 0.0.0.0
+grep -q 'Current LAN access: all' <<<"$(run_lan)"
+run_lan dashboards >/dev/null 2>&1
+# A hand-edited combination is reported as custom.
+set_value() { sed -i "s|^$2=.*|$2=$3|" "$1"; }
+set_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_DATA_BIND_ADDRESS 192.0.2.10
+grep -q 'Current LAN access: custom' <<<"$(run_lan)"
+run_lan dashboards >/dev/null 2>&1
+# Refusals: unknown preset, extra argument, unknown option; nothing changes.
+before=$(lan_files_digest)
+for bad in bogus 'local dashboards' --bogus '0.0.0.0'; do
+    # shellcheck disable=SC2086  # word splitting of the case is intended
+    if run_lan $bad >/dev/null 2>&1; then echo "lan accepted: $bad" >&2; exit 1; fi
+done
+[ "$(lan_files_digest)" = "$before" ]
+# Firewall interplay: with the firewall on and wlan0 untrusted, opening the LAN is refused
+# (explicitly naming the interface and what is blocked), unless acknowledged; loopback is fine.
+printf 'VESSELSTACK_FIREWALL_ENABLE=true\nVESSELSTACK_UNTRUSTED_INTERFACE=wlan0\n' >> "$LAN_ROOT/config/vesselstack.env"
+run_lan local >/dev/null 2>&1
+before=$(lan_files_digest)
+if FAKE_DEFAULT_ROUTE_IF=wlan0 run_lan dashboards >/dev/null 2>"$TEST_ROOT/lan.stderr"; then echo 'lan opened the LAN against the firewall' >&2; exit 1; fi
+grep -q 'treats wlan0 as untrusted' "$TEST_ROOT/lan.stderr"
+grep -q 'blocked from Grafana 9877, InfluxDB 8086, Prometheus 9090 and MQTT 1883' "$TEST_ROOT/lan.stderr"
+grep -q 'This machine reaches your network over wlan0 itself' "$TEST_ROOT/lan.stderr"
+grep -q 'Refusing to change LAN access while the firewall would block it' "$TEST_ROOT/lan.stderr"
+[ "$(lan_files_digest)" = "$before" ]
+run_lan dashboards --dry-run >/dev/null 2>&1 && { echo 'dry run hid the firewall conflict' >&2; exit 1; }
+run_lan dashboards --allow-firewall-conflict >/dev/null 2>&1
+test "$(lan_value "$LAN_ROOT/config/boat-chat.env" BOAT_CHAT_HOST)" = 0.0.0.0
+printf 'VESSELSTACK_FIREWALL_STRICT=true\nVESSELSTACK_FIREWALL_ALLOW_TCP=22\n' >> "$LAN_ROOT/config/vesselstack.env"
+run_lan local >/dev/null 2>&1
+if run_lan dashboards >/dev/null 2>"$TEST_ROOT/lan.stderr"; then echo 'lan opened the LAN against the strict firewall' >&2; exit 1; fi
+grep -q 'everything except the allow-listed TCP ports (22)' "$TEST_ROOT/lan.stderr"
+# The Boat Chat Settings page override wins over boat-chat.env: say so.
+sed -i '/^VESSELSTACK_FIREWALL_/d' "$LAN_ROOT/config/vesselstack.env"
+printf 'BOAT_CHAT_HOST=0.0.0.0\n' > "$LAN_ROOT/data/boat-chat/boat-chat.env"
+run_lan dashboards >/dev/null 2>&1
+override_output=$(run_lan local 2>&1)
+grep -q "Settings page overrides BOAT_CHAT_HOST with 0.0.0.0" <<<"$override_output"
+rm -f -- "$LAN_ROOT/data/boat-chat/boat-chat.env"
+# A symlinked service-writable file is refused before anything is written.
+run_lan dashboards >/dev/null 2>&1
+mv "$LAN_ROOT/config/boat-chat.env" "$LAN_ROOT/config/boat-chat.real"
+ln -s boat-chat.real "$LAN_ROOT/config/boat-chat.env"
+before=$(sha256sum "$LAN_ROOT/config/vesselstack.env")
+if run_lan local >/dev/null 2>"$TEST_ROOT/lan.stderr"; then echo 'lan edited through a symlink' >&2; exit 1; fi
+grep -q 'unsafe' "$TEST_ROOT/lan.stderr"
+[ "$(sha256sum "$LAN_ROOT/config/vesselstack.env")" = "$before" ]
+rm -f -- "$LAN_ROOT/config/boat-chat.env"
+mv "$LAN_ROOT/config/boat-chat.real" "$LAN_ROOT/config/boat-chat.env"
 
 # Docker-mode SignalK: doctor names the root-owned bind-mount source, the symptom
 # and the one-line fix when the container is not running; other modes stay silent.
