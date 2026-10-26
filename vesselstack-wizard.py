@@ -17,7 +17,7 @@ DEFAULTS = {
  "AIS_ENABLE":"false","AIS_IMAGE":"ghcr.io/jvde-github/ais-catcher:v0.70","AIS_DEVICE":"/dev/bus/usb","AIS_CATCHER_ARGS":"-q -N 8100 -S 5011","AIS_WEB_PORT":"8100","AIS_TCP_PORT":"5011",
  "HOME_ASSISTANT_URL":"http://127.0.0.1:8123","HOME_ASSISTANT_TOKEN":"","INFLUXDB_URL":"http://127.0.0.1:8086","INFLUXDB_PORT":"8086","INFLUXDB_CONTAINER_NAME":"vesselstack-influxdb","INFLUXDB_ORG":"vesselstack","INFLUXDB_USERNAME":"boatadmin",
  "INFLUXDB_RAW_BUCKET":"signalk","INFLUXDB_HISTORY_BUCKET":"signalk_1m","INFLUXDB_HOME_ASSISTANT_BUCKET":"homeassistant","INFLUXDB_AIS_BUCKET":"ais","INFLUXDB_RAW_RETENTION":"","INFLUXDB_PASSWORD":"GENERATE","INFLUXDB_TOKEN":"GENERATE","GRAFANA_ADMIN_PASSWORD":"GENERATE",
- "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true",
+ "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true",
  "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780"
 }
 
@@ -215,9 +215,9 @@ def _fw_hint(s):
 # settings and is never written to the env file (so it cannot drift from them). The control
 # panel (CONTROL_PANEL_HOST) is deliberately in NO preset: it is a root-level configuration editor.
 LAN_PRESETS={
- "local":{"VESSELSTACK_WEB_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","BOAT_CHAT_HOST":"127.0.0.1"},
- "dashboards":{"VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","BOAT_CHAT_HOST":"0.0.0.0"},
- "all":{"VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","VESSELSTACK_DATA_BIND_ADDRESS":"0.0.0.0","BOAT_CHAT_HOST":"0.0.0.0"},
+ "local":{"VESSELSTACK_WEB_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","BOAT_CHAT_HOST":"127.0.0.1","HOMEASSISTANT_BIND_ADDRESS":"127.0.0.1"},
+ "dashboards":{"VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","BOAT_CHAT_HOST":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0"},
+ "all":{"VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","VESSELSTACK_DATA_BIND_ADDRESS":"0.0.0.0","BOAT_CHAT_HOST":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0"},
 }
 LAN_DEFAULT="dashboards"
 
@@ -246,7 +246,7 @@ def lan_notes(values):
     if preset in ("all","custom") and values.get("VESSELSTACK_DATA_BIND_ADDRESS")!="127.0.0.1":
         notes.append("InfluxDB (API token), MQTT (password) and Prometheus (NO login at all) are open to every device on the network. Turn on the firewall (and keep Ethernet or a VPN as your way in), or use the 'dashboards' option.")
     if preset=="local":
-        notes.append("SignalK (3000) and Home Assistant (8123) run in host-network containers and still listen on every interface; to limit them use the firewall's strict mode or Home Assistant's own http server_host setting. Check with: sudo vesselstackctl urls")
+        notes.append("Home Assistant (8123) is limited to this Pi: the installer adds a managed http server_host block to its configuration.yaml (and refuses, with instructions, if you already have your own http: section). SignalK (3000) runs in a host-network container whose server has no bind-address setting, so it STILL listens on every interface; limit it with the firewall (strict mode) or by keeping this Pi off untrusted networks. Check with: sudo vesselstackctl urls")
     return notes
 
 def _lan_hint(s):
@@ -317,6 +317,7 @@ SECTIONS=[
     choices=[("local","only this Pi (SSH tunnel for everything)"),("dashboards","dashboards on the boat network (recommended)"),("all","dashboards plus MQTT, InfluxDB, Prometheus on the network")],hint=_lan_hint),
   F("VESSELSTACK_WEB_BIND_ADDRESS","Dashboards (Grafana, Heimdall) listen on","0.0.0.0 shares them with every device on the boat network (default). 127.0.0.1 keeps them on this Pi only. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
   F("VESSELSTACK_DATA_BIND_ADDRESS","Databases (InfluxDB, Prometheus, MQTT) listen on","127.0.0.1 keeps them private to this Pi (default and recommended). Change it only to a trusted LAN or VPN address. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
+  F("HOMEASSISTANT_BIND_ADDRESS","Home Assistant listens on","0.0.0.0 shares it with every device on the boat network (default). 127.0.0.1 keeps it on this Pi only; the installer then manages a delimited http block in Home Assistant's configuration.yaml (see README). (Set by the question above. SignalK has no such setting.)",advanced=True,required=True,check=_ipv4),
   F("CONTROL_PANEL_HOST","Control panel listens on","Keep 127.0.0.1 and use an SSH tunnel to reach it (recommended).",advanced=True,required=True,check=_any_ip),
   F("CONTROL_PANEL_PORT","Control panel port","TCP port of the control panel.",advanced=True,required=True,check=PORT),
   F("GRAFANA_PORT","Grafana port","TCP port of Grafana.",advanced=True,required=True,check=PORT),

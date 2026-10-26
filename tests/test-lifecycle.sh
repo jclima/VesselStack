@@ -345,6 +345,12 @@ run_lan() {
         VESSELSTACK_ENV="${LAN_ENV:-$LAN_ROOT/config/vesselstack.env}" FAKE_CALL_LOG="$TEST_ROOT/lan-calls.log" \
         "$REPO_ROOT/scripts/vesselstackctl" lan "$@"
 }
+run_lan_ha() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$LAN_ROOT" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        VESSELSTACK_ENV="$LAN_ROOT/config/vesselstack.env" FAKE_CALL_LOG="$TEST_ROOT/lan-calls.log" \
+        "$REPO_ROOT/scripts/vesselstackctl" ha-http "$@"
+}
+run_ctl_ha() { run_lan_ha "$@"; }
 lan_value() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
 lan_files_digest() { sha256sum "$LAN_ROOT"/config/*.env | sha256sum; }
 : > "$TEST_ROOT/lan-calls.log"
@@ -357,7 +363,11 @@ grep -q 'LAN access: dashboards -> local' <<<"$dry_output"
 grep -Eq 'VESSELSTACK_WEB_BIND_ADDRESS +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
 grep -Eq 'BOAT_CHAT_HOST \(boat-chat.env\) +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
 grep -q 'Dry run: nothing was changed' <<<"$dry_output"
-grep -q 'SignalK (3000) and Home Assistant (8123) are host-networked' <<<"$dry_output"
+grep -Eq 'HOMEASSISTANT_BIND_ADDRESS +0.0.0.0 +-> 127.0.0.1' <<<"$dry_output"
+grep -q 'Home Assistant configuration.yaml: add the managed http block (server_host: 127.0.0.1)' <<<"$dry_output"
+grep -q 'SignalK (3000) is host-networked and its server has no bind-address setting' <<<"$dry_output"
+HA_CFG="$LAN_ROOT/data/homeassistant/configuration.yaml"
+test ! -e "$HA_CFG"
 [ "$(lan_files_digest)" = "$before" ] || { echo 'lan --dry-run changed the configuration' >&2; exit 1; }
 test ! -s "$TEST_ROOT/lan-calls.log"
 # local: all three bind settings move to loopback, other keys, mode and owner stay, and the
@@ -377,13 +387,48 @@ grep -q ' up -d' "$TEST_ROOT/lan-calls.log"
 grep -q 'systemctl restart vesselstack-chat.service' "$TEST_ROOT/lan-calls.log"
 grep -qx 'CONTROL_PANEL_HOST=127.0.0.1' "$LAN_ROOT/config/control-panel.env"
 grep -q 'Current LAN access: local' <<<"$(run_lan)"
+# Home Assistant: local creates the stock configuration plus exactly one delimited http block,
+# checks it inside the container and restarts only that container.
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" HOMEASSISTANT_BIND_ADDRESS)" = 127.0.0.1
+grep -qx 'default_config:' "$HA_CFG"
+grep -qx '  server_host: 127.0.0.1' "$HA_CFG"
+test "$(grep -c '^http:' "$HA_CFG")" -eq 1
+test "$(grep -c 'BEGIN VESSELSTACK MANAGED http bind' "$HA_CFG")" -eq 1
+test -f "$LAN_ROOT/data/homeassistant/automations.yaml"
+grep -q 'exec -T homeassistant python3 -m homeassistant --script check_config' "$TEST_ROOT/lan-calls.log"
+grep -q 'restart homeassistant' "$TEST_ROOT/lan-calls.log"
+grep -qx 'configuration.yaml: managed:127.0.0.1' <<<"$(run_ctl_ha status)"
 : > "$TEST_ROOT/lan-calls.log"
 grep -q 'Already set' <<<"$(run_lan local 2>&1)"
 test ! -s "$TEST_ROOT/lan-calls.log"
+ha_before=$(sha256sum "$HA_CFG")
+run_lan_ha sync >/dev/null 2>&1
+test "$(sha256sum "$HA_CFG")" = "$ha_before"
+test ! -s "$TEST_ROOT/lan-calls.log"
+printf '\n# my own\nlogger:\n  default: warning\n' >> "$HA_CFG"
 # dashboards restores the recommended state; the control panel is untouched throughout.
 run_lan dashboards >/dev/null 2>&1
+# The managed block is gone again; the owner's own lines and the stock content stay.
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" HOMEASSISTANT_BIND_ADDRESS)" = 0.0.0.0
+if grep -q 'VESSELSTACK\|server_host' "$HA_CFG"; then echo "unexpected content in $HA_CFG" >&2; exit 1; fi
+grep -qx 'logger:' "$HA_CFG"
+grep -qx 'default_config:' "$HA_CFG"
 test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_WEB_BIND_ADDRESS)" = 0.0.0.0
 test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_DATA_BIND_ADDRESS)" = 127.0.0.1
+# An owner-managed http: section is never touched: the other settings still apply, nothing is
+# written to configuration.yaml, and the exact manual step is printed.
+printf 'http:\n  server_port: 8123\n' >> "$HA_CFG"
+ha_before=$(sha256sum "$HA_CFG")
+run_lan local >/dev/null 2>"$TEST_ROOT/lan.stderr"
+test "$(sha256sum "$HA_CFG")" = "$ha_before"
+grep -q 'made NO change\|VesselStack made NO change' "$TEST_ROOT/lan.stderr"
+grep -q '    server_host: 127.0.0.1' "$TEST_ROOT/lan.stderr"
+test "$(lan_value "$LAN_ROOT/config/vesselstack.env" VESSELSTACK_WEB_BIND_ADDRESS)" = 127.0.0.1
+grep -qx 'configuration.yaml: conflict' <<<"$(run_ctl_ha status)"
+run_lan dashboards >/dev/null 2>&1
+test "$(sha256sum "$HA_CFG")" = "$ha_before"
+sed -i '/^http:/,/^  server_port/d' "$HA_CFG"
+if grep -q '^http:' "$HA_CFG"; then echo "unexpected content in $HA_CFG" >&2; exit 1; fi
 test "$(lan_value "$LAN_ROOT/config/boat-chat.env" BOAT_CHAT_HOST)" = 0.0.0.0
 grep -q 'Current LAN access: dashboards' <<<"$(run_lan)"
 # all needs --yes (it opens Prometheus, which has no login); the dry run does not.

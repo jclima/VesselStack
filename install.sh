@@ -75,6 +75,7 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${BOAT_CHAT_HOST:=0.0.0.0}"
 : "${VESSELSTACK_DATA_BIND_ADDRESS:=127.0.0.1}"
 : "${VESSELSTACK_WEB_BIND_ADDRESS:=0.0.0.0}"
+: "${HOMEASSISTANT_BIND_ADDRESS:=0.0.0.0}"
 : "${BOAT_CHAT_PORT:=8765}"
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
@@ -153,7 +154,7 @@ for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
     fi
 done
 for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST VESSELSTACK_DATA_BIND_ADDRESS \
-    VESSELSTACK_WEB_BIND_ADDRESS; do
+    VESSELSTACK_WEB_BIND_ADDRESS HOMEASSISTANT_BIND_ADDRESS; do
     python3 - "${!key}" <<'PY' || { echo "$key must be an IPv4 address" >&2; exit 1; }
 import ipaddress
 import sys
@@ -745,6 +746,7 @@ MQTT_PASSWORD
 MQTT_PORT
 VESSELSTACK_DATA_BIND_ADDRESS
 VESSELSTACK_WEB_BIND_ADDRESS
+HOMEASSISTANT_BIND_ADDRESS
 EOF
 
 # Retain provider credentials and optional Boat Chat settings across installer
@@ -860,6 +862,14 @@ compose config --quiet
 if [ "$SIGNALK_MODE" = native ]; then
     "$SCRIPT_DIR/scripts/install-signalk-native.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
 fi
+
+# Home Assistant bind address: add, update or remove the managed http block in its
+# configuration.yaml (only that block; never the owner's own http: section). A refusal is
+# printed with manual instructions and never aborts the installation. With START=0 the
+# container is not touched; it picks the file up at its next start.
+env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_ENV="$VESSELSTACK_ROOT/config/vesselstack.env" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$SBIN_DIR/vesselstackctl" ha-http sync || \
+    echo "WARN: could not apply HOMEASSISTANT_BIND_ADDRESS to Home Assistant; run: sudo vesselstackctl ha-http sync" >&2
 
 # Boat Chat reports "not ready" until its memory index has content, and nothing else
 # builds it. Do it here, after the code, facts file and virtualenv are in place and the

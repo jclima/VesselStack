@@ -289,9 +289,11 @@ SSH tunnel), `dashboards` (recommended: Grafana, Heimdall and Boat Chat on your 
 InfluxDB, Prometheus and MQTT stay on the Pi) or `all` (also MQTT, InfluxDB and Prometheus,
 which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later with
 `sudo vesselstackctl lan [local|dashboards|all] [--dry-run]` (`all` needs `--yes`). The
-Control Panel stays on the Pi in every preset. SignalK and Home Assistant are host-networked
-and not controlled by the presets; use the firewall's strict mode or Home Assistant's
-`http: server_host` to limit them.
+Control Panel stays on the Pi in every preset. `local` also limits Home Assistant (8123) to the
+Pi through a delimited `http:` block the installer manages in its `configuration.yaml` (it never
+touches an `http:` section you wrote yourself and prints the manual step instead). SignalK (3000)
+has no bind-address setting, so no preset restricts it; only the firewall's strict mode can
+(see the README, "Reaching VesselStack from other devices").
 
 If `VESSELSTACK_FIREWALL_ENABLE=true` and the Pi is on your network over the untrusted
 interface (default `wlan0`), other devices are blocked from Grafana and the data services

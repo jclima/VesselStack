@@ -168,6 +168,8 @@ test "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" = 600
 grep -Eq '^CONTROL_PANEL_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/control-panel.env"
 grep -Eq '^BOAT_CHAT_ACCESS_TOKEN=[a-f0-9]{64}$' "$APP_ROOT/config/boat-chat.env"
 grep -q '^VESSELSTACK_DATA_BIND_ADDRESS=127.0.0.1$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^HOMEASSISTANT_BIND_ADDRESS=0.0.0.0$' "$APP_ROOT/config/vesselstack.env"
+test ! -e "$DATA_ROOT/homeassistant/configuration.yaml"
 grep -qx "Environment=BOAT_CHAT_ENV=$DATA_ROOT/boat-chat/boat-chat.env" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 grep -qx "$(<"$REPO_ROOT/VERSION")" "$APP_ROOT/config/installed-version"
 
@@ -263,6 +265,37 @@ if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     echo "Preflight accepted an invalid INFLUXDB_RAW_RETENTION" >&2
     exit 1
 fi
+
+# Home Assistant bind address: validated, and a loopback value makes the installer manage one
+# delimited http block (created with the stock configuration on a fresh data directory);
+# the default value removes it again without touching anything else in the file.
+BAD_HA_CONFIG="$TEST_ROOT/bad-ha.env"
+cp "$CONFIG" "$BAD_HA_CONFIG"
+printf '\nHOMEASSISTANT_BIND_ADDRESS="lan"\n' >> "$BAD_HA_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$BAD_HA_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted an invalid HOMEASSISTANT_BIND_ADDRESS" >&2
+    exit 1
+fi
+HA_LOCAL_CONFIG="$TEST_ROOT/ha-local.env"
+cp "$CONFIG" "$HA_LOCAL_CONFIG"
+printf '\nHOMEASSISTANT_BIND_ADDRESS="127.0.0.1"\n' >> "$HA_LOCAL_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$HA_LOCAL_CONFIG" >/dev/null
+grep -q '^HOMEASSISTANT_BIND_ADDRESS=127.0.0.1$' "$APP_ROOT/config/vesselstack.env"
+HA_YAML="$DATA_ROOT/homeassistant/configuration.yaml"
+grep -qx '  server_host: 127.0.0.1' "$HA_YAML"
+test "$(grep -c '^http:' "$HA_YAML")" -eq 1
+printf 'logger:\n  default: warning\n' >> "$HA_YAML"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$HA_LOCAL_CONFIG" >/dev/null
+test "$(grep -c '^http:' "$HA_YAML")" -eq 1
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+grep -q '^HOMEASSISTANT_BIND_ADDRESS=0.0.0.0$' "$APP_ROOT/config/vesselstack.env"
+if grep -q 'VESSELSTACK\|server_host' "$HA_YAML"; then echo "unexpected content in $HA_YAML" >&2; exit 1; fi
+grep -qx 'logger:' "$HA_YAML"
+grep -qx 'default_config:' "$HA_YAML"
 
 # Legacy runtime state that cannot be migrated (new path already exists) is moved
 # into a root-only quarantine outside the code tree, never left in place and

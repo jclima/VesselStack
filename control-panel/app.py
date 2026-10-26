@@ -98,6 +98,7 @@ FIELDS = [
     field("INFLUXDB_URL", "InfluxDB URL", "InfluxDB", kind="url"),
     field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services bind address", "Network", description="InfluxDB, Prometheus and MQTT publish on this IPv4 address. Keep 127.0.0.1 unless external devices must connect over a trusted network."),
     field("VESSELSTACK_WEB_BIND_ADDRESS", "Web UI bind address", "Network", description="Grafana and Heimdall publish on this IPv4 address (0.0.0.0 = every interface, 127.0.0.1 = this device only)."),
+    field("HOMEASSISTANT_BIND_ADDRESS", "Home Assistant bind address", "Network", description="0.0.0.0 = every interface, 127.0.0.1 = this device only. Applied through a managed http block in Home Assistant's configuration.yaml by the installer or `vesselstackctl lan`; SignalK has no such setting."),
     field("INFLUXDB_PORT", "Published port", "InfluxDB", kind="port"),
     field("INFLUXDB_CONTAINER_NAME", "Container name", "InfluxDB"),
     field("INFLUXDB_ORG", "Organization", "InfluxDB"),
@@ -236,7 +237,7 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     if kind == "port" and text:
         if not text.isdigit() or not 1 <= int(text) <= 65535:
             raise ValueError(f"{spec['label']} must be an integer from 1 to 65535")
-    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS"} and text:
+    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
         except ValueError as exc:
