@@ -523,7 +523,7 @@ ON_CONFIG="$TEST_ROOT/displays-on.env"
 sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$ON_APP\"|" \
     -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$ON_DATA\"|" \
     -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/on-backups\"|" "$CONFIG" > "$ON_CONFIG"
-printf 'DISPLAYS_ENABLE="true"\nDISPLAYS_SIGNALK_TOKEN="to\\"k\\\\en"\n' >> "$ON_CONFIG"
+printf 'DISPLAYS_ENABLE="true"\nDISPLAYS_SIGNALK_TOKEN="to\\"k\\\\en"\nDISPLAYS_HA_TOKEN="ha\\"t\\\\ok"\n' >> "$ON_CONFIG"
 : > "$FAKE_BIN/systemctl.log"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$ON_CONFIG" >/dev/null
@@ -549,6 +549,8 @@ grep -qx 'MQTT_HOST="127.0.0.1"' "$BENV"
 grep -qx 'MQTT_PORT="1883"' "$BENV"
 grep -qx 'DISPLAYS_BRIDGE_MQTT_USERNAME="vesselstack-bridge"' "$BENV"
 grep -qx 'DISPLAYS_SIGNALK_TOKEN="to\\"k\\\\en"' "$BENV"
+grep -qx 'DISPLAYS_HA_TOKEN="ha\\"t\\\\ok"' "$BENV"
+grep -qx 'HOME_ASSISTANT_URL="http://127.0.0.1:8123"' "$BENV"
 bridge_secret=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["bridge"]["mqtt_password"])' \
     "$ON_APP/config/displays.secrets.json")
 grep -qx "DISPLAYS_BRIDGE_MQTT_PASSWORD=\"$bridge_secret\"" "$BENV"
@@ -580,6 +582,14 @@ printf 'DISPLAYS_SIGNALK_TOKEN=$'"'"'bad\\ntoken'"'"'\n' >> "$ON_CONFIG"
 if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$ON_CONFIG" --dry-run >/dev/null 2>&1; then
     echo "Preflight accepted a SignalK token containing a line break" >&2
+    exit 1
+fi
+# The same for the Home Assistant token.
+sed -i '/^DISPLAYS_SIGNALK_TOKEN=/d' "$ON_CONFIG"
+printf 'DISPLAYS_HA_TOKEN=$'"'"'bad\\ntoken'"'"'\n' >> "$ON_CONFIG"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$ON_CONFIG" --dry-run >/dev/null 2>&1; then
+    echo "Preflight accepted a Home Assistant token containing a line break" >&2
     exit 1
 fi
 
