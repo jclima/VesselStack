@@ -6,7 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
-    "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
+    "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" \
@@ -30,7 +30,7 @@ grep -qF ":$(tr -d '[:space:]' < "$ROOT/displays/esphome/VERSION")@" <<<"$IMAGE_
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
-    "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
+    "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" \
@@ -81,6 +81,12 @@ test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)"
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"
 "$ROOT/scripts/vesselstackctl" --help | grep -q 'backup \[--allow-unmounted\] \[DIRECTORY\]'
+"$ROOT/scripts/vesselstackctl" --help | grep -q 'reindex  *Rebuild Boat Chat'
+test -x "$ROOT/scripts/memory-index.sh"
+# The memory index must be built by the installer (Boat Chat is not ready without it), and as
+# the service user, never by root directly.
+grep -qF 'scripts/memory-index.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" ensure' "$ROOT/install.sh"
+grep -qF 'runuser -u "$VESSELSTACK_USER"' "$ROOT/scripts/memory-index.sh"
 if grep -RInE --exclude=test-distribution.sh \
     --exclude-dir=.git --exclude-dir=generated \
     '(BOAT_MMSI="[1-9][0-9]+"|BOAT_CALLSIGN="[A-Z0-9]+"|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY)' "$ROOT"; then
@@ -143,4 +149,13 @@ if grep -nE '\beval\b|/tmp/' "$ROOT/scripts/get-vesselstack.sh" \
 fi
 test -x "$ROOT/tests/test-get-vesselstack.sh"
 "$ROOT/scripts/get-vesselstack.sh" --help | grep -q -- '--offline'
+# SignalK docker data directory: created for uid/gid 1000 only in docker mode and
+# before compose up (Docker would otherwise create the mount source as root:root).
+# shellcheck disable=SC2016  # Literal source text, not an expansion.
+grep -q '^if \[ "\$SIGNALK_MODE" = docker \]; then$' "$ROOT/install.sh"
+signalk_line=$(grep -n '^    ensure_signalk_docker_dir$' "$ROOT/install.sh" | cut -d: -f1)
+compose_line=$(grep -n '^    compose_up=(compose up -d)$' "$ROOT/install.sh" | cut -d: -f1)
+[ -n "$signalk_line" ] && [ -n "$compose_line" ] && [ "$signalk_line" -lt "$compose_line" ] \
+    || { echo "install.sh must create the SignalK data directory before compose up" >&2; exit 1; }
+grep -q '^SIGNALK_CONTAINER_UID=1000$' "$ROOT/install.sh"
 echo "distribution static checks passed"

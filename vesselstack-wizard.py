@@ -200,6 +200,50 @@ def _fw_hint(s):
     names=[n for n in s.facts.get("interfaces",[]) if n.startswith(("wl",))]
     return ("Wi-Fi interface found: "+", ".join(names)+".") if names else "No Wi-Fi interface found; the default name is wlan0."
 
+# "Who can reach the dashboards?" is a pseudo-setting: it expands at once into the real bind
+# settings and is never written to the env file (so it cannot drift from them). The control
+# panel (CONTROL_PANEL_HOST) is deliberately in NO preset: it is a root-level configuration editor.
+LAN_PRESETS={
+ "local":{"VESSELSTACK_WEB_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","BOAT_CHAT_HOST":"127.0.0.1"},
+ "dashboards":{"VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","BOAT_CHAT_HOST":"0.0.0.0"},
+ "all":{"VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","VESSELSTACK_DATA_BIND_ADDRESS":"0.0.0.0","BOAT_CHAT_HOST":"0.0.0.0"},
+}
+LAN_DEFAULT="dashboards"
+
+def lan_preset_of(values):
+    for name,keys in LAN_PRESETS.items():
+        if all(values.get(key)==value for key,value in keys.items()): return name
+    return "custom"
+
+def apply_lan_preset(values,name): values.update(LAN_PRESETS[name])
+
+def firewall_note(values):
+    """Plain statement of what an enabled firewall does to LAN access (empty when it is off)."""
+    if values.get("VESSELSTACK_FIREWALL_ENABLE")!="true": return ""
+    iface=values.get("VESSELSTACK_UNTRUSTED_INTERFACE","wlan0")
+    if values.get("VESSELSTACK_FIREWALL_STRICT")=="true":
+        what="everything except the allow-listed ports ("+(values.get("VESSELSTACK_FIREWALL_ALLOW_TCP") or "none")+")"
+    else:
+        what="Grafana, InfluxDB, Prometheus and MQTT"
+    return (f"The firewall is ON and treats {iface} as untrusted: devices that reach this Pi over {iface} (usually Wi-Fi) are blocked from {what}. "
+            f"If this Pi is on your network over {iface}, those services will NOT be reachable from other devices: pick another untrusted interface, or turn the firewall off.")
+
+def lan_notes(values):
+    """Warnings that go with the chosen access level (never secrets)."""
+    preset=lan_preset_of(values); notes=[]
+    if preset!="local" and firewall_note(values): notes.append(firewall_note(values))
+    if preset in ("all","custom") and values.get("VESSELSTACK_DATA_BIND_ADDRESS")!="127.0.0.1":
+        notes.append("InfluxDB (API token), MQTT (password) and Prometheus (NO login at all) are open to every device on the network. Turn on the firewall (and keep Ethernet or a VPN as your way in), or use the 'dashboards' option.")
+    if preset=="local":
+        notes.append("SignalK (3000) and Home Assistant (8123) run in host-network containers and still listen on every interface; to limit them use the firewall's strict mode or Home Assistant's own http server_host setting. Check with: sudo vesselstackctl urls")
+    return notes
+
+def _lan_hint(s):
+    lines=["Grafana, Heimdall, Boat Chat (needs its access token), Home Assistant and SignalK; the control panel always stays on this Pi only (SSH tunnel)."]
+    note=firewall_note(s.values)
+    if note: lines.append("WARNING: "+note)
+    return "\n    ".join(lines)
+
 def _secret(key,label,what):
     return F(key,label,f"{what} Press Enter to have a strong random value generated during installation (recommended). It is never shown on screen or stored anywhere but the root-only configuration.",
         "secret",advanced=True,check=SECRET,generate=True)
@@ -260,9 +304,11 @@ SECTIONS=[
   F("VESSELSTACK_FIREWALL_ALLOW_UDP","UDP ports to keep open","Comma-separated ports or ranges. Usually none. Type - for none.",optional=True,when=lambda s:s.values["VESSELSTACK_FIREWALL_ENABLE"]=="true")]},
  {"title":"Data retention","intro":"How long InfluxDB keeps the full-detail (raw) readings. One-minute averages are kept much longer.","fields":[
   F("INFLUXDB_RAW_RETENTION","Keep raw data for","Enter a duration such as 30d, 8w or 720h, 0 to keep it forever, or press Enter for the installer default: 30d on a new install and no change to an existing database. Raw data is large: 30 days suits a small SSD.",optional=True)]},
- {"title":"Who can reach what","intro":"Which network addresses the services listen on. The defaults keep databases private to this Pi and share the dashboards on your boat network.","fields":[
-  F("VESSELSTACK_WEB_BIND_ADDRESS","Dashboards (Grafana, Heimdall) listen on","0.0.0.0 shares them with every device on the boat network (default). 127.0.0.1 keeps them on this Pi only.",required=True,check=_ipv4),
-  F("VESSELSTACK_DATA_BIND_ADDRESS","Databases (InfluxDB, Prometheus, MQTT) listen on","127.0.0.1 keeps them private to this Pi (default and recommended). Change it only to a trusted LAN or VPN address.",required=True,check=_ipv4),
+ {"title":"Who can reach what","intro":"Which devices on your network can open the dashboards. The default shares the dashboards and keeps the databases private to this Pi. You can change this later with: sudo vesselstackctl lan","fields":[
+  F("LAN_ACCESS","Who should be able to reach the dashboards?","local: only this Pi (reach everything through an SSH tunnel). dashboards (recommended): Grafana, Heimdall, Boat Chat, Home Assistant and SignalK on your boat network, while InfluxDB, Prometheus and MQTT stay on this Pi. all: also InfluxDB, Prometheus (it has no login) and MQTT on the network; turn the firewall on if you choose this. The control panel stays on this Pi in every case.","choice",
+    choices=[("local","only this Pi (SSH tunnel for everything)"),("dashboards","dashboards on the boat network (recommended)"),("all","dashboards plus MQTT, InfluxDB, Prometheus on the network")],hint=_lan_hint),
+  F("VESSELSTACK_WEB_BIND_ADDRESS","Dashboards (Grafana, Heimdall) listen on","0.0.0.0 shares them with every device on the boat network (default). 127.0.0.1 keeps them on this Pi only. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
+  F("VESSELSTACK_DATA_BIND_ADDRESS","Databases (InfluxDB, Prometheus, MQTT) listen on","127.0.0.1 keeps them private to this Pi (default and recommended). Change it only to a trusted LAN or VPN address. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
   F("CONTROL_PANEL_HOST","Control panel listens on","Keep 127.0.0.1 and use an SSH tunnel to reach it (recommended).",advanced=True,required=True,check=_any_ip),
   F("CONTROL_PANEL_PORT","Control panel port","TCP port of the control panel.",advanced=True,required=True,check=PORT),
   F("GRAFANA_PORT","Grafana port","TCP port of Grafana.",advanced=True,required=True,check=PORT),
@@ -392,6 +438,7 @@ def normalize(field,raw,values):
         if check:
             message=check(value)
             if message: return None,message
+    if key=="LAN_ACCESS": return value,None
     try: validate({**values,key:value})
     except ValueError as exc: return None,str(exc)
     return value,None
@@ -405,6 +452,7 @@ def apply_settings(values,pairs):
         if field is None: raise ValueError(f"Unknown setting {key}: see vesselstack.example.env for the settings VesselStack knows")
         value,message=normalize(field,raw,values)
         if message: raise ValueError(f"{key}: {message}")
+        if key=="LAN_ACCESS": apply_lan_preset(values,value); continue
         values[key]=value
         if field.get("after"): field["after"](Session(None,values,{}))
     return values
@@ -456,7 +504,7 @@ def ask_field(session,field):
         if text: console.say("    "+text)
     if field["kind"]=="choice":
         for number,(name,text) in enumerate(field["choices"],1): console.say(f"    {number}) {name:<18} {text}")
-    current=session.values[field["key"]]
+    current=lan_preset_of(session.values) if field["key"]=="LAN_ACCESS" else session.values[field["key"]]
     while True:
         raw=console.ask(prompt_text(field,current),secret=field["kind"]=="secret")
         if raw=="?": show_help(console,field); continue
@@ -467,6 +515,10 @@ def ask_field(session,field):
             console.say("    This setting cannot be cleared. Press Enter to keep it, or type ? for help."); continue
         value,message=normalize(field,raw,session.values)
         if message: console.say("    "+message+" (type ? for help)"); continue
+        if field["key"]=="LAN_ACCESS":
+            apply_lan_preset(session.values,value)
+            for note in lan_notes(session.values): console.say("    NOTE: "+note)
+            return None
         session.values[field["key"]]=value
         if field.get("after"): field["after"](session)
         return None
@@ -500,13 +552,16 @@ def review(session):
         for f in section["fields"]:
             if f["kind"]=="gate": continue
             when=f.get("when")
-            value=session.values[f["key"]]
-            if when and not when(session) and value==DEFAULTS[f["key"]]: continue
-            if f["advanced"] and value==DEFAULTS[f["key"]]: continue
+            lan=f["key"]=="LAN_ACCESS"
+            value=lan_preset_of(session.values) if lan else session.values[f["key"]]
+            default=LAN_DEFAULT if lan else DEFAULTS[f["key"]]
+            if when and not when(session) and value==default: continue
+            if f["advanced"] and value==default: continue
             lines.append(f"      {f['label']:<52} {describe(f,value)}")
         c.say(f"  {number+1}. {section['title']}")
         for line in lines or ["      (all defaults)"]: c.say(line)
     c.say("  (Advanced settings you did not change are not listed; they keep their defaults.)")
+    for note in lan_notes(session.values): c.say("  NOTE: "+note)
 
 def run_cli(console,values,facts):
     """Walk through every section, then review. Returns the final values, or None if the user quits."""
@@ -547,6 +602,8 @@ def cli_main(args):
     except (OSError,ValueError) as exc: raise SystemExit(f"error: {exc}")
     output=Path(args.output).resolve() if args.output else OUTPUT
     def write(text): sys.stdout.write(text); sys.stdout.flush()
+    if args.set and any(pair.partition("=")[0]=="LAN_ACCESS" for pair in args.set):
+        for note in lan_notes(values): write("NOTE: "+note+"\n")
     if args.non_interactive:
         write("VesselStack setup: no questions asked"+(f" ({len(args.set)} setting(s) given with --set)" if args.set else "")+".\n")
     else:

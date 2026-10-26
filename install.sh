@@ -68,6 +68,10 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_ALLOW_UDP=}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
+# Whether the INPUT configuration really sets BOAT_CHAT_HOST: the installed vesselstack.env
+# never carries it (it lives in config/boat-chat.env), so a re-render from it must keep
+# the installed value (for example one set by `vesselstackctl lan local`), not reset it.
+BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${BOAT_CHAT_HOST:=0.0.0.0}"
 : "${VESSELSTACK_DATA_BIND_ADDRESS:=127.0.0.1}"
 : "${VESSELSTACK_WEB_BIND_ADDRESS:=0.0.0.0}"
@@ -510,6 +514,59 @@ done
 # Change only the mount root itself; never recursively rewrite existing data.
 install -d -m 0750 -o 1000 -g 1000 "$VESSELSTACK_DATA/influxdb"
 install -d -m 0750 -o 472 -g 0 "$VESSELSTACK_DATA/grafana"
+# The signalk-server image runs SignalK as its "node" user (uid/gid 1000, config
+# dir /home/node/.signalk). Without a pre-created, correctly owned source directory
+# Docker creates the bind mount as root:root and SignalK exits with
+# "EACCES: permission denied, open '/home/node/.signalk/package.json'".
+# Native mode keeps its own service-user-owned directory (install-signalk-native.sh).
+SIGNALK_CONTAINER_UID=1000
+SIGNALK_CONTAINER_GID=1000
+ensure_signalk_docker_dir() {
+    local dir="$VESSELSTACK_DATA/signalk" want="$SIGNALK_CONTAINER_UID:$SIGNALK_CONTAINER_GID" have mode
+    safe_data_path "$dir" leaf
+    if [ ! -e "$dir" ]; then
+        install -d -m 0750 -o "$SIGNALK_CONTAINER_UID" -g "$SIGNALK_CONTAINER_GID" "$dir"
+        return 0
+    fi
+    [ -d "$dir" ] || fail_data_path "$dir exists but is not a directory"
+    have=$(stat -c %u:%g "$dir")
+    [ "$have" != "$want" ] || return 0
+    if [ -z "$(find "$dir" -mindepth 1 -print -quit)" ]; then
+        chown -h "$want" "$dir"
+        echo "Repaired SignalK data directory ownership: $dir $have -> $want (empty directory)"
+        return 0
+    fi
+    # Populated. The only state repaired automatically is the known one: Docker created
+    # the bind-mount source as root:root. A directory owned by anyone else may still be
+    # written by that owner while a root-run chown walks it (symlink and hard-link
+    # swaps), so it is left untouched.
+    if [ "$have" != 0:0 ]; then
+        fail_data_path "$dir is not empty and is owned by $have (neither root:root nor $want); making no change. Stop whatever uses it, review the contents, then run: chown -R -h $want '$dir' and rerun"
+    fi
+    # Lock the top directory first (root-only, no traversal) so no other user can swap
+    # entries during the walk, then refuse anything a chown could be tricked through.
+    mode=$(stat -c %a "$dir")
+    chmod 0700 "$dir"
+    local problem=''
+    if [ -n "$(find -P "$dir" -xdev -mindepth 1 -type l -print -quit)" ]; then
+        problem="contains symlinks (they may be legitimate, e.g. node_modules/.bin)"
+    elif [ -n "$(find -P "$dir" -xdev -mindepth 1 -type f -links +1 -print -quit)" ]; then
+        problem="contains files with more than one hard link"
+    elif [ -n "$(find -P "$dir" -xdev -mindepth 1 -not -type f -not -type d -print -quit)" ]; then
+        problem="contains special files (devices, sockets or pipes)"
+    fi
+    if [ -n "$problem" ]; then
+        chmod "$mode" "$dir"
+        fail_data_path "$dir $problem; refusing to change ownership. Review it, then run: chown -R -h $want '$dir' and rerun"
+    fi
+    find -P "$dir" -xdev -mindepth 1 -exec chown -h "$want" {} +
+    chown -h "$want" "$dir"
+    chmod "$mode" "$dir"
+    echo "Repaired SignalK data directory ownership: $dir $have -> $want (recursive, locked during the change; no symlinks, hard links or special files found)"
+}
+if [ "$SIGNALK_MODE" = docker ]; then
+    ensure_signalk_docker_dir
+fi
 # Code and the Python virtualenv are root-owned; the service user may only write
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
@@ -811,7 +868,9 @@ for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN 
     sed -i "/^${key}=/d" "$boat_chat_temp"
 done
 for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
-    if [ -n "${!key+x}" ]; then
+    key_given=${!key+x}
+    [ "$key" != BOAT_CHAT_HOST ] || key_given=$BOAT_CHAT_HOST_FROM_CONFIG
+    if [ -n "$key_given" ]; then
         sed -i "/^${key}=/d" "$boat_chat_temp"
         printf '%s=%q\n' "$key" "${!key}" >> "$boat_chat_temp"
     elif ! grep -q "^${key}=" "$boat_chat_temp"; then
@@ -916,6 +975,16 @@ compose config --quiet
 
 if [ "$SIGNALK_MODE" = native ]; then
     "$SCRIPT_DIR/scripts/install-signalk-native.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+fi
+
+# Boat Chat reports "not ready" until its memory index has content, and nothing else
+# builds it. Do it here, after the code, facts file and virtualenv are in place and the
+# state directory exists, as the service user (see scripts/memory-index.sh). `ensure` is
+# idempotent, so a re-run or an upgrade only rebuilds when the bundled knowledge changed.
+# A failure is loud but never aborts the installation (doctor reports it too).
+if ! "$SCRIPT_DIR/scripts/memory-index.sh" "$VESSELSTACK_ROOT/config/vesselstack.env" ensure; then
+    echo "WARN: the Boat Chat memory index could not be built, so Boat Chat will report 'not ready' (and 'vesselstackctl doctor' will fail)." >&2
+    echo "WARN: build it manually with: sudo vesselstackctl reindex" >&2
 fi
 
 if [ "$START" -eq 1 ]; then

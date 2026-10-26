@@ -260,10 +260,10 @@ def drive(answers, values=None, facts=None, strict=False):
 # One Enter for each question of an all-default walk (see SECTIONS), the advanced gate, then the review choice.
 class CliWizardTests(unittest.TestCase):
     def test_every_setting_has_a_prompt_and_every_default_passes_its_own_check(self):
-        self.assertEqual(set(wizard.FIELD_INDEX), set(wizard.DEFAULTS))
+        self.assertEqual(set(wizard.FIELD_INDEX) - {"LAN_ACCESS"}, set(wizard.DEFAULTS))  # LAN_ACCESS is a pseudo-setting
         values = wizard.DEFAULTS.copy()
         for key, field in wizard.FIELD_INDEX.items():
-            if field["kind"] in ("bool", "choice") or values[key] in ("", "GENERATE"): continue
+            if key == "LAN_ACCESS" or field["kind"] in ("bool", "choice") or values[key] in ("", "GENERATE"): continue
             self.assertEqual(wizard.normalize(field, values[key], values)[1], None, key)
         # The browser wizard's fields are all reachable from the terminal.
         app = (ROOT / "wizard" / "app.js").read_text()
@@ -294,7 +294,7 @@ class CliWizardTests(unittest.TestCase):
                    "y", "12345", "123456789", "b", "", "ABCD1", "11.5", "3.8",
                    "2", "http://192.0.2.10:3000",
                    "y", "y", "", "",   # CAN on, vcan on (interface becomes vcan0), interface, bitrate
-                   "n", "", "?", "", "1", "y", "y", "", "n", "22,8080", "-", "14d", "", "", "n", "s"]
+                   "n", "", "?", "", "1", "y", "y", "", "n", "22,8080", "-", "14d", "", "n", "s"]
         result, output = drive(answers, strict=True)
         self.assertIsInstance(result, dict, output)
         self.assertEqual(result["BOAT_NAME"], "Sea Wolf")
@@ -349,14 +349,14 @@ class CliWizardTests(unittest.TestCase):
         self.assertNotIn("123456789", output); self.assertNotIn("ABCD1", output)
 
     def test_quit_and_ended_input(self):
-        self.assertIsNone(drive([""] * 17 + ["q"], strict=True)[0])
+        self.assertIsNone(drive([""] * 16 + ["q"], strict=True)[0])
         self.assertEqual(drive([""] * 3, strict=True)[0], "aborted")
-        self.assertEqual(drive([""] * 17, strict=True)[0], "aborted")   # no review answer
+        self.assertEqual(drive([""] * 16, strict=True)[0], "aborted")   # no review answer
 
     def test_edit_a_section_from_the_review(self):
-        result, _ = drive([""] * 17 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
+        result, _ = drive([""] * 16 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
         self.assertEqual(result["BOAT_NAME"], "Edited")
-        result, output = drive([""] * 17 + ["e", "99", "x", "s"], strict=True)
+        result, output = drive([""] * 16 + ["e", "99", "x", "s"], strict=True)
         self.assertIn("Please enter a section number", output)
 
     def test_set_option_uses_the_same_rules(self):
@@ -373,6 +373,84 @@ class CliWizardTests(unittest.TestCase):
         self.assertNotIn("short", str(caught.exception))
         values = wizard.DEFAULTS.copy(); wizard.apply_settings(values, ["INFLUXDB_RAW_RETENTION=default", "BOAT_MMSI=123456789", "BOAT_MMSI="])
         self.assertEqual((values["INFLUXDB_RAW_RETENTION"], values["BOAT_MMSI"]), ("", ""))
+
+    def test_lan_access_presets_map_to_the_real_settings(self):
+        keys = ("VESSELSTACK_WEB_BIND_ADDRESS", "VESSELSTACK_DATA_BIND_ADDRESS", "BOAT_CHAT_HOST")
+        expected = {"local": ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
+                    "dashboards": ("0.0.0.0", "127.0.0.1", "0.0.0.0"),
+                    "all": ("0.0.0.0", "0.0.0.0", "0.0.0.0")}
+        for name, want in expected.items():
+            values = wizard.DEFAULTS.copy()
+            wizard.apply_settings(values, [f"LAN_ACCESS={name}"])
+            self.assertEqual(tuple(values[k] for k in keys), want, name)
+            self.assertEqual(wizard.lan_preset_of(values), name)
+            self.assertNotIn("LAN_ACCESS", values)
+            self.assertNotIn("LAN_ACCESS", wizard.render(values))
+            # The control panel is in no preset: it stays on loopback, port untouched.
+            self.assertEqual((values["CONTROL_PANEL_HOST"], values["CONTROL_PANEL_PORT"]), ("127.0.0.1", "8780"))
+        # The default answer is the recommended preset and equals the plain defaults.
+        self.assertEqual(wizard.lan_preset_of(wizard.DEFAULTS), wizard.LAN_DEFAULT)
+        self.assertEqual(wizard.LAN_DEFAULT, "dashboards")
+        for preset in wizard.LAN_PRESETS.values(): self.assertNotIn("CONTROL_PANEL_HOST", preset)
+        # Later --set wins, in order; a mixed combination is reported as custom.
+        values = wizard.DEFAULTS.copy()
+        wizard.apply_settings(values, ["LAN_ACCESS=all", "VESSELSTACK_DATA_BIND_ADDRESS=127.0.0.1", "LAN_ACCESS=2"])
+        self.assertEqual(wizard.lan_preset_of(values), "dashboards")  # 2 = second choice
+        wizard.apply_settings(values, ["LAN_ACCESS=all", "BOAT_CHAT_HOST=127.0.0.1"])
+        self.assertEqual(wizard.lan_preset_of(values), "custom")
+
+    def test_lan_access_refusals(self):
+        for bad in ("LAN_ACCESS=everyone", "LAN_ACCESS=", "LAN_ACCESS=4", "LAN_ACCESS=0.0.0.0"):
+            with self.assertRaises(ValueError, msg=bad): wizard.apply_settings(wizard.DEFAULTS.copy(), [bad])
+        # An env file cannot carry the pseudo-setting: install.sh would ignore it silently.
+        with self.assertRaises(ValueError): wizard.validate({"LAN_ACCESS": "local"})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "x.env"; path.write_text("LAN_ACCESS=local\n")
+            result = subprocess.run([sys.executable, "-I", str(ROOT / "vesselstack-wizard.py"), "--validate", str(path)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+
+    def test_lan_question_walk_and_firewall_warning(self):
+        # Without the firewall: the three choices, the recommended default is kept on Enter.
+        result, output = drive([], strict=False)
+        self.assertIn("Who should be able to reach the dashboards? - choose 1-3 [dashboards]", output)
+        self.assertNotIn("WARNING: The firewall is ON", output)
+        self.assertEqual(wizard.lan_preset_of(result), "dashboards")
+        # Choosing "local" and "all" through the prompt; the firewall interplay is explicit.
+        values = wizard.DEFAULTS.copy(); wizard.apply_settings(values, ["VESSELSTACK_FIREWALL_ENABLE=true"])
+        result, output = drive([], values=values, strict=False)
+        self.assertIn("WARNING: The firewall is ON and treats wlan0 as untrusted", output)
+        self.assertIn("will NOT be reachable from other devices", output)
+        values = wizard.DEFAULTS.copy()
+        field = wizard.FIELD_INDEX["LAN_ACCESS"]
+        session = wizard.Session(Scripted(["3"]).console(), values, {})
+        self.assertIsNone(wizard.ask_field(session, field))
+        self.assertEqual(wizard.lan_preset_of(values), "all")
+        self.assertTrue(any("NO login" in n for n in wizard.lan_notes(values)))
+        session = wizard.Session(Scripted(["local"]).console(), values, {})
+        wizard.ask_field(session, field)
+        self.assertEqual(wizard.lan_preset_of(values), "local")
+        self.assertTrue(any("host-network" in n for n in wizard.lan_notes(values)))
+        # Strict mode: the note names the allow-list.
+        wizard.apply_settings(values, ["LAN_ACCESS=dashboards", "VESSELSTACK_FIREWALL_ENABLE=true", "VESSELSTACK_FIREWALL_STRICT=true", "VESSELSTACK_FIREWALL_ALLOW_TCP=22"])
+        self.assertIn("allow-listed ports (22)", wizard.firewall_note(values))
+        # The review lists the choice only when it differs from the default.
+        values = wizard.DEFAULTS.copy(); wizard.apply_settings(values, ["LAN_ACCESS=local"])
+        _, output = drive([], values=values, strict=False)
+        self.assertRegex(output, r"Who should be able to reach the dashboards\?\s+local")
+
+    def test_set_lan_access_on_the_command_line_prints_the_notes_and_saves_real_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = subprocess.run([sys.executable, "-I", str(ROOT / "vesselstack-wizard.py"), "--cli", "--output", str(out),
+                                     "--set", "LAN_ACCESS=all", "--set", "VESSELSTACK_FIREWALL_ENABLE=true"],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("NO login", result.stdout)
+            self.assertIn("The firewall is ON and treats wlan0 as untrusted", result.stdout)
+            saved = wizard.load_env(out)
+            self.assertEqual((saved["VESSELSTACK_WEB_BIND_ADDRESS"], saved["VESSELSTACK_DATA_BIND_ADDRESS"], saved["BOAT_CHAT_HOST"], saved["CONTROL_PANEL_HOST"]),
+                             ("0.0.0.0", "0.0.0.0", "0.0.0.0", "127.0.0.1"))
+            self.assertNotIn("LAN_ACCESS", out.read_text())
 
     def test_timezone_detection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -443,7 +521,7 @@ class CliCommandTests(unittest.TestCase):
     def test_answers_from_a_descriptor_and_early_end(self):
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "vesselstack.env"
-            answers = Path(directory) / "answers"; answers.write_text("Piped Boat\n" + "\n" * 17 + "s\n")
+            answers = Path(directory) / "answers"; answers.write_text("Piped Boat\n" + "\n" * 16 + "s\n")
             with open(answers, "rb") as handle:
                 result = subprocess.run([sys.executable, "-I", str(ROOT / "vesselstack-wizard.py"), "--cli", "--input-fd", str(handle.fileno()), "--output", str(out)],
                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, pass_fds=(handle.fileno(),))
