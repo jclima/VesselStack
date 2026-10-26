@@ -230,3 +230,141 @@ class SeverityPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+NOTE_CONFIG = {
+    "heartbeat_s": 5,
+    "instruments": CONFIG["instruments"],
+    "notifications": {
+        "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
+        "bilge": {"path": "notifications.bilge", "label": "Bilge", "absent": "unknown"},
+    },
+}
+ANCHOR = "notifications.navigation.anchor"
+ANCHOR_TOPIC = "vesselstack/v1/notifications/anchor"
+BILGE_TOPIC = "vesselstack/v1/notifications/bilge"
+
+
+def by_topic(msgs):
+    out = {}
+    for topic, body, retain in decode(msgs):
+        assert retain is True
+        out.setdefault(topic, []).append(body)
+    return out
+
+
+class EventEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.events = topics.EventEngine(NOTE_CONFIG)
+
+    def connect(self, now=0.0):
+        self.events.source_state("signalk", True, now)
+        return now
+
+    def test_topic_and_payload_shape(self) -> None:
+        self.assertEqual(topics.notification_topic("anchor"), ANCHOR_TOPIC)
+        self.assertEqual(self.events.paths(), [ANCHOR, "notifications.bilge"])
+        raw = self.events.tick(0.0)
+        self.assertEqual(raw[0][0], ANCHOR_TOPIC)
+        self.assertEqual(raw[0][1], '{"v":null,"u":"","st":"missing","sev":"unknown","ts":null,"age":null}')
+        self.assertTrue(all(retain for _, _, retain in raw))
+
+    def test_never_connected_is_missing_then_absent_mapping_once_connected(self) -> None:
+        self.assertEqual({b["st"] for bodies in by_topic(self.events.tick(0.0)).values() for b in bodies},
+                         {"missing"})
+        sent = by_topic(self.events.source_state("signalk", True, 1.0))
+        self.assertEqual(sent[ANCHOR_TOPIC][0]["st"], "ok")
+        # settling: nothing is claimed healthy until SignalK had a chance to resend active alarms
+        self.assertEqual(sent[ANCHOR_TOPIC][0]["sev"], "unknown")
+        later = by_topic(self.events.tick(1.0 + topics.EVENT_SETTLE_S))
+        self.assertEqual(later[ANCHOR_TOPIC][0]["sev"], "ok")          # absent defaults to ok
+        self.assertNotIn(BILGE_TOPIC, later)                            # unchanged: still ("ok", "unknown")
+        beat = by_topic(self.events.tick(1.0 + 5.0))
+        self.assertEqual((beat[BILGE_TOPIC][0]["st"], beat[BILGE_TOPIC][0]["sev"]), ("ok", "unknown"))  # absent: unknown
+
+    def test_raise_publishes_immediately_and_never_reads_the_message(self) -> None:
+        self.connect()
+        out = by_topic(self.events.update(ANCHOR, {"state": "alarm", "message": "SECRET-TEXT", "method": ["sound"]},
+                                          TS, 2.0))
+        self.assertEqual(list(out), [ANCHOR_TOPIC])
+        body = out[ANCHOR_TOPIC][0]
+        self.assertEqual((body["st"], body["sev"], body["ts"], body["v"], body["u"]), ("ok", "alarm", TS, None, ""))
+        self.assertNotIn("SECRET", json.dumps(out))
+        self.assertEqual(list(body), ["v", "u", "st", "sev", "ts", "age"])
+        # the same state again is not republished before the heartbeat
+        self.assertEqual(self.events.update(ANCHOR, {"state": "alarm"}, TS, 2.5), [])
+
+    def test_state_changes_map_through_severity(self) -> None:
+        self.connect()
+        seen = []
+        for t, state in enumerate(("warn", "emergency", "normal", "alert", "bogus"), start=1):
+            out = by_topic(self.events.set("anchor", {"state": state}, TS, float(t)))
+            seen.append(out[ANCHOR_TOPIC][0]["sev"])
+        self.assertEqual(seen, ["warn", "alarm", "ok", "warn", "unknown"])
+
+    def test_clear_follows_absent_mapping(self) -> None:
+        self.connect()
+        self.events.set("anchor", {"state": "alarm"}, TS, 1.0)
+        self.events.set("bilge", {"state": "alarm"}, TS, 1.0)
+        cleared = by_topic(self.events.update(ANCHOR, None, TS, 2.0) + self.events.update("notifications.bilge", None, TS, 2.0))
+        self.assertEqual(cleared[ANCHOR_TOPIC][0]["sev"], "ok")
+        self.assertEqual(cleared[BILGE_TOPIC][0]["sev"], "unknown")
+        self.assertEqual(cleared[ANCHOR_TOPIC][0]["st"], "ok")
+
+    def test_disconnect_makes_everything_stale_and_forgets_alarms(self) -> None:
+        self.connect()
+        self.events.set("anchor", {"state": "alarm"}, TS, 1.0)
+        out = by_topic(self.events.source_state("signalk", False, 5.0))
+        for topic in (ANCHOR_TOPIC, BILGE_TOPIC):
+            self.assertEqual((out[topic][0]["st"], out[topic][0]["sev"]), ("stale", "unknown"))
+            self.assertIsNone(out[topic][0]["age"])
+        # a repeat of the same state changes nothing
+        self.assertEqual(self.events.source_state("signalk", False, 6.0), [])
+        # reconnect: the alarm raised before the outage is not assumed; SignalK re-sends it
+        back = by_topic(self.events.source_state("signalk", True, 20.0))
+        self.assertEqual((back[ANCHOR_TOPIC][0]["st"], back[ANCHOR_TOPIC][0]["sev"]), ("ok", "unknown"))
+        resent = by_topic(self.events.update(ANCHOR, {"state": "alarm"}, TS, 20.5))
+        self.assertEqual(resent[ANCHOR_TOPIC][0]["sev"], "alarm")
+
+    def test_stale_message_while_disconnected_never_shows_ok(self) -> None:
+        out = by_topic(self.events.set("anchor", {"state": "normal"}, TS, 1.0))
+        self.assertEqual(out[ANCHOR_TOPIC][0]["st"], "missing")
+        self.assertEqual(out[ANCHOR_TOPIC][0]["sev"], "unknown")
+
+    def test_heartbeat_republishes_every_heartbeat_s(self) -> None:
+        self.connect()
+        self.events.set("anchor", {"state": "alarm"}, TS, 1.0)
+        self.assertEqual(self.events.tick(1.0), [])
+        self.assertEqual(self.events.tick(4.9), [])
+        self.assertEqual(list(by_topic(self.events.tick(5.0))), [BILGE_TOPIC])  # published at connect, t=0
+        beat = by_topic(self.events.tick(6.0))                                # anchor: published at t=1
+        self.assertEqual(beat[ANCHOR_TOPIC][0]["sev"], "alarm")
+        self.assertEqual(beat[ANCHOR_TOPIC][0]["age"], 5.0)
+        self.assertEqual(self.events.tick(6.5), [])
+        self.assertEqual(len(self.events.tick(11.0)), 2)
+
+    def test_unknown_ids_and_other_sources_are_ignored(self) -> None:
+        self.assertEqual(self.events.set("nope", {"state": "alarm"}, TS, 0.0), [])
+        self.assertEqual(self.events.update("notifications.other", {"state": "alarm"}, TS, 0.0), [])
+        self.assertEqual(self.events.source_state("ha", True, 0.0), [])
+        self.assertFalse(self.events.connected)
+
+    def test_no_notifications_means_no_output(self) -> None:
+        engine = topics.EventEngine(CONFIG)
+        self.assertEqual(engine.paths(), [])
+        self.assertEqual(engine.source_state("signalk", True, 0.0), [])
+        self.assertEqual(engine.tick(100.0), [])
+
+    def test_subscribe_frame_includes_notification_paths(self) -> None:
+        frame = topics.subscribe_frame(NOTE_CONFIG)
+        entries = {e["path"]: e for e in frame["subscribe"]}
+        self.assertEqual(entries[ANCHOR]["period"], 1000)
+        self.assertEqual(entries["notifications.bilge"]["period"], 1000)
+        self.assertEqual(entries["navigation.speedOverGround"]["period"], 500)
+        self.assertEqual(topics.subscribe_frame(CONFIG)["subscribe"],
+                         [e for e in frame["subscribe"] if not e["path"].startswith("notifications.")])
+
+    def test_instrument_engine_still_drops_non_numeric_values(self) -> None:
+        engine = topics.Engine({"instruments": {"n": {"path": ANCHOR, "convert": "none", "unit": "",
+                                                       "precision": 0, "stale_after_s": 10}}})
+        self.assertEqual(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.0), [])

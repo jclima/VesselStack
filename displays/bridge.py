@@ -113,7 +113,7 @@ def load_config(path) -> dict:
     errors = schema.validate_config(config, registry)
     if errors:
         raise ValueError(f"{path} is invalid: " + "; ".join(errors))
-    if not config["instruments"]:
+    if not config["instruments"] and not config.get("notifications"):
         raise ValueError(f"{path} defines no instruments; add instruments to publish")
     return config
 
@@ -151,6 +151,7 @@ class Bridge:
     def __init__(self, config, publisher, connect, clock=time.monotonic,
                  wait=None, rng=random.random):
         self.engine = topics.Engine(config)
+        self.events = topics.EventEngine(config)
         self.frame = json.dumps(topics.subscribe_frame(config), separators=(",", ":"))
         self.publisher = publisher
         self._connect = connect
@@ -177,6 +178,7 @@ class Bridge:
         if state != self.signalk_state:
             self.signalk_state = state
             LOG.info("SignalK %s", state)
+            self._send(self.events.source_state("signalk", state == SIGNALK_CONNECTED, self.clock()))
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, state, True, qos=1)
 
     def _tick(self):
@@ -184,6 +186,7 @@ class Bridge:
         if now >= self._next_tick:
             self._next_tick = now + TICK_INTERVAL_S
             self._send(self.engine.tick(now))
+            self._send(self.events.tick(now))
 
     # -- loop -------------------------------------------------------------
     def run(self, stop) -> None:
@@ -287,7 +290,9 @@ class Bridge:
             self.self_urn = data["self"]
             return
         for path, value, ts in topics.parse_delta(data, self.self_urn):
-            self._send(self.engine.update(path, value, ts, self.clock()))
+            now = self.clock()
+            self._send(self.engine.update(path, value, ts, now))
+            self._send(self.events.update(path, value, ts, now))
 
     def shutdown(self):
         if self.signalk_state != SIGNALK_DISCONNECTED:
@@ -416,8 +421,8 @@ def main(env=None) -> int:
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda _signum, _frame: stop.set())
-    LOG.info("starting: %d instrument(s), SignalK %s, MQTT %s:%s as %s",
-             len(config["instruments"]), settings.signalk_url, settings.mqtt_host,
+    LOG.info("starting: %d instrument(s), %d notification(s), SignalK %s, MQTT %s:%s as %s",
+             len(config["instruments"]), len(config.get("notifications", {})), settings.signalk_url, settings.mqtt_host,
              settings.mqtt_port, settings.mqtt_username)
     Bridge(config, publisher, connect).run(stop)
     LOG.info("stopped")

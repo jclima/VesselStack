@@ -140,6 +140,55 @@ class Harness:
         return self.publisher
 
 
+NOTE_PATH = "notifications.navigation.anchor"
+NOTE_TOPIC = "vesselstack/v1/notifications/anchor"
+NOTE_CONFIG = dict(CONFIG, notifications={"anchor": {"path": NOTE_PATH, "label": "Anchor"}})
+
+
+def note_delta(value, ts="2026-01-01T00:00:00.000Z"):
+    return json.dumps({"updates": [{"timestamp": ts, "values": [{"path": NOTE_PATH, "value": value}]}]})
+
+
+class NotificationBridgeTests(unittest.TestCase):
+    def sevs(self, pub):
+        return [(json.loads(p)["st"], json.loads(p)["sev"]) for p, _ in pub.on(NOTE_TOPIC)]
+
+    def test_subscribe_frame_and_missing_before_signalk(self):
+        h = Harness([[("idle",), ("close",)]], NOTE_CONFIG)
+        pub = h.run()
+        frame = json.loads(h.sources[0].sent[0])
+        paths = {e["path"]: e["period"] for e in frame["subscribe"]}
+        self.assertEqual(paths, {SOG: 500, NOTE_PATH: 1000})
+        self.assertEqual(self.sevs(Harness([], NOTE_CONFIG).run())[0], ("missing", "unknown"))
+
+    def test_raise_then_clear_then_disconnect(self):
+        script = [("idle",)] * 4 + [("msg", note_delta({"state": "alarm", "message": "Anchor drag"})),
+                                    ("idle",), ("msg", note_delta(None)), ("idle",), ("close",)]
+        pub = Harness([script], NOTE_CONFIG).run()
+        seen = []
+        for item in self.sevs(pub):
+            if not seen or seen[-1] != item:
+                seen.append(item)
+        self.assertEqual(seen, [("ok", "unknown"), ("ok", "ok"), ("ok", "alarm"),
+                                ("ok", "ok"), ("stale", "unknown")])
+        self.assertNotIn("Anchor drag", json.dumps(pub.sent))
+
+    def test_instrument_engine_ignores_notification_objects_and_vice_versa(self):
+        script = [("msg", note_delta({"state": "warn"})), ("msg", delta(10 * KN)), ("idle",)]
+        pub = Harness([script], NOTE_CONFIG).run()
+        self.assertIn(("ok", "warn"), self.sevs(pub))
+        self.assertEqual(len([p for p, _ in pub.on(SOG_TOPIC) if json.loads(p)["st"] == "ok"]), 1)
+
+    def test_notifications_only_config_is_loadable(self):
+        cfg = json.loads((ROOT / "displays" / "displays.example.json").read_text())
+        cfg["instruments"], cfg["displays"] = {}, {}
+        cfg["notifications"] = {"anchor": {"path": NOTE_PATH, "label": "Anchor"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "displays.json"
+            path.write_text(json.dumps(cfg))
+            self.assertIn("anchor", bridge.load_config(str(path))["notifications"])
+
+
 class BridgeLoopTests(unittest.TestCase):
     def test_startup_publishes_status_and_missing_instruments(self):
         pub = Harness([]).run()
