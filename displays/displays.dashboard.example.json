@@ -9,7 +9,8 @@
     "house_v": {"path": "electrical.batteries.house.voltage", "label": "House", "convert": "none", "unit": "V", "precision": 2, "stale_after_s": 30, "thresholds": {"alarm_below": 11.8, "warn_below": 12.2, "warn_above": 14.8, "alarm_above": 15.2, "hysteresis": 0.1}, "min": 10, "max": 16},
     "start_v": {"path": "electrical.batteries.start.voltage", "label": "Start", "convert": "none", "unit": "V", "precision": 2, "stale_after_s": 30, "thresholds": {"alarm_below": 11.5, "warn_below": 12.0, "hysteresis": 0.1}},
     "fuel": {"path": "tanks.fuel.0.currentLevel", "label": "Fuel", "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "thresholds": {"alarm_below": 10, "warn_below": 25, "hysteresis": 2}, "min": 0, "max": 100},
-    "water": {"path": "tanks.freshWater.0.currentLevel", "label": "Water", "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "thresholds": {"warn_below": 20, "hysteresis": 2}, "min": 0, "max": 100}
+    "water": {"path": "tanks.freshWater.0.currentLevel", "label": "Water", "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "thresholds": {"warn_below": 20, "hysteresis": 2}, "min": 0, "max": 100},
+    "waste": {"path": "tanks.blackWater.0.currentLevel", "label": "Waste", "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60, "thresholds": {"warn_above": 75, "alarm_above": 90, "hysteresis": 2}, "min": 0, "max": 100}
   },
   "notifications": {
     "anchor": {"path": "notifications.navigation.anchor", "label": "Anchor"},
@@ -23,7 +24,8 @@
       "pages": [
         {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "house_v", "start_v"]},
         {"title": "Status", "layout": "status-grid", "items": ["anchor", "low_battery", "depth", "house_v", "start_v", "fuel", "water"]},
-        {"title": "Tanks", "layout": "grid-2x2", "items": ["fuel", "water"]}
+        {"title": "Tanks", "layout": "tank-bars", "items": ["fuel", "water", "waste"]},
+        {"title": "Fuel", "layout": "gauge-arc", "items": ["fuel"]}
       ]
     }
   }

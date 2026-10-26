@@ -1725,10 +1725,10 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
   [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
   1-8 `pages`. A page has a `title` (1-16 characters), a `layout` the board
   supports (`single` holds 1 item, `grid-2x2` holds 4, `list-6` holds 6,
-  `status-grid` holds 1-9) and unique `items` naming existing instruments or,
+  `status-grid` holds 1-9, `tank-bars` holds 1-4, `gauge-arc` holds 1) and unique `items` naming existing instruments or,
   on layouts that accept them (`status-grid`), notifications. Each layout
-  declares the item types it accepts; `single` and `grid-2x2` take instruments
-  only.
+  declares the item types it accepts; `single`, `grid-2x2`, `tank-bars` and
+  `gauge-arc` take instruments only.
 - A notification (see [Notifications](#notifications)) has the same id rules
   as an instrument; ids are unique across instruments and notifications.
 - Conversions: `none`, `m/s->kn`, `m/s->km/h`, `m/s->mph`, `K->C`, `K->F`,
@@ -1784,8 +1784,10 @@ are rejected):
 - `alarm` (boolean, meaning "this instrument may raise an alarm", default true
   when `thresholds` is present, false otherwise) decides whether the instrument
   counts in the [alarm summary](#alarm-summary-and-takeover). `min` and `max`
-  (finite, `min < max`) are validated and stored; widgets that use them
-  (gauges) come in a later release and they change nothing on the screen yet.
+  (finite, `min < max`) are validated; they scale the bars and the arc of the
+  [`tank-bars` and `gauge-arc` layouts](#the-tank-bars-and-gauge-arc-layouts)
+  and are required for instruments on those layouts. They change nothing on the
+  other layouts.
 - Colours on the tile (background / value text): `ok` green `0x1E7B34` /
   white, `warn` amber `0xF2A900` / black, `alarm` red `0xC62828` / white. A
   tile that shows `--` (bridge offline, MQTT disconnected, `st` not `ok` or no
@@ -1797,7 +1799,7 @@ are rejected):
 
 [`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
 is an example with thresholds on depth, battery voltages and tank levels
-(two grid pages). New firmware is needed to see colours: `vesselstackctl
+(a status page, tank bars and a fuel arc). New firmware is needed to see colours: `vesselstackctl
 display build ID` and then `display flash ID --ota HOST` or `--serial DEVICE`.
 Rollback: remove `thresholds` from the instruments and rebuild and reflash, or
 flash the previous firmware (`display flash ID --previous ...`).
@@ -2073,6 +2075,88 @@ is needed; firmware built before this release ignores notification topics.
 Rollback: remove the `status-grid` pages and the `notifications` and reflash,
 or flash the previous firmware.
 
+#### The `tank-bars` and `gauge-arc` layouts
+
+Two layouts draw a reading as a level instead of digits only. Every instrument
+on them needs `min` and `max` (in display units, after `convert`); the check
+names the item and the layout (`instrument 'fuel' needs min and max on layout
+'tank-bars'`).
+
+| Layout | Items | Boards | What is drawn | Required |
+| --- | --- | --- | --- | --- |
+| `tank-bars` | 1-4 instruments | round and rect | 1-4 vertical bars side by side in the content area (340 x 340 px on the Waveshare 2.8C): the label above (small font, `!literal`, clipped with an ellipsis), a 60 px wide, 210 px high bar and the value with its unit below (36 px bold digits, unit in the small font). The columns share the width evenly (85 px each for four bars). | `min` and `max` on every item |
+| `gauge-arc` | 1 instrument | round only | One 270 degree arc, 24 px wide and 440 px across (screen size minus 20 px on each side), with the value in the middle (the 96 px digits of `single`), the label above it and the unit below it. Optional zone arcs, 6 px wide just inside the track, show the warn (amber) and alarm (red) ranges of the instrument's `thresholds`. | `min` and `max`; `thresholds` optional |
+
+On a rectangular board `gauge-arc` is refused: `gauge-arc needs a round board;
+use single`.
+
+- **Scaling.** A bar has the range 0..100: `round(100 * (v - min) / (max - min))`,
+  clamped to 0..100 and rounded half away from zero (`lroundf`). The arc has the
+  range 0..1000 on the same formula, so one tenth of a percent moves it. The
+  firmware reads the reading as a number from the payload (`v`); nothing is
+  parsed from text and no text is built from MQTT data. The text shows the
+  value as the other layouts do, with the instrument's `precision` and `unit`
+  (`62%`). Use `precision` 0 or 1 on narrow bars: the value row is clipped to
+  its column, and with four bars (85 px) `100%` or `62.5%` should fit (estimated from the font size, not measured on the panel).
+- **Colour.** The bar or arc indicator follows the severity of the instrument
+  with the same freshness gate and guarded repaint as the tiles: ok green
+  `0x1E7B34`, warn amber `0xF2A900`, alarm red `0xC62828`, unknown grey
+  `0x37474F`. An instrument without `thresholds` has no severity, so a fresh
+  reading is drawn neutral blue `0x2E86C1` (never green).
+- **Stale, offline or unknown.** When the bridge is offline, MQTT is
+  disconnected, `st` is not `ok` or nothing arrived within the staleness
+  threshold, the bar or arc goes to 0, the indicator turns grey and the text
+  is `--` (the unit stays). It never shows the last value and is never green.
+- **Zone arcs.** Angles are computed when the firmware is generated, from
+  `thresholds`, `min` and `max`: `alarm_below` is red from `min`, `warn_below`
+  amber up to it (from `alarm_below` when both are set), `warn_above` amber from
+  it (up to `alarm_above` when both are set) and `alarm_above` red up to `max`.
+  Zones outside the range, or shorter than one degree, are not drawn. They are
+  static (hysteresis is not shown).
+- **Angles.** LVGL measures angles clockwise from 3 o'clock. The arc normally
+  runs from 135 to 45 degrees (left of the bottom, over the top, to the right
+  of the bottom) and leaves a 90 degree gap at the **bottom**. With `ui.header`
+  the header sits at the top of the ring, so the arc runs from 315 to 225
+  degrees and the gap is at the **top**: the value then grows clockwise from the
+  upper right, round the bottom, to the upper left. The arc ends are about 85
+  px from the top of the screen, below the header band (y 14 to 66); a
+  unit test checks that the arc band does not touch the clock, status dots,
+  title or page dots. The bars only use the content area, so they never meet
+  the header.
+- **Night.** With `ui.night` the labels, value text, bar and arc tracks, zone
+  arcs and indicator colours switch to the red/amber night palette through the
+  same guarded repaint as the tiles (no blue; the neutral colour becomes dim
+  amber).
+- **SignalK tank paths.** SignalK publishes tanks as
+  `tanks.<type>.<id>.currentLevel`, a **ratio from 0 to 1**, for example
+  `tanks.fuel.0.currentLevel`, `tanks.freshWater.0.currentLevel`,
+  `tanks.blackWater.0.currentLevel` (also `wasteWater`, `lubrication`, `liveWell`,
+  `baitWell`, `ballast`, `gas`). Use `"convert": "ratio->%"`, `"unit": "%"`,
+  `"min": 0`, `"max": 100`. To find the paths on your boat open the SignalK
+  admin UI (Data Browser, filter `tanks`) or read
+  `http://<pi>:3000/signalk/v1/api/vessels/self/tanks`; the `<id>` is whatever
+  your tank sensor plugin or N2K gateway reports (`0`, `1`, ... or a name). If
+  you prefer litres, use `currentVolume` with `m3->L` and set `max` to the tank
+  capacity.
+- **Cost.** On the dashboard example (a Tanks page with three bars and a Fuel
+  arc with two zones added to the previous example, which had a grid page
+  instead) the ESPHome build report went from 1148119 to 1183939 bytes of flash
+  (+35.8 kB: the 36 px font, the LVGL bar and arc code) and from 120595 to
+  121739 bytes of RAM (+1.1 kB).
+
+[`displays/displays.dashboard.example.json`](displays/displays.dashboard.example.json)
+has a `Tanks` page (`tank-bars`: fuel, water and waste, with thresholds fuel
+`warn_below` 25 / `alarm_below` 10, water `warn_below` 20, waste `warn_above` 75
+/ `alarm_above` 90) and a `Fuel` page (`gauge-arc`). To use them: add the
+instruments with the right `path`, `convert`, `min` and `max`, put them on a
+page, run `vesselstackctl display validate`, then rebuild and reflash
+(`display build ID`, then `display flash ID --ota HOST` or `--serial DEVICE`);
+firmware built before this release cannot draw these layouts. Rollback: change
+the pages back to another layout (or remove them), rebuild and reflash, or flash
+the previous firmware (`display flash ID --previous ...`). Not verified on the
+hardware yet: how the bars and the arc look on the round panel, the column
+widths with long units, and the arc ends near the header.
+
 #### Board registry schema 2
 
 `displays/boards/registry.json` is now `schema` 2, where each layout is an
@@ -2085,8 +2169,9 @@ that support its `shape`. A board may also have an optional `ring`
 The header band (at least 50 px high) must end above the content area and the
 10 px page indicator must lie between the content area and the bottom edge;
 the registry validator checks it. `vesselstackctl display add` still picks the largest
-layout that takes only instruments for the default page; `status-grid` is
-chosen only when nothing else fits.
+layout that takes only instruments for the default page (`tank-bars` and
+`gauge-arc` are listed after `grid-2x2` so they never win a tie; they need
+`min` and `max`); `status-grid` is chosen only when nothing else fits.
 
 ### MQTT topics and freshness
 
@@ -2125,7 +2210,7 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board.
 
@@ -2138,7 +2223,7 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
   interface that can reach the Raspberry Pi's MQTT port.
 - The build path is exporting from the Pi and compiling on a laptop; building
   and flashing on the Pi (a Compose profile) is planned and not available yet.
-  Only the `single`, `grid-2x2` and `status-grid` layouts are generated.
+  Only the `single`, `grid-2x2`, `status-grid`, `tank-bars` and `gauge-arc` layouts are generated.
 - The runtime `displays.json`, `displays.secrets.json`, ESPHome
   `secrets.yaml`, `.esphome/` and `displays/build/` output, `$VESSELSTACK_ROOT/build/` and firmware
   binaries (`.bin`, `.elf`, `.uf2`) are git-ignored and rejected by
