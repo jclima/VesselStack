@@ -24,3 +24,14 @@ pre-change-backups/
 backups/
 reviews/
 .local/
+
+# Instrument displays: runtime config, secrets and firmware build output
+displays.json
+displays.secrets.json
+secrets.yaml
+.esphome/
+displays/build/
+/build/
+*.bin
+*.elf
+*.uf2

@@ -80,6 +80,10 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
+: "${DISPLAYS_ENABLE:=false}"
+: "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
+: "${DISPLAYS_SIGNALK_TOKEN:=}"
+: "${DISPLAYS_HA_TOKEN:=}"
 # Empty = unset: fresh InfluxDB setups get 30d on the raw bucket; existing buckets
 # are never changed unless a value is set explicitly (see README).
 : "${INFLUXDB_RAW_RETENTION:=}"
@@ -129,11 +133,25 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
     esac
+done
+# MQTT account names are written into the Mosquitto password and ACL files.
+for key in MQTT_USERNAME DISPLAYS_BRIDGE_MQTT_USERNAME; do
+    if ! [[ "${!key}" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+        echo "$key may contain 1-64 letters, numbers, dot, underscore, and hyphen" >&2
+        exit 1
+    fi
+done
+# The optional SignalK and Home Assistant tokens go into a systemd EnvironmentFile line.
+for key in DISPLAYS_SIGNALK_TOKEN DISPLAYS_HA_TOKEN; do
+    if [[ "${!key}" =~ [[:cntrl:]] ]]; then
+        echo "$key must not contain line breaks or control characters" >&2
+        exit 1
+    fi
 done
 for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
     [[ "${!key}" =~ ^([0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*)?$ ]] || {
@@ -288,6 +306,11 @@ PIP_LOCK="$SOURCE_ROOT/boat-chat/requirements.lock"
     echo "Missing $PIP_LOCK: the hash-pinned requirements lock must ship with the release (maintainers: scripts/update-requirements-lock.sh). Nothing was changed." >&2
     exit 1
 }
+if [ "$OFFLINE" = true ] && [ "$DISPLAYS_ENABLE" = true ] \
+    && [ ! -x "$VESSELSTACK_ROOT/displays/.venv/bin/python" ]; then
+    echo "Offline install: the displays bridge dependencies (displays/requirements.txt) are not part of the offline bundle yet. Install them once while online (run the installer without --offline), or set DISPLAYS_ENABLE=false. Nothing was changed." >&2
+    exit 1
+fi
 if [ "$OFFLINE" = true ]; then
     [ -n "$(find "$VESSELSTACK_WHEELHOUSE" -maxdepth 1 -name '*.whl' -print -quit 2>/dev/null)" ] || {
         echo "Offline install: no Python wheels found in VESSELSTACK_WHEELHOUSE=$VESSELSTACK_WHEELHOUSE" >&2
@@ -307,7 +330,7 @@ if [ "$OFFLINE" = true ]; then
         exit 1
     }
     mapfile -t required_images < <(
-        { compose_template config --images; echo "${MOSQUITTO_IMAGE:-eclipse-mosquitto:2.1.2-alpine}"; } | sort -u
+        compose_template config --images | sort -u
     )
     missing_images=()
     for image in "${required_images[@]}"; do
@@ -326,8 +349,25 @@ if [ "$OFFLINE" = true ]; then
         echo "WARNING: load the images before running with --start or starting services." >&2
     fi
 fi
+# Everything the MQTT access sync would reject is checked here, read-only and
+# before anything is changed, so a dry run (and "vesselstackctl update", which
+# runs one before taking a backup) fails early instead of partway through.
+# Secrets travel in the child environment only. The release's own tool and
+# compose template are used because the installed copies may be older.
+MOSQUITTO_COMPOSE="$SCRIPT_DIR/templates/compose.yml"
+displays_preflight() {
+    PYTHONDONTWRITEBYTECODE=1 \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="${MQTT_PASSWORD:-}" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
+        DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
+        python3 "$SCRIPT_DIR/displays/displayctl.py" preflight \
+        --root "$VESSELSTACK_ROOT" --compose "$MOSQUITTO_COMPOSE" "$@"
+}
+
 
 if [ "$DRY_RUN" -eq 1 ]; then
+    displays_preflight --check-image
     echo "Preflight passed"
     [ "$OFFLINE" = true ] && echo "Offline mode: Python packages from $VESSELSTACK_WHEELHOUSE, no image pulls"
     echo "Would install to $VESSELSTACK_ROOT with data in $VESSELSTACK_DATA"
@@ -336,6 +376,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+# Same checks as the dry run; a missing Mosquitto image is pulled now, before
+# any file is changed, so an offline boat fails here with nothing touched.
+displays_preflight --pull-image
 install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
 
 # Transactional ordering: the network/package-dependent step runs FIRST, into a
@@ -355,6 +398,16 @@ if ! python3 -m venv "$STAGING_VENV" \
     echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable, and is there a wheel in boat-chat/requirements.lock for this platform? use --offline with a prepared bundle)")." >&2
     echo "Nothing was changed on this system." >&2
     exit 1
+fi
+
+# Only boats that opt in need the extra network download. It runs before
+# anything is rendered, so an offline boat fails here with the installation
+# untouched. The environment is root-owned but readable by the service user
+# (see the helper for why this cannot rely on this script's umask 077).
+if [ "$DISPLAYS_ENABLE" = true ]; then
+    install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/displays"
+    "$SCRIPT_DIR/scripts/install-displays-venv.sh" \
+        "$VESSELSTACK_ROOT/displays/.venv" "$SCRIPT_DIR/displays/requirements.txt"
 fi
 
 generate_secret() {
@@ -457,7 +510,7 @@ safe_data_path() {
 }
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
-    "$VESSELSTACK_ROOT/installer"
+    "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 [ ! -L "$VESSELSTACK_DATA" ] || fail_data_path "$VESSELSTACK_DATA is a symlink"
@@ -630,11 +683,17 @@ chown -hR root:root "$VESSELSTACK_ROOT/boat-chat"
 chmod -R go-w,go+rX "$VESSELSTACK_ROOT/boat-chat"
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
+tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
+    | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
+# GNU tar run as root keeps the archive's modes, which are only as readable as the
+# source checkout (often 0600/0700 under umask 077). The bridge runs as the
+# service user and needs read access; the tree holds no secrets and stays root-owned.
+chmod -R u=rwX,go=rX "$VESSELSTACK_ROOT/displays"
 # Keep a bundled, reviewed installer so the control panel can run preflight and
 # apply operations without depending on a source checkout that may be removed.
 if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
-    tar -C "$SOURCE_ROOT" --exclude='__pycache__' --exclude='*.pyc' \
-        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel \
+    tar -C "$SOURCE_ROOT" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' \
+        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel displays \
         | tar --no-same-owner -C "$VESSELSTACK_ROOT/installer" -xf -
 fi
 # The source application keeps legacy defaults for compatibility. Installed
@@ -643,9 +702,76 @@ sed -i "s/VesselStack/$BOAT_NAME/g" \
     "$VESSELSTACK_ROOT/boat-chat/static/index.html" \
     "$VESSELSTACK_ROOT/boat-chat/BOAT_CHAT_AGENT.md" \
     "$VESSELSTACK_ROOT/boat-chat/telegram_bot.py"
+# Render the always-on Mosquitto ACL and hashed passwords. Secrets travel in the
+# child environment only, never on a command line. The release's compose template
+# names the image because the installed compose.yml is still the previous one.
+sync_mqtt_access() {
+    PYTHONDONTWRITEBYTECODE=1 \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
+        python3 "$VESSELSTACK_ROOT/displays/displayctl.py" sync-mqtt \
+        --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" \
+        --compose "$MOSQUITTO_COMPOSE"
+}
+# Displays are opt-in. Seed an instruments-only displays.json once (no display
+# entries, so no display account is created implicitly) and never overwrite an
+# existing one. It holds no secrets and must be readable by the service user.
+DISPLAYS_JSON="$VESSELSTACK_ROOT/config/displays.json"
+if [ "$DISPLAYS_ENABLE" = true ]; then
+    if [ ! -e "$DISPLAYS_JSON" ] && [ ! -L "$DISPLAYS_JSON" ]; then
+        displays_seed=$(mktemp)
+        jq '.displays = {}' "$VESSELSTACK_ROOT/displays/displays.example.json" > "$displays_seed"
+        install -m 0644 "$displays_seed" "$DISPLAYS_JSON"
+        rm -f -- "$displays_seed"
+        echo "Seeded $DISPLAYS_JSON with the example instruments and no displays"
+    elif [ -f "$DISPLAYS_JSON" ] && [ ! -L "$DISPLAYS_JSON" ]; then
+        chmod 0644 "$DISPLAYS_JSON"
+    fi
+fi
+# Mosquitto reads its configuration from the DIRECTORY config/mosquitto (mounted
+# as a directory, so a replaced file reaches the broker). Refuse a planted
+# symlink before anything is written.
+MOSQUITTO_CONF_DIR="$VESSELSTACK_ROOT/config/mosquitto"
+MOSQUITTO_CONF="$MOSQUITTO_CONF_DIR/mosquitto.conf"
+MOSQUITTO_CONF_STAMP="$VESSELSTACK_ROOT/config/.mosquitto-conf.sha256"
+if [ -L "$MOSQUITTO_CONF_DIR" ] || [ -L "$MOSQUITTO_CONF" ]; then
+    echo "Refusing to use $MOSQUITTO_CONF_DIR: it contains a symbolic link" >&2
+    exit 1
+fi
+if [ -e "$MOSQUITTO_CONF_DIR" ] && [ ! -d "$MOSQUITTO_CONF_DIR" ]; then
+    echo "Refusing to use $MOSQUITTO_CONF_DIR: it is not a directory" >&2
+    exit 1
+fi
+# The auth files live in the root-owned config/mosquitto-auth directory (mounted
+# read-only into the broker), so syncing is safe on every run, including
+# render-only runs such as Control Panel apply. It runs BEFORE the new compose
+# definition and Mosquitto configuration are installed, so a failed sync aborts
+# with the previous broker configuration still in place.
+sync_mqtt_access
 install -m 0644 "$SCRIPT_DIR/templates/compose.yml" "$VESSELSTACK_ROOT/compose.yml"
 install -m 0644 "$SCRIPT_DIR/templates/prometheus.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
-install -m 0644 "$SCRIPT_DIR/templates/mosquitto.conf" "$VESSELSTACK_ROOT/config/mosquitto.conf"
+# The legacy single-file config/mosquitto.conf is deliberately left alone: a
+# container created by an older release keeps bind-mounting it, also across
+# reboots, until it is recreated; a downgrade finds it unchanged.
+install -d -m 0755 -o 0 -g 0 "$MOSQUITTO_CONF_DIR"
+install -m 0644 -o 0 -g 0 "$SCRIPT_DIR/templates/mosquitto.conf" "$MOSQUITTO_CONF"
+MOSQUITTO_CONF_HASH=$(sha256sum "$MOSQUITTO_CONF" | cut -d' ' -f1)
+# The bridge environment file holds the bridge MQTT password generated by the
+# sync above, so it is written by displayctl (never via argv) after that sync.
+if [ "$DISPLAYS_ENABLE" = true ]; then
+    PYTHONDONTWRITEBYTECODE=1 \
+        SIGNALK_URL="$SIGNALK_URL" MQTT_PORT="$MQTT_PORT" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
+        DISPLAYS_SIGNALK_TOKEN="$DISPLAYS_SIGNALK_TOKEN" BOAT_TIMEZONE="$BOAT_TIMEZONE" \
+        DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
+        python3 "$VESSELSTACK_ROOT/displays/displayctl.py" bridge-env \
+        --root "$VESSELSTACK_ROOT" \
+        --output "$VESSELSTACK_ROOT/config/displays-bridge.env" \
+        >/dev/null
+else
+    rm -f -- "$VESSELSTACK_ROOT/config/displays-bridge.env"
+fi
 install -d -m 0755 "$VESSELSTACK_ROOT/config/grafana/provisioning/datasources" \
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards"
@@ -721,6 +847,10 @@ CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
 TELEMETRY_INDEXER_ENABLE
+DISPLAYS_ENABLE
+DISPLAYS_BRIDGE_MQTT_USERNAME
+DISPLAYS_SIGNALK_TOKEN
+DISPLAYS_HA_TOKEN
 HOME_ASSISTANT_URL
 HOME_ASSISTANT_TOKEN
 INFLUXDB_URL
@@ -827,7 +957,8 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
-for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service; do
+for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
+    vesselstack-displays-bridge.service; do
     sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
         -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
         -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
@@ -851,6 +982,15 @@ if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
     systemctl enable vesselstack-telemetry-indexer.timer
 else
     systemctl disable vesselstack-telemetry-indexer.timer 2>/dev/null || true
+fi
+if [ "$DISPLAYS_ENABLE" = true ]; then
+    systemctl enable vesselstack-displays-bridge.service
+    # The environment file was just rewritten; restart a running bridge so it
+    # takes the new settings (a stopped one is started with the stack). Harmless
+    # on a render-only run.
+    [ "$START" -eq 1 ] || systemctl try-restart vesselstack-displays-bridge.service
+else
+    systemctl disable --now vesselstack-displays-bridge.service 2>/dev/null || true
 fi
 
 compose config --quiet
@@ -888,12 +1028,18 @@ if [ "$START" -eq 1 ]; then
     else
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
-    "$SCRIPT_DIR/scripts/mosquitto-credentials.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
-    if [ "$OFFLINE" = true ]; then
-        compose up -d --pull never
-    else
-        compose up -d
+    install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
+    # Broker access files were already rendered by sync_mqtt_access above.
+    compose_up=(compose up -d)
+    [ "$OFFLINE" != true ] || compose_up=(compose up -d --pull never)
+    "${compose_up[@]}"
+    # A changed compose definition is recreated by "compose up -d" itself; a
+    # changed configuration file alone is not, and may have been rendered by an
+    # earlier render-only run, so compare with the stamp of the last applied one.
+    if [ -r "$MOSQUITTO_CONF_STAMP" ] && [ "$(<"$MOSQUITTO_CONF_STAMP")" != "$MOSQUITTO_CONF_HASH" ]; then
+        compose up -d --force-recreate mosquitto
     fi
+    printf '%s\n' "$MOSQUITTO_CONF_HASH" > "$MOSQUITTO_CONF_STAMP"
     "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then
@@ -906,11 +1052,37 @@ if [ "$START" -eq 1 ]; then
     else
         systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
     fi
+    if [ "$DISPLAYS_ENABLE" = true ]; then
+        systemctl restart vesselstack-displays-bridge.service
+    else
+        systemctl stop vesselstack-displays-bridge.service 2>/dev/null || true
+    fi
     if [ "${VESSELSTACK_SKIP_PANEL_RESTART:-false}" != true ]; then
         systemctl restart vesselstack-control-panel.service
     fi
     if [ "$SIGNALK_MODE" = native ]; then
         systemctl restart vesselstack-signalk.service
+    fi
+fi
+
+if [ "$START" -eq 0 ]; then
+    # A render-only run never recreates containers. A broker created by an older
+    # release (or before displays were enabled) keeps its old configuration and
+    # mounts, across reboots too, until the stack is started.
+    mosquitto_mounts=$(docker inspect -f \
+        '{{range .Mounts}}{{.Destination}}={{.Source}}{{"\n"}}{{end}}' vesselstack-mosquitto \
+        2>/dev/null) || mosquitto_mounts=
+    if [ -n "$mosquitto_mounts" ] && {
+        ! grep -qx "/mosquitto/config=$MOSQUITTO_CONF_DIR" <<<"$mosquitto_mounts" ||
+            ! grep -q '^/mosquitto/auth=' <<<"$mosquitto_mounts"
+    }; then
+        echo "NOTICE: the running Mosquitto container was created by an older configuration and"
+        echo "        keeps its old configuration and mounts, also after a reboot, until it is"
+        echo "        recreated. New MQTT accounts (displays bridge, displays) and the ACL take"
+        echo "        effect only after: sudo vesselstackctl start"
+    fi
+    if [ "$DISPLAYS_ENABLE" = true ] && ! systemctl is-active --quiet vesselstack-displays-bridge.service; then
+        echo "NOTICE: the displays bridge is enabled but not running; start it with: sudo vesselstackctl start"
     fi
 fi
 

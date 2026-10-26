@@ -7,14 +7,22 @@ import subprocess
 from pathlib import Path
 
 BLOCKED_PARTS = {'.git-local', '.local', '.venv', 'memory', 'data', 'backups',
-                 'pre-change-backups', 'reviews', '.claude', '.codex', '.agents', '.tools'}
-BLOCKED_NAMES = {'.mcp.json', 'boat_facts.json', 'boat-chat.env', 'boatstack.env', 'token.pass'}
+                 'pre-change-backups', 'reviews', '.claude', '.codex', '.agents', '.tools', '.esphome'}
+BLOCKED_NAMES = {'.mcp.json', 'boat_facts.json', 'boat-chat.env', 'boatstack.env', 'token.pass',
+                 'secrets.yaml', 'displays.json', 'displays.secrets.json'}
+BLOCKED_PREFIXES = (('displays', 'build'), ('build', 'displays'))
+BLOCKED_SUFFIXES = {'.sqlite', '.sqlite3', '.db', '.jsonl', '.log', '.secret', '.tar', '.gz', '.zip',
+                    '.bin', '.elf', '.uf2'}
 SECRET_PATTERNS = [
     re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
     re.compile(rb'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b'),
     re.compile(rb'\bAKIA[A-Z0-9]{16}\b'),
     re.compile(rb'\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{30,}\b'),
     re.compile(rb'https?://[^\s/:]+:[^\s/@]+@'),
+    re.compile(rb'(?m)^\s*key:\s*["\']?[A-Za-z0-9+/]{43}=["\']?\s*$'),  # ESPHome API encryption key
+]
+YAML_SECRET_PATTERNS = [
+    re.compile(rb'(?m)^\s*(?:password|ota_password|ap_password):\s*(?!!secret)\S'),
 ]
 
 
@@ -22,10 +30,11 @@ def findings(name, data):
     path = Path(name)
     if set(path.parts) & BLOCKED_PARTS or path.name in BLOCKED_NAMES:
         return ['runtime/private artifact']
-    if path.suffix in {'.sqlite', '.sqlite3', '.db', '.jsonl', '.log', '.secret', '.tar', '.gz', '.zip'} or (path.name.endswith('.env') and not path.name.endswith('example.env')):
+    if any(path.parts[i:i + len(p)] == p for p in BLOCKED_PREFIXES for i in range(len(path.parts))) or path.suffix in BLOCKED_SUFFIXES or (path.name.endswith('.env') and not path.name.endswith('example.env')):
         return ['runtime/private artifact']
     problems = []
-    if any(pattern.search(data) for pattern in SECRET_PATTERNS):problems.append('credential pattern')
+    patterns = SECRET_PATTERNS + (YAML_SECRET_PATTERNS if path.name.endswith(('.yaml', '.yml', '.yaml.in')) else [])
+    if any(pattern.search(data) for pattern in patterns):problems.append('credential pattern')
     for value in re.findall(rb'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])', data):
         try:
             ip = ipaddress.ip_address(value.decode())

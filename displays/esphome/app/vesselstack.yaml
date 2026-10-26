@@ -1,0 +1,39 @@
+# VesselStack application layer: Wi-Fi, OTA, MQTT. Requires the substitution
+# mqtt_username (set by the generated device file). All secrets come from the
+# secrets.yaml written next to the device file.
+#
+# There is deliberately NO fallback access point and NO captive portal: they add
+# an unauthenticated-looking configuration surface to a boat network device. If
+# the Wi-Fi credentials change, reflash the display over USB.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: INFO
+
+# The display ACL only allows reading vesselstack/v1/{bridge,instruments,notifications,alarms}/# and
+# writing its own .../displays/<user>/status topic, so everything else is off.
+mqtt:
+  broker: !secret mqtt_host
+  port: 1883
+  username: ${mqtt_username}
+  password: !secret mqtt_password
+  client_id: vesselstack-${mqtt_username}
+  discovery: false
+  discover_ip: false
+  topic_prefix: vesselstack/v1/displays/${mqtt_username}
+  log_topic: null
+  reboot_timeout: 0s
+  birth_message:
+    topic: vesselstack/v1/displays/${mqtt_username}/status
+    payload: online
+    retain: true
+  will_message:
+    topic: vesselstack/v1/displays/${mqtt_username}/status
+    payload: offline
+    retain: true

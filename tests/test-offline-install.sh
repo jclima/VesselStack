@@ -60,6 +60,20 @@ case "${1:-}" in
         [ "${2:-}" = inspect ] && grep -qxF "$3" "$IMAGES_PRESENT"
         exit ;;
     pull) exit 0 ;;
+    run)
+        # Emulate the Mosquitto hashing container used by displayctl sync-mqtt:
+        # promote passwords.new to passwords, as 1883:1883 0600 when root.
+        for argument in "$@"; do
+            case "$argument" in
+                *:/auth)
+                    host_path=${argument%:/auth}
+                    [ -f "$host_path/passwords.new" ] && mv -f "$host_path/passwords.new" "$host_path/passwords"
+                    chmod 0600 "$host_path/passwords"
+                    if [ "$(id -u)" -eq 0 ]; then chown 1883:1883 "$host_path/passwords"; fi
+                    ;;
+            esac
+        done
+        exit 0 ;;
     save)
         out=$3; image=$4
         printf '%s\n' "$image" > "$out"; exit 0 ;;

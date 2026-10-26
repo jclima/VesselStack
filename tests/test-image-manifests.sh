@@ -8,6 +8,14 @@ mapfile -t images < <(
         --env-file "$ROOT/vesselstack.example.env" \
         -f "$ROOT/templates/compose.yml" config --images | sort -u
 )
+# The optional on-host display firmware build runs the ESPHome image pinned (by
+# digest) in displays/esphome/IMAGE; it must also have a Linux ARM64 manifest.
+esphome_image=$(tr -d '[:space:]' < "$ROOT/displays/esphome/IMAGE")
+[[ "$esphome_image" =~ ^ghcr\.io/esphome/esphome:[0-9.]+@sha256:[0-9a-f]{64}$ ]] || {
+    echo "displays/esphome/IMAGE is malformed: $esphome_image" >&2
+    exit 1
+}
+images+=("$esphome_image")
 manifest=""
 trap 'rm -f -- "$manifest"' EXIT
 

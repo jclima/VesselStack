@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "mqtt_host": "vesselstack.local",
+  "heartbeat_s": 5,
+  "instruments": {
+    "sog": {"path": "navigation.speedOverGround", "label": "SOG", "convert": "m/s->kn", "unit": "kn", "precision": 1, "stale_after_s": 10, "min_interval_ms": 500},
+    "depth": {"path": "environment.depth.belowTransducer", "label": "Depth", "convert": "m->ft", "unit": "ft", "precision": 1, "stale_after_s": 10},
+    "awa": {"path": "environment.wind.angleApparent", "label": "AWA", "convert": "rad->deg_signed", "unit": "°", "precision": 0, "stale_after_s": 10},
+    "house_v": {"path": "electrical.batteries.house.voltage", "label": "House", "convert": "none", "unit": "V", "precision": 2, "stale_after_s": 30}
+  },
+  "displays": {
+    "helm": {
+      "name": "Helm",
+      "board": "waveshare-esp32-s3-touch-lcd-2.8c",
+      "home_assistant_api": false,
+      "pages": [
+        {"title": "Nav", "layout": "grid-2x2", "items": ["sog", "depth", "awa", "house_v"]}
+      ]
+    }
+  }
+}

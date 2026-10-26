@@ -8,7 +8,7 @@
 #
 # The bundle holds a wheelhouse built from the hash-pinned boat-chat/requirements.lock
 # (only wheels whose sha256 the lock lists), a `docker save` tarball for every image
-# the Compose template (all profiles) and the Mosquitto helper use, BUNDLE_INFO
+# the Compose template (all profiles, including Mosquitto) uses, BUNDLE_INFO
 # (which records the lock sha256) and MANIFEST.sha256 with a checksum for each file.
 # It contains no configuration, credentials or vessel data. --verify and --load
 # refuse a bundle whose files differ from the manifest, that holds unlisted files, or
@@ -58,15 +58,9 @@ check_manifest() {
 }
 
 image_list() {
-    local mosquitto
-    # shellcheck disable=SC2016  # literal pattern, not an expansion
-    mosquitto=$(sed -n 's/^MOSQUITTO_IMAGE=\${MOSQUITTO_IMAGE:-\(.*\)}$/\1/p' "$ROOT/scripts/mosquitto-credentials.sh")
-    [ -n "$mosquitto" ] || { echo "Cannot determine the Mosquitto helper image" >&2; return 1; }
-    {
-        docker compose --profile signalk --profile ais --env-file "$ROOT/vesselstack.example.env" \
-            -f "$ROOT/templates/compose.yml" config --images
-        echo "$mosquitto"
-    } | sort -u
+    # The Mosquitto image that hashes the broker passwords is the compose one.
+    docker compose --profile signalk --profile ais --env-file "$ROOT/vesselstack.example.env" \
+        -f "$ROOT/templates/compose.yml" config --images | sort -u
 }
 
 sha256_only() { sha256_of "$1" | cut -d' ' -f1; }

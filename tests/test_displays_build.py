@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""Tests for the optional on-Pi firmware build and flash (displays/firmware.py).
+
+Docker is never run: the capture runner and the streaming runner are fakes.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from collections import namedtuple
+from pathlib import Path
+from subprocess import CompletedProcess
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "displays"))
+sys.path.insert(0, str(ROOT / "tests"))
+
+import displayctl  # noqa: E402
+import firmware  # noqa: E402
+import lifecycle  # noqa: E402
+import render  # noqa: E402
+from test_displays_render import Base, MQTT_PW, multipage  # noqa: E402
+
+IMAGE = render.pinned_image()
+Vfs = namedtuple("Vfs", "f_bavail f_frsize")
+GIB = 1024 ** 3
+FACTORY_BYTES = b"FACTORY-IMAGE\x00" * 100
+OTA_BYTES = b"OTA-IMAGE\x01" * 100
+NOW = datetime.datetime(2026, 10, 24, 12, 30, 5, tzinfo=datetime.timezone.utc)
+
+
+def vfs_free(gib):
+    return lambda path: Vfs(int(gib * GIB) // 4096, 4096)
+
+
+class FakeDocker:
+    """Capture runner (inspect/info) plus streaming runner (run) in one object."""
+
+    def __init__(self, image_present=True, volume_present=True, root_dir="/var/lib/docker",
+                 compile_status=0, produce=True, factory=FACTORY_BYTES, ota=OTA_BYTES):
+        self.image_present = image_present
+        self.volume_present = volume_present
+        self.root_dir = root_dir
+        self.compile_status = compile_status
+        self.produce = produce
+        self.factory = factory
+        self.ota = ota
+        self.captured: list = []
+        self.streamed: list = []
+        self.upload_status = 0
+        self.uploaded: list = []  # bytes of the file mounted at /fw.bin, read during the call
+        self.staged_paths: list = []
+        self.config_dirs: list = []
+        self.config_snapshots: list = []  # files under the /config mount, read during the call
+
+    def capture(self, argv):
+        self.captured.append(argv)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return CompletedProcess(argv, 0 if self.image_present else 1, "", "")
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return CompletedProcess(argv, 0 if self.volume_present else 1, "", "")
+        if argv[:2] == ["docker", "info"]:
+            return CompletedProcess(argv, 0 if self.root_dir else 1, (self.root_dir or "") + "\n", "")
+        raise AssertionError(f"unexpected capture command {argv}")
+
+    def stream(self, argv):
+        self.streamed.append(argv)
+        if "compile" in argv:
+            if self.compile_status == 0 and self.produce:
+                mount = next(a for a in argv if a.endswith(":/config")).rsplit(":", 1)[0]
+                out = Path(mount) / ".esphome" / "build" / "vs-helm" / "build"
+                out.mkdir(parents=True)
+                (out / "firmware.factory.bin").write_bytes(self.factory)
+                (out / "firmware.ota.bin").write_bytes(self.ota)
+                (out / "vs-helm.bin").write_bytes(self.ota)
+            return self.compile_status
+        staged = next(a for a in argv if a.endswith(":/fw.bin:ro")).rsplit(":/fw.bin", 1)[0]
+        self.staged_paths.append(staged)
+        self.staged_modes = (stat.S_IMODE(os.stat(Path(staged).parent).st_mode),
+                             stat.S_IMODE(os.stat(staged).st_mode))
+        self.uploaded.append(Path(staged).read_bytes())
+        config = next(a for a in argv if a.endswith(":/config:ro")).rsplit(":/config", 1)[0]
+        self.config_dirs.append(config)
+        self.config_snapshots.append({str(p.relative_to(config)): p.read_bytes()
+                                      for p in Path(config).rglob("*") if p.is_file()})
+        self.config_modes = (stat.S_IMODE(os.stat(Path(config).parent).st_mode),
+                             stat.S_IMODE(os.stat(config).st_mode))
+        return self.upload_status
+
+
+class FirmwareBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.docker = FakeDocker()
+        self.clock = iter(range(1000, 100000, 7))
+
+    def ctx(self, **kw):
+        kw.setdefault("runner", self.docker.capture)
+        return super().ctx(**kw)
+
+    def build(self, display="helm", free=50, **kw):
+        return firmware.build(self.ctx(), display, stream=self.docker.stream,
+                              statvfs=vfs_free(free), monotonic=lambda: next(self.clock),
+                              now=lambda: NOW, warn=self.messages.append, **kw)
+
+    def flash(self, display="helm", **kw):
+        return firmware.flash(self.ctx(), display, stream=self.docker.stream, **kw)
+
+    def project(self, display="helm"):
+        return self.root / "build" / "displays" / display
+
+    def project_files(self, display="helm"):
+        """The ESPHome project directory (the only one mounted into a container)."""
+        return self.project(display) / "project"
+
+    def fake_serial(self, name="ttyACM0", by_id=None):
+        """Replace lstat/realpath with a tiny virtual /dev."""
+        nodes = {f"/dev/{name}": stat.S_IFCHR | 0o660}
+        links = {}
+        if by_id:
+            links[f"/dev/serial/by-id/{by_id}"] = f"/dev/{name}"
+        return nodes, links
+
+    def seam(self, nodes, links):
+        def lstat(path):
+            if path in links:
+                return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+            if path in nodes:
+                return os.stat_result((nodes[path],) + (0,) * 9)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        return {"lstat": lstat, "realpath": lambda p: links.get(p, p)}
+
+    def mode(self, path):
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+class BuildTests(FirmwareBase):
+    def test_build_runs_exactly_one_compile_container_without_secrets(self):
+        self.build()
+        self.assertEqual(len(self.docker.streamed), 1)
+        argv = self.docker.streamed[0]
+        project = str(self.project_files())
+        self.assertEqual(argv[:4], ["docker", "run", "--rm", "--pull"])
+        self.assertEqual(argv[4], "missing")
+        self.assertIn(f"{project}:/config", argv)
+        self.assertIn("vesselstack-esphome-cache:/cache", argv)
+        self.assertEqual(argv[-3:], [IMAGE, "compile", "/config/helm.yaml"][-3:])
+        self.assertEqual(argv[argv.index(IMAGE) + 1:], ["compile", "/config/helm.yaml"])
+        self.assertIn("--cap-drop", argv)
+        self.assertNotIn("--privileged", argv)
+        self.assertNotIn("--device", argv)
+        joined = " ".join(argv)
+        for secret in (MQTT_PW, "wifi-pass-123", "boat-wifi"):
+            self.assertNotIn(secret, joined)
+        secrets = json.loads(self.secrets_path.read_text())
+        self.assertNotIn(secrets["displays"]["helm"]["ota_password"], joined)
+
+    def test_build_renders_first_and_requires_wifi(self):
+        self.set_config(None, wifi=None)
+        with self.assertRaises(render.RenderError) as caught:
+            self.build()
+        self.assertIn("Wi-Fi", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+        self.assertFalse(self.project().exists())
+
+    def test_unknown_display_is_an_error(self):
+        with self.assertRaises((render.RenderError, lifecycle.LifecycleError)):
+            self.build("nope")
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_artifacts_copied_with_modes_and_manifest(self):
+        path = self.build()
+        self.assertEqual(path, self.project() / "firmware")
+        self.assertEqual(self.mode(path), 0o700)
+        self.assertEqual(sorted(p.name for p in path.iterdir()),
+                         ["firmware.factory.bin", "firmware.ota.bin", "manifest.json"])
+        for child in path.iterdir():
+            self.assertEqual(self.mode(child), 0o600, child.name)
+        self.assertEqual((path / "firmware.factory.bin").read_bytes(), FACTORY_BYTES)
+        manifest = json.loads((path / "manifest.json").read_text())
+        self.assertEqual(manifest["schema"], 1)
+        self.assertEqual(manifest["display"], "helm")
+        self.assertEqual(manifest["device_name"], "vs-helm")
+        self.assertEqual(manifest["image"], IMAGE)
+        self.assertEqual(manifest["image_digest"], IMAGE.split("@")[1])
+        self.assertEqual(manifest["esphome_version"], render.esphome_version())
+        self.assertEqual(manifest["built_at_utc"], "2026-10-24T12:30:05Z")
+        self.assertRegex(manifest["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(manifest["vesselstack_version"],
+                         (ROOT / "VERSION").read_text().strip())
+        import hashlib
+        self.assertEqual(manifest["files"]["firmware.factory.bin"],
+                         {"sha256": hashlib.sha256(FACTORY_BYTES).hexdigest(),
+                          "size": len(FACTORY_BYTES)})
+        self.assertEqual(manifest["files"]["firmware.ota.bin"]["sha256"],
+                         hashlib.sha256(OTA_BYTES).hexdigest())
+        # secrets never enter the manifest
+        self.assertNotIn(MQTT_PW, (path / "manifest.json").read_text())
+        # the scratch tree is gone
+        self.assertFalse((self.project() / ".esphome").exists())
+
+    def test_source_hash_ignores_secrets_but_follows_the_config(self):
+        first = firmware.source_hash(self.collect().files, "helm")
+        self.assertEqual(first, firmware.source_hash(self.collect().files, "helm"))
+        self.set_config(None, wifi={"ssid": "other", "password": "other-pass-1"})
+        self.assertEqual(first, firmware.source_hash(self.collect().files, "helm"))
+
+        def mutate(cfg):
+            cfg["instruments"]["sog"]["label"] = "Speed2"
+        self.set_config(mutate)
+        self.assertNotEqual(first, firmware.source_hash(self.collect().files, "helm"))
+
+    def test_previous_build_rotated_keeping_exactly_one(self):
+        self.build()
+        first = (self.project() / "firmware" / "manifest.json").read_bytes()
+        self.docker.factory = b"SECOND" * 50
+        self.build()
+        self.assertEqual((self.project() / "firmware.prev" / "manifest.json").read_bytes(), first)
+        self.assertEqual((self.project() / "firmware" / "firmware.factory.bin").read_bytes(),
+                         b"SECOND" * 50)
+        second = (self.project() / "firmware" / "manifest.json").read_bytes()
+        self.docker.factory = b"THIRD" * 50
+        self.build()
+        self.assertEqual((self.project() / "firmware.prev" / "manifest.json").read_bytes(), second)
+        self.assertFalse((self.project() / "firmware.new").exists())
+        self.assertEqual(self.mode(self.project() / "firmware.prev"), 0o700)
+
+    def test_render_keeps_finished_firmware(self):
+        self.build()
+        build_manifest = (self.project() / "firmware" / "manifest.json").read_bytes()
+        render.render(self.ctx(), "helm", warn=lambda text: None)
+        render.render(self.ctx(), "helm", warn=lambda text: None)
+        self.assertEqual((self.project() / "firmware" / "manifest.json").read_bytes(), build_manifest)
+        self.assertEqual((self.project() / "firmware" / "firmware.factory.bin").read_bytes(),
+                         FACTORY_BYTES)
+
+    def test_failed_compile_keeps_existing_firmware(self):
+        self.build()
+        before = (self.project() / "firmware" / "manifest.json").read_bytes()
+        self.docker.compile_status = 2
+        with self.assertRaises(render.RenderError) as caught:
+            self.build()
+        self.assertIn("exit status 2", str(caught.exception))
+        self.assertEqual((self.project() / "firmware" / "manifest.json").read_bytes(), before)
+        self.assertFalse((self.project() / "firmware.prev").exists())
+
+    def test_missing_artifact_is_an_error_and_stores_nothing(self):
+        self.docker.produce = False
+        with self.assertRaises(render.RenderError) as caught:
+            self.build()
+        self.assertIn("did not produce", str(caught.exception))
+        self.assertFalse((self.project() / "firmware").exists())
+
+    def test_symlinked_artifact_refused(self):
+        original = self.docker.stream
+
+        def stream(argv):
+            status = original(argv)
+            mount = next(a for a in argv if a.endswith(":/config")).rsplit(":", 1)[0]
+            target = Path(mount) / ".esphome" / "build" / "vs-helm" / "build" / "firmware.ota.bin"
+            target.unlink()
+            target.symlink_to("/etc/hostname")
+            return status
+        self.docker.stream = stream
+        with self.assertRaises(render.RenderError):
+            self.build()
+        self.assertFalse((self.project() / "firmware").exists())
+
+    def test_fifo_planted_at_an_artifact_path_is_refused_without_hanging(self):
+        import signal
+        original = self.docker.stream
+
+        def stream(argv):
+            status = original(argv)
+            mount = next(a for a in argv if a.endswith(":/config")).rsplit(":", 1)[0]
+            target = Path(mount) / ".esphome" / "build" / "vs-helm" / "build" / "firmware.ota.bin"
+            target.unlink()
+            os.mkfifo(target)
+            return status
+        self.docker.stream = stream
+
+        def timed_out(*_):
+            raise AssertionError("build hung on a FIFO")
+        previous = signal.signal(signal.SIGALRM, timed_out)
+        signal.alarm(20)
+        try:
+            with self.assertRaises(render.RenderError) as caught:
+                self.build()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertFalse((self.project() / "firmware").exists())
+
+    def test_pull_notice_only_when_image_missing(self):
+        self.build()
+        self.assertFalse(any("not present locally" in m for m in self.messages if isinstance(m, str)))
+        self.messages.clear()
+        self.docker.image_present = False
+        self.build()
+        self.assertTrue(any("not present locally" in m and "pulling" in m for m in self.messages))
+        self.assertEqual(self.docker.streamed[-1][:5], ["docker", "run", "--rm", "--pull", "missing"])
+
+    def test_disk_preflight_thresholds(self):
+        for volume_present, needed in ((False, 3), (True, 1)):
+            self.docker = FakeDocker(volume_present=volume_present)
+            with self.assertRaises(render.RenderError) as caught:
+                self.build(free=needed - 0.01)
+            self.assertIn("not enough free disk space", str(caught.exception))
+            self.assertIn(f"{needed} GB needed", str(caught.exception))
+            self.assertEqual(self.docker.streamed, [])
+            self.build(free=needed)  # exactly enough passes
+            self.assertEqual(len(self.docker.streamed), 1)
+
+    def test_disk_check_uses_docker_root_then_fallbacks(self):
+        seen = []
+
+        def statvfs(path):
+            seen.append(path)
+            if path == "/srv/docker":
+                raise OSError("unreadable")
+            if path == "/var/lib/docker":
+                raise OSError("unreadable")
+            return Vfs(10 ** 9, 4096)
+        self.docker.root_dir = "/srv/docker"
+        free, where = firmware.free_bytes(self.ctx(), statvfs)
+        self.assertEqual(seen, ["/srv/docker", "/var/lib/docker", str(self.root)])
+        self.assertEqual(where, str(self.root))
+        self.assertEqual(free, 10 ** 9 * 4096)
+        self.assertIn(["docker", "info", "--format", "{{.DockerRootDir}}"], self.docker.captured)
+
+    def test_elapsed_time_is_printed(self):
+        self.build()
+        self.assertTrue(any("built in 7 s" in m for m in self.messages))
+
+    def test_docker_missing_is_a_clear_error(self):
+        def runner(argv):
+            raise FileNotFoundError("docker")
+        with self.assertRaises(render.RenderError) as caught:
+            firmware.build(self.ctx(runner=runner), "helm", stream=self.docker.stream,
+                           statvfs=vfs_free(50), warn=lambda t: None)
+        self.assertIn("docker is not installed", str(caught.exception))
+
+    def test_build_requires_root(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root")
+        with self.assertRaises(lifecycle.LifecycleError):
+            firmware.build(self.ctx(require_root=True), "helm", stream=self.docker.stream)
+
+    def test_mount_path_with_colon_refused(self):
+        with self.assertRaises(render.RenderError):
+            firmware._check_mount_path(Path("/opt/a:b"))
+
+    def test_build_dir_symlink_refused(self):
+        self.build()
+        build = self.root / "build"
+        moved = self.root / "elsewhere"
+        build.rename(moved)
+        build.symlink_to(moved)
+        with self.assertRaises(render.RenderError):
+            self.build()
+
+
+class ServerFlashBase(FirmwareBase):
+    def setUp(self):
+        super().setUp()
+        self.build()
+        self.docker.streamed.clear()
+        self.docker.captured.clear()
+        self.messages.clear()
+
+
+class FlashSerialTests(ServerFlashBase):
+    def test_serial_passes_device_and_stored_factory_image(self):
+        nodes, links = self.fake_serial()
+        self.flash(serial="/dev/ttyACM0", **self.seam(nodes, links))
+        argv = self.docker.streamed[0]
+        self.assertEqual(argv[:5], ["docker", "run", "--rm", "--pull", "never"])
+        self.assertEqual(argv[argv.index("--device") + 1], "/dev/ttyACM0")
+        self.assertEqual(argv[argv.index("--network") + 1], "none")
+        self.assertEqual(argv[argv.index(IMAGE) + 1:],
+                         ["upload", "/config/helm.yaml", "--device", "/dev/ttyACM0",
+                          "--file", "/fw.bin"])
+        self.assertNotIn("compile", argv)
+        self.assertIn(f"{self.docker.config_dirs[0]}:/config:ro", argv)
+        self.assertNotEqual(self.docker.config_dirs[0], str(self.project_files()))
+        self.assertEqual(self.docker.uploaded, [FACTORY_BYTES])
+        self.assertEqual(len(self.docker.streamed), 1)
+
+    def test_by_id_symlink_resolved_to_the_real_device(self):
+        nodes, links = self.fake_serial("ttyUSB0", "usb-Espressif_USB_JTAG-if00")
+        self.flash(serial="/dev/serial/by-id/usb-Espressif_USB_JTAG-if00", **self.seam(nodes, links))
+        argv = self.docker.streamed[0]
+        self.assertEqual(argv[argv.index("--device") + 1], "/dev/ttyUSB0")
+        self.assertEqual(argv[argv.index("--device", argv.index(IMAGE)) + 1], "/dev/ttyUSB0")
+
+    def test_serial_validation_refusals(self):
+        nodes = {"/dev/ttyACM0": stat.S_IFCHR | 0o660, "/dev/sda": stat.S_IFBLK | 0o660,
+                 "/dev/null": stat.S_IFCHR | 0o666, "/dev/ttyfile": stat.S_IFREG | 0o644}
+        links = {"/dev/ttylink": "/dev/ttyACM0",                    # symlink outside by-id
+                 "/dev/serial/by-id/evil": "/dev/sda",              # by-id to a non-tty
+                 "/dev/serial/by-id/up": "/dev/../etc/passwd"}      # escapes /dev
+        nodes["/dev/serial/by-id/up"] = 0
+        seam = self.seam(nodes, links)
+        cases = ["ttyACM0", "/tmp/ttyACM0", "relative/dev/ttyACM0", "/dev/../tmp/x",
+                 "/dev/ttylink", "/dev/sda", "/dev/null", "/dev/ttyfile", "/dev/ttyMISSING",
+                 "/dev/serial/by-id/evil", "/dev/serial/by-id/up", "/dev/serial/by-id/none",
+                 "/dev/ttyACM0\n", "/dev//ttyACM0", "/dev/"]
+        for case in cases:
+            with self.assertRaises(render.RenderError, msg=case) as caught:
+                self.flash(serial=case, **seam)
+            self.assertEqual(caught.exception.code, 2, case)
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_real_dev_null_and_a_symlink_to_tty_are_refused_with_the_real_lstat(self):
+        link = Path(self._tmp.name) / "tty-link"
+        link.symlink_to("/dev/null")
+        for case in ("/dev/null", str(link)):
+            with self.assertRaises(render.RenderError):
+                self.flash(serial=case)
+
+    def test_serial_refuses_a_modified_firmware(self):
+        nodes, links = self.fake_serial()
+        target = self.project() / "firmware" / "firmware.factory.bin"
+        target.write_bytes(b"tampered" + FACTORY_BYTES[8:])
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(serial="/dev/ttyACM0", **self.seam(nodes, links))
+        self.assertIn("does not match", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+        target.write_bytes(FACTORY_BYTES + b"x")  # size differs
+        with self.assertRaises(render.RenderError):
+            self.flash(serial="/dev/ttyACM0", **self.seam(nodes, links))
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_serial_refuses_a_symlinked_image_file(self):
+        nodes, links = self.fake_serial()
+        target = self.project() / "firmware" / "firmware.factory.bin"
+        target.unlink()
+        target.symlink_to("/etc/hostname")
+        with self.assertRaises(render.RenderError):
+            self.flash(serial="/dev/ttyACM0", **self.seam(nodes, links))
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_upload_failure_is_reported(self):
+        nodes, links = self.fake_serial()
+        self.docker.upload_status = 2
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(serial="/dev/ttyACM0", **self.seam(nodes, links))
+        self.assertIn("exit status 2", str(caught.exception))
+
+
+class FlashStagingTests(ServerFlashBase):
+    def test_upload_reads_a_private_copy_that_is_removed_afterwards(self):
+        self.flash(ota="192.0.2.50")
+        staged = Path(self.docker.staged_paths[0])
+        self.assertEqual(staged.parent.parent, self.root / "build")  # not a shared /tmp
+        self.assertEqual(self.docker.staged_modes, (0o700, 0o600))
+        self.assertFalse(staged.parent.exists())
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+    def test_temp_dir_removed_when_the_upload_fails(self):
+        self.docker.upload_status = 1
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50")
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+    def test_stored_bytes_that_change_after_verification_are_not_what_is_mounted(self):
+        # flash() reads and verifies the stored file once and mounts a copy of THOSE bytes.
+        original = firmware.load_firmware
+
+        def load_then_tamper(dd, directory, name):
+            result = original(dd, directory, name)
+            (self.project() / "firmware" / name).write_bytes(b"TAMPERED")
+            return result
+
+        firmware.load_firmware = load_then_tamper
+        self.addCleanup(setattr, firmware, "load_firmware", original)
+        self.flash(ota="192.0.2.50")
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+
+    def test_staged_copy_with_wrong_digest_is_refused(self):
+        with self.assertRaises(render.RenderError):
+            with firmware.staged_firmware(self.ctx(), b"abc", "0" * 64):
+                self.fail("must not be reached")
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+    def test_old_layout_asks_for_a_render_first(self):
+        (self.project() / "helm.yaml").write_text("legacy")
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50")
+        self.assertIn("display render helm", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+
+
+class BuildLockTests(ServerFlashBase):
+    def lock(self, display="helm", **kw):
+        return render.build_lock(self.ctx(), display, notify=self.notices.append, **kw)
+
+    def setUp(self):
+        super().setUp()
+        self.notices: list = []
+
+    def test_lock_file_is_private_and_named_after_the_display(self):
+        with self.lock() as held:
+            self.assertTrue(held)
+        path = self.root / "build" / "displays" / ".helm.lock"
+        self.assertTrue(path.is_file())
+        self.assertEqual(self.mode(path), 0o600)
+
+    def test_build_flash_render_and_export_wait_then_fail_clearly(self):
+        calls = {
+            "build": lambda: firmware.build(self.ctx(), "helm", stream=self.docker.stream,
+                                            statvfs=vfs_free(50), warn=self.notices.append),
+            "flash": lambda: firmware.flash(self.ctx(), "helm", ota="192.0.2.50",
+                                            stream=self.docker.stream, notify=self.notices.append),
+            "render": lambda: render.render(self.ctx(), "helm", warn=lambda t: None),
+            "export": lambda: render.export(self.ctx(), "helm", None, True, warn=lambda t: None,
+                                            stdout=self._stream()),
+        }
+        self.docker.streamed.clear()
+        before = (self.project() / "firmware" / "manifest.json").read_bytes()
+        with self.lock():
+            for name, call in calls.items():
+                with self.assertRaises(render.RenderError, msg=name) as caught:
+                    call()
+                self.assertIn("another build/flash for helm is running", str(caught.exception), name)
+        self.assertEqual(self.docker.streamed, [])  # nothing ran while the lock was held
+        self.assertEqual((self.project() / "firmware" / "manifest.json").read_bytes(), before)
+        # the waiter said so once, up front, rather than blocking silently
+        self.assertEqual(sum("waiting up to" in n for n in self.notices if "waiting" in n), 2)
+        # and everything works again once the lock is free
+        render.render(self.ctx(), "helm", warn=lambda t: None)
+        self.flash(ota="192.0.2.50")
+
+    def _stream(self):
+        import io
+        stream = io.BytesIO()
+        stream.isatty = lambda: False
+        return stream
+
+    def test_lock_is_per_display_and_released_on_error(self):
+        with self.lock("helm"):
+            with self.lock("aux") as other:  # a different id does not block
+                self.assertTrue(other)
+        with self.assertRaises(RuntimeError):
+            with self.lock():
+                raise RuntimeError("boom")
+        with self.lock() as again:
+            self.assertTrue(again)
+
+    def test_build_releases_the_lock_after_a_failed_compile(self):
+        self.docker.compile_status = 1
+        with self.assertRaises(render.RenderError):
+            self.build()
+        with self.lock() as held:
+            self.assertTrue(held)
+
+    def test_config_lock_is_taken_inside_the_build_lock_and_released(self):
+        # A held configuration lock makes render fail on the (separate) 10 s lock, and the
+        # build lock is not left behind.
+        with lifecycle.ConfigDir(self.ctx()) as cfg_dir:
+            cfg_dir.lock()
+            with self.assertRaises(lifecycle.LifecycleError) as caught:
+                render.render(self.ctx(), "helm", warn=lambda t: None)
+            self.assertIn("another displayctl command", str(caught.exception))
+        with self.lock() as held:
+            self.assertTrue(held)
+
+    def test_a_waiter_proceeds_when_another_process_releases_the_lock(self):
+        import subprocess
+        code = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(ROOT / 'displays')!r})\n"
+            "import lifecycle, render\n"
+            f"ctx = lifecycle.Context(root=__import__('pathlib').Path({str(self.root)!r}), "
+            "require_root=False)\n"
+            "with render.build_lock(ctx, 'helm'):\n"
+            "    print('held', flush=True)\n"
+            "    time.sleep(1.0)\n")
+        holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        started = __import__("time").monotonic()
+        render.render(self.ctx(build_lock_timeout=10), "helm", warn=lambda t: None)
+        self.assertGreater(__import__("time").monotonic() - started, 0.3)  # it really waited
+
+    def test_symlinked_lock_file_is_refused(self):
+        displays = self.root / "build" / "displays"
+        (displays / ".helm.lock").unlink(missing_ok=True)
+        target = Path(self._tmp.name) / "victim"
+        target.write_text("keep")
+        os.symlink(target, displays / ".helm.lock")
+        with self.assertRaises(render.RenderError):
+            with self.lock():
+                pass
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_display_id_is_validated_before_it_becomes_a_file_name(self):
+        for bad in ("../x", "a/b", "Helm", ""):
+            with self.assertRaises(render.RenderError):
+                with self.lock(bad):
+                    pass
+
+    def test_no_lock_without_create_when_nothing_was_ever_built(self):
+        import shutil
+        shutil.rmtree(self.root / "build")
+        with self.lock(create=False) as held:
+            self.assertFalse(held)
+        self.assertFalse((self.root / "build").exists())
+
+
+class CredentialCheckTests(ServerFlashBase):
+    def refused(self, **kw):
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50", **kw)
+        self.assertEqual(self.docker.streamed, [])
+        return str(caught.exception)
+
+    def test_manifest_records_a_fingerprint_of_the_compiled_in_secrets(self):
+        manifest = json.loads((self.project() / "firmware" / "manifest.json").read_text())
+        secrets = (self.project_files() / "secrets.yaml").read_bytes()
+        self.assertEqual(manifest["secrets_sha256"], firmware.sha256_hex(secrets))
+        self.assertNotIn(MQTT_PW, json.dumps(manifest))
+
+    def test_unchanged_credentials_flash_without_force(self):
+        self.flash(ota="192.0.2.50")
+        self.assertEqual(len(self.docker.streamed), 1)
+
+    def test_rotate_then_flash_is_refused_until_rebuilt_or_forced(self):
+        entry = self.stored()["displays"]["helm"]
+        entry["ota_password"] = "rotated-ota-password"
+        data = self.stored()
+        data["displays"]["helm"] = entry
+        self.secrets_path.write_text(json.dumps(data))
+        text = self.refused()
+        self.assertIn("credentials changed since it was built", text)
+        self.assertIn("display build helm", text)
+        self.assertIn("--force", text)
+        self.flash(ota="192.0.2.50", force=True)
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+        self.docker.streamed.clear()
+        self.build()  # rebuilding makes the new firmware flashable without --force
+        self.flash(ota="192.0.2.50")
+
+    def test_changed_wifi_is_refused(self):
+        self.set_config(None, wifi={"ssid": "other-boat", "password": "another-pass-1"},
+                        display_secrets=self.stored()["displays"])
+        self.assertIn("credentials changed", self.refused())
+
+    def test_remove_then_add_with_new_credentials_is_refused(self):
+        data = self.stored()
+        data["displays"]["helm"] = {"mqtt_password": "brand-new-password"}
+        self.secrets_path.write_text(json.dumps(data))
+        self.assertIn("credentials changed", self.refused())
+
+    def test_previous_is_checked_too_and_explains_the_rollback_risk(self):
+        self.docker.ota = b"NEWER-OTA" * 20
+        self.build()
+        self.docker.streamed.clear()
+        data = self.stored()
+        data["displays"]["helm"]["mqtt_password"] = "rotated-mqtt-password"
+        self.secrets_path.write_text(json.dumps(data))
+        text = self.refused(previous=True)
+        self.assertIn("rollback firmware", text)
+        self.assertIn("revoked or outdated", text)
+        self.flash(ota="192.0.2.50", previous=True, force=True)
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+
+    def test_firmware_without_a_fingerprint_is_refused_unless_forced(self):
+        manifest_path = self.project() / "firmware" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["secrets_sha256"]
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertIn("before credentials were tracked", self.refused())
+        self.flash(ota="192.0.2.50", force=True)
+
+    def test_credentials_that_cannot_be_rendered_are_refused_with_the_reason(self):
+        self.set_config(None, wifi=None, display_secrets=self.stored()["displays"])
+        text = self.refused()
+        self.assertIn("cannot be rendered", text)
+        self.assertIn("Wi-Fi", text)
+        self.assertNotIn("Traceback", text)
+
+    def test_missing_project_secrets_do_not_matter_the_project_is_not_used(self):
+        (self.project_files() / "secrets.yaml").unlink()  # e.g. after wifi --clear then wifi
+        self.flash(ota="192.0.2.50")
+        self.assertIn("secrets.yaml", self.docker.config_snapshots[0])
+
+    def test_force_without_renderable_credentials_still_fails_before_the_container(self):
+        self.set_config(None, wifi=None, display_secrets=self.stored()["displays"])
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50", force=True)
+        self.assertIn("Wi-Fi", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_parser_accepts_force(self):
+        args = displayctl.build_parser().parse_args(["flash", "helm", "--ota", "192.0.2.2", "--force"])
+        self.assertTrue(args.force)
+
+
+class FlashStagedProjectTests(ServerFlashBase):
+    """project/ is writable by the compile container, so flash never mounts it."""
+
+    def rename_display(self):
+        def mutate(cfg):
+            multipage(cfg)
+        self.set_config(mutate, display_secrets=self.stored()["displays"])
+
+    def test_mounted_config_is_a_fresh_private_staging_dir_removed_afterwards(self):
+        self.flash(ota="192.0.2.50")
+        config = Path(self.docker.config_dirs[0])
+        self.assertEqual(config.parent.parent, self.root / "build")
+        self.assertTrue(config.parent.name.startswith(".flash-"))
+        self.assertEqual(self.docker.config_modes, (0o700, 0o700))
+        self.assertFalse(config.parent.exists())
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+        self.assertNotIn(str(self.project_files()), " ".join(self.docker.streamed[0]))
+
+    def test_staged_project_is_the_rerendered_one_with_current_secrets(self):
+        self.flash(ota="192.0.2.50")
+        snapshot = self.docker.config_snapshots[0]
+        for relative in snapshot:
+            self.assertEqual(snapshot[relative], (self.project_files() / relative).read_bytes(), relative)
+        self.assertEqual(set(snapshot), {str(p.relative_to(self.project_files()))
+                                         for p in self.project_files().rglob("*") if p.is_file()})
+
+    def test_tampering_with_project_does_not_reach_the_mount(self):
+        evil = (self.project_files() / "helm.yaml")
+        good = evil.read_bytes()
+        evil.write_text(good.decode() + "\nexternal_components:\n  - source: github://evil/x\n")
+        (self.project_files() / "extra.yaml").write_text("packages: evil")
+        self.flash(ota="192.0.2.50")
+        snapshot = self.docker.config_snapshots[0]
+        self.assertEqual(snapshot["helm.yaml"], good)
+        self.assertNotIn("extra.yaml", snapshot)
+        self.assertNotIn(b"evil", b"".join(snapshot.values()))
+        self.flash(serial="/dev/ttyACM0", **self.seam(*self.fake_serial()))
+        self.assertEqual(self.docker.config_snapshots[1]["helm.yaml"], good)
+
+    def test_missing_project_dir_is_irrelevant(self):
+        import shutil
+        shutil.rmtree(self.project_files())
+        self.flash(ota="192.0.2.50")
+        self.assertEqual(len(self.docker.streamed), 1)
+
+    def test_configuration_change_since_the_build_is_refused_unless_forced(self):
+        self.rename_display()
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50")
+        self.assertIn("configuration changed since this firmware was built; run", str(caught.exception))
+        self.assertIn("display build helm", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+        self.flash(ota="192.0.2.50", force=True)
+        self.assertEqual(len(self.docker.streamed), 1)
+        # the staged project is the re-rendered, current one
+        self.assertIn(b"p2_content", self.docker.config_snapshots[0]["helm.yaml"])
+
+    def test_previous_with_a_different_configuration_is_refused_unless_forced(self):
+        self.docker.ota = b"NEWER-OTA" * 20
+        self.rename_display()
+        self.build()
+        self.docker.streamed.clear()
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50", previous=True)
+        self.assertIn("configuration changed", str(caught.exception))
+        self.flash(ota="192.0.2.50", previous=True, force=True)
+
+    def test_manifest_without_a_source_hash_is_refused(self):
+        manifest_path = self.project() / "firmware" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["source_sha256"]
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50")
+
+    def test_staging_dir_is_removed_when_the_upload_fails(self):
+        self.docker.upload_status = 1
+        with self.assertRaises(render.RenderError):
+            self.flash(serial="/dev/ttyACM0", **self.seam(*self.fake_serial()))
+        self.assertEqual([p.name for p in (self.root / "build").iterdir()], ["displays"])
+
+
+class FlashOtaTests(ServerFlashBase):
+    def test_ota_uses_host_network_and_the_stored_ota_image(self):
+        self.flash(ota="192.0.2.50")
+        argv = self.docker.streamed[0]
+        self.assertEqual(argv[argv.index("--network") + 1], "host")
+        self.assertNotIn("--device", argv[:argv.index(IMAGE)])
+        self.assertEqual(argv[argv.index(IMAGE) + 1:],
+                         ["upload", "/config/helm.yaml", "--device", "192.0.2.50",
+                          "--file", "/fw.bin"])
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])
+        # a freshly staged project is mounted read-only; ESPHome's scratch space is tmpfs
+        self.assertIn(f"{self.docker.config_dirs[0]}:/config:ro", argv)
+        self.assertNotIn(str(self.project_files()), " ".join(argv))
+        self.assertIn("--tmpfs", argv)
+        self.assertNotIn("firmware", " ".join(a for a in argv if a.startswith("/config")))
+        joined = " ".join(argv)
+        secrets = json.loads(self.secrets_path.read_text())
+        for secret in (secrets["displays"]["helm"]["ota_password"], MQTT_PW, "wifi-pass-123"):
+            self.assertNotIn(secret, joined)
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-e"],
+                         ["ESPHOME_DATA_DIR=/tmp/esphome-data"])
+
+    def test_host_validation(self):
+        for good in ("192.0.2.50", "helm", "vs-helm.local", "display-1.example.com",
+                     "fe80::1", "192.0.2.1", "a" * 63 + ".example"):
+            self.assertEqual(firmware.validate_host(good), good)
+        for bad in ("", "http://192.0.2.50", "192.0.2.50:6053", "host/path", "-oops",
+                    "--file=x", "a b", "host\n", "bad_name", "1.2.3", "300.1.1.1.1", "a." + "b" * 64,
+                    "/dev/ttyACM0", "COM3", "MQTT", "mqttip", "BOOTSEL", "x" * 254, "ex ample.com",
+                    "host;rm", "$(id)", "über.example"):
+            with self.assertRaises(render.RenderError, msg=bad) as caught:
+                firmware.validate_host(bad)
+            self.assertEqual(caught.exception.code, 2)
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="http://192.0.2.50")
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_ota_refuses_a_modified_image(self):
+        (self.project() / "firmware" / "firmware.ota.bin").write_bytes(b"tampered")
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50")
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_exactly_one_target_required(self):
+        with self.assertRaises(render.RenderError):
+            self.flash()
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50", serial="/dev/ttyACM0")
+
+
+class FlashCommonTests(ServerFlashBase):
+    def test_previous_flashes_firmware_prev(self):
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50", previous=True)
+        self.assertIn("no previous firmware", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+        self.docker.ota = b"NEWER-OTA" * 20
+        self.build()
+        self.docker.streamed.clear()
+        self.flash(ota="192.0.2.50", previous=True)
+        self.assertEqual(self.docker.uploaded, [OTA_BYTES])  # the OLD build, not NEWER-OTA
+        nodes, links = self.fake_serial()
+        self.flash(serial="/dev/ttyACM0", previous=True, **self.seam(nodes, links))
+        self.assertEqual(self.docker.uploaded[1], FACTORY_BYTES)
+
+    def test_previous_is_verified_against_its_own_manifest(self):
+        self.build()
+        (self.project() / "firmware.prev" / "firmware.ota.bin").write_bytes(b"bad")
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50", previous=True)
+
+    def test_missing_firmware_says_run_build_first(self):
+        import shutil
+        shutil.rmtree(self.project() / "firmware")
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50")
+        self.assertIn("display build helm", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_never_built_display_says_run_build_first(self):
+        shutil_root = self.root / "build"
+        import shutil
+        shutil.rmtree(shutil_root)
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50")
+        self.assertIn("display build helm", str(caught.exception))
+
+    def test_flash_never_pulls_and_needs_the_image_locally(self):
+        self.docker.image_present = False
+        with self.assertRaises(render.RenderError) as caught:
+            self.flash(ota="192.0.2.50")
+        self.assertIn("never pulls", str(caught.exception))
+        self.assertEqual(self.docker.streamed, [])
+        self.docker.image_present = True
+        self.flash(ota="192.0.2.50")
+        argv = self.docker.streamed[0]
+        self.assertEqual(argv[argv.index("--pull") + 1], "never")
+        self.assertFalse([a for a in self.docker.captured if a[:2] == ["docker", "pull"]])
+
+    def test_corrupt_manifest_is_an_error(self):
+        (self.project() / "firmware" / "manifest.json").write_text("{not json")
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50")
+        (self.project() / "firmware" / "manifest.json").write_text('{"files": {}}')
+        with self.assertRaises(render.RenderError):
+            self.flash(ota="192.0.2.50")
+
+
+class CommandLineTests(FirmwareBase):
+    def test_parser_requires_one_flash_target(self):
+        parser = displayctl.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["flash", "helm"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["flash", "helm", "--serial", "/dev/ttyACM0", "--ota", "h"])
+        args = parser.parse_args(["flash", "helm", "--ota", "192.0.2.2", "--previous"])
+        self.assertEqual((args.ota, args.serial, args.previous), ("192.0.2.2", None, True))
+        self.assertEqual(parser.parse_args(["build", "helm"]).id, "helm")
+
+    def test_exit_codes_for_usage_errors(self):
+        import io
+        from contextlib import redirect_stderr
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = displayctl.main(["flash", "helm", "--ota", "http://x", "--root", str(self.root),
+                                    "--allow-non-root"])
+        self.assertEqual(code, 2)
+        self.assertIn("error:", err.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

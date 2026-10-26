@@ -119,6 +119,10 @@ FIELDS = [
     field("MQTT_USERNAME", "MQTT username", "MQTT"),
     field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret", description="Applied to the Mosquitto password file on the next apply/start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "Published port", "MQTT", kind="port"),
+    field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
+    field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
+    field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
+    field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", "Displays", kind="secret", description="Optional, only for Home Assistant items (ha) in displays.json; leave blank otherwise. A leaked token can operate every device in your Home Assistant; a non-admin user only prevents configuration changes. Keep it on the Pi (root-only), never reuse it, and revoke it in Home Assistant (Profile -> Security) if it leaks."),
     field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
     field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
     field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),
@@ -164,6 +168,7 @@ SYSTEMD_COMPONENTS = {
     "boat-chat": "vesselstack-chat.service",
     "telegram": "vesselstack-chat-telegram.service",
     "telemetry-indexer": "vesselstack-telemetry-indexer.timer",
+    "displays-bridge": "vesselstack-displays-bridge.service",
     "signalk-native": "vesselstack-signalk.service",
     "socketcan": "vesselstack-socketcan.service",
     "firewall": "vesselstack-firewall.service",
@@ -218,6 +223,10 @@ def write_env(path: Path, values: dict[str, str], preferred_order: list[str]) ->
             pass
 
 
+MQTT_ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+DEFAULT_BRIDGE_MQTT_USERNAME = "vesselstack-bridge"
+
+
 def validate_value(spec: dict[str, Any], value: Any) -> str:
     text = str(value).strip()
     kind = spec["kind"]
@@ -244,6 +253,13 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
             raise ValueError(f"{spec['label']} must be an IPv4 address") from exc
         if address.version != 4:
             raise ValueError(f"{spec['label']} must be an IPv4 address")
+    # Mirrors the installer: account names go into the Mosquitto password and ACL
+    # files, and the SignalK and Home Assistant tokens into a systemd EnvironmentFile line.
+    if spec["key"] in {"MQTT_USERNAME", "DISPLAYS_BRIDGE_MQTT_USERNAME"} and text:
+        if not MQTT_ACCOUNT_NAME.fullmatch(text):
+            raise ValueError(f"{spec['label']} may contain 1-64 letters, numbers, dot, underscore, and hyphen")
+    if spec["key"] in {"DISPLAYS_SIGNALK_TOKEN", "DISPLAYS_HA_TOKEN"} and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        raise ValueError(f"{spec['label']} must not contain control characters")
     if spec["key"] in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
         if not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*", text):
             raise ValueError(f"{spec['label']} must be comma-separated ports or LOW:HIGH ranges")
@@ -410,6 +426,10 @@ def update_configuration(updates: dict[str, Any]) -> str:
             saved_chat_keys.add(key)
         if key in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             panel[key] = value
+    if vessel.get("DISPLAYS_ENABLE", "false") == "true":
+        bridge_user = vessel.get("DISPLAYS_BRIDGE_MQTT_USERNAME") or DEFAULT_BRIDGE_MQTT_USERNAME
+        if bridge_user == vessel.get("MQTT_USERNAME", ""):
+            raise ValueError("Displays bridge MQTT username must differ from the MQTT username")
     paths = [VESSEL_ENV, CHAT_ENV, PANEL_ENV]
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
     backup = CONFIG_BACKUP_ROOT / stamp
@@ -473,6 +493,7 @@ def component_command(component: str, verb: str) -> list[str]:
             "signalk-native": settings.get("SIGNALK_MODE") == "native",
             "socketcan": settings.get("SOCKETCAN_ENABLE", "false") == "true",
             "firewall": settings.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true",
+            "displays-bridge": settings.get("DISPLAYS_ENABLE", "false") == "true",
         }
         if component in enabled and not enabled[component]:
             raise ValueError(f"{component} is disabled by configuration")
@@ -580,6 +601,8 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("SOCKETCAN_ENABLE", "false") == "true"
         elif name == "firewall":
             enabled = vessel.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true"
+        elif name == "displays-bridge":
+            enabled = vessel.get("DISPLAYS_ENABLE", "false") == "true"
         components.append({"id": name, "label": name.replace("-", " ").title(), "kind": "systemd", "enabled": enabled, "state": output or ("active" if code == 0 else "inactive")})
     return components
 

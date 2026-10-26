@@ -28,8 +28,14 @@ Commands:
                                (HOMEASSISTANT_BIND_ADDRESS); used by the installer and lan
   reindex                      Rebuild Boat Chat's memory index as the service user
                                (fixes "memory ... not ready" and a failing doctor check)
-  logs [chat|telegram|indexer|control|containers|all]
+  logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
+  display list|add|remove|rotate|wifi|status|render|export|build|flash|validate|sync-mqtt [ARGUMENTS]
+                               Manage instrument displays, generate their ESPHome
+                               projects and optionally build/flash firmware on this
+                               host (display build ID; display flash ID --serial
+                               DEVICE | --ota HOST [--previous]); see
+                               "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
@@ -66,6 +72,36 @@ load_config() {
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
 }
 
+# Render the Mosquitto ACL and hashed passwords (admin, plus the displays bridge
+# and per-display accounts when enabled). Secrets pass through the environment.
+sync_mqtt_access() {
+    : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
+    : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
+    local displayctl="$VESSELSTACK_ROOT/displays/displayctl.py"
+    [ -r "$displayctl" ] || { echo "Missing displays tool: $displayctl" >&2; return 1; }
+    PYTHONDONTWRITEBYTECODE=1 \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
+        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
+        python3 "$displayctl" sync-mqtt --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA"
+}
+
+# Pass-through to the displays tool with the installed configuration. Broker
+# credentials travel in the environment only (never on a command line); wifi
+# reads its SSID and password from the terminal or standard input.
+display_command() {
+    : "${MQTT_USERNAME:?Missing MQTT_USERNAME}"
+    : "${MQTT_PASSWORD:?Missing MQTT_PASSWORD}"
+    local displayctl="$VESSELSTACK_ROOT/displays/displayctl.py"
+    [ -r "$displayctl" ] || { echo "Missing displays tool: $displayctl" >&2; return 1; }
+    PYTHONDONTWRITEBYTECODE=1 \
+        VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
+        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
+        python3 "$displayctl" "$@"
+}
+
 # Run the bundled memory-index helper (as the service user). Returns non-zero when it
 # is missing or fails; callers decide how loud to be.
 memory_index_helper() {
@@ -93,12 +129,22 @@ start_stack() {
     if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
         systemctl enable --now vesselstack-firewall.service
     fi
-    [ -x "$installer_scripts/mosquitto-credentials.sh" ] || {
-        echo "Missing bundled Mosquitto helper: $installer_scripts/mosquitto-credentials.sh" >&2
-        return 1
-    }
-    "$installer_scripts/mosquitto-credentials.sh" "$ENV_FILE"
+    if [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/passwords" ] || \
+        [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/acl" ]; then
+        sync_mqtt_access
+    fi
     "${COMPOSE[@]}" up -d
+    # A changed compose definition is recreated by "up -d"; a changed Mosquitto
+    # configuration file alone is not, so compare with the last applied stamp.
+    local conf="$VESSELSTACK_ROOT/config/mosquitto/mosquitto.conf"
+    local stamp="$VESSELSTACK_ROOT/config/.mosquitto-conf.sha256" conf_hash=
+    if [ -r "$conf" ]; then
+        conf_hash=$(sha256sum "$conf" | cut -d' ' -f1)
+        if [ -r "$stamp" ] && [ "$(<"$stamp")" != "$conf_hash" ]; then
+            "${COMPOSE[@]}" up -d --force-recreate mosquitto
+        fi
+        printf '%s\n' "$conf_hash" > "$stamp"
+    fi
     [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
         echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
         return 1
@@ -119,10 +165,14 @@ start_stack() {
     if [ "${TELEMETRY_INDEXER_ENABLE:-true}" = true ]; then
         systemctl start vesselstack-telemetry-indexer.timer
     fi
+    if [ "${DISPLAYS_ENABLE:-false}" = true ]; then
+        systemctl start vesselstack-displays-bridge.service
+    fi
     systemctl start vesselstack-control-panel.service
 }
 
 stop_stack() {
+    systemctl stop vesselstack-displays-bridge.service 2>/dev/null || true
     systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
     systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
     systemctl stop vesselstack-chat.service || true
@@ -186,6 +236,8 @@ status_stack() {
         "${TELEGRAM_ENABLE:-false}" || failed=1
     status_unit 'Telemetry indexer' vesselstack-telemetry-indexer.timer \
         "${TELEMETRY_INDEXER_ENABLE:-true}" || failed=1
+    status_unit 'Displays bridge' vesselstack-displays-bridge.service \
+        "${DISPLAYS_ENABLE:-false}" || failed=1
     status_unit 'Native SignalK' vesselstack-signalk.service \
         "$([ "${SIGNALK_MODE:-existing}" = native ] && echo true || echo false)" || failed=1
     status_unit 'SocketCAN' vesselstack-socketcan.service \
@@ -409,15 +461,17 @@ show_logs() {
         telegram) journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager ;;
         indexer) journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager ;;
         control) journalctl -u vesselstack-control-panel.service -n 100 --no-pager ;;
+        displays) journalctl -u vesselstack-displays-bridge.service -n 100 --no-pager ;;
         containers) "${COMPOSE[@]}" logs --tail 100 ;;
         all)
             journalctl -u vesselstack-chat.service -n 100 --no-pager
             journalctl -u vesselstack-chat-telegram.service -n 100 --no-pager
             journalctl -u vesselstack-telemetry-indexer.service -n 100 --no-pager
             journalctl -u vesselstack-control-panel.service -n 100 --no-pager
+            journalctl -u vesselstack-displays-bridge.service -n 100 --no-pager
             "${COMPOSE[@]}" logs --tail 100
             ;;
-        *) echo 'logs target must be chat, telegram, indexer, control, containers, or all' >&2; exit 2 ;;
+        *) echo 'logs target must be chat, telegram, indexer, control, displays, containers, or all' >&2; exit 2 ;;
     esac
 }
 
@@ -1200,6 +1254,9 @@ PY
     tar --numeric-owner -czf "$archive" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/.venv" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/__pycache__" \
+        --exclude="${VESSELSTACK_ROOT#/}/displays/.venv" \
+        --exclude="${VESSELSTACK_ROOT#/}/displays/__pycache__" \
+        --exclude="${VESSELSTACK_ROOT#/}/build" \
         --transform 's,^,vesselstack-backup/,' \
         "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "${extras[@]}"
     sha256sum "$archive" > "$manifest"
@@ -1438,6 +1495,7 @@ uninstall_stack() {
     systemctl disable --now vesselstack-signalk.service || true
     systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
+    systemctl disable --now vesselstack-displays-bridge.service || true
     if [ -x "$SBIN_DIR/vesselstack-firewall" ]; then
         "$SBIN_DIR/vesselstack-firewall" remove || true
     fi
@@ -1448,14 +1506,24 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer" \
         "$SYSTEMD_DIR/vesselstack-signalk.service" \
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
+        "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall"
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
         rm -rf -- /opt/vesselstack /opt/vesselstack-data
+        # The optional on-host firmware build keeps its toolchain cache (about
+        # 2 GB) in a named Docker volume; remove it best-effort.
+        if docker volume rm vesselstack-esphome-cache >/dev/null 2>&1; then
+            echo "Removed Docker volume vesselstack-esphome-cache"
+        fi
         echo "VesselStack services, configuration, and data removed"
     else
         echo "VesselStack services removed; data preserved at $VESSELSTACK_DATA"
+        if docker volume inspect vesselstack-esphome-cache >/dev/null 2>&1; then
+            echo "The ESPHome toolchain cache (Docker volume vesselstack-esphome-cache, about 2 GB) was left in place;" \
+                "remove it with: docker volume rm vesselstack-esphome-cache"
+        fi
     fi
 }
 
@@ -1484,5 +1552,6 @@ case "$command" in
     restore) [ $# -ge 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
     update) [ $# -ge 1 ] || { usage; exit 2; }; update_stack "$@" ;;
     uninstall) uninstall_stack "$@" ;;
+    display) [ $# -ge 1 ] || { usage; exit 2; }; display_command "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
 esac

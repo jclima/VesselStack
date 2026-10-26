@@ -78,3 +78,20 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Start and verify observability services
         run: tests/test-service-integration.sh
+      - name: Verify Mosquitto ACL and display accounts
+        run: sudo tests/test-displays-mosquitto.sh
+      - name: Verify the Mosquitto upgrade path (old container, reboot, recreate)
+        run: sudo tests/test-mosquitto-upgrade.sh
+      - name: Verify the SignalK to MQTT displays bridge
+        run: sudo tests/test-displays-bridge.sh
+      - name: Verify the bridge EnvironmentFile and unit under real systemd
+        run: tests/test-displays-envfile-systemd.sh
+
+  displays-esphome-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Pull the pinned ESPHome image
+        run: docker pull "$(tr -d '[:space:]' < displays/esphome/IMAGE)"
+      - name: Validate generated display projects with the pinned ESPHome
+        run: tests/test-displays-esphome-config.sh

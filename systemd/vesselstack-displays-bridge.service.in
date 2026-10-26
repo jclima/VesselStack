@@ -1,0 +1,40 @@
+[Unit]
+Description=VesselStack SignalK to MQTT displays bridge
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@VESSELSTACK_USER@
+Group=@VESSELSTACK_USER@
+WorkingDirectory=@VESSELSTACK_ROOT@/displays
+EnvironmentFile=@VESSELSTACK_ROOT@/config/displays-bridge.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@VESSELSTACK_ROOT@/displays/.venv/bin/python @VESSELSTACK_ROOT@/displays/bridge.py
+Restart=on-failure
+RestartSec=10
+# Exit 2 (invalid settings or displays.json) and 3 (missing dependency) cannot fix
+# themselves by retrying; stay failed until the operator fixes it and restarts.
+RestartPreventExitStatus=2 3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+LockPersonality=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+# A runaway bridge is stopped (and restarted by Restart=) before it can starve the Pi.
+MemoryHigh=96M
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

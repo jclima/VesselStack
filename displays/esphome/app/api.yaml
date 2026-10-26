@@ -1,0 +1,6 @@
+# Optional Home Assistant native API; included only when the display has
+# "home_assistant_api": true. The encryption key is generated per display.
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s

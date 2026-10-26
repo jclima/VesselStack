@@ -181,6 +181,74 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertEqual(panel.component_command("telegram", "start"), ["systemctl", "start", "vesselstack-chat-telegram.service"])
                 self.assertEqual(panel.component_command("telemetry-indexer", "restart"), ["systemctl", "restart", "vesselstack-telemetry-indexer.timer"])
 
+    def test_displays_bridge_is_opt_in_and_token_is_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vessel = Path(directory) / "vessel.env"
+            with mock.patch.object(panel, "VESSEL_ENV", vessel):
+                panel.write_env(vessel, {"DISPLAYS_ENABLE": "false"}, [])
+                with self.assertRaisesRegex(ValueError, "disabled"):
+                    panel.component_command("displays-bridge", "start")
+                panel.write_env(vessel, {"DISPLAYS_ENABLE": "true"}, [])
+                self.assertEqual(panel.component_command("displays-bridge", "restart"),
+                                 ["systemctl", "restart", "vesselstack-displays-bridge.service"])
+        self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_SIGNALK_TOKEN"]["kind"], "secret")
+        self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]["kind"], "secret")
+        self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]["section"], "Displays")
+
+    def test_displays_values_mirror_the_installer_checks(self) -> None:
+        user = panel.FIELD_BY_KEY["DISPLAYS_BRIDGE_MQTT_USERNAME"]
+        for good in ("vesselstack-bridge", "a", "A_b.c-9", "x" * 64, ""):
+            self.assertEqual(panel.validate_value(user, good), good)
+        for bad in ("bad name", "x" * 65, "bad:name", "bad/name", "b\u00e9", "bad;", "a b"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                panel.validate_value(user, bad)
+        # Surrounding whitespace is stripped by validate_value; the pattern itself never accepts a newline.
+        self.assertFalse(panel.MQTT_ACCOUNT_NAME.fullmatch("bridge\n"))
+        with self.assertRaises(ValueError):
+            panel.validate_value(panel.FIELD_BY_KEY["MQTT_USERNAME"], "bad name")
+        token = panel.FIELD_BY_KEY["DISPLAYS_SIGNALK_TOKEN"]
+        self.assertEqual(panel.validate_value(token, 'a$b`c"d\\e\'f#g;h%i j'), 'a$b`c"d\\e\'f#g;h%i j')
+        for bad in ("a\tb", "a\x01b", "a\x7fb", "a\x00b", "a\nb", "a\rb", "a\x1bb"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                panel.validate_value(token, bad)
+
+    def test_ha_token_rejects_control_characters_and_is_never_echoed(self) -> None:
+        token = panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]
+        self.assertEqual(panel.validate_value(token, "eyJ.abc_-d"), "eyJ.abc_-d")
+        self.assertEqual(panel.validate_value(token, ""), "")
+        for bad in ("a\tb", "a\nb", "a\x7fb", "a\x00b", "a\rb"):
+            with self.assertRaises(ValueError, msg=repr(bad)) as caught:
+                panel.validate_value(token, bad)
+            self.assertTrue(str(caught.exception).startswith("Displays bridge Home Assistant token "))
+            self.assertNotIn(bad, str(caught.exception))
+
+    def test_bridge_username_must_differ_from_the_mqtt_username(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vessel, chat, control = root / "vessel.env", root / "chat.env", root / "control.env"
+            panel.write_env(vessel, {"MQTT_USERNAME": "homeassistant", "DISPLAYS_ENABLE": "false"}, [])
+            panel.write_env(chat, {}, [])
+            panel.write_env(control, {"CONTROL_PANEL_TOKEN": "t"}, [])
+            before = vessel.read_text()
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control,
+                                     CONFIG_BACKUP_ROOT=root / "backups"):
+                # Not enabled: the shared name is harmless until displays are switched on.
+                panel.update_configuration({"DISPLAYS_BRIDGE_MQTT_USERNAME": "homeassistant"})
+                with self.assertRaisesRegex(ValueError, "must differ"):
+                    panel.update_configuration({"DISPLAYS_ENABLE": "true"})
+                with self.assertRaisesRegex(ValueError, "must differ"):
+                    panel.update_configuration({"DISPLAYS_ENABLE": "true",
+                                                "DISPLAYS_BRIDGE_MQTT_USERNAME": "homeassistant"})
+                self.assertEqual(panel.parse_env(vessel)["DISPLAYS_ENABLE"], "false")
+                # The default bridge name collides with a MQTT user of the same name.
+                panel.update_configuration({"MQTT_USERNAME": "vesselstack-bridge",
+                                            "DISPLAYS_BRIDGE_MQTT_USERNAME": ""})
+                with self.assertRaisesRegex(ValueError, "must differ"):
+                    panel.update_configuration({"DISPLAYS_ENABLE": "true"})
+                panel.update_configuration({"DISPLAYS_ENABLE": "true", "MQTT_USERNAME": "homeassistant"})
+                self.assertEqual(panel.parse_env(vessel)["DISPLAYS_ENABLE"], "true")
+            self.assertNotEqual(before, vessel.read_text())
+
     def test_update_requires_reviewed_release_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

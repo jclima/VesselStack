@@ -1,0 +1,500 @@
+"""MQTT topics, payloads and the freshness state machine. Pure logic: no I/O, clock injected."""
+from __future__ import annotations
+
+import json
+import math
+from urllib.parse import urlsplit, urlunsplit
+
+import conversions
+import severity
+from schema import DEFAULT_HEARTBEAT_S, DEFAULT_MIN_INTERVAL_MS
+
+TOPIC_ROOT = "vesselstack/v1"
+INSTRUMENT_TOPIC_PREFIX = f"{TOPIC_ROOT}/instruments/"
+NOTIFICATION_TOPIC_PREFIX = f"{TOPIC_ROOT}/notifications/"
+NOTIFICATION_PERIOD_MS = 1000
+# After (re)connecting, SignalK re-sends active notifications within about one period; until
+# then a notification nobody has reported on yet is "unknown", never a possibly false "ok".
+EVENT_SETTLE_S = 3.0
+HA_TOPIC_PREFIX = f"{TOPIC_ROOT}/ha/"
+HA_MIN_INTERVAL_S = 1.0       # a Home Assistant item changes the retained topic at most once a second
+ALARM_SUMMARY_TOPIC = f"{TOPIC_ROOT}/alarms/summary"
+SUMMARY_MAX_IDS = 16
+BRIDGE_STATUS_TOPIC = f"{TOPIC_ROOT}/bridge/status"
+BRIDGE_SIGNALK_TOPIC = f"{TOPIC_ROOT}/bridge/signalk"
+BRIDGE_CLOCK_TOPIC = f"{TOPIC_ROOT}/bridge/clock"
+BRIDGE_HA_TOPIC = f"{TOPIC_ROOT}/bridge/homeassistant"
+DISPLAY_STATUS_TOPIC = f"{TOPIC_ROOT}/displays/{{username}}/status"
+
+
+def instrument_topic(instrument_id: str) -> str:
+    return INSTRUMENT_TOPIC_PREFIX + instrument_id
+
+
+def notification_topic(notification_id: str) -> str:
+    return NOTIFICATION_TOPIC_PREFIX + notification_id
+
+
+def ha_topic(item_id: str) -> str:
+    return HA_TOPIC_PREFIX + item_id
+
+
+def display_status_topic(username: str) -> str:
+    return DISPLAY_STATUS_TOPIC.format(username=username)
+
+
+def build_payload(value, unit, state, ts, age, sev=None) -> str:
+    """JSON payload; ``sev`` is added (after ``st``) only when not None."""
+    body = {"v": value, "u": unit, "st": state}
+    if sev is not None:
+        body["sev"] = sev
+    body.update({"ts": ts, "age": age})
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+
+def numeric(value):
+    """Return float for finite non-bool numbers, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+class _State:
+    def __init__(self):
+        self.value = None          # latest converted+rounded value
+        self.ts = None             # SignalK timestamp of latest value
+        self.received = None       # bridge receive time of latest value
+        self.state = "missing"     # current freshness
+        self.pub_value = None
+        self.pub_state = None
+        self.sev = None            # severity of the latest ok value (hysteresis memory); None unless ok
+        self.pub_sev = None
+        self.pub_time = None
+        self.dirty = False
+
+
+class Engine:
+    """Tracks instruments and decides what to publish. Times are seconds (monotonic or epoch)."""
+
+    def __init__(self, config: dict):
+        self.heartbeat_s = config.get("heartbeat_s", DEFAULT_HEARTBEAT_S)
+        self.instruments = config["instruments"]
+        self._state = {iid: _State() for iid in self.instruments}
+        self._by_path: dict[str, list[str]] = {}
+        for iid, inst in self.instruments.items():
+            self._by_path.setdefault(inst["path"], []).append(iid)
+
+    def paths(self):
+        return list(self._by_path)
+
+    def _min_interval(self, iid) -> float:
+        return self.instruments[iid].get("min_interval_ms", DEFAULT_MIN_INTERVAL_MS) / 1000.0
+
+    def _emit(self, iid, now):
+        inst, st = self.instruments[iid], self._state[iid]
+        ok = st.state == "ok"
+        age = None if st.received is None else round(max(0.0, now - st.received), 1)
+        st.pub_value, st.pub_state, st.pub_time, st.dirty = st.value if ok else None, st.state, now, False
+        sev = None
+        if "thresholds" in inst:
+            sev = st.sev if ok and st.sev is not None else "unknown"
+            st.pub_sev = sev
+        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev)
+        return (instrument_topic(iid), payload, True)
+
+    def update(self, path: str, value, ts, now: float) -> list:
+        """Handle a SignalK value; returns [(topic, payload, retain)]."""
+        raw = numeric(value)
+        if raw is None:
+            return []
+        out = []
+        for iid in self._by_path.get(path, ()):
+            inst, st = self.instruments[iid], self._state[iid]
+            rounded = conversions.convert_and_round(inst["convert"], raw, inst["precision"])
+            if rounded is None:
+                continue
+            st.value = rounded
+            if "thresholds" in inst:  # on the rounded value, so the colour matches the digits
+                st.sev = severity.numeric_sev(rounded, inst["thresholds"], st.sev if st.state == "ok" else None)
+            st.ts = ts if isinstance(ts, str) else None
+            st.received = now
+            st.state = "ok"
+            if st.pub_state != "ok":
+                out.append(self._emit(iid, now))
+            elif st.value != st.pub_value or st.sev != st.pub_sev:
+                if now - st.pub_time >= self._min_interval(iid):
+                    out.append(self._emit(iid, now))
+                else:
+                    st.dirty = True
+        return out
+
+    def summary_items(self) -> list:
+        """[(id, severity)] for the instruments that count towards the alarm summary.
+
+        An instrument counts when ``alarm`` is true (default: it has thresholds). Anything
+        not currently "ok" (stale, missing) is "unknown"; without thresholds a fresh value is "ok".
+        """
+        out = []
+        for iid, inst in self.instruments.items():
+            if not inst.get("alarm", "thresholds" in inst):
+                continue
+            st = self._state[iid]
+            if st.state != "ok":
+                sev = "unknown"
+            else:
+                sev = (st.sev or "unknown") if "thresholds" in inst else "ok"
+            out.append((iid, sev))
+        return out
+
+    def tick(self, now: float) -> list:
+        out = []
+        for iid, inst in self.instruments.items():
+            st = self._state[iid]
+            if st.state == "ok" and now - st.received > inst["stale_after_s"]:
+                st.state = "stale"
+                st.sev = None
+                out.append(self._emit(iid, now))
+            elif st.pub_time is None or st.pub_state != st.state:
+                out.append(self._emit(iid, now))
+            elif st.dirty and now - st.pub_time >= self._min_interval(iid):
+                out.append(self._emit(iid, now))
+            elif now - st.pub_time >= self.heartbeat_s:
+                out.append(self._emit(iid, now))
+        return out
+
+
+class _EventState:
+    def __init__(self):
+        self.sev = None        # severity from the latest message (None: nothing heard since connecting)
+        self.ts = None
+        self.received = None
+        self.pub = None        # (state, sev) last published
+        self.pub_time = None
+
+
+class EventEngine:
+    """Event-driven items (SignalK notifications): no numeric value, a severity per item.
+
+    Freshness follows the SignalK connection rather than a per-item timeout, because an
+    alarm that is not changing is silent: while SignalK is connected an item is "ok" (never
+    reported means "not raised", shown per its ``absent`` setting), when SignalK is
+    disconnected it is "stale" with severity "unknown" and everything heard is forgotten
+    (a notification cleared during the outage is never re-announced; SignalK re-sends the
+    active ones on reconnect). Before the first connection it is "missing". Every item is
+    republished each ``heartbeat_s`` so a display can tell a live bridge from a dead one.
+    Times are seconds from an injected clock.
+    """
+
+    def __init__(self, config: dict):
+        self.heartbeat_s = config.get("heartbeat_s", DEFAULT_HEARTBEAT_S)
+        self.notifications = config.get("notifications", {})
+        self._state = {nid: _EventState() for nid in self.notifications}
+        self._by_path: dict[str, list[str]] = {}
+        for nid, note in self.notifications.items():
+            self._by_path.setdefault(note["path"], []).append(nid)
+        self.connected = False
+        self._ever_connected = False
+        self._connected_at = None
+
+    def paths(self):
+        return list(self._by_path)
+
+    def _freshness(self) -> str:
+        if self.connected:
+            return "ok"
+        return "stale" if self._ever_connected else "missing"
+
+    def _sev(self, nid, now) -> str:
+        if not self.connected:
+            return "unknown"
+        st = self._state[nid]
+        if st.sev is not None:
+            return st.sev
+        if now - self._connected_at < EVENT_SETTLE_S:
+            return "unknown"
+        return severity.notification_sev(None, self.notifications[nid].get("absent", "ok"))
+
+    def _emit(self, nid, now):
+        st = self._state[nid]
+        state, sev = self._freshness(), self._sev(nid, now)
+        age = None if st.received is None else round(max(0.0, now - st.received), 1)
+        st.pub, st.pub_time = (state, sev), now
+        return (notification_topic(nid), build_payload(None, "", state, st.ts, age, sev), True)
+
+    def source_state(self, source: str, connected: bool, now: float) -> list:
+        """The SignalK connection went up or down; returns [(topic, payload, retain)]."""
+        if source != "signalk" or connected == self.connected:
+            return []
+        self.connected = connected
+        if connected:
+            self._ever_connected, self._connected_at = True, now
+        else:
+            self._connected_at = None
+            for st in self._state.values():
+                st.sev = st.ts = st.received = None
+        return [self._emit(nid, now) for nid in self.notifications]
+
+    def set(self, nid: str, raw, ts, now: float) -> list:
+        """A notification value (an object with a ``state``, or None when cleared)."""
+        note = self.notifications.get(nid)
+        if note is None:
+            return []
+        st = self._state[nid]
+        st.sev = severity.notification_sev(raw, note.get("absent", "ok"))
+        st.ts = ts if isinstance(ts, str) else None
+        st.received = now
+        if st.pub == (self._freshness(), self._sev(nid, now)):
+            return []
+        return [self._emit(nid, now)]
+
+    def update(self, path: str, value, ts, now: float) -> list:
+        out = []
+        for nid in self._by_path.get(path, ()):
+            out.extend(self.set(nid, value, ts, now))
+        return out
+
+    def summary_items(self, now: float) -> list:
+        """[(id, severity)] for the notifications that count towards the alarm summary (``alarm``, default true)."""
+        return [(nid, self._sev(nid, now)) for nid, note in self.notifications.items()
+                if note.get("alarm", True)]
+
+    def tick(self, now: float) -> list:
+        out = []
+        for nid in self.notifications:
+            st = self._state[nid]
+            if st.pub_time is None or st.pub != (self._freshness(), self._sev(nid, now)) \
+                    or now - st.pub_time >= self.heartbeat_s:
+                out.append(self._emit(nid, now))
+        return out
+
+
+class HaEngine:
+    """Home Assistant items: numeric sensors and mapped binary / multi-valued states.
+
+    Freshness follows the Home Assistant connection, as for notifications: while connected an
+    item is "ok" when its last state is usable, "missing" when HA reports no value ("unknown",
+    "unavailable", gone, or not a finite number) or has not reported the entity yet; when the
+    connection is down it is "stale" (or "missing" before the first connection), severity
+    "unknown", and every value heard is forgotten. Nothing is ever "ok" unless a state matched
+    or a number was read. Every item is republished each ``heartbeat_s``; a changed item at most
+    once per ``HA_MIN_INTERVAL_S`` when only its number changes. Payload: ``{"v","k","u","st","sev","ts","age"}`` where ``v``
+    is the number (numeric items), ``k`` the index of the matched ``states`` entry (-1: the
+    ``default``) and never any state text. Times are seconds from an injected clock.
+    """
+
+    def __init__(self, config: dict):
+        self.heartbeat_s = config.get("heartbeat_s", DEFAULT_HEARTBEAT_S)
+        self.items = config.get("ha", {})
+        self._state = {hid: _HaState() for hid in self.items}
+        self._by_entity: dict[str, list[str]] = {}
+        for hid, item in self.items.items():
+            self._by_entity.setdefault(item["entity_id"], []).append(hid)
+        self.connected = False
+        self._ever_connected = False
+
+    def entity_ids(self):
+        return list(self._by_entity)
+
+    def _freshness(self, hid) -> str:
+        st = self._state[hid]
+        if self.connected:
+            return "ok" if st.result is not None and st.result[0] == "ok" else "missing"
+        return "stale" if self._ever_connected else "missing"
+
+    def _view(self, hid) -> tuple:
+        """(st, sev, k, v) as it would be published now."""
+        st = self._state[hid]
+        fresh = self._freshness(hid)
+        if fresh != "ok":
+            return (fresh, "unknown", None, None)
+        return st.result
+
+    def _emit(self, hid, now):
+        st, item = self._state[hid], self.items[hid]
+        view = self._view(hid)
+        age = None if st.received is None else round(max(0.0, now - st.received), 1)
+        st.pub, st.pub_time = view, now
+        body = {"v": view[3], "k": view[2], "u": item.get("unit", ""), "st": view[0], "sev": view[1],
+                "ts": st.ts, "age": age}
+        return (ha_topic(hid), json.dumps(body, separators=(",", ":"), ensure_ascii=False), True)
+
+    def source_state(self, connected: bool, now: float) -> list:
+        """The Home Assistant connection went up or down; returns [(topic, payload, retain)]."""
+        if connected == self.connected:
+            return []
+        self.connected = connected
+        if connected:
+            self._ever_connected = True
+        else:
+            for st in self._state.values():
+                st.result = st.ts = st.received = None
+        return [self._emit(hid, now) for hid in self.items]
+
+    def set_state(self, entity_id: str, state, ts, now: float) -> list:
+        """A state string (or None: the entity is gone) for an entity."""
+        out = []
+        for hid in self._by_entity.get(entity_id, ()):
+            item, st = self.items[hid], self._state[hid]
+            prev = st.result[1] if st.result is not None and st.result[0] == "ok" else None
+            st.result = severity.ha_state(state, item["kind"], item, prev)
+            st.ts = ts if isinstance(ts, str) else None
+            st.received = now
+            view = self._view(hid)
+            if view == st.pub:
+                continue
+            # A new state, severity or index goes out at once; only a changing number is rate limited.
+            if st.pub is None or view[:3] != st.pub[:3] or now - st.pub_time >= HA_MIN_INTERVAL_S:
+                out.append(self._emit(hid, now))      # otherwise the next tick publishes it
+        return out
+
+    def summary_items(self) -> list:
+        """[(id, severity)] for the items that count towards the alarm summary (``alarm``, default true)."""
+        return [(hid, self._view(hid)[1]) for hid, item in self.items.items() if item.get("alarm", True)]
+
+    def tick(self, now: float) -> list:
+        out = []
+        for hid in self.items:
+            st = self._state[hid]
+            changed = st.pub is None or st.pub != self._view(hid)
+            if st.pub_time is None or (changed and now - st.pub_time >= HA_MIN_INTERVAL_S) \
+                    or now - st.pub_time >= self.heartbeat_s:
+                out.append(self._emit(hid, now))
+        return out
+
+
+class _HaState:
+    def __init__(self):
+        self.result = None     # (st, sev, k, v) from severity.ha_state for the latest state
+        self.ts = None
+        self.received = None
+        self.pub = None
+        self.pub_time = None
+
+
+def ha_websocket_url(base: str) -> str:
+    """The ``/api/websocket`` URL of a Home Assistant base URL (http->ws, https->wss; no credentials)."""
+    parts = urlsplit(base.strip())
+    scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}.get(parts.scheme)
+    if scheme is None or not parts.netloc:
+        raise ValueError("unsupported Home Assistant URL (expected http://host:port or https://host:port)")
+    if "@" in parts.netloc:
+        raise ValueError("the Home Assistant URL must not embed credentials")
+    return urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + "/api/websocket", "", ""))
+
+
+SUMMARY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "alarm": 3}
+
+
+def alarm_summary(items, ts) -> str | None:
+    """Compact JSON for the retained alarm summary, or None when nothing is counted.
+
+    ``items`` is [(id, severity)] in config order (only items that count; any severity other
+    than ok/warn/alarm is treated as unknown). ``max`` is the highest of alarm > warn >
+    unknown > ok, so unknown outranks ok: a dead feed is never reported as all clear. ``ids``
+    lists alarm ids, then warn ids (each in config order), at most SUMMARY_MAX_IDS. Only ids
+    are published, never labels or message text.
+    """
+    items = [(iid, sev if sev in ("ok", "warn", "alarm") else "unknown") for iid, sev in items]
+    if not items:
+        return None
+    alarms = [iid for iid, sev in items if sev == "alarm"]
+    warns = [iid for iid, sev in items if sev == "warn"]
+    unknown = sum(1 for _, sev in items if sev == "unknown")
+    top = max((sev for _, sev in items), key=SUMMARY_RANK.__getitem__)
+    body = {"max": top, "na": len(alarms), "nw": len(warns), "nu": unknown,
+            "ids": (alarms + warns)[:SUMMARY_MAX_IDS], "ts": ts}
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+
+def hhmm_minutes(text: str) -> int:
+    """Minutes since local midnight for a validated "HH:MM" (ValueError otherwise)."""
+    if (not isinstance(text, str) or len(text) != 5 or text[2] != ":"
+            or not (text[:2] + text[3:]).isdigit() or not text.isascii()):
+        raise ValueError(f"not an HH:MM time: {text!r}")
+    hours, minutes = int(text[:2]), int(text[3:])
+    if hours > 23 or minutes > 59:
+        raise ValueError(f"not an HH:MM time: {text!r}")
+    return hours * 60 + minutes
+
+
+def in_night_window(minute_of_day: int, schedule) -> bool:
+    """True from ``start`` (inclusive) to ``end`` (exclusive) on the local wall clock.
+
+    A window whose start is later than its end crosses midnight (22:00 -> 06:00). With no
+    schedule it is never night. Only wall-clock minutes are compared, so a daylight saving
+    change moves the window with the clock instead of shifting it by an hour.
+    """
+    if not schedule:
+        return False
+    start, end = hhmm_minutes(schedule["start"]), hhmm_minutes(schedule["end"])
+    if start < end:
+        return start <= minute_of_day < end
+    return minute_of_day >= start or minute_of_day < end
+
+
+def clock_state(local, schedule) -> tuple:
+    """(``HH:MM`` text, night flag) for an aware or naive local datetime."""
+    return local.strftime("%H:%M"), in_night_window(local.hour * 60 + local.minute, schedule)
+
+
+def clock_payload(state: tuple, ts: str) -> str:
+    """Compact JSON for the retained bridge clock: ``{"hm","night","ts"}``."""
+    return json.dumps({"hm": state[0], "night": state[1], "ts": ts}, separators=(",", ":"))
+
+
+def clock_wanted(config: dict) -> bool:
+    """The clock is only published when a display shows it (header) or follows the schedule."""
+    for display in config.get("displays", {}).values():
+        ui = display.get("ui", {}) if isinstance(display, dict) else {}
+        if ui.get("header") is True or ui.get("night") == "schedule":
+            return True
+    return False
+
+
+def subscribe_frame(config: dict) -> dict:
+    periods: dict[str, int] = {}
+    for inst in config["instruments"].values():
+        interval = inst.get("min_interval_ms", DEFAULT_MIN_INTERVAL_MS)
+        periods[inst["path"]] = min(interval, periods.get(inst["path"], interval))
+    for note in config.get("notifications", {}).values():
+        periods.setdefault(note["path"], NOTIFICATION_PERIOD_MS)
+    return {"context": "vessels.self",
+            "subscribe": [{"path": p, "period": ms, "minPeriod": ms} for p, ms in periods.items()]}
+
+
+def signalk_stream_url(base: str) -> str:
+    parts = urlsplit(base.strip())
+    scheme = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}.get(parts.scheme)
+    if scheme is None or not parts.netloc:
+        raise ValueError(f"unsupported SignalK URL: {base!r}")
+    path = parts.path.rstrip("/") + "/signalk/v1/stream"
+    return urlunsplit((scheme, parts.netloc, path, "subscribe=none", ""))
+
+
+def parse_delta(message, self_urn: str | None = None) -> list:
+    """Extract [(path, value, timestamp)] from a SignalK delta for the own vessel."""
+    if isinstance(message, (str, bytes)):
+        try:
+            message = json.loads(message)
+        except ValueError:
+            return []
+    if not isinstance(message, dict):
+        return []
+    context = message.get("context")
+    own = {None, "vessels.self"}
+    if self_urn:
+        own.update({self_urn, f"vessels.{self_urn}"})
+    if context not in own:
+        return []
+    results = []
+    updates = message.get("updates")
+    for update in updates if isinstance(updates, list) else []:
+        if not isinstance(update, dict):
+            continue
+        ts = update.get("timestamp")
+        values = update.get("values")
+        for item in values if isinstance(values, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("path"), str) and "value" in item:
+                results.append((item["path"], item["value"], ts))
+    return results
