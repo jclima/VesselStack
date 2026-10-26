@@ -617,3 +617,135 @@ class DashboardUiOptionTests(unittest.TestCase):
         reg = copy.deepcopy(REGISTRY)
         del reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["ring"]
         self.assertEqual(schema.validate_registry(reg), [])
+
+
+class ElectricalLayoutTests(unittest.TestCase):
+    """The ``electrical`` layout and positional slots (display dashboard slice S7)."""
+
+    def cfg(self, items=("batt_v", "batt_soc", "batt_a"), **page_extra):
+        cfg = copy.deepcopy(EXAMPLE)
+        cfg["instruments"].update({
+            "batt_v": {"path": "electrical.batteries.house.voltage", "label": "House", "convert": "none",
+                       "unit": "V", "precision": 2, "stale_after_s": 30},
+            "batt_soc": {"path": "electrical.batteries.house.capacity.stateOfCharge", "label": "SoC",
+                         "convert": "ratio->%", "unit": "%", "precision": 0, "stale_after_s": 60,
+                         "min": 0, "max": 100},
+            "batt_a": {"path": "electrical.batteries.house.current", "label": "Current", "convert": "none",
+                       "unit": "A", "precision": 1, "stale_after_s": 30},
+            "solar_a": {"path": "electrical.solar.main.current", "label": "Solar", "convert": "none",
+                        "unit": "A", "precision": 1, "stale_after_s": 30},
+        })
+        cfg["notifications"] = {"shore": {"path": "notifications.electrical.shorePower", "label": "Shore",
+                                          "absent": "unknown"}}
+        cfg["displays"]["helm"]["pages"] = [{"title": "Power", "layout": "electrical", "items": list(items)}]
+        return cfg
+
+    def errors(self, cfg, registry=REGISTRY):
+        return schema.validate_config(cfg, registry)
+
+    def test_registry_entry_and_normalised_slots(self) -> None:
+        self.assertEqual(schema.validate_registry(REGISTRY), [])
+        spec = schema.layout_specs(REGISTRY)["electrical"]
+        self.assertEqual((spec["capacity"], spec["min_items"], spec["shapes"], spec["types"]),
+                         (5, 3, ["round"], ["instrument", "notification"]))
+        self.assertEqual([s["role"] for s in spec["slots"]], ["voltage", "soc", "current", "shore", "solar"])
+        self.assertEqual(spec["slots"][1], {"role": "soc", "types": ["instrument"], "needs": ["numeric", "min_max"]})
+        self.assertEqual([bool(s.get("optional")) for s in spec["slots"]], [False, False, False, True, True])
+        self.assertNotIn("slots", schema.layout_specs(REGISTRY)["gauge-arc"])      # other layouts are unchanged
+        self.assertIn("electrical", REGISTRY["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["layouts"])
+        self.assertEqual(REGISTRY["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["layouts"][-2:],
+                         ["gauge-arc", "electrical"])
+
+    def test_three_four_and_five_items_are_valid(self) -> None:
+        for items in (("batt_v", "batt_soc", "batt_a"), ("batt_v", "batt_soc", "batt_a", "shore"),
+                      ("batt_v", "batt_soc", "batt_a", "shore", "solar_a"),
+                      ("batt_v", "batt_soc", "batt_a", "solar_a")):      # an instrument may fill the shore slot
+            with self.subTest(items):
+                self.assertEqual(self.errors(self.cfg(items)), [])
+
+    def test_too_few_and_too_many_items(self) -> None:
+        self.assertTrue(any("needs at least 3" in e for e in self.errors(self.cfg(("batt_v", "batt_soc")))))
+        over = self.cfg(("batt_v", "batt_soc", "batt_a", "shore", "solar_a", "sog"))
+        self.assertTrue(any("exceed layout capacity 5" in e for e in self.errors(over)))
+
+    def test_soc_needs_min_and_max_and_the_error_names_the_role(self) -> None:
+        cfg = self.cfg(("batt_v", "batt_soc", "batt_a"))
+        del cfg["instruments"]["batt_soc"]["max"]
+        self.assertEqual(self.errors(cfg), [
+            "$.displays.helm.pages[0].items[1] (soc): instrument 'batt_soc' needs min and max on layout 'electrical'"])
+
+    def test_voltage_and_current_do_not_need_a_range(self) -> None:
+        cfg = self.cfg()
+        for iid in ("batt_v", "batt_a"):
+            self.assertNotIn("min", cfg["instruments"][iid])
+        self.assertEqual(self.errors(cfg), [])
+
+    def test_items_map_positionally_so_a_swapped_order_names_the_role(self) -> None:
+        errors = self.errors(self.cfg(("batt_soc", "batt_v", "batt_a")))
+        self.assertEqual(errors, [
+            "$.displays.helm.pages[0].items[1] (soc): instrument 'batt_v' needs min and max on layout 'electrical'"])
+
+    def test_a_notification_is_only_accepted_in_the_shore_slot(self) -> None:
+        self.assertEqual(self.errors(self.cfg(("batt_v", "batt_soc", "batt_a", "shore"))), [])
+        for position, role in ((0, "voltage"), (1, "soc"), (2, "current")):
+            items = ["batt_v", "batt_soc", "batt_a"]
+            items[position] = "shore"
+            errors = self.errors(self.cfg(items))
+            self.assertTrue(any(f"items[{position}] ({role}): layout 'electrical' does not accept notification "
+                                "items here ('shore'); this slot takes instrument" in e for e in errors), errors)
+        solar = self.errors(self.cfg(("batt_v", "batt_soc", "batt_a", "batt_a", "shore")))
+        self.assertTrue(any("items[4] (solar)" in e and "does not accept notification" in e for e in solar), solar)
+
+    def test_duplicates_and_unknown_items_are_still_rejected(self) -> None:
+        self.assertTrue(any("duplicate item" in e for e in self.errors(self.cfg(("batt_v", "batt_soc", "batt_v")))))
+        self.assertTrue(any("unknown" in e for e in self.errors(self.cfg(("batt_v", "batt_soc", "nope")))))
+
+    def test_electrical_needs_a_round_board(self) -> None:
+        reg = copy.deepcopy(REGISTRY)
+        board = copy.deepcopy(reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"])
+        board.update(shape="rect", layouts=["single", "grid-2x2"])
+        del board["ring"]
+        reg["boards"]["rect-board"] = board
+        cfg = self.cfg()
+        cfg["displays"]["helm"]["board"] = "rect-board"
+        errors = self.errors(cfg, reg)
+        self.assertTrue(any("'electrical' is not supported by board 'rect-board'; electrical needs a round board"
+                            in e for e in errors), errors)
+        reg["boards"]["rect-board"]["layouts"].append("electrical")
+        self.assertTrue(any("does not support the rect shape" in e for e in schema.validate_registry(reg)))
+
+    # -- registry validation of slots ------------------------------------------------------------
+
+    def slot_errors(self, mutate):
+        reg = copy.deepcopy(REGISTRY)
+        mutate(reg["layouts"]["electrical"])
+        return schema.validate_registry(reg)
+
+    def assertSlotError(self, mutate, fragment):
+        errors = self.slot_errors(mutate)
+        self.assertTrue(any(fragment in e for e in errors), errors)
+
+    def test_slot_definitions_are_validated(self) -> None:
+        self.assertSlotError(lambda l: l.update(slots=[]), "slots: must be a non-empty list")
+        self.assertSlotError(lambda l: l.update(slots="x"), "slots: must be a non-empty list")
+        self.assertSlotError(lambda l: l["slots"].append({"role": "extra", "types": ["instrument"]}),
+                             "must have one slot per item (capacity 5)")
+        self.assertSlotError(lambda l: l["slots"][0].update(role="Voltage"), "slots[0].role")
+        self.assertSlotError(lambda l: l["slots"][1].update(role="voltage"), "duplicate role 'voltage'")
+        self.assertSlotError(lambda l: l["slots"][0].update(types=[]), "slots[0].types")
+        self.assertSlotError(lambda l: l["slots"][0].update(types=["gauge"]), "slots[0].types")
+        self.assertSlotError(lambda l: (l.update(types=["instrument"]), l["slots"][3].update(types=["notification"])),
+                             "subset of the layout types")
+        self.assertSlotError(lambda l: l["slots"][0].update(needs=["numeric", "numeric"]), "slots[0].needs")
+        self.assertSlotError(lambda l: l["slots"][0].update(needs=["bogus"]), "slots[0].needs")
+        self.assertSlotError(lambda l: l["slots"][0].update(optional="yes"), "slots[0].optional")
+        self.assertSlotError(lambda l: l["slots"][0].update(color=1), "slots[0].color: unknown key")
+        self.assertSlotError(lambda l: l["slots"][2].update(optional=True), "min_items: must equal the number of required slots (2)")
+        self.assertSlotError(lambda l: l["slots"][4].pop("optional"), "a required slot cannot follow an optional one")
+        self.assertSlotError(lambda l: l["slots"].__setitem__(0, "x"), "slots[0]: must be an object")
+        self.assertSlotError(lambda l: l["slots"][0].pop("role"), "slots[0].role: required")
+        self.assertSlotError(lambda l: l.update(min_items=2), "must equal the number of required slots (3)")
+
+    def test_a_layout_without_slots_keeps_working(self) -> None:
+        self.assertEqual(self.slot_errors(lambda l: l.pop("slots")), [])
+        self.assertEqual(self.slot_errors(lambda l: None), [])

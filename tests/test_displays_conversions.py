@@ -37,6 +37,7 @@ KNOWN = {
     "C->Ah": (3600, 1.0),
     "s->min": (120, 2.0),
     "s->h": (7200, 2.0),
+    "negate": (12.5, -12.5),
 }
 
 
@@ -46,6 +47,15 @@ class ConversionTests(unittest.TestCase):
         for name, (src, expected) in KNOWN.items():
             with self.subTest(name):
                 self.assertAlmostEqual(conversions.convert(name, src), expected, places=6)
+
+    def test_negate_flips_the_sign_and_never_yields_negative_zero(self) -> None:
+        self.assertEqual(conversions.convert("negate", -3.2), 3.2)
+        self.assertEqual(conversions.convert_and_round("negate", 0.0, 1), 0.0)
+        self.assertEqual(str(conversions.convert_and_round("negate", 0.0, 1)), "0.0")
+        self.assertEqual(str(conversions.convert_and_round("negate", 0.04, 1)), "0.0")   # -0.04 rounds to zero
+        self.assertEqual(conversions.convert_and_round("negate", 12.34, 1), -12.3)
+        self.assertEqual(conversions.convert_and_round("negate", -12.34, 0), 12)
+        self.assertIsNone(conversions.convert_and_round("negate", float("inf"), 1))
 
     def test_signed_angle_wrap(self) -> None:
         f = lambda deg: conversions.convert("rad->deg_signed", math.radians(deg))  # noqa: E731

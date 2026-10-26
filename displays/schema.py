@@ -29,10 +29,15 @@ NOTIFICATION_PREFIX = "notifications."
 ABSENT_MODES = ("ok", "unknown")
 ITEM_TYPES = ("instrument", "notification")
 SHAPES = ("round", "rect")
-LAYOUT_KEYS = {"capacity", "min_items", "shapes", "types"}
+LAYOUT_KEYS = {"capacity", "min_items", "shapes", "types", "slots"}
+# Positional slots (layout "electrical"): item N of a page fills slot N of the layout.
+SLOT_KEYS = {"role", "types", "needs", "optional"}
+SLOT_NEEDS = ("numeric", "min_max")
+SLOT_ROLE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 # Layouts that scale a reading into a bar or an arc: every instrument on them needs a min and a max.
 RANGE_LAYOUTS = ("tank-bars", "gauge-arc")
-LAYOUT_HINTS = {"gauge-arc": "gauge-arc needs a round board; use single"}
+LAYOUT_HINTS = {"gauge-arc": "gauge-arc needs a round board; use single",
+                "electrical": "electrical needs a round board; use grid-2x2"}
 INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms",
                    "thresholds", "min", "max", "alarm"}
 # Bounds in severity order; "low" bounds are checked with <, "high" bounds with >.
@@ -254,14 +259,72 @@ def _validate_layout(name, spec, version, errors: list):
                     and all(isinstance(v, str) and v in allowed for v in value)):
                 errors.append(f"{where}.{key}: must be a non-empty list of unique values from "
                               f"{', '.join(allowed)}")
+    if "slots" in spec:
+        _validate_slots(spec, where, errors)
     return normalise_layout(spec) if len(errors) == start else None
+
+
+def _validate_slots(spec: dict, where: str, errors: list) -> None:
+    """``slots``: one entry per position of a page's items, with role, types, needs and optional."""
+    slots, sw = spec["slots"], f"{where}.slots"
+    if not isinstance(slots, list) or not slots:
+        errors.append(f"{sw}: must be a non-empty list")
+        return
+    roles: set = set()
+    seen_optional = False
+    required = 0
+    layout_types = spec.get("types") if isinstance(spec.get("types"), list) else []
+    for i, slot in enumerate(slots):
+        w = f"{sw}[{i}]"
+        if not isinstance(slot, dict):
+            errors.append(f"{w}: must be an object")
+            continue
+        _unknown(slot, SLOT_KEYS, w, errors)
+        _missing(slot, {"role", "types"}, w, errors)
+        role = slot.get("role")
+        if "role" in slot:
+            if not (isinstance(role, str) and SLOT_ROLE.fullmatch(role)):
+                errors.append(f"{w}.role: must match ^[a-z][a-z0-9_]{{0,15}}$")
+            elif role in roles:
+                errors.append(f"{w}.role: duplicate role {role!r}")
+            else:
+                roles.add(role)
+        if "types" in slot:
+            types = slot["types"]
+            if not (isinstance(types, list) and types and len(set(map(str, types))) == len(types)
+                    and all(isinstance(t, str) and t in ITEM_TYPES for t in types)):
+                errors.append(f"{w}.types: must be a non-empty list of unique values from "
+                              f"{', '.join(ITEM_TYPES)}")
+            elif not set(types) <= set(layout_types):
+                errors.append(f"{w}.types: must be a subset of the layout types ({', '.join(layout_types)})")
+        if "needs" in slot:
+            needs = slot["needs"]
+            if not (isinstance(needs, list) and len(set(map(str, needs))) == len(needs)
+                    and all(isinstance(n, str) and n in SLOT_NEEDS for n in needs)):
+                errors.append(f"{w}.needs: must be a list of unique values from {', '.join(SLOT_NEEDS)}")
+        if "optional" in slot and not isinstance(slot["optional"], bool):
+            errors.append(f"{w}.optional: must be true or false")
+        if slot.get("optional") is True:
+            seen_optional = True
+        else:
+            required += 1
+            if seen_optional:
+                errors.append(f"{w}: a required slot cannot follow an optional one (optional slots are trailing)")
+    if is_int(spec.get("capacity")) and len(slots) != spec["capacity"]:
+        errors.append(f"{sw}: must have one slot per item (capacity {spec['capacity']})")
+    if is_int(spec.get("min_items")) and required != spec["min_items"]:
+        errors.append(f"{where}.min_items: must equal the number of required slots ({required})")
 
 
 def normalise_layout(spec) -> dict:
     """The v2 form of a layout entry; a schema 1 integer is the capacity of an instrument layout."""
     if isinstance(spec, dict):
-        return {"capacity": spec["capacity"], "min_items": spec["min_items"],
-                "shapes": list(spec["shapes"]), "types": list(spec["types"])}
+        out = {"capacity": spec["capacity"], "min_items": spec["min_items"],
+               "shapes": list(spec["shapes"]), "types": list(spec["types"])}
+        if "slots" in spec:
+            out["slots"] = [{**slot, **{k: list(slot[k]) for k in ("types", "needs") if k in slot}}
+                            for slot in spec["slots"]]
+        return out
     return {"capacity": spec, "min_items": 1, "shapes": list(SHAPES), "types": ["instrument"]}
 
 
@@ -523,6 +586,7 @@ def validate_config(cfg, registry) -> list[str]:
                             errors.append(f"{pw}.items: layout {layout!r} needs at least "
                                           f"{spec['min_items']} item(s)")
                         seen: set = set()
+                        slots = spec.get("slots") if spec is not None else None
                         for ii, item in enumerate(items):
                             if not isinstance(item, str) or (item not in valid_ids
                                                              and item not in notification_ids):
@@ -534,6 +598,12 @@ def validate_config(cfg, registry) -> list[str]:
                             else:
                                 seen.add(item)
                                 kind = "instrument" if item in valid_ids else "notification"
+                                slot = slots[ii] if slots and ii < len(slots) else None
+                                if slot is not None:
+                                    problem = _slot_problem(slot, kind, item, layout, instruments)
+                                    if problem:
+                                        errors.append(f"{pw}.items[{ii}] ({slot['role']}): {problem}")
+                                    continue
                                 if spec is not None and kind not in spec["types"]:
                                     errors.append(f"{pw}.items[{ii}]: layout {layout!r} does not accept "
                                                   f"{kind} items ({item!r})")
@@ -543,6 +613,21 @@ def validate_config(cfg, registry) -> list[str]:
                                     errors.append(f"{pw}.items[{ii}]: instrument {item!r} needs min and max "
                                                   f"on layout {layout!r}")
     return errors
+
+
+def _slot_problem(slot: dict, kind: str, item: str, layout: str, instruments) -> str | None:
+    """Why ``item`` cannot fill ``slot`` of ``layout``, or None."""
+    if kind not in slot["types"]:
+        return (f"layout {layout!r} does not accept {kind} items here ({item!r}); "
+                f"this slot takes {' or '.join(slot['types'])}")
+    needs = slot.get("needs", [])
+    if "numeric" in needs and kind != "instrument":
+        return f"{kind} {item!r} is not numeric; this slot needs an instrument"
+    inst = instruments.get(item) if kind == "instrument" and isinstance(instruments, dict) else None
+    if ("min_max" in needs and isinstance(inst, dict)
+            and not all(finite_number(inst.get(k)) for k in ("min", "max"))):
+        return f"instrument {item!r} needs min and max on layout {layout!r}"
+    return None
 
 
 def _no_duplicate_keys(pairs):

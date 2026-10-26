@@ -48,6 +48,7 @@ CONVERSIONS: dict[str, Callable[[float], float]] = {
     "C->Ah": lambda v: v / 3600.0,
     "s->min": lambda v: v / 60.0,
     "s->h": lambda v: v / 3600.0,
+    "negate": lambda v: -v,   # reversed shunt: SignalK current is positive while charging
 }
 
 
