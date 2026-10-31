@@ -1245,12 +1245,16 @@ panel_access() {
 panel_access_preflight() {
     local file uid mode_bits panel_file="$ROOT/config/control-panel.env"
     for file in "$ENV_FILE" "$panel_file"; do
-        [ -f "$file" ] && [ ! -L "$file" ] || { echo "Refusing panel-access: unsafe or missing config file $file." >&2; return 1; }
+        if [ ! -f "$file" ] || [ -L "$file" ]; then
+            echo "Refusing panel-access: unsafe or missing config file $file." >&2
+            return 1
+        fi
         uid=$(stat -c '%u' -- "$file") || return 1
         mode_bits=$(stat -c '%a' -- "$file") || return 1
-        [ "$uid" -eq 0 ] && [ $(( (8#$mode_bits) & 8#022 )) -eq 0 ] || {
-            echo "Refusing panel-access: $file must be root-owned and not group/world-writable." >&2; return 1;
-        }
+        if [ "$uid" -ne 0 ] || [ $(( (8#$mode_bits) & 8#022 )) -ne 0 ]; then
+            echo "Refusing panel-access: $file must be root-owned and not group/world-writable." >&2
+            return 1
+        fi
     done
     [ "${1:-1}" -eq 0 ] || [ -n "$(env_file_value "$panel_file" CONTROL_PANEL_TOKEN)" ] || {
         echo "Refusing panel-access: non-empty CONTROL_PANEL_TOKEN is required in $panel_file." >&2; return 1;

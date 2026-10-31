@@ -195,7 +195,10 @@ fi
 export FAKE_CALL_LOG="$TEST_ROOT/panel-calls.log"
 run_ctl panel-access lan >/dev/null
 grep -qx 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"
-! grep -qv 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"
+if grep -qv 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"; then
+    echo 'panel-access made an unexpected service call' >&2
+    exit 1
+fi
 grep -q '^CONTROL_PANEL_HOST=0.0.0.0$' "$APP_ROOT/config/vesselstack.env"
 grep -q '^CONTROL_PANEL_HOST=0.0.0.0$' "$APP_ROOT/config/control-panel.env"
 grep -q '^CONTROL_PANEL_PORT=8780$' "$APP_ROOT/config/control-panel.env"

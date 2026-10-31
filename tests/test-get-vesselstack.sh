@@ -340,9 +340,9 @@ run() {  # args... (stdin is never a terminal)
 fail_test() { echo "FAIL: $1" >&2; echo "--- output ---" >&2; cat "$OUT" >&2; echo "--- calls ---" >&2; cat "$LOG" >&2; exit 1; }
 # The convenience alias must be translated at parse time, preserving ordering
 # with ordinary --set values so the last explicit setting wins.
-alias_line=$(grep -n -- '--panel-lan) SETS+=("CONTROL_PANEL_HOST=0.0.0.0")' "$GET" | cut -d: -f1)
-set_line=$(grep -n -- 'SETS+=("$2")' "$GET" | head -n1 | cut -d: -f1)
-[ -n "$alias_line" ] && [ -n "$set_line" ] || fail_test "panel-lan alias parser missing"
+alias_line=$(grep -n -- "--panel-lan) SETS+=(\"CONTROL_PANEL_HOST=0.0.0.0\")" "$GET" | cut -d: -f1)
+set_line=$(grep -n -- "SETS+=(\"\$2\")" "$GET" | head -n1 | cut -d: -f1)
+if [ -z "$alias_line" ] || [ -z "$set_line" ]; then fail_test "panel-lan alias parser missing"; fi
 [ "$alias_line" -gt "$set_line" ] || fail_test "panel-lan alias parser ordering changed"
 expect_rc() { [ "$RC" -eq "$1" ] || fail_test "$2 (exit $RC, wanted $1)"; }
 expect_out() { grep -qE -- "$1" "$OUT" || fail_test "output lacks /$1/"; }
