@@ -12,7 +12,8 @@ BACKUP_ROOT="$TEST_ROOT/backups"
 FAKE_BIN="$TEST_ROOT/bin"
 SYSTEM_ROOT="$TEST_ROOT/system-root"
 install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_BIN" \
-    "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin"
+    "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin" \
+    "$DATA_ROOT/grafana" "$DATA_ROOT/influxdb"
 
 cat > "$APP_ROOT/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$APP_ROOT
@@ -800,8 +801,10 @@ fi
 # LAN changes re-apply only selected services, and re-adding the component starts
 # it without disturbing the retained data directory.
 printf 'VESSELSTACK_DISABLED_COMPONENTS=grafana\n' >> "$LAN_ROOT/config/vesselstack.env"
+run_lan local >/dev/null 2>&1
 : > "$TEST_ROOT/lan-calls.log"
 run_lan dashboards >/dev/null 2>&1
+grep -q 'compose .* up -d .*homeassistant' "$TEST_ROOT/lan-calls.log"
 if grep -Eq 'compose .* up -d .*grafana|compose .* up -d grafana' "$TEST_ROOT/lan-calls.log"; then
     echo 'LAN re-apply started removed Grafana' >&2
     exit 1
@@ -823,8 +826,8 @@ grep -qx 'influx data sentinel' "$DATA_ROOT/influxdb/component-sentinel"
 
 # Invalid membership and duplicate entries are rejected before any file or
 # service mutation.
-before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
 sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=grafana,grafana/' "$APP_ROOT/config/vesselstack.env"
+before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
 if run_ctl start >/dev/null 2>&1; then echo 'duplicate component was accepted' >&2; exit 1; fi
 [ "$before" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ] || {
     echo 'duplicate validation mutated the config' >&2; exit 1;

@@ -3269,6 +3269,10 @@ tests verify the whole base chain is root-controlled and fail clearly otherwise;
 the product check is unchanged. The directory is left empty after a run and can
 be removed with `sudo rmdir /usr/local/share/vs-test`.
 
+The lifecycle and installer regression tests cover persisted component
+exclusions, filtered LAN re-apply, retained data, optional-service selection,
+and offline-safe startup behavior.
+
 `tests/test-get-vesselstack.sh` simulates "Docker absent" by running the
 bootstrap under an isolated `PATH` made of its stubs and symlinks to every host
 tool except `docker*`, so the result no longer depends on whether the host (for
