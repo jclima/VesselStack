@@ -1,23 +1,104 @@
 # VesselStack
 
-Self-hosted monitoring, automation, and diagnostics for connected boats.
-VesselStack targets Raspberry Pi OS and Debian-family boat computers and
-combines Home Assistant, SignalK-compatible history, Grafana, MQTT,
-infrastructure monitoring, and a local diagnostic assistant.
+![VesselStack architecture](docs/images/vesselstack-hero.svg)
 
-New build? Start with the [hardware bill of materials](docs/BOM.md), then follow
-the illustrated [end-to-end installation and commissioning guide](docs/INSTALLATION.md).
-It covers Raspberry Pi 5 assembly, marine power, isolated NMEA 2000/SocketCAN,
-backbone connection, acceptance tests, backup, and rollback.
+VesselStack is a private, self-hosted companion for your boat. It keeps useful
+boat data, dashboards, automation, and diagnostics together on a Raspberry Pi
+you control—at home, in the lab, or aboard. It is designed to keep working on
+the boat's local network when the internet is unavailable.
 
-Deploying a release to a home-lab Pi and an offline boat Pi? Follow the
-[deployment runbook](docs/DEPLOYMENT.md): SSH release signing and the signed
-`v0.4.0` tag, a clean build with recorded sha256, a home-lab soak and rehearsals
-(update, backup/restore, offline install, `vcan` replay), the carry bundle,
-dock-side install with `VESSELSTACK_OFFLINE=true vesselstackctl update DIR`, rollback, an
-acceptance checklist and known gaps. It is documentation only; it changes no
-code, configuration or runtime behaviour, so there is nothing to roll back
-beyond deleting the file.
+## What you get
+
+- A local view of boat data from Signal K-compatible sources and supported NMEA
+  2000/SocketCAN hardware.
+- History and dashboards through InfluxDB, Grafana, MQTT, and Home Assistant.
+- Boat Chat, a local diagnostic assistant with an optional provider you choose.
+- A guided installer, backups, health checks, and an offline release path.
+
+VesselStack is monitoring and diagnostics software. It is not certified
+navigation, collision avoidance, engine control, or a sole alarm system.
+
+![VesselStack local data flow](docs/images/vesselstack-map.svg)
+
+### What runs locally
+
+| Purpose | Local service or view | Typical use |
+|---|---|---|
+| Boat data | Signal K-compatible history and MQTT | Collect and share readings on the boat LAN |
+| History | InfluxDB and Grafana | Explore trends and dashboards |
+| Home automation | Home Assistant | Connect boat signals to automations |
+| Diagnostics | Boat Chat | Ask questions about the data and system |
+| Operations | Control Panel and `vesselstackctl` | Check health, configure, update, and back up |
+
+Boat Chat defaults to a local provider. Other providers are optional and may
+need internet access or their own credentials; VesselStack does not promise
+that every provider works offline. The optional [instrument displays preview](displays/README.md)
+is another separately enabled local feature.
+
+### Optional VesselTwin connection
+
+An optional VesselTwin connection uses the separately installed
+`signalk-vesseltwin` plugin, pairing, and explicit reading opt-ins. VesselStack
+does not enable it for you. See the [VesselTwin integration guide](docs/VESSELTWIN.md)
+for setup and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals
+and service records.
+
+## Choose your path
+
+| If you are… | Start here |
+|---|---|
+| Building a new Pi | [Hardware bill of materials](docs/BOM.md), then the [installation guide](docs/INSTALLATION.md) |
+| Adding VesselStack to an existing Pi | [Getting started](docs/GETTING_STARTED.md), then [installation](docs/INSTALLATION.md) |
+| Releasing to a lab and an offline boat | [Deployment runbook](docs/DEPLOYMENT.md) |
+| Developing or validating changes | [Development guide](docs/DEVELOPMENT.md) |
+
+## Quick start for an internet-connected Pi
+
+The normal first install is headless: the Pi needs no screen, keyboard, or
+browser. From your laptop, SSH to the Pi with a terminal allocation, then run
+the release installer and answer its short questions:
+
+```bash
+ssh -t YOUR_USER@raspberrypi.local
+curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
+```
+
+The installer checks the host before changing it. It may install Debian
+prerequisites and, after asking, Docker Engine and Compose v2 from Docker's
+official apt repository. It then downloads and checksum-verifies the release,
+asks for boat and service settings, and offers a final review before starting
+VesselStack. `sudo` is required because installation writes system packages,
+services, and `/opt/vesselstack`; the questions explain each change. Secrets
+are generated or entered without echo and are not printed in the review.
+
+To pin a specific release, use the [installation guide](docs/INSTALLATION.md).
+For a boat with no internet, prepare the release and offline bundle in the lab
+and follow the [offline deployment path](docs/DEPLOYMENT.md).
+
+## Before and after installation
+
+Before installation, decide where the Pi will live, how it will be powered,
+and whether its data disk and backups are separate from the boot media. If you
+connect to NMEA 2000, confirm the bus is correctly powered and terminated and
+that the interface is galvanically isolated. Commission on the bench first.
+
+After installation, use the printed URLs from a trusted local device, run
+`sudo vesselstackctl doctor`, and confirm the dashboards show the signals you expect.
+Keep the generated credentials per host, schedule backups to a separate device,
+and test restoring one before relying on the system. Read the deployment guide
+before carrying an update to a boat without internet access.
+
+## Find your next answer
+
+The [documentation index](docs/README.md) maps common tasks to the right guide,
+including first boot, access, offline operation, troubleshooting, privacy, and
+contribution. The full setup and operations reference below remains available
+for exact commands, settings, ports, security details, and rollback procedures.
+
+<details>
+<summary>Full setup, configuration and operations reference</summary>
+
+<!-- The reference below is intentionally retained verbatim for compatibility. -->
 
 ## Quick start: one command on the Raspberry Pi
 
@@ -3483,3 +3564,5 @@ separate reviewed release workflow. The launcher, helper and config stay install
 locally across Git pulls; they change only when you run a reviewed release's
 `install.sh` (the update flow never replaces its own helper).
 See [development/update details](docs/DEVELOPMENT.md).
+
+</details>
