@@ -3,6 +3,17 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.2 - 2026-10-31
+
+- Lab prerelease: fix the real bridge's retained MQTT connection state for
+  SignalK, preserving the state across broker reconnects and clean shutdown;
+  component status topics now become known during startup and the full
+  component lifecycle feature set is available in the lab release.
+- Release status: annotated unsigned tag `v0.5.2`, authorized for lab use and
+  not latest. CI-generated asset checksums must be verified before publishing;
+  physical Raspberry Pi tests remain pending. This is not a stable promotion
+  or a cryptographically signed release.
+
 ## 0.5.1 - 2026-10-31
 
 - Lab prerelease: add a persistent six-component catalog for Home Assistant,
@@ -16,10 +27,11 @@ Semantic Versioning.
   installation state; do not edit state files by hand. Removing Grafana does
   not delete its data, and adding Grafana again restores its component
   membership.
-- Release status: annotated unsigned tag `v0.5.1`, published as a lab
-  prerelease and not latest. CI-generated asset checksums must be verified
-  before publishing; no physical Raspberry Pi test is claimed here. This is not
-  a stable promotion or a cryptographically signed release.
+- Release status: annotated unsigned tag `v0.5.1` exists but was not published;
+  its release pipeline was blocked by the bridge startup-status race. CI asset
+  checksums were not a release-publish claim, and physical Raspberry Pi testing
+  remained pending. This is not a stable promotion or a cryptographically
+  signed release.
 
 ## 0.5.0 - 2026-10-26
 

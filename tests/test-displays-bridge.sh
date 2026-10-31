@@ -145,6 +145,18 @@ docker run --rm --network none -v "$VENV_VOL:/venv" \
     || fail "re-running the venv helper offline failed although the requirements are satisfied"
 pass
 
+# Run the publisher regressions in the exact venv used by the bridge.  These are
+# intentionally a hard gate here: the host's dependency-free unit run may skip
+# them, but the integration image must prove the pinned Paho 2.1.0 callback and
+# publish behavior.
+docker run --rm --network none "${UNPRIV[@]}" -v "$REPO_ROOT:/source:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
+    /venv/bin/python /source/tests/test_mqtt_publisher.py 2>&1 | tee "$TEST_ROOT/mqtt-publisher.log"
+grep -q 'Ran [0-9][0-9]* tests' "$TEST_ROOT/mqtt-publisher.log" \
+    || fail "publisher regression suite did not run"
+! grep -q 'skipped=' "$TEST_ROOT/mqtt-publisher.log" \
+    || fail "publisher regression suite skipped a critical Paho case"
+pass
+
 docker run -d --name "$BROKER" --network "$NETWORK" \
     -v "$ROOT/config/mosquitto:/mosquitto/config:ro" \
     -v "$PDIR:/mosquitto/data" -v "$AUTH_SRC:/mosquitto/auth:ro" "$IMAGE" >/dev/null
