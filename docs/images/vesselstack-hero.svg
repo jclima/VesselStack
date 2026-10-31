@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 560" role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">VesselStack — your boat, one connected view</title>
+  <desc id="hero-desc">A stylized boat connects to an onboard Raspberry Pi, local dashboards and history, with an optional dashed connection to VesselTwin.</desc>
+  <defs>
+    <linearGradient id="hero-bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#081b2b"/><stop offset="1" stop-color="#10384a"/></linearGradient>
+    <linearGradient id="hero-sea" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#42c7bf" stop-opacity=".18"/><stop offset="1" stop-color="#42c7bf" stop-opacity="0"/></linearGradient>
+    <linearGradient id="hero-boat" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f5fbf8"/><stop offset="1" stop-color="#9bd9d0"/></linearGradient>
+    <filter id="hero-shadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#020b13" flood-opacity=".35"/></filter>
+    <marker id="hero-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#7edbd0"/></marker>
+    <pattern id="hero-grid" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" fill="none" stroke="#b8eee7" stroke-opacity=".07"/></pattern>
+  </defs>
+  <rect width="1440" height="560" rx="28" fill="url(#hero-bg)"/>
+  <rect width="1440" height="560" rx="28" fill="url(#hero-grid)"/>
+  <path d="M0 378C180 294 332 424 512 350S858 290 1044 365s250 32 396-32V560H0Z" fill="url(#hero-sea)"/>
+  <path d="M0 426C188 350 318 473 520 405s318-68 502 2 265 30 418-28" fill="none" stroke="#71d6cc" stroke-opacity=".2" stroke-width="2"/>
+  <g fill="#dff8f2" font-family="Inter, ui-sans-serif, system-ui, -apple-system, sans-serif">
+    <text x="86" y="88" font-size="15" letter-spacing="3" fill="#7edbd0">ON BOARD · OPEN SOURCE · OWNER CONTROLLED</text>
+    <text x="82" y="168" font-size="62" font-weight="700" letter-spacing="-2">VesselStack</text>
+    <text x="86" y="222" font-size="29" fill="#a8d8d3">Your boat. One connected view.</text>
+    <text x="86" y="278" font-size="17" fill="#a9c5c6">Keep useful boat data close at hand —</text>
+    <text x="86" y="304" font-size="17" fill="#a9c5c6">local first, understandable, and yours to connect.</text>
+  </g>
+  <g transform="translate(575 94)">
+    <rect width="268" height="196" rx="20" fill="#102f3c" stroke="#4bbdb5" stroke-width="2"/>
+    <circle cx="32" cy="32" r="6" fill="#ef8f82"/><circle cx="52" cy="32" r="6" fill="#f4c56d"/><circle cx="72" cy="32" r="6" fill="#7edbd0"/>
+    <rect x="24" y="58" width="220" height="110" rx="10" fill="#082333" stroke="#275364"/>
+    <path d="M42 143h184M42 127h184M42 111h184" stroke="#295967" stroke-width="1"/>
+    <path d="M46 133c30-42 53 13 78-20s42 28 64-4 32-13 46-30" fill="none" stroke="#7edbd0" stroke-width="3"/>
+    <path d="M45 151c30-15 48-6 76-17s47 12 74-2 35 3 54-10" fill="none" stroke="#ef8f82" stroke-width="3" opacity=".9"/>
+    <text x="24" y="184" font-size="12" fill="#9ed3ce" font-family="Inter, ui-sans-serif, system-ui, sans-serif">ONBOARD DASHBOARD · LOCAL HISTORY</text>
+  </g>
+  <g transform="translate(898 98)">
+    <rect width="214" height="188" rx="18" fill="#f1f8f5"/>
+    <rect x="16" y="16" width="182" height="30" rx="8" fill="#d5eee9"/>
+    <circle cx="32" cy="31" r="5" fill="#42b8ae"/><text x="48" y="36" font-size="12" fill="#174351" font-family="Inter, ui-sans-serif, system-ui, sans-serif">VESSELSTACK / HOME</text>
+    <rect x="18" y="62" width="83" height="104" rx="9" fill="#e0f2ee"/><rect x="112" y="62" width="84" height="48" rx="9" fill="#fff0ea"/><rect x="112" y="119" width="84" height="47" rx="9" fill="#e8edf1"/>
+    <path d="M32 144c13-32 20-22 31-44s20 23 30-8" fill="none" stroke="#218c87" stroke-width="3"/><circle cx="37" cy="82" r="6" fill="#42b8ae"/><text x="49" y="87" font-size="10" fill="#174351" font-family="Inter, ui-sans-serif, system-ui, sans-serif">HISTORY</text><text x="125" y="88" font-size="10" fill="#7f493f" font-family="Inter, ui-sans-serif, system-ui, sans-serif">CHECKLISTS</text><text x="125" y="145" font-size="10" fill="#405565" font-family="Inter, ui-sans-serif, system-ui, sans-serif">SENSORS</text>
+  </g>
+  <g transform="translate(584 328)">
+    <path d="M0 67c24 37 85 51 160 51h101c70 0 111-18 131-51l-22 1-22-18H36L16 68Z" fill="url(#hero-boat)" stroke="#d2eee8" stroke-width="3"/>
+    <path d="M61 49V11h81v38" fill="#183c4a" stroke="#7edbd0" stroke-width="3"/><path d="M75 49V27h53v22" fill="#76cbc5" opacity=".55"/><path d="M102 11V-29" stroke="#dff8f2" stroke-width="3"/><path d="M104-28L168 5h-64Z" fill="#ef8f82" opacity=".9"/>
+    <path d="M37 78h254" stroke="#438e91" stroke-width="4"/><circle cx="68" cy="96" r="5" fill="#ef8f82"/><circle cx="236" cy="96" r="5" fill="#ef8f82"/>
+  </g>
+  <g stroke="#7edbd0" stroke-width="2.5" fill="none" marker-end="url(#hero-arrow)"><path d="M848 192h42"/><path d="M760 328v-36"/><path d="M1002 328V286"/></g>
+  <g transform="translate(1170 116)"><rect width="190" height="126" rx="18" fill="#193b4b" stroke="#ef8f82" stroke-width="2" stroke-dasharray="7 6"/><circle cx="34" cy="35" r="15" fill="#ef8f82" fill-opacity=".18" stroke="#ef8f82"/><path d="M27 35h14M34 28v14" stroke="#ef8f82" stroke-width="2"/><text x="61" y="39" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15" fill="#f5d6d0">VesselTwin</text><text x="20" y="77" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#a9c5c6">OPTIONAL INTEGRATION</text><text x="20" y="97" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12" fill="#a9c5c6">availability varies</text></g>
+  <path d="M1113 188h51" fill="none" stroke="#ef8f82" stroke-width="2" stroke-dasharray="7 7"/><text x="1163" y="280" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="12" text-anchor="middle" fill="#8fb6b8">opt-in link</text>
+  <g transform="translate(86 474)" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="13" fill="#a9c5c6"><circle cx="8" cy="-4" r="5" fill="#7edbd0"/><text x="22" y="0">Raspberry Pi / local services</text><circle cx="258" cy="-4" r="5" fill="#ef8f82"/><text x="272" y="0">Cloud connection is always your choice</text></g>
+</svg>
