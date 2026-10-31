@@ -3,7 +3,8 @@
 Canonical offline brand assets for the VesselStack owner-operated chart-room
 identity:
 
-- `icon.svg` — navy rounded-square icon with teal stacked hull/system layers.
+- `icon.svg` — canonical Rising Decks icon: a navy rounded square with a wide
+  white hull below two ascending teal decks.
 - `wordmark.svg` — icon and VesselStack wordmark.
 - `github-banner.svg` — 1280×640 social/banner artwork.
 - `github-banner.png` — rendered 1280×640 upload-ready banner.

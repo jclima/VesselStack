@@ -18,7 +18,8 @@ system font fallbacks. Keyboard focus remains visible, controls meet mobile
 touch-target sizing, and reduced-motion preferences are respected.
 
 Canonical icon, wordmark, banner, palette, and social-upload limitations live
-in [`brand/README.md`](brand/README.md).
+in [`brand/README.md`](brand/README.md). The canonical Rising Decks icon uses a
+wide white hull below two ascending teal decks on a navy rounded square.
 
 Run these checks to verify the change:
 
