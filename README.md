@@ -35,6 +35,24 @@ need internet access or their own credentials; VesselStack does not promise
 that every provider works offline. The optional [instrument displays preview](displays/README.md)
 is another separately enabled local feature.
 
+### Component lifecycle
+
+The Control Panel and `vesselstackctl` manage the six core components as a
+persistent, reviewable catalog: Home Assistant, InfluxDB, Grafana, Prometheus,
+Mosquitto, and Heimdall. Components can be added or removed without deleting
+their retained user data. Membership survives restarts, upgrades, and a
+reinstall; updates re-apply the selected membership rather than silently
+enabling removed services.
+
+Use the Control Panel's component view (normally reached at
+`http://127.0.0.1:8780` through an SSH tunnel) or the corresponding
+`vesselstackctl` commands to review and apply a change. Adding a component
+provisions required InfluxDB/MQTT integration when applicable; removing one may
+leave integrations degraded until it is added again, but does not auto-configure
+or delete unrelated services. Hardware and systemd services remain
+configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
+for the release acceptance recipe.
+
 ### Optional VesselTwin connection
 
 An optional VesselTwin connection uses the separately installed
@@ -232,9 +250,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.0/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.0 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.1/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.1 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.1
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -376,7 +394,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.0
+git checkout v0.5.1
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -518,7 +536,7 @@ For a stable release, use a published tag:
 
 ```bash
 git fetch --tags
-git checkout v0.5.0
+git checkout v0.5.1
 ```
 
 ## 4. Configure the vessel
@@ -3566,3 +3584,22 @@ locally across Git pulls; they change only when you run a reviewed release's
 See [development/update details](docs/DEVELOPMENT.md).
 
 </details>
+
+### Selective core component lifecycle
+
+The installed `VESSELSTACK_DISABLED_COMPONENTS` setting is a comma-separated
+list of core services to exclude: `homeassistant`, `influxdb`, `grafana`,
+`prometheus`, `mosquitto`, and `heimdall`. Empty (the default) starts all six;
+unknown or duplicate IDs are rejected. `install.sh --start` and
+`vesselstackctl start` pass only selected services to Compose, preserve offline
+`--pull never`, and skip InfluxDB provisioning and Mosquitto force-recreation
+when those services are disabled.
+
+Use `sudo vesselstackctl component remove ID` to persist a removal and run
+`docker compose rm --stop --force ID` without deleting volumes, or
+`sudo vesselstackctl component add ID` to persist inclusion and start it. Adding
+Mosquitto refreshes its managed access files; adding InfluxDB runs its bootstrap
+when available. Do not edit the membership field in the Control Panel directly;
+use its Components controls. CLI and Control Panel lifecycle operations should
+be run one at a time because external CLI requests are not cross-process
+serialized.

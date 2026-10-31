@@ -892,4 +892,21 @@ fi
 grep -q 'is a symlink' "$TEST_ROOT/sk-link.stderr"
 rm -f -- "$DATA3/signalk"
 
+# Installer --start honors persisted component exclusions. Influx bootstrap is
+# skipped, and an excluded broker is neither force-recreated nor stamped.
+printf '\nVESSELSTACK_DISABLED_COMPONENTS="influxdb,mosquitto"\n' >> "$CONFIG"
+rm -f -- "$APP_ROOT/config/.mosquitto-conf.sha256"
+: > "$FAKE_BIN/docker.log"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" --start >/dev/null
+if grep -Eq 'compose .* up -d .*influxdb|compose .* up -d influxdb|bootstrap-influx' "$FAKE_BIN/docker.log"; then
+    echo 'excluded InfluxDB was started or bootstrapped' >&2
+    exit 1
+fi
+if grep -Eq 'force-recreate mosquitto|compose .* up -d .*mosquitto' "$FAKE_BIN/docker.log"; then
+    echo 'excluded Mosquitto was started or recreated' >&2
+    exit 1
+fi
+test ! -e "$APP_ROOT/config/.mosquitto-conf.sha256"
+
 echo "clean installation checks passed"

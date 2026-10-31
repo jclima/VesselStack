@@ -50,7 +50,8 @@ cp "$REPO_ROOT/scripts/memory-index.sh" "$APP_ROOT/installer/scripts/memory-inde
 printf '0.3.0\n' > "$APP_ROOT/config/installed-version"
 # The real credential helper runs against the fake docker below.
 for helper in configure-hardware.sh bootstrap-influx.sh; do
-    printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
+    # shellcheck disable=SC2016
+    printf '#!/bin/bash\nprintf "%%s\\n" "$(basename "$0")" >> "%s/helper.log"\nexit 0\n' "$TEST_ROOT" > "$APP_ROOT/installer/scripts/$helper"
     chmod +x "$APP_ROOT/installer/scripts/$helper"
 done
 
@@ -778,6 +779,72 @@ test -e "$DATA_ROOT/state.txt"
 
 if run_ctl status unexpected >/dev/null 2>&1; then
     echo 'Lifecycle command silently ignored an extra argument' >&2
+    exit 1
+fi
+
+# Core component membership is durable: removing a service removes only its
+# container, leaves its data mount intact, and filters every later re-apply.
+printf 'grafana data sentinel\n' > "$DATA_ROOT/grafana/component-sentinel"
+: > "$FAKE_BIN/calls.log"
+run_ctl component remove grafana >/dev/null
+grep -q 'docker compose.*rm --stop --force grafana' "$FAKE_BIN/calls.log"
+grep -qx 'grafana data sentinel' "$DATA_ROOT/grafana/component-sentinel"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana$' "$APP_ROOT/config/vesselstack.env"
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+if grep -Eq 'compose .* up -d .*grafana|compose .* up -d grafana' "$FAKE_BIN/calls.log"; then
+    echo 'start reintroduced removed Grafana' >&2
+    exit 1
+fi
+
+# LAN changes re-apply only selected services, and re-adding the component starts
+# it without disturbing the retained data directory.
+printf 'VESSELSTACK_DISABLED_COMPONENTS=grafana\n' >> "$LAN_ROOT/config/vesselstack.env"
+: > "$TEST_ROOT/lan-calls.log"
+run_lan dashboards >/dev/null 2>&1
+if grep -Eq 'compose .* up -d .*grafana|compose .* up -d grafana' "$TEST_ROOT/lan-calls.log"; then
+    echo 'LAN re-apply started removed Grafana' >&2
+    exit 1
+fi
+run_ctl component add grafana >/dev/null
+grep -q 'docker compose.*up -d grafana' "$FAKE_BIN/calls.log"
+grep -qx 'grafana data sentinel' "$DATA_ROOT/grafana/component-sentinel"
+
+# Re-adding stateful services uses the existing provisioners and leaves their
+# existing data roots in place.
+printf 'influx data sentinel\n' > "$DATA_ROOT/influxdb/component-sentinel"
+run_ctl component remove influxdb >/dev/null
+run_ctl component remove mosquitto >/dev/null
+: > "$TEST_ROOT/helper.log"
+run_ctl component add influxdb >/dev/null
+grep -q '^bootstrap-influx.sh$' "$TEST_ROOT/helper.log"
+run_ctl component add mosquitto >/dev/null
+grep -qx 'influx data sentinel' "$DATA_ROOT/influxdb/component-sentinel"
+
+# Invalid membership and duplicate entries are rejected before any file or
+# service mutation.
+before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=grafana,grafana/' "$APP_ROOT/config/vesselstack.env"
+if run_ctl start >/dev/null 2>&1; then echo 'duplicate component was accepted' >&2; exit 1; fi
+[ "$before" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ] || {
+    echo 'duplicate validation mutated the config' >&2; exit 1;
+}
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=not-a-component/' "$APP_ROOT/config/vesselstack.env"
+before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+if run_ctl start >/dev/null 2>&1; then echo 'unknown component was accepted' >&2; exit 1; fi
+[ "$before" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ] || {
+    echo 'unknown validation mutated the config' >&2; exit 1;
+}
+
+# With all six core services disabled, optional Docker SignalK/AIS remain
+# selectable and no bare Compose up is emitted.
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=homeassistant,influxdb,grafana,prometheus,mosquitto,heimdall/' "$APP_ROOT/config/vesselstack.env"
+printf 'SIGNALK_MODE=docker\nAIS_ENABLE=true\n' >> "$APP_ROOT/config/vesselstack.env"
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+grep -q 'docker compose.*up -d signalk ais-catcher' "$FAKE_BIN/calls.log"
+if grep -Eq 'docker compose.* up -d$|docker compose.* up -d --' "$FAKE_BIN/calls.log"; then
+    echo 'all-disabled start emitted a bare Compose up' >&2
     exit 1
 fi
 
