@@ -34,7 +34,7 @@ class WizardTests(unittest.TestCase):
         values = wizard.DEFAULTS.copy()
         self.assertEqual(wizard.normalize(field, "1", values)[0], "127.0.0.1")
         self.assertEqual(wizard.normalize(field, "2", values)[0], "0.0.0.0")
-        for custom in ("192.168.1.25", "2001:db8::25"):
+        for custom in ("192.0.2.10", "2001:db8::25"):
             wizard.apply_settings(values, [f"CONTROL_PANEL_HOST={custom}"])
             self.assertEqual(values["CONTROL_PANEL_HOST"], custom)
         for invalid in ("hostname", "3", "999"):
