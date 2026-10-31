@@ -24,7 +24,10 @@ Commands:
   lan [local|dashboards|all] [--dry-run] [--yes] [--allow-firewall-conflict]
                                Show or change who on the network can reach the dashboards
                                (rewrites the bind settings, re-applies; the control panel
-                               always stays on this device)
+                               leaves the control-panel setting unchanged)
+  panel-access [local|lan] [--dry-run]
+                               Bind the administration control panel to this device
+                               or all interfaces (never changes other listeners)
   ha-http sync|status          Re-apply or show the managed Home Assistant http bind block
                                (HOMEASSISTANT_BIND_ADDRESS); used by the installer and lan
   reindex                      Rebuild Boat Chat's memory index as the service user
@@ -486,12 +489,14 @@ url_host_port() {
 }
 
 show_urls() {
-    local chat_host panel_host data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
+    local chat_host panel_host panel_port data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
     local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} host port i
     chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
     chat_host=${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_host=${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}
+    panel_port=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_PORT)
+    panel_port=${panel_port:-${CONTROL_PANEL_PORT:-8780}}
     collect_listeners
     collect_reachable
     printf 'Addresses other devices on this network can use to reach this machine:\n'
@@ -507,9 +512,11 @@ show_urls() {
     printf '\n'
     show_service 'Boat Chat' "${BOAT_CHAT_PORT:-8765}" http "$chat_host" no 'access token required' \
         'to change: sudo vesselstackctl lan dashboards'
-    show_service 'Control Panel' "${CONTROL_PANEL_PORT:-8780}" http "$panel_host" no \
-        'root-level editor, loopback by design' \
-        "to reach it: ssh -L ${CONTROL_PANEL_PORT:-8780}:127.0.0.1:${CONTROL_PANEL_PORT:-8780} USER@HOST (SSH tunnel)"
+    local panel_note='root-level editor'
+    [ "$(bind_kind "$panel_host")" = loopback ] && panel_note='root-level editor, loopback by design'
+    show_service 'Control Panel' "$panel_port" http "$panel_host" no \
+        "$panel_note" \
+        "to reach it: ssh -L ${panel_port}:127.0.0.1:${panel_port} USER@HOST (SSH tunnel)"
     if [ "${SIGNALK_MODE:-existing}" = existing ]; then
         printf '%-20s %s\n' SignalK "existing server, not managed here: $SIGNALK_URL"
     else
@@ -1118,6 +1125,142 @@ EOF
     echo "Done. Check the result with: sudo vesselstackctl urls"
 }
 
+# --- Control panel listener ---------------------------------------------------------
+# This is intentionally separate from `lan`: the panel is a root-level editor and
+# must never be changed as a side effect of dashboard/database LAN presets.
+panel_access() {
+    local mode='' dry_run=0 argument panel_file="$ROOT/config/control-panel.env"
+    local old_env old_panel backup new_host panel_port token panel_url panel_ip
+    for argument in "$@"; do
+        case "$argument" in
+            local|lan) [ -z "$mode" ] || { echo 'panel-access accepts only one mode' >&2; exit 2; }; mode=$argument ;;
+            --dry-run) dry_run=1 ;;
+            *) echo "Unknown panel-access argument: $argument" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+    old_env=$(env_file_value "$ENV_FILE" CONTROL_PANEL_HOST)
+    old_env=${old_env:-127.0.0.1}
+    old_panel=$(env_file_value "$panel_file" CONTROL_PANEL_HOST)
+    old_panel=${old_panel:-$old_env}
+    panel_port=$(env_file_value "$panel_file" CONTROL_PANEL_PORT)
+    panel_port=${panel_port:-${CONTROL_PANEL_PORT:-8780}}
+    panel_ip=''
+    case "$old_panel" in
+        127.*|::1|localhost) panel_ip=127.0.0.1 ;;
+        0.0.0.0|'*'|'::')
+            collect_reachable
+            for panel_ip in "${REACH_HOSTS[@]}"; do
+                [[ "$panel_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && break
+            done
+            [ -n "$panel_ip" ] || panel_ip=$(hostname 2>/dev/null || printf '127.0.0.1')
+            ;;
+        *) panel_ip=$old_panel ;;
+    esac
+    panel_url=$(url_for http "$panel_ip" "$panel_port")
+    if [ -z "$mode" ]; then
+        printf 'Control panel: host=%s port=%s\n' "$old_panel" "$panel_port"
+        printf 'Browser URL: %s\n' "$panel_url"
+        printf 'Token: sudo grep '\''^CONTROL_PANEL_TOKEN='\'' %s\n' "$panel_file"
+        return 0
+    fi
+    case "$mode" in local) new_host=127.0.0.1 ;; lan) new_host=0.0.0.0 ;; esac
+    printf 'Control panel access: %s -> %s (host=%s port=%s)\n' "$old_panel" "$mode" "$new_host" "$panel_port"
+    if [ "$mode" = lan ]; then
+        echo 'WARNING: HTTP is unencrypted; every device on the listening interfaces can reach the panel. A strict firewall may still block access.' >&2
+    fi
+    printf 'Token: sudo grep '\''^CONTROL_PANEL_TOKEN='\'' %s\n' "$panel_file"
+    if [ "$dry_run" -eq 1 ]; then
+        echo 'Dry run: nothing was changed. Run without --dry-run to apply.'
+        return 0
+    fi
+    # Both files are fixed root-owned regular files. Do not create or follow a
+    # replacement path during a privileged listener change.
+    local file uid mode_bits
+    for file in "$ENV_FILE" "$panel_file"; do
+        if [ ! -f "$file" ] || [ -L "$file" ]; then
+            echo "Refusing panel-access: unsafe or missing config file $file (must be a regular non-symlink file)." >&2
+            return 1
+        fi
+        uid=$(stat -c '%u' -- "$file") || { echo "Refusing panel-access: cannot inspect $file." >&2; return 1; }
+        mode_bits=$(stat -c '%a' -- "$file") || { echo "Refusing panel-access: cannot inspect mode for $file." >&2; return 1; }
+        if [ "$uid" -ne 0 ] || [ $(( (8#$mode_bits) & 8#022 )) -ne 0 ]; then
+            echo "Refusing panel-access: $file must be root-owned and not group/world-writable." >&2
+            return 1
+        fi
+    done
+    token=$(env_file_value "$panel_file" CONTROL_PANEL_TOKEN)
+    if [ -z "$token" ]; then
+        echo "Refusing panel-access: non-empty CONTROL_PANEL_TOKEN is required in $panel_file." >&2
+        return 1
+    fi
+    backup=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-panel-access.XXXXXX")
+    cp -p -- "$ENV_FILE" "$backup/vesselstack.env"
+    cp -p -- "$panel_file" "$backup/control-panel.env"
+    if ! { set_env_key "$ENV_FILE" CONTROL_PANEL_HOST "$new_host" && set_env_key "$panel_file" CONTROL_PANEL_HOST "$new_host"; }; then
+        local restore_env=0 restore_panel=0
+        cp -p -- "$backup/vesselstack.env" "$ENV_FILE" || restore_env=1
+        cp -p -- "$backup/control-panel.env" "$panel_file" || restore_panel=1
+        if [ "$restore_env" -ne 0 ] || [ "$restore_panel" -ne 0 ]; then
+            echo "RECOVERY ERROR: configuration write failed and restoration failed (vesselstack.env=$restore_env control-panel.env=$restore_panel). Backups retained at $backup; restore them manually." >&2
+            return 1
+        fi
+        rm -rf -- "$backup"
+        echo "Panel-access failed while writing configuration; previous files were restored. Recovery: verify both config files, then retry panel-access local or panel-access lan." >&2
+        return 1
+    fi
+    if ! systemctl restart vesselstack-control-panel.service; then
+        echo 'Panel-access restart failed; restoring the previous configuration.' >&2
+        local restore_env=0 restore_panel=0 old_restart=0
+        cp -p -- "$backup/vesselstack.env" "$ENV_FILE" || restore_env=1
+        cp -p -- "$backup/control-panel.env" "$panel_file" || restore_panel=1
+        if [ "$restore_env" -ne 0 ] || [ "$restore_panel" -ne 0 ]; then
+            echo "RECOVERY ERROR: could not restore both config files from $backup. Restore them manually, then run: sudo systemctl restart vesselstack-control-panel.service" >&2
+            return 1
+        fi
+        systemctl restart vesselstack-control-panel.service || old_restart=1
+        if [ "$old_restart" -ne 0 ]; then
+            echo "RECOVERY ERROR: old panel configuration was restored but the old service restart failed. Backup retained at $backup. Run: sudo systemctl restart vesselstack-control-panel.service" >&2
+            return 1
+        fi
+        rm -rf -- "$backup"
+        echo 'Panel-access rolled back successfully; the requested mode was not applied.' >&2
+        return 1
+    fi
+    rm -rf -- "$backup"
+    case "$new_host" in
+        127.*|::1|localhost) panel_url=$(url_for http 127.0.0.1 "$panel_port") ;;
+        0.0.0.0)
+            collect_reachable
+            panel_ip=''
+            for panel_ip in "${REACH_HOSTS[@]}"; do
+                [[ "$panel_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && break
+            done
+            [ -n "$panel_ip" ] || panel_ip=$(hostname 2>/dev/null || printf '127.0.0.1')
+            panel_url=$(url_for http "$panel_ip" "$panel_port") ;;
+    esac
+    printf 'Browser URL: %s\n' "$panel_url"
+    echo "Panel-access applied. Verify with: sudo vesselstackctl urls"
+}
+
+panel_access_preflight() {
+    local file uid mode_bits panel_file="$ROOT/config/control-panel.env"
+    for file in "$ENV_FILE" "$panel_file"; do
+        if [ ! -f "$file" ] || [ -L "$file" ]; then
+            echo "Refusing panel-access: unsafe or missing config file $file." >&2
+            return 1
+        fi
+        uid=$(stat -c '%u' -- "$file") || return 1
+        mode_bits=$(stat -c '%a' -- "$file") || return 1
+        if [ "$uid" -ne 0 ] || [ $(( (8#$mode_bits) & 8#022 )) -ne 0 ]; then
+            echo "Refusing panel-access: $file must be root-owned and not group/world-writable." >&2
+            return 1
+        fi
+    done
+    [ "${1:-1}" -eq 0 ] || [ -n "$(env_file_value "$panel_file" CONTROL_PANEL_TOKEN)" ] || {
+        echo "Refusing panel-access: non-empty CONTROL_PANEL_TOKEN is required in $panel_file." >&2; return 1;
+    }
+}
+
 # Warn (never fail) when the data filesystem is more than 80% full. Time-series
 # data grows without bound unless INFLUXDB_RAW_RETENTION is set.
 disk_usage_warning() {
@@ -1621,6 +1764,9 @@ case "$command" in
     help|-h|--help) usage; exit 0 ;;
 esac
 require_root
+if [ "$command" = panel-access ]; then
+    panel_access_preflight 0
+fi
 load_config
 case "$command" in
     status) [ $# -eq 0 ] || { usage; exit 2; }; status_stack ;;
@@ -1629,6 +1775,7 @@ case "$command" in
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
     lan) lan_stack "$@" ;;
+    panel-access) panel_access "$@" ;;
     ha-http) ha_http_command "$@" ;;
     reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;

@@ -89,6 +89,14 @@ from another computer (Grafana, Home Assistant, Boat Chat), the command that sho
 Chat access token and the SSH tunnel hint for the control panel
 (`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
 
+The administration panel remains loopback-only unless explicitly changed. To
+make only that panel reachable on a trusted LAN, use
+`sudo vesselstackctl panel-access lan` (HTTP is unencrypted and a strict
+firewall may block it); restore the default with
+`sudo vesselstackctl panel-access local`. Add `--dry-run` to preview either
+change. The command requires the existing root-owned config files and a
+non-empty panel token, and restarts only the control-panel service.
+
 **Without questions** (scripts, repeatable installs, or when no terminal is available):
 
 ```bash
@@ -105,8 +113,8 @@ installer stops before changing anything and lists these options. `--web-wizard`
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
 The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.5.2/get-vesselstack.sh`, or add
-`--version 0.5.2` (`| sudo bash -s -- --version 0.5.2`). It installs the Debian
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.5.3/get-vesselstack.sh`, or add
+`--version 0.5.3` (`| sudo bash -s -- --version 0.5.3`). It installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, asks the configuration questions in the terminal, then runs the installer dry run, the
@@ -211,7 +219,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.2
+git checkout v0.5.3
 python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
 # python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```
@@ -289,7 +297,8 @@ SSH tunnel), `dashboards` (recommended: Grafana, Heimdall and Boat Chat on your 
 InfluxDB, Prometheus and MQTT stay on the Pi) or `all` (also MQTT, InfluxDB and Prometheus,
 which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later with
 `sudo vesselstackctl lan [local|dashboards|all] [--dry-run]` (`all` needs `--yes`). The
-Control Panel stays on the Pi in every preset. `local` also limits Home Assistant (8123) to the
+LAN presets leave the Control Panel setting unchanged; it remains loopback by default unless
+you explicitly use `vesselstackctl panel-access lan`. `local` also limits Home Assistant (8123) to the
 Pi through a delimited `http:` block the installer manages in its `configuration.yaml` (it never
 touches an `http:` section you wrote yourself and prints the manual step instead). SignalK (3000)
 has no bind-address setting, so no preset restricts it; only the firewall's strict mode can

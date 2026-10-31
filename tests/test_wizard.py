@@ -22,6 +22,24 @@ wizard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wizard)
 
 class WizardTests(unittest.TestCase):
+    def test_control_panel_access_defaults_and_lan_independence(self):
+        self.assertEqual(wizard.DEFAULTS["CONTROL_PANEL_HOST"], "127.0.0.1")
+        for preset in wizard.LAN_PRESETS:
+            values = wizard.DEFAULTS.copy()
+            wizard.apply_settings(values, ["CONTROL_PANEL_HOST=0.0.0.0", f"LAN_ACCESS={preset}"])
+            self.assertEqual(values["CONTROL_PANEL_HOST"], "0.0.0.0")
+
+    def test_control_panel_friendly_choices_and_custom_ip_validation(self):
+        field = wizard.FIELD_INDEX["CONTROL_PANEL_HOST"]
+        values = wizard.DEFAULTS.copy()
+        self.assertEqual(wizard.normalize(field, "1", values)[0], "127.0.0.1")
+        self.assertEqual(wizard.normalize(field, "2", values)[0], "0.0.0.0")
+        for custom in ("192.0.2.10", "2001:db8::25"):
+            wizard.apply_settings(values, [f"CONTROL_PANEL_HOST={custom}"])
+            self.assertEqual(values["CONTROL_PANEL_HOST"], custom)
+        for invalid in ("hostname", "3", "999"):
+            with self.assertRaises(ValueError): wizard.apply_settings(wizard.DEFAULTS.copy(), [f"CONTROL_PANEL_HOST={invalid}"])
+
     def test_component_membership_defaults_empty_and_canonicalizes(self):
         self.assertEqual(wizard.DEFAULTS["VESSELSTACK_DISABLED_COMPONENTS"], "")
         rendered = wizard.render({"VESSELSTACK_DISABLED_COMPONENTS": " grafana, influxdb "})
@@ -147,8 +165,8 @@ class WizardHttpTests(unittest.TestCase):
             self.assertIn(f"['{preset}'", source)
         self.assertIn("Prometheus (NO login at all)", source)
         self.assertIn("Turn on the firewall", source)
-        self.assertIn("control panel always stays on this Pi only", source)
-        self.assertNotIn("CONTROL_PANEL_HOST", source)
+        self.assertIn("control panel has its own access choice", source)
+        self.assertIn("CONTROL_PANEL_HOST", source)
 
     def test_missing_or_wrong_token_is_rejected(self):
         for token in (None, "wrong"):
@@ -348,7 +366,7 @@ class CliWizardTests(unittest.TestCase):
                    "y", "12345", "123456789", "b", "", "ABCD1", "11.5", "3.8",
                    "2", "http://192.0.2.10:3000",
                    "y", "y", "", "",   # CAN on, vcan on (interface becomes vcan0), interface, bitrate
-                   "n", "", "?", "", "1", "y", "y", "", "n", "22,8080", "-", "14d", "", "n", "s"]
+                   "n", "", "?", "", "1", "y", "y", "", "n", "22,8080", "-", "14d", "", "", "n", "s"]
         result, output = drive(answers, strict=True)
         self.assertIsInstance(result, dict, output)
         self.assertEqual(result["BOAT_NAME"], "Sea Wolf")
@@ -403,14 +421,14 @@ class CliWizardTests(unittest.TestCase):
         self.assertNotIn("123456789", output); self.assertNotIn("ABCD1", output)
 
     def test_quit_and_ended_input(self):
-        self.assertIsNone(drive([""] * 16 + ["q"], strict=True)[0])
+        self.assertIsNone(drive([""] * 17 + ["q"], strict=True)[0])
         self.assertEqual(drive([""] * 3, strict=True)[0], "aborted")
-        self.assertEqual(drive([""] * 16, strict=True)[0], "aborted")   # no review answer
+        self.assertEqual(drive([""] * 17, strict=True)[0], "aborted")   # no review answer
 
     def test_edit_a_section_from_the_review(self):
-        result, _ = drive([""] * 16 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
+        result, _ = drive([""] * 17 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
         self.assertEqual(result["BOAT_NAME"], "Edited")
-        result, output = drive([""] * 16 + ["e", "99", "x", "s"], strict=True)
+        result, output = drive([""] * 17 + ["e", "99", "x", "s"], strict=True)
         self.assertIn("Please enter a section number", output)
 
     def test_set_option_uses_the_same_rules(self):
@@ -613,7 +631,7 @@ class CliCommandTests(unittest.TestCase):
     def test_answers_from_a_descriptor_and_early_end(self):
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "vesselstack.env"
-            answers = Path(directory) / "answers"; answers.write_text("Piped Boat\n" + "\n" * 16 + "s\n")
+            answers = Path(directory) / "answers"; answers.write_text("Piped Boat\n" + "\n" * 17 + "s\n")
             with open(answers, "rb") as handle:
                 result = subprocess.run([sys.executable, "-I", str(ROOT / "vesselstack-wizard.py"), "--cli", "--input-fd", str(handle.fileno()), "--output", str(out)],
                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, pass_fds=(handle.fileno(),))
