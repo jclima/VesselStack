@@ -689,7 +689,7 @@ expect_no_web_wizard
 
 # Quitting at the review, and input that ends early, install nothing.
 reset_state
-{ printf 'y\n'; blank 16; printf 'q\n'; } > "$ANSWERS"
+{ printf 'y\n'; blank 17; printf 'q\n'; } > "$ANSWERS"
 run_asking
 expect_rc 1 "quit at the review"
 expect_out "Quit without saving"
@@ -706,7 +706,7 @@ refuse_log "^install "
 
 # Edit a section from the review screen, then save.
 reset_state
-{ printf 'y\n'; blank 16; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
+{ printf 'y\n'; blank 17; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
 run_asking
 expect_rc 0 "edit a section at the review"
 expect_saved "BOAT_NAME='Edited Boat'"
