@@ -8,7 +8,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
     "$ROOT/scripts/migrate.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
-    "$ROOT/tests/test-service-integration.sh"
+    "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-build-package.sh"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
@@ -23,8 +23,23 @@ grep -q 'CONTROL_PANEL_TOKEN' "$ROOT/control-panel/app.py"
 test -s "$ROOT/systemd/vesselstack-control-panel.service.in"
 grep -q 'VesselStack InfluxDB' "$ROOT/templates/grafana/provisioning/datasources/vesselstack.yml"
 python3 -m json.tool "$ROOT/templates/grafana/dashboards/system-health.json" >/dev/null
+# shellcheck disable=SC2016 # Match the literal Compose substitution.
 grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}' "$ROOT/templates/compose.yml"
 grep -q 'ghcr.io/jvde-github/ais-catcher:v0.70' "$ROOT/vesselstack.example.env"
+"$ROOT/tests/test-build-package.sh"
+package_path=$(
+    "$ROOT/build-package.sh"
+)
+package_root="vesselstack-$(<"$ROOT/VERSION")"
+for package_entry in \
+    templates/compose.yml \
+    vesselstack.example.env \
+    scripts/install-signalk-native.sh \
+    systemd/vesselstack-signalk.service.in; do
+    tar -tzf "$package_path" "$package_root/$package_entry" >/dev/null
+done
+tar -xOf "$package_path" "$package_root/templates/compose.yml" | grep -q '^  signalk:$'
+tar -xOf "$package_path" "$package_root/templates/compose.yml" | grep -q '^  ais-catcher:$'
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"

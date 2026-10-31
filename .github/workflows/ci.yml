@@ -36,6 +36,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Static distribution checks
         run: tests/test-distribution.sh
+      - name: Packaging isolation and failure checks
+        run: tests/test-build-package.sh
       - name: Lifecycle backup and restore checks
         run: sudo tests/test-lifecycle.sh
       - name: Versioned migration checks

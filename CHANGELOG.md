@@ -13,6 +13,15 @@ Semantic Versioning.
 - Added a bundled installer snapshot so panel operations do not depend on a
   persistent Git checkout.
 
+### Changed
+
+- Release builds now require and verify the managed Signal K Docker/native
+  assets and the AIS-catcher Compose/configuration assets in every tarball.
+- Release archives now use an explicit public-file manifest. Validation
+  failures leave the previous archive and checksum untouched; after validation,
+  each output file is replaced atomically, but the two replacements are not a
+  single transaction.
+
 ### Security
 
 - Control Panel commands use fixed argument allowlists and serialized

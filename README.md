@@ -20,6 +20,8 @@ infrastructure monitoring, and a local diagnostic assistant.
 | Prometheus | Infrastructure metrics | `http://HOST:9090` |
 | Mosquitto | Authenticated MQTT broker | `HOST:1883` |
 | Heimdall | Local service launcher | `http://HOST` |
+| Signal K | Marine data server; existing, managed Docker, or managed native mode | `http://HOST:3000` |
+| AIS-catcher | SDR AIS receiver and NMEA feed; opt-in when hardware is present | `http://HOST:8100` / `HOST:5011` |
 | Boat Chat | Telemetry-backed diagnostic assistant | `http://HOST:8765` |
 | Control Panel | Component installation, configuration, and lifecycle | `http://127.0.0.1:8780` |
 
@@ -41,6 +43,12 @@ also provides hardware-probed SocketCAN and AIS-catcher modules. Hardware
 modules remain disabled unless explicitly configured. It also includes generic
 Home Assistant alert/dashboard templates and an optional untrusted-interface
 firewall policy.
+
+Every release tarball includes the Signal K Docker definition, native install
+script and systemd unit, plus the AIS-catcher Docker definition and example
+configuration. The package build fails if any of those files or services are
+missing. The pinned runtime images and native npm package are downloaded during
+installation; they are not embedded for offline installation.
 
 ## Supported platform
 
@@ -561,6 +569,16 @@ Build a sanitized release:
 ./build-package.sh
 (cd generated && sha256sum -c vesselstack-1.0.1.tar.gz.sha256)
 ```
+
+The build uses an explicit public-file manifest: runtime settings, generated
+artifacts, repository metadata, and Boat Chat caches are excluded. It verifies
+that the archive contains both managed Signal K install paths and the
+AIS-catcher profile. Validation failures leave the previous archive and
+checksum untouched. After validation, each output file is replaced atomically;
+the two replacements are not a single transaction.
+Run `tests/test-build-package.sh` for isolated positive, exclusion, checksum,
+mode, and failure-preservation checks; `tests/test-distribution.sh` also runs
+this focused packaging gate.
 
 The checksum records only the archive basename, so the archive and `.sha256`
 file can be downloaded and verified together from any directory.
