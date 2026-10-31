@@ -113,3 +113,10 @@ p { color: var(--muted); line-height: 1.6; }
   .component-toolbar { align-items: stretch; flex-direction: column; }
   .search-field { width: 100%; }
 }
+
+/* Chart-room presentation tokens; existing selectors retain behavior. */
+:root { --ink:#0a2341; --muted:#526778; --secondary:#344c61; --panel:#ffffff; --panel-2:#eaf2f6; --line:#d4e0e8; --sea:#006d89; --sea-dark:#00566d; --amber:#8a6218; --red:#b3382e; --bg:#f4f8fa; --success:#1e6f45; font-family:"Public Sans",ui-sans-serif,system-ui,sans-serif; }
+body { background:var(--bg); } h1,h2,h3 { font-family:Archivo,ui-sans-serif,system-ui,sans-serif; } .brand-mark { display:block; background:transparent; color:transparent; }
+body,.topbar { background:var(--bg); color:var(--ink); }.topbar { background:rgba(255,255,255,.96); }.card,.component,.config-section { background:var(--panel); box-shadow:0 14px 34px rgba(10,35,65,.07); } input,select { background:#fff; color:var(--ink); } input:disabled,select:disabled { background:var(--panel-2); color:var(--muted); } code,.operation pre,.pill { background:var(--panel-2); color:var(--secondary); } button.primary { color:#fff; background:var(--sea); } button.primary:hover { color:#fff; background:var(--sea-dark); } .dot.online { background:var(--success); } .pill.active,.pill.running,.pill.succeeded { color:var(--success); } #toast { background:var(--ink); color:#fff; }
+button,input,select { min-height:44px; border-radius:8px; } button:focus-visible,input:focus-visible,select:focus-visible { outline:3px solid #006d89; outline-offset:2px; }
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { transition-duration:.01ms!important; animation-duration:.01ms!important; } }
