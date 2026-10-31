@@ -2,7 +2,7 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.1/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
@@ -24,7 +24,7 @@ set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="0.5.1"
+DEFAULT_VERSION="0.5.2"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
 

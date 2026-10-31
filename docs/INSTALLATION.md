@@ -105,8 +105,8 @@ installer stops before changing anything and lists these options. `--web-wizard`
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
 The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.5.1/get-vesselstack.sh`, or add
-`--version 0.5.1` (`| sudo bash -s -- --version 0.5.1`). It installs the Debian
+Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.5.2/get-vesselstack.sh`, or add
+`--version 0.5.2` (`| sudo bash -s -- --version 0.5.2`). It installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, asks the configuration questions in the terminal, then runs the installer dry run, the
@@ -211,7 +211,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.1
+git checkout v0.5.2
 python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
 # python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```

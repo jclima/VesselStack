@@ -1,6 +1,6 @@
 # Control Panel component lifecycle lab test
 
-This is the release 0.5.1 lab recipe. It is a bounded acceptance test, not
+This is the release 0.5.2 lab recipe. It is a bounded acceptance test, not
 evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
@@ -8,11 +8,11 @@ positions, MMSIs, tokens, logs, and backups out of this repository.
 ## Fetch and verify the pinned prerelease
 
 Download the pinned bootstrap and the CI-generated checksum from the same
-`v0.5.1` GitHub prerelease. Verify before reading or running it:
+`v0.5.2` GitHub prerelease. Verify before reading or running it:
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.1/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.1/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help

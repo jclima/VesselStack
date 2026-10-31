@@ -254,9 +254,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.1/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.1 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.1
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.2 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.2
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -398,7 +398,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.1
+git checkout v0.5.2
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -536,12 +536,16 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-For a stable release, use a published tag:
+For the pinned 0.5.2 lab prerelease, use its annotated unsigned tag (it is not
+the latest release):
 
 ```bash
 git fetch --tags
-git checkout v0.5.1
+git checkout v0.5.2
 ```
+
+This lab prerelease is for authorized lab use only; physical Raspberry Pi
+testing is pending, and it is not a stable or cryptographically signed release.
 
 ## 4. Configure the vessel
 
