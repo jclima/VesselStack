@@ -881,3 +881,22 @@ body[data-view="overview"] #capabilities-open, body[data-view="overview"] #insig
 .message-evidence summary { cursor:pointer; }
 .message-evidence ul { padding-left:1.3em; }
 .feedback-controls { flex-wrap:wrap; }
+
+/* Chart-room presentation tokens; existing selectors retain behavior. */
+:root { --bg:#f4f8fa; --panel:#fff; --panel-soft:#eaf2f6; --border:#d4e0e8; --border-strong:#778b9b; --text:#0a2341; --muted:#526778; --accent:#006d89; --accent-strong:#00566d; --accent-soft:#dceef3; --ok:#1e6f45; --warning:#8a6218; --danger:#b3382e; font-family:"Public Sans",ui-sans-serif,system-ui,sans-serif; }
+body { color:var(--text); background:var(--bg); }
+h1,h2,h3 { font-family:Archivo,ui-sans-serif,system-ui,sans-serif; } button,input,select,textarea { min-height:44px; border-radius:8px; }
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible { outline:3px solid #006d89; outline-offset:2px; }
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { transition-duration:.01ms!important; animation-duration:.01ms!important; } }
+.header-icon { width:42px; height:42px; border-radius:8px; vertical-align:middle; margin-right:10px; }
+.header-brand { display:flex; align-items:center; gap:10px; }
+@media (prefers-color-scheme:dark) {
+  :root { --bg:#0a1826; --panel:#10253a; --panel-soft:#173247; --border:#36536a; --border-strong:#7892a5; --text:#eaf2f6; --muted:#b3c5d0; --accent:#4aaebe; --accent-strong:#72c6ce; --accent-soft:#173d50; --ok:#78c99b; --warning:#e5bd68; --danger:#f08a80; }
+body { background:var(--bg); color:var(--text); }
+  .app-header,.examples,.composer,.message.assistant,.context-drawer,dialog,.dialog-header,.dialog-footer,.settings-section { background:var(--panel); color:var(--text); }
+  button,input,select,textarea { background:var(--panel); color:var(--text); }
+  .message.user { background:var(--accent-soft); border-color:var(--border); }
+  .answer-details,pre,.secondary-button { background:var(--panel-soft); color:var(--text); }
+  .composer #send-button { color:#04121c; }
+  button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible { outline-color:#4aaebe; }
+}

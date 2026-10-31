@@ -1,11 +1,37 @@
 # VesselStack
 
-![VesselStack architecture](docs/images/vesselstack-hero.svg)
+![VesselStack banner](brand/github-banner.png)
 
 VesselStack is a private, self-hosted companion for your boat. It keeps useful
 boat data, dashboards, automation, and diagnostics together on a Raspberry Pi
 you control—at home, in the lab, or aboard. It is designed to keep working on
 the boat's local network when the internet is unavailable.
+
+## Brand and appearance
+
+The Control Panel, Boat Chat, and setup wizard share the VesselStack chart-room
+palette: a light blue-gray canvas, white panels, navy ink, teal actions, and
+restrained status colors. Boat Chat also preserves a coherent dark appearance
+for operating-system dark mode. Local icons are bundled with each surface; no
+external font or asset host is needed, so all three remain usable offline with
+system font fallbacks. Keyboard focus remains visible, controls meet mobile
+touch-target sizing, and reduced-motion preferences are respected.
+
+Canonical icon, wordmark, banner, palette, and social-upload limitations live
+in [`brand/README.md`](brand/README.md).
+
+Run these checks to verify the change:
+
+```bash
+bash tests/test-build-package.sh
+python3 -m unittest discover -s tests -p 'test_control_panel.py'
+```
+
+The
+release package is built from committed files, so uncommitted presentation
+edits are intentionally excluded until reviewed and committed. Roll back the
+presentation by restoring the previous release package; runtime configuration
+and vessel data are unaffected.
 
 ## What you get
 
@@ -21,6 +47,8 @@ navigation, collision avoidance, engine control, or a sole alarm system.
 ![VesselStack local data flow](docs/images/vesselstack-map.svg)
 
 ### What runs locally
+
+![VesselStack architecture](docs/images/vesselstack-hero.svg)
 
 | Purpose | Local service or view | Typical use |
 |---|---|---|
