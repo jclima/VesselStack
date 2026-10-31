@@ -13,7 +13,7 @@
       <span class="brand-mark" aria-hidden="true">VS</span>
       <div><strong>VesselStack</strong><span>Control Panel</span></div>
     </div>
-    <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Locked</span></div>
+    <div class="topbar-actions"><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Locked</span></div><button id="sign-out" class="quiet" hidden>Sign out</button></div>
   </header>
 
   <main>
@@ -51,13 +51,16 @@
 
       <section id="components" class="tab-panel">
         <div class="section-heading"><div><p class="eyebrow">RUNTIME</p><h2>Components</h2></div><button id="refresh">Refresh status</button></div>
+        <div id="component-overview" class="overview" aria-label="Component overview"></div>
+        <p class="catalog-note">The catalog below covers the six managed core components. SignalK, AIS, and hardware integrations stay configuration-driven.</p>
+        <div class="component-toolbar"><label class="search-field" for="component-search">Search components<input id="component-search" type="search" placeholder="Name or description" autocomplete="off"></label><div class="filter-group" role="group" aria-label="Component filter"><button class="active" data-component-filter="all">All</button><button data-component-filter="enabled">Enabled</button><button data-component-filter="available">Available</button></div></div>
         <div id="component-grid" class="component-grid"></div>
       </section>
 
       <section id="configuration" class="tab-panel" hidden>
         <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>Configuration</h2></div><div class="inline-actions"><button id="discard-config">Discard edits</button><button id="save-config" class="primary">Save configuration</button></div></div>
         <div class="notice">Secrets are write-only. Leave a secret field blank to keep its current value. Saving does not restart services; use <strong>Apply configuration</strong> after review.</div>
-        <form id="config-form"></form>
+        <p id="config-status" class="form-status" aria-live="polite"></p><form id="config-form"></form>
       </section>
 
       <section id="maintenance" class="tab-panel" hidden>

@@ -48,6 +48,20 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
+: "${VESSELSTACK_DISABLED_COMPONENTS:=}"
+
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+disabled_input=${VESSELSTACK_DISABLED_COMPONENTS:-}
+VESSELSTACK_DISABLED_COMPONENTS=""
+component_disabled() { case ",${VESSELSTACK_DISABLED_COMPONENTS}," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
+while [ -n "$disabled_input" ]; do
+    case "$disabled_input" in *,*) disabled=${disabled_input%%,*}; disabled_input=${disabled_input#*,} ;; *) disabled=$disabled_input; disabled_input="" ;; esac
+    disabled=${disabled//[[:space:]]/}; [ -z "$disabled" ] && continue
+    valid=0; for core in "${CORE_COMPONENTS[@]}"; do [ "$disabled" = "$core" ] && valid=1; done
+    [ "$valid" -eq 1 ] || { echo "Unknown disabled component: $disabled" >&2; exit 1; }
+    component_disabled "$disabled" && { echo "Duplicate disabled component: $disabled" >&2; exit 1; }
+    VESSELSTACK_DISABLED_COMPONENTS="${VESSELSTACK_DISABLED_COMPONENTS:+$VESSELSTACK_DISABLED_COMPONENTS,}$disabled"
+done
 
 required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_DATA
           SIGNALK_URL INFLUXDB_ORG INFLUXDB_USERNAME MQTT_USERNAME)
@@ -249,6 +263,7 @@ AIS_ENABLE
 AIS_IMAGE
 AIS_DEVICE
 AIS_CATCHER_ARGS
+VESSELSTACK_DISABLED_COMPONENTS
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
 CONTROL_PANEL_HOST
@@ -363,8 +378,17 @@ if [ "$START" -eq 1 ]; then
     docker run --rm -v "$VESSELSTACK_DATA/mosquitto:/mosquitto/data" \
         eclipse-mosquitto:2.1.2-alpine mosquitto_passwd -b -c \
         /mosquitto/data/passwords "$MQTT_USERNAME" "$MQTT_PASSWORD"
-    compose up -d
-    "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+    selected_services=()
+    selected_count=0
+    for core in "${CORE_COMPONENTS[@]}"; do
+        if ! component_disabled "$core"; then selected_services+=("$core"); selected_count=$((selected_count + 1)); fi
+    done
+    if [ "$SIGNALK_MODE" = docker ]; then selected_services+=(signalk); selected_count=$((selected_count + 1)); fi
+    if [ "$AIS_ENABLE" = true ]; then selected_services+=(ais-catcher); selected_count=$((selected_count + 1)); fi
+    [ "$selected_count" -eq 0 ] || compose up -d "${selected_services[@]+${selected_services[@]}}"
+    if ! component_disabled influxdb; then
+        "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+    fi
     systemctl restart vesselstack-chat.service
     if [ "${VESSELSTACK_SKIP_PANEL_RESTART:-false}" != true ]; then
         systemctl restart vesselstack-control-panel.service

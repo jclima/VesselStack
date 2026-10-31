@@ -66,6 +66,7 @@ FIELDS = [
     field("VESSELSTACK_ROOT", "Application path", "Installation", kind="path", read_only=True, description="Change from the recovery shell with a reviewed migration."),
     field("VESSELSTACK_DATA", "Data path", "Installation", kind="path", read_only=True, description="Relocate data only with a stopped stack and verified backup."),
     field("VESSELSTACK_BACKUP", "Backup path", "Installation", kind="path"),
+    field("VESSELSTACK_DISABLED_COMPONENTS", "Disabled components", "Installation", description="Comma-separated core services excluded from lifecycle starts; use Components to add or remove services."),
     field("SIGNALK_MODE", "SignalK mode", "SignalK", kind="select", choices=["existing", "docker", "native"]),
     field("SIGNALK_VERSION", "SignalK version", "SignalK"),
     field("SIGNALK_URL", "SignalK URL", "SignalK", kind="url"),
@@ -125,6 +126,24 @@ COMPOSE_COMPONENTS = {
     "signalk": "signalk",
     "ais-catcher": "ais-catcher",
 }
+CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
+CORE_METADATA = {
+    "homeassistant": ("Home Assistant", "Home automation and vessel dashboard", "Home Assistant"),
+    "influxdb": ("InfluxDB", "Time-series history storage", "InfluxDB"),
+    "grafana": ("Grafana", "History and system dashboards", "Grafana"),
+    "prometheus": ("Prometheus", "Metrics collection", ""),
+    "mosquitto": ("Mosquitto", "MQTT message broker", "MQTT"),
+    "heimdall": ("Heimdall", "Local service launcher", ""),
+}
+LIFECYCLE_LOCK = threading.Lock()
+
+
+def disabled_components(settings: dict[str, str] | None = None) -> set[str]:
+    raw = (settings or parse_env(VESSEL_ENV)).get("VESSELSTACK_DISABLED_COMPONENTS", "")
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if len(values) != len(set(values)) or any(item not in CORE_COMPONENTS for item in values):
+        raise ValueError("Invalid disabled component configuration")
+    return set(values)
 SYSTEMD_COMPONENTS = {
     "boat-chat": "vesselstack-chat.service",
     "signalk-native": "vesselstack-signalk.service",
@@ -187,6 +206,11 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         return text.lower()
     if kind == "select" and text not in spec["choices"]:
         raise ValueError(f"Invalid value for {spec['label']}")
+    if spec["key"] == "VESSELSTACK_DISABLED_COMPONENTS":
+        values = [item.strip() for item in text.split(",") if item.strip()]
+        if len(values) != len(set(values)) or any(item not in CORE_COMPONENTS for item in values):
+            raise ValueError("Disabled components must be unique allowed core component IDs")
+        return ",".join(values)
     if kind == "number" and text:
         try:
             float(text)
@@ -226,6 +250,15 @@ def public_configuration() -> dict[str, Any]:
 
 
 def update_configuration(updates: dict[str, Any]) -> None:
+    if not LIFECYCLE_LOCK.acquire(blocking=False):
+        raise ValueError("Another operation is already running")
+    try:
+        _update_configuration(updates)
+    finally:
+        LIFECYCLE_LOCK.release()
+
+
+def _update_configuration(updates: dict[str, Any]) -> None:
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
     panel = parse_env(PANEL_ENV)
@@ -263,10 +296,16 @@ def compose_base() -> list[str]:
 
 
 def component_command(component: str, verb: str) -> list[str]:
+    if verb in {"add", "remove"}:
+        if component not in CORE_COMPONENTS:
+            raise ValueError("Unknown core component")
+        return [str(CTL), "component", verb, component]
     if verb not in {"start", "stop", "restart"}:
         raise ValueError("Unsupported component action")
     if component in COMPOSE_COMPONENTS:
         settings = parse_env(VESSEL_ENV)
+        if component in CORE_COMPONENTS and component in disabled_components(settings) and verb in {"start", "restart"}:
+            raise ValueError("Component is disabled by configuration")
         if component == "signalk" and settings.get("SIGNALK_MODE", "existing") != "docker":
             raise ValueError("Docker SignalK is disabled by configuration")
         if component == "ais-catcher" and settings.get("AIS_ENABLE", "false") != "true":
@@ -322,12 +361,16 @@ def command_output(command: list[str], timeout: int = 8) -> tuple[int, str]:
 
 def component_status() -> list[dict[str, Any]]:
     vessel = parse_env(VESSEL_ENV)
+    disabled = disabled_components(vessel)
     compose_state: dict[str, str] = {}
-    code, output = command_output(compose_base() + ["ps", "--format", "json"])
+    code, output = command_output(compose_base() + ["ps", "--all", "--format", "json"])
+    compose_parse_failed = code != 0
     if code == 0 and output:
+        compose_parse_failed = True
         try:
             decoded = json.loads(output)
             rows = decoded if isinstance(decoded, list) else [decoded]
+            compose_parse_failed = False if decoded == [] else True
         except json.JSONDecodeError:
             rows = []
             for line in output.splitlines():
@@ -336,16 +379,26 @@ def component_status() -> list[dict[str, Any]]:
                 except json.JSONDecodeError:
                     pass
         for row in rows:
+            if not isinstance(row, dict):
+                continue
             service = str(row.get("Service") or row.get("service") or "")
+            if not service:
+                continue
+            compose_parse_failed = False
             compose_state[service] = str(row.get("State") or row.get("state") or "unknown")
     components = []
     for name, service in COMPOSE_COMPONENTS.items():
-        enabled = True
+        enabled = name not in disabled
         if name == "signalk":
             enabled = vessel.get("SIGNALK_MODE", "existing") == "docker"
         elif name == "ais-catcher":
             enabled = vessel.get("AIS_ENABLE", "false") == "true"
-        components.append({"id": name, "label": name.replace("-", " ").title(), "kind": "container", "enabled": enabled, "state": compose_state.get(service, "stopped")})
+        state = compose_state.get(service, "unknown" if compose_parse_failed else "stopped")
+        item = {"id": name, "label": name.replace("-", " ").title(), "kind": "container", "enabled": enabled, "state": state}
+        if name in CORE_METADATA:
+            label, description, section = CORE_METADATA[name]
+            item.update({"label": label, "description": description, "section": section, "manageable": True})
+        components.append(item)
     for name, unit in SYSTEMD_COMPONENTS.items():
         code, output = command_output(["systemctl", "is-active", unit], timeout=3)
         enabled = True
@@ -355,7 +408,8 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("SOCKETCAN_ENABLE", "false") == "true"
         elif name == "firewall":
             enabled = vessel.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true"
-        components.append({"id": name, "label": name.replace("-", " ").title(), "kind": "systemd", "enabled": enabled, "state": output or ("active" if code == 0 else "inactive")})
+        state = output if output in {"active", "inactive", "failed", "activating", "deactivating"} else "unknown"
+        components.append({"id": name, "label": name.replace("-", " ").title(), "kind": "systemd", "enabled": enabled, "state": state})
     return components
 
 
@@ -365,24 +419,34 @@ class OperationStore:
         self.current: dict[str, Any] | None = None
         self.counter = 0
 
-    def start(self, label: str, command: list[str]) -> dict[str, Any]:
-        with self.lock:
-            if self.current and self.current["state"] == "running":
-                raise ValueError("Another operation is already running")
-            self.counter += 1
-            operation = {
-                "id": self.counter,
-                "label": label,
-                "command": command[0:1] + ["[arguments hidden]"],
-                "state": "running",
-                "started_at": int(time.time()),
-                "finished_at": None,
-                "exit_code": None,
-                "output": deque(maxlen=400),
-            }
-            self.current = operation
-        threading.Thread(target=self._run, args=(operation, command), daemon=True).start()
-        return self.public()
+    def start(self, label: str, command_or_factory: list[str] | Any) -> dict[str, Any]:
+        if not LIFECYCLE_LOCK.acquire(blocking=False):
+            raise ValueError("Another operation is already running")
+        operation = None
+        try:
+            command = command_or_factory() if callable(command_or_factory) else command_or_factory
+            with self.lock:
+                if self.current and self.current["state"] == "running":
+                    raise ValueError("Another operation is already running")
+                self.counter += 1
+                operation = {
+                    "id": self.counter, "label": label,
+                    "command": command[0:1] + ["[arguments hidden]"],
+                    "state": "running", "started_at": int(time.time()),
+                    "finished_at": None, "exit_code": None, "output": deque(maxlen=400),
+                }
+                self.current = operation
+            threading.Thread(target=self._run, args=(operation, command), daemon=True).start()
+            return self.public()
+        except Exception:
+            if operation is not None:
+                with self.lock:
+                    operation["state"] = "failed"
+                    operation["exit_code"] = 1
+                    operation["finished_at"] = int(time.time())
+                    operation["output"].append("Operation failed")
+            LIFECYCLE_LOCK.release()
+            raise
 
     def _run(self, operation: dict[str, Any], command: list[str]) -> None:
         environment = os.environ.copy()
@@ -391,19 +455,23 @@ class OperationStore:
             process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
             assert process.stdout is not None
             for line in process.stdout:
-                operation["output"].append(line.rstrip())
-            operation["exit_code"] = process.wait()
-            operation["state"] = "succeeded" if operation["exit_code"] == 0 else "failed"
-            if operation["state"] == "succeeded" and operation["label"] in {"apply", "install", "update"}:
-                operation["output"].append(
-                    "If this operation changed Control Panel code or its listener, restart "
-                    "vesselstack-control-panel.service from the recovery shell."
-                )
+                with self.lock:
+                    operation["output"].append(line.rstrip())
+            with self.lock:
+                operation["exit_code"] = process.wait()
+                operation["state"] = "succeeded" if operation["exit_code"] == 0 else "failed"
+                if operation["state"] == "succeeded" and operation["label"] in {"apply", "install", "update"}:
+                    operation["output"].append("If this operation changed Control Panel code or its listener, restart vesselstack-control-panel.service from the recovery shell.")
         except Exception as exc:
-            operation["output"].append(str(exc))
-            operation["exit_code"] = 1
-            operation["state"] = "failed"
-        operation["finished_at"] = int(time.time())
+            with self.lock:
+                operation["output"].append("Operation failed")
+            with self.lock:
+                operation["exit_code"] = 1
+                operation["state"] = "failed"
+        finally:
+            with self.lock:
+                operation["finished_at"] = int(time.time())
+            LIFECYCLE_LOCK.release()
 
     def public(self) -> dict[str, Any]:
         with self.lock:
@@ -519,14 +587,12 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/action":
                 action = str(payload.get("action", ""))
-                command = action_command(action, payload)
-                self.send_json(202, OPERATIONS.start(action, command))
+                self.send_json(202, OPERATIONS.start(action, lambda: action_command(action, payload)))
                 return
             if path == "/api/component":
                 component = str(payload.get("component", ""))
                 verb = str(payload.get("action", ""))
-                command = component_command(component, verb)
-                self.send_json(202, OPERATIONS.start(f"{verb} {component}", command))
+                self.send_json(202, OPERATIONS.start(f"{verb} {component}", lambda: component_command(component, verb)))
                 return
             self.send_json(404, {"error": "Not found"})
         except (ValueError, json.JSONDecodeError) as exc:

@@ -612,3 +612,34 @@ material. This is a safety net, not a substitute for reviewing staged changes.
 
 See `CHANGELOG.md` for release notes and `VALIDATION.md` for the full evidence
 and hardware-dependent commissioning limits.
+
+### Selective component lifecycle
+
+Set `VESSELSTACK_DISABLED_COMPONENTS` in the installed environment to a
+comma-separated allowlist of core services to exclude (the default is empty,
+so all six core services are enabled): `homeassistant`, `influxdb`, `grafana`,
+`prometheus`, `mosquitto`, and `heimdall`. Unknown or duplicate IDs are
+rejected. `install.sh --start` and `vesselstackctl start` pass only selected
+services to Compose; history bootstrap is skipped when InfluxDB is excluded,
+so integrations depending on that service may fail until it is re-added.
+
+The authenticated Control Panel and CLI can change membership:
+`sudo vesselstackctl component remove grafana` persists the exclusion and runs
+`docker compose rm --stop --force grafana` without removing volumes;
+`sudo vesselstackctl component add grafana` persists the inclusion and starts
+it. If InfluxDB was excluded during first install, run the Control Panel's
+Provision history action after adding it so buckets and the downsample task
+are created. To recover, re-add the service and rerun `vesselstackctl start`
+(or the installer with `--start`).
+
+Component changes made directly through the CLI or by editing the environment
+are not externally serialized with Control Panel requests; use one
+administrator workflow at a time and let any current operation finish before
+changing membership elsewhere.
+
+For a lightweight regression check of browser-side control-panel state handling, run `node tests/test_control_panel_ui.cjs`. This covers inactive status classification, secret replacement/blank preservation/clearing, and default select/boolean dirty-state normalization.
+
+Use the Control Panel or `vesselstackctl` for lifecycle changes; a raw
+`docker compose up` bypasses the saved exclusions. The Control Panel also
+provides catalog search filters, warns about unsaved changes, and supports
+explicit sign-out from the local browser session.

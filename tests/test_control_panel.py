@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -73,6 +74,27 @@ class EnvironmentFileTests(unittest.TestCase):
 
 
 class CommandAllowlistTests(unittest.TestCase):
+    def test_component_membership_commands_are_allowlisted(self) -> None:
+        self.assertEqual(panel.component_command("grafana", "remove")[-3:], ["component", "remove", "grafana"])
+        with self.assertRaises(ValueError):
+            panel.component_command("arbitrary", "remove")
+
+    def test_disabled_component_value_is_canonical_and_validated(self) -> None:
+        spec = panel.FIELD_BY_KEY["VESSELSTACK_DISABLED_COMPONENTS"]
+        self.assertEqual(panel.validate_value(spec, "grafana, influxdb"), "grafana,influxdb")
+        with self.assertRaises(ValueError):
+            panel.validate_value(spec, "grafana,grafana")
+        with self.assertRaises(ValueError):
+            panel.validate_value(spec, "unknown")
+
+    def test_excluded_component_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vessel.env"
+            panel.write_env(env, {"VESSELSTACK_DISABLED_COMPONENTS": "grafana"}, [])
+            with mock.patch.object(panel, "VESSEL_ENV", env):
+                with self.assertRaises(ValueError):
+                    panel.component_command("grafana", "start")
+
     def test_component_commands_are_argument_arrays(self) -> None:
         command = panel.component_command("grafana", "start")
         self.assertEqual(command[-3:], ["up", "-d", "grafana"])
@@ -91,6 +113,67 @@ class CommandAllowlistTests(unittest.TestCase):
             (Path(directory) / "install.sh").write_text("#!/bin/bash\n")
             command = panel.action_command("update", {"source_directory": directory})
             self.assertEqual(command[-2:], ["update", directory])
+
+
+class LifecycleStateTests(unittest.TestCase):
+    def test_status_reports_unknown_for_malformed_docker_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vessel.env"
+            panel.write_env(env, {"VESSELSTACK_DISABLED_COMPONENTS": "grafana"}, [])
+            def output(command: list[str], timeout: int = 8) -> tuple[int, str]:
+                if command[:2] == ["docker", "compose"]:
+                    return (0, "not-json")
+                return (3, "inactive")
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "command_output", side_effect=output):
+                statuses = panel.component_status()
+            self.assertEqual(statuses[0]["state"], "unknown")
+            self.assertEqual(statuses[2]["state"], "unknown")
+            self.assertEqual(statuses[-1]["state"], "inactive")
+
+    def test_status_reports_stopped_for_valid_empty_docker_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vessel.env"
+            panel.write_env(env, {}, [])
+            def output(command: list[str], timeout: int = 8) -> tuple[int, str]:
+                return (0, "[]") if command[:2] == ["docker", "compose"] else (3, "inactive")
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "command_output", side_effect=output):
+                statuses = panel.component_status()
+            self.assertEqual(statuses[0]["state"], "stopped")
+
+    def test_operation_lock_rejects_busy_configuration_and_releases_after_failure(self) -> None:
+        self.assertTrue(panel.LIFECYCLE_LOCK.acquire(blocking=False))
+        try:
+            with self.assertRaises(ValueError):
+                panel.update_configuration({})
+        finally:
+            panel.LIFECYCLE_LOCK.release()
+
+        # Poll only this short-lived local operation through its store.
+        local_store = panel.OperationStore()
+        local_store.start("test", ["/path/that/does/not/exist"])
+        for _ in range(50):
+            if local_store.public()["state"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(local_store.public()["state"], "failed")
+        local_store.start("test", ["/usr/bin/true"])
+        for _ in range(50):
+            if local_store.public()["state"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(local_store.public()["state"], "succeeded")
+
+    def test_operation_start_failure_releases_admission_lock(self) -> None:
+        local_store = panel.OperationStore()
+        with mock.patch.object(panel.subprocess, "Popen", side_effect=OSError("spawn failed")):
+            local_store.start("test", ["mock-command"])
+        for _ in range(50):
+            if local_store.public()["state"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(local_store.public()["state"], "failed")
+        self.assertTrue(panel.LIFECYCLE_LOCK.acquire(blocking=False))
+        panel.LIFECYCLE_LOCK.release()
 
 
 class ValidationTests(unittest.TestCase):
