@@ -3,6 +3,19 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.3 - 2026-10-31
+
+- Lab prerelease: make headless Raspberry Pi setup and Control Panel access
+  friendlier with an independent, optional trusted-LAN panel mode. The
+  `panel-access lan|local` commands require the existing panel token, preserve
+  the configured token and port, restart only the Control Panel, and do not
+  change dashboard or other service listeners. The panel remains ordinary
+  unencrypted HTTP for a trusted network; no firewall rules are changed.
+- Release status: annotated unsigned tag `v0.5.3`, authorized for lab use and
+  not latest. CI-generated asset checksums must be verified before publishing;
+  physical Raspberry Pi tests remain pending. This is not a stable promotion
+  or a cryptographically signed release.
+
 ## 0.5.2 - 2026-10-31
 
 - Lab prerelease: fix the real bridge's retained MQTT connection state for

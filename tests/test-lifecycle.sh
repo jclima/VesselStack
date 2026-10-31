@@ -28,7 +28,15 @@ GRAFANA_PORT=9877
 HEIMDALL_PORT=9878
 MQTT_USERNAME=test-user
 MQTT_PASSWORD=test-password
+CONTROL_PANEL_HOST=127.0.0.1
+CONTROL_PANEL_PORT=8780
 EOF
+cat > "$APP_ROOT/config/control-panel.env" <<EOF
+CONTROL_PANEL_HOST=127.0.0.1
+CONTROL_PANEL_PORT=8780
+CONTROL_PANEL_TOKEN=test-panel-token
+EOF
+chmod 0600 "$APP_ROOT/config/vesselstack.env" "$APP_ROOT/config/control-panel.env"
 printf 'version one\n' > "$DATA_ROOT/state.txt"
 ln -s state.txt "$DATA_ROOT/current-state"
 install -d "$APP_ROOT/boat-chat/.venv/bin"
@@ -61,6 +69,10 @@ cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$(dirname "$0")/calls.log"
 [ -z "${FAKE_CALL_LOG:-}" ] || printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALL_LOG"
+if [ "$(basename "$0")" = systemctl ] && [ "${FAKE_SYSTEMCTL_FAIL_ONCE:-}" = 1 ] && [ ! -e "${FAKE_SYSTEMCTL_FAIL_MARKER:?}" ]; then
+    : > "$FAKE_SYSTEMCTL_FAIL_MARKER"
+    exit 1
+fi
 if [ "$(basename "$0")" = curl ]; then
     if [ -n "${FAKE_MEMORY_CHUNKS:-}" ]; then
         printf '{"ok":true,"ready":true,"readiness":{"layers":{"memory":{"ready":true,"chunks":%s}}}}\n' "$FAKE_MEMORY_CHUNKS"
@@ -165,6 +177,62 @@ run_ctl() {
         FAKE_MOUNTS="$TEST_ROOT/mounts" \
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
+
+# The administration panel listener is an explicit, isolated change. Dry runs and
+# invalid arguments are inert; applying it updates both bind files and restarts
+# only the panel service, while preserving its token and port.
+panel_before=$(sha256sum "$APP_ROOT/config/control-panel.env")
+if run_ctl panel-access lan --dry-run >/dev/null 2>&1; then :; else
+    echo 'panel-access dry-run failed' >&2; exit 1
+fi
+[ "$(sha256sum "$APP_ROOT/config/control-panel.env")" = "$panel_before" ] || {
+    echo 'panel-access dry-run changed the panel config' >&2; exit 1;
+}
+if run_ctl panel-access invalid >/dev/null 2>&1; then
+    echo 'panel-access accepted an invalid mode' >&2; exit 1
+fi
+: > "$TEST_ROOT/panel-calls.log"
+export FAKE_CALL_LOG="$TEST_ROOT/panel-calls.log"
+run_ctl panel-access lan >/dev/null
+grep -qx 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"
+! grep -qv 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"
+grep -q '^CONTROL_PANEL_HOST=0.0.0.0$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^CONTROL_PANEL_HOST=0.0.0.0$' "$APP_ROOT/config/control-panel.env"
+grep -q '^CONTROL_PANEL_PORT=8780$' "$APP_ROOT/config/control-panel.env"
+grep -q '^CONTROL_PANEL_TOKEN=test-panel-token$' "$APP_ROOT/config/control-panel.env"
+run_ctl panel-access local >/dev/null
+grep -q '^CONTROL_PANEL_HOST=127.0.0.1$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^CONTROL_PANEL_HOST=127.0.0.1$' "$APP_ROOT/config/control-panel.env"
+unset FAKE_CALL_LOG
+
+# A failed first restart restores both complete files (including 0600 modes) and
+# attempts the old restart. The failure is surfaced to the caller.
+before_env=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+before_panel=$(sha256sum "$APP_ROOT/config/control-panel.env")
+before_env_mode=$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")
+before_panel_mode=$(stat -c '%a' "$APP_ROOT/config/control-panel.env")
+: > "$TEST_ROOT/restart-calls.log"
+export FAKE_CALL_LOG="$TEST_ROOT/restart-calls.log" FAKE_SYSTEMCTL_FAIL_ONCE=1 FAKE_SYSTEMCTL_FAIL_MARKER="$TEST_ROOT/restart-failed"
+if run_ctl panel-access lan >/dev/null 2>&1; then
+    echo 'panel-access hid a failed restart' >&2; exit 1
+fi
+[ "$before_env" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ]
+[ "$before_panel" = "$(sha256sum "$APP_ROOT/config/control-panel.env")" ]
+[ "$before_env_mode" = "$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")" ]
+[ "$before_panel_mode" = "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" ]
+test "$(grep -c '^systemctl restart vesselstack-control-panel.service$' "$TEST_ROOT/restart-calls.log")" -eq 2
+unset FAKE_CALL_LOG FAKE_SYSTEMCTL_FAIL_ONCE FAKE_SYSTEMCTL_FAIL_MARKER
+
+# Unsafe config paths and missing tokens are refused before any write.
+mv "$APP_ROOT/config/control-panel.env" "$APP_ROOT/config/control-panel.env.real"
+ln -s control-panel.env.real "$APP_ROOT/config/control-panel.env"
+if run_ctl panel-access lan >/dev/null 2>&1; then echo 'panel-access followed a config symlink' >&2; exit 1; fi
+rm "$APP_ROOT/config/control-panel.env"
+mv "$APP_ROOT/config/control-panel.env.real" "$APP_ROOT/config/control-panel.env"
+cp -p "$APP_ROOT/config/control-panel.env" "$TEST_ROOT/control-panel.env.saved"
+sed -i '/^CONTROL_PANEL_TOKEN=/d' "$APP_ROOT/config/control-panel.env"
+if run_ctl panel-access lan >/dev/null 2>&1; then echo 'panel-access accepted a missing token' >&2; exit 1; fi
+mv "$TEST_ROOT/control-panel.env.saved" "$APP_ROOT/config/control-panel.env"
 
 install -d -m 0750 -o 65534 -g 65534 "$DATA_ROOT/prometheus"
 printf 'tsdb\n' > "$DATA_ROOT/prometheus/lifecycle-marker"

@@ -129,7 +129,7 @@ FIELDS = [
     field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),
     field("VESSELSTACK_FIREWALL_ALLOW_TCP", "Strict mode allowed TCP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default 22."),
     field("VESSELSTACK_FIREWALL_ALLOW_UDP", "Strict mode allowed UDP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default none."),
-    field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 unless access is protected by a trusted VPN or proxy."),
+    field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 for local-only access. For a trusted LAN, use `sudo vesselstackctl panel-access lan`; this exposes unencrypted HTTP on every interface and may still be blocked by a strict firewall. Roll back with `sudo vesselstackctl panel-access local`."),
     field("CONTROL_PANEL_PORT", "Control panel port", "Control Panel", kind="port"),
     field("BOAT_CHAT_PROVIDER", "Primary provider", "Boat Chat", source="chat", kind="select", choices=["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
     field("BOAT_CHAT_MODEL", "Primary model", "Boat Chat", source="chat"),

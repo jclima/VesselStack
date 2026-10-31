@@ -2,7 +2,7 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
@@ -24,7 +24,7 @@ set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="0.5.2"
+DEFAULT_VERSION="0.5.3"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
 
@@ -126,6 +126,7 @@ Options:
                       rules; on top of --config, a saved configuration or the defaults.
                       Avoid secrets here (they show in the process list): leave them to be
                       generated. Example: --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
+  --panel-lan         Bind the control panel to all interfaces (token required; firewall unchanged).
   --config FILE       Existing vesselstack.env to use (copied to a root-only location)
   --no-wizard         Skip the wizard; use --config FILE
   --cli, --terminal   Ask the configuration questions in this terminal (the default)
@@ -225,6 +226,7 @@ parse_args() {
                 [[ "$2" =~ $set_re ]] || die "--set needs KEY=VALUE with an upper-case setting name (e.g. BOAT_NAME=Foo)." \
                     "Values may contain only letters, digits, spaces and . , : / @ + ( ) - _   (setting: ${2%%=*})"
                 SETS+=("$2"); shift 2 ;;
+            --panel-lan) SETS+=("CONTROL_PANEL_HOST=0.0.0.0"); shift ;;
             --version) [ $# -ge 2 ] || die "--version needs a value"; VERSION=$2; shift 2 ;;
             --no-wizard) NO_WIZARD=1; shift ;;
             --config) [ $# -ge 2 ] || die "--config needs a file"; CONFIG_ARG=$2; shift 2 ;;
@@ -1378,7 +1380,7 @@ final_report() {
 
 # Plain-text information for a headless Pi: nothing here has to be opened now.
 print_access_info() {
-    local host ip where user web_bind web_port heimdall chat chat_host panel_port app_root cfg=$ENV_FILE
+    local host ip where user web_bind web_port heimdall chat chat_host panel_host panel_port panel_url_host app_root cfg=$ENV_FILE panel_cfg
     # After an upgrade the settings live in the installed configuration, not in the staged one.
     if [ "$UPGRADE" -eq 1 ]; then cfg=$INSTALL_ROOT/config/vesselstack.env; fi
     host=$(hostname 2>/dev/null || true)
@@ -1393,10 +1395,23 @@ print_access_info() {
     chat=$(env_get "$cfg" BOAT_CHAT_PORT 2>/dev/null || true)
     chat_host=$(env_get "$cfg" BOAT_CHAT_HOST 2>/dev/null || true)
     panel_port=$(env_get "$cfg" CONTROL_PANEL_PORT 2>/dev/null || true)
+    panel_host=$(env_get "$cfg" CONTROL_PANEL_HOST 2>/dev/null || true)
     app_root=$(env_get "$cfg" VESSELSTACK_ROOT 2>/dev/null || true)
     web_bind=${web_bind:-0.0.0.0}; web_port=${web_port:-43000}; heimdall=${heimdall:-80}
     chat=${chat:-8765}; chat_host=${chat_host:-0.0.0.0}; panel_port=${panel_port:-8780}
     app_root=${app_root:-$INSTALL_ROOT}
+    # The installed service environment is authoritative after install. Only
+    # read it when it is a regular root-controlled file; otherwise fall back to
+    # the validated vesselstack.env above.
+    panel_cfg=$app_root/config/control-panel.env
+    if [ -f "$panel_cfg" ] && [ ! -L "$panel_cfg" ] && require_root_controlled "$panel_cfg"; then
+        local installed_panel_host installed_panel_port
+        installed_panel_host=$(env_get "$panel_cfg" CONTROL_PANEL_HOST 2>/dev/null || true)
+        installed_panel_port=$(env_get "$panel_cfg" CONTROL_PANEL_PORT 2>/dev/null || true)
+        [ -n "$installed_panel_host" ] && panel_host=$installed_panel_host
+        [ -n "$installed_panel_port" ] && panel_port=$installed_panel_port
+    fi
+    panel_host=${panel_host:-127.0.0.1}; panel_port=${panel_port:-8780}
     say ""
     say "  Addresses (for information; use them from any computer on the boat network when you like):"
     if [ "$web_bind" = 127.0.0.1 ]; then
@@ -1416,10 +1431,25 @@ print_access_info() {
     say "  Generated passwords and tokens are stored root-only under $app_root/config/."
     say "  Show the Boat Chat access token (it is printed only when you run this):"
     info "sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' $app_root/config/boat-chat.env"
-    say "  Control panel (administration; it listens on this Pi only, port $panel_port). From your own computer:"
-    info "ssh -L $panel_port:127.0.0.1:$panel_port $user@$where"
-    info "then browse to http://127.0.0.1:$panel_port on that computer; its token:"
-    info "sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+    say "  Control panel (administration, port $panel_port):"
+    if [ "$panel_host" = 127.0.0.1 ] || [ "$panel_host" = ::1 ]; then
+        info "It is limited to this Pi. From your own computer:"
+        panel_url_host=127.0.0.1
+        [ "$panel_host" = ::1 ] && panel_url_host='[::1]'
+        info "ssh -L $panel_port:$panel_url_host:$panel_port $user@$where"
+        info "then browse to http://127.0.0.1:$panel_port on that computer."
+        info "The panel token is stored root-only: sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+    elif [ "$panel_host" = 0.0.0.0 ]; then
+        info "It listens on all interfaces: http://$where:$panel_port"
+        info "The control panel requires its access token. HTTP is unencrypted; strict firewall rules may block this access, and this installer never relaxes them."
+        info "The panel token is stored root-only: sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+    else
+        panel_url_host=$panel_host
+        case "$panel_url_host" in *:*) panel_url_host="[$panel_url_host]" ;; esac
+        info "It listens on the configured interface: http://$panel_url_host:$panel_port"
+        info "The control panel requires its access token. HTTP is unencrypted; strict firewall rules may block this access, and this installer never relaxes them."
+        info "The panel token is stored root-only: sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+    fi
 }
 
 find_ctl() {

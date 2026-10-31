@@ -1,6 +1,6 @@
 # Control Panel component lifecycle lab test
 
-This is the release 0.5.2 lab recipe. It is a bounded acceptance test, not
+This is the release 0.5.3 lab recipe. It is a bounded acceptance test, not
 evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
@@ -8,11 +8,11 @@ positions, MMSIs, tokens, logs, and backups out of this repository.
 ## Fetch and verify the pinned prerelease
 
 Download the pinned bootstrap and the CI-generated checksum from the same
-`v0.5.2` GitHub prerelease. Verify before reading or running it:
+`v0.5.3` GitHub prerelease. Verify before reading or running it:
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.2/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
@@ -55,8 +55,12 @@ capacity is low or if any device/data path is unclear.
 
 ## Exercise the catalog
 
-Reach the real Control Panel through its loopback SSH tunnel (`8780`); do not
-hardcode a preview port. In the Components view:
+Run `sudo vesselstackctl panel-access lan` on the Pi and open its printed address
+from your laptop on the same trusted network. Retrieve the unlock token with the
+printed command. No SSH tunnel is needed. Confirm `panel-access` shows the chosen
+host/port and that the other service bindings are unchanged. Use
+`sudo vesselstackctl panel-access local` to undo this after testing if desired.
+Do not hardcode a preview port. In the Components view:
 
 1. Confirm the component membership summary is read-only and that the CSV
    membership field cannot be edited manually.

@@ -338,6 +338,12 @@ run() {  # args... (stdin is never a terminal)
         </dev/null >"$OUT" 2>&1 || RC=$?
 }
 fail_test() { echo "FAIL: $1" >&2; echo "--- output ---" >&2; cat "$OUT" >&2; echo "--- calls ---" >&2; cat "$LOG" >&2; exit 1; }
+# The convenience alias must be translated at parse time, preserving ordering
+# with ordinary --set values so the last explicit setting wins.
+alias_line=$(grep -n -- '--panel-lan) SETS+=("CONTROL_PANEL_HOST=0.0.0.0")' "$GET" | cut -d: -f1)
+set_line=$(grep -n -- 'SETS+=("$2")' "$GET" | head -n1 | cut -d: -f1)
+[ -n "$alias_line" ] && [ -n "$set_line" ] || fail_test "panel-lan alias parser missing"
+[ "$alias_line" -gt "$set_line" ] || fail_test "panel-lan alias parser ordering changed"
 expect_rc() { [ "$RC" -eq "$1" ] || fail_test "$2 (exit $RC, wanted $1)"; }
 expect_out() { grep -qE -- "$1" "$OUT" || fail_test "output lacks /$1/"; }
 refuse_out() { if grep -qE -- "$1" "$OUT"; then fail_test "output must not contain /$1/"; fi; }
@@ -610,7 +616,7 @@ expect_no_web_wizard() {
 
 # Full walk with the default answer to every question (Enter): confirmation, 16 prompts, review, install.
 reset_state
-{ printf 'y\n'; blank 19; } > "$ANSWERS"
+{ printf 'y\n'; blank 20; } > "$ANSWERS"
 run_asking
 expect_rc 0 "terminal wizard, all defaults"
 expect_out "Review \\(secrets are never shown\\)"
@@ -1441,6 +1447,13 @@ expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE= OFFLINE=$"
 refuse_log "^wizard "
 refuse_log "^install "
 expect_out "backup made first"
+
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+run --yes --panel-lan
+expect_rc 1 "panel-lan refuses upgrade settings"
+expect_out "--set cannot change the configuration of an installed system"
 
 reset_state
 install -d "$APP_ROOT/config"
