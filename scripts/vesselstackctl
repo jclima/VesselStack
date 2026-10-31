@@ -6,6 +6,7 @@ umask 077
 
 ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
@@ -39,6 +40,8 @@ Commands:
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
+  component add ID             Enable one core component and start it
+  component remove ID          Disable one core component and remove its container (data preserved)
   backup [--allow-unmounted] [DIRECTORY]
                                Create a checksummed, consistent backup (stops the
                                whole stack briefly). Refuses /media and /mnt
@@ -62,14 +65,72 @@ require_root() {
 
 load_config() {
     [ -r "$ENV_FILE" ] || { echo "Missing installed config: $ENV_FILE" >&2; exit 1; }
+    VESSELSTACK_DISABLED_COMPONENTS=""
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     : "${VESSELSTACK_ROOT:?Missing VESSELSTACK_ROOT}"
     : "${VESSELSTACK_DATA:?Missing VESSELSTACK_DATA}"
+    validate_disabled_components
     COMPOSE=(docker compose)
     [ "${SIGNALK_MODE:-existing}" = docker ] && COMPOSE+=(--profile signalk)
     [ "${AIS_ENABLE:-false}" = true ] && COMPOSE+=(--profile ais)
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
+}
+
+validate_disabled_components() {
+    local raw=${VESSELSTACK_DISABLED_COMPONENTS:-} item known seen=""
+    while [ -n "$raw" ]; do
+        case "$raw" in *,*) item=${raw%%,*}; raw=${raw#*,} ;; *) item=$raw; raw="" ;; esac
+        item=${item//[[:space:]]/}; [ -z "$item" ] && continue
+        known=0; for component in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && known=1; done
+        [ "$known" -eq 1 ] || { echo "Unknown disabled component: $item" >&2; exit 2; }
+        case ",$seen," in *,"$item",*) echo "Duplicate disabled component: $item" >&2; exit 2 ;; esac
+        seen="${seen:+$seen,}$item"
+    done
+    VESSELSTACK_DISABLED_COMPONENTS=$seen
+}
+
+selected_services() {
+    local component
+    for component in "${CORE_COMPONENTS[@]}"; do
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,"$component",*) ;; *) printf '%s\n' "$component" ;; esac
+    done
+    [ "${SIGNALK_MODE:-existing}" = docker ] && printf '%s\n' signalk
+    [ "${AIS_ENABLE:-false}" = true ] && printf '%s\n' ais-catcher
+}
+
+persist_disabled_components() {
+    local value=$1
+    set_env_key "$ENV_FILE" VESSELSTACK_DISABLED_COMPONENTS "$value"
+    VESSELSTACK_DISABLED_COMPONENTS=$value
+}
+
+component_change() {
+    local action=$1 component=$2 item found=0 value=""
+    for item in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && found=1; done
+    [ "$found" -eq 1 ] || { echo "Unknown core component: $component" >&2; exit 2; }
+    local disabled=${VESSELSTACK_DISABLED_COMPONENTS:-}
+    while [ -n "$disabled" ]; do
+        case "$disabled" in *,*) item=${disabled%%,*}; disabled=${disabled#*,} ;; *) item=$disabled; disabled="" ;; esac
+        [ -n "$item" ] && [ "$item" != "$component" ] && value="${value:+$value,}$item"
+    done
+    if [ "$action" = remove ]; then
+        value="${value:+$value,}$component"; persist_disabled_components "$value"
+        "${COMPOSE[@]}" rm --stop --force "$component"
+    else
+        persist_disabled_components "$value"
+        if [ "$component" = mosquitto ]; then sync_mqtt_access; fi
+        if [ "$component" = influxdb ]; then
+            [ -x "$VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" ] || {
+                echo "Missing bundled InfluxDB provisioner: $VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" >&2
+                return 1
+            }
+            "${COMPOSE[@]}" up -d "$component"
+            "$VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" "$ENV_FILE"
+        else
+            "${COMPOSE[@]}" up -d "$component"
+        fi
+    fi
 }
 
 # Render the Mosquitto ACL and hashed passwords (admin, plus the displays bridge
@@ -129,29 +190,45 @@ start_stack() {
     if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
         systemctl enable --now vesselstack-firewall.service
     fi
-    if [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/passwords" ] || \
-        [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/acl" ]; then
-        sync_mqtt_access
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+        *,mosquitto,*) ;;
+        *) if [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/passwords" ] || \
+              [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/acl" ]; then
+               sync_mqtt_access
+           fi ;;
+    esac
+    local -a services=()
+    while IFS= read -r service; do services+=("$service"); done < <(selected_services)
+    if [ "${#services[@]}" -gt 0 ]; then
+        "${COMPOSE[@]}" up -d "${services[@]}"
     fi
-    "${COMPOSE[@]}" up -d
+    # Do not issue a bare `up`, which would recreate intentionally removed core components.
     # A changed compose definition is recreated by "up -d"; a changed Mosquitto
     # configuration file alone is not, so compare with the last applied stamp.
     local conf="$VESSELSTACK_ROOT/config/mosquitto/mosquitto.conf"
     local stamp="$VESSELSTACK_ROOT/config/.mosquitto-conf.sha256" conf_hash=
     if [ -r "$conf" ]; then
         conf_hash=$(sha256sum "$conf" | cut -d' ' -f1)
-        if [ -r "$stamp" ] && [ "$(<"$stamp")" != "$conf_hash" ]; then
-            "${COMPOSE[@]}" up -d --force-recreate mosquitto
-        fi
-        printf '%s\n' "$conf_hash" > "$stamp"
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+            *,mosquitto,*) ;;
+            *) if [ -r "$stamp" ] && [ "$(<"$stamp")" != "$conf_hash" ]; then
+                   "${COMPOSE[@]}" up -d --force-recreate mosquitto
+               fi ;;
+        esac
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+            *,mosquitto,*) ;;
+            *) printf '%s\n' "$conf_hash" > "$stamp" ;;
+        esac
     fi
-    [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
+    if [[ ",${VESSELSTACK_DISABLED_COMPONENTS:-}," != *,influxdb,* ]]; then
+      [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
         echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
         return 1
-    }
+      }
     # bootstrap-influx.sh first waits (bounded) for InfluxDB /health, so start,
     # restart and the backup restart trap never provision against a booting server.
-    "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
+      "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
+    fi
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
     fi
@@ -227,6 +304,11 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
 status_stack() {
     local failed=0 service running_services
     local services=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+    local -a selected=()
+    for service in "${services[@]}"; do
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,"$service",*) ;; *) selected+=("$service") ;; esac
+    done
+    services=("${selected[@]}")
     [ "${SIGNALK_MODE:-existing}" = docker ] && services+=(signalk)
     [ "${AIS_ENABLE:-false}" = true ] && services+=(ais-catcher)
     printf '%-20s %s\n' COMPONENT STATE
@@ -259,9 +341,9 @@ status_stack() {
     check_chat_endpoint "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
     check_endpoint 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" || failed=1
     check_endpoint SignalK "${SIGNALK_URL%/}/signalk" || failed=1
-    check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1
-    check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1
-    check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homeassistant,*) ;; *) check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1 ;; esac
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,influxdb,*) ;; *) check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1 ;; esac
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,grafana,*) ;; *) check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1 ;; esac
     printf '\nRun vesselstackctl doctor for configuration and dependency checks.\n'
     return "$failed"
 }
@@ -1019,7 +1101,9 @@ EOF
     echo "Configuration updated."
     # Re-apply: compose recreates only the containers whose published ports changed.
     if "${COMPOSE[@]}" ps --status running --quiet 2>/dev/null | grep -q .; then
-        "${COMPOSE[@]}" up -d
+        local -a lan_services=()
+        while IFS= read -r service; do lan_services+=("$service"); done < <(selected_services)
+        [ "${#lan_services[@]}" -eq 0 ] || "${COMPOSE[@]}" up -d "${lan_services[@]}"
     else
         echo "The containers are not running; the new addresses apply at the next start."
     fi
@@ -1160,7 +1244,7 @@ doctor_stack() {
     disk_usage_warning
     check_signalk_data_dir || failed=1
     check_homeassistant_bind
-    check_prometheus_data_dir || failed=1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,prometheus,*) ;; *) check_prometheus_data_dir || failed=1 ;; esac
     check_memory_index || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
@@ -1442,6 +1526,9 @@ PY
         # rebuilds it, re-renders units and starts the stack.
         "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start
     else
+        # A restored archive may carry different membership than the process
+        # that invoked restore; reload it before the fallback start.
+        load_config
         start_stack
         echo "NOTE: the Boat Chat virtualenv was not rebuilt. Run: sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
     fi
@@ -1547,6 +1634,7 @@ case "$command" in
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
+    component) [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
     backup) backup_stack "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
     restore) [ $# -ge 2 ] || { usage; exit 2; }; restore_stack "$@" ;;

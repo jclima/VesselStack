@@ -51,13 +51,16 @@
 
       <section id="components" class="tab-panel">
         <div class="section-heading"><div><p class="eyebrow">RUNTIME</p><h2>Components</h2></div><button id="refresh">Refresh status</button></div>
+        <div id="component-overview" class="overview" aria-label="Component overview"></div>
+        <p class="catalog-note">The catalog below covers the six managed core components. SignalK, AIS, and hardware integrations stay configuration-driven.</p>
+        <div class="component-toolbar"><label class="search-field" for="component-search">Search components<input id="component-search" type="search" placeholder="Name or description" autocomplete="off"></label><div class="filter-group" role="group" aria-label="Component filter"><button class="active" data-component-filter="all">All</button><button data-component-filter="enabled">Enabled</button><button data-component-filter="available">Available</button></div></div>
         <div id="component-grid" class="component-grid"></div>
       </section>
 
       <section id="configuration" class="tab-panel" hidden>
         <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>Configuration</h2></div><div class="inline-actions"><button id="discard-config">Discard edits</button><button id="save-config" class="primary">Save configuration</button></div></div>
         <div class="notice">Secrets are write-only. Leave a secret field blank to keep its current value. Saving does not restart services; use <strong>Apply configuration</strong> after review.</div>
-        <form id="config-form"></form>
+        <p id="config-status" class="form-status" aria-live="polite"></p><form id="config-form"></form>
       </section>
 
       <section id="maintenance" class="tab-panel" hidden>
@@ -66,7 +69,7 @@
           <article class="card action-card"><h3>Configuration</h3><p>Validate, render, and apply the saved configuration without starting stopped services.</p><button data-action="apply">Apply configuration</button></article>
           <article class="card action-card"><h3>History storage</h3><p>Create configured InfluxDB buckets and the idempotent one-minute downsample task.</p><button data-action="bootstrap-history">Provision history</button></article>
           <article class="card action-card"><h3>Stack lifecycle</h3><p>Start, stop, or restart the managed stack. The control panel remains available.</p><div class="inline-actions"><button data-action="start">Start</button><button data-action="restart">Restart</button><button class="danger" data-action="stop">Stop</button></div></article>
-          <article class="card action-card"><h3>Reviewed update</h3><p>Back up and apply a root-controlled release staged under /var/lib/vesselstack/releases.</p><label for="update-source">Staged release directory</label><input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z"><button id="run-update">Back up &amp; update</button></article>
+          <article class="card action-card"><h3>Reviewed update</h3><p>Back up and apply a release staged by the root-controlled update workflow.</p><label for="update-source">Staged release directory</label><input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z"><button id="run-update">Back up &amp; update</button></article>
         </div>
       </section>
 

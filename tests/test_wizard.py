@@ -22,6 +22,16 @@ wizard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wizard)
 
 class WizardTests(unittest.TestCase):
+    def test_component_membership_defaults_empty_and_canonicalizes(self):
+        self.assertEqual(wizard.DEFAULTS["VESSELSTACK_DISABLED_COMPONENTS"], "")
+        rendered = wizard.render({"VESSELSTACK_DISABLED_COMPONENTS": " grafana, influxdb "})
+        self.assertIn("VESSELSTACK_DISABLED_COMPONENTS=grafana,influxdb", rendered)
+
+    def test_component_membership_rejects_unknown_and_duplicates(self):
+        for value in ("grafana,unknown", "grafana,grafana"):
+            with self.assertRaises(ValueError):
+                wizard.render({"VESSELSTACK_DISABLED_COMPONENTS": value})
+
     def test_render_is_complete_and_shell_safe(self):
         output = wizard.render({"BOAT_NAME": "A Boat (Test)", "SOCKETCAN_ENABLE": "true"})
         self.assertIn("BOAT_NAME='A Boat (Test)'", output)

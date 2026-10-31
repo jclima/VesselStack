@@ -49,7 +49,9 @@ Do not build and upload files by hand.
    integration). Merge it to `main`.
 3. Tag the merged `main` commit (signed tag, see [DEPLOYMENT.md](DEPLOYMENT.md)
    section 1) and push the tag. The workflow refuses a tag whose commit is not on
-   `main`, or that differs from `VERSION`.
+   `main`, or that differs from `VERSION`. The explicitly approved `v0.5.1`
+   lab-prerelease exception is an annotated unsigned tag because no SSH/GPG key
+   is available; it is not a stable promotion and must not be treated as signed.
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate
@@ -68,7 +70,9 @@ Do not build and upload files by hand.
    `docker-compose-plugin` installed, `docker info` answering; check `dpkg --print-architecture`
    says `arm64`), an upgrade from the previous release, and an offline
    upgrade. The test suites use stubs and cannot cover this. Do not publish before it
-   passes.
+   passes. For the approved `0.5.1` lab prerelease, run the pinned installer and
+   component lifecycle recipe in [CONTROL_PANEL_TESTING.md](CONTROL_PANEL_TESTING.md)
+   on the lab first; this exception does not waive the stable-release gates.
 7. Publish the draft as a **pre-release** (or otherwise not latest) first, so
    `releases/latest/download/` still points at the previous release. Install-test
    through the pinned URL from a scratch directory (never run it piped into root

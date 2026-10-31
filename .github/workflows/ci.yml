@@ -64,6 +64,8 @@ jobs:
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run control panel UI regression checks
+        run: node tests/test_control_panel_ui.cjs
       - name: Build and verify release archive
         run: |
           ./build-package.sh
