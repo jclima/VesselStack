@@ -653,7 +653,7 @@ SECRET=sekrit-token-value-123
     printf '%s\n' y ''                                           # AIS on, device
     printf '%s\n' '' '?' "$SECRET" 1 n                           # HA url, help, HA token, provider, telegram
     printf '%s\n' y '' n 22,8080 -                               # firewall on ...
-    printf '%s\n' 14d '' n                                       # retention, LAN access, no advanced
+    printf '%s\n' 14d '' '' n                                    # retention, LAN access, panel access, no advanced
     printf '%s\n' s y                                            # save, install
 } > "$ANSWERS"
 run_asking
