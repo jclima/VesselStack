@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent
 WIZARD = ROOT / "wizard"
 OUTPUT = ROOT / "vesselstack.env"
 ALLOWED = re.compile(r"^[A-Za-z0-9 _.,:/@+()-]*$")
+CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
 
 DEFAULTS = {
  "BOAT_NAME":"My Boat","BOAT_TYPE":"Motor vessel","BOAT_MMSI":"","BOAT_CALLSIGN":"","BOAT_LOA_M":"","BOAT_BEAM_M":"","BOAT_TIMEZONE":"UTC","BOAT_UNITS":"metric",
@@ -20,7 +21,14 @@ DEFAULTS = {
  "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true",
  "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780",
  "DISPLAYS_ENABLE":"false","DISPLAYS_BRIDGE_MQTT_USERNAME":"vesselstack-bridge","DISPLAYS_SIGNALK_TOKEN":"","DISPLAYS_HA_TOKEN":"",
+ "VESSELSTACK_DISABLED_COMPONENTS":"",
 }
+
+def normalize_disabled_components(value):
+    items=[item.strip() for item in value.split(",") if item.strip()]
+    if len(items) != len(set(items)) or any(item not in CORE_COMPONENTS for item in items):
+        raise ValueError("VESSELSTACK_DISABLED_COMPONENTS must contain unique allowed core component IDs")
+    return ",".join(items)
 
 def compose_available():
     if not shutil.which("docker"): return False
@@ -42,6 +50,7 @@ def validate(values):
     for key,value in values.items():
         if not isinstance(value,str) or "\n" in value or "\r" in value or not ALLOWED.fullmatch(value): raise ValueError(f"Invalid value for {key}")
         result[key]=value
+    result["VESSELSTACK_DISABLED_COMPONENTS"] = normalize_disabled_components(result["VESSELSTACK_DISABLED_COMPONENTS"])
     if result["SIGNALK_MODE"] not in {"existing","docker","native"}: raise ValueError("Invalid SignalK mode")
     for key in ("SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT"):
         if result[key] not in {"true","false"}: raise ValueError(f"Invalid boolean for {key}")
@@ -277,7 +286,8 @@ SECTIONS=[
   F("VESSELSTACK_GID","Service account group id","Numeric group id for container volumes.",advanced=True,required=True,check=_number(1,65534,"Group id")),
   F("VESSELSTACK_ROOT","Application folder","Where the application is installed. Not under /home or /root, no spaces.",advanced=True,required=True,check=_install_path),
   F("VESSELSTACK_DATA","Data folder","Where databases and logs live. Put it on the SSD. Not under /home or /root, no spaces.",advanced=True,required=True,check=_install_path),
-  F("VESSELSTACK_BACKUP","Backup folder","Where backups are written; removable media is best.",advanced=True,required=True,check=_backup_path)]},
+  F("VESSELSTACK_BACKUP","Backup folder","Where backups are written; removable media is best.",advanced=True,required=True,check=_backup_path),
+  F("VESSELSTACK_DISABLED_COMPONENTS","Disabled core components","Managed by the Control Panel or vesselstackctl; this membership is preserved by the wizard.",advanced=True,when=lambda s:False)]},
  {"title":"Signal K (the boat data hub)","intro":"Signal K collects data from your instruments and serves it to everything else.","fields":[
   F("SIGNALK_MODE","How should Signal K run?","docker: VesselStack installs and manages Signal K in a container (recommended). existing: you already run Signal K elsewhere. native: installed directly on the Pi (not in a container).","choice",
     choices=[("docker","VesselStack runs Signal K for you (recommended)"),("existing","use a Signal K server you already have"),("native","install Signal K directly on this Pi")]),

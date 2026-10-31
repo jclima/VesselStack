@@ -44,6 +44,10 @@ their retained user data. Membership survives restarts, upgrades, and a
 reinstall; updates re-apply the selected membership rather than silently
 enabling removed services.
 
+The guided wizard defaults membership to empty and preserves an existing
+validated value when re-rendering; membership is managed through the Control
+Panel or `vesselstackctl`, not an additional wizard question.
+
 Use the Control Panel's component view (normally reached at
 `http://127.0.0.1:8780` through an SSH tunnel) or the corresponding
 `vesselstackctl` commands to review and apply a change. Adding a component
