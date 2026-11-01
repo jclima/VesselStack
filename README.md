@@ -7,33 +7,6 @@ boat data, dashboards, automation, and diagnostics together on a Raspberry Pi
 you control—at home, in the lab, or aboard. It is designed to keep working on
 the boat's local network when the internet is unavailable.
 
-## Brand and appearance
-
-The Control Panel, Boat Chat, and setup wizard share the VesselStack chart-room
-palette: a light blue-gray canvas, white panels, navy ink, teal actions, and
-restrained status colors. Boat Chat also preserves a coherent dark appearance
-for operating-system dark mode. Local icons are bundled with each surface; no
-external font or asset host is needed, so all three remain usable offline with
-system font fallbacks. Keyboard focus remains visible, controls meet mobile
-touch-target sizing, and reduced-motion preferences are respected.
-
-Canonical icon, wordmark, banner, palette, and social-upload limitations live
-in [`brand/README.md`](brand/README.md). The canonical Rising Decks icon uses a
-wide white hull below two ascending teal decks on a navy rounded square.
-
-Run these checks to verify the change:
-
-```bash
-bash tests/test-build-package.sh
-python3 -m unittest discover -s tests -p 'test_control_panel.py'
-```
-
-The
-release package is built from committed files, so uncommitted presentation
-edits are intentionally excluded until reviewed and committed. Roll back the
-presentation by restoring the previous release package; runtime configuration
-and vessel data are unaffected.
-
 ## What you get
 
 - A local view of boat data from Signal K-compatible sources and supported NMEA
@@ -66,26 +39,14 @@ is another separately enabled local feature.
 
 ### Component lifecycle
 
-The Control Panel and `vesselstackctl` manage the six core components as a
-persistent, reviewable catalog: Home Assistant, InfluxDB, Grafana, Prometheus,
-Mosquitto, and Heimdall. Components can be added or removed without deleting
-their retained user data. Membership survives restarts, upgrades, and a
-reinstall; updates re-apply the selected membership rather than silently
-enabling removed services.
-
-The guided wizard defaults membership to empty and preserves an existing
-validated value when re-rendering; membership is managed through the Control
-Panel or `vesselstackctl`, not an additional wizard question.
-
-Use the Control Panel's component view (normally reached at
-`http://127.0.0.1:8780` through an SSH tunnel) or the corresponding
-`vesselstackctl` commands to review and apply a change. Adding a component
-provisions required InfluxDB/MQTT integration when applicable; removing one may
-leave integrations degraded until it is added again, but does not auto-configure
-or delete unrelated services. Hardware and systemd services remain
-configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
-for the release acceptance recipe.
-On Linux, keep temporary test roots protected with `trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX"); TMPDIR="$trusted_test_tmp" python3 -m unittest discover -s tests -p 'test_*.py'` and remove the directory afterward.
+The Control Panel and `vesselstackctl` manage six core components—Home
+Assistant, InfluxDB, Grafana, Prometheus, Mosquitto, and Heimdall—as a
+persistent catalog. Add or remove components without deleting retained data;
+membership survives restarts, upgrades, and reinstalls. Review and apply
+changes in the component view at `http://127.0.0.1:8780` through an SSH tunnel,
+or use the corresponding `vesselstackctl` commands. Hardware and systemd
+services remain configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
+for acceptance steps.
 
 ### Optional VesselTwin connection
 
@@ -124,7 +85,9 @@ VesselStack. `sudo` is required because installation writes system packages,
 services, and `/opt/vesselstack`; the questions explain each change. Secrets
 are generated or entered without echo and are not printed in the review.
 
-To pin a specific release, use the [installation guide](docs/INSTALLATION.md).
+The command above installs the latest stable release. For the `0.5.6` lab
+prerelease, follow the pinned-release instructions in the
+[installation guide](docs/INSTALLATION.md).
 For a boat with no internet, prepare the release and offline bundle in the lab
 and follow the [offline deployment path](docs/DEPLOYMENT.md).
 
@@ -162,16 +125,12 @@ explicit CLI `vesselstackctl verify-backup` and `vesselstackctl restore` path in
 the deployment guide when recovery is needed. `--require-mounted` defeats
 `ALLOW_UNMOUNTED` for this flow.
 
-The update runs in a detached updater, restarts the Control Panel, and verifies
-the new version and boot, then the browser reconnects using the existing
-authenticated session token. Status survives refresh and reconnect.
-Settings also has a standalone **Restart Control Panel** button; common settings
-changes no longer require a shell. If the panel host or port changes, the old
-tab cannot reconnect automatically; the UI opens the new URL and retains the
-token for that session. The reviewed source-path update remains an advanced
-option. The panel uses ordinary HTTP;
-release checksums provide corruption detection, not signed provenance, and the
-0.5.6 lab tag is explicitly unsigned and not latest.
+The detached updater restarts the Control Panel and verifies its new version and
+boot before the browser reconnects. Settings also provides a standalone
+**Restart Control Panel** action. The panel uses ordinary HTTP; release
+checksums provide corruption detection, not signed provenance, and the 0.5.6
+lab tag is explicitly unsigned and not latest. See the full reference below for
+backup, recovery, and update details.
 
 The browser updater was introduced in `0.5.5`. Installations on `0.5.4` or
 earlier must use the CLI installer/update once; installations on `0.5.5` can
@@ -3384,6 +3343,14 @@ ownership: containers use different internal user IDs.
 
 ## Developer validation
 
+On Linux, keep temporary test roots protected and remove them after the run:
+
+```bash
+trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX")
+TMPDIR="$trusted_test_tmp" python3 -m unittest discover -s tests -p 'test_*.py'
+rm -rf -- "$trusted_test_tmp"
+```
+
 The `displays-esphome-config` CI job pulls the image pinned in
 `displays/esphome/IMAGE` and runs `tests/test-displays-esphome-config.sh` on every
 push and pull request. That script runs the containers with the same hardening
@@ -3458,7 +3425,7 @@ Build a sanitized release:
 
 ```bash
 ./build-package.sh
-(cd generated && sha256sum -c vesselstack-0.4.3.tar.gz.sha256)
+(cd generated && sha256sum -c "vesselstack-$(cat ../VERSION).tar.gz.sha256")
 ```
 
 The package is produced by `git archive` of the committed `HEAD`, so untracked
