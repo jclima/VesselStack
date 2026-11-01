@@ -64,6 +64,10 @@ offline bundle (copy the bundle root-owned, `chmod -R go-w`). Install Docker and
 the apt prerequisites while the Pi still has internet (the script cannot install
 packages offline and tells you what is missing), then:
 
+For a first offline install, review the managed SignalK preload and displays
+bridge prerequisites in section 3.5.3; a bundle alone cannot provide a first
+offline plugin or bridge-virtualenv installation.
+
 ```bash
 sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle \
   --tarball /path/to/vesselstack-0.5.6.tar.gz
@@ -121,9 +125,10 @@ fetches the pinned `origin` into a root-owned mirror and requires the upstream
 branch tip to have a valid commit signature **or** a validly signed tag pointing
 at it. It needs network access to `origin`, so it is a home-lab/connected-machine
 flow. **`install.sh` and `vesselstackctl update` do not verify signatures** of the
-tarball or directory they are given. On the boat the integrity gate for the
-carried tarball is the sha256 you recorded at build time (section 2) plus the
-signed tag you verified on the maintainer machine.
+tarball or directory they are given. On the boat, this `v0.5.6` lab recipe uses
+the sha256 recorded at build time (section 2) and the recorded commit; future
+signed releases also require the signed tag to be verified on the maintainer
+machine.
 
 On the **maintainer machine** (private key never leaves it):
 
@@ -174,18 +179,23 @@ hatch; never set it on the boat. The boat has no route to `origin`, so
 `vesselstack-update` is not the boat's update path; leave it unconfigured there
 unless you later add a connection you trust.
 
-Cut and verify the tag (on the maintainer machine, from merged `main`):
+The authorized `v0.5.6` tag already exists. Do not recreate or retag it. On the
+maintainer machine, verify that the existing tag points at the intended merged
+commit:
 
 ```bash
-git checkout main && git pull --ff-only
-git tag -a v0.5.6 -m "VesselStack 0.5.6 lab prerelease"
-git push origin v0.5.6
+git fetch origin main --tags
+git show --no-patch --decorate v0.5.6
+git rev-parse v0.5.6^{commit}
+git merge-base --is-ancestor v0.5.6^{commit} origin/main
 ```
 
 For this explicitly authorized lab prerelease, `v0.5.6` is an annotated,
 unsigned tag: no SSH/GPG signing key is available. Do not claim
 `git verify-tag` success, and do not use this exception for a stable release.
-Future stable versions still require a cryptographically signed tag.
+For a future release, follow the tag-creation and signing gates in
+[DEVELOPMENT.md](DEVELOPMENT.md#release-checklist); future stable versions
+require a cryptographically signed tag.
 
 ## 2. Cut and build
 
@@ -242,10 +252,13 @@ sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-0.5.6
 cd /var/lib/vesselstack/releases/vesselstack-0.5.6
 ```
 
-Configuration: either the terminal wizard (`python3 vesselstack-wizard.py --cli`, over plain
+Configuration: either the terminal wizard (`python3 vesselstack-wizard.py --cli --output ~/vesselstack-lab.env`, over plain
 SSH; add `--defaults` and `--set KEY=VALUE` for no questions), the optional browser wizard
 (loopback only; tunnel it with
-`ssh -L 8088:127.0.0.1:8088 YOUR_USER@LAB_PI`, run `python3 vesselstack-wizard.py` as a normal user and open the printed `http://127.0.0.1:8088/#token=...` address)
+`ssh -L 8088:127.0.0.1:8088 YOUR_USER@LAB_PI`, run
+`python3 vesselstack-wizard.py --output ~/vesselstack-lab.env` as a normal user
+and open the printed `http://127.0.0.1:8088/#token=...` address; the explicit
+output path avoids writing to the root-owned release checkout)
 or edit a copy of the example. Keep it out of git and mode 600:
 
 ```bash
@@ -291,9 +304,12 @@ canplayer -I /path/to/private-candump.log vcan0=can0       # add -l i to loop fo
 ip -statistics link show vcan0                             # RX packets should climb
 ```
 
-Point SignalK's NMEA 2000/SocketCAN connection at `vcan0`. The rendered
-`vesselstack-socketcan.service` runs `ip link set vcan0 up` only. Reboot once and
-confirm the unit recreates `vcan0` (`systemctl status vesselstack-socketcan`).
+Point SignalK's NMEA 2000/SocketCAN connection at `vcan0`. With
+`VESSELSTACK_CAN_CREATE_VCAN=true`, the rendered
+`vesselstack-socketcan.service` loads the helper that creates the virtual
+interface and brings it up; physical `can*` interfaces must already exist.
+Reboot once and confirm the unit recreates `vcan0` (`systemctl status
+vesselstack-socketcan`).
 
 ### 3.3 Firewall decision
 
@@ -375,7 +391,13 @@ values, and record the `doctor` result and data-directory size each day.
    ```
 
    The bundle path and **every parent** must be root-owned and not
-   group/world-writable, or root refuses it.
+   group/world-writable, or root refuses it. Managed Docker SignalK with
+   `SIGNALK_VESSELTWIN_PRELOAD=true` requires a valid preload plugin install
+   prepared while online; for a fresh offline install, set it to `false` or
+   deliberately pre-provision the plugin state. Native SignalK installation is
+   not supported offline. `DISPLAYS_ENABLE=true` likewise requires its bridge
+   virtualenv to have been provisioned online first; set it to `false` for a
+   fresh offline install.
 
 4. **Disk and retention.** `doctor` prints data-filesystem usage and warns above
    80 % (`VESSELSTACK_DISK_WARN_PERCENT`).
@@ -427,8 +449,12 @@ backup, the recorded sha256 and a console/Ethernet path ready.
    mountpoint /media/vesselstack-backup                       # [read-only] USB/SSD must be mounted
    sudo vesselstackctl backup /media/vesselstack-backup/backups     # [MUTATES HOST] stack stops briefly
    sudo vesselstackctl verify-backup /media/vesselstack-backup/backups/vesselstack-STAMP.tar.gz
-   rsync -av YOUR_USER@BOAT_PI:/media/vesselstack-backup/backups/ ./boat-backup/   # from the laptop
    ```
+
+   Backups are root-owned mode `0600`; copy them with a privileged encrypted
+   transfer on each endpoint, retaining mode `0600`. Do not change SSH/sudo
+   permissions or publish the backup contents. Verify the transferred checksum
+   before storing the private copy.
 
    Keep one copy off the Pi. `vesselstackctl update` also takes its own backup
    into `VESSELSTACK_BACKUP`, but that is not a substitute for this one.

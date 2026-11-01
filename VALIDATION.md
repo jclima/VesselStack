@@ -1,7 +1,8 @@
-# VesselStack 1.3 validation
+# Historical 0.3.0 validation (schema 1.3)
 
-This record describes the evidence used to release 0.3.0. It does not convert
-VesselStack into certified marine safety equipment.
+This record describes the evidence used for the historical 0.3.0 release. It is
+not a current-release gate and does not convert VesselStack into certified
+marine safety equipment.
 
 ## Automated release gates
 

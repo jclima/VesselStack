@@ -153,6 +153,8 @@ The [documentation index](docs/README.md) maps common tasks to the right guide,
 including first boot, access, offline operation, troubleshooting, privacy, and
 contribution. The full setup and operations reference below remains available
 for exact commands, settings, ports, security details, and rollback procedures.
+For Boat Chat provider configuration and unit behavior, see [Boat Chat setup](boat-chat/README.md);
+for power sources and instrument-reading coverage, see [Power monitoring](boat-chat/POWER_MONITORING.md).
 
 <details>
 <summary>Full setup, configuration and operations reference</summary>
@@ -3382,21 +3384,14 @@ directory `/home/node/.signalk`), but `<data>/signalk` was created by Docker as
 as `1000:1000` mode 0750 before `compose up` and repair a root-owned one on
 every installer run, so rerunning the installer (`sudo vesselstackctl update` or
 the installer from the release) fixes it. `sudo vesselstackctl doctor` also
-detects the condition and prints the fix. Manual fix (the data directory is
-`/opt/vesselstack-data` by default):
-
-```bash
-sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk
-```
-
-The installer repairs only the known state conservatively, because a recursive `chown`
-by root over a tree its previous owner can still write could be redirected through symlink
-or hard-link swaps. An empty directory is chowned (`-h`, the directory only). A populated
-`root:root` directory is first locked (mode 0700, restored afterwards), refused if it holds
-any symlink, file with more than one hard link or special file, and otherwise chowned with a
-non-following walk on the same filesystem. A populated directory owned by anyone else is left
-untouched with manual instructions (the `chown -R -h 1000:1000` command above after you have
-stopped whatever uses it and reviewed the contents).
+detects the condition and reports it. Start with the read-only doctor output
+and inspect the exact configured SignalK data directory and ownership. The
+installer repairs only the known state conservatively: an empty or root-owned
+directory with safe contents may be repaired, while symlinks, hard links,
+special files, or another owner are left untouched with instructions. Resolve
+the indicated cause, then rerun the supported installer repair. Do not
+blanket-chown the SignalK tree or restart the container while ownership and
+symlink state are still unknown.
 
 ### Container mount permissions fail
 

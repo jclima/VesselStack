@@ -1,6 +1,7 @@
 # Contributing to VesselStack
 
-Thank you for helping make self-hosted boat monitoring safer and easier.
+Contributions should keep self-hosted boat monitoring clear, reviewable, and
+operationally bounded.
 
 ## Before submitting a change
 
