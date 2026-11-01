@@ -71,13 +71,14 @@
           <article class="card action-card"><h3>Configuration</h3><p>Validate, render, and apply the saved configuration without starting stopped services.</p><button data-action="apply">Apply configuration</button></article>
           <article class="card action-card"><h3>History storage</h3><p>Create configured InfluxDB buckets and the idempotent one-minute downsample task.</p><button data-action="bootstrap-history">Provision history</button></article>
           <article class="card action-card"><h3>Stack lifecycle</h3><p>Start, stop, or restart the managed stack. The control panel remains available.</p><div class="inline-actions"><button data-action="start">Start</button><button data-action="restart">Restart</button><button class="danger" data-action="stop">Stop</button></div></article>
-          <article class="card action-card"><h3>Reviewed update</h3><p>Back up and apply a release staged by the root-controlled update workflow.</p><label for="update-source">Staged release directory</label><input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z"><button id="run-update">Back up &amp; update</button></article>
+          <article class="card action-card release-card"><h3>Maintenance updates</h3><p>Check the release catalog, review what will be installed, and keep a backup before the panel restarts.</p><div class="release-toolbar"><button id="check-releases" class="primary">Check for updates</button><label class="check-label"><input id="include-lab" type="checkbox"> Include lab prereleases</label></div><p id="release-versions" class="release-versions">Installed and running version: checking…</p><div id="release-warning" class="notice release-warning" hidden></div><label for="release-select">Available release</label><select id="release-select" disabled><option>Check for updates first</option></select><p id="release-detail" class="release-detail"></p><button id="install-release" class="primary" disabled>Back up &amp; install version</button><div id="release-progress" class="release-progress" aria-live="polite"></div><details class="advanced-update"><summary>Advanced: install a manually reviewed release</summary><p>Compatibility path for an already staged release directory.</p><label for="update-source">Staged release directory</label><input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z"><button id="run-update">Back up &amp; update reviewed release</button></details></article>
+          <article class="card action-card"><h3>Panel recovery</h3><p>Restart only the control panel after a verified installation or when recovery guidance requires it.</p><button id="restart-panel">Restart control panel</button></article>
         </div>
       </section>
 
       <section class="operation card">
         <div class="section-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Operation log</h2></div><span id="operation-state" class="pill">Idle</span></div>
-        <pre id="operation-output">No operation has run in this session.</pre>
+        <p id="operation-progress" class="operation-progress" hidden></p><pre id="operation-output">No operation has run in this session.</pre>
       </section>
     </div>
   </main>

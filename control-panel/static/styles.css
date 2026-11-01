@@ -94,9 +94,24 @@ p { color: var(--muted); line-height: 1.6; }
 .maintenance-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
 .action-card { padding: 1.3rem; }
 .action-card p { min-height: 4.8rem; font-size: .9rem; }
+.release-card { grid-column: 1 / -1; order: -1; }
+.release-card p { min-height: 0; }
+.release-card .release-toolbar { max-width: 42rem; }
 .action-card > button { width: 100%; }
 .action-card input { margin-bottom: .7rem; }
+.release-toolbar { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; margin-bottom: .8rem; }
+.release-toolbar .check-label { display: flex; align-items: center; gap: .45rem; margin: 0; color: var(--muted); font-size: .78rem; font-weight: 500; }
+.release-toolbar .check-label input { width: auto; min-height: auto; }
+.release-versions, .release-detail, .operation-progress { min-height: 1.4rem; margin: .45rem 0 .8rem; font-size: .8rem; }
+.release-detail a { color: var(--sea); }
+.release-warning { margin: .6rem 0 .8rem; color: var(--amber); font-size: .8rem; }
+.release-progress { min-height: 1.5rem; margin-top: .8rem; color: var(--amber); font-size: .82rem; }
+.advanced-update { margin-top: 1.15rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.advanced-update summary { color: var(--muted); cursor: pointer; font-size: .8rem; }
+.advanced-update p { margin: .8rem 0; font-size: .8rem; }
+.advanced-update button { width: 100%; }
 .operation { margin-top: 3rem; padding: clamp(1rem, 3vw, 1.5rem); }
+.operation-progress { color: var(--amber); }
 .operation pre { min-height: 9rem; max-height: 28rem; margin: 0; padding: 1rem; overflow: auto; white-space: pre-wrap; color: #bcd1ce; background: #050d0c; border-radius: .6rem; line-height: 1.55; }
 #toast { position: fixed; right: 1rem; bottom: 1rem; max-width: min(28rem, calc(100vw - 2rem)); padding: .9rem 1rem; background: var(--ink); color: #071612; border-radius: .7rem; box-shadow: 0 14px 40px rgba(0,0,0,.35); transform: translateY(6rem); transition: .2s ease; z-index: 10; }
 #toast.show { transform: translateY(0); }

@@ -190,7 +190,7 @@ class PrecedenceTests(unittest.TestCase):
             panel.write_env(chat, {"BOAT_CHAT_PROVIDER": "local"}, [])
             override.write_text("# UI\nBOAT_CHAT_PROVIDER=ollama\nBOAT_CHAT_MODEL=llama3.2\n")
             os.chmod(override, 0o600)
-            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=ctl, CONFIG_BACKUP_ROOT=root / "bk"), \
+            with mock.patch.multiple(panel, ROOT=root, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=ctl, CONFIG_BACKUP_ROOT=root / "bk"), \
                  mock.patch.dict(os.environ, {"BOAT_CHAT_ENV": str(override)}):
                 config = panel.public_configuration()
                 self.assertEqual(["BOAT_CHAT_MODEL", "BOAT_CHAT_PROVIDER"], config["overridden"])

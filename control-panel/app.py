@@ -21,6 +21,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+try:
+    from browser_updates import installed_version, release_catalog, read_operation, public_operation, release_snapshot, running_identity, acquire_slot, release_slot, start_detached
+except ImportError:
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("browser_updates", Path(__file__).with_name("browser_updates.py"))
+    assert _spec and _spec.loader
+    _updates = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_updates)
+    installed_version = _updates.installed_version; release_catalog = _updates.release_catalog
+    read_operation = _updates.read_operation; public_operation = _updates.public_operation
+    running_identity = _updates.running_identity
+    acquire_slot = _updates.acquire_slot; release_slot = _updates.release_slot
+    start_detached = _updates.start_detached
+    release_snapshot = _updates.release_snapshot
+
 
 ROOT = Path(os.environ.get("VESSELSTACK_ROOT", "/opt/vesselstack"))
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
@@ -34,6 +48,7 @@ REVIEWED_RELEASE_ROOT = Path(
 )
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8780
+RUNNING_IDENTITY = running_identity(ROOT)
 CONFIG_BACKUP_ROOT = Path(
     os.environ.get("CONTROL_PANEL_CONFIG_BACKUPS", "/opt/vesselstack-data/control-panel/config-backups")
 )
@@ -425,13 +440,29 @@ def public_configuration() -> dict[str, Any]:
     return {"fields": fields, "values": result, "overridden": sorted(overridden & {s["key"] for s in FIELDS if s["source"] == "chat"})}
 
 
-def update_configuration(updates: dict[str, Any]) -> str:
+def take_lifecycle_slot():
     if not LIFECYCLE_LOCK.acquire(blocking=False):
         raise ValueError("Another operation is already running")
     try:
-        return _update_configuration(updates)
+        return acquire_slot(ROOT)
+    except Exception:
+        LIFECYCLE_LOCK.release()
+        raise
+
+
+def release_lifecycle_slot(slot_fd) -> None:
+    try:
+        release_slot(slot_fd)
     finally:
         LIFECYCLE_LOCK.release()
+
+
+def update_configuration(updates: dict[str, Any]) -> str:
+    slot_fd = take_lifecycle_slot()
+    try:
+        return _update_configuration(updates)
+    finally:
+        release_lifecycle_slot(slot_fd)
 
 
 def _update_configuration(updates: dict[str, Any]) -> str:
@@ -671,8 +702,7 @@ class OperationStore:
         self.counter = 0
 
     def start(self, label: str, command_or_factory: list[str] | Any) -> dict[str, Any]:
-        if not LIFECYCLE_LOCK.acquire(blocking=False):
-            raise ValueError("Another operation is already running")
+        slot_fd = take_lifecycle_slot()
         operation = None
         try:
             command = command_or_factory() if callable(command_or_factory) else command_or_factory
@@ -687,7 +717,7 @@ class OperationStore:
                     "finished_at": None, "exit_code": None, "output": deque(maxlen=400),
                 }
                 self.current = operation
-            threading.Thread(target=self._run, args=(operation, command), daemon=True).start()
+            threading.Thread(target=self._run, args=(operation, command, slot_fd), daemon=True).start()
             return self.public()
         except Exception:
             if operation is not None:
@@ -696,33 +726,34 @@ class OperationStore:
                     operation["exit_code"] = 1
                     operation["finished_at"] = int(time.time())
                     operation["output"].append("Operation failed")
-            LIFECYCLE_LOCK.release()
+            release_lifecycle_slot(slot_fd)
             raise
 
-    def _run(self, operation: dict[str, Any], command: list[str]) -> None:
+    def _run(self, operation: dict[str, Any], command: list[str], slot_fd) -> None:
         environment = os.environ.copy()
         environment["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
+        exit_code = 1
+        succeeded = False
         try:
             process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
             assert process.stdout is not None
             for line in process.stdout:
                 with self.lock:
                     operation["output"].append(line.rstrip())
+            exit_code = process.wait()
+            succeeded = exit_code == 0
             with self.lock:
-                operation["exit_code"] = process.wait()
-                operation["state"] = "succeeded" if operation["exit_code"] == 0 else "failed"
-                if operation["state"] == "succeeded" and operation["label"] in {"apply", "install", "update"}:
+                if succeeded and operation["label"] in {"apply", "install", "update"}:
                     operation["output"].append("If this operation changed Control Panel code or its listener, restart vesselstack-control-panel.service from the recovery shell.")
         except Exception as exc:
             with self.lock:
                 operation["output"].append("Operation failed")
-            with self.lock:
-                operation["exit_code"] = 1
-                operation["state"] = "failed"
         finally:
+            release_lifecycle_slot(slot_fd)
             with self.lock:
+                operation["exit_code"] = exit_code
+                operation["state"] = "succeeded" if succeeded else "failed"
                 operation["finished_at"] = int(time.time())
-            LIFECYCLE_LOCK.release()
 
     def public(self) -> dict[str, Any]:
         with self.lock:
@@ -807,7 +838,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
-            self.send_json(200, {"ok": True, "version": os.environ.get("VESSELSTACK_VERSION", "development")})
+            self.send_json(200, {"ok": True, "version": RUNNING_IDENTITY["running_version"], "boot_id": RUNNING_IDENTITY["boot_id"]})
             return
         if path.startswith("/api/"):
             if not self.require_auth():
@@ -815,9 +846,25 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             if path == "/api/config":
                 self.send_json(200, public_configuration())
             elif path == "/api/status":
-                self.send_json(200, {"components": component_status(), "operation": OPERATIONS.public()})
+                persisted = public_operation(ROOT)
+                memory = OPERATIONS.public()
+                operation = memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))
+                self.send_json(200, {"components": component_status(), "operation": operation, "installed_version": installed_version(ROOT), **RUNNING_IDENTITY})
             elif path == "/api/operation":
-                self.send_json(200, OPERATIONS.public())
+                persisted = public_operation(ROOT)
+                memory = OPERATIONS.public()
+                self.send_json(200, memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0)))
+            elif path == "/api/releases":
+                channel = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("channel", ["stable"])[0]
+                if channel not in {"stable", "lab"}:
+                    self.send_json(400, {"error": "channel must be stable or lab"})
+                    return
+                try:
+                    catalog = release_catalog(channel, ROOT, running_version=RUNNING_IDENTITY["running_version"])
+                except Exception:
+                    self.send_json(502, {"error": "Release catalog unavailable; please retry."})
+                    return
+                self.send_json(200, catalog)
             else:
                 self.send_json(404, {"error": "Not found"})
             return
@@ -838,7 +885,35 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/action":
                 action = str(payload.get("action", ""))
+                if action == "restart-panel":
+                    slot = take_lifecycle_slot()
+                    try:
+                        result = start_detached("restart-panel", ROOT, RUNNING_IDENTITY)
+                    finally:
+                        release_lifecycle_slot(slot)
+                    self.send_json(202, result); return
+                if action == "update-release":
+                    channel = str(payload.get("channel", "")); release_id = payload.get("release_id")
+                    if channel not in {"stable", "lab"} or not isinstance(release_id, int) or isinstance(release_id, bool):
+                        raise ValueError("release_id and channel are required")
+                    if OPERATIONS.public().get("state") == "running":
+                        raise ValueError("Another operation is already running")
+                    slot = take_lifecycle_slot()
+                    try:
+                        snapshot = release_snapshot(release_id, channel, ROOT)
+                        result = start_detached("update-release", ROOT, RUNNING_IDENTITY, release_id, channel, target_version=snapshot["version"], snapshot=snapshot)
+                    finally:
+                        release_lifecycle_slot(slot)
+                    self.send_json(202, result); return
                 self.send_json(202, OPERATIONS.start(action, lambda: action_command(action, payload)))
+                return
+            if path == "/api/restart-panel":
+                slot = take_lifecycle_slot()
+                try:
+                    result = start_detached("restart-panel", ROOT, RUNNING_IDENTITY)
+                finally:
+                    release_lifecycle_slot(slot)
+                self.send_json(202, result)
                 return
             if path == "/api/component":
                 component = str(payload.get("component", ""))

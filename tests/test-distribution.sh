@@ -81,7 +81,7 @@ grep -q 'ghcr.io/jvde-github/ais-catcher:v0.70' "$ROOT/vesselstack.example.env"
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"
-"$ROOT/scripts/vesselstackctl" --help | grep -q 'backup \[--allow-unmounted\] \[DIRECTORY\]'
+"$ROOT/scripts/vesselstackctl" --help | grep -qF 'backup [--require-mounted] [--allow-unmounted] [DIRECTORY]'
 "$ROOT/scripts/vesselstackctl" --help | grep -q 'reindex  *Rebuild Boat Chat'
 test -x "$ROOT/scripts/memory-index.sh"
 # The memory index must be built by the installer (Boat Chat is not ready without it), and as
