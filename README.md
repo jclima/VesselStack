@@ -677,7 +677,8 @@ nano vesselstack.env
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
 | `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
-| `TELEMETRY_INDEXER_ENABLE` | Refresh Boat Chat's telemetry memory every five minutes |
+| `TELEMETRY_INDEXER_ENABLE` | Enable five-minute current/power sampling and thirty-minute history refreshes |
+| `NODE_EXPORTER_ENABLE` | Optional private host metrics exporter; disabled by default |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
 | `MQTT_USERNAME`, `MQTT_PASSWORD` | Mosquitto administrator account; the username may contain letters, numbers, `.`, `_` and `-` (1-64), and a custom password must not contain `:` or leading/trailing whitespace |
 | `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
@@ -984,6 +985,11 @@ browser headers while remaining embeddable in the Home Assistant dashboard.
 It also provides deterministic time-window and signal planning, durable local
 sessions, answer feedback, selectable response modes, chart-ready evidence,
 relative AIS context, recent-trip insights, and a local maintenance tracker.
+Telemetry remains in canonical API/cache units; Boat Chat converts the
+model-facing context, computed answers, metric cards, and chart labels at the
+presentation boundary. Set `BOAT_UNITS=metric` for L/L/h, °C, kPa, hPa, and m;
+knots and nautical miles remain unchanged. Switching the preference does not
+rewrite stored telemetry or cached summaries.
 The interface rate-limits each client and runs at most two chat requests at a
 time so slow model calls cannot exhaust the Raspberry Pi.
 
@@ -1023,6 +1029,56 @@ from any address; with no settings token they are accepted from loopback only
 (private-LAN addresses are no longer trusted). `TELEGRAM_ALLOWED_CHAT_IDS` is a
 secret setting and is never returned by `GET /api/settings`.
 
+Settings updates are serialized and written atomically. Blank secret fields
+keep the saved value; an explicit JSON `null` stores an empty override so an
+inherited credential cannot reappear. Use the current settings token to
+authenticate a save and the separate replacement field to rotate it. Tokens
+remain in this browser tab's session storage. JSON write requests require
+`Content-Type: application/json`; supplied browser origins must match the
+request authority.
+
+#### Automatic telemetry refresh
+
+`TELEMETRY_INDEXER_ENABLE=true` controls two schedules. The sample timer gathers
+current telemetry and power observations five minutes after the previous run
+finishes. The history timer refreshes retained summaries every thirty minutes.
+The jobs have independent overlap locks, preserve the existing AIS and memory
+index context, and use the installed service account and private state paths.
+Their journal output contains counts and error classifications rather than
+vessel readings or credentials.
+
+The installer enables the schedules for boot; **Install & start** or
+`vesselstackctl start` starts them immediately. Render-only installation keeps
+previously active schedules active. Backup, restore, and installation stop the
+timers and running jobs before touching their state. Inspect or run them with:
+
+```bash
+systemctl list-timers 'vesselstack-telemetry-*'
+sudo systemctl start vesselstack-telemetry-sample.service
+sudo systemctl start vesselstack-telemetry-indexer.service
+```
+
+To disable automatic refresh, turn off the telemetry indexer in the Control
+Panel and apply/start the configuration. For temporary maintenance, stop both
+timers, then both services. Unknown Home Assistant distance units are excluded
+from spatial power inference; configured integration outages fail the sample,
+while missing optional entities remain unknown.
+
+#### Optional host metrics
+
+Enable **Host metrics** in the Control Panel's Prometheus settings, save, and
+use **Install & start**. Equivalently, set `NODE_EXPORTER_ENABLE=true` in the
+installed vessel configuration and apply it with the reviewed installer.
+The pinned exporter runs on the private Compose network without publishing
+port 9100. Its read-only host mounts support CPU, memory, disk, filesystem,
+load, and thermal collectors; host network-interface metrics are intentionally
+excluded. Grafana's system-health dashboard includes optional host panels.
+
+Set the option back to `false` and apply/start to remove the exporter and its
+scrape target. Existing Prometheus data, retention, and listener settings are
+preserved. Offline bundles must be rebuilt with this release so the exporter
+image is available before enabling it offline.
+
 `BOAT_CHAT_WEB_SEARCH=true` enables the OpenAI Responses API web-search tool
 when the OpenAI provider is selected. This can send the question and grounded
 context to an external service and may incur provider charges; it is disabled
@@ -1058,7 +1114,7 @@ side files in the state directory. `ensure` is idempotent: it rebuilds only when
 the index is missing, empty or the hash of the source documents changed. It runs
 on every installer run (including upgrades), on `vesselstackctl start`, and at
 the start of every telemetry-indexer run (so a release that changes the
-knowledge files refreshes the index within five minutes). A failed build prints
+knowledge files refreshes the index on the next history run). A failed build prints
 a `WARN` with the exact manual command, never aborts the install, and
 `vesselstackctl doctor` fails until it is fixed. `sudo vesselstackctl reindex`
 rebuilds it on demand.

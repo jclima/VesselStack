@@ -13,6 +13,8 @@
 - Never equate SmartShunt positive power with measured solar. The shore-power entity is only a charging proxy; use underway or beyond-dock evidence to exclude physical shore charging, exclude engine charging, and still label the result inferred net solar or another uninstrumented source.
 - Keep Telegram answers short enough to read on a phone.
 
+- Present measurements using the selected Boat Chat preference (`BOAT_UNITS`): metric uses L/L/h, °C, kPa, hPa, and m; US customary uses gallons/gal/h, °F, psi, inHg, and feet. Knots and nautical miles remain unchanged. Canonical telemetry keys and cached payloads are never rewritten.
+
 ## Do Not
 
 - Do not mention implementation details such as context tiers, MCP, prompts, SQLite tables, Flux, or API calls.

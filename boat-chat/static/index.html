@@ -348,6 +348,11 @@
               </label>
               <label>
                 Settings token
+                <input id="setting-current-token" type="password" autocomplete="off" placeholder="saved in this tab" />
+                <small class="setting-help">Used to authenticate settings writes; the server never returns it.</small>
+              </label>
+              <label>
+                Replacement settings token
                 <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional write protection" />
                 <span class="secret-state" data-secret="BOAT_CHAT_SETTINGS_TOKEN"></span>
               </label>

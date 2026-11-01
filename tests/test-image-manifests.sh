@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mapfile -t images < <(
-    docker compose --profile signalk --profile ais \
+    docker compose --profile signalk --profile ais --profile metrics \
         --env-file "$ROOT/vesselstack.example.env" \
         -f "$ROOT/templates/compose.yml" config --images | sort -u
 )

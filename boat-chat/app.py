@@ -34,6 +34,7 @@ import session_store
 import telemetry_cache
 import status_model
 from cruise_efficiency import matched_sample
+import display_units
 
 
 ROOT = Path(__file__).resolve().parent
@@ -167,7 +168,8 @@ def system_prompt() -> str:
     if _SYSTEM_PROMPT_CACHE["mtime"] != mtime or not _SYSTEM_PROMPT_CACHE["text"]:
         _SYSTEM_PROMPT_CACHE["text"] = load_system_prompt()
         _SYSTEM_PROMPT_CACHE["mtime"] = mtime
-    return str(_SYSTEM_PROMPT_CACHE["text"])
+    pref = display_units.preference(setting_value)
+    return str(_SYSTEM_PROMPT_CACHE["text"]) + f"\n\nUnit preference rule: present measurements in {pref} units. Keep knots and nautical miles; do not relabel canonical source keys."
 
 
 DOC_PATHS = [
@@ -441,7 +443,7 @@ def normalize_http_url(value: str, default_scheme: str = "http") -> str:
     return text
 
 
-def write_env_config(settings: dict[str, str]) -> None:
+def _write_env_config_unlocked(settings: dict[str, str]) -> None:
     service_name = os.environ.get("BOAT_CHAT_SERVICE_NAME", "boat-chat.service")
     lines = [
         f"# Local runtime settings for {service_name}.",
@@ -449,7 +451,7 @@ def write_env_config(settings: dict[str, str]) -> None:
         "",
     ]
     for key in SETTING_KEYS:
-        if key in settings and settings[key] != "":
+        if key in settings:
             lines.append(f"{key}={quote_env_value(settings[key])}")
     lines.extend(
         [
@@ -469,11 +471,12 @@ def write_env_config(settings: dict[str, str]) -> None:
         if passthrough:
             lines.extend(["", "# Deployment-managed integration settings", *passthrough])
     ENV_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    ENV_CONFIG.write_text("\n".join(lines) + "\n")
-    try:
-        ENV_CONFIG.chmod(0o600)
-    except OSError:
-        pass
+    env_config.atomic_write(ENV_CONFIG, "\n".join(lines) + "\n")
+
+
+def write_env_config(settings: dict[str, str]) -> None:
+    with env_config.locked(ENV_CONFIG):
+        _write_env_config_unlocked(settings)
 
 
 def public_settings() -> dict[str, Any]:
@@ -501,25 +504,26 @@ def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
     # would inject extra KEY=VALUE lines into the env file read by the services.
     for key, value in updates.items():
         if key in SETTING_KEYS and value is not None:
-            if any(char in str(value).strip() for char in ("\n", "\r", "\x00")):
+            if any(char in str(value) for char in ("\n", "\r", "\x00")):
                 raise ValueError(f"{key} contains unsupported characters")
-    current = parse_env_config()
-    for key, value in updates.items():
-        if key not in SETTING_KEYS:
-            continue
-        if value is None:
-            current.pop(key, None)
-            continue
-        text = str(value).strip()
-        if key in SECRET_SETTING_KEYS and text == "":
-            continue
-        if text == "" or text == os.environ.get(key, ""):
-            # Empty, or identical to the root-managed base value: keep no
-            # override, so later control-panel/installer changes take effect.
-            current.pop(key, None)
-        else:
-            current[key] = text
-    write_env_config(current)
+    with env_config.locked(ENV_CONFIG):
+        current = parse_env_config()
+        for key, value in updates.items():
+            if key not in SETTING_KEYS:
+                continue
+            if value is None:
+                # An explicit clear must mask the inherited base value.
+                current[key] = ""
+                continue
+            text = str(value).strip()
+            if key in SECRET_SETTING_KEYS and text == "":
+                # Blank secret fields mean "leave the saved secret alone".
+                continue
+            if text == os.environ.get(key, ""):
+                current.pop(key, None)
+            else:
+                current[key] = text
+        _write_env_config_unlocked(current)
     return public_settings()
 
 
@@ -1467,6 +1471,34 @@ def pearson_correlation(left: list[float], right: list[float]) -> float | None:
     return numerator / denominator
 
 
+def _threshold_unit_for_measurement(measurement: str, explicit: str | None, message: str) -> tuple[str, str] | None:
+    """Return canonical row unit and query unit for comparable thresholds."""
+    row_unit = display_units.unit_for_measurement(measurement, "us_customary")
+    if not row_unit:
+        return None
+    aliases = {"f": "°F", "c": "°C", "psi": "psi", "kpa": "kPa", "hpa": "hPa", "inhg": "inHg", "ft": "ft", "feet": "ft", "m": "m", "l/h": "L/h", "gph": "gal/h", "gal/h": "gal/h", "v": "V", "volts": "V", "percent": "%", "%": "%"}
+    if explicit:
+        query_unit = aliases.get(explicit.lower(), explicit)
+        dimensions = {
+            "temperature": {"f", "c"}, "pressure": {"psi", "kpa", "hpa", "inhg", "pa"},
+            "distance": {"ft", "m"}, "fuel": {"gal/h", "l/h"}, "voltage": {"v"}, "percent": {"%"},
+        }
+        def dim(unit: str) -> str | None:
+            plain = unit.lower().replace("°", "")
+            return next((name for name, values in dimensions.items() if plain in values), None)
+        return (row_unit, query_unit) if dim(row_unit) == dim(query_unit) else None
+    lower = message.lower()
+    pref = display_units.preference(setting_value)
+    families = [("temperature", ["temperature", "temp", "coolant"], "°C" if pref == "metric" else "F"), ("pressure", ["pressure", "psi", "kpa", "barometer"], "kPa" if pref == "metric" else "psi"), ("depth", ["depth", "feet", "meter"], "m" if pref == "metric" else "ft"), ("fuel", ["fuel", "gph", "gal/h", "l/h"], "L/h" if pref == "metric" else "gal/h"), ("voltage", ["voltage", "volt"], "V")]
+    hits = [unit for _name, terms, unit in families if any(term in lower for term in terms)]
+    if not hits:
+        return row_unit, row_unit
+    query_unit = "hPa" if pref == "metric" and ("barometer" in lower or ("environment." in measurement.lower() and "pressure" in measurement.lower())) else hits[0]
+    row_dimension = "temperature" if "temp" in measurement.lower() or "temperature" in measurement.lower() else "pressure" if "pressure" in measurement.lower() else "depth" if "depth" in measurement.lower() else "fuel" if "fuel" in measurement.lower() else "voltage" if "voltage" in measurement.lower() else None
+    query_dimension = next((name for name, terms, _unit in families if any(term in lower for term in terms)), None)
+    return (row_unit, query_unit) if not row_dimension or not query_dimension or row_dimension == query_dimension else None
+
+
 def analyze_history_rows(
     message: str,
     rows: list[dict[str, str]],
@@ -1529,22 +1561,31 @@ def analyze_history_rows(
 
     threshold_results: list[dict[str, Any]] = []
     threshold_match = re.search(
-        r"\b(below|under|above|over)\s+(-?\d+(?:\.\d+)?)\s*(v|volts?|psi|knots?|kt|ft|feet|°?f|percent|%)?\b",
+        r"\b(below|under|above|over)\s+(-?\d+(?:\.\d+)?)\s*(v|volts?|psi|kpa|hpa|inhg|knots?|kt|ft|feet|m|l/h|gph|gal/h|°?c|°?f|percent|%)?\b",
         message.lower(),
     )
     if threshold_match:
         direction = threshold_match.group(1)
         threshold = float(threshold_match.group(2))
+        explicit_unit = threshold_match.group(3)
+        if not explicit_unit and len(selected) > 1 and not re.search(r"temperature|temp|coolant|pressure|psi|kpa|barometer|depth|feet|meter|fuel|gph|gal/h|l/h|voltage|volt|percent|%", message.lower()):
+            selected = []
         for measurement in selected[:8]:
             samples = [values[measurement] for values in by_time.values() if measurement in values]
             if not samples:
                 continue
-            matching = [value for value in samples if value < threshold] if direction in {"below", "under"} else [value for value in samples if value > threshold]
+            unit_pair = _threshold_unit_for_measurement(measurement, explicit_unit, message)
+            if not unit_pair:
+                continue
+            row_unit, query_unit = unit_pair
+            comparable_threshold = display_units.convert(threshold, query_unit, row_unit)
+            matching = [value for value in samples if value < comparable_threshold] if direction in {"below", "under"} else [value for value in samples if value > comparable_threshold]
             threshold_results.append(
                 {
                     "measurement": measurement,
                     "direction": "below" if direction in {"below", "under"} else "above",
                     "threshold": threshold,
+                    "threshold_unit": query_unit,
                     "matching_samples": len(matching),
                     "total_samples": len(samples),
                     "approximate_matching_hours": round(len(matching) * sample_minutes / 60.0, 2),
@@ -1714,12 +1755,14 @@ from(bucket: "{bucket}")
             try:
                 rows = convert_generic_rows(query_influx(flux))
                 chart_series = []
+                pref = display_units.preference(setting_value)
                 for measurement in selected[:3]:
-                    points = [
-                        {"time": row.get("_time"), "value": safe_float(row.get("_value"))}
-                        for row in rows
-                        if row.get("_measurement") == measurement and safe_float(row.get("_value")) is not None
-                    ]
+                    points = []
+                    for row in rows:
+                        raw_value = safe_float(row.get("_value"))
+                        if row.get("_measurement") == measurement and raw_value is not None:
+                            shown_value = display_units.display_value(measurement, raw_value, pref)
+                            points.append({"time": row.get("_time"), "value": round(shown_value, 4), "label": f"{round(shown_value, 2):g} {unit_for_measurement(measurement, {})}"})
                     if points:
                         stride = max(1, math.ceil(len(points) / 80))
                         chart_series.append({"label": display_measurement_name(measurement), "unit": unit_for_measurement(measurement, {}), "points": points[::stride][-80:]})
@@ -1727,9 +1770,9 @@ from(bucket: "{bucket}")
                 bucket_payload["sample_interval"] = f"{interval} mean"
                 bucket_payload["numeric_summary"] = summarize_numeric_rows(rows)
                 bucket_payload["units"] = {
-                    measurement: unit_for_measurement(measurement, {})
+                    measurement: canonical_unit_for_measurement(measurement)
                     for measurement in selected
-                    if unit_for_measurement(measurement, {})
+                    if canonical_unit_for_measurement(measurement)
                 }
                 bucket_payload["quality_flags"] = history_quality_flags(bucket_payload["numeric_summary"])
                 bucket_payload["analysis"] = analyze_history_rows(message, rows, selected, interval_minutes)
@@ -1830,7 +1873,7 @@ def complex_answer_focus(message: str, history: dict[str, Any]) -> dict[str, Any
             aligned_display = (
                 {
                     name: {
-                        "value": format_stat_value(value),
+                        "value": format_stat_value(display_units.display_value(name, float(value), display_units.preference(setting_value)) if isinstance(value, (int, float)) else value),
                         "unit": unit_for_measurement(name, {}),
                     }
                     for name, value in aligned_values.items()
@@ -1842,8 +1885,8 @@ def complex_answer_focus(message: str, history: dict[str, Any]) -> dict[str, Any
             extrema.append(
                 {
                     "direction": direction,
-                    "value": format_stat_value(raw_value),
-                    "unit": units.get(measurement) or unit_for_measurement(measurement, {}),
+                    "value": format_stat_value(display_units.display_value(measurement, float(raw_value), display_units.preference(setting_value)) if isinstance(raw_value, (int, float)) else raw_value),
+                    "unit": unit_for_measurement(measurement, {}),
                     "time_local": summary.get(measurement, {}).get(time_key),
                     "engine_running_only": use_running,
                     "aligned_values": aligned_display,
@@ -2685,7 +2728,7 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             value = round(convert_generic_value(key, float(value)), 4)
         values[key] = value
-        unit = unit_for_measurement(key, {})
+        unit = canonical_unit_for_measurement(key)
         if unit:
             units[key] = unit
 
@@ -2726,6 +2769,16 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
     result: dict[str, Any] = {}
     if "ais" in concepts:
         result["ais"] = current_ais_context()
+    signalk_failed = bool(signalk.get("error")) if isinstance(signalk, dict) else True
+    notifications_summary = (
+        f"SignalK notifications unavailable: {signalk.get('error') or 'no telemetry paths returned'}."
+        if signalk_failed or not flat
+        else (
+            f"{len(active_notifications)} active SignalK notification(s)."
+            if active_notifications
+            else f"No active SignalK notifications; {normal_notification_count} notification paths report normal."
+        )
+    )
     result.update({
         "source": "SignalK self vessel",
         "signalk_error": signalk.get("error") if isinstance(signalk, dict) else None,
@@ -2735,11 +2788,7 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         "timestamps": timestamps,
         "units": units,
         "active_notifications": active_notifications,
-        "alarm_summary": (
-            f"{len(active_notifications)} active SignalK notification(s)."
-            if active_notifications
-            else f"No active SignalK notifications; {normal_notification_count} notification paths report normal."
-        ),
+        "alarm_summary": notifications_summary,
         "normal_notification_count": normal_notification_count,
         "interpretation_notes": [
             "When RPM is below 200, zero oil pressure and zero fuel rate are expected engine-off values.",
@@ -3495,6 +3544,8 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
         if error:
             return f"I could not compute fuel usage from InfluxDB: {error}"
         return None
+    metric = display_units.preference(setting_value) == "metric"
+    shown = display_units.normalize_context(summary, display_units.preference(setting_value))
     running_minutes = int(summary.get("running_minutes") or 0)
     if running_minutes <= 0:
         return (
@@ -3502,17 +3553,23 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
             f"({summary.get('start_local')} to {summary.get('stop_local')}) using RPM >= "
             f"{summary.get('rpm_threshold', ENGINE_RUNNING_RPM)}."
         )
-    totals = summary.get("totals", {})
-    averages = summary.get("averages", {})
+    totals = shown.get("totals", {})
+    averages = shown.get("averages", {})
+    volume_unit = "L" if metric else "gal"
+    rate_unit = "L/h" if metric else "gal/h"
+    total_key = "total_liters" if metric else "total_gallons"
+    port_key = "port_liters" if metric else "port_gallons"
+    stbd_key = "starboard_liters" if metric else "starboard_gallons"
+    rate_key = "total_lph_running" if metric else "total_gph_running"
     return (
         f"Fuel used for {summary.get('label', 'the requested period')} "
         f"({summary.get('start_local')} to {summary.get('stop_local')}): "
-        f"{totals.get('total_gallons')} gal total. "
-        f"Port: {totals.get('port_gallons')} gal; "
-        f"starboard: {totals.get('starboard_gallons')} gal. "
+        f"{totals.get(total_key)} {volume_unit} total. "
+        f"Port: {totals.get(port_key)} {volume_unit}; "
+        f"starboard: {totals.get(stbd_key)} {volume_unit}. "
         f"Running time: {running_minutes} minutes, from {summary.get('first_running_sample_local')} "
         f"to {summary.get('last_running_sample_local')}. "
-        f"Average burn while running: {averages.get('total_gph_running')} gal/h total. "
+        f"Average burn while running: {averages.get(rate_key)} {rate_unit} total. "
         "This is a computed telemetry answer from retained 1-minute InfluxDB history."
     )
 
@@ -3527,10 +3584,14 @@ def answer_from_fuel_economy(context: dict[str, Any]) -> str | None:
         if error:
             return f"I could not compute fuel economy from InfluxDB: {error}"
         return None
+    metric = display_units.preference(setting_value) == "metric"
+    shown = display_units.normalize_context(summary, display_units.preference(setting_value))
     running_minutes = int(summary.get("running_minutes") or 0)
-    totals = summary.get("totals", {})
-    economy = summary.get("economy", {})
-    if running_minutes <= 0 or not economy.get("nm_per_gallon"):
+    totals = shown.get("totals", {})
+    economy = shown.get("economy", {})
+    economy_key = "nm_per_liter" if metric else "nm_per_gallon"
+    reverse_key = "liters_per_nm" if metric else "gallons_per_nm"
+    if running_minutes <= 0 or not economy.get(economy_key):
         return (
             f"I do not have enough retained running fuel/speed samples to compute fuel economy for "
             f"{summary.get('label', 'the requested period')}."
@@ -3547,10 +3608,10 @@ def answer_from_fuel_economy(context: dict[str, Any]) -> str | None:
         )
     return (
         f"Average fuel economy over {summary.get('label', 'the retained period')}: "
-        f"{economy.get('nm_per_gallon')} NM/gal "
-        f"({economy.get('gallons_per_nm')} gal/NM){filter_text}. "
+        f"{economy.get(economy_key)} {'NM/L' if metric else 'NM/gal'} "
+        f"({economy.get(reverse_key)} {'L/NM' if metric else 'gal/NM'}){filter_text}. "
         f"That is based on {round(matched_minutes / 60.0, 1)} matched engine-running hours, "
-        f"{totals.get('distance_nm')} NM, and {totals.get('fuel_gallons')} gal from "
+        f"{totals.get('distance_nm')} NM, and {totals.get('fuel_liters' if metric else 'fuel_gallons')} {'L' if metric else 'gal'} from "
         f"{summary.get('first_running_sample_local')} to {summary.get('last_running_sample_local')}."
         f"{coverage_text}"
     )
@@ -3723,10 +3784,14 @@ def history_source_priority(bucket: str) -> int:
 
 
 def unit_for_measurement(measurement: str, context: dict[str, Any]) -> str:
+    pref = display_units.preference(setting_value)
     ha = context.get("ha_telemetry", {})
     for item in ha.get("matched", []) if isinstance(ha, dict) else []:
         if item.get("entity_id") == measurement and item.get("unit"):
-            return str(item["unit"])
+            source_unit = str(item["unit"])
+            if pref == "metric":
+                return display_units.unit_for_measurement(measurement, pref, source_unit) or source_unit
+            return source_unit
     if measurement.endswith("humidity") or "humidity" in measurement:
         return "%"
     if measurement.startswith("tanks.fuel.") or "fuel_tank" in measurement or measurement.endswith("currentLevel"):
@@ -3734,9 +3799,9 @@ def unit_for_measurement(measurement: str, context: dict[str, Any]) -> str:
     if "stateOfCharge" in measurement or "state_of_charge" in measurement or measurement.endswith("_soc"):
         return "%"
     if measurement.endswith("temperature") or "temperature" in measurement or "temp" in measurement:
-        return "F" if measurement.startswith("propulsion.") else ""
+        return display_units.unit_for_measurement(measurement, pref) if measurement.startswith(("propulsion.", "environment.")) else ""
     if measurement.startswith("environment.depth.") or "water_depth" in measurement:
-        return "ft"
+        return display_units.unit_for_measurement(measurement, pref)
     if "voltage" in measurement:
         return "V"
     if "current" in measurement:
@@ -3748,17 +3813,37 @@ def unit_for_measurement(measurement: str, context: dict[str, Any]) -> str:
     if measurement == "navigation.rateOfTurn":
         return "deg/min"
     if "pressure" in measurement.lower():
-        return "psi" if measurement.startswith("propulsion.") else "inHg"
+        return display_units.unit_for_measurement(measurement, pref)
     if measurement.endswith(".revolutions"):
         return "RPM"
     if measurement.endswith(".fuel.rate"):
-        return "gal/h"
+        return display_units.unit_for_measurement(measurement, pref)
     if measurement.endswith(".runTime") or measurement.endswith(".timeRemaining"):
         return "h"
     if measurement.endswith((".engineLoad", ".engineTorque", ".trimState")):
         return "%"
     if measurement.endswith(".power"):
         return "W"
+    return ""
+
+
+def canonical_unit_for_measurement(measurement: str) -> str:
+    """Unit label for canonical API/cache payloads (always legacy US baseline)."""
+    m = measurement.lower()
+    if m.startswith("tanks.") or "currentlevel" in m or "stateofcharge" in m or "humidity" in m: return "%"
+    if "temperature" in m or "temp" in m: return "F" if m.startswith(("propulsion.", "environment.")) else ""
+    if "voltage" in m: return "V"
+    if "current" in m and "currentlevel" not in m: return "A"
+    if "speedoverground" in m or "speedthroughwater" in m: return "kn"
+    if "heading" in m or "courseoverground" in m or "attitude" in m: return "deg"
+    if m.endswith(".revolutions"): return "RPM"
+    if m == "navigation.rateofturn": return "deg/min"
+    if m.endswith(".fuel.rate"): return "gal/h"
+    if m.endswith((".runtime", ".timeremaining")): return "h"
+    if m.endswith((".engineload", ".enginetorque", ".trimstate")): return "%"
+    if m.endswith(".power"): return "W"
+    if "depth" in m: return "ft"
+    if "pressure" in m or "oilpressure" in m or "boostpressure" in m: return "inHg" if m.startswith("environment.") else "psi"
     return ""
 
 
@@ -3861,11 +3946,15 @@ def answer_from_generic_history(context: dict[str, Any]) -> str | None:
     lines = [f"Retained history for {label} ({history.get('start_local')} to {history.get('stop_local')}):"]
     for bucket, measurement, stats in rows[:6]:
         unit = unit_for_measurement(measurement, context)
+        pref = display_units.preference(setting_value)
+        def shown_stat(key: str) -> Any:
+            value = stats.get(key)
+            return display_units.display_value(measurement, float(value), pref) if isinstance(value, (int, float)) else value
         suffix = f" {unit}" if unit else ""
         lines.append(
             f"- {display_measurement_name(measurement)}: "
-            f"min {format_stat_value(stats.get('min'))}{suffix}, avg {format_stat_value(stats.get('avg'))}{suffix}, "
-            f"max {format_stat_value(stats.get('max'))}{suffix}, latest {format_stat_value(stats.get('last'))}{suffix} "
+            f"min {format_stat_value(shown_stat('min'))}{suffix}, avg {format_stat_value(shown_stat('avg'))}{suffix}, "
+            f"max {format_stat_value(shown_stat('max'))}{suffix}, latest {format_stat_value(shown_stat('last'))}{suffix} "
             f"({stats.get('count')} samples from {bucket}; min at {stats.get('min_time_local')}, max at {stats.get('max_time_local')})."
         )
     if len(rows) > 6:
@@ -4255,7 +4344,8 @@ def answer_experience(context: dict[str, Any]) -> dict[str, Any]:
         charts.extend(bucket.get("chart_series") or [])
         units=bucket.get("units") or {}
         for measurement,stats in list((bucket.get("numeric_summary") or {}).items())[:3]:
-            metrics.append({"label":display_measurement_name(measurement),"unit":units.get(measurement) or unit_for_measurement(measurement,context),"min":stats.get("min"),"avg":stats.get("avg"),"max":stats.get("max"),"latest":stats.get("latest")})
+            shown_unit = unit_for_measurement(measurement, context)
+            metrics.append({"label":display_measurement_name(measurement),"unit":shown_unit,"min":display_units.display_value(measurement, stats.get("min"), display_units.preference(setting_value)) if isinstance(stats.get("min"),(int,float)) else stats.get("min"),"avg":display_units.display_value(measurement, stats.get("avg"), display_units.preference(setting_value)) if isinstance(stats.get("avg"),(int,float)) else stats.get("avg"),"max":display_units.display_value(measurement, stats.get("max"), display_units.preference(setting_value)) if isinstance(stats.get("max"),(int,float)) else stats.get("max"),"latest":display_units.display_value(measurement, stats.get("latest"), display_units.preference(setting_value)) if isinstance(stats.get("latest"),(int,float)) else stats.get("latest")})
     return {"evidence":evidence,"followups":list(dict.fromkeys(followups))[:3],"metrics":metrics[:4],"charts":charts[:3],"calculation":{"operation":plan.get("operation"),"signals":plan.get("signals",[])},"elapsed_ms":profile.get("elapsed_ms")}
 
 
@@ -4394,7 +4484,8 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
             }
         )
     compact["local_docs"] = docs
-    return compact
+    # Canonical context remains untouched; normalize this model-facing copy once.
+    return display_units.normalize_context(compact, display_units.preference(setting_value))
 
 
 def build_prompt(message: str, context: dict[str, Any], max_chars: int = 50000) -> str:
@@ -5117,13 +5208,20 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         return {"query_plan": context.get("query_plan", {}), "context_profile": context.get("context_profile", {})}
 
     def read_json_body(self) -> dict[str, Any]:
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise ValueError("invalid Content-Length") from exc
         if length < 0 or length > MAX_REQUEST_BODY:
             raise ValueError(f"request body must be at most {MAX_REQUEST_BODY} bytes")
-        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("request body must be valid UTF-8") from exc
+        payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             raise ValueError("JSON object is required")
         return payload
@@ -5214,6 +5312,19 @@ class BoatChatHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                host = self.headers.get("Host", "")
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                    raise ValueError
+                expected_host = urllib.parse.urlsplit(f"//{host}")
+                if parsed.hostname.lower() != (expected_host.hostname or "").lower() or parsed.port != expected_host.port:
+                    raise ValueError
+            except (ValueError, UnicodeError):
+                self.send_json(403, {"error": "request origin is not allowed"})
+                return
         if path == "/api/settings":
             try:
                 allowed, reason = self.settings_write_allowed()
@@ -5226,7 +5337,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "settings object is required"})
                     return
                 self.send_json(200, update_settings(settings))
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"error": str(exc)})
             except Exception as exc:
                 self.send_json(500, {"error": str(exc)})
@@ -5238,7 +5349,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 self.send_json(429, {"error":"Too many requests; try again in a minute"}); return
             try:
                 self.send_json(200, {"task": session_store.save_maintenance(self.read_json_body())})
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"error": str(exc)})
             return
         if path in {"/api/feedback", "/api/session/clear"}:
@@ -5253,7 +5364,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 else:
                     session_store.clear_session(str(payload.get("session_id", "")))
                 self.send_json(200, {"ok": True})
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.send_json(400, {"error": str(exc)})
             return
         if path != "/api/chat":
@@ -5288,7 +5399,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             session_store.record_request(request_id, session_id, hashlib.sha256(message.encode()).hexdigest(), context.get("query_plan", {}), context.get("context_profile", {}), elapsed_ms, "answered")
             self.log_message("request_id=%s elapsed_ms=%s signals=%s history=%s", request_id, elapsed_ms, context.get("query_plan", {}).get("signals"), context.get("query_plan", {}).get("historical"))
             self.send_json(200, {"answer":answer,"context":self.safe_context(context),"experience":answer_experience(context),"request_id":request_id})
-        except (ValueError, json.JSONDecodeError) as exc:
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})

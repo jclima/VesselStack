@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh VesselStack latest telemetry
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=vesselstack-telemetry-sample.service
+
+[Install]
+WantedBy=timers.target

@@ -627,6 +627,8 @@ async function loadSettings() {
     throw new Error(data.error || `HTTP ${response.status}`);
   }
   loadedSettings = data.settings || {};
+  const currentSettingsToken = document.querySelector("#setting-current-token");
+  if (currentSettingsToken) currentSettingsToken.value = sessionStorage.getItem("boatChatSettingsToken") || "";
 
   function populateProviderSelect(selector, includeBlank) {
     const provider = document.querySelector(selector);
@@ -667,7 +669,7 @@ async function loadSettings() {
 }
 
 function settingsToken() {
-  const field = settingsForm.elements.BOAT_CHAT_SETTINGS_TOKEN;
+  const field = document.querySelector("#setting-current-token");
   const typed = field ? String(field.value).trim() : "";
   return typed || sessionStorage.getItem("boatChatSettingsToken") || "";
 }
@@ -709,10 +711,10 @@ async function saveSettings(event) {
     if (!response.ok) {
       throw new Error(data.error || `HTTP ${response.status}`);
     }
-    if (settings.BOAT_CHAT_SETTINGS_TOKEN) {
-      sessionStorage.setItem("boatChatSettingsToken", settings.BOAT_CHAT_SETTINGS_TOKEN);
-    } else if (token) {
-      sessionStorage.setItem("boatChatSettingsToken", token);
+    if (settings.BOAT_CHAT_SETTINGS_TOKEN || token) {
+      sessionStorage.setItem("boatChatSettingsToken", settings.BOAT_CHAT_SETTINGS_TOKEN || token);
+      const currentSettingsToken = document.querySelector("#setting-current-token");
+      if (currentSettingsToken) currentSettingsToken.value = "";
     }
     if (settings.BOAT_CHAT_ACCESS_TOKEN) {
       sessionStorage.setItem("boatChatAccessToken", settings.BOAT_CHAT_ACCESS_TOKEN);

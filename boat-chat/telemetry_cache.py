@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import sqlite3
 import time
@@ -20,7 +21,17 @@ import memory_index
 
 
 DEFAULT_POWER_DB_PATH = memory_index.STATE_DIR / "data" / "power_tracking.sqlite"
-LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def _configured_timezone() -> dt.tzinfo:
+    name = os.environ.get("BOAT_TIMEZONE", "UTC")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+LOCAL_TZ = _configured_timezone()
 POWER_MAX_GAP_SECONDS = 15 * 60
 
 
@@ -102,7 +113,8 @@ def _optional_float(value: Any) -> float | None:
     try:
         if value in ("", None, "unknown", "unavailable"):
             return None
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 

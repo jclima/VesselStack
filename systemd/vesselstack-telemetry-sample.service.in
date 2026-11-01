@@ -1,0 +1,30 @@
+[Unit]
+Description=Refresh VesselStack latest telemetry context
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@VESSELSTACK_USER@
+Group=@VESSELSTACK_USER@
+WorkingDirectory=@VESSELSTACK_ROOT@/boat-chat
+EnvironmentFile=@VESSELSTACK_ROOT@/config/boat-chat.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=BOAT_CHAT_STATE_DIR=@VESSELSTACK_DATA@/boat-chat
+Environment=BOAT_CHAT_ENV=@VESSELSTACK_DATA@/boat-chat/boat-chat.env
+ExecStart=@VESSELSTACK_ROOT@/boat-chat/.venv/bin/python @VESSELSTACK_ROOT@/boat-chat/telemetry_indexer.py sample --quiet
+TimeoutStartSec=1500s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@VESSELSTACK_DATA@/boat-chat
+CapabilityBoundingSet=
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+SystemCallArchitectures=native

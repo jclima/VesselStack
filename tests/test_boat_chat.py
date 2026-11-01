@@ -415,14 +415,25 @@ class PowerTrackingTests(unittest.TestCase):
 class RequestBodyTests(unittest.TestCase):
     def test_json_body_is_bounded_and_must_be_an_object(self) -> None:
         handler = object.__new__(app.BoatChatHandler)
-        handler.headers = {"Content-Length": str(app.MAX_REQUEST_BODY + 1)}
+        handler.headers = {"Content-Type": "application/json", "Content-Length": str(app.MAX_REQUEST_BODY + 1)}
         handler.rfile = io.BytesIO(b"")
         with self.assertRaisesRegex(ValueError, "at most"):
             handler.read_json_body()
         payload = b'["not", "an", "object"]'
-        handler.headers = {"Content-Length": str(len(payload))}
+        handler.headers = {"Content-Type": "application/json", "Content-Length": str(len(payload))}
         handler.rfile = io.BytesIO(payload)
         with self.assertRaisesRegex(ValueError, "JSON object"):
+            handler.read_json_body()
+
+    def test_json_body_rejects_negative_length_and_invalid_utf8(self) -> None:
+        handler = object.__new__(app.BoatChatHandler)
+        handler.headers = {"Content-Type": "application/json", "Content-Length": "-1"}
+        handler.rfile = io.BytesIO(b"")
+        with self.assertRaisesRegex(ValueError, "body|nonnegative|at most"):
+            handler.read_json_body()
+        handler.headers = {"Content-Type": "application/json", "Content-Length": "1"}
+        handler.rfile = io.BytesIO(b"\xff")
+        with self.assertRaisesRegex(ValueError, "UTF-8"):
             handler.read_json_body()
 
 
