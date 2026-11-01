@@ -172,8 +172,12 @@ class BrowserUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); root.joinpath("var/lib/vesselstack").mkdir(parents=True)
             updates.write_operation(root, {"id": 9, "state": "running", "phase": "installing"})
-            with self.assertRaises(ValueError):
-                updates.acquire_slot(root)
+            runner_fd = updates.acquire_runner_lock(root)
+            try:
+                with self.assertRaisesRegex(ValueError, "already running"):
+                    updates.acquire_slot(root)
+            finally:
+                updates.release_slot(runner_fd)
 
     def test_inactive_helper_marks_interrupted_state_and_allows_retry(self):
         with tempfile.TemporaryDirectory() as directory:
