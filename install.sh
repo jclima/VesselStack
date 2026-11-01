@@ -89,6 +89,20 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${INFLUXDB_RAW_RETENTION:=}"
 # Prometheus TSDB retention (time only; never 0, which Prometheus would treat as the default).
 : "${PROMETHEUS_RETENTION:=30d}"
+: "${VESSELSTACK_DISABLED_COMPONENTS:=}"
+
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+disabled_input=$VESSELSTACK_DISABLED_COMPONENTS
+VESSELSTACK_DISABLED_COMPONENTS=""
+component_disabled() { case ",${VESSELSTACK_DISABLED_COMPONENTS}," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
+while [ -n "$disabled_input" ]; do
+    case "$disabled_input" in *,*) disabled=${disabled_input%%,*}; disabled_input=${disabled_input#*,} ;; *) disabled=$disabled_input; disabled_input="" ;; esac
+    disabled=${disabled//[[:space:]]/}; [ -z "$disabled" ] && continue
+    valid=0; for core in "${CORE_COMPONENTS[@]}"; do [ "$disabled" = "$core" ] && valid=1; done
+    [ "$valid" -eq 1 ] || { echo "Unknown disabled component: $disabled" >&2; exit 1; }
+    component_disabled "$disabled" && { echo "Duplicate disabled component: $disabled" >&2; exit 1; }
+    VESSELSTACK_DISABLED_COMPONENTS="${VESSELSTACK_DISABLED_COMPONENTS:+$VESSELSTACK_DISABLED_COMPONENTS,}$disabled"
+done
 
 : "${VESSELSTACK_WHEELHOUSE:=$SCRIPT_DIR/offline/wheelhouse}"
 case "$OFFLINE" in
@@ -838,6 +852,7 @@ AIS_DEVICE
 AIS_CATCHER_ARGS
 AIS_WEB_PORT
 AIS_TCP_PORT
+VESSELSTACK_DISABLED_COMPONENTS
 VESSELSTACK_UNTRUSTED_INTERFACE
 VESSELSTACK_FIREWALL_ENABLE
 VESSELSTACK_FIREWALL_STRICT
@@ -1030,17 +1045,29 @@ if [ "$START" -eq 1 ]; then
     fi
     install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
     # Broker access files were already rendered by sync_mqtt_access above.
+    selected_services=()
+    for core in "${CORE_COMPONENTS[@]}"; do
+        component_disabled "$core" || selected_services+=("$core")
+    done
+    [ "$SIGNALK_MODE" = docker ] && selected_services+=(signalk)
+    [ "$AIS_ENABLE" = true ] && selected_services+=(ais-catcher)
     compose_up=(compose up -d)
     [ "$OFFLINE" != true ] || compose_up=(compose up -d --pull never)
-    "${compose_up[@]}"
+    if [ "${#selected_services[@]}" -gt 0 ]; then
+        "${compose_up[@]}" "${selected_services[@]}"
+    fi
     # A changed compose definition is recreated by "compose up -d" itself; a
     # changed configuration file alone is not, and may have been rendered by an
     # earlier render-only run, so compare with the stamp of the last applied one.
-    if [ -r "$MOSQUITTO_CONF_STAMP" ] && [ "$(<"$MOSQUITTO_CONF_STAMP")" != "$MOSQUITTO_CONF_HASH" ]; then
-        compose up -d --force-recreate mosquitto
+    if ! component_disabled mosquitto && [ -r "$MOSQUITTO_CONF_STAMP" ] && [ "$(<"$MOSQUITTO_CONF_STAMP")" != "$MOSQUITTO_CONF_HASH" ]; then
+        "${compose_up[@]}" --force-recreate mosquitto
     fi
-    printf '%s\n' "$MOSQUITTO_CONF_HASH" > "$MOSQUITTO_CONF_STAMP"
-    "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+    if ! component_disabled mosquitto; then
+        printf '%s\n' "$MOSQUITTO_CONF_HASH" > "$MOSQUITTO_CONF_STAMP"
+    fi
+    if ! component_disabled influxdb; then
+        "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+    fi
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then
         systemctl restart vesselstack-chat-telegram.service

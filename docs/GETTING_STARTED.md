@@ -85,6 +85,13 @@ Then open `http://127.0.0.1:8780` and enter the token. Do not expose port 8780 d
 internet. Exact ports, LAN presets, firewall behavior, token storage, and
 rollback are documented in the [main README reference](../README.md#quick-start-one-command-on-the-raspberry-pi).
 
+For a deliberate trusted-LAN setup, preview and apply only the panel listener:
+`sudo vesselstackctl panel-access lan --dry-run`, then
+`sudo vesselstackctl panel-access lan`. This is unencrypted HTTP on all
+interfaces; a strict firewall may still block it. Roll back with
+`sudo vesselstackctl panel-access local`. The command prints the token retrieval
+command but never prints the token itself.
+
 ## Lab Pi versus boat Pi
 
 Use an internet-connected home-lab Pi to stage and soak a release, test backup

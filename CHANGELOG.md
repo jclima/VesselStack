@@ -3,6 +3,49 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.3 - 2026-10-31
+
+- Lab prerelease: make headless Raspberry Pi setup and Control Panel access
+  friendlier with an independent, optional trusted-LAN panel mode. The
+  `panel-access lan|local` commands require the existing panel token, preserve
+  the configured token and port, restart only the Control Panel, and do not
+  change dashboard or other service listeners. The panel remains ordinary
+  unencrypted HTTP for a trusted network; no firewall rules are changed.
+- Release status: annotated unsigned tag `v0.5.3`, authorized for lab use and
+  not latest. CI-generated asset checksums must be verified before publishing;
+  physical Raspberry Pi tests remain pending. This is not a stable promotion
+  or a cryptographically signed release.
+
+## 0.5.2 - 2026-10-31
+
+- Lab prerelease: fix the real bridge's retained MQTT connection state for
+  SignalK, preserving the state across broker reconnects and clean shutdown;
+  component status topics now become known during startup and the full
+  component lifecycle feature set is available in the lab release.
+- Release status: annotated unsigned tag `v0.5.2`, authorized for lab use and
+  not latest. CI-generated asset checksums must be verified before publishing;
+  physical Raspberry Pi tests remain pending. This is not a stable promotion
+  or a cryptographically signed release.
+
+## 0.5.1 - 2026-10-31
+
+- Lab prerelease: add a persistent six-component catalog for Home Assistant,
+  InfluxDB, Grafana, Prometheus, Mosquitto, and Heimdall. Control Panel and
+  `vesselstackctl` can add or remove components; membership is retained across
+  restart, reinstall, and update, and user data is retained when a component is
+  removed. Adding a component provisions applicable InfluxDB/MQTT integration;
+  removing one may leave integrations degraded until it is added again. Hardware
+  and systemd services remain configuration-driven.
+- The CSV component membership is read-only in the interface and persisted in
+  installation state; do not edit state files by hand. Removing Grafana does
+  not delete its data, and adding Grafana again restores its component
+  membership.
+- Release status: annotated unsigned tag `v0.5.1` exists but was not published;
+  its release pipeline was blocked by the bridge startup-status race. CI asset
+  checksums were not a release-publish claim, and physical Raspberry Pi testing
+  remained pending. This is not a stable promotion or a cryptographically
+  signed release.
+
 ## 0.5.0 - 2026-10-26
 
 - Upgrade notes (behaviour changes for existing installs): (1) Mosquitto now always enforces an ACL, so the first `vesselstackctl update`/`install.sh --start` recreates the broker once (a brief MQTT interruption); MQTT users you added by hand to the old password file lose access unless they are added through VesselStack, and an administrator `MQTT_PASSWORD` containing `:` or leading/trailing whitespace is refused by the installer's dry run before anything changes. (2) The broker configuration and credentials moved to `config/mosquitto/` and `config/mosquitto-auth/`; the installer redoes this on every run, so no data migration is needed (the legacy files are left untouched and safe to delete once the new broker runs). (3) Displays are opt-in: `DISPLAYS_ENABLE=false` is the default, so nothing displays-related runs unless you enable it. Rollback: reinstall 0.4.4 and `vesselstackctl restore` the pre-update backup.

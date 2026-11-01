@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from contextlib import redirect_stderr, redirect_stdout
@@ -374,6 +375,73 @@ class BridgeLoopTests(unittest.TestCase):
         call = next(c for c in created[0].calls if c[0] == "max_queued_messages_set")
         self.assertEqual(call[1], (bridge.MQTT_MAX_QUEUED_MESSAGES,))
         self.assertEqual(bridge.MQTT_MAX_QUEUED_MESSAGES, 1000)
+
+    def test_mqtt_retained_publish_after_connect_is_drained_by_owner_worker(self):
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        publisher = bridge.MqttPublisher(settings)
+        published = []
+        ready = threading.Event()
+
+        class Info:
+            def __init__(self, mid): self.mid = mid
+
+        class Client:
+            def publish(self, topic, payload, qos, retain):
+                published.append((topic, payload, qos, retain))
+                return Info(len(published))
+            def disconnect(self): pass
+            def loop_stop(self): pass
+            def disconnect(self): pass
+            def loop_stop(self): pass
+
+        publisher._client = Client()
+        publisher._worker = threading.Thread(target=publisher._run, daemon=True)
+        publisher._worker.start()
+        publisher._event("connect", ready.set)
+        self.assertTrue(ready.wait(1))
+        publisher.publish("status", "online", True, qos=0)
+        for _ in range(100):
+            if published:
+                break
+            time.sleep(0.01)
+        publisher.stop()
+        self.assertEqual(published, [("status", "online", 0, True)])
+
+    def test_mqtt_retained_updates_coalesce_while_qos1_is_outstanding(self):
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        publisher = bridge.MqttPublisher(settings)
+        published = []
+        class Info:
+            def __init__(self, mid): self.mid = mid
+        class Client:
+            def publish(self, topic, payload, qos, retain):
+                published.append((topic, payload, qos, retain))
+                return Info(len(published))
+            def disconnect(self): pass
+            def loop_stop(self): pass
+        publisher._client = Client()
+        publisher._connected = True
+        publisher._worker = threading.Thread(target=publisher._run, daemon=True)
+        publisher._worker.start()
+        publisher.publish("status", "one", True, qos=1)
+        for _ in range(100):
+            if published:
+                break
+            time.sleep(0.01)
+        publisher.publish("status", "two", True, qos=1)
+        publisher.publish("status", "three", True, qos=1)
+        self.assertEqual(published, [("status", "one", 1, True)])
+        publisher._event("ack", 1)
+        for _ in range(100):
+            if len(published) == 2:
+                break
+            time.sleep(0.01)
+        publisher.stop()
+        self.assertEqual(published[-1], ("status", "three", 1, True))
 
     def test_mqtt_reconnect_republishes_online_and_signalk_state(self):
         h = Harness([])

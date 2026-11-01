@@ -64,6 +64,28 @@ need internet access or their own credentials; VesselStack does not promise
 that every provider works offline. The optional [instrument displays preview](displays/README.md)
 is another separately enabled local feature.
 
+### Component lifecycle
+
+The Control Panel and `vesselstackctl` manage the six core components as a
+persistent, reviewable catalog: Home Assistant, InfluxDB, Grafana, Prometheus,
+Mosquitto, and Heimdall. Components can be added or removed without deleting
+their retained user data. Membership survives restarts, upgrades, and a
+reinstall; updates re-apply the selected membership rather than silently
+enabling removed services.
+
+The guided wizard defaults membership to empty and preserves an existing
+validated value when re-rendering; membership is managed through the Control
+Panel or `vesselstackctl`, not an additional wizard question.
+
+Use the Control Panel's component view (normally reached at
+`http://127.0.0.1:8780` through an SSH tunnel) or the corresponding
+`vesselstackctl` commands to review and apply a change. Adding a component
+provisions required InfluxDB/MQTT integration when applicable; removing one may
+leave integrations degraded until it is added again, but does not auto-configure
+or delete unrelated services. Hardware and systemd services remain
+configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
+for the release acceptance recipe.
+
 ### Optional VesselTwin connection
 
 An optional VesselTwin connection uses the separately installed
@@ -261,9 +283,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.0/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.0 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.3 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.3
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -285,6 +307,51 @@ and VesselStack on a fresh Pi, but leaves an installed system alone (the upgrade
 defaults to no) and never removes conflicting Docker packages. With neither, and no
 terminal to ask on (for example `curl | sudo bash` over `ssh` without `-t`), the installer
 stops before changing anything and lists these options.
+
+### Headless Raspberry Pi: open the panel from your laptop
+
+Use Raspberry Pi Imager to prepare **Raspberry Pi OS Lite (64-bit)**. In its
+customization screen, set a hostname, username, password and Wi-Fi details, and
+turn on SSH. Boot the Pi, then connect once from your laptop with
+`ssh -t YOUR_USER@YOUR_PI.local` (use the Pi's router-assigned IP if the name does
+not resolve). You do not need a screen, keyboard or SSH tunnel on the Pi.
+
+Run the guided installer above in that terminal. In **Who can reach what**, choose
+**Trusted network — token required** for the Control Panel. This choice is separate
+from the dashboard preset: choose **local** for the dashboards if you want their
+managed listeners kept on the Pi. The installer prints the panel's real address,
+such as `http://YOUR_PI.local:8780`, and the command to retrieve its unlock token.
+Open that address in your laptop's browser and paste the token into **Unlock**.
+
+For an existing installation with this command available:
+
+```bash
+sudo vesselstackctl panel-access lan
+sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env
+```
+
+The command restarts only the Control Panel. It preserves its token and port and
+does not change any other service's listener or firewall rules. Use the address it
+prints; `0.0.0.0` is a listen setting, not a browser address. Check the current
+setting with `sudo vesselstackctl panel-access`. To undo network access:
+
+```bash
+sudo vesselstackctl panel-access local
+```
+
+For unattended **fresh installs**, `--panel-lan` is shorthand for
+`--set CONTROL_PANEL_HOST=0.0.0.0`. Combine it with `--set LAN_ACCESS=local` to keep
+the preset-managed dashboards and databases local. `LAN_ACCESS=local` does not
+restrict Signal K's host-networked listener; see the network limitations below.
+The panel option alone leaves every other network setting unchanged. For upgrades,
+use `panel-access lan` after updating instead of passing configuration overrides
+to the installer.
+
+Network access binds the panel to **all IPv4 interfaces**. Use it only on a trusted
+lab or boat network: its token is still required, but ordinary HTTP does not encrypt
+administration traffic. Do not forward this port from the internet. An enabled
+strict firewall may need an explicit rule for the panel port on the relevant
+interface; setup never silently opens firewall ports. Local-only remains the default.
 
 The guided installer explains each step in plain language and asks before it
 does anything beyond installing ordinary Debian packages:
@@ -329,7 +396,7 @@ does anything beyond installing ordinary Debian packages:
    nothing is written) and expands it with the terminal wizard's `LAN_PRESETS` mapping
    into `VESSELSTACK_WEB_BIND_ADDRESS`, `VESSELSTACK_DATA_BIND_ADDRESS`, `BOAT_CHAT_HOST` and `HOMEASSISTANT_BIND_ADDRESS`;
    the preset wins over explicit bind values, `LAN_ACCESS` is never written to the env file
-   and the control panel stays on 127.0.0.1. Choosing `all` shows the warning that Prometheus
+   and the independent Control Panel access choice is preserved. Choosing `all` shows the warning that Prometheus
    has no login and recommends the firewall. The loopback, Host/Origin, URL-fragment token
    and content-type protections are unchanged.
    The terminal wizard has no network surface (no web server, no token, no URL), so it
@@ -351,12 +418,13 @@ does anything beyond installing ordinary Debian packages:
    runs `install.sh --dry-run`, then `install.sh --start`, then `vesselstackctl
    doctor`, and prints `vesselstackctl urls` plus, as plain text, the service
    addresses to use from another computer (host name or IP), the command that shows
-   the Boat Chat access token and the SSH tunnel hint for the control panel
+   the Boat Chat access token and either the panel network address or its local-only access hint
    (information only), where the generated tokens are stored and the next steps.
    It ends with a list of everything it changed.
 
 Options (`sudo bash get-vesselstack.sh --help`): `--yes` (ask nothing, answer yes),
-`--defaults` (ask nothing, each question's default), `--set KEY=VALUE` (repeatable;
+`--defaults` (ask nothing, each question's default), `--panel-lan` (share only the
+panel listener on a fresh install), `--set KEY=VALUE` (repeatable;
 avoid secrets here, they would show in the process list: leave them to be generated),
 `--config FILE` (use an existing `vesselstack.env`; `--no-wizard --config FILE` is the
 same), `--cli` / `--terminal` (the default terminal questions), `--web-wizard` (optional
@@ -405,7 +473,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.0
+git checkout v0.5.3
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -543,12 +611,16 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-For a stable release, use a published tag:
+For the pinned 0.5.3 lab prerelease, use its annotated unsigned tag (it is not
+the latest release):
 
 ```bash
 git fetch --tags
-git checkout v0.5.0
+git checkout v0.5.3
 ```
+
+This lab prerelease is for authorized lab use only; it is unsigned, not latest,
+and physical Raspberry Pi testing is pending. It is not a stable release.
 
 ## 4. Configure the vessel
 
@@ -1043,15 +1115,19 @@ and applies an already downloaded, reviewed, and root-controlled release.
 It deliberately stays available when the managed stack is stopped. The
 `vesselstackctl` command remains the recovery path if the panel is unavailable.
 
-The default listener is loopback-only. From an administrator workstation, use
-an SSH tunnel or a trusted VPN rather than exposing the panel publicly:
+To open the panel directly from a laptop or phone on your trusted network:
 
 ```bash
-ssh -L 8780:127.0.0.1:8780 boat-admin@HOST
+sudo vesselstackctl panel-access lan
 ```
 
-Then open `http://127.0.0.1:8780`. Retrieve the generated token locally and
-enter it on the unlock screen:
+Open the address printed by the command (normally `http://PI_ADDRESS:8780`).
+This enables only the panel listener; it does not expose the rest of the stack.
+The default remains loopback-only, and `sudo vesselstackctl panel-access local`
+restores it. Local-only users can still use a trusted VPN or an SSH tunnel
+(`ssh -L 8780:127.0.0.1:8780 boat-admin@HOST`).
+
+Retrieve the generated token on the Pi and enter it on the unlock screen:
 
 ```bash
 sudo grep '^CONTROL_PANEL_TOKEN=' \
@@ -2705,8 +2781,11 @@ a preset that sets the real bind settings; `LAN_ACCESS` itself is never written 
 | `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` | `0.0.0.0` |
 | `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
 
-The Control Panel (`CONTROL_PANEL_HOST`) stays on `127.0.0.1` in every preset: it is a
-root-level configuration editor; reach it through an SSH tunnel. `all` also opens
+The Control Panel (`CONTROL_PANEL_HOST`) defaults to `127.0.0.1` and is independent
+of every preset. Choose network access during setup or run
+`sudo vesselstackctl panel-access lan` to share only its administration listener;
+`panel-access local` returns it to loopback. The dashboard presets leave this choice
+unchanged. `all` also opens
 Prometheus, which has **no login**, plus InfluxDB (token) and MQTT (password) to every
 device on the network; turn the firewall on and prefer Ethernet or a VPN as the way in.
 
@@ -3280,6 +3359,10 @@ tests verify the whole base chain is root-controlled and fail clearly otherwise;
 the product check is unchanged. The directory is left empty after a run and can
 be removed with `sudo rmdir /usr/local/share/vs-test`.
 
+The lifecycle and installer regression tests cover persisted component
+exclusions, filtered LAN re-apply, retained data, optional-service selection,
+and offline-safe startup behavior.
+
 `tests/test-get-vesselstack.sh` simulates "Docker absent" by running the
 bootstrap under an isolated `PATH` made of its stubs and symlinks to every host
 tool except `docker*`, so the result no longer depends on whether the host (for
@@ -3595,3 +3678,22 @@ locally across Git pulls; they change only when you run a reviewed release's
 See [development/update details](docs/DEVELOPMENT.md).
 
 </details>
+
+### Selective core component lifecycle
+
+The installed `VESSELSTACK_DISABLED_COMPONENTS` setting is a comma-separated
+list of core services to exclude: `homeassistant`, `influxdb`, `grafana`,
+`prometheus`, `mosquitto`, and `heimdall`. Empty (the default) starts all six;
+unknown or duplicate IDs are rejected. `install.sh --start` and
+`vesselstackctl start` pass only selected services to Compose, preserve offline
+`--pull never`, and skip InfluxDB provisioning and Mosquitto force-recreation
+when those services are disabled.
+
+Use `sudo vesselstackctl component remove ID` to persist a removal and run
+`docker compose rm --stop --force ID` without deleting volumes, or
+`sudo vesselstackctl component add ID` to persist inclusion and start it. Adding
+Mosquitto refreshes its managed access files; adding InfluxDB runs its bootstrap
+when available. Do not edit the membership field in the Control Panel directly;
+use its Components controls. CLI and Control Panel lifecycle operations should
+be run one at a time because external CLI requests are not cross-process
+serialized.

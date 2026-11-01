@@ -6,6 +6,7 @@ umask 077
 
 ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
@@ -23,7 +24,10 @@ Commands:
   lan [local|dashboards|all] [--dry-run] [--yes] [--allow-firewall-conflict]
                                Show or change who on the network can reach the dashboards
                                (rewrites the bind settings, re-applies; the control panel
-                               always stays on this device)
+                               leaves the control-panel setting unchanged)
+  panel-access [local|lan] [--dry-run]
+                               Bind the administration control panel to this device
+                               or all interfaces (never changes other listeners)
   ha-http sync|status          Re-apply or show the managed Home Assistant http bind block
                                (HOMEASSISTANT_BIND_ADDRESS); used by the installer and lan
   reindex                      Rebuild Boat Chat's memory index as the service user
@@ -39,6 +43,8 @@ Commands:
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
+  component add ID             Enable one core component and start it
+  component remove ID          Disable one core component and remove its container (data preserved)
   backup [--allow-unmounted] [DIRECTORY]
                                Create a checksummed, consistent backup (stops the
                                whole stack briefly). Refuses /media and /mnt
@@ -62,14 +68,72 @@ require_root() {
 
 load_config() {
     [ -r "$ENV_FILE" ] || { echo "Missing installed config: $ENV_FILE" >&2; exit 1; }
+    VESSELSTACK_DISABLED_COMPONENTS=""
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     : "${VESSELSTACK_ROOT:?Missing VESSELSTACK_ROOT}"
     : "${VESSELSTACK_DATA:?Missing VESSELSTACK_DATA}"
+    validate_disabled_components
     COMPOSE=(docker compose)
     [ "${SIGNALK_MODE:-existing}" = docker ] && COMPOSE+=(--profile signalk)
     [ "${AIS_ENABLE:-false}" = true ] && COMPOSE+=(--profile ais)
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
+}
+
+validate_disabled_components() {
+    local raw=${VESSELSTACK_DISABLED_COMPONENTS:-} item known seen=""
+    while [ -n "$raw" ]; do
+        case "$raw" in *,*) item=${raw%%,*}; raw=${raw#*,} ;; *) item=$raw; raw="" ;; esac
+        item=${item//[[:space:]]/}; [ -z "$item" ] && continue
+        known=0; for component in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && known=1; done
+        [ "$known" -eq 1 ] || { echo "Unknown disabled component: $item" >&2; exit 2; }
+        case ",$seen," in *,"$item",*) echo "Duplicate disabled component: $item" >&2; exit 2 ;; esac
+        seen="${seen:+$seen,}$item"
+    done
+    VESSELSTACK_DISABLED_COMPONENTS=$seen
+}
+
+selected_services() {
+    local component
+    for component in "${CORE_COMPONENTS[@]}"; do
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,"$component",*) ;; *) printf '%s\n' "$component" ;; esac
+    done
+    [ "${SIGNALK_MODE:-existing}" = docker ] && printf '%s\n' signalk
+    [ "${AIS_ENABLE:-false}" = true ] && printf '%s\n' ais-catcher
+}
+
+persist_disabled_components() {
+    local value=$1
+    set_env_key "$ENV_FILE" VESSELSTACK_DISABLED_COMPONENTS "$value"
+    VESSELSTACK_DISABLED_COMPONENTS=$value
+}
+
+component_change() {
+    local action=$1 component=$2 item found=0 value=""
+    for item in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && found=1; done
+    [ "$found" -eq 1 ] || { echo "Unknown core component: $component" >&2; exit 2; }
+    local disabled=${VESSELSTACK_DISABLED_COMPONENTS:-}
+    while [ -n "$disabled" ]; do
+        case "$disabled" in *,*) item=${disabled%%,*}; disabled=${disabled#*,} ;; *) item=$disabled; disabled="" ;; esac
+        [ -n "$item" ] && [ "$item" != "$component" ] && value="${value:+$value,}$item"
+    done
+    if [ "$action" = remove ]; then
+        value="${value:+$value,}$component"; persist_disabled_components "$value"
+        "${COMPOSE[@]}" rm --stop --force "$component"
+    else
+        persist_disabled_components "$value"
+        if [ "$component" = mosquitto ]; then sync_mqtt_access; fi
+        if [ "$component" = influxdb ]; then
+            [ -x "$VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" ] || {
+                echo "Missing bundled InfluxDB provisioner: $VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" >&2
+                return 1
+            }
+            "${COMPOSE[@]}" up -d "$component"
+            "$VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" "$ENV_FILE"
+        else
+            "${COMPOSE[@]}" up -d "$component"
+        fi
+    fi
 }
 
 # Render the Mosquitto ACL and hashed passwords (admin, plus the displays bridge
@@ -129,29 +193,45 @@ start_stack() {
     if [ "${VESSELSTACK_FIREWALL_ENABLE:-false}" = true ]; then
         systemctl enable --now vesselstack-firewall.service
     fi
-    if [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/passwords" ] || \
-        [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/acl" ]; then
-        sync_mqtt_access
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+        *,mosquitto,*) ;;
+        *) if [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/passwords" ] || \
+              [ ! -s "$VESSELSTACK_ROOT/config/mosquitto-auth/acl" ]; then
+               sync_mqtt_access
+           fi ;;
+    esac
+    local -a services=()
+    while IFS= read -r service; do services+=("$service"); done < <(selected_services)
+    if [ "${#services[@]}" -gt 0 ]; then
+        "${COMPOSE[@]}" up -d "${services[@]}"
     fi
-    "${COMPOSE[@]}" up -d
+    # Do not issue a bare `up`, which would recreate intentionally removed core components.
     # A changed compose definition is recreated by "up -d"; a changed Mosquitto
     # configuration file alone is not, so compare with the last applied stamp.
     local conf="$VESSELSTACK_ROOT/config/mosquitto/mosquitto.conf"
     local stamp="$VESSELSTACK_ROOT/config/.mosquitto-conf.sha256" conf_hash=
     if [ -r "$conf" ]; then
         conf_hash=$(sha256sum "$conf" | cut -d' ' -f1)
-        if [ -r "$stamp" ] && [ "$(<"$stamp")" != "$conf_hash" ]; then
-            "${COMPOSE[@]}" up -d --force-recreate mosquitto
-        fi
-        printf '%s\n' "$conf_hash" > "$stamp"
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+            *,mosquitto,*) ;;
+            *) if [ -r "$stamp" ] && [ "$(<"$stamp")" != "$conf_hash" ]; then
+                   "${COMPOSE[@]}" up -d --force-recreate mosquitto
+               fi ;;
+        esac
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+            *,mosquitto,*) ;;
+            *) printf '%s\n' "$conf_hash" > "$stamp" ;;
+        esac
     fi
-    [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
+    if [[ ",${VESSELSTACK_DISABLED_COMPONENTS:-}," != *,influxdb,* ]]; then
+      [ -x "$installer_scripts/bootstrap-influx.sh" ] || {
         echo "Missing bundled InfluxDB provisioner: $installer_scripts/bootstrap-influx.sh" >&2
         return 1
-    }
+      }
     # bootstrap-influx.sh first waits (bounded) for InfluxDB /health, so start,
     # restart and the backup restart trap never provision against a booting server.
-    "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
+      "$installer_scripts/bootstrap-influx.sh" "$ENV_FILE"
+    fi
     if [ "${SIGNALK_MODE:-existing}" = native ]; then
         systemctl start vesselstack-signalk.service
     fi
@@ -227,6 +307,11 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
 status_stack() {
     local failed=0 service running_services
     local services=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+    local -a selected=()
+    for service in "${services[@]}"; do
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,"$service",*) ;; *) selected+=("$service") ;; esac
+    done
+    services=("${selected[@]}")
     [ "${SIGNALK_MODE:-existing}" = docker ] && services+=(signalk)
     [ "${AIS_ENABLE:-false}" = true ] && services+=(ais-catcher)
     printf '%-20s %s\n' COMPONENT STATE
@@ -259,9 +344,9 @@ status_stack() {
     check_chat_endpoint "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
     check_endpoint 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" || failed=1
     check_endpoint SignalK "${SIGNALK_URL%/}/signalk" || failed=1
-    check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1
-    check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1
-    check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homeassistant,*) ;; *) check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1 ;; esac
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,influxdb,*) ;; *) check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1 ;; esac
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,grafana,*) ;; *) check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1 ;; esac
     printf '\nRun vesselstackctl doctor for configuration and dependency checks.\n'
     return "$failed"
 }
@@ -404,12 +489,14 @@ url_host_port() {
 }
 
 show_urls() {
-    local chat_host panel_host data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
+    local chat_host panel_host panel_port data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
     local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} host port i
     chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
     chat_host=${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_host=${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}
+    panel_port=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_PORT)
+    panel_port=${panel_port:-${CONTROL_PANEL_PORT:-8780}}
     collect_listeners
     collect_reachable
     printf 'Addresses other devices on this network can use to reach this machine:\n'
@@ -425,9 +512,11 @@ show_urls() {
     printf '\n'
     show_service 'Boat Chat' "${BOAT_CHAT_PORT:-8765}" http "$chat_host" no 'access token required' \
         'to change: sudo vesselstackctl lan dashboards'
-    show_service 'Control Panel' "${CONTROL_PANEL_PORT:-8780}" http "$panel_host" no \
-        'root-level editor, loopback by design' \
-        "to reach it: ssh -L ${CONTROL_PANEL_PORT:-8780}:127.0.0.1:${CONTROL_PANEL_PORT:-8780} USER@HOST (SSH tunnel)"
+    local panel_note='root-level editor'
+    [ "$(bind_kind "$panel_host")" = loopback ] && panel_note='root-level editor, loopback by design'
+    show_service 'Control Panel' "$panel_port" http "$panel_host" no \
+        "$panel_note" \
+        "to reach it: ssh -L ${panel_port}:127.0.0.1:${panel_port} USER@HOST (SSH tunnel)"
     if [ "${SIGNALK_MODE:-existing}" = existing ]; then
         printf '%-20s %s\n' SignalK "existing server, not managed here: $SIGNALK_URL"
     else
@@ -1019,7 +1108,9 @@ EOF
     echo "Configuration updated."
     # Re-apply: compose recreates only the containers whose published ports changed.
     if "${COMPOSE[@]}" ps --status running --quiet 2>/dev/null | grep -q .; then
-        "${COMPOSE[@]}" up -d
+        local -a lan_services=()
+        while IFS= read -r service; do lan_services+=("$service"); done < <(selected_services)
+        [ "${#lan_services[@]}" -eq 0 ] || "${COMPOSE[@]}" up -d "${lan_services[@]}"
     else
         echo "The containers are not running; the new addresses apply at the next start."
     fi
@@ -1032,6 +1123,142 @@ EOF
         echo "Home Assistant was left unchanged; the other settings were applied. Details above." >&2
     fi
     echo "Done. Check the result with: sudo vesselstackctl urls"
+}
+
+# --- Control panel listener ---------------------------------------------------------
+# This is intentionally separate from `lan`: the panel is a root-level editor and
+# must never be changed as a side effect of dashboard/database LAN presets.
+panel_access() {
+    local mode='' dry_run=0 argument panel_file="$ROOT/config/control-panel.env"
+    local old_env old_panel backup new_host panel_port token panel_url panel_ip
+    for argument in "$@"; do
+        case "$argument" in
+            local|lan) [ -z "$mode" ] || { echo 'panel-access accepts only one mode' >&2; exit 2; }; mode=$argument ;;
+            --dry-run) dry_run=1 ;;
+            *) echo "Unknown panel-access argument: $argument" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+    old_env=$(env_file_value "$ENV_FILE" CONTROL_PANEL_HOST)
+    old_env=${old_env:-127.0.0.1}
+    old_panel=$(env_file_value "$panel_file" CONTROL_PANEL_HOST)
+    old_panel=${old_panel:-$old_env}
+    panel_port=$(env_file_value "$panel_file" CONTROL_PANEL_PORT)
+    panel_port=${panel_port:-${CONTROL_PANEL_PORT:-8780}}
+    panel_ip=''
+    case "$old_panel" in
+        127.*|::1|localhost) panel_ip=127.0.0.1 ;;
+        0.0.0.0|'*'|'::')
+            collect_reachable
+            for panel_ip in "${REACH_HOSTS[@]}"; do
+                [[ "$panel_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && break
+            done
+            [ -n "$panel_ip" ] || panel_ip=$(hostname 2>/dev/null || printf '127.0.0.1')
+            ;;
+        *) panel_ip=$old_panel ;;
+    esac
+    panel_url=$(url_for http "$panel_ip" "$panel_port")
+    if [ -z "$mode" ]; then
+        printf 'Control panel: host=%s port=%s\n' "$old_panel" "$panel_port"
+        printf 'Browser URL: %s\n' "$panel_url"
+        printf 'Token: sudo grep '\''^CONTROL_PANEL_TOKEN='\'' %s\n' "$panel_file"
+        return 0
+    fi
+    case "$mode" in local) new_host=127.0.0.1 ;; lan) new_host=0.0.0.0 ;; esac
+    printf 'Control panel access: %s -> %s (host=%s port=%s)\n' "$old_panel" "$mode" "$new_host" "$panel_port"
+    if [ "$mode" = lan ]; then
+        echo 'WARNING: HTTP is unencrypted; every device on the listening interfaces can reach the panel. A strict firewall may still block access.' >&2
+    fi
+    printf 'Token: sudo grep '\''^CONTROL_PANEL_TOKEN='\'' %s\n' "$panel_file"
+    if [ "$dry_run" -eq 1 ]; then
+        echo 'Dry run: nothing was changed. Run without --dry-run to apply.'
+        return 0
+    fi
+    # Both files are fixed root-owned regular files. Do not create or follow a
+    # replacement path during a privileged listener change.
+    local file uid mode_bits
+    for file in "$ENV_FILE" "$panel_file"; do
+        if [ ! -f "$file" ] || [ -L "$file" ]; then
+            echo "Refusing panel-access: unsafe or missing config file $file (must be a regular non-symlink file)." >&2
+            return 1
+        fi
+        uid=$(stat -c '%u' -- "$file") || { echo "Refusing panel-access: cannot inspect $file." >&2; return 1; }
+        mode_bits=$(stat -c '%a' -- "$file") || { echo "Refusing panel-access: cannot inspect mode for $file." >&2; return 1; }
+        if [ "$uid" -ne 0 ] || [ $(( (8#$mode_bits) & 8#022 )) -ne 0 ]; then
+            echo "Refusing panel-access: $file must be root-owned and not group/world-writable." >&2
+            return 1
+        fi
+    done
+    token=$(env_file_value "$panel_file" CONTROL_PANEL_TOKEN)
+    if [ -z "$token" ]; then
+        echo "Refusing panel-access: non-empty CONTROL_PANEL_TOKEN is required in $panel_file." >&2
+        return 1
+    fi
+    backup=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-panel-access.XXXXXX")
+    cp -p -- "$ENV_FILE" "$backup/vesselstack.env"
+    cp -p -- "$panel_file" "$backup/control-panel.env"
+    if ! { set_env_key "$ENV_FILE" CONTROL_PANEL_HOST "$new_host" && set_env_key "$panel_file" CONTROL_PANEL_HOST "$new_host"; }; then
+        local restore_env=0 restore_panel=0
+        cp -p -- "$backup/vesselstack.env" "$ENV_FILE" || restore_env=1
+        cp -p -- "$backup/control-panel.env" "$panel_file" || restore_panel=1
+        if [ "$restore_env" -ne 0 ] || [ "$restore_panel" -ne 0 ]; then
+            echo "RECOVERY ERROR: configuration write failed and restoration failed (vesselstack.env=$restore_env control-panel.env=$restore_panel). Backups retained at $backup; restore them manually." >&2
+            return 1
+        fi
+        rm -rf -- "$backup"
+        echo "Panel-access failed while writing configuration; previous files were restored. Recovery: verify both config files, then retry panel-access local or panel-access lan." >&2
+        return 1
+    fi
+    if ! systemctl restart vesselstack-control-panel.service; then
+        echo 'Panel-access restart failed; restoring the previous configuration.' >&2
+        local restore_env=0 restore_panel=0 old_restart=0
+        cp -p -- "$backup/vesselstack.env" "$ENV_FILE" || restore_env=1
+        cp -p -- "$backup/control-panel.env" "$panel_file" || restore_panel=1
+        if [ "$restore_env" -ne 0 ] || [ "$restore_panel" -ne 0 ]; then
+            echo "RECOVERY ERROR: could not restore both config files from $backup. Restore them manually, then run: sudo systemctl restart vesselstack-control-panel.service" >&2
+            return 1
+        fi
+        systemctl restart vesselstack-control-panel.service || old_restart=1
+        if [ "$old_restart" -ne 0 ]; then
+            echo "RECOVERY ERROR: old panel configuration was restored but the old service restart failed. Backup retained at $backup. Run: sudo systemctl restart vesselstack-control-panel.service" >&2
+            return 1
+        fi
+        rm -rf -- "$backup"
+        echo 'Panel-access rolled back successfully; the requested mode was not applied.' >&2
+        return 1
+    fi
+    rm -rf -- "$backup"
+    case "$new_host" in
+        127.*|::1|localhost) panel_url=$(url_for http 127.0.0.1 "$panel_port") ;;
+        0.0.0.0)
+            collect_reachable
+            panel_ip=''
+            for panel_ip in "${REACH_HOSTS[@]}"; do
+                [[ "$panel_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && break
+            done
+            [ -n "$panel_ip" ] || panel_ip=$(hostname 2>/dev/null || printf '127.0.0.1')
+            panel_url=$(url_for http "$panel_ip" "$panel_port") ;;
+    esac
+    printf 'Browser URL: %s\n' "$panel_url"
+    echo "Panel-access applied. Verify with: sudo vesselstackctl urls"
+}
+
+panel_access_preflight() {
+    local file uid mode_bits panel_file="$ROOT/config/control-panel.env"
+    for file in "$ENV_FILE" "$panel_file"; do
+        if [ ! -f "$file" ] || [ -L "$file" ]; then
+            echo "Refusing panel-access: unsafe or missing config file $file." >&2
+            return 1
+        fi
+        uid=$(stat -c '%u' -- "$file") || return 1
+        mode_bits=$(stat -c '%a' -- "$file") || return 1
+        if [ "$uid" -ne 0 ] || [ $(( (8#$mode_bits) & 8#022 )) -ne 0 ]; then
+            echo "Refusing panel-access: $file must be root-owned and not group/world-writable." >&2
+            return 1
+        fi
+    done
+    [ "${1:-1}" -eq 0 ] || [ -n "$(env_file_value "$panel_file" CONTROL_PANEL_TOKEN)" ] || {
+        echo "Refusing panel-access: non-empty CONTROL_PANEL_TOKEN is required in $panel_file." >&2; return 1;
+    }
 }
 
 # Warn (never fail) when the data filesystem is more than 80% full. Time-series
@@ -1160,7 +1387,7 @@ doctor_stack() {
     disk_usage_warning
     check_signalk_data_dir || failed=1
     check_homeassistant_bind
-    check_prometheus_data_dir || failed=1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,prometheus,*) ;; *) check_prometheus_data_dir || failed=1 ;; esac
     check_memory_index || failed=1
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
@@ -1442,6 +1669,9 @@ PY
         # rebuilds it, re-renders units and starts the stack.
         "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start
     else
+        # A restored archive may carry different membership than the process
+        # that invoked restore; reload it before the fallback start.
+        load_config
         start_stack
         echo "NOTE: the Boat Chat virtualenv was not rebuilt. Run: sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
     fi
@@ -1534,6 +1764,9 @@ case "$command" in
     help|-h|--help) usage; exit 0 ;;
 esac
 require_root
+if [ "$command" = panel-access ]; then
+    panel_access_preflight 0
+fi
 load_config
 case "$command" in
     status) [ $# -eq 0 ] || { usage; exit 2; }; status_stack ;;
@@ -1542,11 +1775,13 @@ case "$command" in
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;
     lan) lan_stack "$@" ;;
+    panel-access) panel_access "$@" ;;
     ha-http) ha_http_command "$@" ;;
     reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
+    component) [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
     backup) backup_stack "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
     restore) [ $# -ge 2 ] || { usage; exit 2; }; restore_stack "$@" ;;

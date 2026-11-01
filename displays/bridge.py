@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -564,7 +565,20 @@ class MqttPublisher:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._client = None
-        self._pending = []
+        self._condition = threading.Condition()
+        self._commands = deque()
+        self._retained_mailbox = {}
+        self._waiting = deque()
+        self._retained = {}
+        self._sent_retained = {}
+        self._retained_generation = {}
+        self._sent_generation = {}
+        self._outstanding = {}
+        self._mid_topics = {}
+        self._connected = False
+        self._stopping = False
+        self._stop_deadline = None
+        self._worker = None
 
     def start(self, on_connect):
         import paho.mqtt.client as mqtt
@@ -582,31 +596,156 @@ class MqttPublisher:
                 LOG.error("MQTT connection refused: %s", reason)
                 return
             LOG.info("MQTT connected to %s:%s", s.mqtt_host, s.mqtt_port)
-            on_connect()
+            self._event("connect", on_connect)
 
         def disconnected(_client, _userdata, _flags, reason, _properties):
             LOG.warning("MQTT disconnected: %s", reason)
+            self._event("disconnect", None)
+
+        def published(_client, _userdata, mid, _reason, _properties):
+            self._event("ack", mid)
 
         client.on_connect = connected
         client.on_disconnect = disconnected
+        client.on_publish = published
+        # The worker must see the client before loop_start can deliver a callback.
+        self._client = client
+        self._worker = threading.Thread(target=self._run, name="mqtt-publisher", daemon=True)
+        self._worker.start()
         client.connect_async(s.mqtt_host, s.mqtt_port, keepalive=30)
         client.loop_start()
-        self._client = client
 
     def publish(self, topic, payload, retain, qos=0):
+        if retain and threading.current_thread() is self._worker:
+            # Re-entrant publishes from on_connect already run on the owner
+            # worker.  Apply them inline so a producer-thread update queued
+            # earlier cannot be overtaken by this callback's stale snapshot.
+            self._retained[topic] = (payload, qos)
+            self._retained_generation[topic] = self._retained_generation.get(topic, 0) + 1
+            self._drain_topic(topic)
+            return
+        with self._condition:
+            if self._stopping:
+                return
+            if retain:
+                # Cache before CONNACK; only the worker submits to Paho.  This
+                # makes rapid updates coalesce without allowing an old retained
+                # packet to overtake the latest value.
+                first = topic not in self._retained_mailbox
+                self._retained_mailbox[topic] = (payload, qos)
+                if first:
+                    self._commands.append(("retained", topic))
+            else:
+                if len(self._commands) < MQTT_MAX_QUEUED_MESSAGES:
+                    self._commands.append(("publish", topic, payload, retain, qos))
+            self._condition.notify()
+
+    def _event(self, kind, value):
+        with self._condition:
+            self._commands.append((kind, value))
+            self._condition.notify()
+
+    def _run(self):
+        while True:
+            stop_drain = False
+            with self._condition:
+                if self._stopping and self._stop_deadline is not None and time.monotonic() >= self._stop_deadline:
+                    return
+                while not self._commands and not self._stopping:
+                    self._condition.wait(0.25)
+                if self._commands:
+                    command = self._commands.popleft()
+                elif self._stopping:
+                    # Bridge.shutdown queues its final retained offline state
+                    # immediately before stop().  Give the live MQTT loop a
+                    # bounded chance to submit it and receive QoS1 acks.
+                    if self._stop_deadline is None:
+                        self._stop_deadline = time.monotonic() + 3
+                        stop_drain = True
+                    if stop_drain:
+                        pass
+                    elif not self._outstanding or not self._connected or time.monotonic() >= self._stop_deadline:
+                        return
+                    if not stop_drain:
+                        self._condition.wait(min(0.1, self._stop_deadline - time.monotonic()))
+                        continue
+                else:
+                    continue
+            if stop_drain:
+                # Never call into Paho while holding the ingress condition;
+                # its callback can synchronously enqueue an acknowledgement.
+                self._drain_retained()
+                continue
+            kind, *args = command
+            if kind == "connect":
+                self._connected = True
+                for topic in tuple(self._retained):
+                    if topic not in self._outstanding:
+                        self._sent_retained.pop(topic, None)
+                    self._sent_generation.pop(topic, None)
+                if not self._stopping:
+                    args[0]()
+                while self._waiting:
+                    self._send(*self._waiting.popleft())
+                self._drain_retained()
+            elif kind == "disconnect":
+                self._connected = False
+            elif kind == "ack":
+                topic = self._mid_topics.pop(args[0], None)
+                if topic is not None:
+                    self._outstanding.pop(topic, None)
+                    self._drain_retained()
+            elif kind == "retained":
+                with self._condition:
+                    item = self._retained_mailbox.pop(args[0], None)
+                if item is not None:
+                    self._retained[args[0]] = item
+                    self._retained_generation[args[0]] = self._retained_generation.get(args[0], 0) + 1
+                    self._drain_topic(args[0])
+            elif kind == "publish":
+                if self._connected:
+                    self._send(args[0], args[1], args[2], args[3])
+                elif len(self._waiting) < MQTT_MAX_QUEUED_MESSAGES:
+                    self._waiting.append(tuple(args))
+
+    def _drain_retained(self):
+        for topic in tuple(self._retained):
+            self._drain_topic(topic)
+
+    def _drain_topic(self, topic):
+        if not self._connected or topic in self._outstanding:
+            return
+        item = self._retained.get(topic)
+        if item is not None and self._sent_generation.get(topic) != self._retained_generation.get(topic):
+            self._send(topic, item[0], True, item[1])
+
+    def _send(self, topic, payload, retain, qos):
+        if not self._connected or self._client is None:
+            return
         info = self._client.publish(topic, payload, qos=qos, retain=retain)
+        # Paho returns an MQTTMessageInfo even when it rejected the packet.
+        # QUEUE_SIZE (15) has no future acknowledgement; leave the retained
+        # value dirty so a later connection/update can retry it.
+        rc = getattr(info, "rc", 0)
+        if rc != 0 and not (qos > 0 and rc == 4):  # SUCCESS; NO_CONN queues QoS1 only
+            return
         if qos > 0:
-            self._pending = (self._pending + [info])[-8:]
+            self._outstanding[topic] = info
+            self._mid_topics[info.mid] = topic
+        if retain:
+            self._sent_retained[topic] = (payload, qos)
+            self._sent_generation[topic] = self._retained_generation.get(topic, 0)
 
     def stop(self):
         client = self._client
         if client is None:
             return
-        for info in self._pending:
-            try:
-                info.wait_for_publish(timeout=3)
-            except (ValueError, RuntimeError):
-                pass
+        with self._condition:
+            self._stopping = True
+            self._stop_deadline = time.monotonic() + 3
+            self._condition.notify_all()
+        if self._worker is not None:
+            self._worker.join(timeout=3)
         client.disconnect()
         client.loop_stop()
 

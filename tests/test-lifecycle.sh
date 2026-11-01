@@ -12,7 +12,8 @@ BACKUP_ROOT="$TEST_ROOT/backups"
 FAKE_BIN="$TEST_ROOT/bin"
 SYSTEM_ROOT="$TEST_ROOT/system-root"
 install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_BIN" \
-    "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin"
+    "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin" \
+    "$DATA_ROOT/grafana" "$DATA_ROOT/influxdb"
 
 cat > "$APP_ROOT/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$APP_ROOT
@@ -27,7 +28,15 @@ GRAFANA_PORT=9877
 HEIMDALL_PORT=9878
 MQTT_USERNAME=test-user
 MQTT_PASSWORD=test-password
+CONTROL_PANEL_HOST=127.0.0.1
+CONTROL_PANEL_PORT=8780
 EOF
+cat > "$APP_ROOT/config/control-panel.env" <<EOF
+CONTROL_PANEL_HOST=127.0.0.1
+CONTROL_PANEL_PORT=8780
+CONTROL_PANEL_TOKEN=test-panel-token
+EOF
+chmod 0600 "$APP_ROOT/config/vesselstack.env" "$APP_ROOT/config/control-panel.env"
 printf 'version one\n' > "$DATA_ROOT/state.txt"
 ln -s state.txt "$DATA_ROOT/current-state"
 install -d "$APP_ROOT/boat-chat/.venv/bin"
@@ -50,7 +59,8 @@ cp "$REPO_ROOT/scripts/memory-index.sh" "$APP_ROOT/installer/scripts/memory-inde
 printf '0.3.0\n' > "$APP_ROOT/config/installed-version"
 # The real credential helper runs against the fake docker below.
 for helper in configure-hardware.sh bootstrap-influx.sh; do
-    printf '#!/bin/bash\nexit 0\n' > "$APP_ROOT/installer/scripts/$helper"
+    # shellcheck disable=SC2016
+    printf '#!/bin/bash\nprintf "%%s\\n" "$(basename "$0")" >> "%s/helper.log"\nexit 0\n' "$TEST_ROOT" > "$APP_ROOT/installer/scripts/$helper"
     chmod +x "$APP_ROOT/installer/scripts/$helper"
 done
 
@@ -59,6 +69,10 @@ cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$(dirname "$0")/calls.log"
 [ -z "${FAKE_CALL_LOG:-}" ] || printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALL_LOG"
+if [ "$(basename "$0")" = systemctl ] && [ "${FAKE_SYSTEMCTL_FAIL_ONCE:-}" = 1 ] && [ ! -e "${FAKE_SYSTEMCTL_FAIL_MARKER:?}" ]; then
+    : > "$FAKE_SYSTEMCTL_FAIL_MARKER"
+    exit 1
+fi
 if [ "$(basename "$0")" = curl ]; then
     if [ -n "${FAKE_MEMORY_CHUNKS:-}" ]; then
         printf '{"ok":true,"ready":true,"readiness":{"layers":{"memory":{"ready":true,"chunks":%s}}}}\n' "$FAKE_MEMORY_CHUNKS"
@@ -163,6 +177,65 @@ run_ctl() {
         FAKE_MOUNTS="$TEST_ROOT/mounts" \
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
+
+# The administration panel listener is an explicit, isolated change. Dry runs and
+# invalid arguments are inert; applying it updates both bind files and restarts
+# only the panel service, while preserving its token and port.
+panel_before=$(sha256sum "$APP_ROOT/config/control-panel.env")
+if run_ctl panel-access lan --dry-run >/dev/null 2>&1; then :; else
+    echo 'panel-access dry-run failed' >&2; exit 1
+fi
+[ "$(sha256sum "$APP_ROOT/config/control-panel.env")" = "$panel_before" ] || {
+    echo 'panel-access dry-run changed the panel config' >&2; exit 1;
+}
+if run_ctl panel-access invalid >/dev/null 2>&1; then
+    echo 'panel-access accepted an invalid mode' >&2; exit 1
+fi
+: > "$TEST_ROOT/panel-calls.log"
+export FAKE_CALL_LOG="$TEST_ROOT/panel-calls.log"
+run_ctl panel-access lan >/dev/null
+grep -qx 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"
+if grep -qv 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"; then
+    echo 'panel-access made an unexpected service call' >&2
+    exit 1
+fi
+grep -q '^CONTROL_PANEL_HOST=0.0.0.0$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^CONTROL_PANEL_HOST=0.0.0.0$' "$APP_ROOT/config/control-panel.env"
+grep -q '^CONTROL_PANEL_PORT=8780$' "$APP_ROOT/config/control-panel.env"
+grep -q '^CONTROL_PANEL_TOKEN=test-panel-token$' "$APP_ROOT/config/control-panel.env"
+run_ctl panel-access local >/dev/null
+grep -q '^CONTROL_PANEL_HOST=127.0.0.1$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^CONTROL_PANEL_HOST=127.0.0.1$' "$APP_ROOT/config/control-panel.env"
+unset FAKE_CALL_LOG
+
+# A failed first restart restores both complete files (including 0600 modes) and
+# attempts the old restart. The failure is surfaced to the caller.
+before_env=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+before_panel=$(sha256sum "$APP_ROOT/config/control-panel.env")
+before_env_mode=$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")
+before_panel_mode=$(stat -c '%a' "$APP_ROOT/config/control-panel.env")
+: > "$TEST_ROOT/restart-calls.log"
+export FAKE_CALL_LOG="$TEST_ROOT/restart-calls.log" FAKE_SYSTEMCTL_FAIL_ONCE=1 FAKE_SYSTEMCTL_FAIL_MARKER="$TEST_ROOT/restart-failed"
+if run_ctl panel-access lan >/dev/null 2>&1; then
+    echo 'panel-access hid a failed restart' >&2; exit 1
+fi
+[ "$before_env" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ]
+[ "$before_panel" = "$(sha256sum "$APP_ROOT/config/control-panel.env")" ]
+[ "$before_env_mode" = "$(stat -c '%a' "$APP_ROOT/config/vesselstack.env")" ]
+[ "$before_panel_mode" = "$(stat -c '%a' "$APP_ROOT/config/control-panel.env")" ]
+test "$(grep -c '^systemctl restart vesselstack-control-panel.service$' "$TEST_ROOT/restart-calls.log")" -eq 2
+unset FAKE_CALL_LOG FAKE_SYSTEMCTL_FAIL_ONCE FAKE_SYSTEMCTL_FAIL_MARKER
+
+# Unsafe config paths and missing tokens are refused before any write.
+mv "$APP_ROOT/config/control-panel.env" "$APP_ROOT/config/control-panel.env.real"
+ln -s control-panel.env.real "$APP_ROOT/config/control-panel.env"
+if run_ctl panel-access lan >/dev/null 2>&1; then echo 'panel-access followed a config symlink' >&2; exit 1; fi
+rm "$APP_ROOT/config/control-panel.env"
+mv "$APP_ROOT/config/control-panel.env.real" "$APP_ROOT/config/control-panel.env"
+cp -p "$APP_ROOT/config/control-panel.env" "$TEST_ROOT/control-panel.env.saved"
+sed -i '/^CONTROL_PANEL_TOKEN=/d' "$APP_ROOT/config/control-panel.env"
+if run_ctl panel-access lan >/dev/null 2>&1; then echo 'panel-access accepted a missing token' >&2; exit 1; fi
+mv "$TEST_ROOT/control-panel.env.saved" "$APP_ROOT/config/control-panel.env"
 
 install -d -m 0750 -o 65534 -g 65534 "$DATA_ROOT/prometheus"
 printf 'tsdb\n' > "$DATA_ROOT/prometheus/lifecycle-marker"
@@ -778,6 +851,74 @@ test -e "$DATA_ROOT/state.txt"
 
 if run_ctl status unexpected >/dev/null 2>&1; then
     echo 'Lifecycle command silently ignored an extra argument' >&2
+    exit 1
+fi
+
+# Core component membership is durable: removing a service removes only its
+# container, leaves its data mount intact, and filters every later re-apply.
+printf 'grafana data sentinel\n' > "$DATA_ROOT/grafana/component-sentinel"
+: > "$FAKE_BIN/calls.log"
+run_ctl component remove grafana >/dev/null
+grep -q 'docker compose.*rm --stop --force grafana' "$FAKE_BIN/calls.log"
+grep -qx 'grafana data sentinel' "$DATA_ROOT/grafana/component-sentinel"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana$' "$APP_ROOT/config/vesselstack.env"
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+if grep -Eq 'compose .* up -d .*grafana|compose .* up -d grafana' "$FAKE_BIN/calls.log"; then
+    echo 'start reintroduced removed Grafana' >&2
+    exit 1
+fi
+
+# LAN changes re-apply only selected services, and re-adding the component starts
+# it without disturbing the retained data directory.
+printf 'VESSELSTACK_DISABLED_COMPONENTS=grafana\n' >> "$LAN_ROOT/config/vesselstack.env"
+run_lan local >/dev/null 2>&1
+: > "$TEST_ROOT/lan-calls.log"
+run_lan dashboards >/dev/null 2>&1
+grep -q 'compose .* up -d .*homeassistant' "$TEST_ROOT/lan-calls.log"
+if grep -Eq 'compose .* up -d .*grafana|compose .* up -d grafana' "$TEST_ROOT/lan-calls.log"; then
+    echo 'LAN re-apply started removed Grafana' >&2
+    exit 1
+fi
+run_ctl component add grafana >/dev/null
+grep -q 'docker compose.*up -d grafana' "$FAKE_BIN/calls.log"
+grep -qx 'grafana data sentinel' "$DATA_ROOT/grafana/component-sentinel"
+
+# Re-adding stateful services uses the existing provisioners and leaves their
+# existing data roots in place.
+printf 'influx data sentinel\n' > "$DATA_ROOT/influxdb/component-sentinel"
+run_ctl component remove influxdb >/dev/null
+run_ctl component remove mosquitto >/dev/null
+: > "$TEST_ROOT/helper.log"
+run_ctl component add influxdb >/dev/null
+grep -q '^bootstrap-influx.sh$' "$TEST_ROOT/helper.log"
+run_ctl component add mosquitto >/dev/null
+grep -qx 'influx data sentinel' "$DATA_ROOT/influxdb/component-sentinel"
+
+# Invalid membership and duplicate entries are rejected before any file or
+# service mutation.
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=grafana,grafana/' "$APP_ROOT/config/vesselstack.env"
+before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+if run_ctl start >/dev/null 2>&1; then echo 'duplicate component was accepted' >&2; exit 1; fi
+[ "$before" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ] || {
+    echo 'duplicate validation mutated the config' >&2; exit 1;
+}
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=not-a-component/' "$APP_ROOT/config/vesselstack.env"
+before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+if run_ctl start >/dev/null 2>&1; then echo 'unknown component was accepted' >&2; exit 1; fi
+[ "$before" = "$(sha256sum "$APP_ROOT/config/vesselstack.env")" ] || {
+    echo 'unknown validation mutated the config' >&2; exit 1;
+}
+
+# With all six core services disabled, optional Docker SignalK/AIS remain
+# selectable and no bare Compose up is emitted.
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=homeassistant,influxdb,grafana,prometheus,mosquitto,heimdall/' "$APP_ROOT/config/vesselstack.env"
+printf 'SIGNALK_MODE=docker\nAIS_ENABLE=true\n' >> "$APP_ROOT/config/vesselstack.env"
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+grep -q 'docker compose.*up -d signalk ais-catcher' "$FAKE_BIN/calls.log"
+if grep -Eq 'docker compose.* up -d$|docker compose.* up -d --' "$FAKE_BIN/calls.log"; then
+    echo 'all-disabled start emitted a bare Compose up' >&2
     exit 1
 fi
 

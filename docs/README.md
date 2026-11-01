@@ -38,6 +38,11 @@ should be reached through an SSH tunnel:
 ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI
 ```
 
+To deliberately allow panel access from a trusted LAN, preview then run
+`sudo vesselstackctl panel-access lan`; this changes only the panel bind and
+uses unencrypted HTTP on all interfaces. A strict firewall may still block it.
+Restore the tunnel-only default with `sudo vesselstackctl panel-access local`.
+
 An optional VesselTwin connection uses the separately installed
 `signalk-vesseltwin` plugin, pairing, and explicit reading opt-ins. VesselStack
 does not enable it for you. See the [VesselTwin integration guide](VESSELTWIN.md)
