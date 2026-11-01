@@ -1524,13 +1524,13 @@ PY
     manifest="$archive.sha256"
     install -d -m 0700 "$destination"
     mapfile -t was_compose_services < <("${COMPOSE[@]}" ps --status running --services 2>/dev/null || true)
-    systemctl is-active --quiet vesselstack-chat.service && chat_active=1 || true
-    systemctl is-active --quiet vesselstack-chat-telegram.service && telegram_active=1 || true
-    systemctl is-active --quiet vesselstack-displays-bridge.service && displays_active=1 || true
-    systemctl is-active --quiet vesselstack-signalk.service && signalk_active=1 || true
-    systemctl is-active --quiet vesselstack-socketcan.service && socketcan_active=1 || true
-    systemctl is-active --quiet vesselstack-telemetry-sample.timer && sample_timer_active=1 || true
-    systemctl is-active --quiet vesselstack-telemetry-indexer.timer && indexer_timer_active=1 || true
+    if systemctl is-active --quiet vesselstack-chat.service; then chat_active=1; fi
+    if systemctl is-active --quiet vesselstack-chat-telegram.service; then telegram_active=1; fi
+    if systemctl is-active --quiet vesselstack-displays-bridge.service; then displays_active=1; fi
+    if systemctl is-active --quiet vesselstack-signalk.service; then signalk_active=1; fi
+    if systemctl is-active --quiet vesselstack-socketcan.service; then socketcan_active=1; fi
+    if systemctl is-active --quiet vesselstack-telemetry-sample.timer; then sample_timer_active=1; fi
+    if systemctl is-active --quiet vesselstack-telemetry-indexer.timer; then indexer_timer_active=1; fi
     cleanup_backup() {
         local rc=$? recovery_failed=0 service
         if [ "$socketcan_active" -eq 1 ]; then systemctl start vesselstack-socketcan.service || recovery_failed=1; fi

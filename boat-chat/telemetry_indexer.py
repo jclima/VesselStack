@@ -103,6 +103,7 @@ def refresh_item(category: str, key: str, func, results: list[dict[str, Any]]) -
                 "key": key,
                 "ok": False,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "error": str(exc),
                 "error_class": type(exc).__name__,
             }
         )

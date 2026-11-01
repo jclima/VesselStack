@@ -706,13 +706,13 @@ stop_telemetry_for_migration() {
 }
 telemetry_sample_was_active=0
 telemetry_indexer_was_active=0
-systemctl is-active --quiet vesselstack-telemetry-sample.timer && telemetry_sample_was_active=1 || true
-systemctl is-active --quiet vesselstack-telemetry-indexer.timer && telemetry_indexer_was_active=1 || true
+if systemctl is-active --quiet vesselstack-telemetry-sample.timer; then telemetry_sample_was_active=1; fi
+if systemctl is-active --quiet vesselstack-telemetry-indexer.timer; then telemetry_indexer_was_active=1; fi
 restore_telemetry_on_exit() {
     local rc=$?
     if [ "$rc" -ne 0 ] || [ "$START" -eq 0 ]; then
-        [ "$telemetry_sample_was_active" -eq 1 ] && systemctl start vesselstack-telemetry-sample.timer 2>/dev/null || true
-        [ "$telemetry_indexer_was_active" -eq 1 ] && systemctl start vesselstack-telemetry-indexer.timer 2>/dev/null || true
+        if [ "$telemetry_sample_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-sample.timer 2>/dev/null || true; fi
+        if [ "$telemetry_indexer_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-indexer.timer 2>/dev/null || true; fi
     fi
     return "$rc"
 }
@@ -1040,13 +1040,11 @@ for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.serv
         "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
     chmod 0644 "$SYSTEMD_DIR/$unit"
 done
-for unit in sample; do
-    sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
-        -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
-        -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
-        "$SCRIPT_DIR/systemd/vesselstack-telemetry-$unit.timer.in" > "$SYSTEMD_DIR/vesselstack-telemetry-$unit.timer"
-    chmod 0644 "$SYSTEMD_DIR/vesselstack-telemetry-$unit.timer"
-done
+sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
+    -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
+    "$SCRIPT_DIR/systemd/vesselstack-telemetry-sample.timer.in" > "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer"
+chmod 0644 "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer"
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-telemetry-indexer.timer" \
     "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
