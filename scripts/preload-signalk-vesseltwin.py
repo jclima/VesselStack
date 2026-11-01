@@ -122,7 +122,9 @@ def publish(raw: bytes, args, target: Path) -> None:
             os.fchdir(nfd)
             if os.path.lexists(NAME):
                 existing(Path(NAME)); return
-            temp = Path(tempfile.mkdtemp(prefix=f".{NAME}.", dir=".")); leaf = temp / NAME
+            # Keep the extraction path relative to the already-open node_modules fd;
+            # absolute temp paths would retraverse a parent the dropped uid cannot enter.
+            temp = Path(Path(tempfile.mkdtemp(prefix=f".{NAME}.", dir=".")).name); leaf = temp / NAME
             try:
                 for path, data, is_dir in entries:
                     dest = leaf / Path(path).relative_to("package")
