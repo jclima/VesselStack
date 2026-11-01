@@ -96,6 +96,7 @@ case "${1:-}" in
                 case "$line" in
                     *signalk-server*) [[ " $* " == *" signalk "* ]] || continue ;;
                     *'${AIS_IMAGE}'*) [[ " $* " == *" ais "* ]] || continue ;;
+                    *node-exporter*) [[ " $* " == *" metrics "* ]] || continue ;;
                 esac
                 eval "echo $line"
             done < <(sed -n 's/^ *image: *//p' "$composef")

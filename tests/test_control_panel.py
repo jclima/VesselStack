@@ -206,6 +206,18 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertEqual(panel.component_command("telegram", "start"), ["systemctl", "start", "vesselstack-chat-telegram.service"])
                 self.assertEqual(panel.component_command("telemetry-indexer", "restart"), ["systemctl", "restart", "vesselstack-telemetry-indexer.timer"])
 
+    def test_metrics_and_sample_workers_follow_enable_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vessel.env"
+            env.write_text("NODE_EXPORTER_ENABLE=false\nTELEMETRY_INDEXER_ENABLE=false\n")
+            with mock.patch.object(panel, "VESSEL_ENV", env):
+                for component in ("node-exporter", "telemetry-sample"):
+                    with self.assertRaises(ValueError):
+                        panel.component_command(component, "start")
+                env.write_text("NODE_EXPORTER_ENABLE=true\nTELEMETRY_INDEXER_ENABLE=true\n")
+                self.assertIn("node-exporter", panel.component_command("node-exporter", "start"))
+                self.assertEqual(panel.component_command("telemetry-sample", "restart"), ["systemctl", "restart", "vesselstack-telemetry-sample.timer"])
+
     def test_displays_bridge_is_opt_in_and_token_is_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             vessel = Path(directory) / "vessel.env"

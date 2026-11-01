@@ -533,7 +533,7 @@ def _update_configuration(updates: dict[str, Any]) -> str:
 
 def compose_base() -> list[str]:
     return [
-        "docker", "compose", "--profile", "signalk", "--profile", "ais",
+        "docker", "compose", "--profile", "signalk", "--profile", "ais", "--profile", "metrics",
         "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml"),
     ]
 
@@ -553,6 +553,8 @@ def component_command(component: str, verb: str) -> list[str]:
             raise ValueError("Docker SignalK is disabled by configuration")
         if component == "ais-catcher" and settings.get("AIS_ENABLE", "false") != "true":
             raise ValueError("AIS-catcher is disabled by configuration")
+        if component == "node-exporter" and settings.get("NODE_EXPORTER_ENABLE", "false") != "true" and verb in {"start", "restart"}:
+            raise ValueError("node-exporter is disabled by configuration")
         service = COMPOSE_COMPONENTS[component]
         if verb == "start":
             return compose_base() + ["up", "-d", service]
@@ -564,6 +566,7 @@ def component_command(component: str, verb: str) -> list[str]:
         enabled = {
             "telegram": settings.get("TELEGRAM_ENABLE", "false") == "true",
             "telemetry-indexer": settings.get("TELEMETRY_INDEXER_ENABLE", "true") == "true",
+            "telemetry-sample": settings.get("TELEMETRY_INDEXER_ENABLE", "true") == "true",
             "signalk-native": settings.get("SIGNALK_MODE") == "native",
             "socketcan": settings.get("SOCKETCAN_ENABLE", "false") == "true",
             "firewall": settings.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true",

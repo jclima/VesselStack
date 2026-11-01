@@ -1259,7 +1259,11 @@ sudo systemctl disable --now vesselstack-control-panel.service
 
 Re-enable it with `sudo systemctl enable --now
 vesselstack-control-panel.service`. CLI configuration and lifecycle commands
-continue to work while it is disabled.
+continue to work while it is disabled. Optional workers and schedules follow the
+same guard: Control Panel start/restart is rejected until its enable flag is set.
+Offline preflight requires the node-exporter image only when
+`NODE_EXPORTER_ENABLE=true`; the default-disabled profile does not add it to the
+required image set.
 
 ### Heimdall
 
