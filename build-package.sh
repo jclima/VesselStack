@@ -47,6 +47,19 @@ fi
 install -d "$SCRIPT_DIR/generated" "$STAGE/$PACKAGE_NAME"
 git_in_repo archive --format=tar --prefix="$PACKAGE_NAME/" HEAD \
     | tar --no-same-owner -C "$STAGE" -xf -
+# Brand/runtime presentation files are explicit release requirements. Keep this
+# gate close to the archive extraction so a renamed or forgotten asset cannot
+# silently disappear from an offline package.
+for required_asset in \
+    wizard/favicon.svg \
+    control-panel/static/favicon.svg control-panel/static/index.html control-panel/static/styles.css \
+    boat-chat/static/favicon.svg boat-chat/static/index.html boat-chat/static/styles.css \
+    brand/icon.svg brand/icon.png brand/wordmark.svg brand/github-banner.svg brand/github-banner.png brand/README.md; do
+    [ -s "$STAGE/$PACKAGE_NAME/$required_asset" ] || {
+        echo "Refusing to package without required brand asset: $required_asset" >&2
+        exit 1
+    }
+done
 # Defence in depth: tracked-only does not excuse a tracked private artifact.
 for private in boat-chat/boat_facts.json boat-chat/boat-chat.env vesselstack.env .mcp.json boat-chat/.venv boat-chat/memory boat-chat/data; do
     if [ -e "$STAGE/$PACKAGE_NAME/$private" ]; then

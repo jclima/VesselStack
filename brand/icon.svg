@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">VesselStack</title><desc id="desc">A wide white hull below two ascending teal decks.</desc>
+  <rect width="256" height="256" rx="48" fill="#0a2341"/>
+  <path d="M44 147h168l-25 46H69z" fill="#fff"/>
+  <path d="M56 113h144l-12 22H68z" fill="#4aaebe"/>
+  <path d="M78 82h100l-9 20H87z" fill="#006d89"/>
+</svg>
