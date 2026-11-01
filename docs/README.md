@@ -43,9 +43,11 @@ To deliberately allow panel access from a trusted LAN, preview then run
 uses unencrypted HTTP on all interfaces. A strict firewall may still block it.
 Restore the tunnel-only default with `sudo vesselstackctl panel-access local`.
 
-An optional VesselTwin connection uses the separately installed
-`signalk-vesseltwin` plugin, pairing, and explicit reading opt-ins. VesselStack
-does not enable it for you. See the [VesselTwin integration guide](VESSELTWIN.md)
+An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
+and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
+pinned 0.2.1 plugin by default; existing mode is untouched and uses the upstream
+install path. VesselStack never enables, pairs, or authorizes readings for you.
+See the [VesselTwin integration guide](VESSELTWIN.md)
 and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals and service
 records. Review any external Boat Chat provider's network and retention terms
 before enabling it.

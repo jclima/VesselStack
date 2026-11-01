@@ -42,3 +42,10 @@ instance was created from the variable font (FILL 1, wght 500, GRAD 0, opsz 48) 
 subset to the icons listed in `displays/esphome/fonts/icons.json` (layout features
 and hinting removed). `scripts/build-icon-font.py` reproduces the file from the
 upstream font.
+
+## signalk-vesseltwin
+
+Managed SignalK installs may preload `signalk-vesseltwin` 0.2.1 from npm using
+an immutable SHA-512 pin. It is an optional third-party plugin; upstream
+license and notices remain authoritative. See the [upstream repository](https://github.com/jclima/signalk-vesseltwin)
+and its Apache-2.0 license. The pinned package declares no runtime dependencies.

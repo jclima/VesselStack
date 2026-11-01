@@ -22,6 +22,10 @@ wizard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wizard)
 
 class WizardTests(unittest.TestCase):
+    def test_vesseltwin_preload_default_and_validation(self):
+        self.assertEqual(wizard.DEFAULTS["SIGNALK_VESSELTWIN_PRELOAD"], "true")
+        self.assertEqual(wizard.validate({"SIGNALK_VESSELTWIN_PRELOAD": "false"})["SIGNALK_VESSELTWIN_PRELOAD"], "false")
+
     def test_control_panel_access_defaults_and_lan_independence(self):
         self.assertEqual(wizard.DEFAULTS["CONTROL_PANEL_HOST"], "127.0.0.1")
         for preset in wizard.LAN_PRESETS:

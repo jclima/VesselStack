@@ -116,9 +116,11 @@ keep generated tokens per host. Do not copy lab secrets to the boat. Do not
 publish vessel positions, MMSIs, call signs, device identifiers, telemetry
 databases, backups, logs, or environment files.
 
-An optional VesselTwin connection uses the separately installed
-`signalk-vesseltwin` plugin, pairing, and explicit reading opt-ins. VesselStack
-does not enable it for you. Consult the [VesselTwin integration guide](VESSELTWIN.md)
+An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
+and explicit reading opt-ins. Managed Docker/native SignalK preloads the pinned
+plugin by default;
+VesselStack does not enable, pair, or authorize readings for you. Consult the
+[VesselTwin integration guide](VESSELTWIN.md)
 and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals and service
 records.
 

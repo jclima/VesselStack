@@ -3,6 +3,17 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.6 - 2026-11-01
+
+- Lab prerelease: managed Docker/native SignalK installations preload the pinned
+  `signalk-vesseltwin` 0.2.1 plugin by default. Existing SignalK mode and any
+  existing plugin are preserved; offline Docker installs reuse an existing
+  plugin or fail before mutation when preload is enabled and missing. Plugin
+  enablement, pairing, and master/category reading switches remain explicit.
+- Release status: public lab prerelease only, using the authorized unsigned-tag
+  exception; physical Raspberry Pi acceptance remains pending before any stable
+  promotion. This is not a signed or latest release.
+
 ## 0.5.5 - 2026-10-31
 
 - Lab prerelease: the authenticated Control Panel can check the public

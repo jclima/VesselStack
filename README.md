@@ -89,9 +89,10 @@ On Linux, keep temporary test roots protected with `trusted_test_tmp=$(mktemp -d
 
 ### Optional VesselTwin connection
 
-An optional VesselTwin connection uses the separately installed
-`signalk-vesseltwin` plugin, pairing, and explicit reading opt-ins. VesselStack
-does not enable it for you. See the [VesselTwin integration guide](docs/VESSELTWIN.md)
+An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
+and explicit reading opt-ins. Managed Docker/native SignalK preloads the pinned
+plugin by default; VesselStack does not enable, pair, or authorize readings for you.
+See the [VesselTwin integration guide](docs/VESSELTWIN.md)
 for setup and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals
 and service records.
 
@@ -140,7 +141,7 @@ Keep the generated credentials per host, schedule backups to a separate device,
 and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
-### Update from the Control Panel (0.5.5 lab release)
+### Update from the Control Panel (0.5.6 lab release)
 
 An authenticated Control Panel session can check releases from the public
 `jclima/VesselStack` repository. Stable releases are shown by default; enable
@@ -170,11 +171,11 @@ tab cannot reconnect automatically; the UI opens the new URL and retains the
 token for that session. The reviewed source-path update remains an advanced
 option. The panel uses ordinary HTTP;
 release checksums provide corruption detection, not signed provenance, and the
-0.5.5 lab tag is explicitly unsigned and not latest.
+0.5.6 lab tag is explicitly unsigned and not latest.
 
-The first upgrade from `0.5.4` or earlier must use the CLI installer/update once
-to obtain the browser updater for `0.5.5`. Later releases can be installed
-through the Control Panel.
+The browser updater was introduced in `0.5.5`. Installations on `0.5.4` or
+earlier must use the CLI installer/update once; installations on `0.5.5` can
+upgrade to `0.5.6` through the Control Panel with lab prereleases enabled.
 The panel serializes its own update/configuration/component operations, but
 unrelated CLI commands are separate maintenance actions and are not globally
 serialized by the panel; do not run them concurrently with an update.
@@ -331,9 +332,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.5/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.5 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.5
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.6/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.6 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.6
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -521,7 +522,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.5
+git checkout v0.5.6
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -659,12 +660,12 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-For the pinned 0.5.5 lab prerelease, use its annotated unsigned tag (it is not
+For the pinned 0.5.6 lab prerelease, use its annotated unsigned tag (it is not
 the latest release):
 
 ```bash
 git fetch --tags
-git checkout v0.5.5
+git checkout v0.5.6
 ```
 
 This lab prerelease is for authorized lab use only; it is unsigned, not latest,
@@ -699,6 +700,7 @@ nano vesselstack.env
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
 | `SIGNALK_VERSION` | Pinned SignalK release used by managed modes |
 | `SIGNALK_URL` | Existing SignalK endpoint |
+| `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.1 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
 | `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
@@ -866,6 +868,12 @@ uid/gid 1000, the image's `node` user, so the container can write it). With
 `/opt/vesselstack/signalk-server` and runs it as the locked VesselStack user.
 `SIGNALK_MODE=existing` never modifies SignalK. The managed modes use the same
 first-run admin onboarding at `http://HOST:3000`.
+
+Managed Docker and native installs preload the pinned, zero-runtime-dependency
+`signalk-vesseltwin` 0.2.1 package before SignalK starts. The archive is
+integrity-checked before publication; an existing plugin directory is preserved
+and never overwritten. Preloading is separate from plugin enablement, pairing,
+and reading switches, which remain explicit owner actions.
 
 When AIS is enabled, AIS-catcher exposes its viewer on port `8100` and an NMEA
 TCP feed on port `5011`. Add a SignalK NMEA 0183 TCP client connection to

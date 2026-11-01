@@ -100,6 +100,7 @@ FIELDS = [
     field("SIGNALK_MODE", "SignalK mode", "SignalK", kind="select", choices=["existing", "docker", "native"]),
     field("SIGNALK_VERSION", "SignalK version", "SignalK"),
     field("SIGNALK_URL", "SignalK URL", "SignalK", kind="url"),
+    field("SIGNALK_VESSELTWIN_PRELOAD", "Preload VesselTwin plugin", "SignalK", kind="boolean", description="Managed Docker/native modes install the pinned signalk-vesseltwin plugin before SignalK starts. Existing mode is never modified; false skips installation and never uninstalls."),
     field("SOCKETCAN_ENABLE", "Enable SocketCAN", "SignalK", kind="boolean"),
     field("SOCKETCAN_INTERFACE", "CAN interface", "SignalK"),
     field("SOCKETCAN_BITRATE", "CAN bitrate", "SignalK", kind="number"),
