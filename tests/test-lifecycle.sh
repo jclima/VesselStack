@@ -307,6 +307,60 @@ done
 # /mnt and /media destinations must be mounted unless explicitly overridden.
 unmounted=/mnt/vesselstack-lifecycle-test
 trap 'rm -rf -- "$TEST_ROOT" "$unmounted"' EXIT
+
+# The browser/update path uses the strict flag even when the general backup
+# configuration permits unmounted destinations.  It must reject before any
+# stack stop or archive creation, and the compatibility override must not
+# weaken the strict flag.
+strict_unmounted=/mnt/vesselstack-lifecycle-require-mounted
+strict_calls="$TEST_ROOT/strict-backup-calls.log"
+strict_config="$TEST_ROOT/vesselstack.env.before-strict-backup"
+cp -p "$APP_ROOT/config/vesselstack.env" "$strict_config"
+printf 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true\n' >> "$APP_ROOT/config/vesselstack.env"
+: > "$strict_calls"
+export FAKE_CALL_LOG="$strict_calls"
+strict_before=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+if run_ctl backup --require-mounted "$strict_unmounted/backups" >/dev/null 2>&1; then
+    echo 'Backup --require-mounted accepted an unmounted destination despite configuration override' >&2
+    exit 1
+fi
+test ! -e "$strict_unmounted"
+test "$(sha256sum "$APP_ROOT/config/vesselstack.env")" = "$strict_before"
+test ! -s "$strict_calls"
+if run_ctl backup --require-mounted --allow-unmounted "$strict_unmounted/backups" >/dev/null 2>&1; then
+    echo 'Backup --require-mounted --allow-unmounted weakened the strict mount policy' >&2
+    exit 1
+fi
+test ! -e "$strict_unmounted"
+test ! -s "$strict_calls"
+
+invalid_strict=/var/backups/vesselstack-lifecycle-require-mounted
+if run_ctl backup --require-mounted "$invalid_strict" >/dev/null 2>&1; then
+    echo 'Backup --require-mounted accepted a non-mounted /var/backups destination' >&2
+    exit 1
+fi
+test ! -e "$invalid_strict"
+test ! -s "$strict_calls"
+
+# Canonicalize the CLI destination before mount checks or directory creation:
+# traversal and a controlled symlink escape must not be accepted by a fake
+# mountpoint or leave a destination behind.
+raw_escape=/mnt/vesselstack-lifecycle-require-mounted/../../var/backups/vesselstack-raw-escape
+if run_ctl backup --require-mounted "$raw_escape" >/dev/null 2>&1; then
+    echo 'Backup accepted a canonical path traversal destination' >&2
+    exit 1
+fi
+test ! -e /var/backups/vesselstack-raw-escape
+link_parent="$TEST_ROOT/controlled-backup-link"
+ln -s "$BACKUP_ROOT" "$link_parent"
+if run_ctl backup --require-mounted "$link_parent/escape" >/dev/null 2>&1; then
+    echo 'Backup accepted a controlled symlink destination escape' >&2
+    exit 1
+fi
+test ! -e "$BACKUP_ROOT/escape"
+cp -p "$strict_config" "$APP_ROOT/config/vesselstack.env"
+unset FAKE_CALL_LOG
+
 if run_ctl backup "$unmounted/backups" >/dev/null 2>&1; then
     echo 'Backup wrote to an unmounted /mnt destination' >&2
     exit 1

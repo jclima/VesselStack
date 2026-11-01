@@ -16,6 +16,9 @@ SPEC = importlib.util.spec_from_file_location("vesselstack_control_panel", ROOT 
 assert SPEC and SPEC.loader
 panel = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(panel)
+# Keep the durable lifecycle lock inside the test fixture rather than the
+# privileged production default. Individual tests still patch their env files.
+panel.ROOT = Path(tempfile.mkdtemp(prefix="vesselstack-panel-test-"))
 
 
 class EnvironmentFileTests(unittest.TestCase):

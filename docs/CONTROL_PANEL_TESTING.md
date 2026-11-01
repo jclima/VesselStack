@@ -1,6 +1,6 @@
 # Control Panel component lifecycle lab test
 
-This is the release 0.5.3 lab recipe. It is a bounded acceptance test, not
+This is the release 0.5.4 lab recipe. It is a bounded acceptance test, not
 evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
@@ -8,11 +8,11 @@ positions, MMSIs, tokens, logs, and backups out of this repository.
 ## Fetch and verify the pinned prerelease
 
 Download the pinned bootstrap and the CI-generated checksum from the same
-`v0.5.3` GitHub prerelease. Verify before reading or running it:
+`v0.5.4` GitHub prerelease. Verify before reading or running it:
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.4/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.4/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
@@ -21,6 +21,38 @@ sudo bash get-vesselstack.sh --help
 The release is an annotated unsigned lab tag, not a signed stable release. The
 checksum catches a corrupt or truncated asset; it does not replace review of
 the release provenance.
+
+## Exercise the browser updater
+
+Open the authenticated panel and use **Check for updates**. Confirm the catalog
+is `jclima/VesselStack`, stable releases are the default, and **Include lab
+prereleases** is opt-in. Select `0.5.4`, review its notes, and verify that the
+panel offers **Back up & install** rather than an arbitrary URL/path field.
+Mount the configured external backup device first. Confirm the backup path is
+shown before confirmation and that the operation log records download,
+SHA-256 verification, safe extraction, preflight, backup verification, install,
+detached updater restart of the Control Panel, reconnect, and final version/boot
+verification.
+
+Acceptance cases:
+
+- With the backup path unmounted, `--require-mounted` must refuse the update
+  even if `ALLOW_UNMOUNTED=true`; no install may start. The failure keeps the
+  path and recovery help visible.
+- Use a checksum-mismatch fixture and an unsafe-archive fixture; both must stop
+  before preflight/install. Do not weaken the live release checksum check or
+  hack the production endpoint.
+- Refresh during an in-progress operation and reconnect the browser. Status and
+  the bounded log must be durable; the authenticated token must remain valid
+  without a second login.
+- Complete one successful update and confirm the Control Panel comes back on the
+  new version/boot and the same token. If the listen host or port changes,
+  confirm the old tab cannot reconnect and the UI opens the new URL with that
+  session's token.
+- Use the standalone **Restart Control Panel** button and confirm the panel
+  restarts independently; unrelated service bindings remain unchanged.
+- Confirm failed-backup help names `vesselstackctl verify-backup` and
+  `vesselstackctl restore`; the UI makes no automatic-rollback promise.
 
 ## Install and check the backup mount guard
 

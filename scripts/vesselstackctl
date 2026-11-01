@@ -45,7 +45,7 @@ Commands:
   restart                      Restart the stack
   component add ID             Enable one core component and start it
   component remove ID          Disable one core component and remove its container (data preserved)
-  backup [--allow-unmounted] [DIRECTORY]
+  backup [--require-mounted] [--allow-unmounted] [DIRECTORY]
                                Create a checksummed, consistent backup (stops the
                                whole stack briefly). Refuses /media and /mnt
                                destinations that are not mounted unless
@@ -1438,9 +1438,10 @@ check_backup_destination() {
 }
 
 backup_stack() {
-    local allow_unmounted=0 destination=''
+    local allow_unmounted=0 require_mounted=0 destination=''
     while [ $# -gt 0 ]; do
         case "$1" in
+            --require-mounted) require_mounted=1 ;;
             --allow-unmounted) allow_unmounted=1 ;;
             -*) echo "Unknown backup option: $1" >&2; exit 2 ;;
             *) [ -z "$destination" ] || { echo "backup takes at most one directory" >&2; exit 2; }
@@ -1449,6 +1450,21 @@ backup_stack() {
         shift
     done
     destination=${destination:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
+    destination=$(python3 - "$destination" <<'PY'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY
+)
+    if [ "$require_mounted" -eq 1 ]; then
+        allow_unmounted=0
+        case "$destination" in
+            /media/*|/mnt/*)
+                mount_dir=$(printf '%s' "$destination" | cut -d/ -f1-3)
+                mountpoint -q "$mount_dir" || { echo "Refusing backup: destination is not mounted: $mount_dir" >&2; exit 1; }
+                ;;
+            *) echo "Refusing backup: --require-mounted requires a /media or /mnt destination" >&2; exit 1 ;;
+        esac
+    fi
     local stamp archive manifest was_active=0
     local -a extras
     python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$destination" <<'PY'
@@ -1484,6 +1500,7 @@ PY
         --exclude="${VESSELSTACK_ROOT#/}/displays/.venv" \
         --exclude="${VESSELSTACK_ROOT#/}/displays/__pycache__" \
         --exclude="${VESSELSTACK_ROOT#/}/build" \
+        --exclude="${VESSELSTACK_ROOT#/}/var/lib/vesselstack" \
         --transform 's,^,vesselstack-backup/,' \
         "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "${extras[@]}"
     sha256sum "$archive" > "$manifest"

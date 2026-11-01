@@ -110,6 +110,52 @@ Keep the generated credentials per host, schedule backups to a separate device,
 and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
+### Update from the Control Panel (0.5.4 lab release)
+
+An authenticated Control Panel session can check releases from the public
+`jclima/VesselStack` repository. Stable releases are shown by default; enable
+**Include lab prereleases** to make an annotated lab release such as `0.5.4`
+selectable. The panel shows the installed/running version, release channel,
+release notes, and a link to the release; it does not display a checksum value.
+It accepts no arbitrary URL or filesystem path and does
+not let the browser override the backup destination.
+
+Before an update, mount the configured external backup device under `/media` or
+`/mnt` and confirm the displayed path is the one you intend. The panel's **Back
+up & install** flow
+asks for confirmation, verifies the downloaded SHA-256 manifest, safely extracts
+the release, runs preflight, then makes and verifies the backup. A failed or
+unmounted backup stops the update; the backup path and bounded operation log
+remain available for recovery. There is no automatic rollback promise: use the
+explicit CLI `vesselstackctl verify-backup` and `vesselstackctl restore` path in
+the deployment guide when recovery is needed. `--require-mounted` defeats
+`ALLOW_UNMOUNTED` for this flow.
+
+The update runs in a detached updater, restarts the Control Panel, and verifies
+the new version and boot, then reconnects and confirms the same authenticated
+session token before reporting success. Status survives refresh and reconnect.
+Settings also has a standalone **Restart Control Panel** button; common settings
+changes no longer require a shell. If the panel host or port changes, the old
+tab cannot reconnect automatically; the UI opens the new URL and retains the
+token for that session. The reviewed source-path update remains an advanced
+option. The panel uses ordinary HTTP;
+release checksums provide corruption detection, not signed provenance, and the
+0.5.4 lab tag is explicitly unsigned and not latest.
+
+The first upgrade from `0.5.3` must use the CLI installer/update once to obtain
+the browser updater. Later releases can be installed through the Control Panel.
+The panel serializes its own update/configuration/component operations, but
+unrelated CLI commands are separate maintenance actions and are not globally
+serialized by the panel; do not run them concurrently with an update.
+
+The strict backup flag requires a mounted external destination under `/media`
+or `/mnt`; browser input cannot override that destination. The transient
+updater job, status, and staging files under `/var/lib/vesselstack` are
+intentionally excluded from backups; user configuration and data are backed up.
+If an update fails, the verified pre-update backup is kept for explicit
+`vesselstackctl verify-backup`/`restore` recovery. The browser does not promise
+automatic restoration.
+
 ## Find your next answer
 
 The [documentation index](docs/README.md) maps common tasks to the right guide,
@@ -254,9 +300,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.3 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.3
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.4/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.4 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.4
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -444,7 +490,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.3
+git checkout v0.5.4
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -582,12 +628,12 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-For the pinned 0.5.3 lab prerelease, use its annotated unsigned tag (it is not
+For the pinned 0.5.4 lab prerelease, use its annotated unsigned tag (it is not
 the latest release):
 
 ```bash
 git fetch --tags
-git checkout v0.5.3
+git checkout v0.5.4
 ```
 
 This lab prerelease is for authorized lab use only; it is unsigned, not latest,

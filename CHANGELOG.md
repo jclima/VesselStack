@@ -3,6 +3,27 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.4 - 2026-10-31
+
+- Lab prerelease: the authenticated Control Panel can check the public
+  `jclima/VesselStack` releases API, choose a stable release (or explicitly
+  include lab prereleases), and perform a guarded update. The flow downloads
+  the release assets and SHA-256 manifest, safely extracts them, runs preflight,
+  creates and verifies a mounted external backup, installs only after the
+  backup succeeds, then uses a detached updater to restart the Control Panel and verifies the
+  new version, boot, reconnect, and retained session token before reporting
+  success. Progress is durable across refresh and reconnect and the log is
+  bounded.
+- Settings now has a standalone **Restart Control Panel** action. Common
+  configuration changes no longer require a shell; a changed listen address
+  opens the new panel URL. The manual reviewed-path update remains available as
+  an advanced option.
+- Release status: annotated unsigned tag `v0.5.4`, authorized for lab use and
+  not latest. CI asset checksums must be verified before publishing; physical
+  Raspberry Pi testing remains pending. This is not a stable promotion or a
+  cryptographically signed release. `v0.5.3` remains the historical lab
+  baseline and `v0.4.4` remains latest stable.
+
 ## 0.5.3 - 2026-10-31
 
 - Lab prerelease: make headless Raspberry Pi setup and Control Panel access
