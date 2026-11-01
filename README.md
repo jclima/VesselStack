@@ -85,6 +85,7 @@ leave integrations degraded until it is added again, but does not auto-configure
 or delete unrelated services. Hardware and systemd services remain
 configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
 for the release acceptance recipe.
+On Linux, keep temporary test roots protected with `trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX"); TMPDIR="$trusted_test_tmp" python3 -m unittest discover -s tests -p 'test_*.py'` and remove the directory afterward.
 
 ### Optional VesselTwin connection
 

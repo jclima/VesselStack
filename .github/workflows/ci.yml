@@ -41,7 +41,10 @@ jobs:
       - name: Public-source privacy check
         run: python3 scripts/check-public-tree.py
       - name: Static distribution checks
-        run: tests/test-distribution.sh
+        run: |
+          trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX")
+          trap 'rm -rf -- "$trusted_test_tmp"' EXIT
+          TMPDIR="$trusted_test_tmp" tests/test-distribution.sh
       - name: Lifecycle backup and restore checks
         run: sudo tests/test-lifecycle.sh
       - name: Versioned migration checks
@@ -65,7 +68,10 @@ jobs:
       - name: Validate Linux ARM64 image manifests
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+        run: |
+          trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX")
+          trap 'rm -rf -- "$trusted_test_tmp"' EXIT
+          TMPDIR="$trusted_test_tmp" python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Run control panel UI regression checks
         run: node tests/test_control_panel_ui.cjs
       - name: Build and verify release archive
