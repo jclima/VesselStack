@@ -1,11 +1,38 @@
 # VesselStack
 
-![VesselStack architecture](docs/images/vesselstack-hero.svg)
+![VesselStack banner](brand/github-banner.png)
 
 VesselStack is a private, self-hosted companion for your boat. It keeps useful
 boat data, dashboards, automation, and diagnostics together on a Raspberry Pi
 you control—at home, in the lab, or aboard. It is designed to keep working on
 the boat's local network when the internet is unavailable.
+
+## Brand and appearance
+
+The Control Panel, Boat Chat, and setup wizard share the VesselStack chart-room
+palette: a light blue-gray canvas, white panels, navy ink, teal actions, and
+restrained status colors. Boat Chat also preserves a coherent dark appearance
+for operating-system dark mode. Local icons are bundled with each surface; no
+external font or asset host is needed, so all three remain usable offline with
+system font fallbacks. Keyboard focus remains visible, controls meet mobile
+touch-target sizing, and reduced-motion preferences are respected.
+
+Canonical icon, wordmark, banner, palette, and social-upload limitations live
+in [`brand/README.md`](brand/README.md). The canonical Rising Decks icon uses a
+wide white hull below two ascending teal decks on a navy rounded square.
+
+Run these checks to verify the change:
+
+```bash
+bash tests/test-build-package.sh
+python3 -m unittest discover -s tests -p 'test_control_panel.py'
+```
+
+The
+release package is built from committed files, so uncommitted presentation
+edits are intentionally excluded until reviewed and committed. Roll back the
+presentation by restoring the previous release package; runtime configuration
+and vessel data are unaffected.
 
 ## What you get
 
@@ -21,6 +48,8 @@ navigation, collision avoidance, engine control, or a sole alarm system.
 ![VesselStack local data flow](docs/images/vesselstack-map.svg)
 
 ### What runs locally
+
+![VesselStack architecture](docs/images/vesselstack-hero.svg)
 
 | Purpose | Local service or view | Typical use |
 |---|---|---|
@@ -254,9 +283,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.3/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.3 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.3
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.4/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.4 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.4
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -444,7 +473,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.3
+git checkout v0.5.4
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -582,12 +611,12 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-For the pinned 0.5.3 lab prerelease, use its annotated unsigned tag (it is not
+For the pinned 0.5.4 lab prerelease, use its annotated unsigned tag (it is not
 the latest release):
 
 ```bash
 git fetch --tags
-git checkout v0.5.3
+git checkout v0.5.4
 ```
 
 This lab prerelease is for authorized lab use only; it is unsigned, not latest,

@@ -3,6 +3,17 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.4 - 2026-10-31
+
+- Lab prerelease: align the VesselStack application and repository surfaces with
+  the VesselTwin owner-first brand, including the selected Rising Decks identity
+  and offline-safe assets. The headless Control Panel access improvements and
+  retained MQTT state fixes from 0.5.3 and 0.5.2 remain included.
+- Release status: annotated unsigned tag `v0.5.4`, authorized for lab use and
+  not latest. CI-generated asset checksums must be verified before publishing;
+  physical Raspberry Pi tests remain pending. This is not a stable promotion or
+  a cryptographically signed release.
+
 ## 0.5.3 - 2026-10-31
 
 - Lab prerelease: make headless Raspberry Pi setup and Control Panel access
