@@ -1,7 +1,7 @@
 # Getting started
 
-This is the owner-friendly starting point for an existing Raspberry Pi or a
-new build. For a complete hardware-to-commissioning run, use
+Start here to set up VesselStack on an existing Raspberry Pi or a new build.
+For a complete hardware-to-commissioning run, use
 [INSTALLATION.md](INSTALLATION.md).
 
 ## Before you begin
@@ -42,6 +42,11 @@ installer. `-t` gives the session a terminal so the installer can ask questions:
 ssh -t YOUR_USER@raspberrypi.local
 curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
 ```
+
+The `latest/download` URL follows the latest stable release. The lab prerelease
+`v0.5.6` is not selected by that URL; use its explicit pinned URL or
+`--version 0.5.6` only when following the lab and offline-release instructions
+in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 The script checks the host first. It asks before installing missing Debian
 packages or Docker Engine and Compose v2 from Docker's official apt repository,
@@ -108,6 +113,18 @@ for the local Signal K/history/dashboard stack once its images and packages
 are present. It may still be required by an explicitly selected remote Boat
 Chat provider or another separately configured integration.
 
+For a fresh offline managed Docker install, the default
+`SIGNALK_VESSELTWIN_PRELOAD=true` requires a valid existing plugin to be
+installed while online. If the plugin is absent, set
+`SIGNALK_VESSELTWIN_PRELOAD=false` in the carried configuration before
+installing offline; you can preload it later while online, and enabling,
+pairing, and readings remain separate owner choices. Native SignalK is
+unsupported offline. If `DISPLAYS_ENABLE=true`, provision the displays bridge
+virtual environment on that Pi while it is online, or set
+`DISPLAYS_ENABLE=false`. See the
+[offline deployment path](DEPLOYMENT.md#simple-path-one-command) for the bundle
+and verification details.
+
 ## Keep data private
 
 VesselStack is local-first but not automatically isolated from every network:
@@ -117,9 +134,9 @@ publish vessel positions, MMSIs, call signs, device identifiers, telemetry
 databases, backups, logs, or environment files.
 
 An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
-and explicit reading opt-ins. Managed Docker/native SignalK preloads the pinned
-plugin by default;
-VesselStack does not enable, pair, or authorize readings for you. Consult the
+and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
+pinned plugin package by default; that preload does not enable the plugin, pair
+the account, or authorize readings. Consult the
 [VesselTwin integration guide](VESSELTWIN.md)
 and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals and service
 records.

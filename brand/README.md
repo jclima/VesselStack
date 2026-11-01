@@ -19,4 +19,4 @@ Mono for data when those fonts are installed; every surface has system fallbacks
 and ships without external font requests for offline use.
 
 These are source and rendered assets for documentation and review. Uploading the
-GitHub banner is a manual GitHub setting change and is not performed by this PR.
+GitHub banner remains a manual GitHub setting change outside this asset inventory.

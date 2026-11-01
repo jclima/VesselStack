@@ -55,20 +55,22 @@ sudo apt-get update
 # optional, deletes ALL images, containers and volumes: sudo rm -rf /var/lib/docker /var/lib/containerd
 ```
 
-Once the hardware is assembled, the operating system is installed (section 3) and
-`can0` works if you use NMEA 2000 (section 4), SSH into the Raspberry Pi from your laptop
-(`ssh -t YOUR_USER@raspberrypi.local`; the `-t` lets the installer ask its questions), paste
-this one line and answer the questions in the same terminal. The Pi needs no screen,
-keyboard or browser, and nothing has to be opened or tunnelled:
+Once the hardware is assembled, the operating system is installed (section 3),
+and `can0` works if you use NMEA 2000 (section 4), SSH into the Raspberry Pi
+from your laptop (`ssh -t YOUR_USER@raspberrypi.local`; `-t` lets the installer
+ask its questions). Paste this one line and answer the questions in the same
+terminal. The Pi needs no screen, keyboard, or browser, and nothing has to be
+opened or tunnelled:
 
 ```bash
 curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
 ```
 
-The terminal questions come in short sections (boat, Signal K, NMEA 2000 / CAN, AIS, Home
-Assistant and Boat Chat, firewall, retention, network addresses). Each has a plain-language
-explanation and a default in `[brackets]`: Enter accepts it, `?` explains, `b` goes back one
-question, and a review screen (never showing secrets) lets you save, edit a section or quit.
+The terminal questions come in short sections (boat, Signal K, NMEA 2000 / CAN,
+AIS, Home Assistant and Boat Chat, firewall, retention, and network addresses).
+Each has a plain-language explanation and a default in `[brackets]`: Enter
+accepts it, `?` explains, and `b` goes back one question. A review screen (never
+showing secrets) lets you save, edit a section, or quit.
 Passwords and tokens are generated for you; MMSI, call sign and boat size are optional and
 stay on the Pi. A short example:
 
@@ -84,9 +86,9 @@ stay on the Pi. A short example:
   Install and start VesselStack now? [Y/n]:
 ```
 
-At the end the installer prints, as plain text for information, the service addresses to use
-from another computer (Grafana, Home Assistant, Boat Chat), the command that shows the Boat
-Chat access token and the SSH tunnel hint for the control panel
+At the end, the installer prints the service addresses to use from another
+computer (Grafana, Home Assistant, and Boat Chat), the command that shows the
+Boat Chat access token, and the SSH tunnel hint for the control panel
 (`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
 
 The administration panel remains loopback-only unless explicitly changed. To
@@ -348,11 +350,11 @@ directory `<data>/signalk` is owned by root instead of uid/gid 1000 (the `node`
 user in the SignalK image). Release 0.4.3 and later create and repair it on every
 installer run (an empty or `root:root` directory only; a populated directory with symlinks,
 hard links, special files or another owner is left untouched with instructions), and
-`sudo vesselstackctl doctor` reports it. Manual fix:
-
-```bash
-sudo chown -R 1000:1000 /opt/vesselstack-data/signalk && sudo docker restart vesselstack-signalk
-```
+`sudo vesselstackctl doctor` reports it. Start with the read-only doctor output
+and inspect the exact configured SignalK data directory and ownership. Resolve
+the indicated cause, then rerun the supported installer repair. Do not
+blanket-chown the SignalK tree or restart the container while ownership and
+symlink state are still unknown.
 
 ## Rollback and recovery
 

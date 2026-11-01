@@ -1,18 +1,23 @@
-# Power And Solar Monitoring
+# Power and solar monitoring
 
-## Current Coverage
+## Current coverage
 
-The boat currently exposes one Victron SmartShunt through the SignalK
-`signalk-victron-ble` plugin. It measures whole-house-bank voltage, current,
-power, state of charge, discharge since full, and time remaining. There is no
-dedicated solar-controller, PV, charger-output, or AC shore-power measurement
-in SignalK or Home Assistant.
+The reference configuration described here exposes one Victron SmartShunt
+through the SignalK `signalk-victron-ble` plugin. It measures whole-house-bank
+voltage, current, power, state of charge, discharge since full, and time
+remaining. Your installation may expose different instruments or paths; verify
+the actual SignalK and Home Assistant entities before interpreting the examples.
+In the reference configuration there is no dedicated solar-controller, PV,
+charger-output, or AC shore-power measurement.
 
-Home Assistant's `binary_sensor.shore_power_connected` is not a physical
-shore-input sensor. It is a delayed charging proxy derived from SmartShunt
-voltage and current, so sufficient solar charging can turn it on.
+In the reference configuration, Home Assistant's
+`binary_sensor.shore_power_connected` is not a physical shore-input sensor. It
+is a delayed charging proxy derived from SmartShunt voltage and current, so
+sufficient solar charging can turn it on. Confirm whether your installation
+uses the same proxy or has a physical shore-input sensor.
 
-Boat Chat records a sample every five minutes in
+When the reference SmartShunt signals are configured, Boat Chat records a
+sample every five minutes in
 `$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`. It attributes positive SmartShunt power
 to `inferred net solar or another uninstrumented source` only when:
 
@@ -27,7 +32,7 @@ is net energy at the battery after onboard loads, not gross panel production.
 The database is ignored by Git, retained for 400 days, and included in the
 normal VesselStack backup.
 
-## Best Upgrade Order
+## Best upgrade order
 
 1. Identify the existing solar charge controller.
 
@@ -35,11 +40,13 @@ normal VesselStack backup.
    `Voc` and `Isc`, battery chemistry, and controller-to-battery wiring. Do not
    select a replacement MPPT from panel wattage alone.
 
-2. Connect an existing compatible controller before replacing it.
+2. Connect an existing compatible controller before replacing it, if your
+   installation has one.
 
-   The installed SignalK `signalk-victron-ble` plugin supports Victron
-   SmartSolar and BlueSolar MPPT controllers. For SmartSolar, add its Bluetooth
-   MAC address and Victron advertisement key as another plugin device. For a
+   If you use the SignalK `signalk-victron-ble` plugin, verify that its current
+   version supports the controller. For a supported Victron SmartSolar MPPT
+   controller, add its Bluetooth MAC address and Victron advertisement key as
+   another plugin device. For a
    compatible controller with VE.Direct, a VE.Direct-to-USB interface to the
    Raspberry Pi is another local option. Never commit the advertisement key.
 
@@ -49,13 +56,15 @@ normal VesselStack backup.
    - `electrical.solar.<id>.loadCurrent`
    - `electrical.solar.<id>.yieldToday`
 
-3. If the existing controller has no data interface, use a correctly sized
-   Victron SmartSolar MPPT.
+3. If the existing controller has no data interface, have a qualified marine
+   installer select a correctly sized controller for the actual array and
+   battery system.
 
    SmartSolar provides direct PV power, battery charge current, charge stage,
-   daily yield, peak PV power, and retained history. Size it from the array's
-   cold-weather open-circuit voltage and maximum current, then select the
-   correct AGM charging profile.
+   daily yield, peak PV power, and retained history. Size any replacement from
+   the array's cold-weather open-circuit voltage and maximum current, then use
+   the charging profile specified for the actual battery chemistry by its
+   manufacturer. Do not assume AGM.
 
 4. Add branch monitoring for appliance attribution.
 
@@ -77,7 +86,7 @@ normal VesselStack backup.
    shore-versus-solar attribution reliable at the dock. AC work should be
    performed by a qualified marine electrician.
 
-## Decision Metrics
+## Decision metrics
 
 Collect at least two to four representative weeks with some shore-power-off
 days before deciding about the panel. Compare:
@@ -87,7 +96,7 @@ days before deciding about the panel. Compare:
 - Overnight and baseline DC consumption.
 - Refrigerator, electronics, lighting, and pump Wh per day.
 - Battery SOC at sunset, before sunrise, and after solar recovery.
-- Time below the desired AGM SOC floor.
+- Time below the desired SOC floor for the installed battery chemistry.
 - Days when the controller clips at its rated output.
 - Solar yield versus the panel's weight, roof area, shading, wiring losses, and
   maintenance burden.
@@ -96,7 +105,7 @@ Keep the panel when its representative daily yield materially offsets the
 boat's unattended and cruising loads or prevents damaging battery discharge.
 Panel usefulness cannot be judged from peak watts alone.
 
-## Reference Documentation
+## Reference documentation
 
 - Victron SmartSolar MPPT:
   <https://www.victronenergy.com/solar-charge-controllers/smartsolar-mppt-75-10-75-15-100-15-100-20>

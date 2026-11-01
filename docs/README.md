@@ -22,6 +22,8 @@ Boat Chat provider that sends data elsewhere.
 | Stage releases in a home lab | [Deployment](DEPLOYMENT.md) |
 | Carry an update to an offline boat | [Deployment: offline path](DEPLOYMENT.md#simple-path-one-command) |
 | Understand every setting and command | [README reference](../README.md#quick-start-one-command-on-the-raspberry-pi) |
+| Configure Boat Chat providers and units | [Boat Chat setup](../boat-chat/README.md) |
+| Review power sources and instrument-reading coverage | [Power monitoring](../boat-chat/POWER_MONITORING.md) |
 | Connect selected readings to VesselTwin | [Optional VesselTwin connection](VESSELTWIN.md) |
 | Develop, test, or cut a release | [Development](DEVELOPMENT.md) |
 | Fix an unhealthy service | [README troubleshooting](../README.md#troubleshooting) and [Installation troubleshooting](INSTALLATION.md#troubleshooting-boat-chat-not-ready-memory-index-empty) |

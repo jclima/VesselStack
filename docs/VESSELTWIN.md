@@ -1,9 +1,9 @@
 # Optional VesselTwin connection
 
 VesselStack is the onboard system for monitoring, automation, local history, and
-Boat Chat. VesselTwin is a separate, private place for maintenance documents,
-equipment, and logbook records. Managed SignalK installs can preload the
-separate VesselTwin Signal K plugin, but the connection remains opt-in.
+Boat Chat. VesselTwin is a separate service for maintenance documents, equipment,
+and logbook records. Managed SignalK installs can preload the separate VesselTwin
+Signal K plugin, but the connection remains opt-in.
 
 If you choose to connect them, the supported path is the separate
 [VesselTwin Signal K plugin](https://github.com/jclima/signalk-vesseltwin). It
@@ -13,10 +13,11 @@ account. Pairing is optional, and pairing by itself does not send readings.
 ## Before you install anything
 
 Managed Docker and native installs preload the pinned `signalk-vesseltwin`
-0.2.1 package by default. This does not enable, pair, or send readings.
-Existing mode is untouched; `SIGNALK_VESSELTWIN_PRELOAD=false` skips without
-uninstalling. Offline Docker installs reuse a valid existing plugin; if preload
-is enabled and it is missing, preflight fails before mutation. Native SignalK is
+0.2.1 package by default. Preloading the package does not enable the plugin,
+pair the account, or send readings. Existing mode is untouched;
+`SIGNALK_VESSELTWIN_PRELOAD=false` skips future preloads without uninstalling.
+Offline Docker installs reuse a valid existing plugin; if preload is enabled and
+the plugin is missing, preflight fails before mutation. Native SignalK is
 unsupported offline. Disable the plugin itself separately in SignalK's Plugin
 Config UI.
 
