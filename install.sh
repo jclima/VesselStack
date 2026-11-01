@@ -710,6 +710,10 @@ if systemctl is-active --quiet vesselstack-telemetry-sample.timer; then telemetr
 if systemctl is-active --quiet vesselstack-telemetry-indexer.timer; then telemetry_indexer_was_active=1; fi
 restore_telemetry_on_exit() {
     local rc=$?
+    if ! rm -rf -- "$STAGING_DIR" ${PLUGIN_STAGE:+"$PLUGIN_STAGE"}; then
+        echo "Installer staging cleanup failed" >&2
+        if [ "$rc" -eq 0 ]; then rc=1; fi
+    fi
     if [ "$rc" -ne 0 ] || [ "$START" -eq 0 ]; then
         if [ "$telemetry_sample_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-sample.timer 2>/dev/null || true; fi
         if [ "$telemetry_indexer_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-indexer.timer 2>/dev/null || true; fi

@@ -3472,6 +3472,9 @@ tests/compile-display-firmware.sh       # optional, not in CI: full "esphome com
 tests/test-build-package.sh
 tests/test-socketcan.sh
 sudo tests/test-offline-install.sh
+
+This root-controlled offline regression also verifies failed staging cleanup while
+telemetry scheduler recovery remains active.
 sudo tests/test-update-launcher.sh
 sudo tests/test-get-vesselstack.sh
 docker compose --env-file vesselstack.example.env \
