@@ -361,10 +361,11 @@ if tail -n 1 "$TEST_ROOT/pip.log" | grep -q -- '--no-index'; then fail "online i
 BUNDLE="$TEST_ROOT/bundle"
 env PATH="$FAKE_BIN:$PATH" "$RELEASE/scripts/prepare-offline-bundle.sh" --output "$BUNDLE" >/dev/null
 ls "$BUNDLE"/wheelhouse/*.whl >/dev/null
-test "$(find "$BUNDLE/images" -type f | wc -l)" -eq 8 || fail "expected one tarball per image (8)"
+test "$(find "$BUNDLE/images" -type f | wc -l)" -eq 9 || fail "expected one tarball per image (9)"
 grep -qx "release=$VERSION" "$BUNDLE/BUNDLE_INFO"
 grep -qx 'image=eclipse-mosquitto:2.1.2-alpine' "$BUNDLE/BUNDLE_INFO"
 grep -qx 'image=cr.signalk.io/signalk/signalk-server:v2.27.0' "$BUNDLE/BUNDLE_INFO"
+grep -qx 'image=quay.io/prometheus/node-exporter:v1.10.2' "$BUNDLE/BUNDLE_INFO"
 grep -q 'sqlite_vec' "$BUNDLE/MANIFEST.sha256"
 grep -q 'pip -m pip download .*--require-hashes --only-binary=:all: --python-version 3.11 --implementation cp --platform manylinux2014_aarch64' "$TEST_ROOT/pip.log" || fail "pip download platform args missing"
 grep -q -- 'pull --platform linux/arm64 influxdb:2.9.1' "$TEST_ROOT/docker.log"

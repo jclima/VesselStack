@@ -3229,6 +3229,8 @@ and no source distribution is ever built), a `docker save` tarball for every
 image in `templates/compose.yml` (all profiles; this includes the Mosquitto image that also hashes the broker passwords),
 `BUNDLE_INFO` (release, platform, image list, `lock_sha256`) and
 `MANIFEST.sha256`. It holds no configuration, credentials or vessel data.
+The all-profile image list includes the optional pinned node-exporter image;
+offline installation requires it only when `NODE_EXPORTER_ENABLE=true`.
 
 Before installing or loading anything, `--verify DIR`, `--load DIR` and
 `install.sh --offline` refuse the bundle unless: the manifest lists exactly the
