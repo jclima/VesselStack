@@ -173,9 +173,9 @@ option. The panel uses ordinary HTTP;
 release checksums provide corruption detection, not signed provenance, and the
 0.5.6 lab tag is explicitly unsigned and not latest.
 
-The first upgrade from `0.5.4` or earlier must use the CLI installer/update once
-to obtain the browser updater for `0.5.6`. Later releases can be installed
-through the Control Panel.
+The browser updater was introduced in `0.5.5`. Installations on `0.5.4` or
+earlier must use the CLI installer/update once; installations on `0.5.5` can
+upgrade to `0.5.6` through the Control Panel with lab prereleases enabled.
 The panel serializes its own update/configuration/component operations, but
 unrelated CLI commands are separate maintenance actions and are not globally
 serialized by the panel; do not run them concurrently with an update.

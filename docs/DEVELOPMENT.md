@@ -71,10 +71,11 @@ Do not build and upload files by hand.
    verified, `/etc/apt/sources.list.d/docker.sources` written, `docker-ce` and
    `docker-compose-plugin` installed, `docker info` answering; check `dpkg --print-architecture`
    says `arm64`), an upgrade from the previous release, and an offline
-   upgrade. The test suites use stubs and cannot cover this. Do not publish before it
-   passes. For the approved `0.5.6` lab prerelease, run the pinned installer and
-   component lifecycle recipe in [CONTROL_PANEL_TESTING.md](CONTROL_PANEL_TESTING.md)
-   on the lab first; this exception does not waive the stable-release gates.
+   upgrade. The test suites use stubs and cannot cover this. For the explicitly
+   authorized `0.5.6` lab prerelease, publication may precede physical-Pi
+   acceptance; record that acceptance is pending. Complete the pinned installer
+   and component lifecycle recipe in [CONTROL_PANEL_TESTING.md](CONTROL_PANEL_TESTING.md)
+   before any stable promotion.
 7. Publish the draft as a **pre-release** (or otherwise not latest) first, so
    `releases/latest/download/` still points at the previous release. Install-test
    through the pinned URL from a scratch directory (never run it piped into root
