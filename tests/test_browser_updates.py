@@ -175,6 +175,32 @@ class BrowserUpdateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 updates.acquire_slot(root)
 
+    def test_inactive_helper_marks_interrupted_state_and_allows_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            updates.write_operation(root, {"id": 9, "state": "running", "phase": "backing-up", "backup_path": "/media/backup.tar.gz", "output": []})
+            inactive = updates.subprocess.CompletedProcess([], 0, stdout="inactive")
+            with mock.patch.object(updates.subprocess, "run", return_value=inactive):
+                fd = updates.acquire_slot(root)
+            try:
+                state = updates.read_operation(root)
+                self.assertEqual(state["state"], "failed")
+                self.assertEqual(state["backup_path"], "/media/backup.tar.gz")
+            finally:
+                updates.release_slot(fd)
+            with mock.patch.object(updates.subprocess, "run", return_value=inactive):
+                retry_fd = updates.acquire_slot(root)
+            updates.release_slot(retry_fd)
+
+    def test_unavailable_helper_keeps_running_state_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            updates.write_operation(root, {"id": 9, "state": "running", "phase": "installing", "output": []})
+            with mock.patch.object(updates.subprocess, "run", side_effect=OSError("systemctl unavailable")):
+                with self.assertRaisesRegex(ValueError, "already running"):
+                    updates.acquire_slot(root)
+            self.assertEqual(updates.read_operation(root)["state"], "running")
+
     def test_safe_extract_rejects_traversal_and_links(self):
         import io, tarfile
         with tempfile.TemporaryDirectory() as directory:

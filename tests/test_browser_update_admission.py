@@ -119,11 +119,12 @@ class Fixture(unittest.TestCase):
         thread.start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-
+        lock_fd = self.panel.start_detached.__globals__["acquire_runner_lock"](self.root)
+        self.addCleanup(self.panel.start_detached.__globals__["release_slot"], lock_fd)
         config_status, config_body = self.request(server, "/api/config", {"settings": {"BOAT_NAME": "No write"}})
         component_status, component_body = self.request(server, "/api/component", {"component": "grafana", "action": "start"})
         update_subprocess = self.panel.start_detached.__globals__["subprocess"]
-        with mock.patch.object(update_subprocess, "run", return_value=update_subprocess.CompletedProcess([], 0, stdout="active")) as run:
+        with mock.patch.object(update_subprocess, "run") as run:
             update_status, update_body = self.request(server, "/api/action", {"action": "update-release", "release_id": 42, "channel": "stable"})
 
         self.assertEqual(config_status, 400)
@@ -132,8 +133,7 @@ class Fixture(unittest.TestCase):
         self.assertIn("already running", str(component_body))
         self.assertEqual(update_status, 400)
         self.assertIn("already running", str(update_body))
-        self.assertTrue(run.called)
-        self.assertTrue(all(call.args[0][:2] == ["systemctl", "is-active"] for call in run.call_args_list))
+        run.assert_not_called()
         self.assertEqual((self.root / "config" / "vesselstack.env").read_bytes(), before)
 
 
