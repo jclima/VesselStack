@@ -1,9 +1,9 @@
 [Unit]
-Description=Refresh VesselStack telemetry memory
+Description=Refresh VesselStack telemetry history
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitInactiveSec=30min
 Persistent=true
 Unit=vesselstack-telemetry-indexer.service
 

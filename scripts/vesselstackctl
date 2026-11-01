@@ -77,6 +77,7 @@ load_config() {
     COMPOSE=(docker compose)
     [ "${SIGNALK_MODE:-existing}" = docker ] && COMPOSE+=(--profile signalk)
     [ "${AIS_ENABLE:-false}" = true ] && COMPOSE+=(--profile ais)
+    [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && COMPOSE+=(--profile metrics)
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
 }
 
@@ -100,6 +101,20 @@ selected_services() {
     done
     [ "${SIGNALK_MODE:-existing}" = docker ] && printf '%s\n' signalk
     [ "${AIS_ENABLE:-false}" = true ] && printf '%s\n' ais-catcher
+    [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && printf '%s\n' node-exporter
+}
+
+sync_prometheus_config() {
+    local source="$VESSELSTACK_ROOT/installer/templates/prometheus.yml"
+    [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && source="$VESSELSTACK_ROOT/installer/templates/prometheus-node-exporter.yml"
+    [ -r "$source" ] || return 0
+    if ! cmp -s "$source" "$VESSELSTACK_ROOT/config/prometheus.yml"; then
+        install -m 0644 "$source" "$VESSELSTACK_ROOT/config/prometheus.yml"
+        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+            *,prometheus,*) ;;
+            *) "${COMPOSE[@]}" up -d --force-recreate prometheus ;;
+        esac
+    fi
 }
 
 persist_disabled_components() {
@@ -201,9 +216,13 @@ start_stack() {
            fi ;;
     esac
     local -a services=()
+    sync_prometheus_config
     while IFS= read -r service; do services+=("$service"); done < <(selected_services)
     if [ "${#services[@]}" -gt 0 ]; then
         "${COMPOSE[@]}" up -d "${services[@]}"
+    fi
+    if [ "${NODE_EXPORTER_ENABLE:-false}" != true ]; then
+        docker compose --env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml" rm --stop --force node-exporter >/dev/null 2>&1 || true
     fi
     # Do not issue a bare `up`, which would recreate intentionally removed core components.
     # A changed compose definition is recreated by "up -d"; a changed Mosquitto
@@ -243,7 +262,7 @@ start_stack() {
         systemctl start vesselstack-chat-telegram.service
     fi
     if [ "${TELEMETRY_INDEXER_ENABLE:-true}" = true ]; then
-        systemctl start vesselstack-telemetry-indexer.timer
+        systemctl start vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer
     fi
     if [ "${DISPLAYS_ENABLE:-false}" = true ]; then
         systemctl start vesselstack-displays-bridge.service
@@ -251,17 +270,35 @@ start_stack() {
     systemctl start vesselstack-control-panel.service
 }
 
-stop_stack() {
-    systemctl stop vesselstack-displays-bridge.service 2>/dev/null || true
-    systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
-    systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
-    systemctl stop vesselstack-chat.service || true
-    if [ "${SIGNALK_MODE:-existing}" = native ]; then
-        systemctl stop vesselstack-signalk.service || true
+stop_unit_if_present() {
+    local unit=$1
+    if systemctl show -p LoadState --value "$unit" 2>/dev/null | grep -qx not-found; then
+        return 0
     fi
-    "${COMPOSE[@]}" down
+    systemctl stop "$unit" || return 1
+}
+
+stop_telemetry() {
+    local unit
+    for unit in vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer; do
+        stop_unit_if_present "$unit" || return 1
+    done
+    for unit in vesselstack-telemetry-sample.service vesselstack-telemetry-indexer.service; do
+        stop_unit_if_present "$unit" || return 1
+    done
+}
+
+stop_stack() {
+    stop_unit_if_present vesselstack-displays-bridge.service || return 1
+    stop_unit_if_present vesselstack-chat-telegram.service || return 1
+    stop_telemetry || return 1
+    stop_unit_if_present vesselstack-chat.service || return 1
+    if [ "${SIGNALK_MODE:-existing}" = native ]; then
+        stop_unit_if_present vesselstack-signalk.service || return 1
+    fi
+    "${COMPOSE[@]}" down || return 1
     if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
-        systemctl stop vesselstack-socketcan.service || true
+        stop_unit_if_present vesselstack-socketcan.service || return 1
     fi
 }
 
@@ -314,12 +351,15 @@ status_stack() {
     services=("${selected[@]}")
     [ "${SIGNALK_MODE:-existing}" = docker ] && services+=(signalk)
     [ "${AIS_ENABLE:-false}" = true ] && services+=(ais-catcher)
+    [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && services+=(node-exporter)
     printf '%-20s %s\n' COMPONENT STATE
     printf '%-20s %s\n' -------------------- --------------------
     status_unit 'Boat Chat service' vesselstack-chat.service || failed=1
     status_unit 'Telegram worker' vesselstack-chat-telegram.service \
         "${TELEGRAM_ENABLE:-false}" || failed=1
     status_unit 'Telemetry indexer' vesselstack-telemetry-indexer.timer \
+        "${TELEMETRY_INDEXER_ENABLE:-true}" || failed=1
+    status_unit 'Telemetry sample' vesselstack-telemetry-sample.timer \
         "${TELEMETRY_INDEXER_ENABLE:-true}" || failed=1
     status_unit 'Displays bridge' vesselstack-displays-bridge.service \
         "${DISPLAYS_ENABLE:-false}" || failed=1
@@ -1465,8 +1505,8 @@ PY
             *) echo "Refusing backup: --require-mounted requires a /media or /mnt destination" >&2; exit 1 ;;
         esac
     fi
-    local stamp archive manifest was_active=0
-    local -a extras
+    local stamp archive manifest sample_timer_active=0 indexer_timer_active=0 chat_active=0 telegram_active=0 displays_active=0 signalk_active=0 socketcan_active=0
+    local -a extras was_compose_services=()
     python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$destination" <<'PY'
 import pathlib
 import sys
@@ -1483,11 +1523,29 @@ PY
     archive="$destination/vesselstack-$stamp.tar.gz"
     manifest="$archive.sha256"
     install -d -m 0700 "$destination"
-    if "${COMPOSE[@]}" ps --status running --quiet | grep -q .; then
-        was_active=1
-    fi
+    mapfile -t was_compose_services < <("${COMPOSE[@]}" ps --status running --services 2>/dev/null || true)
+    if systemctl is-active --quiet vesselstack-chat.service; then chat_active=1; fi
+    if systemctl is-active --quiet vesselstack-chat-telegram.service; then telegram_active=1; fi
+    if systemctl is-active --quiet vesselstack-displays-bridge.service; then displays_active=1; fi
+    if systemctl is-active --quiet vesselstack-signalk.service; then signalk_active=1; fi
+    if systemctl is-active --quiet vesselstack-socketcan.service; then socketcan_active=1; fi
+    if systemctl is-active --quiet vesselstack-telemetry-sample.timer; then sample_timer_active=1; fi
+    if systemctl is-active --quiet vesselstack-telemetry-indexer.timer; then indexer_timer_active=1; fi
     cleanup_backup() {
-        if [ "$was_active" -eq 1 ]; then start_stack; fi
+        local rc=$? recovery_failed=0 service
+        if [ "$socketcan_active" -eq 1 ]; then systemctl start vesselstack-socketcan.service || recovery_failed=1; fi
+        if [ "${#was_compose_services[@]}" -gt 0 ]; then
+            "${COMPOSE[@]}" up -d "${was_compose_services[@]}" || recovery_failed=1
+        fi
+        if [ "$signalk_active" -eq 1 ]; then systemctl start vesselstack-signalk.service || recovery_failed=1; fi
+        if [ "$chat_active" -eq 1 ]; then systemctl start vesselstack-chat.service || recovery_failed=1; fi
+        if [ "$telegram_active" -eq 1 ]; then systemctl start vesselstack-chat-telegram.service || recovery_failed=1; fi
+        if [ "$displays_active" -eq 1 ]; then systemctl start vesselstack-displays-bridge.service || recovery_failed=1; fi
+        if [ "$sample_timer_active" -eq 1 ]; then systemctl start vesselstack-telemetry-sample.timer || recovery_failed=1; fi
+        if [ "$indexer_timer_active" -eq 1 ]; then systemctl start vesselstack-telemetry-indexer.timer || recovery_failed=1; fi
+        [ "$recovery_failed" -eq 1 ] && echo "Backup recovery failed; inspect service state" >&2
+        [ "$recovery_failed" -eq 0 ] || rc=1
+        return "$rc"
     }
     trap cleanup_backup EXIT
     # The whole stack is stopped on purpose: InfluxDB (WAL/TSM), Home Assistant,
@@ -1515,7 +1573,9 @@ verify_backup() {
     local archive=$1 root_path data_path systemd_path sbin_path update_path entry invalid=0
     [ -f "$archive" ] || { echo "Backup not found: $archive" >&2; exit 1; }
     [ -f "$archive.sha256" ] || { echo "Checksum not found: $archive.sha256" >&2; exit 1; }
-    (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$archive").sha256")
+    expected=$(awk 'NF {print $1; exit}' "$archive.sha256")
+    actual=$(sha256sum "$archive" | awk '{print $1}')
+    [ "$expected" = "$actual" ] || { echo "Backup checksum does not match requested archive" >&2; exit 1; }
     python3 - "$archive" "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$SYSTEMD_DIR" "$SBIN_DIR" \
         "$SYSTEM_ROOT/etc/vesselstack/update.env" <<'PY'
 import pathlib
@@ -1681,15 +1741,31 @@ PY
         -o -path "$stage/vesselstack-backup/${SYSTEM_ROOT#/}/etc/vesselstack/update.env" \))
     rm -rf -- "$stage"
     systemctl daemon-reload
+    restore_start_failed() {
+        echo "Restore startup failed; attempting rollback to prior trees" >&2
+        if ! stop_stack; then
+            echo "Could not stop restored services; preserving restored and rollback trees" >&2
+            return 1
+        fi
+        local failed_root="$root.failed-restore-$stamp" failed_data="$data.failed-restore-$stamp"
+        mv -- "$root" "$failed_root" || return 1
+        mv -- "$data" "$failed_data" || return 1
+        mv -- "$root.pre-restore-$stamp" "$root" || return 1
+        mv -- "$data.pre-restore-$stamp" "$data" || return 1
+        load_config
+        start_stack || return 1
+        echo "Restored trees retained at $failed_root and $failed_data" >&2
+        return 1
+    }
     if [ "$skip_installer" -eq 0 ] && [ -x "$root/installer/install.sh" ]; then
         # The backup excludes the Python virtualenv; the restored bundled installer
         # rebuilds it, re-renders units and starts the stack.
-        "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start
+        "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start || { restore_start_failed || exit 1; }
     else
         # A restored archive may carry different membership than the process
         # that invoked restore; reload it before the fallback start.
         load_config
-        start_stack
+        start_stack || { restore_start_failed || exit 1; }
         echo "NOTE: the Boat Chat virtualenv was not rebuilt. Run: sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
     fi
     echo "Restore completed"
@@ -1738,7 +1814,7 @@ uninstall_stack() {
     stop_stack
     systemctl disable vesselstack-chat.service || true
     systemctl disable --now vesselstack-chat-telegram.service || true
-    systemctl disable --now vesselstack-telemetry-indexer.timer || true
+    systemctl disable --now vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer || true
     systemctl disable --now vesselstack-signalk.service || true
     systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
@@ -1751,6 +1827,8 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-chat-telegram.service" \
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.service" \
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer" \
+        "$SYSTEMD_DIR/vesselstack-telemetry-sample.service" \
+        "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer" \
         "$SYSTEMD_DIR/vesselstack-signalk.service" \
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \

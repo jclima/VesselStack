@@ -81,6 +81,8 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
+: "${BOAT_UNITS:=us_customary}"
+: "${NODE_EXPORTER_ENABLE:=false}"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
 : "${DISPLAYS_SIGNALK_TOKEN:=}"
@@ -152,12 +154,13 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD NODE_EXPORTER_ENABLE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
     esac
 done
+case "$BOAT_UNITS" in us_customary|metric) ;; *) echo "BOAT_UNITS must be us_customary or metric" >&2; exit 1 ;; esac
 # MQTT account names are written into the Mosquitto password and ACL files.
 for key in MQTT_USERNAME DISPLAYS_BRIDGE_MQTT_USERNAME; do
     if ! [[ "${!key}" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
@@ -232,6 +235,7 @@ fi
 COMPOSE_PROFILES=()
 [ "$SIGNALK_MODE" = docker ] && COMPOSE_PROFILES+=(--profile signalk)
 [ "$AIS_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile ais)
+[ "$NODE_EXPORTER_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile metrics)
 
 compose() {
     docker compose "${COMPOSE_PROFILES[@]}" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env" \
@@ -690,16 +694,46 @@ migrate_runtime_path() {
         quarantine_legacy "$old"
     fi
 }
+stop_telemetry_for_migration() {
+    local unit
+    for unit in vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer \
+        vesselstack-telemetry-sample.service vesselstack-telemetry-indexer.service; do
+        if systemctl show -p LoadState --value "$unit" 2>/dev/null | grep -qx not-found; then
+            continue
+        fi
+        systemctl stop "$unit"
+    done
+}
+telemetry_sample_was_active=0
+telemetry_indexer_was_active=0
+if systemctl is-active --quiet vesselstack-telemetry-sample.timer; then telemetry_sample_was_active=1; fi
+if systemctl is-active --quiet vesselstack-telemetry-indexer.timer; then telemetry_indexer_was_active=1; fi
+restore_telemetry_on_exit() {
+    local rc=$?
+    if ! rm -rf -- "$STAGING_DIR" ${PLUGIN_STAGE:+"$PLUGIN_STAGE"}; then
+        echo "Installer staging cleanup failed" >&2
+        if [ "$rc" -eq 0 ]; then rc=1; fi
+    fi
+    if [ "$rc" -ne 0 ] || [ "$START" -eq 0 ]; then
+        if [ "$telemetry_sample_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-sample.timer 2>/dev/null || true; fi
+        if [ "$telemetry_indexer_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-indexer.timer 2>/dev/null || true; fi
+    fi
+    return "$rc"
+}
+trap restore_telemetry_on_exit EXIT
 if [ -e "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -e "$VESSELSTACK_ROOT/boat-chat/data" ] \
     || [ -e "$VESSELSTACK_ROOT/boat-chat/boat-chat.env" ] \
     || [ -L "$VESSELSTACK_ROOT/boat-chat/memory" ] || [ -L "$VESSELSTACK_ROOT/boat-chat/data" ]; then
     # Quiesce writers so SQLite files are not copied mid-write.
-    systemctl stop vesselstack-chat.service vesselstack-chat-telegram.service \
-        vesselstack-telemetry-indexer.service 2>/dev/null || true
+    systemctl stop vesselstack-chat.service vesselstack-chat-telegram.service
+    stop_telemetry_for_migration
     for runtime_name in memory data boat-chat.env; do
         migrate_runtime_path "$runtime_name"
     done
 fi
+# Quiesce telemetry writers before replacing application files, even when no
+# legacy runtime migration is needed.
+stop_telemetry_for_migration
 tar -C "$SOURCE_ROOT/boat-chat" \
     --exclude=boat-chat.env --exclude=.venv --exclude=memory --exclude=data \
     --exclude='__pycache__' --exclude='*.pyc' -cf - . \
@@ -786,7 +820,11 @@ fi
 # with the previous broker configuration still in place.
 sync_mqtt_access
 install -m 0644 "$SCRIPT_DIR/templates/compose.yml" "$VESSELSTACK_ROOT/compose.yml"
-install -m 0644 "$SCRIPT_DIR/templates/prometheus.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
+if [ "$NODE_EXPORTER_ENABLE" = true ]; then
+    install -m 0644 "$SCRIPT_DIR/templates/prometheus-node-exporter.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
+else
+    install -m 0644 "$SCRIPT_DIR/templates/prometheus.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
+fi
 # The legacy single-file config/mosquitto.conf is deliberately left alone: a
 # container created by an older release keeps bind-mounting it, also across
 # reboots, until it is recreated; a downgrade finds it unchanged.
@@ -885,6 +923,7 @@ CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
 TELEMETRY_INDEXER_ENABLE
+NODE_EXPORTER_ENABLE
 DISPLAYS_ENABLE
 DISPLAYS_BRIDGE_MQTT_USERNAME
 DISPLAYS_SIGNALK_TOKEN
@@ -924,7 +963,7 @@ if [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
     cp "$VESSELSTACK_ROOT/config/boat-chat.env" "$boat_chat_temp"
 fi
 for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE \
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE BOAT_UNITS \
     SIGNALK_URL HOME_ASSISTANT_URL \
     HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
     INFLUXDB_RAW_BUCKET INFLUXDB_HISTORY_BUCKET \
@@ -953,6 +992,7 @@ done
     printf 'BOAT_CHAT_ACCESS_TOKEN=%q\n' "$BOAT_CHAT_ACCESS_TOKEN"
     printf 'TELEGRAM_ENABLE=%q\n' "$TELEGRAM_ENABLE"
     printf 'TELEMETRY_INDEXER_ENABLE=%q\n' "$TELEMETRY_INDEXER_ENABLE"
+    printf 'BOAT_UNITS=%q\n' "$BOAT_UNITS"
     printf 'SIGNALK_URL=%q\n' "$SIGNALK_URL"
     printf 'HOME_ASSISTANT_URL=%q\n' "$HOME_ASSISTANT_URL"
     printf 'HOME_ASSISTANT_TOKEN=%q\n' "${HOME_ASSISTANT_TOKEN:-}"
@@ -995,7 +1035,7 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
     "$SCRIPT_DIR/systemd/vesselstack-chat.service.in" > "$SYSTEMD_DIR/vesselstack-chat.service"
 systemctl daemon-reload
 systemctl enable vesselstack-chat.service
-for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
+for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service vesselstack-telemetry-sample.service \
     vesselstack-displays-bridge.service; do
     sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
         -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
@@ -1003,6 +1043,11 @@ for unit in vesselstack-chat-telegram.service vesselstack-telemetry-indexer.serv
         "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
     chmod 0644 "$SYSTEMD_DIR/$unit"
 done
+sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
+    -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
+    "$SCRIPT_DIR/systemd/vesselstack-telemetry-sample.timer.in" > "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer"
+chmod 0644 "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer"
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-telemetry-indexer.timer" \
     "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
@@ -1018,8 +1063,10 @@ else
 fi
 if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
     systemctl enable vesselstack-telemetry-indexer.timer
+    systemctl enable vesselstack-telemetry-sample.timer
 else
     systemctl disable vesselstack-telemetry-indexer.timer 2>/dev/null || true
+    systemctl disable vesselstack-telemetry-sample.timer 2>/dev/null || true
 fi
 if [ "$DISPLAYS_ENABLE" = true ]; then
     systemctl enable vesselstack-displays-bridge.service
@@ -1085,11 +1132,16 @@ if [ "$START" -eq 1 ]; then
     done
     [ "$SIGNALK_MODE" = docker ] && selected_services+=(signalk)
     [ "$AIS_ENABLE" = true ] && selected_services+=(ais-catcher)
+    [ "$NODE_EXPORTER_ENABLE" = true ] && selected_services+=(node-exporter)
     compose_up=(compose up -d)
     [ "$OFFLINE" != true ] || compose_up=(compose up -d --pull never)
     if [ "${#selected_services[@]}" -gt 0 ]; then
         "${compose_up[@]}" "${selected_services[@]}"
     fi
+    if ! component_disabled prometheus; then
+        "${compose_up[@]}" --force-recreate prometheus
+    fi
+    [ "$NODE_EXPORTER_ENABLE" = true ] || compose rm --stop --force node-exporter 2>/dev/null || true
     # A changed compose definition is recreated by "compose up -d" itself; a
     # changed configuration file alone is not, and may have been rendered by an
     # earlier render-only run, so compare with the stamp of the last applied one.
@@ -1109,9 +1161,9 @@ if [ "$START" -eq 1 ]; then
         systemctl stop vesselstack-chat-telegram.service 2>/dev/null || true
     fi
     if [ "$TELEMETRY_INDEXER_ENABLE" = true ]; then
-        systemctl start vesselstack-telemetry-indexer.timer
+        systemctl start vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer
     else
-        systemctl stop vesselstack-telemetry-indexer.timer 2>/dev/null || true
+        systemctl stop vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer 2>/dev/null || true
     fi
     if [ "$DISPLAYS_ENABLE" = true ]; then
         systemctl restart vesselstack-displays-bridge.service

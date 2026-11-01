@@ -137,6 +137,7 @@ FIELDS = [
     field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret", description="Applied to the Mosquitto password file on the next apply/start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "Published port", "MQTT", kind="port"),
     field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
+    field("NODE_EXPORTER_ENABLE", "Enable host metrics", "Prometheus", kind="boolean", description="Runs the optional hardened host metrics exporter on the private Compose metrics profile."),
     field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
     field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
     field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", "Displays", kind="secret", description="Optional, only for Home Assistant items (ha) in displays.json; leave blank otherwise. A leaked token can operate every device in your Home Assistant; a non-admin user only prevents configuration changes. Keep it on the Pi (root-only), never reuse it, and revoke it in Home Assistant (Profile -> Security) if it leaks."),
@@ -180,6 +181,7 @@ COMPOSE_COMPONENTS = {
     "heimdall": "heimdall",
     "signalk": "signalk",
     "ais-catcher": "ais-catcher",
+    "node-exporter": "node-exporter",
 }
 CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
 CORE_METADATA = {
@@ -203,6 +205,7 @@ SYSTEMD_COMPONENTS = {
     "boat-chat": "vesselstack-chat.service",
     "telegram": "vesselstack-chat-telegram.service",
     "telemetry-indexer": "vesselstack-telemetry-indexer.timer",
+    "telemetry-sample": "vesselstack-telemetry-sample.timer",
     "displays-bridge": "vesselstack-displays-bridge.service",
     "signalk-native": "vesselstack-signalk.service",
     "socketcan": "vesselstack-socketcan.service",
@@ -530,7 +533,7 @@ def _update_configuration(updates: dict[str, Any]) -> str:
 
 def compose_base() -> list[str]:
     return [
-        "docker", "compose", "--profile", "signalk", "--profile", "ais",
+        "docker", "compose", "--profile", "signalk", "--profile", "ais", "--profile", "metrics",
         "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml"),
     ]
 
@@ -550,6 +553,8 @@ def component_command(component: str, verb: str) -> list[str]:
             raise ValueError("Docker SignalK is disabled by configuration")
         if component == "ais-catcher" and settings.get("AIS_ENABLE", "false") != "true":
             raise ValueError("AIS-catcher is disabled by configuration")
+        if component == "node-exporter" and settings.get("NODE_EXPORTER_ENABLE", "false") != "true" and verb in {"start", "restart"}:
+            raise ValueError("node-exporter is disabled by configuration")
         service = COMPOSE_COMPONENTS[component]
         if verb == "start":
             return compose_base() + ["up", "-d", service]
@@ -561,6 +566,7 @@ def component_command(component: str, verb: str) -> list[str]:
         enabled = {
             "telegram": settings.get("TELEGRAM_ENABLE", "false") == "true",
             "telemetry-indexer": settings.get("TELEMETRY_INDEXER_ENABLE", "true") == "true",
+            "telemetry-sample": settings.get("TELEMETRY_INDEXER_ENABLE", "true") == "true",
             "signalk-native": settings.get("SIGNALK_MODE") == "native",
             "socketcan": settings.get("SOCKETCAN_ENABLE", "false") == "true",
             "firewall": settings.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true",
@@ -671,6 +677,8 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("SIGNALK_MODE", "existing") == "docker"
         elif name == "ais-catcher":
             enabled = vessel.get("AIS_ENABLE", "false") == "true"
+        elif name == "node-exporter":
+            enabled = vessel.get("NODE_EXPORTER_ENABLE", "false") == "true"
         state = compose_state.get(service, "unknown" if compose_parse_failed else "stopped")
         item = {"id": name, "label": name.replace("-", " ").title(), "kind": "container", "enabled": enabled, "state": state}
         if name in CORE_METADATA:
@@ -685,6 +693,8 @@ def component_status() -> list[dict[str, Any]]:
         elif name == "telegram":
             enabled = vessel.get("TELEGRAM_ENABLE", "false") == "true"
         elif name == "telemetry-indexer":
+            enabled = vessel.get("TELEMETRY_INDEXER_ENABLE", "true") == "true"
+        elif name == "telemetry-sample":
             enabled = vessel.get("TELEMETRY_INDEXER_ENABLE", "true") == "true"
         elif name == "socketcan":
             enabled = vessel.get("SOCKETCAN_ENABLE", "false") == "true"
@@ -802,10 +812,20 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         return False
 
     def read_payload(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 1024 * 1024:
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > 1024 * 1024:
             raise ValueError("Request is too large")
-        payload = json.loads(self.rfile.read(length).decode() or "{}")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("request body must be valid UTF-8") from exc
+        payload = json.loads(raw or "{}")
         if not isinstance(payload, dict):
             raise ValueError("JSON object required")
         return payload
@@ -873,6 +893,16 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                expected = urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}")
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port:
+                    raise ValueError
+            except (ValueError, UnicodeError):
+                self.send_json(403, {"error": "request origin is not allowed"})
+                return
         if not self.require_auth():
             return
         try:

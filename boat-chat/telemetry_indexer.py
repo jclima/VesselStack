@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import math
+import re
 import time
 from typing import Any
 
@@ -28,11 +31,62 @@ HEALTH_ENTITY_IDS = [
     "sensor.audit_health_summary",
 ]
 
+LOCK_DIR = telemetry_cache.memory_index.db_path().parent
+
+
+def _lock_path(mode: str):
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCK_DIR / f"telemetry-{mode}.lock"
+
+
+class ModeLock:
+    def __init__(self, mode: str):
+        self.path = _lock_path(mode)
+        self.handle = None
+
+    def __enter__(self):
+        self.handle = self.path.open("a+")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.handle.close()
+            raise RuntimeError("already running")
+        return self
+
+    def __exit__(self, *_args):
+        if self.handle:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
+
+
+def _error_payload(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("error", "errors", "signalk_error"):
+            if payload.get(key):
+                return key
+        current = payload.get("current_telemetry")
+        if isinstance(current, dict) and current.get("signalk_error"):
+            return "signalk_error"
+        availability = payload.get("source_availability")
+        if isinstance(availability, dict) and availability.get("home_assistant") == "error":
+            return "home_assistant_error"
+    return None
+
+
+def _safe_result(ok: bool, count: int, failed: int, error_class: str | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": ok, "count": count, "failed": failed}
+    if error_class:
+        result["error_class"] = error_class
+    return result
+
 
 def refresh_item(category: str, key: str, func, results: list[dict[str, Any]]) -> None:
     started = time.monotonic()
     try:
         payload = func()
+        error_key = _error_payload(payload)
+        if error_key:
+            raise ValueError(error_key)
         results.append(
             {
                 "category": category,
@@ -50,6 +104,7 @@ def refresh_item(category: str, key: str, func, results: list[dict[str, Any]]) -
                 "ok": False,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "error": str(exc),
+                "error_class": type(exc).__name__,
             }
         )
 
@@ -232,15 +287,47 @@ def refresh_latest_context() -> dict[str, Any]:
     )
     ha_states = app.get_ha_states(HEALTH_ENTITY_IDS)
     solar_inference = refresh_solar_inference(current_telemetry, ha_states)
+    ha_errors = [item.get("error", "") for item in ha_states.values() if isinstance(item, dict) and item.get("error")]
+    ha_configured = bool(app.load_auth_headers("ha").get("Authorization"))
+    non_404_ha_error = any(not re.search(r"(?:HTTP Error )?404\b", str(error), re.IGNORECASE) for error in ha_errors)
     payload = {
         "boat_facts": app.load_boat_facts(),
         "current_telemetry": current_telemetry,
         "ha_states": ha_states,
         "solar_inference": solar_inference,
         "ais": app.current_ais_context(limit=12),
+        "source_availability": {
+            "signalk": "unknown" if current_telemetry.get("signalk_error") else "available",
+            "home_assistant": "error" if ha_configured and non_404_ha_error else "unknown" if ha_errors else "available",
+            "home_assistant_configured": ha_configured,
+        },
     }
     telemetry_cache.put_summary("latest_context", "boat_status", payload, source="telemetry_indexer")
     return payload
+
+
+def _unit_factor_to_ft(unit: Any) -> float | None:
+    normalized = str(unit or "").strip().lower()
+    return {
+        "ft": 1.0, "feet": 1.0, "foot": 1.0,
+        "m": 3.280839895, "meter": 3.280839895, "meters": 3.280839895,
+        "km": 3280.839895, "kilometer": 3280.839895, "kilometers": 3280.839895,
+    }.get(normalized)
+
+
+def distance_ft_from_ha(state: Any) -> float | None:
+    if not isinstance(state, dict):
+        return None
+    try:
+        number = float(state.get("state"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    attrs = state.get("attributes")
+    unit = attrs.get("unit_of_measurement") if isinstance(attrs, dict) else None
+    factor = _unit_factor_to_ft(unit)
+    return number * factor if factor is not None else None
 
 
 def refresh_solar_inference(
@@ -255,8 +342,8 @@ def refresh_solar_inference(
     observation = telemetry_cache.put_power_observation(
         shore_power_state=shore.get("state") if isinstance(shore, dict) else None,
         underway_state=underway.get("state") if isinstance(underway, dict) else None,
-        distance_from_dock_ft=distance_from_dock.get("state") if isinstance(distance_from_dock, dict) else None,
-        dock_radius_ft=dock_radius.get("state") if isinstance(dock_radius, dict) else None,
+        distance_from_dock_ft=distance_ft_from_ha(distance_from_dock),
+        dock_radius_ft=distance_ft_from_ha(dock_radius),
         port_rpm=values.get("propulsion.port.revolutions"),
         starboard_rpm=values.get("propulsion.starboard.revolutions"),
         battery_power_w=values.get("electrical.batteries.shunt.power"),
@@ -283,12 +370,30 @@ def refresh_solar_inference(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="run", choices=["run", "status"])
+    parser.add_argument("command", nargs="?", default="history", choices=["run", "history", "sample", "status"])
+    parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     if args.command == "status":
         print(json.dumps(telemetry_cache.status(), indent=2, sort_keys=True))
         return
-    print(json.dumps(refresh_all(), indent=2, sort_keys=True))
+    mode = "sample" if args.command == "sample" else "history"
+    try:
+        with ModeLock(mode):
+            payload = refresh_latest_context() if mode == "sample" else refresh_all()
+            if mode == "sample":
+                error = _error_payload(payload)
+                result = _safe_result(error is None, 1, int(error is not None), error)
+            else:
+                failed = sum(1 for item in payload.get("items", []) if not item.get("ok"))
+                result = _safe_result(failed == 0, len(payload.get("items", [])), failed, "refresh_failed" if failed else None)
+            print(json.dumps(result if args.quiet else payload, separators=(",", ":") if args.quiet else None,
+                             indent=None if args.quiet else 2, sort_keys=not args.quiet))
+    except Exception as exc:
+        print(json.dumps(_safe_result(False, 0, 1, type(exc).__name__), separators=(",", ":") if args.quiet else None,
+                         indent=None if args.quiet else 2, sort_keys=not args.quiet))
+        raise SystemExit(1)
+    if not result["ok"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

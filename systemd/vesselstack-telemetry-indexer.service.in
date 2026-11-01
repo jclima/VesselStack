@@ -11,6 +11,8 @@ WorkingDirectory=@VESSELSTACK_ROOT@/boat-chat
 EnvironmentFile=@VESSELSTACK_ROOT@/config/boat-chat.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=@VESSELSTACK_ROOT@/boat-chat/.venv/bin/python @VESSELSTACK_ROOT@/boat-chat/telemetry_indexer.py run
+TimeoutStartSec=240s
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

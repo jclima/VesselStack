@@ -60,6 +60,15 @@ for required_asset in \
         exit 1
     }
 done
+for required_runtime in \
+    boat-chat/display_units.py boat-chat/telemetry_indexer.py \
+    systemd/vesselstack-telemetry-indexer.timer systemd/vesselstack-telemetry-sample.service.in \
+    systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml; do
+    [ -s "$STAGE/$PACKAGE_NAME/$required_runtime" ] || {
+        echo "Refusing to package without required runtime asset: $required_runtime" >&2
+        exit 1
+    }
+done
 # Defence in depth: tracked-only does not excuse a tracked private artifact.
 for private in boat-chat/boat_facts.json boat-chat/boat-chat.env vesselstack.env .mcp.json boat-chat/.venv boat-chat/memory boat-chat/data; do
     if [ -e "$STAGE/$PACKAGE_NAME/$private" ]; then
