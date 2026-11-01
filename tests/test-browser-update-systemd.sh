@@ -28,7 +28,14 @@ worker_load=$(systemctl show -p LoadState --value vesselstack-browser-update.ser
 [[ ! -e /etc/systemd/system/vesselstack-browser-update.service ]] || fail "fixed browser worker unit already exists"
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-FIXTURE="/opt/vesselstack-browser-test-$(cat /proc/sys/kernel/random/uuid)"
+FIXTURE_BASE=/root
+[[ -d "$FIXTURE_BASE" ]] || fail "trusted fixture base does not exist: $FIXTURE_BASE"
+base_uid=$(stat -c '%u' -- "$FIXTURE_BASE")
+base_mode=$(stat -c '%a' -- "$FIXTURE_BASE")
+base_mode_int=$((8#$base_mode))
+[[ "$base_uid" == 0 ]] || fail "trusted fixture base is not root-owned"
+(( (base_mode_int & 18) == 0 )) || fail "trusted fixture base is group/other-writable"
+FIXTURE="$FIXTURE_BASE/vesselstack-browser-test-$(cat /proc/sys/kernel/random/uuid)"
 PANEL_UNIT=/etc/systemd/system/vesselstack-control-panel.service
 CREATED_PANEL=0
 STARTED_WORKER=0
@@ -44,7 +51,7 @@ diagnose_failure() {
         echo "diagnostics: journal $unit (last 50 lines)" >&2
         journalctl -u "$unit" -n 50 --no-pager 2>&1 || true
     done
-    for path in /opt "$FIXTURE" "$FIXTURE/control-panel" "$FIXTURE/var" "$FIXTURE/var/lib" "$FIXTURE/var/lib/vesselstack"; do
+    for path in "$FIXTURE_BASE" "$FIXTURE" "$FIXTURE/control-panel" "$FIXTURE/var" "$FIXTURE/var/lib" "$FIXTURE/var/lib/vesselstack"; do
         [[ -e "$path" ]] && stat -c '%n uid=%u mode=%a' -- "$path" 2>/dev/null || true
     done >&2
 }
@@ -64,6 +71,7 @@ token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
 version=$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")
 
 install -d -m 0700 -o root -g root "$FIXTURE" "$FIXTURE/config" "$FIXTURE/installer" "$FIXTURE/control-panel"
+[[ "$(stat -c '%u' -- "$FIXTURE")" == 0 && "$(stat -c '%a' -- "$FIXTURE")" == 700 ]] || fail "fixture root is not root-owned mode 0700"
 cp -a "$REPO_ROOT/control-panel/app.py" "$REPO_ROOT/control-panel/browser_updates.py" "$FIXTURE/control-panel/"
 cp -a "$REPO_ROOT/control-panel/static" "$FIXTURE/control-panel/"
 cp "$REPO_ROOT/VERSION" "$FIXTURE/installer/VERSION"
