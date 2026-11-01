@@ -257,6 +257,7 @@ Lab settings worth checking (all defined in `vesselstack.example.env`):
 
 ```bash
 SIGNALK_MODE="docker"                      # self-contained; "existing" needs a running SignalK
+SIGNALK_VESSELTWIN_PRELOAD="true"           # package preload only; enable/pair/send remain explicit
 SOCKETCAN_ENABLE="true"
 SOCKETCAN_INTERFACE="vcan0"                # bitrate is ignored for vcan*
 VESSELSTACK_CAN_CREATE_VCAN="true"         # modprobe vcan + ip link add at boot

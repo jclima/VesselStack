@@ -2,8 +2,8 @@
 
 VesselStack is the onboard system for monitoring, automation, local history, and
 Boat Chat. VesselTwin is a separate, private place for maintenance documents,
-equipment, and logbook records. VesselStack does **not** have a built-in,
-automatic VesselTwin connector.
+equipment, and logbook records. Managed SignalK installs can preload the
+separate VesselTwin Signal K plugin, but the connection remains opt-in.
 
 If you choose to connect them, the supported path is the separate
 [VesselTwin Signal K plugin](https://github.com/jclima/signalk-vesseltwin). It
@@ -11,6 +11,14 @@ can send selected sensor values from your Signal K server to your VesselTwin
 account. Pairing is optional, and pairing by itself does not send readings.
 
 ## Before you install anything
+
+Managed Docker and native installs preload the pinned `signalk-vesseltwin`
+0.2.1 package by default. This does not enable, pair, or send readings.
+Existing mode is untouched; `SIGNALK_VESSELTWIN_PRELOAD=false` skips without
+uninstalling. Offline Docker installs reuse a valid existing plugin; if preload
+is enabled and it is missing, preflight fails before mutation. Native SignalK is
+unsupported offline. Disable the plugin itself separately in SignalK's Plugin
+Config UI.
 
 Check the account and rollout first:
 
@@ -28,9 +36,10 @@ Check the account and rollout first:
   [plugin's current requirements](https://github.com/jclima/signalk-vesseltwin#requirements)
   before upgrading a managed installation.
 
-Do not assume that the Signal K Appstore listing is present immediately. If it
-is not listed, use the upstream installation instructions and identify the
-configuration directory used by your actual Signal K service first. Managed
+For existing SignalK mode, do not assume that the Signal K Appstore listing is
+present immediately. If it is not listed, use the upstream installation
+instructions and identify the configuration directory used by your actual
+Signal K service first. Managed
 roots, containers, and mounted volumes differ. Do not blindly run an npm
 install in `~/.signalk`; back up the Signal K administrator configuration before
 changing it. VesselStack's existing install and first-boot guidance is in
@@ -65,8 +74,10 @@ directory and administrator account as private.
 Do this while safely alongside, with Signal K security enabled and an
 administrator session open.
 
-1. In the Signal K admin UI, open **Appstore** and search for **VesselTwin**.
-   If it is available, install it and restart the Signal K server. Then open
+1. If the VesselStack installer preloaded the plugin, restart Signal K if needed
+   and continue. Otherwise, in the Signal K admin UI, open **Appstore** and
+   search for **VesselTwin**. If it is available, install it and restart the
+   Signal K server. Then open
    **Server > Plugin Config** and enable the **VesselTwin** plugin.
 2. Open **Webapps > VesselTwin** and choose **Pair**. The admin-only page shows
    a link and a short link code. Open the displayed link, sign in to VesselTwin,

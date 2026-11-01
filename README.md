@@ -89,9 +89,10 @@ On Linux, keep temporary test roots protected with `trusted_test_tmp=$(mktemp -d
 
 ### Optional VesselTwin connection
 
-An optional VesselTwin connection uses the separately installed
-`signalk-vesseltwin` plugin, pairing, and explicit reading opt-ins. VesselStack
-does not enable it for you. See the [VesselTwin integration guide](docs/VESSELTWIN.md)
+An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
+and explicit reading opt-ins. Managed Docker/native SignalK preloads the pinned
+plugin by default; VesselStack does not enable, pair, or authorize readings for you.
+See the [VesselTwin integration guide](docs/VESSELTWIN.md)
 for setup and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals
 and service records.
 
@@ -699,6 +700,7 @@ nano vesselstack.env
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
 | `SIGNALK_VERSION` | Pinned SignalK release used by managed modes |
 | `SIGNALK_URL` | Existing SignalK endpoint |
+| `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.1 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
 | `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
@@ -866,6 +868,12 @@ uid/gid 1000, the image's `node` user, so the container can write it). With
 `/opt/vesselstack/signalk-server` and runs it as the locked VesselStack user.
 `SIGNALK_MODE=existing` never modifies SignalK. The managed modes use the same
 first-run admin onboarding at `http://HOST:3000`.
+
+Managed Docker and native installs preload the pinned, zero-runtime-dependency
+`signalk-vesseltwin` 0.2.1 package before SignalK starts. The archive is
+integrity-checked before publication; an existing plugin directory is preserved
+and never overwritten. Preloading is separate from plugin enablement, pairing,
+and reading switches, which remain explicit owner actions.
 
 When AIS is enabled, AIS-catcher exposes its viewer on port `8100` and an NMEA
 TCP feed on port `5011`. Add a SignalK NMEA 0183 TCP client connection to

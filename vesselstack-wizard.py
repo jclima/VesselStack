@@ -12,6 +12,7 @@ ALLOWED = re.compile(r"^[A-Za-z0-9 _.,:/@+()-]*$")
 CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
 
 DEFAULTS = {
+ "SIGNALK_VESSELTWIN_PRELOAD":"true",
  "BOAT_NAME":"My Boat","BOAT_TYPE":"Motor vessel","BOAT_MMSI":"","BOAT_CALLSIGN":"","BOAT_LOA_M":"","BOAT_BEAM_M":"","BOAT_TIMEZONE":"UTC","BOAT_UNITS":"metric",
  "VESSELSTACK_USER":"boat","VESSELSTACK_UID":"1000","VESSELSTACK_GID":"1000","VESSELSTACK_ROOT":"/opt/vesselstack","VESSELSTACK_DATA":"/opt/vesselstack-data","VESSELSTACK_BACKUP":"/media/vesselstack-backup/backups",
  "SIGNALK_MODE":"docker","SIGNALK_VERSION":"v2.27.0","SIGNALK_URL":"http://127.0.0.1:3000","SOCKETCAN_ENABLE":"false","VESSELSTACK_CAN_CREATE_VCAN":"false","SOCKETCAN_INTERFACE":"can0","SOCKETCAN_BITRATE":"250000",
@@ -53,7 +54,7 @@ def validate(values):
     result["VESSELSTACK_DISABLED_COMPONENTS"] = normalize_disabled_components(result["VESSELSTACK_DISABLED_COMPONENTS"])
     if result["SIGNALK_MODE"] not in {"existing","docker","native"}: raise ValueError("Invalid SignalK mode")
     if _any_ip(result["CONTROL_PANEL_HOST"]): raise ValueError("Invalid CONTROL_PANEL_HOST: enter an IP address")
-    for key in ("SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT"):
+    for key in ("SIGNALK_VESSELTWIN_PRELOAD","SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT"):
         if result[key] not in {"true","false"}: raise ValueError(f"Invalid boolean for {key}")
     for key in ("VESSELSTACK_FIREWALL_ALLOW_TCP","VESSELSTACK_FIREWALL_ALLOW_UDP"):
         if result[key] and not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*",result[key]): raise ValueError(f"Invalid port list for {key}")
@@ -290,8 +291,9 @@ SECTIONS=[
   F("VESSELSTACK_BACKUP","Backup folder","Where backups are written; removable media is best.",advanced=True,required=True,check=_backup_path),
   F("VESSELSTACK_DISABLED_COMPONENTS","Disabled core components","Managed by the Control Panel or vesselstackctl; this membership is preserved by the wizard.",advanced=True,when=lambda s:False)]},
  {"title":"Signal K (the boat data hub)","intro":"Signal K collects data from your instruments and serves it to everything else.","fields":[
-  F("SIGNALK_MODE","How should Signal K run?","docker: VesselStack installs and manages Signal K in a container (recommended). existing: you already run Signal K elsewhere. native: installed directly on the Pi (not in a container).","choice",
+  F("SIGNALK_MODE","How should Signal K run?","docker: VesselStack installs and manages Signal K in a container (recommended) and preloads the pinned VesselTwin plugin by default. existing: you already run Signal K elsewhere and VesselStack does not modify its plugins. native: installed directly on the Pi (not in a container).","choice",
     choices=[("docker","VesselStack runs Signal K for you (recommended)"),("existing","use a Signal K server you already have"),("native","install Signal K directly on this Pi")]),
+  F("SIGNALK_VESSELTWIN_PRELOAD","Preload VesselTwin plugin","Managed Docker/native modes install pinned signalk-vesseltwin 0.2.1. Existing mode is never modified; this does not enable, pair, or send readings.","bool",advanced=True,when=lambda s:s.values["SIGNALK_MODE"]!="existing"),
   F("SIGNALK_URL","Address of your Signal K server","For example http://127.0.0.1:3000 (or another computer on the boat network).",required=True,check=URL,when=lambda s:s.values["SIGNALK_MODE"]=="existing"),
   F("SIGNALK_VERSION","Signal K version","Release tag of the Signal K container image.",advanced=True,required=True,check=_re(r"v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?","A version such as v2.27.0."))]},
  {"title":"NMEA 2000 (CAN bus)","intro":"Reads your boat's NMEA 2000 network through an isolated CAN interface. Skip this until the hardware is installed and bench-tested; you can enable it later by running the installer again.","fields":[

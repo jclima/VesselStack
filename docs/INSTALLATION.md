@@ -324,6 +324,15 @@ which never built the index, or when the build failed. Fix it with
 doctor`. 0.4.3 and later build the index during installation, on upgrade and on
 `vesselstackctl start`. Details: README, "Memory index".
 
+## Managed SignalK and VesselTwin preload
+
+Managed Docker/native SignalK preloads pinned `signalk-vesseltwin` 0.2.1 when
+`SIGNALK_VESSELTWIN_PRELOAD=true`. Preload, enablement, pairing, and reading
+permissions are separate steps; see [VESSELTWIN.md](VESSELTWIN.md). Offline
+Docker installs reuse a valid existing plugin and fail before mutation when it
+is missing; native SignalK is unsupported offline. Setting the flag false skips
+future preloads and never removes an existing plugin.
+
 ## Troubleshooting: SignalK not running / EACCES on package.json
 
 Prometheus metrics live in `<data>/prometheus` (owned by uid/gid 65534, created by the

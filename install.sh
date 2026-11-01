@@ -54,6 +54,7 @@ source "$CONFIG_FILE"
 : "${INFLUXDB_AIS_BUCKET:=ais}"
 : "${SIGNALK_MODE:=existing}"
 : "${SIGNALK_VERSION:=v2.27.0}"
+: "${SIGNALK_VESSELTWIN_PRELOAD:=true}"
 : "${SOCKETCAN_ENABLE:=false}"
 : "${SOCKETCAN_INTERFACE:=can0}"
 : "${SOCKETCAN_BITRATE:=250000}"
@@ -131,6 +132,10 @@ case "$SIGNALK_MODE" in
     existing|docker|native) ;;
     *) echo "SIGNALK_MODE must be existing, docker, or native" >&2; exit 1 ;;
 esac
+if [ "$SIGNALK_MODE" = native ] && [ "$OFFLINE" = true ]; then
+    echo "Offline install: native SignalK installation requires its npm packages to be installed online first; use managed docker or existing mode." >&2
+    exit 1
+fi
 case "$INFLUXDB_CONTAINER_NAME" in
     ''|*[!A-Za-z0-9_.-]*)
         echo 'INFLUXDB_CONTAINER_NAME may contain letters, numbers, dot, underscore, and hyphen' >&2
@@ -147,7 +152,7 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -297,6 +302,15 @@ if [ "$SIGNALK_MODE" = existing ]; then
     }
 fi
 
+# Check the pinned plugin before any installed file is touched. Existing mode is
+# intentionally a no-op; offline managed installs require a pre-existing plugin.
+if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ] \
+    && { [ "$OFFLINE" = true ] || [ "$DRY_RUN" -eq 1 ]; }; then
+    preload_check_args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --check)
+    [ "$OFFLINE" = true ] && preload_check_args+=(--offline)
+    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" "${preload_check_args[@]}"
+fi
+
 # Everything that can fail for lack of a network, an image, a wheel or a supported
 # upgrade path is checked here, before any installed file is touched.
 if ! "$SCRIPT_DIR/scripts/migrate.sh" --check "$CONFIG_FILE" "$(<"$SCRIPT_DIR/VERSION")"; then
@@ -363,6 +377,14 @@ if [ "$OFFLINE" = true ]; then
         echo "WARNING: load the images before running with --start or starting services." >&2
     fi
 fi
+PLUGIN_STAGE=
+if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ] && [ "$OFFLINE" = false ] && [ "$DRY_RUN" -eq 0 ]; then
+    PLUGIN_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-signalk-plugin-stage.XXXXXX")
+    chmod 0700 "$PLUGIN_STAGE"
+    trap 'rm -rf -- "$PLUGIN_STAGE"' EXIT
+    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" --mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" \
+        --stage "$PLUGIN_STAGE" --prepare
+fi
 # Everything the MQTT access sync would reject is checked here, read-only and
 # before anything is changed, so a dry run (and "vesselstackctl update", which
 # runs one before taking a backup) fails early instead of partway through.
@@ -401,7 +423,7 @@ install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
 # nothing: no env, units, code or installed-version are touched.
 install -d -m 0755 "$VESSELSTACK_ROOT"
 STAGING_DIR=$(mktemp -d "$VESSELSTACK_ROOT/.venv-staging.XXXXXX")
-trap 'rm -rf -- "$STAGING_DIR"' EXIT
+trap 'rm -rf -- "$STAGING_DIR" ${PLUGIN_STAGE:+"$PLUGIN_STAGE"}' EXIT
 STAGING_VENV="$STAGING_DIR/venv"
 pip_args=(install --disable-pip-version-check --only-binary=:all: --require-hashes)
 if [ "$OFFLINE" = true ]; then
@@ -842,6 +864,7 @@ VESSELSTACK_BACKUP
 SIGNALK_MODE
 SIGNALK_VERSION
 SIGNALK_URL
+SIGNALK_VESSELTWIN_PRELOAD
 SOCKETCAN_ENABLE
 SOCKETCAN_INTERFACE
 SOCKETCAN_BITRATE
@@ -1016,6 +1039,17 @@ compose config --quiet
 
 if [ "$SIGNALK_MODE" = native ]; then
     "$SCRIPT_DIR/scripts/install-signalk-native.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+    SIGNALK_CONTAINER_UID=$VESSELSTACK_UID
+    SIGNALK_CONTAINER_GID=$VESSELSTACK_GID
+fi
+if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ]; then
+    preload_args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID")
+    if [ "$OFFLINE" = true ]; then
+        preload_args+=(--offline --check)
+    else
+        preload_args+=(--stage "$PLUGIN_STAGE" --publish)
+    fi
+    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" "${preload_args[@]}"
 fi
 
 # Home Assistant bind address: add, update or remove the managed http block in its

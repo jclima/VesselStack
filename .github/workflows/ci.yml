@@ -72,6 +72,8 @@ jobs:
           trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX")
           trap 'rm -rf -- "$trusted_test_tmp"' EXIT
           TMPDIR="$trusted_test_tmp" python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: SignalK VesselTwin preload security tests (root)
+        run: sudo python3 -m unittest discover -s tests -p 'test_signalk_vesseltwin.py' -v
       - name: Run control panel UI regression checks
         run: node tests/test_control_panel_ui.cjs
       - name: Build and verify release archive
