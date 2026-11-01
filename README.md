@@ -990,6 +990,13 @@ model-facing context, computed answers, metric cards, and chart labels at the
 presentation boundary. Set `BOAT_UNITS=metric` for L/L/h, °C, kPa, hPa, and m;
 knots and nautical miles remain unchanged. Switching the preference does not
 rewrite stored telemetry or cached summaries.
+Fuel-balance comparisons follow the same preference, including signed rate and
+volume differences. Home Assistant history uses the selected entity's reported
+source unit for chart values, metric cards, computed answers, and model context;
+already-metric readings are preserved. Missing or unsupported source units are
+left unchanged rather than assumed to be Fahrenheit or feet. This metadata comes
+from the current entity state, so historical ranges spanning a change in the
+entity's reporting unit need separate review.
 The interface rate-limits each client and runs at most two chat requests at a
 time so slow model calls cannot exhaust the Raspberry Pi.
 
@@ -1046,6 +1053,9 @@ The jobs have independent overlap locks, preserve the existing AIS and memory
 index context, and use the installed service account and private state paths.
 Their journal output contains counts and error classifications rather than
 vessel readings or credentials.
+Both installed services explicitly request quiet output, including history
+refresh failures; manual indexer commands without `--quiet` still show detailed
+results and should be treated as private telemetry.
 
 The installer enables the schedules for boot; **Install & start** or
 `vesselstackctl start` starts them immediately. Render-only installation keeps
@@ -1073,11 +1083,24 @@ The pinned exporter runs on the private Compose network without publishing
 port 9100. Its read-only host mounts support CPU, memory, disk, filesystem,
 load, and thermal collectors; host network-interface metrics are intentionally
 excluded. Grafana's system-health dashboard includes optional host panels.
+The CPU, memory, root-filesystem, and load panels select the provisioned
+Prometheus datasource explicitly, even when InfluxDB is the Grafana default.
 
 Set the option back to `false` and apply/start to remove the exporter and its
 scrape target. Existing Prometheus data, retention, and listener settings are
 preserved. Offline bundles must be rebuilt with this release so the exporter
 image is available before enabling it offline.
+
+After updating an existing installation, rerun the reviewed installer to apply
+the service and dashboard templates, then start the telemetry services. These
+changes do not remove existing journal entries or rewrite retained telemetry.
+To roll back, install the previous reviewed release; it restores the earlier
+presentation and templates without a telemetry database migration. Focused
+regressions can be run from the repository root with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_display_units tests.test_metric_presentation tests.test_node_exporter tests.test_telemetry_indexer
+```
 
 `BOAT_CHAT_WEB_SEARCH=true` enables the OpenAI Responses API web-search tool
 when the OpenAI provider is selected. This can send the question and grounded

@@ -60,6 +60,42 @@ class DisplayUnitsTests(unittest.TestCase):
         self.assertAlmostEqual(normalized["latest_observation"]["distance_from_dock_m"], 3.048)
         self.assertNotIn("US gallons", normalized["notes"][0])
 
+    def test_source_dimensions_override_abbreviated_measurement_names(self):
+        u = self.units
+        self.assertAlmostEqual(u.display_value("sensor.coolant_temp", 68, "metric", "°F"), 20.0)
+        self.assertAlmostEqual(u.display_value("propulsion.port.fuel.rate", 1, "metric", "gal/h"), 3.785411, places=5)
+        self.assertEqual(u.unit_for_measurement("propulsion.port.fuel.rate", "metric", "gal/h"), "L/h")
+        self.assertAlmostEqual(u.display_value("sensor.pressure", 1000, "metric", "hPa"), 100.0)
+
+    def test_unknown_and_missing_source_units_are_preserved(self):
+        u = self.units
+        self.assertEqual(u.display_value("sensor.coolant_temp", 68, "metric", "mystery"), 68)
+        self.assertEqual(u.unit_for_measurement("sensor.coolant_temp", "metric", "mystery"), "mystery")
+        self.assertEqual(u.display_value("sensor.coolant_temp", 68, "metric", ""), 68)
+        self.assertEqual(u.unit_for_measurement("sensor.coolant_temp", "metric", ""), "")
+
+    def test_non_temperature_deltas_are_not_scaled(self):
+        normalized = self.units.normalize_context({"propulsion.port.revolutions": {"delta": 18.0}, "propulsion.port.temperature": {"delta": 18.0}}, "metric")
+        self.assertEqual(normalized["propulsion.port.revolutions"]["delta"], 18.0)
+        self.assertAlmostEqual(normalized["propulsion.port.temperature"]["delta"], 10.0)
+
+    def test_history_bucket_units_are_isolated_and_aligned_snapshots_follow_them(self):
+        source = {"influx_history": {"buckets": {
+            "a": {"units": {"sensor.cabin_temperature": "F"}, "numeric_summary": {"sensor.cabin_temperature": {"min": 68}}, "analysis": {"notable_snapshots": [{"values": {"sensor.cabin_temperature": 68}}]}},
+            "b": {"units": {"sensor.cabin_temperature": "°C"}, "numeric_summary": {"sensor.cabin_temperature": {"min": 20}}, "analysis": {"notable_snapshots": [{"values": {"sensor.cabin_temperature": 20}}]}},
+        }}}
+        normalized = self.units.normalize_context(source, "metric")
+        self.assertAlmostEqual(normalized["influx_history"]["buckets"]["a"]["numeric_summary"]["sensor.cabin_temperature"]["min"], 20.0)
+        self.assertAlmostEqual(normalized["influx_history"]["buckets"]["b"]["numeric_summary"]["sensor.cabin_temperature"]["min"], 20.0)
+        self.assertAlmostEqual(normalized["influx_history"]["buckets"]["a"]["analysis"]["notable_snapshots"][0]["values"]["sensor.cabin_temperature"], 20.0)
+
+    def test_abbreviated_fuel_rate_units_match_propulsion_values(self):
+        source = {"propulsion_24h": {"units": {"fuel.rate": "gal/h"}, "summary": {"propulsion.port.fuel.rate": {"avg": 1.0}}}}
+        normalized = self.units.normalize_context(source, "metric")
+        self.assertEqual(normalized["propulsion_24h"]["units"]["fuel.rate"], "L/h")
+        self.assertAlmostEqual(normalized["propulsion_24h"]["summary"]["propulsion.port.fuel.rate"]["avg"], 3.785411, places=5)
+        self.assertEqual(source["propulsion_24h"]["summary"]["propulsion.port.fuel.rate"]["avg"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
