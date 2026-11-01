@@ -8,7 +8,7 @@ if [[ "${VESSELSTACK_SYSTEMD_UPDATE_TEST:-false}" != "true" ]]; then
     exit 0
 fi
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() { TEST_FAILED=1; echo "FAIL: $*" >&2; exit 1; }
 [[ "$(uname -s)" == "Linux" ]] || fail "real systemd acceptance requires Linux"
 [[ "$(id -u)" == 0 ]] || fail "real systemd acceptance requires root"
 command -v systemctl >/dev/null || fail "systemctl is required"
@@ -33,8 +33,24 @@ PANEL_UNIT=/etc/systemd/system/vesselstack-control-panel.service
 CREATED_PANEL=0
 STARTED_WORKER=0
 PAUSED_WORKER=0
+TEST_FAILED=0
+diagnose_failure() {
+    [[ "$TEST_FAILED" == 1 ]] || return 0
+    echo "diagnostics: authenticated preflight status=${auth_status:-unavailable}; POST status=${post_status:-unavailable}" >&2
+    if [[ -s "${FIXTURE:-}/restart-response.json" ]]; then
+        jq -r 'if type == "object" then (.error // .message // "no error field") else "non-object response" end' "$FIXTURE/restart-response.json" 2>/dev/null || echo "unparseable response body" >&2
+    fi
+    for unit in vesselstack-control-panel.service vesselstack-browser-update.service; do
+        echo "diagnostics: journal $unit (last 50 lines)" >&2
+        journalctl -u "$unit" -n 50 --no-pager 2>&1 || true
+    done
+    for path in /opt "$FIXTURE" "$FIXTURE/control-panel" "$FIXTURE/var" "$FIXTURE/var/lib" "$FIXTURE/var/lib/vesselstack"; do
+        [[ -e "$path" ]] && stat -c '%n uid=%u mode=%a' -- "$path" 2>/dev/null || true
+    done >&2
+}
 cleanup() {
     set +e
+    diagnose_failure
     [[ "$PAUSED_WORKER" == 1 ]] && kill -CONT "$worker_pid" >/dev/null 2>&1
     [[ "$STARTED_WORKER" == 1 ]] && systemctl stop vesselstack-browser-update.service >/dev/null 2>&1
     [[ "$CREATED_PANEL" == 1 ]] && systemctl stop vesselstack-control-panel.service >/dev/null 2>&1
@@ -100,15 +116,21 @@ old_boot=$(jq -r '.boot_id' <<<"$health")
 old_pid=$(systemctl show -p MainPID --value vesselstack-control-panel.service)
 [[ "$old_pid" =~ ^[1-9][0-9]*$ ]] || fail "could not identify old panel PID"
 
+auth_status=$(curl --max-time 2 -sS -o "$FIXTURE/auth-response.json" -w '%{http_code}' "${auth[@]}" "$base/api/operation" 2>/dev/null || true)
+[[ "$auth_status" == 200 ]] || fail "authenticated fixture API request failed (HTTP $auth_status)"
+
 # The response is allowed to disappear with the old listener.  The durable
 # operation file is the source of truth for the request identity.
-curl --max-time 2 -sS -o "$FIXTURE/restart-response.json" "${auth[@]}" -H 'Content-Type: application/json' -d '{"action":"restart-panel"}' "$base/api/action" >/dev/null 2>&1 || true
+post_status=$(curl --max-time 2 -sS -o "$FIXTURE/restart-response.json" -w '%{http_code}' "${auth[@]}" -H 'Content-Type: application/json' -d '{"action":"restart-panel"}' "$base/api/action" 2>/dev/null || true)
 operation_file="$FIXTURE/var/lib/vesselstack/browser-update.json"
 for _ in {1..50}; do
     [[ -s "$operation_file" ]] && break
     sleep 0.1
 done
-[[ -s "$operation_file" ]] || fail "restart did not persist an operation"
+if [[ ! -s "$operation_file" ]]; then
+    TEST_FAILED=1
+    fail "restart did not persist an operation (HTTP $post_status)"
+fi
 operation_id=$(jq -r '.id // empty' "$operation_file")
 [[ "$operation_id" =~ ^[0-9]+$ ]] || fail "durable operation has no id"
 
