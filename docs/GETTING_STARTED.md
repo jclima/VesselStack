@@ -44,8 +44,8 @@ curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-ve
 ```
 
 The `latest/download` URL follows the latest stable release. The lab prerelease
-`v0.5.6` is not selected by that URL; use its explicit pinned URL or
-`--version 0.5.6` only when following the lab and offline-release instructions
+`v0.5.7` is not selected by that URL; use its explicit pinned URL or
+`--version 0.5.7` only when following the lab and offline-release instructions
 in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 The script checks the host first. It asks before installing missing Debian

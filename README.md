@@ -85,7 +85,7 @@ VesselStack. `sudo` is required because installation writes system packages,
 services, and `/opt/vesselstack`; the questions explain each change. Secrets
 are generated or entered without echo and are not printed in the review.
 
-The command above installs the latest stable release. For the `0.5.6` lab
+The command above installs the latest stable release. For the `0.5.7` lab
 prerelease, follow the pinned-release instructions in the
 [installation guide](docs/INSTALLATION.md).
 For a boat with no internet, prepare the release and offline bundle in the lab
@@ -104,7 +104,7 @@ Keep the generated credentials per host, schedule backups to a separate device,
 and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
-### Update from the Control Panel (0.5.6 lab release)
+### Update from the Control Panel (0.5.7 lab release)
 
 An authenticated Control Panel session can check releases from the public
 `jclima/VesselStack` repository. Stable releases are shown by default; enable
@@ -128,13 +128,14 @@ the deployment guide when recovery is needed. `--require-mounted` defeats
 The detached updater restarts the Control Panel and verifies its new version and
 boot before the browser reconnects. Settings also provides a standalone
 **Restart Control Panel** action. The panel uses ordinary HTTP; release
-checksums provide corruption detection, not signed provenance, and the 0.5.6
+checksums provide corruption detection, not signed provenance, and the 0.5.7
 lab tag is explicitly unsigned and not latest. See the full reference below for
 backup, recovery, and update details.
 
 The browser updater was introduced in `0.5.5`. Installations on `0.5.4` or
-earlier must use the CLI installer/update once; installations on `0.5.5` can
-upgrade to `0.5.6` through the Control Panel with lab prereleases enabled.
+earlier must use the CLI installer/update once; installations on `0.5.5` or
+`0.5.6` can upgrade to `0.5.7` through the Control Panel with lab prereleases
+enabled.
 The panel serializes its own update/configuration/component operations, but
 unrelated CLI commands are separate maintenance actions and are not globally
 serialized by the panel; do not run them concurrently with an update.
@@ -300,9 +301,9 @@ release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 To install an exact release instead (recommended once you have tested one):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.6/get-vesselstack.sh | sudo bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.6 bash
-# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.6
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.5.7/get-vesselstack.sh | sudo bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.5.7 bash
+# or: curl -fsSL .../get-vesselstack.sh | sudo bash -s -- --version 0.5.7
 ```
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -490,7 +491,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.6
+git checkout v0.5.7
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the browser wizard
 ```
@@ -628,12 +629,12 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-For the pinned 0.5.6 lab prerelease, use its annotated unsigned tag (it is not
+For the pinned 0.5.7 lab prerelease, use its annotated unsigned tag (it is not
 the latest release):
 
 ```bash
 git fetch --tags
-git checkout v0.5.6
+git checkout v0.5.7
 ```
 
 This lab prerelease is for authorized lab use only; it is unsigned, not latest,
