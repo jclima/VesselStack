@@ -53,7 +53,7 @@ Restore the tunnel-only default with `sudo vesselstackctl panel-access local`.
 
 An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
 and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
-pinned 0.2.1 plugin by default; existing mode is untouched and uses the upstream
+pinned 0.2.3 plugin by default; existing mode is untouched and uses the upstream
 install path. VesselStack never enables, pairs, or authorizes readings for you.
 See the [VesselTwin integration guide](VESSELTWIN.md)
 and [VesselTwin](https://www.vesseltwin.io/) for maintenance documents, equipment and

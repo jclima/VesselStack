@@ -42,7 +42,7 @@ def archive(members):
 def valid_archive(extra=()):
     return archive([
         ("package/", b"", "dir"),
-        ("package/package.json", b'{"name":"signalk-vesseltwin","version":"0.2.1"}', "file"),
+        ("package/package.json", b'{"name":"signalk-vesseltwin","version":"0.2.3"}', "file"),
         *extra,
     ])
 
@@ -83,7 +83,7 @@ class PreloadTests(unittest.TestCase):
         args = types.SimpleNamespace(data=root, uid=os.getuid(), gid=os.getgid())
         fallback = (lambda source, destination, _fd: os.rename(source, destination))
         with mock.patch.object(preload, "rename_noreplace", rename or fallback), mock.patch.object(preload.os, "geteuid", return_value=501):
-            preload.publish(raw, args, root / "signalk/node_modules/signalk-vesseltwin")
+            return preload.publish(raw, args, root / "signalk/node_modules/signalk-vesseltwin")
 
     def test_prepare_then_publish_valid_archive_and_empty_file(self):
         raw = valid_archive((("package/empty.txt", b"", "file"),))
@@ -114,8 +114,8 @@ class PreloadTests(unittest.TestCase):
         cases = [
             valid_archive((("package/../escape", b"x", "file"),)),
             valid_archive((("package/link", "/etc/passwd", "symlink"),)),
-            archive([("package/", b"", "dir"), ("package/package.json", b'{"name":"signalk-vesseltwin","version":"0.2.1"}', "file"), ("package/a", b"1", "file"), ("package/a", b"2", "file")]),
-            archive([("package/", b"", "dir"), ("package/package.json", b'{"name":"signalk-vesseltwin","version":"0.2.1","dependencies":{"x":"1"}}', "file")]),
+            archive([("package/", b"", "dir"), ("package/package.json", b'{"name":"signalk-vesseltwin","version":"0.2.3"}', "file"), ("package/a", b"1", "file"), ("package/a", b"2", "file")]),
+            archive([("package/", b"", "dir"), ("package/package.json", b'{"name":"signalk-vesseltwin","version":"0.2.3","dependencies":{"x":"1"}}', "file")]),
         ]
         for raw in cases:
             with self.subTest():
@@ -149,8 +149,39 @@ class PreloadTests(unittest.TestCase):
                 (target / "package.json").write_text('{"name":"signalk-vesseltwin","version":"9.9.9"}')
                 raise FileExistsError(destination)
 
-            self.publish(raw, root, collide)
+            self.assertFalse(self.publish(raw, root, collide))
             self.assertEqual(json.loads((target / "package.json").read_text())["version"], "9.9.9")
+
+    def test_publish_reports_whether_it_installed_something(self):
+        raw = valid_archive()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.data_tree(root)
+            self.assertTrue(self.publish(raw, root))
+            self.assertFalse(self.publish(raw, root))
+
+    def test_installer_restarts_docker_signalk_only_after_fresh_install(self):
+        script = (Path(__file__).parents[1] / "install.sh").read_text()
+        self.assertIn("|| preload_rc=$?", script)
+        self.assertIn("10) SIGNALK_PLUGIN_INSTALLED=1", script)
+        self.assertIn('[ "$SIGNALK_MODE" = docker ] && [ "$SIGNALK_PLUGIN_INSTALLED" -eq 1 ]', script)
+        self.assertIn("compose restart signalk", script)
+        self.assertEqual(preload.EXIT_INSTALLED, 10)
+
+    def test_main_exit_status_signals_fresh_install_only(self):
+        raw = valid_archive()
+        self.pin(raw)
+        with tempfile.TemporaryDirectory() as temp:
+            root, stage = Path(temp) / "data", Path(temp) / "stage"
+            self.data_tree(root)
+            stage.mkdir()
+            (stage / "plugin.tgz").write_bytes(raw)
+            argv = ["x", "--mode", "docker", "--data", str(root), "--stage", str(stage), "--publish"]
+            fallback = lambda source, destination, _fd: os.rename(source, destination)
+            with mock.patch.object(preload.sys, "argv", argv), mock.patch.object(preload, "rename_noreplace", fallback), \
+                    mock.patch.object(preload.os, "geteuid", return_value=501):
+                self.assertEqual(preload.main(), preload.EXIT_INSTALLED)
+                self.assertEqual(preload.main(), 0)
 
     def test_publish_creates_package_json_dependency(self):
         raw = valid_archive()
@@ -159,7 +190,7 @@ class PreloadTests(unittest.TestCase):
             self.data_tree(root)
             self.publish(raw, root)
             data = json.loads((root / "signalk/package.json").read_text())
-            self.assertEqual(data["dependencies"], {"signalk-vesseltwin": "0.2.1"})
+            self.assertEqual(data["dependencies"], {"signalk-vesseltwin": "0.2.3"})
             self.assertEqual(os.listdir(root / "signalk"), ["node_modules", "package.json"])
 
     def test_publish_preserves_package_json_keys_and_is_idempotent(self):
@@ -173,7 +204,7 @@ class PreloadTests(unittest.TestCase):
             self.publish(raw, root)
             data = json.loads(path.read_text())
             self.assertEqual(data["custom"], {"a": 1})
-            self.assertEqual(data["dependencies"], {"other": "^1.0.0", "signalk-vesseltwin": "0.2.1"})
+            self.assertEqual(data["dependencies"], {"other": "^1.0.0", "signalk-vesseltwin": "0.2.3"})
             self.assertEqual(path.stat().st_mode & 0o777, 0o640)
             # A second pass (plugin now present, dependency listed) changes nothing.
             before = path.read_text()
@@ -205,7 +236,7 @@ class PreloadTests(unittest.TestCase):
             self.pin(raw)
             args = types.SimpleNamespace(data=root, uid=os.getuid(), gid=os.getgid())
             with mock.patch.object(preload.os, "geteuid", return_value=1000):
-                preload.publish(raw, args, root / "signalk/node_modules/signalk-vesseltwin")
+                return preload.publish(raw, args, root / "signalk/node_modules/signalk-vesseltwin")
             self.assertTrue((root / "signalk/node_modules/signalk-vesseltwin/package.json").exists())
 
     @unittest.skipUnless(platform.system() == "Linux" and os.geteuid() == 0, "requires Linux root")
