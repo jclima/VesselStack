@@ -50,7 +50,7 @@ Runtime behavior is governed by `boat-chat/BOAT_CHAT_AGENT.md`. It is optimized 
 
 Complex questions use semantic signal groups instead of requiring every query word to appear in one measurement name. Boat Chat can gather multiple requested signals, exact local windows (including the recorded last trip), min/max timestamps, aligned values at notable times, port/starboard comparisons, RPM-matched comparisons, threshold durations, and correlations. Engine diagnostics include a separate engine-running view so normal engine-off zero readings do not become false low-pressure or fuel-flow findings.
 
-Current SignalK values are converted to the configured `BOAT_UNITS` display units before model reasoning. Nearby-vessel/AIS questions use the SignalK `/vessels` feed and include target distance, speed, course, position timestamp, and staleness. Home Assistant contributes current states, unavailable/stale review lists, and relevant retained state transitions for complex alert, shore-power, trip, bilge, and service questions.
+Current SignalK values are converted to the configured `BOAT_UNITS` display units before model reasoning, and timestamps use the effective `BOAT_TIMEZONE` configured at service startup. Source instants, offsets, and unit labels remain authoritative; unknown units are not guessed. Nearby-vessel/AIS questions use the SignalK `/vessels` feed and include target distance, speed, course, position timestamp, and staleness. Home Assistant contributes current states, unavailable/stale review lists, and relevant retained state transitions for complex alert, shore-power, trip, bilge, and service questions.
 
 The web and Telegram clients send the last few conversation turns with each request. A short answer to a clarification, such as `last 30 days`, is combined with the prior user question instead of being treated as a new unrelated question. Telegram `/clear` and the web Clear button reset that context.
 
@@ -137,6 +137,8 @@ journalctl -u vesselstack-telemetry-indexer.service --since "1 hour ago"
 - `BOAT_CHAT_CLI_TIMEOUT` — optional timeout in seconds for CLI-backed providers; defaults to `120`.
 - `BOAT_CHAT_HOST` — optional, defaults to `0.0.0.0` so trusted LAN devices can reach it.
 - `BOAT_CHAT_PORT` — optional, defaults to `8765`.
+- `BOAT_TIMEZONE` — IANA timezone used for query windows and displayed timestamps; restart Boat Chat after changing it.
+- `BOAT_UNITS` — `us_customary` (default) or `metric` for presentation; canonical telemetry and cache values are not rewritten.
 - `BOAT_CHAT_URL` — optional internal URL used by the Telegram worker. Defaults to `http://127.0.0.1:<BOAT_CHAT_PORT>`.
 - `TELEGRAM_BOT_TOKEN` — optional BotFather token for the Telegram worker.
 - `TELEGRAM_ALLOWED_CHAT_IDS` — comma-separated Telegram chat IDs allowed to ask boat questions.

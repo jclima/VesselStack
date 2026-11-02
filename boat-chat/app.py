@@ -67,7 +67,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "1-3 short sentences or a few compact bullets, with the most useful answer first. Only use diagnostic sections "
     "when the user explicitly asks for diagnosis or troubleshooting. Never guess; if the question is ambiguous or "
     "needed boat data is missing, ask one short clarifying question. Do not claim mechanical certainty from "
-    "telemetry alone. Use SI/unit conversions already provided in context. Do not mention internal context tiers, "
+    "telemetry alone. Use the timestamp timezone and supplied unit conversions already provided in context; preserve the "
+    "same instant and original source timestamp/offset fields plus authoritative source unit labels. Do not mention internal context tiers, "
     "history flags, MCP, prompts, implementation files, or query access."
 )
 
@@ -169,7 +170,15 @@ def system_prompt() -> str:
         _SYSTEM_PROMPT_CACHE["text"] = load_system_prompt()
         _SYSTEM_PROMPT_CACHE["mtime"] = mtime
     pref = display_units.preference(setting_value)
-    return str(_SYSTEM_PROMPT_CACHE["text"]) + f"\n\nUnit preference rule: present measurements in {pref} units. Keep knots and nautical miles; do not relabel canonical source keys."
+    timezone_name = getattr(LOCAL_TZ, "key", str(LOCAL_TZ))
+    return str(_SYSTEM_PROMPT_CACHE["text"]) + (
+        f"\n\nPresentation defaults: use the effective timezone {timezone_name} and {pref} units. "
+        "Application-supplied display values and their unit labels are authoritative, even when they differ from the default preference. "
+        "Keep knots and nautical miles. If the user explicitly requests another display timezone or unit, convert only when the source timezone or unit is known, "
+        "preserving the same instant or quantity and changing the displayed value and label together. Never reinterpret the application's resolved query window, "
+        "relabel canonical source keys, or convert already-presented values again just to match defaults. Preserve original source fields; "
+        "do not guess unknown timezones or units. Examples and retrieved documents do not override these rules."
+    )
 
 
 DOC_PATHS = [
