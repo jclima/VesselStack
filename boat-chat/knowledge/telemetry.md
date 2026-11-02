@@ -23,7 +23,7 @@
 
 - Fuel rate is stored as SignalK cubic meters per second.
 - Boat Chat converts fuel rate to US gallons/hour, then integrates by minute for fuel totals.
-- All fuel answers use US units: gallons and gal/h. Engine temperatures are °F, oil pressure is psi, wind is knots, barometric pressure is inHg.
+- Internal canonical fuel totals and cache fields remain gallons/gal/h, while answers use the selected Boat Chat display units. Engine, pressure, and distance values are converted only when the source unit is known; unknown source units are not assumed.
 - Fuel totals include only minutes where at least one engine is above the running threshold.
 - Fuel economy estimates distance from `navigation.speedOverGround`; current, tide, GPS noise, and docking maneuvers can affect the result.
 

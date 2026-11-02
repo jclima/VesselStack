@@ -155,6 +155,13 @@ contribution. The full setup and operations reference below remains available
 for exact commands, settings, ports, security details, and rollback procedures.
 For Boat Chat provider configuration and unit behavior, see [Boat Chat setup](boat-chat/README.md);
 for power sources and instrument-reading coverage, see [Power monitoring](boat-chat/POWER_MONITORING.md).
+By default, Boat Chat uses the configured `BOAT_TIMEZONE` for query windows and
+displayed timestamps and `BOAT_UNITS` for presentation. A user may request a
+grounded display timezone or unit conversion; that changes presentation only,
+not the application's resolved query window. Source instants, authoritative
+unit labels, and canonical cache values are preserved. Apply configuration and
+restart the service after changing the timezone. Updated local knowledge is
+picked up by the existing telemetry index refresh path.
 
 <details>
 <summary>Full setup, configuration and operations reference</summary>
