@@ -10,7 +10,9 @@ the boat's local network when the internet is unavailable.
 ## What you get
 
 - A local view of boat data from Signal K-compatible sources and supported NMEA
-  2000/SocketCAN hardware.
+  2000/SocketCAN hardware. An isolated NMEA 2000 interface is preferred (safest); a
+  non-isolated one such as the PiCAN-M works with caveats; see the
+  [hardware guide](docs/BOM.md).
 - History and dashboards through InfluxDB, Grafana, MQTT, and Home Assistant.
 - Boat Chat, a local diagnostic assistant with an optional provider you choose.
 - A guided installer, backups, health checks, and an offline release path.
@@ -96,7 +98,9 @@ and follow the [offline deployment path](docs/DEPLOYMENT.md).
 Before installation, decide where the Pi will live, how it will be powered,
 and whether its data disk and backups are separate from the boot media. If you
 connect to NMEA 2000, confirm the bus is correctly powered and terminated and
-that the interface is galvanically isolated. Commission on the bench first.
+that you have chosen the interface and its power source deliberately
+(an isolated interface is preferred (safest); a non-isolated one such as the
+PiCAN-M works with caveats, see docs/BOM.md). Commission on the bench first.
 
 After installation, use the printed URLs from a trusted local device, run
 `sudo vesselstackctl doctor`, and confirm the dashboards show the signals you expect.
@@ -262,7 +266,7 @@ This computer: aarch64, 7.6 GiB RAM, Docker ready; CAN: no can0 yet; network: et
 [3/9] NMEA 2000 (CAN bus)
     No can0 interface found yet (normal before the CAN HAT overlay is installed). You can enable it later.
   Enable SocketCAN / NMEA 2000? [y/N]: ?
-    Needs an isolated CAN interface, a powered and terminated backbone, and the can0 device present. ...
+    An isolated CAN interface is preferred (safest); a non-isolated one such as the PiCAN-M works with caveats (see docs/BOM.md). Needs a powered and terminated backbone and the can0 device present. ...
   Enable SocketCAN / NMEA 2000? [y/N]:
 ...
 Advanced settings (service account, folders, ports, container and bucket names, passwords)? [y/N]:

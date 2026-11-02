@@ -14,8 +14,9 @@ For a complete hardware-to-commissioning run, use
   Ethernet, and a laptop or desktop with an SSH client.
 - Storage with room for the operating system, containers, history, backups, and
   updates. An SSD is strongly preferred for time-series data.
-- If using NMEA 2000, an isolated, compatible SocketCAN interface, a powered
-  and terminated backbone, and the vendor's Pi overlay configured before
+- If using NMEA 2000, a compatible SocketCAN interface (isolated is preferred, safest; a
+  non-isolated one such as the PiCAN-M works with caveats, see
+  [BOM.md](BOM.md)), a powered and terminated backbone, and the vendor's Pi overlay configured before
   enabling CAN. VesselStack does not edit boot firmware or turn hardware on.
 - A quiet commissioning window. Do not install or validate while underway, and
   do not use VesselStack as your only alarm or navigation system.
