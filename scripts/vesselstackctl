@@ -263,6 +263,8 @@ start_stack() {
     fi
     if [ "${TELEMETRY_INDEXER_ENABLE:-true}" = true ]; then
         systemctl start vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer
+    else
+        stop_telemetry || return 1
     fi
     if [ "${DISPLAYS_ENABLE:-false}" = true ]; then
         systemctl start vesselstack-displays-bridge.service

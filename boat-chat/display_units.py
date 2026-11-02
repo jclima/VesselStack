@@ -15,6 +15,23 @@ PA_PER_PSI = 6894.757293168
 PA_PER_INHG = 3386.389
 M_PER_FT = 0.3048
 
+_CONVERSION_FACTORS = {
+    ("pa", "kpa"): 1 / 1000, ("psi", "kpa"): PA_PER_PSI / 1000,
+    ("pa", "psi"): 1 / PA_PER_PSI, ("psi", "pa"): PA_PER_PSI,
+    ("kpa", "psi"): 1000 / PA_PER_PSI, ("psi", "hpa"): PA_PER_PSI / 100,
+    ("hpa", "psi"): 100 / PA_PER_PSI, ("pa", "hpa"): 1 / 100,
+    ("hpa", "kpa"): 0.1, ("kpa", "hpa"): 10,
+    ("inhg", "hpa"): PA_PER_INHG / 100, ("hpa", "inhg"): 100 / PA_PER_INHG,
+    ("inhg", "kpa"): PA_PER_INHG / 1000, ("kpa", "inhg"): 1000 / PA_PER_INHG,
+    ("pa", "inhg"): 1 / PA_PER_INHG, ("inhg", "pa"): PA_PER_INHG,
+    ("psi", "inhg"): PA_PER_PSI / PA_PER_INHG, ("inhg", "psi"): PA_PER_INHG / PA_PER_PSI,
+    ("kpa", "pa"): 1000, ("hpa", "pa"): 100,
+    ("ft", "m"): M_PER_FT, ("m", "ft"): 1 / M_PER_FT,
+    ("gal/h", "l/h"): 1 / US_GALLONS_PER_LITER, ("l/h", "gal/h"): US_GALLONS_PER_LITER,
+    ("us gal", "l"): 1 / US_GALLONS_PER_LITER, ("gal", "l"): 1 / US_GALLONS_PER_LITER,
+    ("l", "us gal"): US_GALLONS_PER_LITER, ("l", "gal"): US_GALLONS_PER_LITER,
+}
+
 
 def normalize_preference(value: str | None) -> str:
     return "metric" if str(value or "").strip().lower() in {"metric", "si", "metre", "meters"} else "us_customary"
@@ -96,33 +113,15 @@ def convert(value: float, from_unit: str, to_unit: str) -> float:
         return (value - 32.0) * 5.0 / 9.0
     if f in {"c", "°c"} and t in {"f", "°f"}:
         return value * 9.0 / 5.0 + 32.0
-    factors = {
-        ("pa", "kpa"): 1 / 1000,
-        ("psi", "kpa"): PA_PER_PSI / 1000,
-        ("pa", "psi"): 1 / PA_PER_PSI,
-        ("psi", "pa"): PA_PER_PSI,
-        ("kpa", "psi"): 1000 / PA_PER_PSI,
-        ("psi", "hpa"): PA_PER_PSI / 100,
-        ("hpa", "psi"): 100 / PA_PER_PSI,
-        ("pa", "hpa"): 1 / 100,
-        ("hpa", "kpa"): 0.1,
-        ("kpa", "hpa"): 10,
-        ("inhg", "hpa"): PA_PER_INHG / 100,
-        ("hpa", "inhg"): 100 / PA_PER_INHG,
-        ("inhg", "kpa"): PA_PER_INHG / 1000,
-        ("kpa", "inhg"): 1000 / PA_PER_INHG,
-        ("kpa", "pa"): 1000,
-        ("hpa", "pa"): 100,
-        ("ft", "m"): M_PER_FT,
-        ("m", "ft"): 1 / M_PER_FT,
-        ("gal/h", "l/h"): 1 / US_GALLONS_PER_LITER,
-        ("l/h", "gal/h"): US_GALLONS_PER_LITER,
-        ("us gal", "l"): 1 / US_GALLONS_PER_LITER,
-        ("gal", "l"): 1 / US_GALLONS_PER_LITER,
-        ("l", "us gal"): US_GALLONS_PER_LITER,
-        ("l", "gal"): US_GALLONS_PER_LITER,
-    }
-    return value * factors.get((f, t), 1.0)
+    return value * _CONVERSION_FACTORS.get((f, t), 1.0)
+
+
+def conversion_supported(from_unit: str, to_unit: str) -> bool:
+    """Whether conversion has a defined factor (rather than a silent fallback)."""
+    f, t = from_unit.lower().replace("°", ""), to_unit.lower().replace("°", "")
+    if f == t or not f or not t:
+        return bool(f and t)
+    return (f, t) in _CONVERSION_FACTORS or {f, t} == {"f", "c"}
 
 
 def convert_delta(value: float, from_unit: str, to_unit: str) -> float:

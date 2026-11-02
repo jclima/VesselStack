@@ -40,6 +40,119 @@ class MetricPresentationTests(unittest.TestCase):
             self.assertEqual(APP._threshold_unit_for_measurement("propulsion.port.oilPressure", "kPa", "below 100"), ("psi", "kPa"))
             self.assertEqual(APP._threshold_unit_for_measurement("environment.outside.pressure", None, "barometer below 1000"), ("inHg", "hPa"))
 
+    def test_history_thresholds_use_explicit_ha_temperature_units(self):
+        ha = {"matched": [{"entity_id": "sensor.air_temperature", "unit": "°C"}]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.air_temperature", "_value": "20"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.air_temperature", "_value": "30"},
+        ]}
+        history = self._history(rows, ha, "temperature history above 25C")
+        analysis = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]["analysis"]
+        self.assertEqual(analysis["threshold_analysis"][0]["matching_samples"], 1)
+        self.assertEqual(analysis["threshold_analysis"][0]["threshold_unit"], "°C")
+
+    def test_history_implicit_ha_temperature_threshold_uses_preference(self):
+        ha = {"matched": [{"entity_id": "sensor.air_temperature", "unit": "°C"}]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.air_temperature", "_value": "20"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.air_temperature", "_value": "30"},
+        ]}
+        for preference, query in (("metric", "temperature above 25"), ("us_customary", "temperature above 77")):
+            with mock.patch.dict(os.environ, {"BOAT_UNITS": preference}, clear=False):
+                history = self._history(rows, ha, query)
+            bucket = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]
+            self.assertEqual(bucket["units"]["sensor.air_temperature"], "°C")
+            self.assertEqual(bucket["numeric_summary"]["sensor.air_temperature"]["avg"], 25.0)
+            self.assertEqual(bucket["analysis"]["threshold_analysis"][0]["matching_samples"], 1)
+
+    def test_history_thresholds_convert_fahrenheit_and_pressure_units(self):
+        ha = {"matched": [
+            {"entity_id": "sensor.temp_f", "unit": "°F"},
+            {"entity_id": "sensor.pressure", "unit": "kPa"},
+        ]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.temp_f", "_value": "68"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.temp_f", "_value": "86"},
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.pressure", "_value": "100"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.pressure", "_value": "10"},
+        ]}
+        history = self._history(rows, ha, "temperature above 25C")
+        results = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]["analysis"]["threshold_analysis"]
+        self.assertEqual({item["measurement"]: item["matching_samples"] for item in results}, {"sensor.temp_f": 1})
+        history = self._history(rows, ha, "pressure above 14psi")
+        results = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]["analysis"]["threshold_analysis"]
+        self.assertEqual({item["measurement"]: item["matching_samples"] for item in results}, {"sensor.pressure": 1})
+
+    def test_history_thresholds_skip_unknown_or_incompatible_source_units(self):
+        ha = {"matched": [
+            {"entity_id": "sensor.opaque", "unit": "mystery"},
+            {"entity_id": "sensor.pressure", "unit": "kPa"},
+        ]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.opaque", "_value": "1"},
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.pressure", "_value": "100"},
+        ]}
+        analysis = APP.analyze_history_rows(
+            "temperature above 25C",
+            rows[APP.INFLUX_HOME_ASSISTANT_BUCKET],
+            ["sensor.opaque", "sensor.pressure"],
+            1,
+            {"sensor.opaque": "mystery", "sensor.pressure": "kPa"},
+        )
+        self.assertEqual(analysis["threshold_analysis"], [])
+
+    def test_history_thresholds_convert_pa_to_inhg(self):
+        rows = [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.pressure", "_value": "101325"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.pressure", "_value": "90000"},
+        ]
+        analysis = APP.analyze_history_rows("pressure above 29inHg", rows, ["sensor.pressure"], 1, {"sensor.pressure": "Pa"})
+        self.assertEqual(analysis["threshold_analysis"][0]["matching_samples"], 1)
+
+    def test_history_thresholds_accept_pa_explicit_spaced_and_attached(self):
+        ha = {"matched": [{"entity_id": "sensor.pressure", "unit": "Pa"}]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.pressure", "_value": "100000"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.pressure", "_value": "90000"},
+        ]}
+        for preference, message in (("metric", "pressure above 95000 Pa"), ("us_customary", "pressure above 95000Pa")):
+            with mock.patch.dict(os.environ, {"BOAT_UNITS": preference}, clear=False):
+                history = self._history(rows, ha, message)
+            analysis = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]["analysis"]
+            self.assertEqual(analysis["threshold_analysis"][0]["matching_samples"], 1)
+            self.assertEqual(analysis["threshold_analysis"][0]["threshold_unit"], "Pa")
+
+    def test_supplied_missing_units_do_not_guess_but_none_keeps_signalk_fallback(self):
+        rows = [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.temp", "_value": "68"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.temp", "_value": "86"},
+        ]
+        self.assertEqual(APP.analyze_history_rows("temperature above 25C", rows, ["sensor.temp"], 1, {})["threshold_analysis"], [])
+        self.assertEqual(APP.analyze_history_rows("temperature above 25C", rows, ["sensor.temp"], 1, {"other": "°F"})["threshold_analysis"], [])
+        signalk = APP.analyze_history_rows("temperature above 25C", rows, ["propulsion.port.temperature"], 1)
+        self.assertEqual(signalk["threshold_analysis"], [])
+        signalk_rows = [dict(row, _measurement="propulsion.port.temperature") for row in rows]
+        signalk = APP.analyze_history_rows("temperature above 25C", signalk_rows, ["propulsion.port.temperature"], 1)
+        self.assertEqual(signalk["threshold_analysis"][0]["matching_samples"], 1)
+
+    def test_source_gph_alias_converts_l_per_hour_threshold(self):
+        rows = [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.fuel", "_value": "0.1"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.fuel", "_value": "1"},
+        ]
+        analysis = APP.analyze_history_rows("fuel above 2L/h", rows, ["sensor.fuel"], 1, {"sensor.fuel": "gph"})
+        self.assertEqual(analysis["threshold_analysis"][0]["matching_samples"], 1)
+
+    def test_history_thresholds_keep_same_unit_canonical_signals(self):
+        rows = [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "electrical.current", "_value": "4"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "electrical.current", "_value": "6"},
+        ]
+        analysis = APP.analyze_history_rows("current above 5", rows, ["electrical.current"], 1)
+        self.assertEqual(analysis["threshold_analysis"][0]["matching_samples"], 1)
+        unknown = APP.analyze_history_rows("current above 5", rows, ["electrical.current"], 1, {"electrical.current": "mystery"})
+        self.assertEqual(unknown["threshold_analysis"], [])
+
     def test_chart_points_have_display_labels(self):
         with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
             points = [{"_time": "2026-01-01T00:00:00Z", "_measurement": "propulsion.port.temperature", "_value": "212"}]
