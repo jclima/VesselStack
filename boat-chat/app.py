@@ -1516,11 +1516,17 @@ def _threshold_unit_for_measurement(
         return row_unit, query_unit
     lower = message.lower()
     pref = display_units.preference(setting_value)
-    families = [("temperature", ["temperature", "temp", "coolant"], "°C" if pref == "metric" else "F"), ("pressure", ["pressure", "psi", "kpa", "barometer"], "kPa" if pref == "metric" else "psi"), ("depth", ["depth", "feet", "meter"], "m" if pref == "metric" else "ft"), ("fuel", ["fuel", "gph", "gal/h", "l/h"], "L/h" if pref == "metric" else "gal/h"), ("voltage", ["voltage", "volt"], "V")]
+    families = [("temperature", ["temperature", "temp", "coolant"], "°C" if pref == "metric" else "F"), ("pressure", ["pressure", "psi", "kpa", "barometer", "barometric"], "kPa" if pref == "metric" else "psi"), ("depth", ["depth", "feet", "meter"], "m" if pref == "metric" else "ft"), ("fuel", ["fuel", "gph", "gal/h", "l/h"], "L/h" if pref == "metric" else "gal/h"), ("voltage", ["voltage", "volt"], "V")]
     hits = [unit for _name, terms, unit in families if any(term in lower for term in terms)]
     if not hits:
         return row_unit, row_unit
-    query_unit = "hPa" if pref == "metric" and ("barometer" in lower or ("environment." in measurement.lower() and "pressure" in measurement.lower())) else hits[0]
+    measurement_lower = measurement.lower()
+    is_barometric = (
+        "barometer" in lower
+        or "barometric" in lower
+        or (measurement_lower.startswith("environment.") and "pressure" in measurement_lower)
+    )
+    query_unit = ("hPa" if pref == "metric" else "inHg") if is_barometric else hits[0]
     row_dimension = "temperature" if "temp" in measurement.lower() or "temperature" in measurement.lower() else "pressure" if "pressure" in measurement.lower() else "depth" if "depth" in measurement.lower() else "fuel" if "fuel" in measurement.lower() else "voltage" if "voltage" in measurement.lower() else None
     query_dimension = next((name for name, terms, _unit in families if any(term in lower for term in terms)), None)
     if dim(row_unit) != dim(query_unit) and (source_unit is not None or row_dimension or query_dimension):
@@ -1593,14 +1599,14 @@ def analyze_history_rows(
 
     threshold_results: list[dict[str, Any]] = []
     threshold_match = re.search(
-        r"\b(below|under|above|over)\s+(-?\d+(?:\.\d+)?)\s*(v|volts?|psi|kpa|hpa|pa|inhg|knots?|kt|ft|feet|m|l/h|gph|gal/h|°?c|°?f|percent|%)?\b",
+        r"\b(below|under|above|over)\s+(-?\d+(?:\.\d+)?)\s*(v|volts?|psi|kpa|hpa|pa|inhg|knots?|kt|ft|feet|m|l/h|gph|gal/h|°?c|°?f|percent|%)?(?![\w%])",
         message.lower(),
     )
     if threshold_match:
         direction = threshold_match.group(1)
         threshold = float(threshold_match.group(2))
         explicit_unit = threshold_match.group(3)
-        if not explicit_unit and len(selected) > 1 and not re.search(r"temperature|temp|coolant|pressure|psi|kpa|barometer|depth|feet|meter|fuel|gph|gal/h|l/h|voltage|volt|percent|%", message.lower()):
+        if not explicit_unit and len(selected) > 1 and not re.search(r"temperature|temp|coolant|pressure|psi|kpa|barometer|barometric|depth|feet|meter|fuel|gph|gal/h|l/h|voltage|volt|percent|%", message.lower()):
             selected = []
         for measurement in selected[:8]:
             samples = [values[measurement] for values in by_time.values() if measurement in values]

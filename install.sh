@@ -825,6 +825,17 @@ if [ "$NODE_EXPORTER_ENABLE" = true ]; then
 else
     install -m 0644 "$SCRIPT_DIR/templates/prometheus.yml" "$VESSELSTACK_ROOT/config/prometheus.yml"
 fi
+PROMETHEUS_CONF="$VESSELSTACK_ROOT/config/prometheus.yml"
+PROMETHEUS_CONF_STAMP="$VESSELSTACK_ROOT/config/.prometheus-conf.sha256"
+PROMETHEUS_CONF_HASH=$(sha256sum "$PROMETHEUS_CONF" | cut -d' ' -f1)
+write_prometheus_stamp() {
+    local tmp
+    tmp=$(mktemp "${PROMETHEUS_CONF_STAMP}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$PROMETHEUS_CONF_HASH" > "$tmp" || ! chmod 0644 "$tmp" || ! mv -f -- "$tmp" "$PROMETHEUS_CONF_STAMP"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
 # The legacy single-file config/mosquitto.conf is deliberately left alone: a
 # container created by an older release keeps bind-mounting it, also across
 # reboots, until it is recreated; a downgrade finds it unchanged.
@@ -1138,8 +1149,12 @@ if [ "$START" -eq 1 ]; then
     if [ "${#selected_services[@]}" -gt 0 ]; then
         "${compose_up[@]}" "${selected_services[@]}"
     fi
-    if ! component_disabled prometheus; then
-        "${compose_up[@]}" --force-recreate prometheus
+    if ! component_disabled prometheus && {
+        [ ! -r "$PROMETHEUS_CONF_STAMP" ] ||
+        [ "$(<"$PROMETHEUS_CONF_STAMP")" != "$PROMETHEUS_CONF_HASH" ];
+    }; then
+        "${compose_up[@]}" --force-recreate prometheus || exit 1
+        write_prometheus_stamp || exit 1
     fi
     [ "$NODE_EXPORTER_ENABLE" = true ] || compose rm --stop --force node-exporter 2>/dev/null || true
     # A changed compose definition is recreated by "compose up -d" itself; a

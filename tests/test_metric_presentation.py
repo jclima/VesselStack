@@ -40,6 +40,152 @@ class MetricPresentationTests(unittest.TestCase):
             self.assertEqual(APP._threshold_unit_for_measurement("propulsion.port.oilPressure", "kPa", "below 100"), ("psi", "kPa"))
             self.assertEqual(APP._threshold_unit_for_measurement("environment.outside.pressure", None, "barometer below 1000"), ("inHg", "hPa"))
 
+    def test_barometric_threshold_defaults_follow_metric_or_customary_preference(self):
+        for preference, expected in (("metric", "hPa"), ("us_customary", "inHg")):
+            with mock.patch.dict(os.environ, {"BOAT_UNITS": preference}, clear=False):
+                self.assertEqual(
+                    APP._threshold_unit_for_measurement(
+                        "environment.outside.pressure", None, "barometer below 30", "Pa"
+                    ),
+                    ("Pa", expected),
+                )
+                self.assertEqual(
+                    APP._threshold_unit_for_measurement(
+                        "environment.outside.pressure", None, "pressure below 30", "hPa"
+                    ),
+                    ("hPa", expected),
+                )
+
+    def test_explicit_barometric_threshold_unit_overrides_preference(self):
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
+            self.assertEqual(
+                APP._threshold_unit_for_measurement(
+                    "environment.outside.pressure", "psi", "barometer below 30psi", "kPa"
+                ),
+                ("kPa", "psi"),
+            )
+
+    def test_actual_signalk_barometer_threshold_uses_pa_source_and_preserves_chart_values(self):
+        rows = {
+            APP.INFLUX_HISTORY_BUCKET: [
+                {"_time": "2026-01-01T00:00:00Z", "_measurement": "environment.outside.pressure", "_value": str(29.5 * 3386.389)},
+                {"_time": "2026-01-01T00:01:00Z", "_measurement": "environment.outside.pressure", "_value": str(31 * 3386.389)},
+            ],
+            APP.INFLUX_HOME_ASSISTANT_BUCKET: [],
+        }
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "us_customary"}, clear=False):
+            history = self._history(rows, message="barometer below 30")
+        bucket = history["buckets"][APP.INFLUX_HISTORY_BUCKET]
+        result = bucket["analysis"]["threshold_analysis"][0]
+        self.assertEqual(result["matching_samples"], 1)
+        self.assertEqual(result["threshold_unit"], "inHg")
+        self.assertEqual(bucket["chart_series"][0]["unit"], "inHg")
+        self.assertAlmostEqual(bucket["chart_series"][0]["points"][0]["value"], 29.5, places=2)
+
+    def test_actual_ha_barometer_threshold_uses_hpa_in_metric_preference(self):
+        ha = {"matched": [{"entity_id": "sensor.barometric_pressure", "unit": "hPa"}]}
+        rows = {
+            APP.INFLUX_HISTORY_BUCKET: [],
+            APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+                {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.barometric_pressure", "_value": "1000"},
+                {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.barometric_pressure", "_value": "1050"},
+            ],
+        }
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
+            history = self._history(rows, ha, "barometer below 1016 hPa")
+        bucket = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]
+        result = bucket["analysis"]["threshold_analysis"][0]
+        self.assertEqual(result["matching_samples"], 1)
+        self.assertEqual(result["threshold_unit"], "hPa")
+        self.assertEqual(bucket["units"]["sensor.barometric_pressure"], "hPa")
+
+    def test_actual_mixed_barometric_history_keeps_both_pressure_measurements(self):
+        ha = {"matched": [
+            {"entity_id": "sensor.barometric_pressure", "unit": "hPa"},
+            {"entity_id": "sensor.outside_pressure", "unit": "hPa"},
+        ]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.barometric_pressure", "_value": "1000"},
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.outside_pressure", "_value": "1000"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.barometric_pressure", "_value": "1050"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.outside_pressure", "_value": "1050"},
+        ]}
+        for preference, threshold in (("metric", "1016"), ("us_customary", "30")):
+            with mock.patch.dict(os.environ, {"BOAT_UNITS": preference}, clear=False):
+                history = self._history(rows, ha, f"barometric pressure below {threshold}")
+            results = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]["analysis"]["threshold_analysis"]
+            self.assertEqual(
+                {item["measurement"]: (item["matching_samples"], item["threshold_unit"]) for item in results},
+                {
+                    "sensor.barometric_pressure": (1, "hPa" if preference == "metric" else "inHg"),
+                    "sensor.outside_pressure": (1, "hPa" if preference == "metric" else "inHg"),
+                },
+            )
+
+    def test_actual_history_explicit_pressure_unit_overrides_both_preferences_and_engine_defaults_remain(self):
+        ha = {"matched": [{"entity_id": "sensor.barometric_pressure", "unit": "hPa"}]}
+        rows = {
+            APP.INFLUX_HISTORY_BUCKET: [],
+            APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+                {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.barometric_pressure", "_value": "1000"},
+                {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.barometric_pressure", "_value": "1050"},
+            ],
+        }
+        for preference in ("metric", "us_customary"):
+            with mock.patch.dict(os.environ, {"BOAT_UNITS": preference}, clear=False):
+                history = self._history(rows, ha, "barometer below 14psi")
+            result = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]["analysis"]["threshold_analysis"][0]
+            self.assertEqual(result["threshold_unit"], "psi")
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
+            self.assertEqual(APP._threshold_unit_for_measurement("propulsion.port.oilPressure", None, "oil pressure below 100", "kPa"), ("kPa", "kPa"))
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "us_customary"}, clear=False):
+            self.assertEqual(APP._threshold_unit_for_measurement("propulsion.port.oilPressure", None, "oil pressure below 14", "kPa"), ("kPa", "psi"))
+
+    def test_percent_threshold_does_not_match_voltage_in_mixed_soc_history(self):
+        rows = [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.soc", "_value": "40"},
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.voltage", "_value": "12"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.soc", "_value": "60"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.voltage", "_value": "13"},
+        ]
+        for suffix in ("%", " %", "%,", "%).", " percent"):
+            message = f"SOC and voltage below 50{suffix}"
+            analysis = APP.analyze_history_rows(
+                message,
+                rows,
+                ["sensor.soc", "sensor.voltage"],
+                1,
+                {"sensor.soc": "%", "sensor.voltage": "V"},
+            )
+            self.assertEqual(
+                analysis["threshold_analysis"],
+                [{
+                    "measurement": "sensor.soc",
+                    "direction": "below",
+                    "threshold": 50.0,
+                    "threshold_unit": "%",
+                    "matching_samples": 1,
+                    "total_samples": 2,
+                    "approximate_matching_hours": 0.02,
+                }],
+            )
+
+    def test_actual_ha_percent_threshold_route_preserves_soc_only_in_both_preferences(self):
+        ha = {"matched": [{"entity_id": "sensor.soc", "unit": "%"}, {"entity_id": "sensor.voltage", "unit": "V"}]}
+        rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.soc", "_value": "40"},
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "sensor.voltage", "_value": "12"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.soc", "_value": "60"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "sensor.voltage", "_value": "13"},
+        ]}
+        for preference in ("metric", "us_customary"):
+            with mock.patch.dict(os.environ, {"BOAT_UNITS": preference}, clear=False):
+                history = self._history(rows, ha, "SOC and voltage below 50%,")
+            bucket = history["buckets"][APP.INFLUX_HOME_ASSISTANT_BUCKET]
+            self.assertEqual([(item["measurement"], item["matching_samples"], item["threshold_unit"]) for item in bucket["analysis"]["threshold_analysis"]], [("sensor.soc", 1, "%")])
+            chart_units = {series["label"]: series["unit"] for series in bucket["chart_series"]}
+            self.assertEqual(chart_units, {"voltage": "V", "soc": "%"})
+
     def test_history_thresholds_use_explicit_ha_temperature_units(self):
         ha = {"matched": [{"entity_id": "sensor.air_temperature", "unit": "°C"}]}
         rows = {APP.INFLUX_HISTORY_BUCKET: [], APP.INFLUX_HOME_ASSISTANT_BUCKET: [

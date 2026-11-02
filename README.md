@@ -1013,6 +1013,11 @@ are converted to the measurement's source unit; omitted query units follow
 `BOAT_UNITS`. Missing, unsupported, or incompatible units omit the threshold
 count rather than guessing a conversion. Raw samples and cached values are
 unchanged.
+Percentage thresholds keep `%` as an explicit unit, including `50%`, `50 %`,
+and `50 percent`, so a mixed SOC/voltage question compares only percentage
+signals. Implicit barometer thresholds use inHg in US customary mode and hPa
+in metric mode; engine-pressure defaults remain psi and kPa. An explicit unit
+in the question always overrides these defaults.
 The interface rate-limits each client and runs at most two chat requests at a
 time so slow model calls cannot exhaust the Raspberry Pi.
 
@@ -1116,11 +1121,27 @@ scrape target. Existing Prometheus data, retention, and listener settings are
 preserved. Offline bundles must be rebuilt with this release so the exporter
 image is available before enabling it offline.
 
+**Apply configuration** followed by **Start** also applies exporter scrape
+changes to a running Prometheus instance. The controller records the last
+successfully applied configuration hash in `config/.prometheus-conf.sha256`;
+render-only Apply does not advance it. Missing or changed hashes cause only
+Prometheus to be recreated, and a failed recreation leaves the previous stamp
+intact for retry. Unchanged starts do not force another recreation. The first
+start after upgrading an installation without this stamp recreates Prometheus
+once. A disabled Prometheus component is neither started nor marked applied.
+This preserves its data volume, retention, and listener configuration and adds
+no reload endpoint or published port.
+The render-only Apply → installed Start regressions run with
+`sudo tests/test-offline-install.sh` on Linux using fake external commands.
+
 After updating an existing installation, rerun the reviewed installer to apply
 the service and dashboard templates, then start the telemetry services. These
 changes do not remove existing journal entries or rewrite retained telemetry.
 To roll back, install the previous reviewed release; it restores the earlier
 presentation, CLI behavior, and templates without a telemetry database migration.
+When rolling back to a release without applied-configuration tracking, remove
+`/opt/vesselstack/config/.prometheus-conf.sha256` (adjust for a custom install
+root) so a later upgrade checks application again instead of reusing that stamp.
 Focused regressions can be run from the repository root with:
 
 ```bash
