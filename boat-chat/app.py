@@ -1480,22 +1480,40 @@ def pearson_correlation(left: list[float], right: list[float]) -> float | None:
     return numerator / denominator
 
 
-def _threshold_unit_for_measurement(measurement: str, explicit: str | None, message: str) -> tuple[str, str] | None:
+def _threshold_unit_for_measurement(
+    measurement: str,
+    explicit: str | None,
+    message: str,
+    source_unit: str | None = None,
+) -> tuple[str, str] | None:
     """Return canonical row unit and query unit for comparable thresholds."""
-    row_unit = display_units.unit_for_measurement(measurement, "us_customary")
+    # An explicit source unit is authoritative.  Empty metadata means that the
+    # numeric value has no safe unit, so threshold analysis must be skipped.
+    if source_unit == "":
+        return None
+    aliases = {"f": "°F", "c": "°C", "psi": "psi", "kpa": "kPa", "pa": "Pa", "hpa": "hPa", "inhg": "inHg", "ft": "ft", "feet": "ft", "m": "m", "l/h": "L/h", "gph": "gal/h", "gal/h": "gal/h", "v": "V", "volts": "V", "percent": "%", "%": "%", "kn": "kn", "kt": "kn", "knot": "kn", "knots": "kn"}
+    row_unit = aliases.get(source_unit.lower(), source_unit) if source_unit is not None else display_units.unit_for_measurement(measurement, "us_customary")
     if not row_unit:
         return None
-    aliases = {"f": "°F", "c": "°C", "psi": "psi", "kpa": "kPa", "hpa": "hPa", "inhg": "inHg", "ft": "ft", "feet": "ft", "m": "m", "l/h": "L/h", "gph": "gal/h", "gal/h": "gal/h", "v": "V", "volts": "V", "percent": "%", "%": "%"}
+    dimensions = {
+        "temperature": {"f", "c"}, "pressure": {"psi", "kpa", "hpa", "inhg", "pa"},
+        "distance": {"ft", "m"}, "fuel": {"gal/h", "l/h"}, "voltage": {"v"}, "percent": {"%"}, "speed": {"kn"},
+        "current": {"a"}, "rotation": {"rpm"}, "power": {"w", "kw"}, "angle": {"deg", "deg/min"}, "time": {"h", "min", "s"},
+    }
+    def dim(unit: str) -> str | None:
+        plain = aliases.get(unit.lower(), unit).lower().replace("°", "")
+        return next((name for name, values in dimensions.items() if plain in values), None)
+    # Explicit metadata must itself be a supported unit.  This prevents the
+    # conversion helper's compatibility fallback from inventing comparisons.
+    if source_unit is not None and dim(row_unit) is None:
+        return None
     if explicit:
         query_unit = aliases.get(explicit.lower(), explicit)
-        dimensions = {
-            "temperature": {"f", "c"}, "pressure": {"psi", "kpa", "hpa", "inhg", "pa"},
-            "distance": {"ft", "m"}, "fuel": {"gal/h", "l/h"}, "voltage": {"v"}, "percent": {"%"},
-        }
-        def dim(unit: str) -> str | None:
-            plain = unit.lower().replace("°", "")
-            return next((name for name, values in dimensions.items() if plain in values), None)
-        return (row_unit, query_unit) if dim(row_unit) == dim(query_unit) else None
+        if dim(row_unit) != dim(query_unit):
+            return None
+        if not display_units.conversion_supported(query_unit, row_unit):
+            return None
+        return row_unit, query_unit
     lower = message.lower()
     pref = display_units.preference(setting_value)
     families = [("temperature", ["temperature", "temp", "coolant"], "°C" if pref == "metric" else "F"), ("pressure", ["pressure", "psi", "kpa", "barometer"], "kPa" if pref == "metric" else "psi"), ("depth", ["depth", "feet", "meter"], "m" if pref == "metric" else "ft"), ("fuel", ["fuel", "gph", "gal/h", "l/h"], "L/h" if pref == "metric" else "gal/h"), ("voltage", ["voltage", "volt"], "V")]
@@ -1505,7 +1523,11 @@ def _threshold_unit_for_measurement(measurement: str, explicit: str | None, mess
     query_unit = "hPa" if pref == "metric" and ("barometer" in lower or ("environment." in measurement.lower() and "pressure" in measurement.lower())) else hits[0]
     row_dimension = "temperature" if "temp" in measurement.lower() or "temperature" in measurement.lower() else "pressure" if "pressure" in measurement.lower() else "depth" if "depth" in measurement.lower() else "fuel" if "fuel" in measurement.lower() else "voltage" if "voltage" in measurement.lower() else None
     query_dimension = next((name for name, terms, _unit in families if any(term in lower for term in terms)), None)
-    return (row_unit, query_unit) if not row_dimension or not query_dimension or row_dimension == query_dimension else None
+    if dim(row_unit) != dim(query_unit) and (source_unit is not None or row_dimension or query_dimension):
+        return None
+    if not display_units.conversion_supported(query_unit, row_unit):
+        return None
+    return row_unit, query_unit
 
 
 def analyze_history_rows(
@@ -1513,6 +1535,7 @@ def analyze_history_rows(
     rows: list[dict[str, str]],
     selected: list[str],
     sample_minutes: int,
+    units: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     by_time: dict[str, dict[str, float]] = {}
     for row in rows:
@@ -1570,7 +1593,7 @@ def analyze_history_rows(
 
     threshold_results: list[dict[str, Any]] = []
     threshold_match = re.search(
-        r"\b(below|under|above|over)\s+(-?\d+(?:\.\d+)?)\s*(v|volts?|psi|kpa|hpa|inhg|knots?|kt|ft|feet|m|l/h|gph|gal/h|°?c|°?f|percent|%)?\b",
+        r"\b(below|under|above|over)\s+(-?\d+(?:\.\d+)?)\s*(v|volts?|psi|kpa|hpa|pa|inhg|knots?|kt|ft|feet|m|l/h|gph|gal/h|°?c|°?f|percent|%)?\b",
         message.lower(),
     )
     if threshold_match:
@@ -1583,7 +1606,12 @@ def analyze_history_rows(
             samples = [values[measurement] for values in by_time.values() if measurement in values]
             if not samples:
                 continue
-            unit_pair = _threshold_unit_for_measurement(measurement, explicit_unit, message)
+            unit_pair = _threshold_unit_for_measurement(
+                measurement,
+                explicit_unit,
+                message,
+                (units or {}).get(measurement, "") if units is not None else None,
+            )
             if not unit_pair:
                 continue
             row_unit, query_unit = unit_pair
@@ -1792,7 +1820,7 @@ from(bucket: "{bucket}")
                     for measurement in selected
                 }
                 bucket_payload["quality_flags"] = history_quality_flags(bucket_payload["numeric_summary"])
-                bucket_payload["analysis"] = analyze_history_rows(message, rows, selected, interval_minutes)
+                bucket_payload["analysis"] = analyze_history_rows(message, rows, selected, interval_minutes, bucket_payload["units"])
                 running_rows = engine_running_history_rows(rows)
                 if running_rows:
                     bucket_payload["engine_running_numeric_summary"] = summarize_numeric_rows(running_rows)
@@ -1804,6 +1832,7 @@ from(bucket: "{bucket}")
                         running_rows,
                         selected,
                         interval_minutes,
+                        bucket_payload["units"],
                     )
                     bucket_payload["engine_running_sample_times"] = len(
                         {str(row.get("_time") or "") for row in running_rows}

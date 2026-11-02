@@ -1007,6 +1007,12 @@ already-metric readings are preserved. Missing or unsupported source units are
 left unchanged rather than assumed to be Fahrenheit or feet. This metadata comes
 from the current entity state, so historical ranges spanning a change in the
 entity's reporting unit need separate review.
+History threshold analysis uses the same source-unit metadata as the charts:
+for example, 20 °C and 30 °C contain one sample above 25 °C. Explicit query units
+are converted to the measurement's source unit; omitted query units follow
+`BOAT_UNITS`. Missing, unsupported, or incompatible units omit the threshold
+count rather than guessing a conversion. Raw samples and cached values are
+unchanged.
 The interface rate-limits each client and runs at most two chat requests at a
 time so slow model calls cannot exhaust the Raspberry Pi.
 
@@ -1067,6 +1073,15 @@ Both installed services explicitly request quiet output, including history
 refresh failures; manual indexer commands without `--quiet` still show detailed
 results and should be treated as private telemetry.
 
+With `TELEMETRY_INDEXER_ENABLE=false` in the installed vessel configuration,
+`vesselstackctl start` stops both telemetry timers before stopping their running
+jobs. A real stop failure makes the command fail instead of reporting a
+successful configuration change; missing legacy units are tolerated. Setting
+the option back to `true` and starting again starts both timers.
+Threshold regressions run with `python3 -m unittest tests.test_metric_presentation`;
+the mocked CLI lifecycle regressions run with `sudo tests/test-lifecycle.sh` on
+Linux and do not control host services.
+
 The installer enables the schedules for boot; **Install & start** or
 `vesselstackctl start` starts them immediately. Render-only installation keeps
 previously active schedules active. Backup, restore, and installation stop the
@@ -1105,8 +1120,8 @@ After updating an existing installation, rerun the reviewed installer to apply
 the service and dashboard templates, then start the telemetry services. These
 changes do not remove existing journal entries or rewrite retained telemetry.
 To roll back, install the previous reviewed release; it restores the earlier
-presentation and templates without a telemetry database migration. Focused
-regressions can be run from the repository root with:
+presentation, CLI behavior, and templates without a telemetry database migration.
+Focused regressions can be run from the repository root with:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_display_units tests.test_metric_presentation tests.test_node_exporter tests.test_telemetry_indexer

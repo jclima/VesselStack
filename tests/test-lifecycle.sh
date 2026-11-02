@@ -69,6 +69,18 @@ cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$(dirname "$0")/calls.log"
 [ -z "${FAKE_CALL_LOG:-}" ] || printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALL_LOG"
+if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = show ] && [ -n "${FAKE_SYSTEMCTL_NOT_FOUND_UNITS:-}" ]; then
+    unit=${5:-}
+    case " $FAKE_SYSTEMCTL_NOT_FOUND_UNITS " in
+        *" $unit "*) echo not-found; exit 0 ;;
+    esac
+    echo loaded
+fi
+if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = stop ] && [ -n "${FAKE_SYSTEMCTL_FAIL_STOP_UNIT:-}" ]; then
+    for unit in "${@:2}"; do
+        [ "$unit" = "$FAKE_SYSTEMCTL_FAIL_STOP_UNIT" ] && exit 1
+    done
+fi
 if [ "$(basename "$0")" = systemctl ] && [ "${FAKE_SYSTEMCTL_FAIL_ONCE:-}" = 1 ] && [ ! -e "${FAKE_SYSTEMCTL_FAIL_MARKER:?}" ]; then
     : > "$FAKE_SYSTEMCTL_FAIL_MARKER"
     exit 1
@@ -177,6 +189,49 @@ run_ctl() {
         FAKE_MOUNTS="$TEST_ROOT/mounts" \
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
+
+# Telemetry is opt-out at start time as well as install time: disabling it must
+# clean up both schedules and any legacy one-shot services, while preserving the
+# existing start path when enabled.  This uses the production start_stack path
+# and only the fake systemctl above; no host services are touched.
+set_telemetry_flag() {
+    if grep -q '^TELEMETRY_INDEXER_ENABLE=' "$APP_ROOT/config/vesselstack.env"; then
+        sed -i "s/^TELEMETRY_INDEXER_ENABLE=.*/TELEMETRY_INDEXER_ENABLE=$1/" "$APP_ROOT/config/vesselstack.env"
+    else
+        printf 'TELEMETRY_INDEXER_ENABLE=%s\n' "$1" >> "$APP_ROOT/config/vesselstack.env"
+    fi
+}
+set_telemetry_flag true
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+grep -qx 'systemctl start vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer' "$FAKE_BIN/calls.log"
+
+set_telemetry_flag false
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '1p')" = 'systemctl stop vesselstack-telemetry-sample.timer'
+test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '2p')" = 'systemctl stop vesselstack-telemetry-indexer.timer'
+test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '3p')" = 'systemctl stop vesselstack-telemetry-sample.service'
+test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '4p')" = 'systemctl stop vesselstack-telemetry-indexer.service'
+if grep -q '^systemctl start vesselstack-telemetry-' "$FAKE_BIN/calls.log"; then
+    echo 'disabled telemetry start path started a telemetry unit' >&2
+    exit 1
+fi
+
+export FAKE_SYSTEMCTL_NOT_FOUND_UNITS='vesselstack-telemetry-sample.service vesselstack-telemetry-indexer.service'
+: > "$FAKE_BIN/calls.log"
+run_ctl start >/dev/null
+test "$(grep -c '^systemctl stop vesselstack-telemetry-.*\.timer$' "$FAKE_BIN/calls.log")" -eq 2
+test "$(grep -c '^systemctl stop vesselstack-telemetry-.*\.service$' "$FAKE_BIN/calls.log")" -eq 0
+unset FAKE_SYSTEMCTL_NOT_FOUND_UNITS
+
+export FAKE_SYSTEMCTL_FAIL_STOP_UNIT=vesselstack-telemetry-indexer.timer
+if run_ctl start >/dev/null 2>&1; then
+    echo 'disabled telemetry start path hid a stop failure' >&2
+    exit 1
+fi
+unset FAKE_SYSTEMCTL_FAIL_STOP_UNIT
+set_telemetry_flag true
 
 # The administration panel listener is an explicit, isolated change. Dry runs and
 # invalid arguments are inert; applying it updates both bind files and restarts
