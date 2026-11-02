@@ -3,6 +3,24 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.5.7 - 2026-11-01
+
+- Boat Chat supports selectable display units, source-unit-aware metric
+  history, and prompts that honor the effective timezone and units without
+  guessing unknown source units.
+- Telemetry sampling runs every five minutes separately from historical
+  indexing every 30 minutes; sampling diagnostics report counts and error
+  classes without vessel readings or credentials.
+- Optional host metrics add Node Exporter and Grafana health panels; installer
+  and Control Panel hardening improve configuration and component lifecycle
+  handling.
+- Installation, update, offline operation, and Boat Chat documentation now
+  match supported behavior.
+- Release status: publication is authorized as an unsigned lab prerelease and
+  is not a stable or latest release. Physical Raspberry Pi acceptance remains
+  pending; verify CI-built assets and test the pinned release before any stable
+  promotion.
+
 ## 0.5.6 - 2026-11-01
 
 - Lab prerelease: managed Docker/native SignalK installations preload the pinned

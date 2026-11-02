@@ -1,6 +1,6 @@
 # Control Panel component lifecycle lab test
 
-This is the release 0.5.6 lab recipe. It is a bounded acceptance test, not
+This is the release 0.5.7 lab recipe. It is a bounded acceptance test, not
 evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
@@ -8,11 +8,11 @@ positions, MMSIs, tokens, logs, and backups out of this repository.
 ## Fetch and verify the pinned prerelease
 
 Download the pinned bootstrap and the CI-generated checksum from the same
-`v0.5.6` GitHub prerelease. Verify before reading or running it:
+`v0.5.7` GitHub prerelease. Verify before reading or running it:
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.6/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.6/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.7/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.7/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
@@ -26,13 +26,14 @@ the release provenance.
 
 Open the authenticated panel and use **Check for updates**. Confirm the catalog
 is `jclima/VesselStack`, stable releases are the default, and **Include lab
-prereleases** is opt-in. Because the installed `0.5.6` release is current, it
+prereleases** is opt-in. Because the installed `0.5.7` release is current, it
 may correctly report **No newer release**; do not downgrade, retag, or force the
 same version. Exercise **Back up & install** only when a newer public lab
-release is available. The first `0.5.6` install is a CLI install; CI-controlled
-fixtures exercise the install orchestration, and the actual systemd restart is
-covered by the backend verifier. Full physical-Pi upgrade proof remains pending
-the next eligible release.
+release is available. A fresh `0.5.7` install is a CLI install; an existing
+`0.5.5` or `0.5.6` install may use the panel upgrade path only after enabling
+**Include lab prereleases**. CI-controlled fixtures exercise the install
+orchestration, and the actual systemd restart is covered by the backend
+verifier. Full physical-Pi upgrade proof remains pending physical testing.
 Mount the configured external backup device first. Confirm the backup path is
 shown before confirmation and that the operation log records download,
 SHA-256 verification, safe extraction, preflight, backup verification, install,
