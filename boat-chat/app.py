@@ -426,6 +426,11 @@ def setting_enabled(key: str, default: bool = False) -> bool:
     return (setting_value(key, fallback) or fallback).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def token_matches(provided: str, expected: str) -> bool:
+    """Constant-time token comparison; bytes so non-ASCII header text cannot raise."""
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
 def access_token_required() -> bool:
     """Access always requires the token unless BOAT_CHAT_ALLOW_OPEN=true.
 
@@ -5226,14 +5231,29 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         if token:
             # A configured settings token is required from every address.
             provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
-            if not hmac.compare_digest(provided, token):
+            if not token_matches(provided, token):
                 return False, "invalid or missing X-Boat-Chat-Token header"
             return True, ""
         # No token configured: only loopback may write. Private-LAN addresses
         # are not trusted.
         if not addr.is_loopback:
             return False, "settings can only be changed from this device unless BOAT_CHAT_SETTINGS_TOKEN is set"
+        # A DNS-rebinding page reaches loopback with an attacker-chosen Host name.
+        if not self.loopback_host_allowed():
+            return False, "settings can only be changed using a local address (localhost) unless BOAT_CHAT_SETTINGS_TOKEN is set"
         return True, ""
+
+    def loopback_host_allowed(self) -> bool:
+        try:
+            hostname = (urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}").hostname or "").lower()
+        except ValueError:
+            return False
+        allowed = {"localhost", "127.0.0.1", "::1"}
+        configured = (setting_value("BOAT_CHAT_HOST", DEFAULT_HOST) or "").strip().lower().strip("[]")
+        if configured and configured not in {"0.0.0.0", "::", "*"}:
+            allowed.add(configured)
+        # Browsers always send Host; only a bare HTTP/1.0 client omits it.
+        return hostname == "" or hostname in allowed or hostname.endswith(".localhost")
 
     def access_allowed(self) -> bool:
         if not access_token_required():
@@ -5243,14 +5263,14 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             # Fail closed: an unset token never grants access.
             return False
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
-        return hmac.compare_digest(provided, token)
+        return token_matches(provided, token)
 
     def sensitive_access_allowed(self) -> bool:
         if not access_token_required():
             return True
         token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
-        return bool(token) and hmac.compare_digest(provided, token)
+        return bool(token) and token_matches(provided, token)
 
     def rate_limit_allowed(self) -> bool:
         now = time.monotonic()
@@ -5268,7 +5288,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         debug = (self.headers.get("X-Boat-Chat-Debug") or "").lower() == "true"
         configured = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
-        if debug and configured and hmac.compare_digest(provided, configured):
+        if debug and configured and token_matches(provided, configured):
             return context
         return {"query_plan": context.get("query_plan", {}), "context_profile": context.get("context_profile", {})}
 
@@ -5349,6 +5369,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             )
             return
         elif path == "/api/settings":
+            if not self.access_allowed():
+                self.send_json(401, {"error": "invalid or missing X-Boat-Chat-Token header"}); return
             self.send_json(200, public_settings())
             return
         elif path == "/api/models":
@@ -5370,7 +5392,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path in {"/health", "/api/settings"}:
-            self.send_response(200)
+            self.send_response(401 if path == "/api/settings" and not self.access_allowed() else 200)
             self.end_headers()
             return
         self.send_static(self.static_target(path), include_body=False)

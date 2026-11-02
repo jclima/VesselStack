@@ -28,7 +28,7 @@ not latest; `v0.4.4` remains the latest stable release. Physical Raspberry Pi
 testing remains pending. This exception uses an annotated unsigned tag because
 no signing key is available. The earlier
 `v0.5.1` tag remains untouched; its release pipeline was blocked by the bridge
-startup-status race. Do not retag or promote either lab tag as stable; a future
+startup-status race. Do not retag or promote any 0.5.x lab prerelease tag as stable; a future
 stable release needs a new signed tag after the real-Pi gates pass.
 
 ## Simple path: one command
@@ -608,6 +608,6 @@ machine only.
   images) has not been built and installed on a real Pi; section 3.5.3 is that
   rehearsal. Image tarballs are manifest-checked but not digest-pinned.
 - Scoped read-only InfluxDB tokens for Boat Chat and Grafana are **deferred**
-  (see README and CHANGELOG); they are not part of 0.4.3.
+  (see README and CHANGELOG); they are not part of 0.5.7.
 - The tarball is integrity-checked by sha256 only on the boat (no signature
   check in `install.sh`/`vesselstackctl update`).

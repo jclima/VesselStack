@@ -3,6 +3,38 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+- Docs: `README.md` is now a landing page with a table of contents and a task-to-document
+  table. Deep reference moved unchanged into `docs/` (`DISPLAYS.md`, `BOAT_CHAT.md`,
+  `CONTROL_PANEL.md`, `MQTT.md`, `NETWORK.md`, `UPDATING.md`; developer validation and
+  historical notes in `DEVELOPMENT.md`). Install, backup, removal and troubleshooting
+  stay in the README and its anchors are preserved. `tests/test-distribution.sh` now
+  checks the pinned ESPHome digest and version in README or `docs/DISPLAYS.md`.
+- Displays: Home Assistant numeric items now round like instruments (half away
+  from zero, no `-0.0`, integer payload at precision 0, out-of-range values are
+  "missing"); a heading that rounds up to 360 shows 0; the board registry
+  validator rejects a board that lists a layout the firmware generator cannot
+  render (`list-6` stays defined but unoffered); `displays/README.md` lists
+  `preflight` and documents adding a board versus adding a layout.
+- Installer env files (`vesselstack.env`, `boat-chat.env`, `control-panel.env`)
+  are written with portable quoting that bash, systemd, Python and Docker
+  Compose read identically; values with spaces, `$` or `!` no longer split or
+  expand. Values with an apostrophe plus a backslash, double quote, `$` or
+  backtick, and multi-line values, are refused.
+- The installed `vesselstackctl` defaults to the configured `VESSELSTACK_ROOT`,
+  and `uninstall` also removes `vesselstack-update` and `deploy-chat.py`.
+- Boat Chat and Control Panel token comparison handles non-ASCII header text;
+  `GET`/`HEAD /api/settings` require the access token; unauthenticated loopback
+  settings writes require a local `Host` name (DNS-rebinding defense).
+- Power tracking splits sign-crossing intervals at zero and floors peak
+  inferred charge at 0 W.
+- The VesselTwin preload also lists `signalk-vesseltwin` in
+  `signalk/package.json` dependencies so Signal K App Store installs do not
+  prune it.
+- Documentation corrections: README structure, version references, VesselTwin
+  wording, and historical 1.0 scope and validation labels.
+
 ## 0.5.7 - 2026-11-01
 
 - Boat Chat supports selectable display units, source-unit-aware metric

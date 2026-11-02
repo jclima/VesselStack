@@ -183,5 +183,23 @@ class HaStateTests(unittest.TestCase):
                 self.assertEqual(got, expected, (label, value))
 
 
+class HaNumericRoundingTests(unittest.TestCase):
+    """Home Assistant numeric items round like the instrument path (conversions.round_value)."""
+
+    def value(self, text, precision):
+        return severity.ha_state(text, "numeric", {"precision": precision})
+
+    def test_half_away_from_zero_no_negative_zero_int_at_precision_zero(self) -> None:
+        for text, precision, expected in (("-0.3", 0, 0), ("2.5", 0, 3), ("-2.5", 0, -3), ("0.125", 2, 0.13)):
+            st, _sev, _k, v = self.value(text, precision)
+            self.assertEqual((st, v), ("ok", expected), text)
+        self.assertIsInstance(self.value("2.5", 0)[3], int)
+        self.assertIsInstance(self.value("0.125", 2)[3], float)
+        self.assertEqual(str(self.value("-0.001", 2)[3]), "0.0")
+
+    def test_out_of_bounds_is_missing(self) -> None:
+        self.assertEqual(self.value("1e308", 1), ("missing", "unknown", None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

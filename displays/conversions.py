@@ -81,4 +81,7 @@ def convert_and_round(name: str, value: float, precision: int) -> float | int | 
         converted = convert(name, value)
     except (OverflowError, ValueError):
         return None
-    return round_value(converted, precision)
+    rounded = round_value(converted, precision)
+    if name == "rad->deg_360" and rounded is not None and rounded >= 360:
+        return 0 if precision == 0 else 0.0   # 359.5..359.99 rounds up to 360: a heading wraps to 0
+    return rounded

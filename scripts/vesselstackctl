@@ -10,6 +10,7 @@ CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
+LIBEXEC_DIR="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 
 usage() {
     cat <<'EOF'
@@ -1855,7 +1856,9 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
-    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall"
+    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall" \
+        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py"
+    rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
         rm -rf -- /opt/vesselstack /opt/vesselstack-data

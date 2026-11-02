@@ -150,6 +150,16 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(bad(lambda r: r.update(schema=3)))
         self.assertTrue(bad(lambda r: r.update(schema=1)))  # objects are not schema 1
 
+    def test_registry_rejects_board_layout_the_generator_cannot_render(self) -> None:
+        reg = copy.deepcopy(REGISTRY)
+        self.assertIn("list-6", reg["layouts"])
+        self.assertNotIn("list-6", schema.SUPPORTED_LAYOUTS)
+        reg["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"]["layouts"].append("list-6")
+        errors = schema.validate_registry(reg)
+        self.assertTrue(any("list-6" in e and "cannot render" in e for e in errors), errors)
+        for board in REGISTRY["boards"].values():
+            self.assertLessEqual(set(board["layouts"]), schema.SUPPORTED_LAYOUTS)
+
     def test_registry_v1_integer_layouts_are_normalised(self) -> None:
         v1 = {"schema": 1, "layouts": {"single": 1, "grid-2x2": 4},
               "boards": {"b": dict(REGISTRY["boards"]["waveshare-esp32-s3-touch-lcd-2.8c"],

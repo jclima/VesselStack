@@ -138,8 +138,8 @@ and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
 pinned plugin package by default; that preload does not enable the plugin, pair
 the account, or authorize readings. Consult the
 [VesselTwin integration guide](VESSELTWIN.md)
-and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals and service
-records.
+and [VesselTwin](https://www.vesseltwin.io/) for maintenance documents, equipment and
+logbook records.
 
 ## If something goes wrong
 

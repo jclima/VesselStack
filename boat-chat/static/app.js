@@ -621,8 +621,12 @@ async function loadModelCatalog() {
 }
 
 async function loadSettings() {
-  const response = await fetch("/api/settings");
+  const accessToken = sessionStorage.getItem("boatChatAccessToken") || "";
+  const response = await fetch("/api/settings", { headers: accessToken ? { "X-Boat-Chat-Token": accessToken } : {} });
   const data = await response.json();
+  if (response.status === 401) {
+    throw new Error("Connect this device (access token) before opening settings.");
+  }
   if (!response.ok) {
     throw new Error(data.error || `HTTP ${response.status}`);
   }

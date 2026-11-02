@@ -104,6 +104,46 @@ def rename_noreplace(source: str, dest: str, fd: int) -> None:
         if error == errno.EEXIST: raise FileExistsError(dest)
         raise OSError(error, os.strerror(error))
 
+def ensure_dependency(sfd: int) -> None:
+    """List the plugin in signalk/package.json so App Store `npm install --save` keeps it.
+
+    npm prunes node_modules entries that package.json does not list. Runs as the
+    dropped service uid, relative to the open signalk directory descriptor.
+    """
+    mode, data = 0o644, {"name": "signalk-server-config", "version": "0.0.1",
+                         "description": "This file is here to track your plugin and webapp installs.",
+                         "dependencies": {}}
+    try:
+        fd = os.open("package.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=sfd)
+    except FileNotFoundError: fd = -1
+    except OSError as exc:
+        print(f"VesselTwin preload: WARN: cannot read signalk/package.json ({exc}); add {NAME} to its dependencies manually", file=sys.stderr); return
+    if fd >= 0:
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode): raise ValueError("not a regular file")
+            raw = os.read(fd, 1048577)
+            if len(raw) > 1048576: raise ValueError("larger than 1 MiB")
+            data, mode = json.loads(raw), stat.S_IMODE(info.st_mode)
+            if not isinstance(data, dict) or not isinstance(data.get("dependencies", {}), dict): raise ValueError("unexpected structure")
+        except (OSError, ValueError) as exc:
+            print(f"VesselTwin preload: WARN: leaving signalk/package.json unchanged ({exc}); add {NAME} to its dependencies manually", file=sys.stderr); return
+        finally: os.close(fd)
+    dependencies = data.setdefault("dependencies", {})
+    if NAME in dependencies: return
+    dependencies[NAME] = VERSION
+    temp = f".package.json.{os.getpid()}.tmp"
+    try:
+        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=sfd)
+        try:
+            os.write(out, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode()); os.fchmod(out, mode); os.fsync(out)
+        finally: os.close(out)
+        os.rename(temp, "package.json", src_dir_fd=sfd, dst_dir_fd=sfd)
+    except OSError as exc:
+        try: os.unlink(temp, dir_fd=sfd)
+        except OSError: pass
+        print(f"VesselTwin preload: WARN: could not update signalk/package.json ({exc}); add {NAME} to its dependencies manually", file=sys.stderr)
+
 def publish(raw: bytes, args, target: Path) -> None:
     entries = validate(raw); signalk = args.data / "signalk"
     try: sfd = os.open(signalk, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -140,6 +180,7 @@ def publish(raw: bytes, args, target: Path) -> None:
                     existing(Path(NAME))
                 else:
                     temp.rmdir()
+                ensure_dependency(sfd)
             finally:
                 if temp.exists(): shutil.rmtree(temp, ignore_errors=True)
         finally: os.close(nfd)

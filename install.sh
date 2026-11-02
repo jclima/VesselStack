@@ -875,7 +875,16 @@ for blueprint in "$SCRIPT_DIR"/templates/homeassistant/blueprints/automation/ves
 done
 install -m 0644 "$SCRIPT_DIR/templates/homeassistant/lovelace-vesselstack.example.yaml" \
     "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml"
-install -m 0755 "$SCRIPT_DIR/scripts/vesselstackctl" "$SBIN_DIR/vesselstackctl"
+# The installed copy defaults to this installation's root, so a custom
+# VESSELSTACK_ROOT works without exporting it (the environment still overrides).
+if [[ $VESSELSTACK_ROOT =~ ^[A-Za-z0-9_./+-]+$ ]]; then
+    sed "s|^ROOT=\${VESSELSTACK_ROOT:-/opt/vesselstack}\$|ROOT=\${VESSELSTACK_ROOT:-$VESSELSTACK_ROOT}|" \
+        "$SCRIPT_DIR/scripts/vesselstackctl" > "$SBIN_DIR/vesselstackctl"
+else
+    echo "WARN: VESSELSTACK_ROOT contains unusual characters; export VESSELSTACK_ROOT when running vesselstackctl" >&2
+    cp "$SCRIPT_DIR/scripts/vesselstackctl" "$SBIN_DIR/vesselstackctl"
+fi
+chmod 0755 "$SBIN_DIR/vesselstackctl"
 install -m 0755 "$SCRIPT_DIR/scripts/vesselstack-firewall" "$SBIN_DIR/vesselstack-firewall"
 # The update launcher and the helper it runs as root are installed root-owned and
 # never executed from a source checkout. A new helper version only arrives through
@@ -892,9 +901,33 @@ install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-signalk.service.in" \
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-socketcan.service.in" \
     "$VESSELSTACK_ROOT/systemd/vesselstack-socketcan.service.in"
 
+# env_line KEY VALUE: one env-file line that bash (`source`), systemd
+# EnvironmentFile, Python shlex and Docker Compose all read back identically.
+# Plain values stay bare; others are POSIX single-quoted. Compose cannot parse the
+# '\'' idiom, so a value with a single quote is double-quoted instead, which is
+# only portable when it has no \ " $ or backtick (such values are rejected).
+# env-line-begin
+env_line() {
+    local key=$1 value=$2
+    case $value in
+        *$'\n'*|*$'\r'*) echo "Refusing multi-line value for $key" >&2; exit 1 ;;
+    esac
+    if [ -n "$value" ] && [[ $value =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+        printf '%s=%s\n' "$key" "$value"
+    elif [[ $value != *\'* ]]; then
+        printf "%s='%s'\n" "$key" "$value"
+    elif [[ $value == *[\\\"\$\`]* ]]; then
+        echo "Refusing value for $key: a single quote cannot be combined with backslash, double quote, dollar or backtick" >&2
+        exit 1
+    else
+        printf '%s="%s"\n' "$key" "$value"
+    fi
+}
+# env-line-end
+
 install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/vesselstack.env"
 while IFS= read -r key; do
-    printf '%s=%q\n' "$key" "${!key:-}" >> "$VESSELSTACK_ROOT/config/vesselstack.env"
+    env_line "$key" "${!key:-}" >> "$VESSELSTACK_ROOT/config/vesselstack.env"
 done <<'EOF'
 BOAT_NAME
 BOAT_TYPE
@@ -986,35 +1019,35 @@ for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
     [ "$key" != BOAT_CHAT_HOST ] || key_given=$BOAT_CHAT_HOST_FROM_CONFIG
     if [ -n "$key_given" ]; then
         sed -i "/^${key}=/d" "$boat_chat_temp"
-        printf '%s=%q\n' "$key" "${!key}" >> "$boat_chat_temp"
+        env_line "$key" "${!key}" >> "$boat_chat_temp"
     elif ! grep -q "^${key}=" "$boat_chat_temp"; then
         case "$key" in
-            BOAT_CHAT_PROVIDER) printf '%s=%q\n' "$key" local >> "$boat_chat_temp" ;;
-            BOAT_CHAT_HOST) printf '%s=%q\n' "$key" 0.0.0.0 >> "$boat_chat_temp" ;;
-            BOAT_CHAT_PORT) printf '%s=%q\n' "$key" 8765 >> "$boat_chat_temp" ;;
+            BOAT_CHAT_PROVIDER) env_line "$key" local >> "$boat_chat_temp" ;;
+            BOAT_CHAT_HOST) env_line "$key" 0.0.0.0 >> "$boat_chat_temp" ;;
+            BOAT_CHAT_PORT) env_line "$key" 8765 >> "$boat_chat_temp" ;;
         esac
     fi
 done
 {
-    printf 'BOAT_NAME=%q\n' "$BOAT_NAME"
-    printf 'BOAT_TIMEZONE=%q\n' "$BOAT_TIMEZONE"
-    printf 'VESSELSTACK_VERSION=%q\n' "$(<"$SCRIPT_DIR/VERSION")"
-    printf 'BOAT_CHAT_SETTINGS_TOKEN=%q\n' "$BOAT_CHAT_SETTINGS_TOKEN"
-    printf 'BOAT_CHAT_ACCESS_TOKEN=%q\n' "$BOAT_CHAT_ACCESS_TOKEN"
-    printf 'TELEGRAM_ENABLE=%q\n' "$TELEGRAM_ENABLE"
-    printf 'TELEMETRY_INDEXER_ENABLE=%q\n' "$TELEMETRY_INDEXER_ENABLE"
-    printf 'BOAT_UNITS=%q\n' "$BOAT_UNITS"
-    printf 'SIGNALK_URL=%q\n' "$SIGNALK_URL"
-    printf 'HOME_ASSISTANT_URL=%q\n' "$HOME_ASSISTANT_URL"
-    printf 'HOME_ASSISTANT_TOKEN=%q\n' "${HOME_ASSISTANT_TOKEN:-}"
-    printf 'INFLUXDB_URL=%q\n' "$INFLUXDB_URL"
+    env_line BOAT_NAME "$BOAT_NAME"
+    env_line BOAT_TIMEZONE "$BOAT_TIMEZONE"
+    env_line VESSELSTACK_VERSION "$(<"$SCRIPT_DIR/VERSION")"
+    env_line BOAT_CHAT_SETTINGS_TOKEN "$BOAT_CHAT_SETTINGS_TOKEN"
+    env_line BOAT_CHAT_ACCESS_TOKEN "$BOAT_CHAT_ACCESS_TOKEN"
+    env_line TELEGRAM_ENABLE "$TELEGRAM_ENABLE"
+    env_line TELEMETRY_INDEXER_ENABLE "$TELEMETRY_INDEXER_ENABLE"
+    env_line BOAT_UNITS "$BOAT_UNITS"
+    env_line SIGNALK_URL "$SIGNALK_URL"
+    env_line HOME_ASSISTANT_URL "$HOME_ASSISTANT_URL"
+    env_line HOME_ASSISTANT_TOKEN "${HOME_ASSISTANT_TOKEN:-}"
+    env_line INFLUXDB_URL "$INFLUXDB_URL"
     # shellcheck disable=SC2153  # Required and validated through the key list.
-    printf 'INFLUXDB_ORG=%q\n' "$INFLUXDB_ORG"
-    printf 'INFLUXDB_TOKEN=%q\n' "$INFLUXDB_TOKEN"
-    printf 'INFLUXDB_RAW_BUCKET=%q\n' "$INFLUXDB_RAW_BUCKET"
-    printf 'INFLUXDB_HISTORY_BUCKET=%q\n' "$INFLUXDB_HISTORY_BUCKET"
-    printf 'INFLUXDB_HOME_ASSISTANT_BUCKET=%q\n' "$INFLUXDB_HOME_ASSISTANT_BUCKET"
-    printf 'INFLUXDB_AIS_BUCKET=%q\n' "$INFLUXDB_AIS_BUCKET"
+    env_line INFLUXDB_ORG "$INFLUXDB_ORG"
+    env_line INFLUXDB_TOKEN "$INFLUXDB_TOKEN"
+    env_line INFLUXDB_RAW_BUCKET "$INFLUXDB_RAW_BUCKET"
+    env_line INFLUXDB_HISTORY_BUCKET "$INFLUXDB_HISTORY_BUCKET"
+    env_line INFLUXDB_HOME_ASSISTANT_BUCKET "$INFLUXDB_HOME_ASSISTANT_BUCKET"
+    env_line INFLUXDB_AIS_BUCKET "$INFLUXDB_AIS_BUCKET"
 } >> "$boat_chat_temp"
 install -m 0600 "$boat_chat_temp" "$VESSELSTACK_ROOT/config/boat-chat.env"
 rm -f -- "$boat_chat_temp"
@@ -1022,9 +1055,9 @@ chown "$VESSELSTACK_USER:$VESSELSTACK_USER" "$VESSELSTACK_ROOT/config/boat-chat.
 
 install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/control-panel.env"
 {
-    printf 'CONTROL_PANEL_HOST=%q\n' "$CONTROL_PANEL_HOST"
-    printf 'CONTROL_PANEL_PORT=%q\n' "$CONTROL_PANEL_PORT"
-    printf 'CONTROL_PANEL_TOKEN=%q\n' "$CONTROL_PANEL_TOKEN"
+    env_line CONTROL_PANEL_HOST "$CONTROL_PANEL_HOST"
+    env_line CONTROL_PANEL_PORT "$CONTROL_PANEL_PORT"
+    env_line CONTROL_PANEL_TOKEN "$CONTROL_PANEL_TOKEN"
 } >> "$VESSELSTACK_ROOT/config/control-panel.env"
 
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)

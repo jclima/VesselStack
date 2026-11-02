@@ -278,8 +278,16 @@ def power_tracking_summary(
         previous_power = float(previous["battery_power_w"])
         current_power = float(current["battery_power_w"])
         hours = seconds / 3600.0
-        positive_wh += (max(previous_power, 0.0) + max(current_power, 0.0)) * 0.5 * hours
-        negative_wh += (max(-previous_power, 0.0) + max(-current_power, 0.0)) * 0.5 * hours
+        if previous_power * current_power < 0:
+            # The sign flips inside the interval: with linear interpolation each
+            # side is a triangle that ends at the zero crossing, not a trapezoid.
+            span = abs(previous_power) + abs(current_power)
+            positive_peak, negative_peak = max(previous_power, current_power), max(-previous_power, -current_power)
+            positive_wh += 0.5 * positive_peak * (positive_peak / span) * hours
+            negative_wh += 0.5 * negative_peak * (negative_peak / span) * hours
+        else:
+            positive_wh += (max(previous_power, 0.0) + max(current_power, 0.0)) * 0.5 * hours
+            negative_wh += (max(-previous_power, 0.0) + max(-current_power, 0.0)) * 0.5 * hours
         net_wh += (previous_power + current_power) * 0.5 * hours
         covered_seconds += seconds
         valid_intervals += 1
@@ -312,7 +320,7 @@ def power_tracking_summary(
         "observed_net_discharge_wh": round(negative_wh, 3),
         "net_battery_energy_wh": round(net_wh, 3),
         "peak_inferred_charge_w": (
-            round(max(float(row["battery_power_w"]) for row in qualifying), 3) if qualifying else None
+            round(max(max(float(row["battery_power_w"]), 0.0) for row in qualifying), 3) if qualifying else None
         ),
         "peak_observed_discharge_w": (
             round(max(max(-float(row["battery_power_w"]), 0.0) for row in qualifying), 3) if qualifying else None

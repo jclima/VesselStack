@@ -304,7 +304,7 @@ you explicitly use `vesselstackctl panel-access lan`. `local` also limits Home A
 Pi through a delimited `http:` block the installer manages in its `configuration.yaml` (it never
 touches an `http:` section you wrote yourself and prints the manual step instead). SignalK (3000)
 has no bind-address setting, so no preset restricts it; only the firewall's strict mode can
-(see the README, "Reaching VesselStack from other devices").
+(see [Network access and security](NETWORK.md)).
 
 If `VESSELSTACK_FIREWALL_ENABLE=true` and the Pi is on your network over the untrusted
 interface (default `wlan0`), other devices are blocked from Grafana and the data services
@@ -315,7 +315,7 @@ whatever the preset says; `vesselstackctl lan` warns and refuses (override:
 curl -sS -o /dev/null -w '%{http_code}\n' http://PI:43000/login   # 200 = Grafana reachable
 ```
 
-See the README section "Reaching VesselStack from other devices" for the full table.
+See [Network access and security](NETWORK.md) for the full table.
 
 ## Troubleshooting: Boat Chat "not ready" (memory index empty)
 
@@ -324,7 +324,7 @@ shows `readiness.layers.memory` with `chunks: 0`) on installs older than 0.4.3,
 which never built the index, or when the build failed. Fix it with
 `sudo vesselstackctl reindex` (it runs as the service user), then `sudo vesselstackctl
 doctor`. 0.4.3 and later build the index during installation, on upgrade and on
-`vesselstackctl start`. Details: README, "Memory index".
+`vesselstackctl start`. Details: [Boat Chat setup](BOAT_CHAT.md), "Memory index".
 
 ## Managed SignalK and VesselTwin preload
 
@@ -341,7 +341,7 @@ Prometheus metrics live in `<data>/prometheus` (owned by uid/gid 65534, created 
 installer, included in backups) and are kept for `PROMETHEUS_RETENTION` (default `30d`).
 Releases before 0.4.4 used an anonymous Docker volume that is left untouched on upgrade;
 the old history stays there until `docker volume prune`. See the README section
-"Prometheus data and retention".
+"Prometheus data and retention" (first-run setup).
 
 With `SIGNALK_MODE=docker`, if the `vesselstack-signalk` container keeps restarting
 and `sudo docker logs vesselstack-signalk` shows
@@ -361,5 +361,5 @@ symlink state are still unknown.
 Before NMEA commissioning, rollback is simply: power down, disconnect the new
 drop at its T-piece, and restore backbone power. For software rollback, stop the
 stack with `sudo vesselstackctl stop`; preserve `/opt/vesselstack-data` and the
-latest verified backup. See the README's update, restore, and uninstall sections
+latest verified backup. See the README's backup and uninstall sections and [Updating and offline install](UPDATING.md)
 before changing or removing persistent data.
