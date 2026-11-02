@@ -51,10 +51,14 @@ GOOD_LOCK="$TEST_ROOT/good.lock"
 cp "$RELEASE/boat-chat/requirements.lock" "$GOOD_LOCK"
 : > "$IMAGES_PRESENT"
 export TEST_ROOT IMAGES_PRESENT
+export FAKE_PROMETHEUS_RECREATE_FAIL=0
 
 cat > "$FAKE_BIN/docker" <<'EOF2'
 #!/bin/bash
 echo "$*" >> "$TEST_ROOT/docker.log"
+if [ "${FAKE_PROMETHEUS_RECREATE_FAIL:-0}" = 1 ] && [[ " $* " == *" --force-recreate prometheus "* ]]; then
+    exit 42
+fi
 case "${1:-}" in
     image)
         [ "${2:-}" = inspect ] && grep -qxF "$3" "$IMAGES_PRESENT"
@@ -315,6 +319,75 @@ installer --offline --start >/dev/null 2>"$TEST_ROOT/err" || { cat "$TEST_ROOT/e
 grep -q -- "--only-binary=:all: --require-hashes --no-index --find-links $WHEELHOUSE -r .*boat-chat/requirements.lock" "$TEST_ROOT/pip.log" || fail "offline pip flags missing"
 grep -q -- 'compose .* up -d --pull never' "$TEST_ROOT/docker.log" || fail "offline start must not pull"
 if grep -E '^(pull|compose .* pull)' "$TEST_ROOT/docker.log"; then fail "offline install pulled an image"; fi
+PROM_STAMP="$APP_ROOT/config/.prometheus-conf.sha256"
+PROM_CONFIG="$APP_ROOT/config/prometheus.yml"
+test -r "$PROM_STAMP" || fail "offline --start did not write Prometheus apply stamp"
+grep -qx "$(sha256sum "$PROM_CONFIG" | cut -d' ' -f1)" "$PROM_STAMP" || fail "Prometheus stamp does not match applied config"
+# Enabling node-exporter through the real installer selects a different scrape
+# template and must recreate Prometheus, then stamp that applied file.
+echo 'quay.io/prometheus/node-exporter:v1.10.2' >> "$IMAGES_PRESENT"
+old_prom_stamp=$(<"$PROM_STAMP")
+if grep -q '^NODE_EXPORTER_ENABLE=' "$CONFIG"; then
+    sed -i 's/^NODE_EXPORTER_ENABLE=.*/NODE_EXPORTER_ENABLE="true"/' "$CONFIG"
+else
+    printf 'NODE_EXPORTER_ENABLE="true"\n' >> "$CONFIG"
+fi
+installer --offline >/dev/null 2>"$TEST_ROOT/err" || { cat "$TEST_ROOT/err" >&2; fail "node-exporter enable render failed"; }
+grep -qxF "$old_prom_stamp" "$PROM_STAMP" || fail "node-exporter render advanced Prometheus stamp"
+: > "$TEST_ROOT/docker.log"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$APP_ROOT/config/vesselstack.env" \
+    "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" start >/dev/null 2>"$TEST_ROOT/err" || {
+    cat "$TEST_ROOT/err" >&2; fail "node-exporter enable start failed";
+}
+grep -q -- 'compose .* --force-recreate prometheus' "$TEST_ROOT/docker.log" || fail "enabling node-exporter did not recreate Prometheus"
+grep -qx "$(sha256sum "$PROM_CONFIG" | cut -d' ' -f1)" "$PROM_STAMP" || fail "node-exporter enable stamp mismatch"
+# The installed lifecycle command must not recreate Prometheus when the
+# rendered configuration and applied stamp are unchanged.
+: > "$TEST_ROOT/docker.log"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$APP_ROOT/config/vesselstack.env" \
+    "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" start >/dev/null 2>"$TEST_ROOT/err" || {
+    cat "$TEST_ROOT/err" >&2; fail "installed vesselstackctl start failed";
+}
+if grep -q -- 'force-recreate prometheus' "$TEST_ROOT/docker.log"; then
+    fail "unchanged installed start recreated Prometheus"
+fi
+# Disabling node-exporter reverses the transition and applies the base scrape
+# template. A failed targeted recreate must preserve the prior stamp and be
+# retryable.
+sed -i 's/^NODE_EXPORTER_ENABLE=.*/NODE_EXPORTER_ENABLE="false"/' "$CONFIG"
+old_prom_stamp=$(<"$PROM_STAMP")
+installer --offline >/dev/null 2>"$TEST_ROOT/err" || { cat "$TEST_ROOT/err" >&2; fail "node-exporter disable render failed"; }
+grep -qxF "$old_prom_stamp" "$PROM_STAMP" || fail "node-exporter disable render advanced Prometheus stamp"
+: > "$TEST_ROOT/docker.log"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$APP_ROOT/config/vesselstack.env" \
+    "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" start >/dev/null 2>"$TEST_ROOT/err" || {
+    cat "$TEST_ROOT/err" >&2; fail "node-exporter disable start failed";
+}
+grep -q -- 'compose .* --force-recreate prometheus' "$TEST_ROOT/docker.log" || fail "disabling node-exporter did not recreate Prometheus"
+grep -qx "$(sha256sum "$PROM_CONFIG" | cut -d' ' -f1)" "$PROM_STAMP" || fail "node-exporter disable stamp mismatch"
+printf 'old-applied\n' > "$PROM_STAMP"
+export FAKE_PROMETHEUS_RECREATE_FAIL=1
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$APP_ROOT/config/vesselstack.env" \
+    "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" start >/dev/null 2>"$TEST_ROOT/err"; then
+    fail "installed start hid targeted Prometheus recreate failure"
+fi
+grep -qx 'old-applied' "$PROM_STAMP" || fail "failed installed recreate changed Prometheus stamp"
+export FAKE_PROMETHEUS_RECREATE_FAIL=0
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$APP_ROOT/config/vesselstack.env" \
+    "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" start >/dev/null 2>"$TEST_ROOT/err" || {
+    cat "$TEST_ROOT/err" >&2; fail "installed Prometheus recreate retry failed";
+}
+grep -qx "$(sha256sum "$PROM_CONFIG" | cut -d' ' -f1)" "$PROM_STAMP" || fail "retry did not update Prometheus stamp"
+# A render-only run may rewrite the rendered file, but it never claims that
+# the new file was applied by advancing the existing stamp.
+printf 'previously-applied\n' > "$PROM_STAMP"
+installer --offline >/dev/null 2>"$TEST_ROOT/err" || { cat "$TEST_ROOT/err" >&2; fail "offline render-only install failed"; }
+grep -qx 'previously-applied' "$PROM_STAMP" || fail "render-only install advanced Prometheus stamp"
 grep -qx "$VERSION" "$APP_ROOT/config/installed-version"
 test "$(head -n 1 "$APP_ROOT/boat-chat/.venv/bin/tool")" = "#!$APP_ROOT/boat-chat/.venv/bin/python" || fail "venv scripts not relocated"
 grep -qx "VIRTUAL_ENV=$APP_ROOT/boat-chat/.venv" "$APP_ROOT/boat-chat/.venv/bin/tool" || fail "venv path not relocated"

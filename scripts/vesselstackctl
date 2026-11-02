@@ -104,17 +104,37 @@ selected_services() {
     [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && printf '%s\n' node-exporter
 }
 
+write_prometheus_stamp() {
+    local stamp=$1 hash=$2 tmp
+    tmp=$(mktemp "${stamp}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$hash" > "$tmp" || ! chmod 0644 "$tmp" || ! mv -f -- "$tmp" "$stamp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
 sync_prometheus_config() {
     local source="$VESSELSTACK_ROOT/installer/templates/prometheus.yml"
+    local conf="$VESSELSTACK_ROOT/config/prometheus.yml"
+    local stamp="$VESSELSTACK_ROOT/config/.prometheus-conf.sha256"
+    local conf_hash
     [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && source="$VESSELSTACK_ROOT/installer/templates/prometheus-node-exporter.yml"
     [ -r "$source" ] || return 0
-    if ! cmp -s "$source" "$VESSELSTACK_ROOT/config/prometheus.yml"; then
-        install -m 0644 "$source" "$VESSELSTACK_ROOT/config/prometheus.yml"
-        case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
-            *,prometheus,*) ;;
-            *) "${COMPOSE[@]}" up -d --force-recreate prometheus ;;
-        esac
+    if ! cmp -s "$source" "$conf"; then
+        install -m 0644 "$source" "$conf" || return 1
     fi
+    conf_hash=$(sha256sum "$conf" | cut -d' ' -f1) || return 1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+        *,prometheus,*) ;;
+        *)
+            # A render-only run may have changed the file without touching
+            # Prometheus, so compare independently of the selected template.
+            if [ ! -r "$stamp" ] || [ "$(<"$stamp")" != "$conf_hash" ]; then
+                "${COMPOSE[@]}" up -d --force-recreate prometheus || return 1
+                write_prometheus_stamp "$stamp" "$conf_hash" || return 1
+            fi
+            ;;
+    esac
 }
 
 persist_disabled_components() {
@@ -216,7 +236,7 @@ start_stack() {
            fi ;;
     esac
     local -a services=()
-    sync_prometheus_config
+    sync_prometheus_config || return 1
     while IFS= read -r service; do services+=("$service"); done < <(selected_services)
     if [ "${#services[@]}" -gt 0 ]; then
         "${COMPOSE[@]}" up -d "${services[@]}"
