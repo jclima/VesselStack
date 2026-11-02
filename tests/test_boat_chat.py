@@ -332,6 +332,36 @@ class PowerTrackingTests(unittest.TestCase):
             self.assertEqual(summary["valid_interval_count"], 2)
             self.assertEqual(summary["peak_inferred_charge_w"], 200.0)
 
+    def test_sign_crossing_interval_is_split_at_zero_and_peak_is_floored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "power.sqlite"
+            start = 1_700_000_000
+            # +100 W to -300 W over 600 s.
+            for offset, power in [(0, 100), (600, -300)]:
+                telemetry_cache.put_power_observation(
+                    shore_power_state="off", port_rpm=0, starboard_rpm=0, battery_power_w=power,
+                    battery_current_a=power / 13.0, battery_voltage_v=13.0, battery_soc_pct=80,
+                    observed_at=start + offset, path=path,
+                )
+            summary = telemetry_cache.power_tracking_summary(days=1, now=start + 600, path=path)
+            hours = 600 / 3600.0
+            # Crossing at 25% of the interval: triangles 0.5*100*0.25*h and 0.5*300*0.75*h.
+            self.assertAlmostEqual(summary["inferred_net_charge_wh"], 0.5 * 100 * 0.25 * hours, places=3)
+            self.assertAlmostEqual(summary["observed_net_discharge_wh"], 0.5 * 300 * 0.75 * hours, places=3)
+            self.assertAlmostEqual(summary["net_battery_energy_wh"], -100 * hours, places=3)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "power.sqlite"
+            for offset, power in [(0, -50), (300, -20)]:
+                telemetry_cache.put_power_observation(
+                    shore_power_state="off", port_rpm=0, starboard_rpm=0, battery_power_w=power,
+                    battery_current_a=power / 13.0, battery_voltage_v=13.0, battery_soc_pct=80,
+                    observed_at=start + offset, path=path,
+                )
+            summary = telemetry_cache.power_tracking_summary(days=1, now=start + 300, path=path)
+            self.assertEqual(summary["peak_inferred_charge_w"], 0.0)
+            self.assertEqual(summary["peak_observed_discharge_w"], 50.0)
+
     def test_rejects_long_gaps_and_non_solar_conditions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "power.sqlite"

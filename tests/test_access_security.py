@@ -114,6 +114,56 @@ class SettingsTests(ServerCase):
         self.assertTrue(self.handler("127.0.0.1")[0])
         self.assertTrue(self.handler("::1")[0])
 
+    def host_handler(self, host, bound=None):
+        stub = mock.Mock()
+        stub.client_address = ("127.0.0.1", 1234)
+        stub.headers = {"Host": host}
+        stub.loopback_host_allowed = lambda: app.BoatChatHandler.loopback_host_allowed(stub)
+        with mock.patch.dict(os.environ, {"BOAT_CHAT_HOST": bound} if bound else {}):
+            return app.BoatChatHandler.settings_write_allowed(stub)
+
+    def test_unauthenticated_loopback_write_rejects_rebound_host_names(self):
+        for host in ("localhost:8765", "127.0.0.1:8765", "[::1]:8765", "chat.localhost"):
+            self.assertTrue(self.host_handler(host)[0], host)
+        for host in ("evil.example:8765", "evil.example", "192.0.2.9:8765"):
+            self.assertFalse(self.host_handler(host)[0], host)
+        # A specific configured bind host is also a legitimate name for this device.
+        self.assertTrue(self.host_handler("boat.example:8765", bound="boat.example")[0])
+
+    def test_host_allowlist_does_not_apply_when_settings_token_is_configured(self):
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "settings-secret"
+        stub = mock.Mock()
+        stub.client_address = (".".join(("192", "168", "1", "20")), 1234)
+        stub.headers = {"Host": "boat.lan:8765", "X-Boat-Chat-Token": "settings-secret"}
+        self.assertTrue(app.BoatChatHandler.settings_write_allowed(stub)[0])
+
+    def test_settings_get_and_head_respect_access_token(self):
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "right-token"
+        self.assertEqual(401, self.call("GET", "/api/settings")[0])
+        self.assertEqual(401, self.call("GET", "/api/settings", token="wrong")[0])
+        self.assertEqual(200, self.call("GET", "/api/settings", token="right-token")[0])
+        for token, expected in ((None, 401), ("right-token", 200)):
+            request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_port}/api/settings", method="HEAD",
+                                             headers={"X-Boat-Chat-Token": token} if token else {})
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    code = response.status
+            except urllib.error.HTTPError as error:
+                code = error.code
+            self.assertEqual(expected, code)
+        os.environ["BOAT_CHAT_ALLOW_OPEN"] = "true"
+        self.assertEqual(200, self.call("GET", "/api/settings")[0])
+
+    def test_non_ascii_token_header_is_rejected_not_a_crash(self):
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "right-token"
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "settings-secret"
+        for path, method in (("/api/status", "GET"), ("/api/settings", "GET"), ("/api/settings", "POST"), ("/api/chat", "POST")):
+            status, _ = self.call(method, path, {"message": "hi"} if method == "POST" else None, token="t\u00f6ken")
+            self.assertIn(status, (401, 403), path)
+        stub = mock.Mock()
+        stub.headers = {"X-Boat-Chat-Token": "t\u00f6ken", "X-Boat-Chat-Debug": "true"}
+        self.assertEqual(["query_plan", "context_profile"], list(app.BoatChatHandler.safe_context(stub, {})))
+
     def test_settings_token_is_required_everywhere_when_configured(self):
         os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "settings-secret"
         self.assertFalse(self.handler("127.0.0.1")[0])
@@ -122,7 +172,8 @@ class SettingsTests(ServerCase):
 
     def test_unauthenticated_settings_never_return_secrets(self):
         self.env_file.write_text("TELEGRAM_ALLOWED_CHAT_IDS=424242\nTELEGRAM_BOT_TOKEN=bot-secret\nBOAT_CHAT_ACCESS_TOKEN=access-secret\nOPENAI_API_KEY=sk-secret\n")
-        status, body = self.call("GET", "/api/settings")
+        self.assertEqual(401, self.call("GET", "/api/settings")[0])
+        status, body = self.call("GET", "/api/settings", token="access-secret")
         self.assertEqual(200, status)
         text = json.dumps(body)
         for leaked in ("424242", "bot-secret", "access-secret", "sk-secret"):

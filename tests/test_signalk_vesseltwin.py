@@ -152,6 +152,50 @@ class PreloadTests(unittest.TestCase):
             self.publish(raw, root, collide)
             self.assertEqual(json.loads((target / "package.json").read_text())["version"], "9.9.9")
 
+    def test_publish_creates_package_json_dependency(self):
+        raw = valid_archive()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.data_tree(root)
+            self.publish(raw, root)
+            data = json.loads((root / "signalk/package.json").read_text())
+            self.assertEqual(data["dependencies"], {"signalk-vesseltwin": "0.2.1"})
+            self.assertEqual(os.listdir(root / "signalk"), ["node_modules", "package.json"])
+
+    def test_publish_preserves_package_json_keys_and_is_idempotent(self):
+        raw = valid_archive()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.data_tree(root)
+            path = root / "signalk/package.json"
+            path.write_text(json.dumps({"name": "cfg", "custom": {"a": 1}, "dependencies": {"other": "^1.0.0"}}))
+            os.chmod(path, 0o640)
+            self.publish(raw, root)
+            data = json.loads(path.read_text())
+            self.assertEqual(data["custom"], {"a": 1})
+            self.assertEqual(data["dependencies"], {"other": "^1.0.0", "signalk-vesseltwin": "0.2.1"})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+            # A second pass (plugin now present, dependency listed) changes nothing.
+            before = path.read_text()
+            preload.ensure_dependency(os.open(root / "signalk", os.O_RDONLY | os.O_DIRECTORY))
+            self.assertEqual(path.read_text(), before)
+
+    def test_ensure_dependency_keeps_existing_entry_and_ignores_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                path = root / "package.json"
+                path.write_text('{"dependencies":{"signalk-vesseltwin":"^0.3.0"}}')
+                preload.ensure_dependency(fd)
+                self.assertEqual(json.loads(path.read_text())["dependencies"]["signalk-vesseltwin"], "^0.3.0")
+                path.write_text("{not json")
+                preload.ensure_dependency(fd)
+                self.assertEqual(path.read_text(), "{not json")
+                self.assertEqual(sorted(os.listdir(root)), ["package.json"])
+            finally:
+                os.close(fd)
+
     @unittest.skipUnless(platform.system() == "Linux", "renameat2 is Linux-only")
     def test_real_linux_noreplace_publication(self):
         raw = valid_archive()

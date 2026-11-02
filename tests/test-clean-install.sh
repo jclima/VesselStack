@@ -154,6 +154,8 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 
 test -x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
+# The installed command defaults to this installation's root (no exported VESSELSTACK_ROOT needed).
+grep -qxF "ROOT=\${VESSELSTACK_ROOT:-$APP_ROOT}" "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
 # The update launcher and the helper root executes are installed root-owned (0755)
 # in a root-owned directory chain, never run from a source checkout.
 test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update")" = "0:755"

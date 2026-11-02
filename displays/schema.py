@@ -56,6 +56,9 @@ SLOT_NEEDS = ("numeric", "min_max")
 SLOT_ROLE = re.compile(r"^[a-z][a-z0-9_]{0,15}$")
 # Layouts that scale a reading into a bar or an arc: every instrument on them needs a min and a max.
 RANGE_LAYOUTS = ("tank-bars", "gauge-arc")
+# Layouts the firmware generator (render.py) can draw. The registry may define more layouts, but a
+# board can only offer these; adding a layout means teaching render.py and adding it here.
+SUPPORTED_LAYOUTS = frozenset({"single", "grid-2x2", "status-grid", "tank-bars", "gauge-arc", "electrical"})
 LAYOUT_HINTS = {"gauge-arc": "gauge-arc needs a round board; use single",
                 "electrical": "electrical needs a round board; use grid-2x2"}
 INSTRUMENT_KEYS = {"path", "label", "convert", "unit", "precision", "stale_after_s", "min_interval_ms",
@@ -567,6 +570,10 @@ def validate_registry(reg) -> list[str]:
                         for i, name in enumerate(bl):
                             if not isinstance(name, str) or name not in known:
                                 errors.append(f"{where}.layouts[{i}]: unknown layout {name!r}")
+                            elif name not in SUPPORTED_LAYOUTS:
+                                errors.append(f"{where}.layouts[{i}]: layout {name!r} is defined in the registry "
+                                              f"but the firmware generator cannot render it yet "
+                                              f"(supported: {', '.join(sorted(SUPPORTED_LAYOUTS))})")
                             elif (known[name] is not None and board.get("shape") in SHAPES
                                   and board["shape"] not in known[name]["shapes"]):
                                 errors.append(f"{where}.layouts[{i}]: layout {name!r} does not support "

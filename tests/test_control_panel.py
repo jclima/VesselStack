@@ -505,6 +505,9 @@ class HttpApiTests(unittest.TestCase):
                 self.assertFalse(handler.authenticated())
                 handler.headers = {"X-VesselStack-Token": "test-panel-token"}
                 self.assertTrue(handler.authenticated())
+                # A non-ASCII header value is a plain mismatch, not a TypeError.
+                handler.headers = {"X-VesselStack-Token": "t\u00f6ken"}
+                self.assertFalse(handler.authenticated())
 
 
 if __name__ == "__main__":

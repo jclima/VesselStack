@@ -943,6 +943,9 @@ rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
 
 touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \
     "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
+install -d "$SYSTEM_ROOT/usr/local/libexec/vesselstack"
+touch "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update" \
+    "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
 if run_ctl uninstall --purge-data >/dev/null 2>&1; then
     echo 'Purge uninstall accepted missing --yes confirmation' >&2
     exit 1
@@ -956,6 +959,9 @@ if grep -q 'volume rm' "$FAKE_BIN/calls.log"; then
 fi
 test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
+# Uninstall also removes the root-owned update launcher and its helper.
+test ! -e "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update"
+test ! -e "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
 test -e "$DATA_ROOT/state.txt"
 
 if run_ctl status unexpected >/dev/null 2>&1; then

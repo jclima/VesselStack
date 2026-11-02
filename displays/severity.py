@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 import re
 
+import conversions
+
 LEVELS = ("ok", "warn", "alarm")
 
 
@@ -106,7 +108,9 @@ def ha_state(state_str, kind: str, cfg: dict, prev=None) -> tuple:
             return ("missing", "unknown", None, None)
         if not math.isfinite(value):
             return ("missing", "unknown", None, None)
-        value = round(value, cfg.get("precision", 0))
+        value = conversions.round_value(value, cfg.get("precision", 0))
+        if value is None:
+            return ("missing", "unknown", None, None)
         thresholds = cfg.get("thresholds")
         sev = numeric_sev(value, thresholds, prev) if thresholds else "ok"
         return ("ok", sev, None, value)

@@ -1,5 +1,7 @@
 # VesselStack Boat Chat
 
+First-run access, settings, telemetry refresh, units and timezone are in [Boat Chat setup](../docs/BOAT_CHAT.md); this page covers providers and development. [Back to README](../README.md)
+
 Local read-only diagnostic chatbot for VesselStack.
 
 This guide follows current `main`. The `0.5.7` lab prerelease includes

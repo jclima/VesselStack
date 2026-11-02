@@ -75,6 +75,13 @@ class ConversionTests(unittest.TestCase):
         self.assertAlmostEqual(f(725), 5.0)
         self.assertLess(conversions.convert("rad->deg_360", -1e-18), 360.0)
 
+    def test_heading_rounding_wraps_to_zero(self) -> None:
+        for deg, precision, expected in ((359.6, 0, 0), (359.5, 0, 0), (359.4, 0, 359), (359.96, 1, 0.0),
+                                         (359.94, 1, 359.9)):
+            got = conversions.convert_and_round("rad->deg_360", math.radians(deg), precision)
+            self.assertEqual(got, expected, (deg, precision))
+        self.assertIsInstance(conversions.convert_and_round("rad->deg_360", math.radians(359.6), 0), int)
+
     def test_rounding(self) -> None:
         self.assertEqual(conversions.round_value(2.5, 0), 3)
         self.assertEqual(conversions.round_value(-2.5, 0), -3)
