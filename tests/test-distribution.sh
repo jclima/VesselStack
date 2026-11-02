@@ -21,11 +21,11 @@ python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 for f in "$ROOT"/displays/*.py "$ROOT"/tests/fixtures/*.py; do python3 -m py_compile "$f"; done
 python3 -m json.tool "$ROOT/displays/boards/registry.json" >/dev/null
 python3 "$ROOT/displays/displayctl.py" validate >/dev/null
-# The ESPHome image pin lives in displays/esphome/IMAGE only; the README must quote the same digest.
+# The ESPHome image pin lives in displays/esphome/IMAGE only; the README or docs/DISPLAYS.md must quote the same digest.
 IMAGE_PIN=$(tr -d '[:space:]' < "$ROOT/displays/esphome/IMAGE")
 grep -Eq '^ghcr\.io/esphome/esphome:[0-9.]+@sha256:[0-9a-f]{64}$' <<<"$IMAGE_PIN"
-grep -qF "$IMAGE_PIN" "$ROOT/README.md"
-grep -qF "esphome==$(tr -d '[:space:]' < "$ROOT/displays/esphome/VERSION")" "$ROOT/README.md"
+grep -qF "$IMAGE_PIN" "$ROOT/README.md" "$ROOT/docs/DISPLAYS.md"
+grep -qF "esphome==$(tr -d '[:space:]' < "$ROOT/displays/esphome/VERSION")" "$ROOT/README.md" "$ROOT/docs/DISPLAYS.md"
 grep -qF ":$(tr -d '[:space:]' < "$ROOT/displays/esphome/VERSION")@" <<<"$IMAGE_PIN"
 shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-influx.sh" \
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \

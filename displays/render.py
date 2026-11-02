@@ -1313,6 +1313,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
     elif layout == ELECTRICAL:
         lines += _electrical_page(config, registry_board, display, pi, page, themed)
     else:
+        assert layout not in schema.SUPPORTED_LAYOUTS, layout   # a supported layout needs a branch above
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
     if header_enabled(display):
         lines += _header_lines(registry_board, display, pi, page, has_ha(config))

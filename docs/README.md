@@ -22,6 +22,12 @@ Boat Chat provider that sends data elsewhere.
 | Stage releases in a home lab | [Deployment](DEPLOYMENT.md) |
 | Carry an update to an offline boat | [Deployment: offline path](DEPLOYMENT.md#simple-path-one-command) |
 | Understand every setting and command | [README reference](../README.md#quick-start-one-command-on-the-raspberry-pi) |
+| Use or secure the Control Panel | [Control Panel](CONTROL_PANEL.md) |
+| Set up Boat Chat access, units and timezone | [Boat Chat setup](BOAT_CHAT.md) |
+| Manage MQTT accounts and access lists | [MQTT access control](MQTT.md) |
+| Reach dashboards from other devices | [Network access and security](NETWORK.md) |
+| Update, roll back, or install offline | [Updating and offline install](UPDATING.md) |
+| Set up ESP32 instrument displays (preview) | [Instrument displays](DISPLAYS.md) |
 | Configure Boat Chat providers and units | [Boat Chat setup](../boat-chat/README.md) |
 | Review power sources and instrument-reading coverage | [Power monitoring](../boat-chat/POWER_MONITORING.md) |
 | Connect selected readings to VesselTwin | [Optional VesselTwin connection](VESSELTWIN.md) |
@@ -50,8 +56,8 @@ and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
 pinned 0.2.1 plugin by default; existing mode is untouched and uses the upstream
 install path. VesselStack never enables, pairs, or authorizes readings for you.
 See the [VesselTwin integration guide](VESSELTWIN.md)
-and [VesselTwin](https://www.vesseltwin.io/) for maintenance manuals and service
-records. Review any external Boat Chat provider's network and retention terms
+and [VesselTwin](https://www.vesseltwin.io/) for maintenance documents, equipment and
+logbook records. Review any external Boat Chat provider's network and retention terms
 before enabling it.
 
 ## Troubleshooting
@@ -67,6 +73,6 @@ MMSIs, call signs, vessel positions, or complete logs publicly.
 ## Contributing
 
 Read [Development](DEVELOPMENT.md) before changing scripts, services, or
-documentation. Keep examples fictional, preserve the README reference, and
+documentation. Keep examples fictional, preserve the README landing page and these reference documents, and
 update the relevant documentation with every repository change. VesselStack is
 licensed under the [Apache License 2.0](../LICENSE).

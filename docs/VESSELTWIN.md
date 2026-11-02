@@ -2,8 +2,8 @@
 
 VesselStack is the onboard system for monitoring, automation, local history, and
 Boat Chat. VesselTwin is a separate service for maintenance documents, equipment,
-and logbook records. Managed SignalK installs can preload the separate VesselTwin
-Signal K plugin, but the connection remains opt-in.
+and logbook records. Managed Docker and native installs preload the separate
+VesselTwin Signal K plugin by default, but the connection remains opt-in.
 
 If you choose to connect them, the supported path is the separate
 [VesselTwin Signal K plugin](https://github.com/jclima/signalk-vesseltwin). It
@@ -14,11 +14,14 @@ account. Pairing is optional, and pairing by itself does not send readings.
 
 Managed Docker and native installs preload the pinned `signalk-vesseltwin`
 0.2.1 package by default. Preloading the package does not enable the plugin,
-pair the account, or send readings. Existing mode is untouched;
+pair the account, or send readings. The preload also lists the plugin under
+`dependencies` in `signalk/package.json` (created if missing, other keys kept),
+because a later `npm install --save` from the Signal K Appstore removes
+packages that file does not list. Existing mode is untouched;
 `SIGNALK_VESSELTWIN_PRELOAD=false` skips future preloads without uninstalling.
 Offline Docker installs reuse a valid existing plugin; if preload is enabled and
-the plugin is missing, preflight fails before mutation. Native SignalK is
-unsupported offline. Disable the plugin itself separately in SignalK's Plugin
+the plugin is missing, preflight fails before mutation. Native Signal K is
+unsupported offline. Disable the plugin itself separately in Signal K's Plugin
 Config UI.
 
 Check the account and rollout first:
@@ -29,7 +32,7 @@ Check the account and rollout first:
   your account.
 - Sign up or check your account at the [VesselTwin home page](https://www.vesseltwin.io/).
   Use the home page rather than bookmarking a direct signup route.
-- In VesselTwin, open **Settings > Integrations > SignalK**. If SignalK is not
+- In VesselTwin, open **Settings > Integrations > SignalK**. If that entry is not
   available there, stop and ask about access before installing the plugin.
 - The upstream plugin currently requires **Node.js 20.3 or newer** and a
   **Signal K 2.x** server. Those are upstream requirements, not a promise that
@@ -75,11 +78,11 @@ directory and administrator account as private.
 Do this while safely alongside, with Signal K security enabled and an
 administrator session open.
 
-1. If the VesselStack installer preloaded the plugin, restart Signal K if needed
-   and continue. Otherwise, in the Signal K admin UI, open **Appstore** and
-   search for **VesselTwin**. If it is available, install it and restart the
-   Signal K server. Then open
-   **Server > Plugin Config** and enable the **VesselTwin** plugin.
+1. Make the plugin available. If the VesselStack installer preloaded it, restart
+   Signal K if needed. Otherwise, in the Signal K admin UI, open **Appstore**,
+   search for **VesselTwin**, install it, and restart the Signal K server. In
+   both cases, then open **Server > Plugin Config** and enable the
+   **VesselTwin** plugin; preloading or installing never enables it.
 2. Open **Webapps > VesselTwin** and choose **Pair**. The admin-only page shows
    a link and a short link code. Open the displayed link, sign in to VesselTwin,
    enter the code, choose the boat, and approve it. The code expires after 10

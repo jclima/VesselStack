@@ -803,7 +803,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
     def authenticated(self) -> bool:
         expected = panel_settings().get("CONTROL_PANEL_TOKEN", "").strip()
         supplied = (self.headers.get("X-VesselStack-Token") or "").strip()
-        return bool(expected) and hmac.compare_digest(expected, supplied)
+        return bool(expected) and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
 
     def require_auth(self) -> bool:
         if self.authenticated():
