@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NodeExporterTemplateTests(unittest.TestCase):
+    def test_system_health_host_panels_use_prometheus_datasource(self):
+        dashboard = json.loads((ROOT / "templates/grafana/dashboards/system-health.json").read_text())
+        panels = {panel["id"]: panel for panel in dashboard["panels"]}
+        expected = {"type": "prometheus", "uid": "vesselstack-prometheus"}
+        for panel_id in range(2, 6):
+            self.assertEqual(panels[panel_id]["datasource"], expected)
+
     def test_exporter_is_optional_hardened_and_internal_only(self):
         compose = (ROOT / "templates/compose.yml").read_text()
         service = compose[compose.index("  node-exporter:"):compose.index("  mosquitto:")]

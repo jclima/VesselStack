@@ -1692,7 +1692,7 @@ def resolve_history_days(message: str, default_days: int = 7) -> int:
     return default_days
 
 
-def generic_influx_history_summary(message: str, limit: int = 24, include_numeric: bool | None = None) -> dict[str, Any]:
+def generic_influx_history_summary(message: str, limit: int = 24, include_numeric: bool | None = None, ha_telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
     tokens = message_tokens(message)
     plan = query_planner.build_query_plan(message)
     concepts = telemetry_concepts(message) | set(plan["signals"])
@@ -1753,7 +1753,13 @@ from(bucket: "{bucket}")
   |> sort(columns: ["_time"])
 '''
             try:
-                rows = convert_generic_rows(query_influx(flux))
+                source = "ha" if bucket == INFLUX_HOME_ASSISTANT_BUCKET else "signalk"
+                rows = convert_generic_rows(query_influx(flux), source=source)
+                source_units = {
+                    str(item.get("entity_id")): str(item.get("unit") or "")
+                    for item in ((ha_telemetry or {}).get("matched", []) if isinstance(ha_telemetry, dict) else [])
+                    if isinstance(item, dict) and item.get("entity_id")
+                } if source == "ha" else {}
                 chart_series = []
                 pref = display_units.preference(setting_value)
                 for measurement in selected[:3]:
@@ -1761,18 +1767,20 @@ from(bucket: "{bucket}")
                     for row in rows:
                         raw_value = safe_float(row.get("_value"))
                         if row.get("_measurement") == measurement and raw_value is not None:
-                            shown_value = display_units.display_value(measurement, raw_value, pref)
-                            points.append({"time": row.get("_time"), "value": round(shown_value, 4), "label": f"{round(shown_value, 2):g} {unit_for_measurement(measurement, {})}"})
+                            source_unit = source_units.get(measurement, "") if source == "ha" else canonical_unit_for_measurement(measurement)
+                            shown_value = display_units.display_value(measurement, raw_value, pref, source_unit)
+                            shown_unit = display_units.unit_for_measurement(measurement, pref, source_unit)
+                            points.append({"time": row.get("_time"), "value": round(shown_value, 4), "label": f"{round(shown_value, 2):g} {shown_unit}".rstrip()})
                     if points:
                         stride = max(1, math.ceil(len(points) / 80))
-                        chart_series.append({"label": display_measurement_name(measurement), "unit": unit_for_measurement(measurement, {}), "points": points[::stride][-80:]})
+                        source_unit = source_units.get(measurement, "") if source == "ha" else canonical_unit_for_measurement(measurement)
+                        chart_series.append({"label": display_measurement_name(measurement), "unit": display_units.unit_for_measurement(measurement, pref, source_unit), "points": points[::stride][-80:]})
                 bucket_payload["chart_series"] = chart_series
                 bucket_payload["sample_interval"] = f"{interval} mean"
                 bucket_payload["numeric_summary"] = summarize_numeric_rows(rows)
                 bucket_payload["units"] = {
-                    measurement: canonical_unit_for_measurement(measurement)
+                    measurement: (source_units.get(measurement, "") if source == "ha" else canonical_unit_for_measurement(measurement))
                     for measurement in selected
-                    if canonical_unit_for_measurement(measurement)
                 }
                 bucket_payload["quality_flags"] = history_quality_flags(bucket_payload["numeric_summary"])
                 bucket_payload["analysis"] = analyze_history_rows(message, rows, selected, interval_minutes)
@@ -1870,11 +1878,12 @@ def complex_answer_focus(message: str, history: dict[str, Any]) -> dict[str, Any
                 None,
             )
             aligned_values = snapshot.get("values") if isinstance(snapshot, dict) else None
+            source_units = units
             aligned_display = (
                 {
                     name: {
-                        "value": format_stat_value(display_units.display_value(name, float(value), display_units.preference(setting_value)) if isinstance(value, (int, float)) else value),
-                        "unit": unit_for_measurement(name, {}),
+                        "value": format_stat_value(display_units.display_value(name, float(value), display_units.preference(setting_value), source_units.get(name)) if isinstance(value, (int, float)) else value),
+                        "unit": display_units.unit_for_measurement(name, display_units.preference(setting_value), source_units.get(name)),
                     }
                     for name, value in aligned_values.items()
                 }
@@ -1885,8 +1894,8 @@ def complex_answer_focus(message: str, history: dict[str, Any]) -> dict[str, Any
             extrema.append(
                 {
                     "direction": direction,
-                    "value": format_stat_value(display_units.display_value(measurement, float(raw_value), display_units.preference(setting_value)) if isinstance(raw_value, (int, float)) else raw_value),
-                    "unit": unit_for_measurement(measurement, {}),
+                    "value": format_stat_value(display_units.display_value(measurement, float(raw_value), display_units.preference(setting_value), source_units.get(measurement)) if isinstance(raw_value, (int, float)) else raw_value),
+                    "unit": display_units.unit_for_measurement(measurement, display_units.preference(setting_value), source_units.get(measurement)),
                     "time_local": summary.get(measurement, {}).get(time_key),
                     "engine_running_only": use_running,
                     "aligned_values": aligned_display,
@@ -2619,7 +2628,7 @@ def convert_generic_value(measurement: str, value: float) -> float:
     return value
 
 
-def convert_generic_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+def convert_generic_rows(rows: list[dict[str, str]], source: str = "signalk") -> list[dict[str, str]]:
     converted: list[dict[str, str]] = []
     for row in rows:
         measurement = row.get("_measurement") or ""
@@ -2627,7 +2636,7 @@ def convert_generic_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         if not measurement or value is None:
             continue
         item = dict(row)
-        item["_value"] = str(convert_generic_value(measurement, value))
+        item["_value"] = str(convert_generic_value(measurement, value)) if source == "signalk" else str(value)
         converted.append(item)
     return converted
 
@@ -3716,6 +3725,9 @@ def answer_from_fuel_balance(context: dict[str, Any]) -> str | None:
     ]
     lines = ["Fuel balance summary, running samples only:"]
     found = False
+    metric = display_units.preference(setting_value) == "metric"
+    fuel_unit = "L/h" if metric else "gal/h"
+    volume_unit = "L" if metric else "gal"
     def signed(value: Any, digits: int = 1) -> str:
         return f"{value:+.{digits}f}" if isinstance(value, (int, float)) else "unknown"
 
@@ -3732,15 +3744,20 @@ def answer_from_fuel_balance(context: dict[str, Any]) -> str | None:
         rpm_diff = derived.get("starboard_minus_port_rpm")
         total_diff = derived.get("starboard_minus_port_total_gallons")
         direction = "more" if diff is not None and diff > 0 else "less" if diff is not None and diff < 0 else "about the same"
-        diff_text = f"{abs(diff):.3f}" if isinstance(diff, (int, float)) else "unknown"
-        total_text = signed(total_diff, 2)
+        factor = 1 / display_units.US_GALLONS_PER_LITER if metric else 1.0
+        port_value = averages.get("port_fuel_gph") * factor if isinstance(averages.get("port_fuel_gph"), (int, float)) else averages.get("port_fuel_gph")
+        stbd_value = averages.get("starboard_fuel_gph") * factor if isinstance(averages.get("starboard_fuel_gph"), (int, float)) else averages.get("starboard_fuel_gph")
+        diff_value = abs(diff) * factor if isinstance(diff, (int, float)) else None
+        total_value = total_diff * factor if isinstance(total_diff, (int, float)) else None
+        diff_text = f"{diff_value:.3f}" if isinstance(diff_value, (int, float)) else "unknown"
+        total_text = signed(total_value, 2)
         lines.append(
             f"- {label}: {running_minutes} running minutes, confidence {summary.get('confidence')}. "
-            f"Port avg {averages.get('port_fuel_gph')} gal/h at {averages.get('port_rpm')} RPM; "
-            f"starboard avg {averages.get('starboard_fuel_gph')} gal/h at {averages.get('starboard_rpm')} RPM. "
-            f"Starboard used {diff_text} gal/h {direction} than port"
+            f"Port avg {port_value} {fuel_unit} at {averages.get('port_rpm')} RPM; "
+            f"starboard avg {stbd_value} {fuel_unit} at {averages.get('starboard_rpm')} RPM. "
+            f"Starboard used {diff_text} {fuel_unit} {direction} than port"
             f"{f' ({pct:+.1f}%)' if isinstance(pct, (int, float)) else ''}; "
-            f"RPM delta {signed(rpm_diff)}; total delta over running minutes {total_text} gal."
+            f"RPM delta {signed(rpm_diff)}; total delta over running minutes {total_text} {volume_unit}."
         )
     if not found:
         lines.append("No comparison is possible until both engines have fuel and RPM samples while running.")
@@ -3945,11 +3962,13 @@ def answer_from_generic_history(context: dict[str, Any]) -> str | None:
     label = str(history.get("label") or f"last {int(history.get('lookback_days', 7) or 7)} days")
     lines = [f"Retained history for {label} ({history.get('start_local')} to {history.get('stop_local')}):"]
     for bucket, measurement, stats in rows[:6]:
-        unit = unit_for_measurement(measurement, context)
+        bucket_payload = (history.get("buckets") or {}).get(bucket, {})
+        source_unit = (bucket_payload.get("units") or {}).get(measurement) if isinstance(bucket_payload, dict) else None
         pref = display_units.preference(setting_value)
+        unit = display_units.unit_for_measurement(measurement, pref, source_unit)
         def shown_stat(key: str) -> Any:
             value = stats.get(key)
-            return display_units.display_value(measurement, float(value), pref) if isinstance(value, (int, float)) else value
+            return display_units.display_value(measurement, float(value), pref, source_unit) if isinstance(value, (int, float)) else value
         suffix = f" {unit}" if unit else ""
         lines.append(
             f"- {display_measurement_name(measurement)}: "
@@ -4121,7 +4140,7 @@ def collect_context(message: str, history: list[dict[str, str]] | None = None, p
         and (kind.get("complex_history") or not purpose_history)
     ):
         try:
-            context["influx_history"] = generic_influx_history_summary(query)
+            context["influx_history"] = generic_influx_history_summary(query, ha_telemetry=context.get("ha_telemetry"))
             focus = complex_answer_focus(query, context["influx_history"])
             if focus:
                 context["answer_focus"] = focus
@@ -4344,8 +4363,10 @@ def answer_experience(context: dict[str, Any]) -> dict[str, Any]:
         charts.extend(bucket.get("chart_series") or [])
         units=bucket.get("units") or {}
         for measurement,stats in list((bucket.get("numeric_summary") or {}).items())[:3]:
-            shown_unit = unit_for_measurement(measurement, context)
-            metrics.append({"label":display_measurement_name(measurement),"unit":shown_unit,"min":display_units.display_value(measurement, stats.get("min"), display_units.preference(setting_value)) if isinstance(stats.get("min"),(int,float)) else stats.get("min"),"avg":display_units.display_value(measurement, stats.get("avg"), display_units.preference(setting_value)) if isinstance(stats.get("avg"),(int,float)) else stats.get("avg"),"max":display_units.display_value(measurement, stats.get("max"), display_units.preference(setting_value)) if isinstance(stats.get("max"),(int,float)) else stats.get("max"),"latest":display_units.display_value(measurement, stats.get("latest"), display_units.preference(setting_value)) if isinstance(stats.get("latest"),(int,float)) else stats.get("latest")})
+            pref = display_units.preference(setting_value)
+            source_unit = units.get(measurement)
+            shown_unit = display_units.unit_for_measurement(measurement, pref, source_unit)
+            metrics.append({"label":display_measurement_name(measurement),"unit":shown_unit,"min":display_units.display_value(measurement, stats.get("min"), pref, source_unit) if isinstance(stats.get("min"),(int,float)) else stats.get("min"),"avg":display_units.display_value(measurement, stats.get("avg"), pref, source_unit) if isinstance(stats.get("avg"),(int,float)) else stats.get("avg"),"max":display_units.display_value(measurement, stats.get("max"), pref, source_unit) if isinstance(stats.get("max"),(int,float)) else stats.get("max"),"latest":display_units.display_value(measurement, stats.get("latest"), pref, source_unit) if isinstance(stats.get("latest"),(int,float)) else stats.get("latest")})
     return {"evidence":evidence,"followups":list(dict.fromkeys(followups))[:3],"metrics":metrics[:4],"charts":charts[:3],"calculation":{"operation":plan.get("operation"),"signals":plan.get("signals",[])},"elapsed_ms":profile.get("elapsed_ms")}
 
 

@@ -28,8 +28,27 @@ def preference(setting_getter: Callable[[str, str], str] | None = None) -> str:
 def unit_for_measurement(measurement: str, pref: str = "us_customary", source_unit: str | None = None) -> str:
     p = normalize_preference(pref)
     m = str(measurement).lower()
-    if source_unit and p == "us_customary":
+    # An explicit empty unit means that the source did not tell us its unit.
+    # Do not infer or relabel that value.  This is important for HA sensors,
+    # where an entity may be numeric but deliberately have no unit metadata.
+    if source_unit == "":
+        return ""
+    if source_unit is not None and source_unit.lower() not in {"f", "°f", "c", "°c", "ft", "m", "psi", "kpa", "pa", "hpa", "inhg", "gal", "us gal", "gal/h", "gph", "l", "l/h"}:
         return source_unit
+    if source_unit is not None and p == "us_customary":
+        return source_unit
+    if source_unit is not None and p == "metric":
+        source_key = source_unit.lower().replace("°", "")
+        if source_key in {"f", "c"}:
+            return "°C"
+        if source_key in {"psi", "kpa", "pa", "inhg", "hpa"}:
+            return "hPa" if ("environment" in m or "barometer" in m) else "kPa"
+        if source_key in {"ft", "m"}:
+            return "m"
+        if source_key in {"gal/h", "gph", "l/h"}:
+            return "L/h"
+        if source_key in {"gal", "us gal", "l"}:
+            return "L"
     if "temperature" in m or m.endswith(".temp"):
         return "°C" if p == "metric" else "F"
     if "pressure" in m or "oilpressure" in m or "boostpressure" in m:
@@ -64,7 +83,7 @@ def unit_for_measurement(measurement: str, pref: str = "us_customary", source_un
         return "A"
     if "humidity" in m or "stateofcharge" in m or "state_of_charge" in m:
         return "%"
-    return source_unit or ""
+    return source_unit if source_unit is not None else ""
 
 
 def convert(value: float, from_unit: str, to_unit: str) -> float:
@@ -83,13 +102,17 @@ def convert(value: float, from_unit: str, to_unit: str) -> float:
         ("pa", "psi"): 1 / PA_PER_PSI,
         ("psi", "pa"): PA_PER_PSI,
         ("kpa", "psi"): 1000 / PA_PER_PSI,
+        ("psi", "hpa"): PA_PER_PSI / 100,
+        ("hpa", "psi"): 100 / PA_PER_PSI,
+        ("pa", "hpa"): 1 / 100,
+        ("hpa", "kpa"): 0.1,
+        ("kpa", "hpa"): 10,
+        ("inhg", "hpa"): PA_PER_INHG / 100,
         ("hpa", "inhg"): 100 / PA_PER_INHG,
         ("inhg", "kpa"): PA_PER_INHG / 1000,
         ("kpa", "inhg"): 1000 / PA_PER_INHG,
         ("kpa", "pa"): 1000,
         ("hpa", "pa"): 100,
-        ("inhg", "hpa"): PA_PER_INHG / 100,
-        ("pa", "hpa"): 1 / 100,
         ("ft", "m"): M_PER_FT,
         ("m", "ft"): 1 / M_PER_FT,
         ("gal/h", "l/h"): 1 / US_GALLONS_PER_LITER,
@@ -109,10 +132,22 @@ def convert_delta(value: float, from_unit: str, to_unit: str) -> float:
     return convert(value, from_unit, to_unit)
 
 
-def display_value(measurement: str, value: float, pref: str = "us_customary") -> float:
-    """Convert an existing generic Boat Chat value (US display baseline)."""
-    target = unit_for_measurement(measurement, pref)
+def display_value(measurement: str, value: float, pref: str = "us_customary", source_unit: str | None = None) -> float:
+    """Convert a value using its explicit source unit, or legacy SignalK units."""
+    target = unit_for_measurement(measurement, pref, source_unit)
     lower = str(measurement).lower()
+    if source_unit == "":
+        return value
+    if source_unit is not None:
+        recognized = {"f", "°f", "c", "°c", "ft", "m", "psi", "kpa", "pa", "hpa", "inhg", "gal", "us gal", "gal/h", "gph", "l", "l/h"}
+        if source_unit.lower() not in recognized:
+            return value
+        source = {"gph": "gal/h"}.get(source_unit.lower(), source_unit)
+        return convert(value, source, target)
+    # Legacy fallback applies only to known SignalK canonical paths.
+    known = lower.startswith(("propulsion.", "environment.", "navigation.", "electrical.", "tanks."))
+    if not known:
+        return value
     if "temperature" in lower or lower.endswith(".temp"):
         return convert(value, "F", target)
     if "depth" in lower or "distance" in lower:
@@ -138,12 +173,25 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
     """Deep-copy context and make unit-bearing model fields self-consistent."""
     p = normalize_preference(pref)
     result = copy.deepcopy(context)
+    fallback_units: dict[str, str] = {}
+    ha = result.get("ha_telemetry")
+    if isinstance(ha, dict):
+        for item in ha.get("matched", []):
+            if isinstance(item, dict) and item.get("entity_id"):
+                fallback_units[str(item["entity_id"])] = str(item.get("unit") or "")
     if p == "us_customary":
         result.setdefault("display_units", "us_customary")
         return result
 
-    def walk(value: Any, parent: str = "") -> Any:
+    def walk(value: Any, parent: str = "", inherited_units: dict[str, str] | None = None) -> Any:
         if isinstance(value, dict):
+            source_units = dict(inherited_units or fallback_units)
+            if isinstance(value.get("units"), dict):
+                source_units = {str(key): str(unit or "") for key, unit in value["units"].items()}
+            def source_for(measurement: str) -> str | None:
+                if measurement in source_units:
+                    return source_units[measurement]
+                return next((unit for key, unit in source_units.items() if measurement.endswith("." + key)), None)
             if p == "metric" and isinstance(value.get("port_measurement"), str):
                 measurement = str(value["port_measurement"])
                 for comparison_key in ("all_aligned_samples", "rpm_matched_within_50"):
@@ -156,12 +204,16 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
                 # Numeric history stats are nested beneath canonical measurement
                 # paths. Convert only those known telemetry paths, never facts
                 # or arbitrary user dictionaries containing a temperature key.
-                known = parent.startswith(("propulsion.", "environment.", "navigation.", "electrical.", "tanks."))
+                known = parent in source_units or parent.startswith(("propulsion.", "environment.", "navigation.", "electrical.", "tanks."))
                 if known:
                     value_keys = {"min", "max", "avg", "average", "last", "latest", "first", "delta", "difference", "p50", "median", "stddev"}
                     for stat_key, stat_value in list(value.items()):
                         if stat_key in value_keys and isinstance(stat_value, (int, float)):
-                            value[stat_key] = convert_delta(float(stat_value), "F", "C") if stat_key in {"delta", "difference", "stddev"} and "temp" in parent.lower() else display_value(parent, float(stat_value), p)
+                            source = source_for(parent)
+                            source_key = (source if source is not None else "F").lower().replace("°", "")
+                            canonical_temp = "temperature" in parent.lower() or parent.lower().endswith(".temp")
+                            explicit_temp = source is not None and source != "" and source_key in {"f", "c"}
+                            value[stat_key] = convert_delta(float(stat_value), source or "F", "C") if stat_key in {"delta", "difference", "stddev"} and (canonical_temp or explicit_temp) and (source is None or source_key in {"f", "c"}) else display_value(parent, float(stat_value), p, source)
             out: dict[str, Any] = {}
             for raw_key, item in value.items():
                 key = _rename_metric_key(str(raw_key))
@@ -178,9 +230,9 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
                         item = float(item) * M_PER_FT
                     elif "liters" in key or "lph" in key:
                         item = convert(float(item), "us gal" if "liter" in key else "gal/h", "L" if "liter" in key else "L/h")
-                if p == "metric" and isinstance(item, (int, float)) and str(raw_key).startswith(("propulsion.", "environment.", "navigation.", "electrical.", "tanks.")):
-                    item = display_value(str(raw_key), float(item), p)
-                out[key] = walk(item, key)
+                if p == "metric" and isinstance(item, (int, float)) and (str(raw_key) in source_units or str(raw_key).startswith(("propulsion.", "environment.", "navigation.", "electrical.", "tanks."))):
+                    item = display_value(str(raw_key), float(item), p, source_for(str(raw_key)))
+                out[key] = walk(item, key, source_units)
             if p == "metric" and "state" in out and ("unit" in out or "unit_of_measurement" in out):
                 source = str(out.get("unit") or out.get("unit_of_measurement") or "")
                 targets = {"F": "°C", "°F": "°C", "psi": "kPa", "Pa": "kPa", "inHg": "hPa", "ft": "m", "gal": "L", "gal/h": "L/h"}
@@ -196,7 +248,7 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
                     pass
             return out
         if isinstance(value, list):
-            items = [walk(item, parent) for item in value]
+            items = [walk(item, parent, inherited_units) for item in value]
             if p == "metric" and parent == "notes":
                 items = [
                     item.replace("Fuel rate is integrated by minute and reported in US gallons (gal, gal/h).", "Fuel rate is integrated by minute and reported in liters (L, L/h).")
