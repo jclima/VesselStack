@@ -59,7 +59,7 @@ cannot interleave with a concurrent `displayctl add`.
 
 With `DISPLAYS_ENABLE=false` (the default) only the administrator account
 (`MQTT_USERNAME`) exists: it has `readwrite #` and `read $SYS/#`, so Home
-Assistant, SignalK and other existing clients that use that account keep
+Assistant, Signal K and other existing clients that use that account keep
 working. With `DISPLAYS_ENABLE=true` these accounts are added:
 
 | Account | Read | Write |
@@ -110,7 +110,7 @@ Operational notes:
   broker without a restart.
 - `install.sh --dry-run` (the Control Panel "Preflight", and the check that
   `vesselstackctl update` runs before it takes a backup) never writes files,
-  pulls images, takes the lock or signals containers, but it now runs
+  pulls images, takes the lock or signals containers, but it runs
   `displayctl.py preflight`, which rejects up front everything the sync would
   reject: an administrator `MQTT_PASSWORD` containing `:` or leading/trailing
   whitespace (a generated one is always fine), invalid account names, a bridge
@@ -124,7 +124,7 @@ Operational notes:
   run repeats the same checks and pulls a missing image *before* it changes any
   file, then syncs the MQTT access files **before** it installs the new
   `compose.yml` and `config/mosquitto/mosquitto.conf`, so a failure leaves the
-  previous broker definition in place. Apply configuration and install may
+  previous broker definition in place. **Apply** and **Reinstall & start** may
   pull the pinned Mosquitto image on first use and send `SIGHUP` to a running
   broker.
 - Upgrade impact: the Mosquitto container is recreated (a brief MQTT
@@ -136,7 +136,7 @@ Operational notes:
   `config/mosquitto.conf` and reads the legacy `passwords` file in
   `$VESSELSTACK_DATA/mosquitto`, so existing clients keep working, but the new
   ACL, the bridge account and the display accounts do **not** exist on that
-  broker. A render-only run (Control Panel "Apply configuration", or
+  broker. A render-only run (Control Panel **Apply**, or
   `install.sh --config ...` without `--start`) writes the new files but never
   recreates containers; it prints a `NOTICE` when the running broker predates
   the new definition (and when the displays bridge is enabled but not running)
@@ -188,7 +188,7 @@ Operational notes:
   survive the new render plus `docker restart`, and only the container
   recreated from the real `compose.yml` mounts enforces the ACL.
 - `tests/test-displays-envfile-systemd.sh` boots systemd in a privileged
-  Debian container and checks that a SignalK token containing dollar, backtick, quote, backslash,
+  Debian container and checks that a Signal K token containing dollar, backtick, quote, backslash,
   hash, semicolon and percent characters and spaces reaches the service environment unchanged through
   `EnvironmentFile=` (systemd does not expand `$` or `%` there), and that
   `systemd-analyze verify` accepts the rendered unit. If the container cannot

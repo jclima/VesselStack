@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import zoneinfo
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,92 +84,127 @@ INIT_ONLY_NOTE = (
     "config/vesselstack.env and re-apply the configuration); see the README, Rotating secrets."
 )
 
+SEC_VESSEL = "Vessel"
+SEC_NETWORK = "Network & access"
+SEC_CHAT = "Boat Chat"
+SEC_SIGNALK = "Signal K & NMEA 2000"
+SEC_DISPLAYS = "Displays"
+SEC_STORAGE = "Storage & history"
+SEC_SERVICES = "Services & ports"
+SEC_AIS = "AIS receiver"
+SEC_HA = "Home Assistant"
+SEC_INSTALL = "Installation"
+
+# Settings sections in display order. Advanced sections start collapsed in the UI.
+SECTIONS = [
+    {"name": SEC_VESSEL, "lead": "Who the boat is and how numbers are shown.", "advanced": False},
+    {"name": SEC_NETWORK, "lead": "Who can reach the boat computer and its web pages.", "advanced": False},
+    {"name": SEC_CHAT, "lead": "The assistant you can ask about your boat, and Telegram alerts.", "advanced": False},
+    {"name": SEC_SIGNALK, "lead": "How boat data gets in.", "advanced": False},
+    {"name": SEC_DISPLAYS, "lead": "Instrument displays that show boat data.", "advanced": False},
+    {"name": SEC_STORAGE, "lead": "How long data is kept, where backups go, and the database settings.", "advanced": True},
+    {"name": SEC_SERVICES, "lead": "Ports and accounts for the individual services.", "advanced": True},
+    {"name": SEC_AIS, "lead": "The AIS-catcher receiver that shows nearby ships.", "advanced": True},
+    {"name": SEC_HA, "lead": "How VesselStack reaches Home Assistant.", "advanced": True},
+    {"name": SEC_INSTALL, "lead": "Read-only here. Change these from a recovery shell with a reviewed migration.", "advanced": True},
+]
+
 FIELDS = [
-    field("BOAT_NAME", "Boat name", "Vessel", description="Display name used across VesselStack."),
-    field("BOAT_TYPE", "Boat type", "Vessel"),
-    field("BOAT_MMSI", "MMSI", "Vessel", kind="secret", description="Optional private vessel identity; never commit it."),
-    field("BOAT_CALLSIGN", "Call sign", "Vessel", kind="secret", description="Optional private vessel identity; never commit it."),
-    field("BOAT_LOA_M", "Length overall (m)", "Vessel", kind="number"),
-    field("BOAT_BEAM_M", "Beam (m)", "Vessel", kind="number"),
-    field("BOAT_TIMEZONE", "Timezone", "Vessel", description="IANA timezone such as America/Los_Angeles."),
-    field("BOAT_UNITS", "Display units", "Vessel", kind="select", choices=["us_customary", "metric"]),
-    field("VESSELSTACK_USER", "Service account", "Installation", read_only=True, description="Change from the recovery shell with a reviewed migration."),
-    field("VESSELSTACK_ROOT", "Application path", "Installation", kind="path", read_only=True, description="Change from the recovery shell with a reviewed migration."),
-    field("VESSELSTACK_DATA", "Data path", "Installation", kind="path", read_only=True, description="Relocate data only with a stopped stack and verified backup."),
-    field("VESSELSTACK_BACKUP", "Backup path", "Installation", kind="path"),
-    field("VESSELSTACK_DISABLED_COMPONENTS", "Disabled components", "Installation", read_only=True, description="Read-only membership summary; use Components to add or remove core services."),
-    field("SIGNALK_MODE", "SignalK mode", "SignalK", kind="select", choices=["existing", "docker", "native"]),
-    field("SIGNALK_VERSION", "SignalK version", "SignalK"),
-    field("SIGNALK_URL", "SignalK URL", "SignalK", kind="url"),
-    field("SIGNALK_VESSELTWIN_PRELOAD", "Preload VesselTwin plugin", "SignalK", kind="boolean", description="Managed Docker/native modes install the pinned signalk-vesseltwin plugin before SignalK starts. Existing mode is never modified; false skips installation and never uninstalls."),
-    field("SOCKETCAN_ENABLE", "Enable SocketCAN", "SignalK", kind="boolean"),
-    field("SOCKETCAN_INTERFACE", "CAN interface", "SignalK"),
-    field("SOCKETCAN_BITRATE", "CAN bitrate", "SignalK", kind="number"),
-    field("AIS_ENABLE", "Enable AIS-catcher", "AIS", kind="boolean"),
-    field("AIS_IMAGE", "AIS image", "AIS"),
-    field("AIS_DEVICE", "AIS device", "AIS", kind="path"),
-    field("AIS_CATCHER_ARGS", "AIS-catcher arguments", "AIS"),
-    field("AIS_WEB_PORT", "AIS web port", "AIS", kind="port"),
-    field("AIS_TCP_PORT", "AIS TCP output port", "AIS", kind="port"),
-    field("HOME_ASSISTANT_URL", "Home Assistant URL", "Home Assistant", kind="url"),
-    field("HOME_ASSISTANT_TOKEN", "Home Assistant token", "Home Assistant", kind="secret"),
-    field("INFLUXDB_URL", "InfluxDB URL", "InfluxDB", kind="url"),
-    field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services bind address", "Network", description="InfluxDB, Prometheus and MQTT publish on this IPv4 address. Keep 127.0.0.1 unless external devices must connect over a trusted network."),
-    field("VESSELSTACK_WEB_BIND_ADDRESS", "Web UI bind address", "Network", description="Grafana and Heimdall publish on this IPv4 address (0.0.0.0 = every interface, 127.0.0.1 = this device only)."),
-    field("HOMEASSISTANT_BIND_ADDRESS", "Home Assistant bind address", "Network", description="0.0.0.0 = every interface, 127.0.0.1 = this device only. Applied through a managed http block in Home Assistant's configuration.yaml by the installer or `vesselstackctl lan`; SignalK has no such setting."),
-    field("INFLUXDB_PORT", "Published port", "InfluxDB", kind="port"),
-    field("INFLUXDB_CONTAINER_NAME", "Container name", "InfluxDB"),
-    field("INFLUXDB_ORG", "Organization", "InfluxDB"),
-    field("INFLUXDB_USERNAME", "Admin username", "InfluxDB"),
-    field("INFLUXDB_RAW_BUCKET", "Raw bucket", "InfluxDB"),
-    field("INFLUXDB_HISTORY_BUCKET", "History bucket", "InfluxDB"),
-    field("INFLUXDB_HOME_ASSISTANT_BUCKET", "Home Assistant bucket", "InfluxDB"),
-    field("INFLUXDB_AIS_BUCKET", "AIS bucket", "InfluxDB"),
-    field("INFLUXDB_RAW_RETENTION", "Raw bucket retention", "InfluxDB", description="Duration such as 720h, 30d or 8w, or 0 to keep forever. Empty = 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply/start and permanently deletes raw data older than the window."),
-    field("PROMETHEUS_RETENTION", "Prometheus retention", "Prometheus", description="Duration such as 720h, 30d or 8w. Empty = 30d. Metrics older than this are deleted by Prometheus."),
-    field("INFLUXDB_PASSWORD", "Admin password", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB")),
-    field("INFLUXDB_TOKEN", "Admin token", "InfluxDB", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB") + " Boat Chat and Grafana also use this token."),
-    field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", "Grafana", kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="Grafana")),
-    field("GRAFANA_PORT", "Published port", "Grafana", kind="port"),
-    field("HEIMDALL_PORT", "HTTP port", "Heimdall", kind="port"),
-    field("HEIMDALL_HTTPS_PORT", "HTTPS port", "Heimdall", kind="port"),
-    field("PROMETHEUS_PORT", "Published port", "Prometheus", kind="port"),
-    field("MQTT_USERNAME", "MQTT username", "MQTT"),
-    field("MQTT_PASSWORD", "MQTT password", "MQTT", kind="secret", description="Applied to the Mosquitto password file on the next apply/start; update Home Assistant's MQTT integration to match."),
-    field("MQTT_PORT", "Published port", "MQTT", kind="port"),
-    field("DISPLAYS_ENABLE", "Enable instrument displays", "Displays", kind="boolean", description="Adds the scoped bridge and per-display read-only MQTT accounts to the Mosquitto access list."),
-    field("NODE_EXPORTER_ENABLE", "Enable host metrics", "Prometheus", kind="boolean", description="Runs the optional hardened host metrics exporter on the private Compose metrics profile."),
-    field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", "Displays", description="Letters, numbers, dot, underscore and hyphen; must differ from the MQTT username."),
-    field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge SignalK token", "Displays", kind="secret", description="Optional. Sent as a bearer token when SignalK requires authentication; leave blank otherwise."),
-    field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", "Displays", kind="secret", description="Optional, only for Home Assistant items (ha) in displays.json; leave blank otherwise. A leaked token can operate every device in your Home Assistant; a non-admin user only prevents configuration changes. Keep it on the Pi (root-only), never reuse it, and revoke it in Home Assistant (Profile -> Security) if it leaks."),
-    field("VESSELSTACK_FIREWALL_ENABLE", "Enable interface firewall", "Network", kind="boolean"),
-    field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted interface", "Network"),
-    field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", "Network", kind="boolean", description="Drops everything on the untrusted interface except the allow-lists; keep another way to reach the device."),
-    field("VESSELSTACK_FIREWALL_ALLOW_TCP", "Strict mode allowed TCP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default 22."),
-    field("VESSELSTACK_FIREWALL_ALLOW_UDP", "Strict mode allowed UDP ports", "Network", description="Comma-separated ports or LOW:HIGH ranges; default none."),
-    field("CONTROL_PANEL_HOST", "Control panel host", "Control Panel", description="Keep 127.0.0.1 for local-only access. For a trusted LAN, use `sudo vesselstackctl panel-access lan`; this exposes unencrypted HTTP on every interface and may still be blocked by a strict firewall. Roll back with `sudo vesselstackctl panel-access local`."),
-    field("CONTROL_PANEL_PORT", "Control panel port", "Control Panel", kind="port"),
-    field("BOAT_CHAT_PROVIDER", "Primary provider", "Boat Chat", source="chat", kind="select", choices=["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
-    field("BOAT_CHAT_MODEL", "Primary model", "Boat Chat", source="chat"),
-    field("BOAT_CHAT_FALLBACK_PROVIDER", "Fallback provider", "Boat Chat", source="chat", kind="select", choices=["", "local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"]),
-    field("BOAT_CHAT_FALLBACK_MODEL", "Fallback model", "Boat Chat", source="chat"),
-    field("BOAT_CHAT_HOST", "Boat Chat host", "Boat Chat", source="chat"),
-    field("BOAT_CHAT_PORT", "Boat Chat port", "Boat Chat", source="chat", kind="port"),
-    field("TELEMETRY_INDEXER_ENABLE", "Refresh telemetry memory", "Boat Chat", kind="boolean"),
-    field("OLLAMA_HOST", "Ollama URL", "Boat Chat", source="chat", kind="url"),
-    field("BOAT_CHAT_BASE_URL", "Compatible API base URL", "Boat Chat", source="chat", kind="url"),
-    field("OPENAI_API_KEY", "OpenAI API key", "Boat Chat", source="chat", kind="secret"),
-    field("AI_GATEWAY_API_KEY", "Vercel AI Gateway key", "Boat Chat", source="chat", kind="secret"),
-    field("BOAT_CHAT_API_KEY", "Compatible API key", "Boat Chat", source="chat", kind="secret"),
-    field("AWS_REGION", "AWS region", "Boat Chat", source="chat"),
-    field("AWS_ACCESS_KEY_ID", "AWS access key", "Boat Chat", source="chat", kind="secret"),
-    field("AWS_SECRET_ACCESS_KEY", "AWS secret key", "Boat Chat", source="chat", kind="secret"),
-    field("GOOGLE_API_KEY", "Google API key", "Boat Chat", source="chat", kind="secret"),
-    field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", "Boat Chat", source="chat"),
-    field("BOAT_CHAT_ACCESS_TOKEN", "Boat Chat access token", "Boat Chat", source="chat", kind="secret", description="Required by chat, status and data APIs and the Telegram bridge."),
-    field("TELEGRAM_BOT_TOKEN", "Telegram bot token", "Telegram", source="chat", kind="secret"),
-    field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chat IDs", "Telegram", source="chat", kind="secret"),
-    field("TELEGRAM_ENABLE", "Run Telegram worker", "Telegram", kind="boolean"),
+    # Vessel
+    field("BOAT_NAME", "Boat name", SEC_VESSEL, description="Shown in headers, alerts and Boat Chat."),
+    field("BOAT_TYPE", "Boat type", SEC_VESSEL, description="For example Motor vessel, Sailing yacht or Catamaran. Shown to people and Boat Chat; it does not change how anything is installed."),
+    field("BOAT_UNITS", "Display units", SEC_VESSEL, kind="select", choices=["us_customary", "metric"], description="US customary shows feet, degrees F, psi and US gallons; metric shows metres, degrees C, kPa and litres. Speeds stay in knots and distances in nautical miles either way."),
+    field("BOAT_TIMEZONE", "Timezone", SEC_VESSEL, description="A region and city name, such as Europe/Lisbon or America/Los_Angeles. Used for timestamps and daily summaries."),
+    field("BOAT_LOA_M", "Length overall (m)", SEC_VESSEL, kind="number", description="Shown to Boat Chat as part of your boat's details. A number above 0, up to 500."),
+    field("BOAT_BEAM_M", "Beam (m)", SEC_VESSEL, kind="number", description="Width at the widest point of the hull. A number above 0, up to 100."),
+    field("BOAT_MMSI", "MMSI", SEC_VESSEL, kind="secret", description="Optional. Your vessel's radio identity number. Kept private on this boat computer; never commit it."),
+    field("BOAT_CALLSIGN", "Call sign", SEC_VESSEL, kind="secret", description="Optional. Kept private on this boat computer; never commit it."),
+    # Network & access
+    field("VESSELSTACK_WEB_BIND_ADDRESS", "Web pages visible to", SEC_NETWORK, description="Grafana and Heimdall listen on this address. 127.0.0.1 means this device only; 0.0.0.0 means every device on the boat network."),
+    field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services visible to", SEC_NETWORK, description="InfluxDB, Prometheus and MQTT listen on this address. Keep 127.0.0.1 unless another device must connect over a network you trust."),
+    field("HOMEASSISTANT_BIND_ADDRESS", "Home Assistant visible to", SEC_NETWORK, description="127.0.0.1 means this device only; 0.0.0.0 means every device on the boat network. Applied through a managed http block in Home Assistant's configuration.yaml when you apply your settings or run sudo vesselstackctl lan. Signal K has no such setting."),
+    field("CONTROL_PANEL_HOST", "Control Panel address", SEC_NETWORK, description="Keep 127.0.0.1 to reach the panel through an SSH tunnel only. To open it to a trusted network, run sudo vesselstackctl panel-access lan on the boat computer; that exposes unencrypted HTTP on every interface and a strict firewall may still block it. Undo it with sudo vesselstackctl panel-access local."),
+    field("CONTROL_PANEL_PORT", "Control Panel port", SEC_NETWORK, kind="port", description="The port the panel listens on. Restart the Control Panel after changing it."),
+    field("VESSELSTACK_FIREWALL_ENABLE", "Protect the boat network with a firewall", SEC_NETWORK, kind="boolean", description="Blocks incoming connections on the interface named below. Strict mode allows only the ports you list, so keep another way in."),
+    field("VESSELSTACK_UNTRUSTED_INTERFACE", "Untrusted network interface", SEC_NETWORK, description="The interface facing the marina or shore Wi-Fi, for example wlan0."),
+    field("VESSELSTACK_FIREWALL_STRICT", "Strict firewall (allow-list only)", SEC_NETWORK, kind="boolean", description="Drops everything on the untrusted interface except the allowed ports below; keep another way to reach the device."),
+    field("VESSELSTACK_FIREWALL_ALLOW_TCP", "Allowed TCP ports (strict mode)", SEC_NETWORK, description="Comma-separated ports or LOW:HIGH ranges, for example 22,8000:8100. Default 22."),
+    field("VESSELSTACK_FIREWALL_ALLOW_UDP", "Allowed UDP ports (strict mode)", SEC_NETWORK, description="Comma-separated ports or LOW:HIGH ranges. Default none."),
+    # Boat Chat
+    field("BOAT_CHAT_PROVIDER", "Primary provider", SEC_CHAT, source="chat", kind="select", choices=["local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"], description="Where answers come from. Local keeps everything on the boat."),
+    field("BOAT_CHAT_MODEL", "Primary model", SEC_CHAT, source="chat", description="Model name for the provider you picked."),
+    field("BOAT_CHAT_FALLBACK_PROVIDER", "Fallback provider", SEC_CHAT, source="chat", kind="select", choices=["", "local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"], description="Used when the primary provider cannot be reached, for example offshore. Optional."),
+    field("BOAT_CHAT_FALLBACK_MODEL", "Fallback model", SEC_CHAT, source="chat", description="Model name for the fallback provider."),
+    field("BOAT_CHAT_HOST", "Boat Chat address", SEC_CHAT, source="chat", description="The address Boat Chat listens on. 127.0.0.1 keeps it on this device."),
+    field("BOAT_CHAT_PORT", "Boat Chat port", SEC_CHAT, source="chat", kind="port", description="The port Boat Chat listens on."),
+    field("BOAT_CHAT_ACCESS_TOKEN", "Boat Chat access token", SEC_CHAT, source="chat", kind="secret", description="Required by chat, status and data pages and the Telegram bridge."),
+    field("TELEMETRY_INDEXER_ENABLE", "Refresh telemetry memory", SEC_CHAT, kind="boolean", description="Keeps Boat Chat's memory of your boat data up to date so it can answer questions about past readings."),
+    field("OLLAMA_HOST", "Ollama address", SEC_CHAT, source="chat", kind="url", description="Where your Ollama server is. Used only when Ollama is a provider."),
+    field("BOAT_CHAT_BASE_URL", "Compatible API base address", SEC_CHAT, source="chat", kind="url", description="Address of an OpenAI-compatible service. Used only with that provider."),
+    field("OPENAI_API_KEY", "OpenAI API key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only when OpenAI is a provider."),
+    field("AI_GATEWAY_API_KEY", "Vercel AI Gateway key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only when Vercel AI Gateway is a provider."),
+    field("BOAT_CHAT_API_KEY", "Compatible API key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only with an OpenAI-compatible service."),
+    field("AWS_REGION", "AWS region", SEC_CHAT, source="chat", description="For example eu-west-1. Used only with Amazon Bedrock."),
+    field("AWS_ACCESS_KEY_ID", "AWS access key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only with Amazon Bedrock."),
+    field("AWS_SECRET_ACCESS_KEY", "AWS secret key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only with Amazon Bedrock."),
+    field("GOOGLE_API_KEY", "Google API key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only when Google is a provider."),
+    field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", SEC_CHAT, source="chat", description="The project name, if your Google setup needs one."),
+    field("TELEGRAM_ENABLE", "Send alerts to Telegram", SEC_CHAT, kind="boolean", description="Runs the Telegram alerts component. It also needs the bot token below."),
+    field("TELEGRAM_BOT_TOKEN", "Telegram bot token", SEC_CHAT, source="chat", kind="secret", description="From BotFather. Needed only for Telegram alerts."),
+    field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chats", SEC_CHAT, source="chat", kind="secret", description="The Telegram chat IDs that may use the bot. Kept private."),
+    # Signal K & NMEA 2000
+    field("SIGNALK_MODE", "Signal K mode", SEC_SIGNALK, kind="select", choices=["existing", "docker", "native"], description="Docker: VesselStack runs Signal K for you in a container (recommended). Existing: you already run a Signal K server and VesselStack only connects to it. Native: Signal K is installed directly on this Pi. Changing it takes effect when you apply your settings."),
+    field("SIGNALK_VERSION", "Signal K version", SEC_SIGNALK, description="Release tag of the Signal K container image, for example v2.27.0."),
+    field("SIGNALK_URL", "Signal K address", SEC_SIGNALK, kind="url", description="Where VesselStack reaches Signal K. Needed when the mode is Existing."),
+    field("SIGNALK_VESSELTWIN_PRELOAD", "Preload the VesselTwin plugin", SEC_SIGNALK, kind="boolean", description="Installs the pinned signalk-vesseltwin plugin before Signal K starts (Docker and Native modes). Existing mode is never modified; turning this off skips installation and never uninstalls."),
+    field("SOCKETCAN_ENABLE", "Read the NMEA 2000 network (SocketCAN)", SEC_SIGNALK, kind="boolean", description="Turn on only after the CAN adapter is installed and tested."),
+    field("SOCKETCAN_INTERFACE", "CAN interface", SEC_SIGNALK, description="Name of the CAN interface on this Pi, usually can0."),
+    field("SOCKETCAN_BITRATE", "CAN speed (bits per second)", SEC_SIGNALK, kind="number", description="NMEA 2000 always uses 250000. Change it only for a non-marine CAN network. Whole number from 10000 to 1000000."),
+    # Displays
+    field("DISPLAYS_ENABLE", "Enable instrument displays", SEC_DISPLAYS, kind="boolean", description="Lets the bridge publish boat data to each display, read-only. Adds the bridge and per-display accounts to the Mosquitto access list."),
+    field("DISPLAYS_BRIDGE_MQTT_USERNAME", "Displays bridge MQTT username", SEC_DISPLAYS, description="Letters, numbers, dot, underscore and hyphen. Must differ from the main MQTT username."),
+    field("DISPLAYS_SIGNALK_TOKEN", "Displays bridge Signal K token", SEC_DISPLAYS, kind="secret", description="Optional. Only needed if Signal K requires sign-in; leave blank otherwise."),
+    field("DISPLAYS_HA_TOKEN", "Displays bridge Home Assistant token", SEC_DISPLAYS, kind="secret", description="Optional, only for Home Assistant items (ha) in displays.json; leave blank otherwise. A leaked token can operate every device in your Home Assistant; a non-admin user only prevents configuration changes. Keep it on the Pi (root-only), never reuse it, and revoke it in Home Assistant (Profile, Security) if it leaks."),
+    # Advanced: Storage & history
+    field("INFLUXDB_RAW_RETENTION", "Keep raw data for", SEC_STORAGE, description="A duration such as 720h, 30d or 8w, or 0 to keep forever. Empty means 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply or start and permanently deletes raw data older than the window."),
+    field("PROMETHEUS_RETENTION", "Keep health numbers for", SEC_STORAGE, description="How long Prometheus keeps Pi and service health history: a duration such as 720h, 30d or 8w. Empty means 30d. Older metrics are deleted."),
+    field("VESSELSTACK_BACKUP", "Backup folder", SEC_STORAGE, kind="path", description="Where backups are saved. Use a mounted external drive under /media or /mnt so a failed SD card does not take the backups with it."),
+    field("INFLUXDB_URL", "InfluxDB address", SEC_STORAGE, kind="url", description="Where VesselStack reaches InfluxDB."),
+    field("INFLUXDB_ORG", "InfluxDB organization", SEC_STORAGE, description="The InfluxDB organization name."),
+    field("INFLUXDB_USERNAME", "InfluxDB admin username", SEC_STORAGE, description="The InfluxDB administrator account name."),
+    field("INFLUXDB_RAW_BUCKET", "Raw data bucket", SEC_STORAGE, description="The InfluxDB bucket that holds incoming readings."),
+    field("INFLUXDB_HISTORY_BUCKET", "History bucket", SEC_STORAGE, description="The InfluxDB bucket that holds the one-minute history averages."),
+    field("INFLUXDB_HOME_ASSISTANT_BUCKET", "Home Assistant bucket", SEC_STORAGE, description="The InfluxDB bucket that holds data sent from Home Assistant."),
+    field("INFLUXDB_AIS_BUCKET", "AIS bucket", SEC_STORAGE, description="The InfluxDB bucket that holds AIS targets."),
+    field("INFLUXDB_PASSWORD", "InfluxDB admin password", SEC_STORAGE, kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB")),
+    field("INFLUXDB_TOKEN", "InfluxDB admin token", SEC_STORAGE, kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="InfluxDB") + " Boat Chat and Grafana also use this token."),
+    field("GRAFANA_ADMIN_PASSWORD", "Grafana admin password", SEC_STORAGE, kind="secret", read_only=True, description=INIT_ONLY_NOTE.format(service="Grafana")),
+    # Advanced: Services & ports
+    field("INFLUXDB_PORT", "InfluxDB port", SEC_SERVICES, kind="port", description="The port InfluxDB is published on."),
+    field("INFLUXDB_CONTAINER_NAME", "InfluxDB container name", SEC_SERVICES, description="The Docker container name. Change only if it clashes with another container."),
+    field("GRAFANA_PORT", "Grafana port", SEC_SERVICES, kind="port", description="The port Grafana is published on."),
+    field("HEIMDALL_PORT", "Heimdall HTTP port", SEC_SERVICES, kind="port", description="The port Heimdall's start page is published on."),
+    field("HEIMDALL_HTTPS_PORT", "Heimdall HTTPS port", SEC_SERVICES, kind="port", description="The secure port Heimdall is published on."),
+    field("PROMETHEUS_PORT", "Prometheus port", SEC_SERVICES, kind="port", description="The port Prometheus is published on."),
+    field("MQTT_USERNAME", "MQTT username", SEC_SERVICES, description="The account name used for the Mosquitto message broker."),
+    field("MQTT_PASSWORD", "MQTT password", SEC_SERVICES, kind="secret", description="Applied to the Mosquitto password file on the next apply or start; update Home Assistant's MQTT integration to match."),
+    field("MQTT_PORT", "MQTT port", SEC_SERVICES, kind="port", description="The port Mosquitto is published on."),
+    field("NODE_EXPORTER_ENABLE", "Report Pi health numbers (Node Exporter)", SEC_SERVICES, kind="boolean", description="Runs the optional hardened host metrics exporter so Prometheus can record Pi temperature and disk use."),
+    # Advanced: AIS receiver
+    field("AIS_ENABLE", "Enable AIS-catcher", SEC_AIS, kind="boolean", description="Shows nearby ships from a USB AIS receiver. Turn on only when a receiver is plugged in."),
+    field("AIS_IMAGE", "AIS-catcher image", SEC_AIS, description="The Docker image to run. Change only if you were told to."),
+    field("AIS_DEVICE", "AIS receiver device", SEC_AIS, kind="path", description="Where the USB AIS receiver appears on this Pi. The default, /dev/bus/usb, works for most single receivers."),
+    field("AIS_CATCHER_ARGS", "AIS-catcher options", SEC_AIS, description="Extra command-line options for AIS-catcher. Leave empty unless you know you need them."),
+    field("AIS_WEB_PORT", "AIS web page port", SEC_AIS, kind="port", description="The port of the AIS-catcher web page."),
+    field("AIS_TCP_PORT", "AIS data output port", SEC_AIS, kind="port", description="The TCP port AIS-catcher sends decoded messages on."),
+    # Advanced: Home Assistant
+    field("HOME_ASSISTANT_URL", "Home Assistant address", SEC_HA, kind="url", description="Where VesselStack reaches Home Assistant."),
+    field("HOME_ASSISTANT_TOKEN", "Home Assistant token", SEC_HA, kind="secret", description="Write-only. Use a token from a non-admin user and revoke it in Home Assistant if it leaks."),
+    # Advanced: Installation (read-only)
+    field("VESSELSTACK_USER", "Service account", SEC_INSTALL, read_only=True, description="The account VesselStack services run as. Change it from the recovery shell with a reviewed migration."),
+    field("VESSELSTACK_ROOT", "Application folder", SEC_INSTALL, kind="path", read_only=True, description="Where VesselStack is installed. Change it from the recovery shell with a reviewed migration."),
+    field("VESSELSTACK_DATA", "Data folder", SEC_INSTALL, kind="path", read_only=True, description="Where your data lives. Move it only with services stopped and a verified backup."),
+    field("VESSELSTACK_DISABLED_COMPONENTS", "Disabled components", SEC_INSTALL, read_only=True, description="A read-only list. Use Disable and Enable on the Home tab to change which core services run."),
 ]
 FIELD_BY_KEY = {item["key"]: item for item in FIELDS}
 
@@ -184,14 +220,28 @@ COMPOSE_COMPONENTS = {
     "node-exporter": "node-exporter",
 }
 CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
-CORE_METADATA = {
-    "homeassistant": ("Home Assistant", "Home automation and vessel dashboard", "Home Assistant"),
-    "influxdb": ("InfluxDB", "Time-series history storage", "InfluxDB"),
-    "grafana": ("Grafana", "History and system dashboards", "Grafana"),
-    "prometheus": ("Prometheus", "Metrics collection", ""),
-    "mosquitto": ("Mosquitto", "MQTT message broker", "MQTT"),
-    "heimdall": ("Heimdall", "Local service launcher", ""),
+# Display name, plain description and the Settings section that configures it.
+COMPONENT_INFO = {
+    "homeassistant": ("Home Assistant", "Dashboards and automations for the boat.", SEC_HA),
+    "influxdb": ("InfluxDB", "Stores the boat's data history.", SEC_STORAGE),
+    "grafana": ("Grafana", "Charts of your history: trips, batteries, temperatures.", SEC_SERVICES),
+    "prometheus": ("Prometheus", "Collects Pi and service health numbers.", SEC_STORAGE),
+    "mosquitto": ("Mosquitto", "Passes messages between devices (MQTT).", SEC_SERVICES),
+    "heimdall": ("Heimdall", "A start page with links to every boat web page.", SEC_SERVICES),
+    "signalk": ("Signal K", "Reads boat data and shares it with everything else.", SEC_SIGNALK),
+    "ais-catcher": ("AIS-catcher", "Shows nearby ships from your AIS receiver.", SEC_AIS),
+    "node-exporter": ("Node Exporter", "Reports Pi health (temperature, disk) for Prometheus.", SEC_SERVICES),
+    "boat-chat": ("Boat Chat", "Ask questions about your boat in plain language.", SEC_CHAT),
+    "telegram": ("Telegram alerts", "Sends boat alerts to your phone through Telegram.", SEC_CHAT),
+    "telemetry-indexer": ("Telemetry memory", "Keeps Boat Chat's memory of your boat data up to date.", SEC_CHAT),
+    "telemetry-sample": ("Telemetry sampler", "Records regular samples of your boat data for Boat Chat.", SEC_CHAT),
+    "displays-bridge": ("Displays bridge", "Feeds data to the boat's instrument displays.", SEC_DISPLAYS),
+    "signalk-native": ("Signal K (on this Pi)", "Signal K installed directly on this Pi instead of in a container.", SEC_SIGNALK),
+    "socketcan": ("SocketCAN", "Connects to the NMEA 2000 network through a CAN adapter.", SEC_SIGNALK),
+    "firewall": ("Network firewall", "Blocks unwanted connections on the marina-facing network.", SEC_NETWORK),
+    "control-panel": ("Control Panel", "This page. Restart it from the Maintenance tab.", ""),
 }
+RUNNING_STATES = {"running", "active", "activating", "reloading", "restarting"}
 LIFECYCLE_LOCK = threading.Lock()
 
 
@@ -261,6 +311,48 @@ def write_env(path: Path, values: dict[str, str], preferred_order: list[str]) ->
             pass
 
 
+# Allowed range for each plain-number setting: (minimum, maximum, whole number only).
+# The minimum is exclusive for sizes (zero metres is not a boat) and inclusive otherwise.
+NUMBER_RULES: dict[str, tuple[float, float, bool, bool]] = {
+    "BOAT_LOA_M": (0, 500, False, True),
+    "BOAT_BEAM_M": (0, 100, False, True),
+    "SOCKETCAN_BITRATE": (10000, 1000000, True, False),
+}
+NUMBER_TEXT = re.compile(r"[0-9]+(\.[0-9]+)?")
+
+
+def validate_number(spec: dict[str, Any], text: str) -> None:
+    label = spec["label"]
+    if not NUMBER_TEXT.fullmatch(text):
+        raise ValueError(f"{label} must be a plain number such as 12.5 (no units, signs or exponents)")
+    minimum, maximum, whole, exclusive = NUMBER_RULES.get(spec["key"], (0, 1e12, False, True))
+    if whole and "." in text:
+        raise ValueError(f"{label} must be a whole number")
+    value = float(text)
+    low_ok = value > minimum if exclusive else value >= minimum
+    if not low_ok or value > maximum or value != value:
+        shown_min = f"more than {minimum:g}" if exclusive else f"at least {minimum:g}"
+        raise ValueError(f"{label} must be {shown_min} and at most {maximum:g}")
+
+
+def timezone_exists(name: str) -> bool:
+    try:
+        known = zoneinfo.available_timezones()
+    except Exception:
+        return True
+    # Without a timezone database nothing can be checked; do not block saving.
+    return not known or name in known or name == "UTC"
+
+
+class FieldErrors(ValueError):
+    """Validation failed for one or more settings; ``fields`` maps key to message."""
+
+    def __init__(self, fields: dict[str, str]) -> None:
+        self.fields = dict(fields)
+        first = next(iter(self.fields.values()))
+        super().__init__(first if len(self.fields) == 1 else f"{len(self.fields)} settings need fixing. {first}")
+
+
 MQTT_ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 DEFAULT_BRIDGE_MQTT_USERNAME = "vesselstack-bridge"
 
@@ -281,14 +373,15 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         if len(values) != len(set(values)) or any(item not in CORE_COMPONENTS for item in values):
             raise ValueError("Disabled components must be unique allowed core component IDs")
         return ",".join(values)
-    if kind in {"number", "port"} and text:
-        try:
-            float(text)
-        except ValueError as exc:
-            raise ValueError(f"{spec['label']} must be numeric") from exc
     if kind == "port" and text:
-        if not text.isdigit() or not 1 <= int(text) <= 65535:
+        if not re.fullmatch(r"[0-9]+", text):
+            raise ValueError(f"{spec['label']} must be numeric")
+        if not 1 <= int(text) <= 65535:
             raise ValueError(f"{spec['label']} must be an integer from 1 to 65535")
+    if kind == "number" and text:
+        validate_number(spec, text)
+    if spec["key"] == "BOAT_TIMEZONE" and text and not timezone_exists(text):
+        raise ValueError("Timezone not recognised. Use a name like Europe/Lisbon")
     if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
@@ -441,7 +534,7 @@ def public_configuration() -> dict[str, Any]:
                 "Saving this field replaces the override."
             )
         fields.append(spec)
-    return {"fields": fields, "values": result, "overridden": sorted(overridden & {s["key"] for s in FIELDS if s["source"] == "chat"})}
+    return {"sections": SECTIONS, "fields": fields, "values": result, "overridden": sorted(overridden & {s["key"] for s in FIELDS if s["source"] == "chat"})}
 
 
 def take_lifecycle_slot():
@@ -474,6 +567,7 @@ def _update_configuration(updates: dict[str, Any]) -> str:
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
     panel = parse_env(PANEL_ENV)
+    problems: dict[str, str] = {}
     for key, raw in updates.items():
         spec = FIELD_BY_KEY.get(key)
         if not spec:
@@ -487,17 +581,23 @@ def _update_configuration(updates: dict[str, Any]) -> str:
                 continue
             value = ""
         else:
-            value = validate_value(spec, raw)
+            try:
+                value = validate_value(spec, raw)
+            except ValueError as exc:
+                problems[key] = str(exc)
+                continue
         target = chat if spec["source"] == "chat" else vessel
         target[key] = value
         if spec["source"] == "chat":
             saved_chat_keys.add(key)
         if key in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             panel[key] = value
+    if problems:
+        raise FieldErrors(problems)
     if vessel.get("DISPLAYS_ENABLE", "false") == "true":
         bridge_user = vessel.get("DISPLAYS_BRIDGE_MQTT_USERNAME") or DEFAULT_BRIDGE_MQTT_USERNAME
         if bridge_user == vessel.get("MQTT_USERNAME", ""):
-            raise ValueError("Displays bridge MQTT username must differ from the MQTT username")
+            raise FieldErrors({"DISPLAYS_BRIDGE_MQTT_USERNAME": "Displays bridge MQTT username must differ from the MQTT username"})
     paths = [VESSEL_ENV, CHAT_ENV, PANEL_ENV]
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
     backup = CONFIG_BACKUP_ROOT / stamp
@@ -639,6 +739,30 @@ def command_output(command: list[str], timeout: int = 8) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def describe_component(name: str, kind: str, enabled: bool, state: str) -> dict[str, Any]:
+    """One component as the UI shows it: real name, plain status, no contradictions."""
+    label, description, section = COMPONENT_INFO.get(name, (name.replace("-", " ").title(), "", ""))
+    raw = str(state or "unknown").strip().lower()
+    running = raw.split(" ")[0] in RUNNING_STATES
+    if not enabled:
+        status = "disabled"
+    elif running:
+        status = "running"
+    elif raw == "unknown":
+        status = "unknown"
+    else:
+        status = "stopped"
+    item: dict[str, Any] = {
+        "id": name, "label": label, "description": description, "section": section,
+        "kind": kind, "enabled": enabled, "state": state, "status": status,
+        "still_running": status == "disabled" and running,
+        "manageable": name in CORE_COMPONENTS,
+    }
+    if status == "stopped" and raw not in {"stopped", "inactive", "dead", "exited"}:
+        item["detail"] = raw
+    return item
+
+
 def component_status() -> list[dict[str, Any]]:
     vessel = parse_env(VESSEL_ENV)
     disabled = disabled_components(vessel)
@@ -680,11 +804,7 @@ def component_status() -> list[dict[str, Any]]:
         elif name == "node-exporter":
             enabled = vessel.get("NODE_EXPORTER_ENABLE", "false") == "true"
         state = compose_state.get(service, "unknown" if compose_parse_failed else "stopped")
-        item = {"id": name, "label": name.replace("-", " ").title(), "kind": "container", "enabled": enabled, "state": state}
-        if name in CORE_METADATA:
-            label, description, section = CORE_METADATA[name]
-            item.update({"label": label, "description": description, "section": section, "manageable": True})
-        components.append(item)
+        components.append(describe_component(name, "container", enabled, state))
     for name, unit in SYSTEMD_COMPONENTS.items():
         code, output = command_output(["systemctl", "is-active", unit], timeout=3)
         enabled = True
@@ -702,8 +822,100 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("VESSELSTACK_FIREWALL_ENABLE", "false") == "true"
         elif name == "displays-bridge":
             enabled = vessel.get("DISPLAYS_ENABLE", "false") == "true"
-        components.append({"id": name, "label": name.replace("-", " ").title(), "kind": "systemd", "enabled": enabled, "state": output or ("active" if code == 0 else "inactive")})
+        components.append(describe_component(name, "systemd", enabled, output or ("active" if code == 0 else "inactive")))
     return components
+
+
+DEFAULT_BACKUP_DIR = "/var/backups/vesselstack"
+BACKUP_ARCHIVE = re.compile(r"vesselstack-[0-9A-Za-z._-]+\.tar\.gz")
+
+
+def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
+    """Read-only view of the backup destination, derived the way vesselstackctl backup does.
+
+    The destination is VESSELSTACK_BACKUP (or the default). A /media or /mnt destination must
+    sit on a mounted filesystem, otherwise vesselstackctl refuses to back up. The newest archive
+    that has its .sha256 manifest next to it is reported by modification time; nothing is hashed
+    or written. Any problem reading the folder yields "unknown" and never an error.
+    """
+    result: dict[str, Any] = {"path": "", "mount": "unknown", "writable": None, "last_backup_at": None, "state": "unknown", "message": ""}
+    try:
+        settings = vessel if vessel is not None else parse_env(VESSEL_ENV)
+        destination = os.path.realpath(settings.get("VESSELSTACK_BACKUP") or os.environ.get("VESSELSTACK_BACKUP") or DEFAULT_BACKUP_DIR)
+        result["path"] = destination
+        parts = Path(destination).parts
+        removable = len(parts) >= 3 and parts[1] in {"media", "mnt"}
+        if removable:
+            mount_dir = os.path.join("/", parts[1], parts[2])
+            result["mount"] = "mounted" if os.path.ismount(mount_dir) else "not_mounted"
+        else:
+            result["mount"] = "system_disk"
+        if result["mount"] == "not_mounted":
+            result["message"] = "The backup drive is not mounted, so backups cannot be saved or checked."
+            return result
+        if not os.path.isdir(destination):
+            result["state"] = "none"
+            result["message"] = "No backup has been made yet."
+            return result
+        result["writable"] = os.access(destination, os.W_OK | os.X_OK)
+        newest = 0
+        with os.scandir(destination) as entries:
+            for entry in entries:
+                if not BACKUP_ARCHIVE.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
+                    continue
+                if not os.path.isfile(os.path.join(destination, entry.name + ".sha256")):
+                    continue
+                newest = max(newest, int(entry.stat(follow_symlinks=False).st_mtime))
+        if newest:
+            result["last_backup_at"] = newest
+            result["state"] = "ok" if result["writable"] else "read_only"
+        else:
+            result["state"] = "none"
+            result["message"] = "No backup has been made yet."
+    except OSError:
+        result.update({"state": "unknown", "last_backup_at": None, "message": "The backup folder could not be read."})
+    except Exception:
+        result.update({"state": "unknown", "last_backup_at": None, "message": "Backup status is not available."})
+    return result
+
+
+ERROR_LINE = re.compile(r"^(?:\[[^\]]*\]\s*)?(?:ERROR|Error|error|FATAL|Refusing[^:]*|Backup[^:]*failed)[:\s]+(.*)$")
+
+
+def summarize_operation(operation: dict[str, Any]) -> dict[str, Any]:
+    """Plain facts about a finished operation, read from its output only."""
+    lines = [str(line).strip() for line in operation.get("output") or [] if str(line).strip()]
+    summary: dict[str, Any] = {}
+    if operation.get("state") == "succeeded" and operation.get("label") == "backup":
+        for line in reversed(lines):
+            if line.startswith("/") and line.endswith(".tar.gz"):
+                summary["saved_path"] = line
+                break
+    if operation.get("state") == "failed" and lines:
+        reason = lines[-1]
+        for line in reversed(lines):
+            found = ERROR_LINE.match(line)
+            if found:
+                reason = found.group(1).strip() or line
+                break
+        summary["reason"] = reason[:400]
+    return summary
+
+
+def with_summary(operation: dict[str, Any]) -> dict[str, Any]:
+    if operation.get("state") in {"succeeded", "failed"}:
+        return {**operation, "summary": summarize_operation(operation)}
+    return operation
+
+
+def restart_needed() -> bool:
+    """True when a newer Control Panel is installed than the one now running."""
+    try:
+        installed = installed_version(ROOT)
+        running = str(RUNNING_IDENTITY.get("running_version") or "")
+        return bool(running) and running != "unknown" and installed != running
+    except Exception:
+        return False
 
 
 class OperationStore:
@@ -754,8 +966,8 @@ class OperationStore:
             exit_code = process.wait()
             succeeded = exit_code == 0
             with self.lock:
-                if succeeded and operation["label"] in {"apply", "install", "update"}:
-                    operation["output"].append("If this operation changed Control Panel code or its listener, restart vesselstack-control-panel.service from the recovery shell.")
+                if succeeded and operation["label"] in {"apply", "install", "update"} and restart_needed():
+                    operation["output"].append("A newer Control Panel is installed than the one running. Use Restart Control Panel on the Maintenance tab.")
         except Exception as exc:
             with self.lock:
                 operation["output"].append("Operation failed")
@@ -782,6 +994,15 @@ def panel_settings() -> dict[str, str]:
     return settings
 
 
+def normalize_token(text: str) -> str:
+    """Accept a pasted ``CONTROL_PANEL_TOKEN=...`` line as well as the bare token."""
+    value = text.strip()
+    value = re.sub(r"^(export\s+)?CONTROL_PANEL_TOKEN\s*=\s*", "", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
 class ControlPanelHandler(BaseHTTPRequestHandler):
     server_version = f"VesselStackControlPanel/{os.environ.get('VESSELSTACK_VERSION', 'development')}"
 
@@ -802,7 +1023,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
 
     def authenticated(self) -> bool:
         expected = panel_settings().get("CONTROL_PANEL_TOKEN", "").strip()
-        supplied = (self.headers.get("X-VesselStack-Token") or "").strip()
+        supplied = normalize_token(self.headers.get("X-VesselStack-Token") or "")
         return bool(expected) and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
 
     def require_auth(self) -> bool:
@@ -870,11 +1091,12 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 persisted = public_operation(ROOT)
                 memory = OPERATIONS.public()
                 operation = memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))
-                self.send_json(200, {"components": component_status(), "operation": operation, "installed_version": installed_version(ROOT), **RUNNING_IDENTITY})
+                vessel = parse_env(VESSEL_ENV)
+                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
             elif path == "/api/operation":
                 persisted = public_operation(ROOT)
                 memory = OPERATIONS.public()
-                self.send_json(200, memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0)))
+                self.send_json(200, with_summary(memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))))
             elif path == "/api/releases":
                 channel = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("channel", ["stable"])[0]
                 if channel not in {"stable", "lab"}:
@@ -952,6 +1174,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 self.send_json(202, OPERATIONS.start(f"{verb} {component}", lambda: component_command(component, verb)))
                 return
             self.send_json(404, {"error": "Not found"})
+        except FieldErrors as exc:
+            self.send_json(400, {"error": str(exc), "fields": exc.fields})
         except (ValueError, json.JSONDecodeError) as exc:
             self.send_json(400, {"error": str(exc)})
         except Exception as exc:

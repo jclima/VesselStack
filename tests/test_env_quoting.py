@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "install.sh").read_text()
-FUNCTION = SOURCE[SOURCE.index("env_line() {"):SOURCE.index("# env-line-end")]
+FUNCTION = SOURCE[SOURCE.index("# env-line-begin"):SOURCE.index("# env-line-end")]
 
 VALUES = {
     "PLAIN": "abc-1.2/x",
@@ -48,6 +48,33 @@ class EnvLineTests(unittest.TestCase):
         for value in ("it's $x", "it's \\", 'it\'s "q"', "it's `t`"):
             with self.assertRaises(subprocess.CalledProcessError):
                 render({"BAD": value})
+
+    def test_predicate_is_shared_and_names_keys_only(self):
+        # The installer preflight and env_line use the same env_value_problem, and
+        # the preflight reports the KEY and reason, never the value.
+        script = FUNCTION + (
+            'SCRIPT_DIR=. ; CONFIG_FILE=c.env\n'
+            'vesselstack_env_keys() { printf "%s\\n" GOOD BAD; }\n'
+            'extra_env_keys() { :; }\n'
+            "GOOD=fine BAD=\"it's \\$SECRET\"\n"
+            + SOURCE[SOURCE.index("env_values_preflight() {"):SOURCE.index("env_values_preflight\n")]
+            + "env_values_preflight\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "VERSION").write_text("0.6.0\n")
+            result = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("BAD:", result.stderr)
+        self.assertNotIn("GOOD", result.stderr)
+        self.assertNotIn("SECRET", result.stderr)
+        self.assertIn("Upgrading to 0.6.0", result.stderr)
+
+    def test_installer_checks_before_dry_run_exit_and_writes_atomically(self):
+        self.assertLess(SOURCE.index("\nenv_values_preflight\n"), SOURCE.index('if [ "$DRY_RUN" -eq 1 ]; then\n    displays_preflight'))
+        self.assertNotIn("install -m 0600 /dev/null", SOURCE)
+        for name in ("vesselstack.env", "boat-chat.env", "control-panel.env"):
+            self.assertIn(f"new_env_temp {name}", SOURCE)
+            self.assertRegex(SOURCE, r'mv -f -- "\$\w+" "\$VESSELSTACK_ROOT/config/%s"' % name.replace(".", r"\."))
 
     def test_multiline_is_rejected(self):
         with self.assertRaises(subprocess.CalledProcessError):

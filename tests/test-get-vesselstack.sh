@@ -647,7 +647,7 @@ refuse_out 'Open the addresses printed above'
 reset_state
 SECRET=sekrit-token-value-123
 {
-    printf '%s\n' y 'Bad;Name' 'Sea Wolf' 'Sailing yacht' 3 Europe/Oslo y 12345 123456789 b '' ABCD1 11.5 3.8
+    printf '%s\n' y 'Bad;Name' 'Sea Wolf' 'Sailing yacht' 2 Europe/Oslo y 12345 123456789 b '' ABCD1 11.5 3.8
     printf '%s\n' 2 http://192.0.2.10:3000                      # Signal K: existing server
     printf '%s\n' y n '' ''                                      # CAN on, no vcan, interface, bitrate
     printf '%s\n' y ''                                           # AIS on, device
@@ -664,7 +664,7 @@ expect_out "A long-lived access token"
 expect_out "Home Assistant access token \\(optional\\) \\[not set\\]"
 expect_saved "BOAT_NAME='Sea Wolf'"
 expect_saved "BOAT_TYPE='Sailing yacht'"
-expect_saved "BOAT_UNITS=nautical"
+expect_saved "BOAT_UNITS=metric"
 expect_saved "BOAT_TIMEZONE=Europe/Oslo"
 expect_saved "BOAT_MMSI=123456789"
 expect_saved "BOAT_CALLSIGN=ABCD1"

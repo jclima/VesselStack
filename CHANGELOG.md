@@ -3,51 +3,166 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
+## 0.6.0 - 2026-11-02
 
-- Docs: `README.md` is now a landing page with a table of contents and a task-to-document
-  table. Deep reference moved unchanged into `docs/` (`DISPLAYS.md`, `BOAT_CHAT.md`,
-  `CONTROL_PANEL.md`, `MQTT.md`, `NETWORK.md`, `UPDATING.md`; developer validation and
-  historical notes in `DEVELOPMENT.md`). Install, backup, removal and troubleshooting
-  stay in the README and its anchors are preserved. `tests/test-distribution.sh` now
-  checks the pinned ESPHome digest and version in README or `docs/DISPLAYS.md`.
-- Displays: Home Assistant numeric items now round like instruments (half away
-  from zero, no `-0.0`, integer payload at precision 0, out-of-range values are
-  "missing"); a heading that rounds up to 360 shows 0; the board registry
-  validator rejects a board that lists a layout the firmware generator cannot
-  render (`list-6` stays defined but unoffered); `displays/README.md` lists
-  `preflight` and documents adding a board versus adding a layout.
-- Installer env files (`vesselstack.env`, `boat-chat.env`, `control-panel.env`)
-  are written with portable quoting that bash, systemd, Python and Docker
-  Compose read identically; values with spaces, `$` or `!` no longer split or
-  expand. Values with an apostrophe plus a backslash, double quote, `$` or
-  backtick, and multi-line values, are refused.
-- The installed `vesselstackctl` defaults to the configured `VESSELSTACK_ROOT`,
-  and `uninstall` also removes `vesselstack-update` and `deploy-chat.py`.
-- Boat Chat and Control Panel token comparison handles non-ASCII header text;
-  `GET`/`HEAD /api/settings` require the access token; unauthenticated loopback
-  settings writes require a local `Host` name (DNS-rebinding defense).
-- Power tracking splits sign-crossing intervals at zero and floors peak
-  inferred charge at 0 W.
-- The VesselTwin preload now pins `signalk-vesseltwin` 0.2.3 (0.2.2 was never
-  published). An existing preloaded copy is never overwritten; existing boats
-  update through the Signal K Appstore. In Docker mode, a re-run that newly
-  preloads the plugin restarts the running `signalk` container (the helper exits
-  with status 10 when it installed something). `docs/VESSELTWIN.md` now lists
-  plugin enablement as its own step for preloaded and Appstore installs, explains
-  how to reach the admin page, and matches the plugin's status messages.
-- The VesselTwin preload also lists `signalk-vesseltwin` in
-  `signalk/package.json` dependencies so Signal K App Store installs do not
-  prune it.
-- Documentation corrections: README structure, version references, VesselTwin
-  wording, and historical 1.0 scope and validation labels.
-- Documentation: the hardware guide now recommends the Copperhill/SK Pang
-  PiCAN-M as the NMEA 2000 HAT, with power guidance per Pi model and USB and
-  ESP32 alternatives. Galvanically isolated interfaces are listed first as
-  preferred (safest); the non-isolated PiCAN-M is documented as field-proven
-  with explicit grounding caveats. Wizard text (terminal and browser) now
-  states the same preferred/caveats framing. Installation docs add a PiCAN-M
-  `config.txt` example.
+### Highlights
+
+- Setup wizard: the "Nautical" units option is gone. It produced a configuration the installer
+  refused; the choices are now US customary (the default, matching the installer) and metric,
+  and knots and nautical miles are always kept. The web wizard asks for the Signal K address
+  when you choose "use existing" and has an untrusted-interface field when the firewall is on.
+  Back keeps your selections, Continue is blocked until the page has its address token, and
+  after saving it shows the next commands to run. It also gains dark mode and screen-reader
+  support.
+- Control Panel: redesigned around four tabs (Home, Settings, Updates, Maintenance). Home shows
+  whether everything is running, the last backup and the backup drive, and whether an update is
+  known, with one **Back up now** button and the components with their real names. The result of
+  the latest operation stays in a dismissible banner with its log under Details, and every
+  stopping or interrupting action asks in an in-page dialog that lists what is affected. Settings
+  has a jump list, plain-language help for every field, Advanced sections that start collapsed,
+  inline field errors (timezone and numeric ranges are now validated), and one Save and Apply bar.
+  The Apply dialog now states what Apply does: it writes the saved settings into the service files,
+  running services keep running until their next restart, and only the displays bridge restarts.
+  The Maintenance restore hint now shows `sudo vesselstackctl restore <backup-file> --yes`.
+  The login accepts a pasted `CONTROL_PANEL_TOKEN=...` line and explains how to reach the panel.
+  Updates are checked only when you press **Check for updates**. Dark mode, "Signal K" naming and
+  accessibility improvements remain. Stored keys and values are unchanged, and no action's
+  behaviour or command changed (the old Install & start and Run preflight buttons are now
+  **Reinstall & start** and **Check setup** under Maintenance).
+- Boat Chat: the credentials are now called "Access code" and "Admin code" in the interface
+  (the environment variable names are unchanged). Phones get a "More" menu, and the header and
+  overview status agree. Chat requests time out after 3 minutes, Clear is a two-step action,
+  notes and feedback use inline forms, and the trip report downloads as
+  `vesselstack-trip-<date>.txt`. A unified brand palette, dark mode and screen-reader
+  announcements complete the update.
+- Installer: every value written to the env files is checked first, before anything changes and
+  also under `--dry-run`, and the env files are written atomically.
+- The README is a short landing page with a table of contents, a "What you need" hardware
+  list and a table that points each task to the right guide. Deep reference lives in `docs/`
+  (`DISPLAYS.md`, `BOAT_CHAT.md`, `CONTROL_PANEL.md`, `MQTT.md`, `NETWORK.md`, `UPDATING.md`;
+  developer validation, wizard internals and historical notes in `DEVELOPMENT.md`). Install,
+  backup, removal and troubleshooting stay in the README. The README sections that moved to
+  `docs/` are listed under "Moved sections" at its end, with links.
+- Every quick start now uses the pinned release URL. GitHub's "Latest" release is still
+  `v0.4.4` (every 0.5.x release was a prerelease), so `releases/latest/download/` installs 0.4.4;
+  it is documented only as a secondary form. The documented default for reaching the Control
+  Panel is an SSH tunnel, with direct network access as an opt-in choice.
+- The README gains an "Upgrading to 0.6.0" section: what changes for an existing boat, how the
+  installer's env-value check behaves, verification, and rollback.
+- Hardware guide: the NMEA 2000 section recommends the Copperhill/SK Pang PiCAN-M as a
+  field-proven HAT, with power guidance per Pi model and USB and ESP32 alternatives.
+  Galvanically isolated interfaces are listed first as preferred (safest); the non-isolated
+  PiCAN-M is documented with explicit grounding caveats. The terminal and browser wizards say
+  the same, and the installation guide adds a PiCAN-M `config.txt` example. The optional
+  Waveshare ESP32-S3-Touch-LCD-2.8C display is listed in the bill of materials as a preview item.
+
+### Fixes
+
+- Control Panel no longer blanks a non-numeric saved boat length or beam on save.
+- Boat Chat: a Settings save could blank the server configuration when settings had failed to
+  load. Settings no longer opens without loading, and it saves only the fields you changed.
+  Saves that blank `BOAT_CHAT_PROVIDER`, `BOAT_CHAT_MODEL`, `BOAT_CHAT_MAX_TOKENS`,
+  `BOAT_CHAT_CONTEXT_CHARS`, `BOAT_CHAT_HOST` or `BOAT_CHAT_PORT`, or give invalid numbers, are
+  rejected with a 400 (an explicit `null` resets the setting to its default).
+- Boat Chat: the access code can no longer be cleared (blank or `null` for
+  `BOAT_CHAT_ACCESS_TOKEN` is rejected with a 400) unless `BOAT_CHAT_ALLOW_OPEN=true`, so an
+  API-only save cannot lock every client out. Set a new code instead.
+- Control Panel: saving settings accepted any text for the timezone. The server now rejects a
+  timezone that is not in the system's timezone list (`Europe/Lisbon` is accepted, `Lisbon` is
+  not) with a 400 that names the field, and writes nothing.
+- Control Panel: numeric settings accepted any number. The server now rejects a value that is
+  not a plain number (no units, signs or exponents), a decimal where a whole number is needed,
+  or a value outside the allowed range for that setting, with a 400 that names each offending
+  field. The page shows these messages beside the fields.
+- Installer: an unsafe env value used to be refused only during `--start`, after services were
+  stopped and files replaced, and the installed `vesselstack.env` had already been truncated.
+  The check now runs first (see Security), and each env file is written to a temporary file in
+  the same directory (mode 0600) and renamed into place only when complete, so a failure leaves
+  the previous file intact. Ownership and permissions are unchanged. The installer also removes
+  stale `.vesselstack.env.*`, `.boat-chat.env.*` and `.control-panel.env.*` temp files (exact
+  `mktemp` names only) from `config/` left by a killed run, and the preflight now also checks
+  the preserved or generated secrets.
+- Displays: Home Assistant numeric items round like instruments (half away from zero, no
+  `-0.0`, an integer payload at precision 0, out-of-range values count as missing). A heading
+  that rounds up to 360 shows 0.
+- Installer env files (`vesselstack.env`, `boat-chat.env`, `control-panel.env`) are written with
+  quoting that bash, systemd, Python and Docker Compose read identically, so values with spaces,
+  `$` or `!` no longer split or expand.
+- The installed `vesselstackctl` defaults to the configured `VESSELSTACK_ROOT`, and `uninstall`
+  also removes `vesselstack-update` and `deploy-chat.py`.
+- Power tracking splits intervals that cross zero and floors peak inferred charge at 0 W.
+- VesselTwin preload: the installer pins `signalk-vesseltwin` 0.2.3 (0.2.2 was never
+  published) and also lists it in `signalk/package.json` dependencies so Signal K App Store
+  installs do not prune it. An existing preloaded copy is never overwritten; existing boats update
+  through the Signal K App Store. `docs/VESSELTWIN.md` lists plugin enablement as its own step
+  for preloaded and App Store installs, explains how to reach the admin page, and matches the
+  plugin's status messages.
+- Documentation corrections: README structure, version references, VesselTwin wording, the
+  historical 1.0 scope and validation labels, the screenshot captions (they show the optional
+  browser wizard), and the "signed release" wording, which is now "pinned release".
+
+### Security
+
+- `GET`, `HEAD` and `POST /api/settings` require the Boat Chat access code, and `POST` also
+  requires the admin code where one is configured. The new optional `X-Boat-Chat-Access-Token`
+  header carries the access code when it differs from the admin code, on `GET`, `HEAD` and
+  `POST`.
+- Unauthenticated loopback settings writes require a local `Host` name (DNS-rebinding defense).
+- Boat Chat and Control Panel token comparison handles non-ASCII header text.
+- Env-file values that contain an apostrophe together with a backslash, double quote, `$` or
+  backtick, and multi-line values, are refused by the installer instead of being written in a
+  form some readers would misparse. A preflight checks every value for `vesselstack.env`,
+  `boat-chat.env` and `control-panel.env` before anything changes, including under
+  `--dry-run`, and names only the offending keys, never the values.
+- Release tags must now be annotated tags SSH-signed by the release key in
+  `.github/allowed_signers`. The release workflow fetches the real tag object, runs
+  `scripts/verify-release-tag.sh` and fails on an unsigned, lightweight or wrongly signed tag
+  before anything is built. Changing the allowed key needs a reviewed pull request to `main`.
+- Release tag verification also binds the tag's own name and the exact commit CI builds.
+
+### Upgrade notes
+
+- `install.sh --dry-run`, and so `vesselstackctl update` and the Control Panel updater, refuses
+  the unsafe env values above before the backup is taken or anything is changed, naming the key.
+  The fix is in the README under "Upgrading to 0.6.0".
+- Docker Signal K may restart once: a re-run that newly preloads the VesselTwin plugin restarts
+  the running `signalk` container (the helper exits with status 10 when it installed something).
+- Anything that read `/api/settings` without the access code now needs it, and scripts that call
+  `POST /api/settings` need the access code (plus the admin code where configured). Send the
+  access code in `X-Boat-Chat-Access-Token` when it differs from the admin code.
+- Owners on 0.4.x: update once from the CLI with the pinned installer. The 0.5.0 Mosquitto access
+  list cuts off MQTT users that were added by hand to the old password file.
+- Owners on 0.5.5 to 0.5.7 can use the Control Panel updater; while 0.6.0 is still a
+  pre-release, turn on the switch that lists prereleases (called "Include lab prereleases" in
+  the 0.5.x panel and "Include early test releases" in 0.6.0).
+
+### Rollback
+
+Downgrades are refused. Restore the verified pre-update backup that the update takes:
+`sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes`. See the README sections
+"Updating" and "Backups".
+
+### Release status
+
+`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes.
+
+### For contributors
+
+- ShellCheck-clean at every severity on the CI runner's ShellCheck 0.9: `install.sh` stale-temp
+  cleanup and `scripts/verify-release-tag.sh` argument and signer checks use explicit `if` blocks
+  instead of `A && B || C` (no behavior change).
+- `tests/test-distribution.sh` checks the pinned ESPHome digest and version in `README.md` or
+  `docs/DISPLAYS.md`.
+- The board registry validator rejects a board that lists a layout the firmware generator cannot
+  render (`list-6` stays defined but unoffered); `displays/README.md` lists `preflight` and
+  documents adding a board versus adding a layout.
+- In Docker mode the VesselTwin preload helper exits with status 10 when it installed something;
+  the installer uses that to restart the `signalk` container.
+- Wizard internals moved from the README to `docs/DEVELOPMENT.md` ("Wizard internals").
+- Version bump: `VERSION` and `DEFAULT_VERSION` in `scripts/get-vesselstack.sh` are 0.6.0.
+- `scripts/verify-release-tag.sh TAG [ALLOWED_SIGNERS_FILE [EXPECTED_COMMIT]]` verifies a release tag (annotated,
+  SSH-signed by an allowed principal) and prints the signer and key fingerprint;
+  `tests/test-verify-release-tag.sh` covers it with throwaway keys and runs in CI.
 
 ## 0.5.7 - 2026-11-01
 

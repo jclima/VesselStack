@@ -34,9 +34,9 @@ Every change must update README.md as required by AGENTS.md.
 
 ## Release checklist
 
-The quick-start URLs (`.../releases/latest/download/get-vesselstack.sh` and
-`.../releases/download/vX.Y.Z/get-vesselstack.sh`) only work if the GitHub release
-carries exactly these files. Nothing publishes a release for you: the tag-triggered
+The quick-start URLs (the pinned `.../releases/download/vX.Y.Z/get-vesselstack.sh` and the
+secondary `.../releases/latest/download/get-vesselstack.sh`, which follows whichever release
+GitHub marks Latest) only work if the GitHub release carries exactly these files. Nothing publishes a release for you: the tag-triggered
 workflow only creates a **draft**, and the CI-built draft is the authoritative release.
 Do not build and upload files by hand.
 
@@ -48,19 +48,28 @@ Do not build and upload files by hand.
    bootstrap, build-package, Compose config, image manifests, Python, service
    integration). Merge it to `main`.
 3. Tag the merged `main` commit (signed tag, see [DEPLOYMENT.md](DEPLOYMENT.md)
-   section 1) and push the tag. The workflow refuses a tag whose commit is not on
-   `main`, or that differs from `VERSION`. The explicitly approved `v0.5.7`
-   lab-prerelease exception is an annotated unsigned tag because no SSH/GPG key
-   is available; it is not a stable promotion and must not be treated as signed.
-   The earlier `v0.5.1` tag remains untouched and was not published because its
-   release pipeline caught the bridge startup-status race.
+   section 1; the recommended 1Password-held signing key is the first subsection there)
+   and push the tag. The workflow refuses a tag whose commit is not on
+   `main`, that differs from `VERSION`, or that is not an annotated tag SSH-signed by a key in
+   `.github/allowed_signers` (checked with `scripts/verify-release-tag.sh`). Verify locally
+   first: `scripts/verify-release-tag.sh vX.Y.Z`; the workflow also passes the built commit
+   (`scripts/verify-release-tag.sh TAG .github/allowed_signers "$GITHUB_SHA"`), requires the signed
+   tag object's own name to equal `TAG`, and refuses a tag that does not point directly at that
+   commit. Locally, pass the commit you expect as the third argument. To rotate or add the release key, change
+   `.github/allowed_signers` in a pull request to `main` and merge it before creating the tag;
+   the workflow reads the copy at the tagged commit. The `v0.5.7` lab prerelease was an
+   annotated unsigned tag because no SSH/GPG key was available; it is not signed and would now
+   be refused. The `v0.5.1` tag is untouched and was not published because its release pipeline
+   caught the bridge startup-status race. `v0.6.0` is an SSH-signed tag, published first as a
+   pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes
+   (see the CHANGELOG).
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate
    job with write access creates a **draft** release (`--draft --latest=false`) with
    the four files and both sha256 values in the notes. It skips creation if a release
-   for the tag already exists. It does not verify the tag signature; do that locally
-   before pushing the tag.
+   for the tag already exists. The build job verifies the tag signature (step 3) before building,
+   so a bad tag fails there and no draft is created.
 5. Take the sha256 values from the draft's notes (or the workflow log). Download the
    draft's assets and test **those exact files** on the home-lab Pi (see
    [DEPLOYMENT.md](DEPLOYMENT.md)): `sha256sum -c`, then the install and update
@@ -71,9 +80,9 @@ Do not build and upload files by hand.
    verified, `/etc/apt/sources.list.d/docker.sources` written, `docker-ce` and
    `docker-compose-plugin` installed, `docker info` answering; check `dpkg --print-architecture`
    says `arm64`), an upgrade from the previous release, and an offline
-   upgrade. The test suites use stubs and cannot cover this. For the explicitly
-   authorized `0.5.7` lab prerelease, publication may precede physical-Pi
-   acceptance; record that acceptance is pending. Complete the pinned installer
+   upgrade. The test suites use stubs and cannot cover this. For a prerelease,
+   publication may precede physical-Pi acceptance; record that acceptance is pending
+   (it was for `0.5.7`). Complete the pinned installer
    and component lifecycle recipe in [CONTROL_PANEL_TESTING.md](CONTROL_PANEL_TESTING.md)
    before any stable promotion.
 7. Publish the draft as a **pre-release** (or otherwise not latest) first, so
@@ -180,6 +189,84 @@ No scheduler or webhook automatically deploys changes. Git pulls alone cannot
 activate arbitrary infrastructure edits. Routine application updates are one
 command; release/schema/dependency changes still need separate review.
 
+## Wizard internals
+
+Reference for the installer's terminal and browser wizards. Owners normally need only the
+[quick start](../README.md#quick-start-one-command-on-the-raspberry-pi).
+
+### Terminal wizard in the guided installer
+
+The guided installer asks the configuration questions **in the terminal** (the terminal wizard,
+`vesselstack-wizard.py --cli`, the default). It reads your answers from the terminal
+(`/dev/tty`, so the piped `curl | sudo bash` form works), validates every answer
+immediately with the same rules as the browser wizard (`DEFAULTS`, `validate()`,
+`render()`; stricter checks only where `install.sh` enforces the same limits, such as
+the boat name characters), and offers sections for the boat (name, type, units, timezone
+detected from the system, optional and private MMSI, call sign, length and beam),
+Signal K (docker, existing or native; docker recommended), NMEA 2000 / CAN
+(`SOCKETCAN_ENABLE`, interface, bit rate and the home-lab virtual-CAN option
+`VESSELSTACK_CAN_CREATE_VCAN`), AIS, Home Assistant (URL, optional hidden token), Boat
+Chat provider (default `local`) and Telegram, the firewall (untrusted interface, enable,
+strict mode, allowed ports), raw-data retention (`INFLUXDB_RAW_RETENTION`; empty means
+30 days on a new install and no change to an existing database) and who can reach the
+dashboards (`local`, `dashboards` or `all`; see "Reaching VesselStack from other devices").
+Ports, container and bucket names, folders, the service account and the generated
+secrets sit behind "Advanced settings? [y/N]". Passwords and tokens default to being
+generated during installation, are read without echo when you do type one and are
+never printed or logged. It detects the architecture, Docker, `can0` and the network
+interface names to inform defaults and hints; it never turns hardware on by itself.
+The browser wizard asks the same "Who should be able to reach the dashboards?" question
+(`local`, `dashboards` default, `all`) on its network step. The page sends only the
+preset name (`LAN_ACCESS`); the server validates it (an unknown name is refused with HTTP 400,
+nothing is written) and expands it with the terminal wizard's `LAN_PRESETS` mapping
+into `VESSELSTACK_WEB_BIND_ADDRESS`, `VESSELSTACK_DATA_BIND_ADDRESS`, `BOAT_CHAT_HOST` and `HOMEASSISTANT_BIND_ADDRESS`;
+the preset wins over explicit bind values, `LAN_ACCESS` is never written to the env file
+and the independent Control Panel access choice is preserved. Choosing `all` shows the warning that Prometheus
+has no login and recommends the firewall. The loopback, Host/Origin, URL-fragment token
+and content-type protections are unchanged.
+The terminal wizard has no network surface (no web server, no token, no URL), so it
+runs as root directly, in a private root-only `0700` directory; its output is then
+treated exactly like the browser wizard's: copied once into the root-only staging
+directory, linted, re-validated as root with `vesselstack-wizard.py --validate FILE`
+(known settings only, allowed characters, enum and boolean values) and installed
+root-only, mode 600. `--config FILE` gets the same treatment (opened without following
+symlinks, a regular file of at most 64 KiB, copied once, only the staged copy linted,
+validated and used); with `--set` the staged copy is the base the values are applied
+to. Optional browser wizard: add `--web-wizard`; it is unchanged (loopback only on a
+random free port, `--wizard-port N`, run as an unprivileged user or the temporary
+`vesselstack-wizard` system account, a `#token=` address printed once, open on the Pi
+or through the printed `ssh -L` tunnel) and cannot be combined with `--yes`-style
+configuration options (`--config`, `--set`, `--defaults`). Limitation: the Docker line
+in a wizard's preflight reflects what that wizard sees; `install.sh` performs the
+authoritative checks.
+
+### Running the wizards by hand
+
+The terminal wizard (`--cli`) asks in the terminal and writes `vesselstack.env`; add
+`--defaults` and `--set KEY=VALUE` to configure without questions, `--base FILE` to start from an
+existing file. For the browser wizard open the address it prints (`http://127.0.0.1:8088/#token=...`), or use the
+SSH tunnel documented in the guide and open the same address on your workstation.
+The wizard accepts `--port N`, `--output FILE` (where to write the env file) and
+`--exit-after-save` (stop after the first successful save; the one-line installer
+uses it) and `--validate FILE` (check an existing env file with the wizard's rules,
+exit 0 if valid, 1 otherwise, no server started; `VESSELSTACK_CAN_CREATE_VCAN` is a
+known wizard setting, default `false`). Nothing is persisted except the temporary account, which is removed on exit (`sudo userdel
+vesselstack-wizard` if a run was killed with SIGKILL). It prints a per-run address of the form `http://127.0.0.1:PORT/#token=...`; open
+that exact address. The token is carried in the URL fragment (never sent to the
+server, never present in any served file); `wizard/app.js` reads it, removes it
+from the address bar with `history.replaceState` and sends it as `X-Wizard-Token`
+with every API call (`/api/system` and `/api/save` refuse requests without it).
+The wizard needs no root privileges; run it as a normal user. Requests are refused unless the `Host`
+header is `127.0.0.1`/`localhost`/`[::1]` on the bound port, any `Origin` is the
+same loopback origin, the token matches, and saves use `Content-Type:
+application/json` (this blocks cross-site form posts and DNS rebinding). The env
+file is created mode 600 from the start and never through a symlink. Open the
+printed URL itself (including the `#token=` part); a bookmarked older address stops working when the wizard restarts. The dependency-free wizard binds only to loopback, shows relevant host
+prerequisites, and writes a complete private `vesselstack.env`. It does not
+change boot firmware, firewall rules, marine wiring, or start services. Then run
+`sudo ./install.sh --config vesselstack.env --dry-run` and `--start` as described
+in the [README](../README.md#5-run-preflight).
+
 ## Developer validation
 
 On Linux, keep temporary test roots protected and remove them after the run:
@@ -209,9 +296,10 @@ info-level findings) on the shell scripts it lists, and they currently pass
 with no findings. The style `A && B || handler` is avoided (SC2015); use
 `if ! { A && B; }; then ... fi` instead.
 Run local checks with `shellcheck -S info` (and default severity) over
-`install.sh`, `build-package.sh`, `scripts/*` and `tests/*.sh`, since CI does; a
-recent ShellCheck (0.11.0) and the Debian bookworm one (0.9.0) both report no
-findings.
+`install.sh`, `build-package.sh`, `scripts/*` and `tests/*.sh`, since CI does.
+Check with ShellCheck 0.9.0 (the Ubuntu and Debian bookworm package, which CI
+installs): ShellCheck 0.11.0 does not report SC2015 for `A && B || continue`, so
+a clean local 0.11 run can still fail CI.
 
 Root-controlled test fixtures (`tests/test-offline-install.sh`,
 `tests/test-update-launcher.sh`) are created under `/usr/local/share/vs-test`,
@@ -261,6 +349,7 @@ docker compose --env-file vesselstack.example.env \
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 python3 displays/displayctl.py validate
 python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
+node tests/test_control_panel_ui.cjs   # Control Panel interface (tabs, dialogs, banner, validation)
 ```
 
 Build a sanitized release:
@@ -315,7 +404,7 @@ statement about the current lab prerelease.
 
 1. **Complete:** InfluxDB schema names and runtime Boat Chat branding are
    configurable, with legacy defaults retained only for 0.x upgrades.
-2. **Complete:** Existing, pinned native, and pinned Docker SignalK modes are
+2. **Complete:** Existing, pinned native, and pinned Docker Signal K modes are
    included.
 3. **Complete:** Opt-in SocketCAN and AIS-catcher modules include hardware
    probes and stay disabled by default.
@@ -347,8 +436,8 @@ refused. This fixes values with spaces (such as `AIS_CATCHER_ARGS`) being passed
 to Compose as one argument. The installed `vesselstackctl` defaults to the
 installation's `VESSELSTACK_ROOT`, so a custom root works without exporting it.
 Boat Chat and Control Panel token checks no longer fail on non-ASCII header
-text, `GET`/`HEAD /api/settings` now need the access token (the Settings page
-sends the token saved by **Connect**), unauthenticated loopback settings writes
+text, `GET`/`HEAD`/`POST /api/settings` now need the access code (the Settings page
+sends the code saved by **Connect**; see [Boat Chat setup](BOAT_CHAT.md)), unauthenticated loopback settings writes
 need a `localhost`/loopback or configured `BOAT_CHAT_HOST` `Host` name (DNS
 rebinding defense; configure `BOAT_CHAT_SETTINGS_TOKEN` to change settings from
 other hosts), and power tracking splits intervals at the zero crossing so
@@ -559,6 +648,6 @@ Use `sudo vesselstackctl component remove ID` to persist a removal and run
 `sudo vesselstackctl component add ID` to persist inclusion and start it. Adding
 Mosquitto refreshes its managed access files; adding InfluxDB runs its bootstrap
 when available. Do not edit the membership field in the Control Panel directly;
-use its Components controls. CLI and Control Panel lifecycle operations should
+use the Disable (⋯ menu) and Enable controls on the Home tab's component cards. CLI and Control Panel lifecycle operations should
 be run one at a time because external CLI requests are not cross-process
 serialized.

@@ -3,10 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
-    <meta name="theme-color" content="#f4f8fa" />
+    <meta name="theme-color" content="#f4f8fa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0a1826" media="(prefers-color-scheme: dark)" />
     <title>VesselStack Boat Chat</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260928-chat-polish" />
+    <link rel="stylesheet" href="/styles.css?v=20261102-brand-a11y" />
   </head>
   <body data-view="overview">
     <main class="app">
@@ -14,32 +15,39 @@
         <header class="app-header">
           <div class="header-brand">
             <img class="header-icon" src="/favicon.svg" alt="">
-            <div><h1><span class="brand-vessel">VesselStack </span>Boat Chat</h1>
-            <p>Telemetry-backed assistant for VesselStack.</p></div>
+            <div><h1>Boat Chat</h1>
+            <p>Ask questions about your boat, answered from its own recorded data.</p></div>
           </div>
           <div class="header-actions">
-            <div class="status-stack" aria-live="polite">
+            <div class="status-stack" aria-live="polite" aria-label="Connection status">
               <div id="status" class="status">Starting</div>
               <div id="route-status" class="status status-secondary" hidden>Local</div>
             </div>
-            <button id="overview-open" type="button">Overview</button>
-            <button id="chat-open" type="button">Chat</button>
-            <button id="connect-open" type="button" hidden>Connect</button>
-            <button id="insights-open" type="button">Hub</button>
-            <button id="capabilities-open" type="button">Prompts</button>
-            <button id="settings-open" type="button">Settings</button>
+            <div class="view-toggle" role="group" aria-label="View">
+              <button id="overview-open" type="button" aria-pressed="true" aria-current="page">Overview</button>
+              <button id="chat-open" type="button" aria-pressed="false">Chat</button>
+            </div>
+            <details class="more-menu" open>
+              <summary aria-label="More actions">More</summary>
+              <div class="more-items">
+                <button id="connect-open" type="button" hidden>Connect</button>
+                <button id="insights-open" type="button">Boat Hub</button>
+                <button id="capabilities-open" type="button">Prompts</button>
+                <button id="settings-open" type="button">Settings</button>
+              </div>
+            </details>
           </div>
         </header>
 
         <div class="examples" aria-label="Example questions">
-          <button data-prompt="How much fuel did I use this weekend?">Fuel this weekend</button>
-          <button data-prompt="Battery voltage over the past 2 weeks">Battery 2 weeks</button>
-          <button data-prompt="When did shore power turn off?">Shore power</button>
-          <button data-prompt="Is the boat healthy right now?">Health check</button>
+          <button data-prompt="How much fuel did I use this weekend?">How much fuel did I use this weekend?</button>
+          <button data-prompt="How has the battery voltage looked over the past 2 weeks?">How has the battery voltage looked over the past 2 weeks?</button>
+          <button data-prompt="When did shore power turn off?">When did shore power turn off?</button>
+          <button data-prompt="Is the boat healthy right now?">Is the boat healthy right now?</button>
         </div>
 
         <section id="owner-overview" class="owner-overview" aria-label="Boat overview">
-          <div class="overview-heading"><div><p class="eyebrow">THEOFFICE · YOUR BOAT</p><h2 id="boat-condition">Connect to your boat</h2></div><button id="refresh-status" type="button">Refresh</button></div>
+          <div class="overview-heading"><div><p class="eyebrow">YOUR BOAT</p><h2 id="boat-condition">Connect to your boat</h2></div><button id="refresh-status" type="button">Refresh</button></div>
           <p id="observation-age" role="status">Connect this device to view boat observations.</p>
           <section id="boat-status-strip" class="boat-status-strip" aria-label="Boat observations" hidden></section>
           <h3>Needs attention</h3><div id="owner-attention"><p>Boat status has not been checked.</p></div>
@@ -52,17 +60,10 @@
           <details><summary>System status</summary><p id="owner-system">Connect to check system status.</p></details>
         </section>
 
-        <section id="messages" class="messages" aria-live="polite"></section>
+        <section id="messages" class="messages" tabindex="0" aria-label="Conversation"></section>
+        <div id="sr-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
-        <details class="context-drawer" hidden>
-          <summary>
-            <span>Answer details</span>
-            <span id="context-summary">No request yet</span>
-          </summary>
-          <div id="context-json" class="answer-details">No request yet.</div>
-        </details>
-
-        <form id="chat-form" class="composer">
+                <form id="chat-form" class="composer">
           <label class="sr-only" for="message">Boat question</label>
           <textarea
             id="message"
@@ -73,7 +74,7 @@
             spellcheck="true"
           ></textarea>
           <div class="composer-actions">
-            <label class="mode-control">Answer<select id="answer-mode"><option value="concise">Concise</option><option value="explain">Explain</option><option value="diagnose">Diagnose</option><option value="checklist">Checklist</option></select></label>
+            <label class="mode-control">Answer style<select id="answer-mode"><option value="concise">Concise</option><option value="explain">Explain</option><option value="diagnose">Diagnose</option><option value="checklist">Checklist</option></select></label>
             <button id="clear-chat" class="secondary-button" type="button">Clear</button>
             <button id="cancel-button" class="secondary-button" type="button" hidden>Cancel</button>
             <button id="send-button" type="submit">Ask</button>
@@ -85,22 +86,27 @@
     <dialog id="connect-dialog">
       <form id="connect-form">
         <header class="dialog-header"><h2>Connect this device</h2><button id="connect-close" type="button">Close</button></header>
-        <p>Enter your Boat Chat access token. It stays in this tab and is cleared when you disconnect.</p>
-        <label>Access token <input id="connect-token" type="password" required autocomplete="off" /></label>
+        <p>Enter your Boat Chat access code. It stays in this tab and is cleared when you disconnect.</p>
+        <label>Access code <input id="connect-token" type="password" required autocomplete="off" /></label>
         <p id="connect-message" role="status"></p>
         <footer class="dialog-footer"><button id="disconnect-device" type="button">Disconnect</button><button type="submit">Connect</button></footer>
       </form>
     </dialog>
     <dialog id="settings-dialog">
-      <form id="settings-form" method="dialog">
+      <form id="settings-form" method="dialog" data-state="ok">
         <header class="dialog-header">
           <h2>Settings</h2>
           <button id="settings-close" type="button" aria-label="Close settings">Close</button>
         </header>
 
+        <div id="settings-error" class="settings-error" role="alert" hidden>
+          <p id="settings-error-text"></p>
+          <div class="followups"><button id="settings-connect" type="button" hidden>Connect</button><button id="settings-retry" type="button">Try again</button></div>
+        </div>
+
         <section class="settings-grid">
           <fieldset class="settings-section">
-            <legend>Routing</legend>
+            <legend>Models</legend>
             <div class="setting-fields">
               <label>
                 Primary provider
@@ -155,7 +161,7 @@
             <legend>Codex CLI</legend>
             <div class="setting-fields">
               <label>
-                Codex effort
+                Codex effort (blank = default)
                 <select name="BOAT_CHAT_CODEX_EFFORT" id="setting-codex-effort">
                   <option value=""></option>
                   <option value="low">low</option>
@@ -175,7 +181,7 @@
             <legend>Claude CLI</legend>
             <div class="setting-fields">
               <label>
-                Claude effort
+                Claude effort (blank = default)
                 <select name="BOAT_CHAT_CLAUDE_EFFORT" id="setting-claude-effort">
                   <option value=""></option>
                   <option value="low">low</option>
@@ -311,7 +317,10 @@
             </div>
           </fieldset>
 
-          <fieldset class="settings-section">
+          <details class="settings-advanced">
+            <summary>Advanced</summary>
+            <div class="settings-advanced-body">
+<fieldset class="settings-section">
             <legend>Telegram</legend>
             <div class="setting-fields">
               <label>
@@ -319,7 +328,7 @@
                 <input name="BOAT_CHAT_URL" id="setting-boat-chat-url" autocomplete="off" placeholder="http://127.0.0.1:8765" />
               </label>
               <label>
-                Telegram token
+                Telegram bot token
                 <input name="TELEGRAM_BOT_TOKEN" id="setting-telegram-token" type="password" autocomplete="off" />
                 <span class="secret-state" data-secret="TELEGRAM_BOT_TOKEN"></span>
               </label>
@@ -347,42 +356,44 @@
                 <input name="BOAT_CHAT_PORT" id="setting-port" inputmode="numeric" />
               </label>
               <label>
-                Settings token
+                Admin code
                 <input id="setting-current-token" type="password" autocomplete="off" placeholder="saved in this tab" />
-                <small class="setting-help">Used to authenticate settings writes; the server never returns it.</small>
+                <small class="setting-help">The admin code lets this device change settings, if one is set. The server never shows it.</small>
               </label>
               <label>
-                Replacement settings token
-                <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional write protection" />
+                New admin code
+                <input name="BOAT_CHAT_SETTINGS_TOKEN" id="setting-settings-token" type="password" autocomplete="off" placeholder="optional; leave blank to keep" />
                 <span class="secret-state" data-secret="BOAT_CHAT_SETTINGS_TOKEN"></span>
               </label>
               <label>
                 Access code
-                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="required for chat and boat data" />
+                <input name="BOAT_CHAT_ACCESS_TOKEN" id="setting-access-token" type="password" autocomplete="off" placeholder="leave blank to keep the current code" />
                 <span class="secret-state" data-secret="BOAT_CHAT_ACCESS_TOKEN"></span>
               </label>
             </div>
           </fieldset>
+            </div>
+          </details>
         </section>
 
         <footer class="dialog-footer">
-          <span id="settings-message"></span>
-          <button type="submit">Save</button>
+          <span id="settings-message" role="status"></span>
+          <button id="settings-save" type="submit">Save</button>
         </footer>
       </form>
     </dialog>
     <dialog id="capabilities-dialog">
       <section class="capabilities-panel">
         <header class="dialog-header"><h2>What Boat Chat can do</h2><button id="capabilities-close" type="button">Close</button></header>
-        <div id="capabilities-content">Loading capabilities…</div>
+        <div id="capabilities-content">Loading the list of things you can ask…</div>
       </section>
     </dialog>
     <dialog id="insights-dialog">
       <section class="insights-panel">
         <header class="dialog-header"><div><h2>Boat Hub</h2><p>Safety, trip, position, and maintenance at a glance.</p></div><button id="insights-close" type="button">Close</button></header>
-        <div id="insights-content" class="insights-content">Loading boat insights…</div>
+        <div id="insights-content" class="insights-content">Loading Boat Hub…</div>
       </section>
     </dialog>
-    <script src="/app.js?v=20260928-chat-polish"></script>
+    <script src="/app.js?v=20261102-brand-a11y"></script>
   </body>
 </html>

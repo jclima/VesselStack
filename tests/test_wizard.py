@@ -22,6 +22,39 @@ wizard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wizard)
 
 class WizardTests(unittest.TestCase):
+    def test_units_are_us_customary_or_metric_only_and_default_matches_the_installer(self):
+        self.assertEqual(wizard.DEFAULTS["BOAT_UNITS"], "us_customary")
+        installer = (ROOT / "install.sh").read_text()
+        self.assertIn(': "${BOAT_UNITS:=us_customary}"', installer)
+        for good in ("us_customary", "metric"):
+            self.assertEqual(wizard.validate({"BOAT_UNITS": good})["BOAT_UNITS"], good)
+        for bad in ("nautical", "imperial", "", "Metric"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "BOAT_UNITS"):
+                wizard.validate({"BOAT_UNITS": bad})
+        self.assertEqual([name for name, _ in wizard.FIELD_INDEX["BOAT_UNITS"]["choices"]], ["us_customary", "metric"])
+        with self.assertRaises(ValueError): wizard.apply_settings(wizard.DEFAULTS.copy(), ["BOAT_UNITS=nautical"])
+        app = (ROOT / "wizard" / "app.js").read_text()
+        self.assertNotIn("nautical'", app.lower().replace("nautical miles", ""))
+        self.assertNotIn("value=\"nautical", app)
+        self.assertIn("BOAT_UNITS:'us_customary'", app)
+
+    def test_wizard_page_is_accessible_and_escapes_values(self):
+        app = (ROOT / "wizard" / "app.js").read_text()
+        page = (ROOT / "wizard" / "index.html").read_text()
+        css = (ROOT / "wizard" / "styles.css").read_text()
+        self.assertIn('aria-live="polite"', page)
+        self.assertIn("aria-current", app)
+        self.assertIn("const esc=", app)
+        self.assertNotIn("value=\"${state.values", app)  # every interpolated value goes through esc()
+        self.assertIn("SIGNALK_URL", app)
+        self.assertIn("VESSELSTACK_UNTRUSTED_INTERFACE", app)
+        self.assertNotIn("pick another untrusted interface", app)
+        for rule in ("button:disabled", "prefers-color-scheme:dark", "color-scheme:light dark"):
+            self.assertIn(rule, css)
+        self.assertIn("#0a1826", css)
+        self.assertNotIn("NO login", app)
+        self.assertNotIn("WARNING", app)
+
     def test_vesseltwin_preload_default_and_validation(self):
         self.assertEqual(wizard.DEFAULTS["SIGNALK_VESSELTWIN_PRELOAD"], "true")
         self.assertEqual(wizard.validate({"SIGNALK_VESSELTWIN_PRELOAD": "false"})["SIGNALK_VESSELTWIN_PRELOAD"], "false")
@@ -162,14 +195,20 @@ class WizardHttpTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertFalse(self.output.exists())
 
+    def test_web_save_rejects_nautical_units_without_writing(self):
+        status, body = self.request("POST", "/api/save", {"values": {"BOAT_UNITS": "nautical"}}, self.good())
+        self.assertEqual(status, 400)
+        self.assertIn(b"BOAT_UNITS", body)
+        self.assertFalse(self.output.exists())
+
     def test_wizard_page_asks_the_lan_question_with_the_all_warning(self):
         source = (ROOT / "wizard" / "app.js").read_text()
         self.assertIn("Who should be able to reach the dashboards?", source)
         for preset in wizard.LAN_PRESETS:
             self.assertIn(f"['{preset}'", source)
-        self.assertIn("Prometheus (NO login at all)", source)
+        self.assertIn("Prometheus (no login at all)", source)
         self.assertIn("Turn on the firewall", source)
-        self.assertIn("control panel has its own access choice", source)
+        self.assertIn("Control Panel has its own access choice", source)
         self.assertIn("CONTROL_PANEL_HOST", source)
 
     def test_missing_or_wrong_token_is_rejected(self):
@@ -366,7 +405,7 @@ class CliWizardTests(unittest.TestCase):
         self.assertIn("installer default (30d on a new install)", output)
 
     def test_edits_invalid_input_help_and_back(self):
-        answers = ["Bad;Name", "Sea Wolf", "Sailing yacht", "3", "Atlantis/Nowhere", "Europe/Oslo",
+        answers = ["Bad;Name", "Sea Wolf", "Sailing yacht", "2", "Atlantis/Nowhere", "Europe/Oslo",
                    "y", "12345", "123456789", "b", "", "ABCD1", "11.5", "3.8",
                    "2", "http://192.0.2.10:3000",
                    "y", "y", "", "",   # CAN on, vcan on (interface becomes vcan0), interface, bitrate
@@ -374,7 +413,7 @@ class CliWizardTests(unittest.TestCase):
         result, output = drive(answers, strict=True)
         self.assertIsInstance(result, dict, output)
         self.assertEqual(result["BOAT_NAME"], "Sea Wolf")
-        self.assertEqual(result["BOAT_UNITS"], "nautical")
+        self.assertEqual(result["BOAT_UNITS"], "metric")
         self.assertEqual(result["BOAT_TIMEZONE"], "Europe/Oslo")
         self.assertEqual((result["BOAT_MMSI"], result["BOAT_CALLSIGN"], result["BOAT_LOA_M"], result["BOAT_BEAM_M"]), ("123456789", "ABCD1", "11.5", "3.8"))
         self.assertEqual((result["SIGNALK_MODE"], result["SIGNALK_URL"]), ("existing", "http://192.0.2.10:3000"))
@@ -439,7 +478,7 @@ class CliWizardTests(unittest.TestCase):
         values = wizard.DEFAULTS.copy()
         wizard.apply_settings(values, ["BOAT_NAME=Foo", "SOCKETCAN_ENABLE=yes", "SOCKETCAN_BITRATE=500000", "BOAT_UNITS=2"])
         self.assertEqual((values["BOAT_NAME"], values["SOCKETCAN_ENABLE"], values["SOCKETCAN_BITRATE"], values["BOAT_UNITS"]),
-                         ("Foo", "true", "500000", "us_customary"))
+                         ("Foo", "true", "500000", "metric"))
         for bad in ("NOT_A_KEY=1", "SIGNALK_MODE=bogus", "BOAT_MMSI=12", "SOCKETCAN_ENABLE=maybe", "BOAT_NAME=", "BOAT_NAME=a;b", "NOEQUALS",
                     "INFLUXDB_RAW_RETENTION=1y", "VESSELSTACK_ROOT=/home/boat/vs", "VESSELSTACK_USER=root", "VESSELSTACK_WEB_BIND_ADDRESS=lan"):
             with self.assertRaises(ValueError, msg=bad): wizard.apply_settings(wizard.DEFAULTS.copy(), [bad])

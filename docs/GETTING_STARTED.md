@@ -41,13 +41,13 @@ installer. `-t` gives the session a terminal so the installer can ask questions:
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
 ```
 
-The `latest/download` URL follows the latest stable release. The lab prerelease
-`v0.5.7` is not selected by that URL; use its explicit pinned URL or
-`--version 0.5.7` only when following the lab and offline-release instructions
-in [DEPLOYMENT.md](DEPLOYMENT.md).
+The URL pins release `v0.6.0`, so it installs that release whatever GitHub marks as Latest
+(`--version 0.6.0` selects the same release). The form `.../releases/latest/download/get-vesselstack.sh`
+points to whichever release GitHub marks Latest, which is not necessarily the newest one. For a
+lab Pi and an offline boat, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 
 The script checks the host first. It asks before installing missing Debian
 packages or Docker Engine and Compose v2 from Docker's official apt repository,
@@ -62,9 +62,42 @@ and the optional Boat Chat provider are configured there. Boat Chat defaults to
 a local provider. A remote provider is optional and may require internet and
 provider credentials.
 
-![Example VesselStack preflight review](images/wizard-preflight.png)
+### The optional browser wizard
 
-*Example of a preflight review; your host checks and values may differ.*
+`--web-wizard` (or `python3 vesselstack-wizard.py` on its own) serves a browser version of the
+same questions on loopback only. It prints a per-run address of the form
+`http://127.0.0.1:PORT/#token=...`; open that exact address on the Pi, or from your laptop
+through `ssh -L PORT:127.0.0.1:PORT YOUR_USER@YOUR_PI.local`. It has seven steps:
+**Preflight**, **Hardware**, **Vessel**, **Storage**, **Signal K**, **Network** and **Review**.
+**Back** keeps what you entered, and **Continue** stays blocked until the page has its address
+token.
+
+![Browser wizard Preflight step showing the host, memory, Docker Compose and can0 checks](images/wizard-preflight.png)
+
+*Step 1, Preflight: host architecture and memory, Docker Compose, network interfaces and
+whether `can0` is present. The checks are for information only.*
+
+Steps 2 to 4 are a hardware checklist for your reference (not saved), the boat name, type,
+timezone and units (US customary or metric; knots and nautical miles are always kept), and the
+service account and paths. **Signal K** chooses a managed or existing server and, if you enable
+NMEA 2000, the CAN interface:
+
+![Browser wizard Signal K and NMEA 2000 step with the CAN interface warning](images/wizard-nmea.png)
+
+*Step 5, Signal K and NMEA 2000: enable SocketCAN only after the vendor overlay is installed
+and `can0` appears.*
+
+**Network** asks who can reach the dashboards and who can open the Control Panel, with an optional
+firewall for Wi-Fi. **Review** writes the file with mode 600; credentials, including the Boat
+Chat access code, are generated later, during installation.
+
+![Browser wizard final page: Configuration saved, with the commands to run next](images/wizard-done.png)
+
+*The last page after saving: nothing is installed yet. Run the `--dry-run` command, then the
+`--start` command, then `sudo vesselstackctl doctor`. If the wizard has stopped by itself, that is
+expected.*
+
+The terminal wizard asks the same things; its wording and values may differ slightly.
 
 ## How to access it
 
@@ -73,7 +106,9 @@ and Boat Chat. Open those addresses from a computer on the same trusted boat
 network. It also prints a command to read the Boat Chat access token locally;
 keep that token private and never commit `config/*.env`.
 
-The control panel is administration-only and binds to loopback by default. On
+## First sign-in to the Control Panel
+
+The Control Panel is administration-only and binds to loopback by default. On
 the Pi, retrieve its token locally:
 
 ```bash
@@ -87,11 +122,18 @@ SSH tunnel from your own computer:
 ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI
 ```
 
-Then open `http://127.0.0.1:8780` and enter the token. Do not expose port 8780 directly to the
-internet. Exact ports, LAN presets, firewall behavior, token storage, and
-rollback are documented in the [main README reference](../README.md#quick-start-one-command-on-the-raspberry-pi).
+Then open `http://127.0.0.1:8780`, paste the token (or the whole `CONTROL_PANEL_TOKEN=…`
+line) into **Control Panel token** and press **Unlock**. If you changed the panel port in
+Settings, use that number. Do not expose port 8780 directly to the internet.
 
-For a deliberate trusted-LAN setup, preview and apply only the panel listener:
+![Control Panel unlock screen](images/control-panel-login.png)
+
+A first look at each tab is in the [Control Panel guide](CONTROL_PANEL.md). Exact ports, LAN presets, firewall behavior, token storage, and
+rollback are documented in [Network access and security](NETWORK.md) and the
+[Control Panel guide](CONTROL_PANEL.md).
+
+The SSH tunnel is the recommended default. Direct panel access from the boat network is an
+opt-in choice: for a deliberate trusted-LAN setup, preview and apply only the panel listener:
 `sudo vesselstackctl panel-access lan --dry-run`, then
 `sudo vesselstackctl panel-access lan`. This is unencrypted HTTP on all
 interfaces; a strict firewall may still block it. Roll back with
@@ -108,7 +150,7 @@ the offline installer cannot fetch them. Before leaving the lab, verify that
 the matching offline bundle contains every required Python dependency and
 container image.
 
-Follow [DEPLOYMENT.md](DEPLOYMENT.md) for the signed release workflow, offline
+Follow [DEPLOYMENT.md](DEPLOYMENT.md) for the pinned release workflow, offline
 bundle verification, dock-side update, and rollback. Internet is not required
 for the local Signal K/history/dashboard stack once its images and packages
 are present. It may still be required by an explicitly selected remote Boat
@@ -119,7 +161,7 @@ For a fresh offline managed Docker install, the default
 installed while online. If the plugin is absent, set
 `SIGNALK_VESSELTWIN_PRELOAD=false` in the carried configuration before
 installing offline; you can preload it later while online, and enabling,
-pairing, and readings remain separate owner choices. Native SignalK is
+pairing, and readings remain separate owner choices. Native Signal K is
 unsupported offline. If `DISPLAYS_ENABLE=true`, provision the displays bridge
 virtual environment on that Pi while it is online, or set
 `DISPLAYS_ENABLE=false`. See the
@@ -135,7 +177,7 @@ publish vessel positions, MMSIs, call signs, device identifiers, telemetry
 databases, backups, logs, or environment files.
 
 An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
-and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
+and explicit reading opt-ins. Managed Docker/native Signal K installs preload the
 pinned plugin package by default; that preload does not enable the plugin, pair
 the account, or authorize readings. Consult the
 [VesselTwin integration guide](VESSELTWIN.md)
@@ -144,11 +186,12 @@ logbook records.
 
 ## If something goes wrong
 
-Start with the read-only checks in [Troubleshooting](README.md#troubleshooting):
+Start with the read-only checks in [Troubleshooting](../README.md#troubleshooting):
 `sudo vesselstackctl status`, `sudo vesselstackctl doctor`, and `sudo vesselstackctl urls`,
 then inspect the relevant service logs. Stop before changing CAN or boot settings if `can0` is
 missing. For release failures, use the deployment backup and rollback path;
 do not delete `/opt/vesselstack-data` while investigating.
 
 For deeper manual setup, every variable, port, service, security note, and
-rollback command remains in the [full README reference](../README.md#quick-start-one-command-on-the-raspberry-pi).
+rollback command remains in the [full README reference](../README.md#4-configure-the-vessel) and
+[Network access and security](NETWORK.md).

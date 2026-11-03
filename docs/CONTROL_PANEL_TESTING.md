@@ -1,6 +1,6 @@
 # Control Panel component lifecycle lab test
 
-This is the release 0.5.7 lab recipe. It is a bounded acceptance test, not
+This is the release 0.6.0 lab recipe. It is a bounded acceptance test, not
 evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
@@ -8,34 +8,37 @@ positions, MMSIs, tokens, logs, and backups out of this repository.
 ## Fetch and verify the pinned prerelease
 
 Download the pinned bootstrap and the CI-generated checksum from the same
-`v0.5.7` GitHub prerelease. Verify before reading or running it:
+`v0.6.0` GitHub release. Verify before reading or running it:
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.7/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.5.7/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
 ```
 
-The release is an annotated unsigned lab tag, not a signed stable release. The
-checksum catches a corrupt or truncated asset; it does not replace review of
-the release provenance.
+0.6.0 release status: `v0.6.0` is an SSH-signed tag, published first as a pre-release and
+marked Latest after the maintainer's physical Raspberry Pi install passes (see the CHANGELOG).
+Check the tag with `scripts/verify-release-tag.sh v0.6.0`. The checksum catches a corrupt or
+truncated asset; it does not replace that signature check.
 
 ## Exercise the browser updater
 
-Open the authenticated panel and use **Check for updates**. Confirm the catalog
-is `jclima/VesselStack`, stable releases are the default, and **Include lab
-prereleases** is opt-in. Because the installed `0.5.7` release is current, it
-may correctly report **No newer release**; do not downgrade, retag, or force the
-same version. Exercise **Back up & install** only when a newer public lab
-release is available. A fresh `0.5.7` install is a CLI install; an existing
-`0.5.5` or `0.5.6` install may use the panel upgrade path only after enabling
-**Include lab prereleases**. CI-controlled fixtures exercise the install
+Open the authenticated panel's **Updates** tab and press **Check for updates**. Before
+you press it, confirm the tab says nothing has been contacted. Confirm the catalog
+is `jclima/VesselStack`, stable releases are the default, and **Include early test
+releases** is opt-in. When the installed `0.6.0` release is current, the panel
+correctly reports "You're up to date"; do not downgrade, retag, or force the
+same version. Exercise **Back up & install** only when a newer public release
+is available. A fresh `0.6.0` install is a CLI install; an existing `0.5.5`,
+`0.5.6` or `0.5.7` install may use the panel upgrade path, after enabling
+**Include early test releases** (named **Include lab prereleases** in the 0.5.x panel) if
+0.6.0 is published as a prerelease. CI-controlled fixtures exercise the install
 orchestration, and the actual systemd restart is covered by the backend
 verifier. Full physical-Pi upgrade proof remains pending physical testing.
-Mount the configured external backup device first. Confirm the backup path is
-shown before confirmation and that the operation log records download,
+Mount the configured external backup device first. Confirm the dialog and the Home tab
+show the backup state, and that the operation log records download,
 SHA-256 verification, safe extraction, preflight, backup verification, install,
 detached updater restart of the Control Panel, reconnect, and final version/boot
 verification.
@@ -91,6 +94,26 @@ This does not make an unmounted backup safe, and the exception must never be
 used to guess at a real boat's backup destination. Stop if manually checked
 capacity is low or if any device/data path is unclear.
 
+## Exercise the interface
+
+With the stack running, walk each tab once and record anything that differs:
+
+1. Unlock with the pasted `CONTROL_PANEL_TOKEN=...` line, then lock and unlock with the
+   bare value. A wrong token shows "That token wasn't accepted".
+2. **Home** shows Services, Backup and Software cells and one **Back up now** button.
+   Press it: a banner reports the result and the saved path, and **Details** shows the
+   log. Unmount the backup drive and repeat: the banner fails with a mount message and the
+   Backup cell says the drive is not mounted.
+3. **Stop all** (Maintenance) opens a dialog listing what goes dark; **Cancel** changes
+   nothing. Confirm it, check the panel stays up, then **Start all**.
+4. **Settings**: enter an unknown timezone and an out-of-range number. **Save** is
+   rejected with an inline message per field and nothing is written. Fix them, **Save**
+   (nothing restarts), then **Apply**.
+5. **Maintenance → Restart Control Panel**: the header shows Disconnected, then reconnects
+   by itself, and boat services keep running. Close the SSH tunnel to see Disconnected
+   and **Retry now**.
+6. Resize to phone width and switch to dark mode; every tab stays usable.
+
 ## Exercise the catalog
 
 Run `sudo vesselstackctl panel-access lan` on the Pi and open its printed address
@@ -98,19 +121,19 @@ from your laptop on the same trusted network. Retrieve the unlock token with the
 printed command. No SSH tunnel is needed. Confirm `panel-access` shows the chosen
 host/port and that the other service bindings are unchanged. Use
 `sudo vesselstackctl panel-access local` to undo this after testing if desired.
-Do not hardcode a preview port. In the Components view:
+Do not hardcode a preview port. On the Home tab's component grid:
 
-1. Confirm the component membership summary is read-only and that the CSV
-   membership field cannot be edited manually.
-2. Remove Grafana. Confirm the operation stops/removes its container while its
+1. Confirm core components show a **⋯** menu with **Disable**, and that optional
+   components show **Turn on in Settings** instead.
+2. Disable Grafana from its **⋯** menu. Confirm the operation stops/removes its container while its
    data directory and dashboards remain present. Do not run `rm -v`, purge
    commands, or unrelated control-system cleanup.
-3. Restart the stack and run `sudo vesselstackctl doctor`; the removed
-   membership must remain removed.
+3. Use **Restart all** and run `sudo vesselstackctl doctor`; the disabled
+   component must remain disabled.
 4. Run the normal update path from the pinned release directory. Confirm the
    catalog membership remains unchanged across the update and that existing
    user data is retained.
-5. Add Grafana again from the Control Panel, or with
+5. Press **Enable** on the Grafana card, or run
    `sudo vesselstackctl component add grafana`. Confirm Grafana is provisioned
    and its retained data is visible again.
 6. Repeat one add/remove check for another core component. If the component

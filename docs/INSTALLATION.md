@@ -63,7 +63,7 @@ terminal. The Pi needs no screen, keyboard, or browser, and nothing has to be
 opened or tunnelled:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
 ```
 
 The terminal questions come in short sections (boat, Signal K, NMEA 2000 / CAN,
@@ -72,13 +72,14 @@ Each has a plain-language explanation and a default in `[brackets]`: Enter
 accepts it, `?` explains, and `b` goes back one question. A review screen (never
 showing secrets) lets you save, edit a section, or quit.
 Passwords and tokens are generated for you; MMSI, call sign and boat size are optional and
-stay on the Pi. A short example:
+stay on the Pi. Units offers 1 US customary (feet, degrees F, psi, US gallons; the default) and
+2 metric; speeds stay in knots and distances in nautical miles either way. A short example:
 
 ```text
 [1/9] Your boat
   Boat name [My Boat]: Sea Wolf
   Boat type [Motor vessel]:
-  Units - choose 1-3 [metric]: 3
+  Units - choose 1-2 [us_customary]: 2
   Timezone [Europe/Oslo]:
   Add optional vessel details (MMSI, call sign, length, beam)? [y/N]:
 ...
@@ -99,10 +100,17 @@ firewall may block it); restore the default with
 change. The command requires the existing root-owned config files and a
 non-empty panel token, and restarts only the control-panel service.
 
+**First sign-in.** Run the tunnel command above on your own computer, open
+`http://127.0.0.1:8780`, and paste the token from
+`sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env` into **Control
+Panel token** (the whole `CONTROL_PANEL_TOKEN=…` line works too), then press **Unlock**. If you
+changed the panel port in Settings, use that number. See the
+[Control Panel guide](CONTROL_PANEL.md) for a tour of the four tabs.
+
 **Without questions** (scripts, repeatable installs, or when no terminal is available):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 ```
 
@@ -114,9 +122,11 @@ not upgrade an installed system or remove Docker conflicts). `--config FILE` use
 installer stops before changing anything and lists these options. `--web-wizard` is the
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
-The `latest` URL works only once a release carrying `get-vesselstack.sh` is marked latest.
-Pinned to one release (works for any published release, including a pre-release): `.../releases/download/v0.5.7/get-vesselstack.sh`, or add
-`--version 0.5.7` (`| sudo bash -s -- --version 0.5.7`). It installs the Debian
+The pinned URL above works for any published release, including a prerelease; add
+`--version 0.6.0` (`| sudo bash -s -- --version 0.6.0`) or set `VESSELSTACK_VERSION=0.6.0` for
+the same effect. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
+points to whichever release GitHub marks Latest, which is not necessarily the newest release
+(every 0.5.x release was a prerelease), so it is a secondary option. The script installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, asks the configuration questions in the terminal, then runs the installer dry run, the
@@ -132,7 +142,9 @@ page, or pass `--sha256 HASH`. To read the script first (recommended for the fir
 install):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh.sha256
+sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
 ```
@@ -239,7 +251,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.5.7
+git checkout v0.6.0
 python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
 # python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```
@@ -253,12 +265,25 @@ ssh -L 8088:127.0.0.1:8088 YOUR_USER@YOUR_PI
 ```
 
 Then open the same printed address (with its `#token=...`) locally. The assistant inventories the host,
-walks through the BOM and deployment choices, and writes `vesselstack.env` with
-mode 600. Stop it with Ctrl-C when finished.
+walks seven steps (**Preflight**, **Hardware**, **Vessel**, **Storage**, **Signal K**,
+**Network**, **Review**) and writes `vesselstack.env` with mode 600. The last page shows the
+commands to run next; if the wizard has already stopped by itself, that is expected, and
+otherwise stop it with Ctrl-C.
 
-![Wizard system preflight](images/wizard-preflight.png)
+![Optional browser wizard, step 1 Preflight: host, memory, Docker Compose and can0 checks](images/wizard-preflight.png)
 
-![Wizard NMEA configuration](images/wizard-nmea.png)
+*Step 1 checks the host for information only; nothing is changed.*
+
+![Optional browser wizard, step 5 Signal K and NMEA 2000, with the CAN interface warning](images/wizard-nmea.png)
+
+*Step 5: enable SocketCAN only after the vendor overlay is installed and `can0` appears.*
+
+![Optional browser wizard, last page: Configuration saved, with the install commands to run next](images/wizard-done.png)
+
+*After saving, the page lists `sudo ./install.sh --config FILE --dry-run`, then `--start`, then
+`sudo vesselstackctl doctor`. Nothing is installed yet.*
+
+These screenshots show the optional browser wizard (`--web-wizard`). The terminal questions are the default path, and wording may differ.
 
 ## 6. Preflight, install, and start
 
@@ -320,7 +345,7 @@ which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later 
 LAN presets leave the Control Panel setting unchanged; it remains loopback by default unless
 you explicitly use `vesselstackctl panel-access lan`. `local` also limits Home Assistant (8123) to the
 Pi through a delimited `http:` block the installer manages in its `configuration.yaml` (it never
-touches an `http:` section you wrote yourself and prints the manual step instead). SignalK (3000)
+touches an `http:` section you wrote yourself and prints the manual step instead). Signal K (3000)
 has no bind-address setting, so no preset restricts it; only the firewall's strict mode can
 (see [Network access and security](NETWORK.md)).
 
@@ -344,16 +369,16 @@ which never built the index, or when the build failed. Fix it with
 doctor`. 0.4.3 and later build the index during installation, on upgrade and on
 `vesselstackctl start`. Details: [Boat Chat setup](BOAT_CHAT.md), "Memory index".
 
-## Managed SignalK and VesselTwin preload
+## Managed Signal K and VesselTwin preload
 
-Managed Docker/native SignalK preloads pinned `signalk-vesseltwin` 0.2.3 when
+Managed Docker/native Signal K preloads pinned `signalk-vesseltwin` 0.2.3 when
 `SIGNALK_VESSELTWIN_PRELOAD=true`. Preload, enablement, pairing, and reading
 permissions are separate steps; see [VESSELTWIN.md](VESSELTWIN.md). Offline
 Docker installs reuse a valid existing plugin and fail before mutation when it
-is missing; native SignalK is unsupported offline. Setting the flag false skips
+is missing; native Signal K is unsupported offline. Setting the flag false skips
 future preloads and never removes an existing plugin.
 
-## Troubleshooting: SignalK not running / EACCES on package.json
+## Troubleshooting: Signal K not running / EACCES on package.json
 
 Prometheus metrics live in `<data>/prometheus` (owned by uid/gid 65534, created by the
 installer, included in backups) and are kept for `PROMETHEUS_RETENTION` (default `30d`).
@@ -365,13 +390,13 @@ With `SIGNALK_MODE=docker`, if the `vesselstack-signalk` container keeps restart
 and `sudo docker logs vesselstack-signalk` shows
 `EACCES: permission denied, open '/home/node/.signalk/package.json'`, the data
 directory `<data>/signalk` is owned by root instead of uid/gid 1000 (the `node`
-user in the SignalK image). Release 0.4.3 and later create and repair it on every
+user in the Signal K image). Release 0.4.3 and later create and repair it on every
 installer run (an empty or `root:root` directory only; a populated directory with symlinks,
 hard links, special files or another owner is left untouched with instructions), and
 `sudo vesselstackctl doctor` reports it. Start with the read-only doctor output
-and inspect the exact configured SignalK data directory and ownership. Resolve
+and inspect the exact configured Signal K data directory and ownership. Resolve
 the indicated cause, then rerun the supported installer repair. Do not
-blanket-chown the SignalK tree or restart the container while ownership and
+blanket-chown the Signal K tree or restart the container while ownership and
 symlink state are still unknown.
 
 ## Rollback and recovery

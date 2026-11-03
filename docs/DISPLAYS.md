@@ -5,7 +5,7 @@ Purpose: reference for the optional ESP32 touch-screen instrument displays: brid
 [Back to README](../README.md) · [Documentation index](README.md)
 
 VesselStack is gaining configurable live-instrument displays: small ESP32 touch
-screens that show SignalK values (speed, depth, wind angle, battery voltage and
+screens that show Signal K values (speed, depth, wind angle, battery voltage and
 so on) on pages you define. The first board is the Waveshare
 ESP32-S3-Touch-LCD-2.8C, planned to run ESPHome with LVGL. The board registry
 and page layouts are data, so more boards and layouts can be added later.
@@ -14,13 +14,13 @@ and page layouts are data, so more boards and layouts can be added later.
 the MQTT topic/payload and freshness logic, the board registry, the MQTT
 account/ACL provisioning (`displayctl.py sync-mqtt`), the **device lifecycle
 commands** (`vesselstackctl display list|add|remove|rotate|wifi|status`), the
-**SignalK-to-MQTT bridge service** and the **ESPHome project generator**
+**Signal K-to-MQTT bridge service** and the **ESPHome project generator**
 (`vesselstackctl display render|export|build|flash`, see [Firmware: generate, build and
 flash](#firmware-generate-build-and-flash)) exist today (`displays/`). With
 `DISPLAYS_ENABLE=true` the bridge publishes your configured instruments to
 Mosquitto. The Waveshare 2.8C has been verified on real hardware: bring-up
 (colours, orientation, round safe area and touch coordinates) needed no knob
-changes, and the path SignalK, bridge, MQTT, screen worked end to end on a
+changes, and the path Signal K, bridge, MQTT, screen worked end to end on a
 Raspberry Pi with a firmware built on the Pi and flashed over USB serial. Not
 yet verified on hardware: OTA updates, long-term stability and `.local` (mDNS)
 name resolution. Building and flashing on the Pi is optional
@@ -52,7 +52,7 @@ environment already exists.
 ## Displays bridge service
 
 `vesselstack-displays-bridge.service` (`displays/bridge.py`) subscribes to the
-SignalK websocket stream (`vessels.self` only, only the paths in
+Signal K websocket stream (`vessels.self` only, only the paths in
 `displays.json`), converts and rounds values with the same tested logic as the
 topic schema below, and publishes them retained to Mosquitto. It is opt-in and
 adds no listening port.
@@ -60,8 +60,8 @@ adds no listening port.
 Enable it:
 
 1. Set `DISPLAYS_ENABLE=true` in `/opt/vesselstack/config/vesselstack.env` (or
-   the Displays section of the Control Panel). If SignalK security is on, also
-   set `DISPLAYS_SIGNALK_TOKEN` to a SignalK access token (read access is
+   the Displays section of the Control Panel). If Signal K security is on, also
+   set `DISPLAYS_SIGNALK_TOKEN` to a Signal K access token (read access is
    enough).
 2. Run `sudo ./install.sh --config /opt/vesselstack/config/vesselstack.env
    --start` (or Control Panel Apply). On the first run the installer seeds
@@ -97,7 +97,7 @@ restart loop). Boat Chat's environment is created as before and owned by the
 service user. The installer also writes `config/displays-bridge.env` (`root:root`,
 mode 0600; systemd reads it as PID 1 before dropping to the service account, so
 the service user never needs read access; it contains the bridge MQTT password
-and the optional SignalK token), renders and enables the unit, and starts it with
+and the optional Signal K token), renders and enables the unit, and starts it with
 `--start`. A render-only run (Control Panel Apply) runs `systemctl try-restart`
 on the bridge so a running bridge picks up the rewritten environment; a stopped
 bridge is only started by `--start` or `vesselstackctl start`. The unit runs as the unprivileged service account with the same
@@ -116,14 +116,14 @@ warns, without failing, when `displays.json` defines `ha` items but
 Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
 `online` (and `offline` on a clean stop; Mosquitto publishes the retained last
 will `offline` if the bridge dies), reports `vesselstack/v1/bridge/signalk`
-`connected` or `disconnected`, and reconnects to SignalK with exponential
-backoff (1 s up to 30 s with jitter). While SignalK is unreachable the clock
+`connected` or `disconnected`, and reconnects to Signal K with exponential
+backoff (1 s up to 30 s with jitter). While Signal K is unreachable the clock
 keeps running, so instruments turn `stale` after their `stale_after_s`; they
 read `missing` until the first value arrives. Treat `bridge/status` as the
 authority: if the bridge dies hard, `bridge/signalk` keeps its last retained
-value. A single SignalK message the bridge cannot process is logged (at most once a
+value. A single Signal K message the bridge cannot process is logged (at most once a
 minute, with a count of the ones suppressed) and dropped; it does not cost the
-SignalK connection. The MQTT client queues at most 1000 messages while the
+Signal K connection. The MQTT client queues at most 1000 messages while the
 broker is down, bounding memory. An invalid `displays.json` or settings (exit
 status 2) or a missing Python dependency (exit status 3) make the bridge exit
 with a clear journal message and stay stopped (`RestartPreventExitStatus=2 3`);
@@ -160,7 +160,7 @@ Troubleshooting:
   (`curl -fsS "$SIGNALK_URL/signalk"`); an HTTP 401 in the log means set
   `DISPLAYS_SIGNALK_TOKEN`.
 - Every instrument is `stale` or `missing` while the bridge is online and
-  connected: the SignalK `path` in `displays.json` is not being produced, or the
+  connected: the Signal K `path` in `displays.json` is not being produced, or the
   token cannot read it.
 - `bridge/homeassistant` is `disabled` and Home Assistant items show `--`:
   `DISPLAYS_HA_TOKEN` is empty or Home Assistant rejected it; see
@@ -205,7 +205,7 @@ sudo vesselstackctl display remove helm --yes
 | `build ID` | Optional. Renders, then compiles the firmware on this machine in a one-shot container of the pinned ESPHome image and stores it with a manifest; see [Building and flashing on the Pi](#building-and-flashing-on-the-pi). Root. |
 | `flash ID (--serial DEVICE \| --ota HOST) [--previous] [--force]` | Optional. Uploads the stored firmware (never compiles) over USB serial or Wi-Fi; `--previous` rolls back; refuses firmware built with credentials that are no longer current unless `--force`. Root. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it and also deletes `secrets.yaml` from every already rendered tree of every display id under `build/displays/` (`ID/project`, `ID/project.new`, `ID/project.prev`, an old-layout `ID/secrets.yaml`, and the old siblings `ID.new/` and `ID.prev/`), each under that display's build lock without following symlinks (a display whose build is running is skipped with a warning); it does this even when no Wi-Fi credentials were stored, so a rerun after a failed or partial clear still cleans up; a changed password prints a notice instead. In both cases projects rendered and firmware built earlier still contain the old Wi-Fi credentials until `render`/`build` runs again (the firmware cannot be scrubbed; `flash` refuses it without `--force`). Nothing is echoed. |
-| `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the SignalK link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
+| `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the Signal K link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
 Behaviour that applies to the changing commands (`add`, `remove`, `rotate`,
 `wifi`):
@@ -550,7 +550,7 @@ It is JSON with `schema` (must be `1`), `mqtt_host` (hostname or IP literal),
 `ha` (see [Home Assistant items](#home-assistant-items)), optional
 `night_schedule` and `displays`:
 
-- An instrument (`^[a-z][a-z0-9_]{0,31}$`) has a SignalK `path` for
+- An instrument (`^[a-z][a-z0-9_]{0,31}$`) has a Signal K `path` for
   `vessels.self` (numeric scalar values only), `label` (1-16 characters),
   `convert` (one named conversion), `unit` (up to 8 characters), `precision`
   (0-3), `stale_after_s` (1-3600 and at least 2 x `heartbeat_s`) and optional
@@ -594,7 +594,7 @@ usage, file or JSON parse errors.
 
 An instrument may carry optional `thresholds` so its tile changes colour with
 the value. All numbers are in **display units** (after `convert`, for example
-knots or feet, not SignalK SI units) and must be finite JSON numbers (booleans
+knots or feet, not Signal K SI units) and must be finite JSON numbers (booleans
 are rejected):
 
 ```json
@@ -647,7 +647,7 @@ flash the previous firmware (`display flash ID --previous ...`).
 
 ### Notifications
 
-A SignalK notification (an alarm or warning such as the anchor alarm or a low
+A Signal K notification (an alarm or warning such as the anchor alarm or a low
 battery notification) can be shown as a coloured status cell on a `status-grid`
 page. Add a top-level `notifications` object to `displays.json`:
 
@@ -659,7 +659,7 @@ page. Add a top-level `notifications` object to `displays.json`:
 }
 ```
 
-- `path` must start with `notifications.` (own vessel, SignalK path syntax),
+- `path` must start with `notifications.` (own vessel, Signal K path syntax),
   `label` is 1-16 printable characters in the bundled font (checked like
   instrument labels), `absent` is `ok` (default) or `unknown` and `alarm` is a
   boolean (default true) that decides whether the notification counts in the
@@ -671,24 +671,24 @@ page. Add a top-level `notifications` object to `displays.json`:
   notification (value `null`) follows `absent`. Any other state string, or a
   value that is not such an object, is `unknown` and shows grey `--`. The
   notification `message` text is never read, published or shown.
-- `absent`: SignalK only reports a notification while it exists, so silence
+- `absent`: Signal K only reports a notification while it exists, so silence
   means either "nothing is wrong" or "the source is not running". `absent:
   "ok"` treats a notification that has not been raised, or has been cleared, as
-  healthy (right for alarms SignalK itself generates, such as the anchor alarm);
+  healthy (right for alarms Signal K itself generates, such as the anchor alarm);
   `absent: "unknown"` shows grey `--` instead (right when a missing notification
   could just as well mean the monitoring plugin is not running). Either way,
-  while SignalK is disconnected every notification is `stale` and grey, and
+  while Signal K is disconnected every notification is `stale` and grey, and
   nothing is ever green on a stale or unknown state.
-- After SignalK (re)connects, notifications that nobody has reported on stay
+- After Signal K (re)connects, notifications that nobody has reported on stay
   `unknown` for 3 s so that an alarm that is still active is shown red as soon
-  as SignalK re-sends it instead of flashing green first.
+  as Signal K re-sends it instead of flashing green first.
 
 Topic: each notification is published retained to
 `vesselstack/v1/notifications/<id>` as compact JSON,
 `{"v":null,"u":"","st":"ok","sev":"alarm","ts":"2026-01-01T00:00:00.000Z","age":0.4}`
 (`v` is always `null` and `u` empty; `sev` is always present). `st` is `ok`
-while SignalK is connected, `stale` once it disconnects (everything heard is
-forgotten and SignalK re-sends active notifications on reconnect) and `missing`
+while Signal K is connected, `stale` once it disconnects (everything heard is
+forgotten and Signal K re-sends active notifications on reconnect) and `missing`
 before the first connection. Items are republished every `heartbeat_s`; the
 display blanks a cell (grey `--`) after 3 x `heartbeat_s` without a message,
 when the bridge is offline, or when MQTT is disconnected. The bridge subscribes
@@ -711,7 +711,7 @@ screen with a flashing banner.
   true. A stale or never-heard item counts as `unknown`.
 - `na`, `nw`, `nu` are the numbers of items that are `alarm`, `warn` and
   `unknown`. `max` is the highest of `alarm` > `warn` > `unknown` > `ok`:
-  `unknown` ranks **above** `ok`, so a dead SignalK feed or stale sensor is never
+  `unknown` ranks **above** `ok`, so a dead Signal K feed or stale sensor is never
   reported as all clear. With no counted item at all the topic is not
   published.
 - `ids` lists the alarm ids first, then the warn ids, each group in
@@ -819,14 +819,14 @@ three 10 px dots, the page title (the `!literal` page `title`, drawn in the smal
 font, up to 200 px wide) sits in a second row at y 40, and one 8 px dot per page
 with the current page highlighted sits at y 414, below the 340 x 340 content
 area (y 70-410). Nothing overlaps the content area or the alarm banner. The
-dots, left to right, are SignalK (bridge reports `connected`), the bridge
+dots, left to right, are Signal K (bridge reports `connected`), the bridge
 (`bridge/status` `online`) and MQTT (the display's own connection): green is
-good, red is bad and grey is unknown. The SignalK dot is retained data, so it is
+good, red is bad and grey is unknown. The Signal K dot is retained data, so it is
 only ever green while the bridge is online and MQTT is connected; a stopped
 bridge shows grey, never a stale green. When `displays.json` has any `ha` item a
 fourth dot (Home Assistant, 14 px to the right of the MQTT dot) follows the retained
 `bridge/homeassistant`: green `connected`, red `disconnected`, grey `disabled` or not
-yet known; like the SignalK dot it is only coloured while the bridge is online. Without
+yet known; like the Signal K dot it is only coloured while the bridge is online. Without
 `ha` items nothing is generated for it. Page titles are checked against the
 bundled font like labels (`validate` and `display render` report a glyph the
 font lacks), but only when `header` is on.
@@ -974,12 +974,12 @@ use single`.
   arcs and indicator colours switch to the red/amber night palette through the
   same guarded repaint as the tiles (no blue; the neutral colour becomes dim
   amber).
-- **SignalK tank paths.** SignalK publishes tanks as
+- **Signal K tank paths.** Signal K publishes tanks as
   `tanks.<type>.<id>.currentLevel`, a **ratio from 0 to 1**, for example
   `tanks.fuel.0.currentLevel`, `tanks.freshWater.0.currentLevel`,
   `tanks.blackWater.0.currentLevel` (also `wasteWater`, `lubrication`, `liveWell`,
   `baitWell`, `ballast`, `gas`). Use `"convert": "ratio->%"`, `"unit": "%"`,
-  `"min": 0`, `"max": 100`. To find the paths on your boat open the SignalK
+  `"min": 0`, `"max": 100`. To find the paths on your boat open the Signal K
   admin UI (Data Browser, filter `tanks`) or read
   `http://<pi>:3000/signalk/v1/api/vessels/self/tanks`; the `<id>` is whatever
   your tank sensor plugin or N2K gateway reports (`0`, `1`, ... or a name). If
@@ -1027,12 +1027,12 @@ want to see the solar line). The layout is round only (`electrical needs a
 round board; use grid-2x2` on a rectangular board). It is never chosen as the
 default page of `display add`.
 
-- **SignalK paths.** `electrical.batteries.<id>.voltage` (volts, `convert`
+- **Signal K paths.** `electrical.batteries.<id>.voltage` (volts, `convert`
   `none`, `unit` `V`, `precision` 2), `electrical.batteries.<id>.capacity.stateOfCharge`
   (a **ratio 0 to 1**: `convert` `ratio->%`, `unit` `%`, `min` 0, `max` 100) and
   `electrical.batteries.<id>.current` (amperes, `none`, `unit` `A`, `precision`
   1). `<id>` is what your battery monitor plugin or N2K gateway reports (`house`,
-  `0`, ...); check the Data Browser in the SignalK admin UI (filter
+  `0`, ...); check the Data Browser in the Signal K admin UI (filter
   `electrical`). Solar controllers usually publish
   `electrical.solar.<id>.current`. For a shore pill see below.
 - **SoC ring.** The ring is the `gauge-arc` ring of the SoC instrument: the
@@ -1048,7 +1048,7 @@ default page of `display add`.
   and the header and page-dot areas. The voltage uses the 56 px digits (the
   font `grid-2x2` uses; a display with an `electrical` page gets it). Fonts,
   glyph sets and the other layouts are otherwise unchanged. Estimated from font sizes, not measured on the panel.
-- **Current and sign convention.** SignalK reports the battery current as
+- **Current and sign convention.** Signal K reports the battery current as
   positive while **charging** and negative while discharging; the value is shown
   with a minus sign when negative. The word next to it is `CHG` above +0.05 A,
   `DSG` below -0.05 A and empty inside that band (and when stale). It is built
@@ -1058,7 +1058,7 @@ default page of `display add`.
   so the number, `CHG`/`DSG`, any `thresholds` and `alarm` all use the corrected
   sign. `negate` works on any instrument.
 - **Shore pill.** With a **notification** (for example
-  `notifications.electrical.shorePower`, which you create with a SignalK rule or
+  `notifications.electrical.shorePower`, which you create with a Signal K rule or
   plugin; the path in the example is a placeholder) the pill is coloured by
   severity and shows `OK`, `WARN`, `ALARM` or `--` exactly like a `status-grid`
   cell; use `"absent": "unknown"` unless a missing notification really means
@@ -1096,10 +1096,10 @@ row spacing and the 56 px digits against the ring.
 ### Home Assistant items
 
 Home Assistant (HA) entities, such as a bilge pump switch, a high water sensor, the
-shore power state or a summary sensor you built in HA, can be shown next to SignalK
+shore power state or a summary sensor you built in HA, can be shown next to Signal K
 data. The bridge keeps one websocket open to HA, reads only the entities named in
 `ha`, and publishes a severity and a small index per item, never the state text. This
-is an optional extra: SignalK instruments and notifications work whether or not HA is
+is an optional extra: Signal K instruments and notifications work whether or not HA is
 reachable. It has been verified against a fake HA server in the integration tests, not
 yet against a real Home Assistant.
 
@@ -1126,11 +1126,11 @@ Then set it, with the URL if HA is not on the Pi:
   `https://`, or keep HA on the Pi. `wss://` verifies the certificate against the
   system trust store; there is no custom-CA option. For a self-signed HA, point the bridge
   at HA on loopback or add the CA to the Pi's system store.
-- **Redirects are refused.** The HA (and SignalK) websocket upgrade does not follow HTTP
+- **Redirects are refused.** The HA (and Signal K) websocket upgrade does not follow HTTP
   redirects (websockets 17.3 would follow them, even to another host, which would
   hand the token to that host); point `HOME_ASSISTANT_URL` at the final address.
 - Re-run the installer (or Control Panel Apply). The token is written only to the
-  root-only 0600 `config/displays-bridge.env` (included in backups, like the SignalK
+  root-only 0600 `config/displays-bridge.env` (included in backups, like the Signal K
   token) and sent once in the websocket `auth` message; the bridge never logs it,
   and removes it from any log text. With no token the bridge logs one warning,
   does not connect, and the items show `--`.
@@ -1301,7 +1301,7 @@ point):
 
 ### Board registry schema 2
 
-`displays/boards/registry.json` is now `schema` 2, where each layout is an
+`displays/boards/registry.json` uses `schema` 2, where each layout is an
 object `{"capacity", "min_items", "shapes": ["round","rect"], "types":
 ["instrument","notification","ha"]}` (the allowed item types). `schema` 1
 registries (a layout is just an integer capacity) are still accepted and mean
@@ -1324,8 +1324,8 @@ layout that takes only instruments for the default page (`tank-bars`,
 Values are published retained to `vesselstack/v1/instruments/<instrument_id>`
 as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","age":0.4}`.
 `v` is converted, then rounded to `precision`, and is `null` unless `st` is
-`ok`. `ts` is the SignalK timestamp (or `null`); `age` is seconds since the
-bridge received the value, measured on the bridge clock, not the SignalK
+`ok`. `ts` is the Signal K timestamp (or `null`); `age` is seconds since the
+bridge received the value, measured on the bridge clock, not the Signal K
 timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
 `vesselstack/v1/bridge/signalk`, `vesselstack/v1/bridge/clock` (see
 [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
@@ -1350,20 +1350,20 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 - `missing`: no value has been received since the bridge started.
 - A changed value is published at most once per `min_interval_ms`; unchanged
   values are not republished except by the `heartbeat_s` heartbeat, which also
-  refreshes `age`. Null, non-numeric, non-finite and boolean SignalK values are
+  refreshes `age`. Null, non-numeric, non-finite and boolean Signal K values are
   ignored, as are values whose magnitude exceeds 1e15 after conversion.
 
 ## Supported boards
 
 | Board | Screen | Layouts | Status |
 | --- | --- | --- | --- |
-| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc`, `electrical` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and SignalK to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
+| Waveshare ESP32-S3-Touch-LCD-2.8C (`waveshare-esp32-s3-touch-lcd-2.8c`) | 480x480 round, 70 px safe inset, 340x340 content area, header and footer bands (`ring`) | `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc`, `electrical` | Config validated and compiles with ESPHome 2026.10.0 (`esphome config` in CI); builds on a laptop or, optionally, on the Pi (`display build`, `display flash`; verified on real hardware: colours, orientation, safe area, touch and Signal K to screen end to end after `display build` and `display flash --serial`; OTA, long-term stability and `.local` resolution not yet verified; see the [bring-up checklist](#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)) |
 
 `list-6` is defined but not offered on the round board: `validate_registry` rejects any board whose `layouts` lists a layout the firmware generator cannot render (`schema.SUPPORTED_LAYOUTS`, shared with `render.py`).
 
 **Adding a board versus adding a layout.** A new board is data only: an entry in `displays/boards/registry.json` that lists already supported layouts and its ESPHome package. A new layout is code: teach `displays/render.py` to draw it and add its id to `SUPPORTED_LAYOUTS` in `displays/schema.py`, otherwise the registry is refused.
 
-**Rounding.** Instrument and Home Assistant numeric values use the same rounding (half away from zero, never `-0.0`, an integer at `precision` 0, a value beyond 1e15 is treated as missing). A heading (`rad->deg_360`) that rounds up to 360 is shown as 0. A numeric Home Assistant item at `precision` 0 is now published as an integer (`3`, not `3.0`) in the MQTT payload; rollback is `git revert`.
+**Rounding.** Instrument and Home Assistant numeric values use the same rounding (half away from zero, never `-0.0`, an integer at `precision` 0, a value beyond 1e15 is treated as missing). A heading (`rad->deg_360`) that rounds up to 360 is shown as 0. A numeric Home Assistant item at `precision` 0 is published as an integer (`3`, not `3.0`) in the MQTT payload.
 
 ## Planned limitations
 
@@ -1372,8 +1372,8 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
   network.
 - With the VesselStack firewall enabled, displays must be on a trusted
   interface that can reach the Raspberry Pi's MQTT port.
-- The build path is exporting from the Pi and compiling on a laptop; building
-  and flashing on the Pi (a Compose profile) is planned and not available yet.
+- Building on a laptop is the primary documented path; building and flashing on the
+  Pi (`display build`, `display flash`) is optional.
   Only the `single`, `grid-2x2`, `status-grid`, `tank-bars`, `gauge-arc` and `electrical` layouts are generated.
 - The runtime `displays.json`, `displays.secrets.json`, ESPHome
   `secrets.yaml`, `.esphome/` and `displays/build/` output, `$VESSELSTACK_ROOT/build/` and firmware

@@ -699,6 +699,47 @@ expect_unchanged_failure "real run with ':' password" xinstall "$X_APP/installer
 printf '\nMQTT_PASSWORD=" padded"\n' >> "$BADPW"
 expect_unchanged_failure "dry-run with padded password" xinstall "$X_APP/installer/install.sh" --config "$BADPW" --dry-run
 
+# 1b. A value the env files cannot hold safely (a single quote with a $) is refused
+# by a dry run and by a real run BEFORE anything changes: the installed env files
+# stay byte-identical, no temp file is left behind, and the message names only the
+# key, never the value.
+BADVAL="$TEST_ROOT/badval.env"
+cp "$XENV" "$BADVAL"
+cat >> "$BADVAL" <<'CFG'
+HOME_ASSISTANT_TOKEN="it's \$SECRET"
+CFG
+env_before=$(sha256sum "$XENV" "$X_APP/config/boat-chat.env" "$X_APP/config/control-panel.env")
+expect_unchanged_failure "dry-run with unsafe env value" xinstall "$X_APP/installer/install.sh" --config "$BADVAL" --dry-run
+grep -q "HOME_ASSISTANT_TOKEN" "$TEST_ROOT/failure.out"
+grep -q 'Upgrading to 0.6.0' "$TEST_ROOT/failure.out"
+if grep -q 'SECRET' "$TEST_ROOT/failure.out"; then echo "the refusal printed the value" >&2; exit 1; fi
+expect_unchanged_failure "real run with unsafe env value" xinstall "$X_APP/installer/install.sh" --config "$BADVAL"
+grep -q "HOME_ASSISTANT_TOKEN" "$TEST_ROOT/failure.out"
+test "$env_before" = "$(sha256sum "$XENV" "$X_APP/config/boat-chat.env" "$X_APP/config/control-panel.env")"
+test -z "$(find "$X_APP/config" -maxdepth 1 -name '.*.env.*' -print -quit)"
+# A safe value with an apostrophe still passes the dry run.
+GOODVAL="$TEST_ROOT/goodval.env"
+cp "$XENV" "$GOODVAL"
+cat >> "$GOODVAL" <<'CFG'
+HOME_ASSISTANT_TOKEN="it's fine"
+CFG
+xinstall "$X_APP/installer/install.sh" --config "$GOODVAL" --dry-run | grep -q 'Preflight passed'
+
+# 1c. Stale env temp files (exact mktemp names) are removed by a real run; a dry run
+# leaves them, and similarly named files are never touched.
+for stale in .vesselstack.env.AbC123 .boat-chat.env.xYz789 .control-panel.env.000000; do : > "$X_APP/config/$stale"; done
+for keep in .vesselstack.env.short .vesselstack.env.AbC1234 .other.env.AbC123 vesselstack.env.AbC123; do : > "$X_APP/config/$keep"; done
+xinstall "$X_APP/installer/install.sh" --config "$XENV" --dry-run >/dev/null
+test -e "$X_APP/config/.vesselstack.env.AbC123"
+xinstall "$X_APP/installer/install.sh" --config "$XENV" >/dev/null
+for stale in .vesselstack.env.AbC123 .boat-chat.env.xYz789 .control-panel.env.000000; do
+    test ! -e "$X_APP/config/$stale" || { echo "stale temp $stale was not removed" >&2; exit 1; }
+done
+for keep in .vesselstack.env.short .vesselstack.env.AbC1234 .other.env.AbC123 vesselstack.env.AbC123; do
+    test -e "$X_APP/config/$keep" || { echo "$keep should not have been removed" >&2; exit 1; }
+    rm -f "$X_APP/config/$keep"
+done
+
 # 2. Bridge username colliding with the administrator account.
 COLLIDE="$TEST_ROOT/collide.env"
 cp "$XENV" "$COLLIDE"

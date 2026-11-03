@@ -204,6 +204,94 @@ class SettingsTests(ServerCase):
         self.assertFalse(self.env_file.exists() and "8765" in self.env_file.read_text())
 
 
+    def test_settings_post_requires_the_access_code_like_get(self):
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "right-token"
+        body = {"settings": {"BOAT_CHAT_PROVIDER": "ollama"}}
+        # Loopback with no settings token passes the admin check, but not the access check.
+        self.assertEqual(401, self.call("POST", "/api/settings", body)[0])
+        self.assertEqual(401, self.call("POST", "/api/settings", body, token="wrong")[0])
+        self.assertFalse(self.env_file.exists() and "ollama" in self.env_file.read_text())
+        self.assertEqual(200, self.call("POST", "/api/settings", body, token="right-token")[0])
+        self.assertIn("ollama", self.env_file.read_text())
+
+    def test_settings_post_needs_both_codes_when_they_differ(self):
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "right-token"
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "settings-secret"
+        data = json.dumps({"settings": {"BOAT_CHAT_PROVIDER": "ollama"}}).encode()
+
+        def post(**headers):
+            request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_port}/api/settings", data=data, method="POST",
+                                             headers={"Content-Type": "application/json", **headers})
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status
+            except urllib.error.HTTPError as error:
+                return error.code
+        self.assertEqual(401, post(**{"X-Boat-Chat-Token": "settings-secret"}))
+        self.assertEqual(403, post(**{"X-Boat-Chat-Token": "right-token"}))
+        self.assertEqual(401, post(**{"X-Boat-Chat-Token": "settings-secret", "X-Boat-Chat-Access-Token": "wrong"}))
+        self.assertEqual(200, post(**{"X-Boat-Chat-Token": "settings-secret", "X-Boat-Chat-Access-Token": "right-token"}))
+
+    def test_access_code_cannot_be_cleared_unless_open_mode(self):
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "right-token"
+        app.update_settings({"BOAT_CHAT_ACCESS_TOKEN": "right-token", "BOAT_CHAT_PROVIDER": "ollama"})
+        before = self.env_file.read_text()
+        for bad in (None, "", "   "):
+            status, body = self.call("POST", "/api/settings", {"settings": {"BOAT_CHAT_ACCESS_TOKEN": bad}}, token="right-token")
+            self.assertEqual(400, status, repr(bad))
+            self.assertEqual("The access code cannot be cleared; set a new one instead.", body["error"])
+            self.assertEqual(before, self.env_file.read_text())
+        self.assertEqual(200, self.call("POST", "/api/settings", {"settings": {"BOAT_CHAT_ACCESS_TOKEN": "new-token"}}, token="right-token")[0])
+        os.environ["BOAT_CHAT_ALLOW_OPEN"] = "true"
+        app.update_settings({"BOAT_CHAT_ACCESS_TOKEN": None})
+
+    def test_settings_get_and_head_accept_the_access_code_header(self):
+        os.environ["BOAT_CHAT_ACCESS_TOKEN"] = "right-token"
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "settings-secret"
+
+        def send(method, **headers):
+            request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_port}/api/settings", method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status
+            except urllib.error.HTTPError as error:
+                return error.code
+        for method in ("GET", "HEAD"):
+            self.assertEqual(401, send(method), method)
+            self.assertEqual(401, send(method, **{"X-Boat-Chat-Access-Token": "wrong"}), method)
+            self.assertEqual(200, send(method, **{"X-Boat-Chat-Access-Token": "right-token"}), method)
+
+    def test_blank_required_settings_are_rejected_without_writing(self):
+        os.environ["BOAT_CHAT_ALLOW_OPEN"] = "true"
+        app.update_settings({"BOAT_CHAT_PORT": "9000", "BOAT_CHAT_MAX_TOKENS": "800", "BOAT_CHAT_MODEL": "m1"})
+        before = self.env_file.read_text()
+        for key in ("BOAT_CHAT_HOST", "BOAT_CHAT_PORT", "BOAT_CHAT_MAX_TOKENS", "BOAT_CHAT_CONTEXT_CHARS", "BOAT_CHAT_PROVIDER", "BOAT_CHAT_MODEL"):
+            status, body = self.call("POST", "/api/settings", {"settings": {"BOAT_CHAT_FALLBACK_PROVIDER": "ollama", key: ""}})
+            self.assertEqual(400, status, key)
+            self.assertIn(key, body["error"])
+            self.assertEqual(before, self.env_file.read_text(), key)
+        # The exact wipe the stale Settings dialog used to send.
+        wipe = {k: "" for k in ("BOAT_CHAT_HOST", "BOAT_CHAT_PORT", "BOAT_CHAT_MAX_TOKENS", "BOAT_CHAT_MODEL", "BOAT_CHAT_FALLBACK_MODEL")}
+        self.assertEqual(400, self.call("POST", "/api/settings", {"settings": wipe})[0])
+        self.assertEqual(before, self.env_file.read_text())
+        for bad in ("abc", "0", "70000"):
+            with self.assertRaises(ValueError):
+                app.update_settings({"BOAT_CHAT_PORT": bad})
+        self.assertEqual(before, self.env_file.read_text())
+
+    def test_explicit_clear_and_blank_secret_semantics_are_kept(self):
+        os.environ["BOAT_CHAT_ALLOW_OPEN"] = "true"
+        app.update_settings({"BOAT_CHAT_MODEL": "m1", "BOAT_CHAT_FALLBACK_MODEL": "f1", "OPENAI_API_KEY": "sk-x"})
+        app.update_settings({"BOAT_CHAT_MODEL": None, "BOAT_CHAT_FALLBACK_MODEL": None, "OPENAI_API_KEY": ""})
+        saved = env_config.parse_env_file(self.env_file, app.SETTING_KEYS)
+        self.assertEqual("", saved["BOAT_CHAT_MODEL"])
+        self.assertEqual("", saved["BOAT_CHAT_FALLBACK_MODEL"])
+        self.assertEqual("sk-x", saved["OPENAI_API_KEY"])
+        # An explicit None still means "clear", also for required keys (reset to default).
+        app.update_settings({"BOAT_CHAT_PORT": None})
+        self.assertEqual("", env_config.parse_env_file(self.env_file, app.SETTING_KEYS)["BOAT_CHAT_PORT"])
+
+
 class PrecedenceTests(unittest.TestCase):
     def test_single_env_variable_selects_the_file_for_both_services(self):
         with tempfile.TemporaryDirectory() as tmp:

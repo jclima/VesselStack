@@ -21,14 +21,17 @@ Boat Chat provider that sends data elsewhere.
 | Install on an existing Pi | [Getting started](GETTING_STARTED.md) → [Installation](INSTALLATION.md) |
 | Stage releases in a home lab | [Deployment](DEPLOYMENT.md) |
 | Carry an update to an offline boat | [Deployment: offline path](DEPLOYMENT.md#simple-path-one-command) |
-| Understand every setting and command | [README reference](../README.md#quick-start-one-command-on-the-raspberry-pi) |
-| Use or secure the Control Panel | [Control Panel](CONTROL_PANEL.md) |
-| Set up Boat Chat access, units and timezone | [Boat Chat setup](BOAT_CHAT.md) |
+| Understand every setting and command | [README settings reference](../README.md#4-configure-the-vessel) |
+| Use or secure the Control Panel (tab-by-tab tour, backups, updates, recovery) | [Control Panel](CONTROL_PANEL.md) |
+| Test the Control Panel on a lab Pi | [Control Panel lab testing](CONTROL_PANEL_TESTING.md) |
+| Use Boat Chat, its access and admin codes, units and timezone | [Boat Chat setup](BOAT_CHAT.md), providers in [Boat Chat providers](../boat-chat/README.md) |
 | Manage MQTT accounts and access lists | [MQTT access control](MQTT.md) |
 | Reach dashboards from other devices | [Network access and security](NETWORK.md) |
 | Update, roll back, or install offline | [Updating and offline install](UPDATING.md) |
+| Verify a signed release tag | [Updating: verify a release tag](UPDATING.md#verify-a-release-tag) |
+| Sign and publish a release (1Password key) | [Deployment: release signing](DEPLOYMENT.md#1-release-signing-with-an-ssh-signing-key) |
 | Set up ESP32 instrument displays (preview) | [Instrument displays](DISPLAYS.md) |
-| Configure Boat Chat providers and units | [Boat Chat setup](../boat-chat/README.md) |
+| Configure Boat Chat providers | [Boat Chat providers](../boat-chat/README.md) |
 | Review power sources and instrument-reading coverage | [Power monitoring](../boat-chat/POWER_MONITORING.md) |
 | Connect selected readings to VesselTwin | [Optional VesselTwin connection](VESSELTWIN.md) |
 | Develop, test, or cut a release | [Development](DEVELOPMENT.md) |
@@ -46,13 +49,13 @@ should be reached through an SSH tunnel:
 ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI
 ```
 
-To deliberately allow panel access from a trusted LAN, preview then run
-`sudo vesselstackctl panel-access lan`; this changes only the panel bind and
+The tunnel is the recommended default. Panel access from a trusted LAN is opt-in: preview
+then run `sudo vesselstackctl panel-access lan`; this changes only the panel bind and
 uses unencrypted HTTP on all interfaces. A strict firewall may still block it.
 Restore the tunnel-only default with `sudo vesselstackctl panel-access local`.
 
 An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
-and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
+and explicit reading opt-ins. Managed Docker/native Signal K installs preload the
 pinned 0.2.3 plugin by default; existing mode is untouched and uses the upstream
 install path. VesselStack never enables, pairs, or authorizes readings for you.
 See the [VesselTwin integration guide](VESSELTWIN.md)

@@ -25,7 +25,7 @@ unchanged. `all` also opens
 Prometheus, which has **no login**, plus InfluxDB (token) and MQTT (password) to every
 device on the network; turn the firewall on and prefer Ethernet or a VPN as the way in.
 
-**What is enforced and what is not (host-networked containers).** SignalK (3000) and Home
+**What is enforced and what is not (host-networked containers).** Signal K (3000) and Home
 Assistant (8123) run with `network_mode: host`, so Compose port bindings cannot restrict them.
 
 - **Home Assistant: enforced by `local`.** Home Assistant binds the address in
@@ -59,7 +59,7 @@ Assistant (8123) run with `network_mode: host`, so Compose port bindings cannot 
   discovery or HomeKit integrations you add) are outside it. Boat Chat, the telemetry indexer
   and the installer already reach it on `http://127.0.0.1:8123`, and Home Assistant reaches
   MQTT and InfluxDB on loopback, so nothing else depends on the LAN address.
-- **SignalK: NOT restricted by any preset (documented limitation).** Verified against the
+- **Signal K: NOT restricted by any preset (documented limitation).** Verified against the
   pinned image (`signalk-server` v2.27.0): the server starts its HTTP/WebSocket listener with
   `server.listen(port)` and logs `signalk-server running at 0.0.0.0:3000`; there is no
   environment variable, `settings.json` key or command-line option for the bind address (only
@@ -67,7 +67,7 @@ Assistant (8123) run with `network_mode: host`, so Compose port bindings cannot 
   restrict the port but breaks SocketCAN and local NMEA feeds, so it is not done. The only
   VesselStack control is the firewall's strict mode (`VESSELSTACK_FIREWALL_STRICT=true`),
   which drops port 3000 on the untrusted interface only; it is not enabled by a preset. On
-  a trusted network, or with the firewall off, SignalK stays reachable by other devices
+  a trusted network, or with the firewall off, Signal K stays reachable by other devices
   even under `local`. `sudo vesselstackctl urls` shows how every service really listens.
 
 ```bash
@@ -110,7 +110,7 @@ curl -sS -m 5 -o /dev/null -w 'influx %{http_code}\n' http://PI:8086/health || e
 
 ## Network security
 
-Compose now publishes InfluxDB `8086`, Prometheus `9090`, and MQTT `1883` on
+Compose publishes InfluxDB `8086`, Prometheus `9090`, and MQTT `1883` on
 `127.0.0.1` by default (`VESSELSTACK_DATA_BIND_ADDRESS`). Grafana `43000` and
 Heimdall `80/443` remain reachable on every interface by default
 (`VESSELSTACK_WEB_BIND_ADDRESS=0.0.0.0`) because the documented dashboards are
@@ -121,7 +121,7 @@ Assistant reaches MQTT on loopback. AIS ports are unchanged. At minimum:
 - restrict Grafana `43000` and Heimdall to trusted management networks, and set
   `VESSELSTACK_DATA_BIND_ADDRESS` to a trusted LAN/VPN IPv4 address only if
   external devices must publish to MQTT or InfluxDB;
-- keep Home Assistant, SignalK, and Boat Chat off the public internet unless
+- keep Home Assistant, Signal K, and Boat Chat off the public internet unless
   protected by an authenticated reverse proxy;
 - keep the root-privileged Control Panel loopback-only or behind a trusted VPN
   and authenticated proxy;
@@ -140,7 +140,7 @@ VESSELSTACK_UNTRUSTED_INTERFACE="wlan0"
 
 Preflight requires that interface to exist. The policy blocks MQTT, InfluxDB,
 Prometheus, and Grafana administrative/data ports arriving on that interface,
-including Docker-forwarded traffic, while leaving Home Assistant, SignalK,
+including Docker-forwarded traffic, while leaving Home Assistant, Signal K,
 Boat Chat, AIS viewer, HTTP/HTTPS, loopback, VPN, and outbound traffic intact.
 Review the policy without root or any change using
 `vesselstack-firewall print` (renders the exact `iptables-restore` payloads).
@@ -163,7 +163,7 @@ VESSELSTACK_FIREWALL_ALLOW_UDP=""
 
 On the untrusted interface strict mode drops everything except replies to
 connections the boat started, ICMP/ICMPv6, DHCP client replies and the
-allow-lists. That covers host-networked SignalK `3000`, AIS, Boat Chat `8765`
+allow-lists. That covers host-networked Signal K `3000`, AIS, Boat Chat `8765`
 (INPUT) and published container ports such as Heimdall `80/443` and Grafana
 (`DOCKER-USER`, matched on the published port). The allow-list therefore opens
 ports on both paths; the default `22` only lets SSH in. Keep Ethernet, a VPN or
