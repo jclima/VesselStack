@@ -960,6 +960,15 @@ The Control Panel is the browser administration surface. It listens on loopback 
 (`http://127.0.0.1:8780` through an SSH tunnel); `sudo vesselstackctl panel-access lan|local`
 changes only that bind. See [Control Panel](docs/CONTROL_PANEL.md) for the full guide.
 
+Its four tabs are **Home** (a status band with service state, last backup and backup drive, and one
+**Back up now** button, then the components), **Settings** (jump list, help for every field, Advanced
+sections collapsed, one Save and Apply bar), **Updates** (checked only when you press **Check for
+updates**, which contacts github.com) and **Maintenance** (Start, Restart and Stop all, **Check setup**,
+**Reinstall & start**). Interrupting actions ask in an in-page dialog first. Sign in with the token or the
+whole pasted `CONTROL_PANEL_TOKEN=...` line. Last backup and backup drive are read-only and show
+"unknown" when they cannot be read. Rollback: `git revert` of this change restores the previous page; stored
+settings keys are unchanged.
+
 ### Heimdall
 
 Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
@@ -1091,10 +1100,10 @@ This is the one place in the README that describes updating and rolling back.
 
 3. **Or use the Control Panel.** An authenticated session can check the public
    `jclima/VesselStack` releases. Stable releases are shown by default; enable
-   **Include lab prereleases** to list prereleases as well, which you need for any release
+   **Include early test releases** on the Updates tab to list prereleases as well, which you need for any release
    GitHub publishes as a prerelease. The panel shows the installed and running version, the
-   release channel, the release notes and a link to the release. **Back up & install**
-   asks for confirmation, verifies the downloaded SHA-256 manifest, safely extracts the
+   release channel and a link to the release notes. Nothing contacts GitHub until you press
+   **Check for updates**. **Back up & install** asks for confirmation in a dialog, verifies the downloaded SHA-256 manifest, safely extracts the
    release, runs preflight, then makes and verifies a backup on a mounted external drive
    (`/media` or `/mnt`; the browser cannot change the destination). A failed or unmounted
    backup stops the update. A detached updater restarts the Control Panel and verifies its
@@ -1105,7 +1114,7 @@ This is the one place in the README that describes updating and rolling back.
 
 | Installed version | Update to 0.6.0 |
 |---|---|
-| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (enable **Include lab prereleases** to see it) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
+| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (enable **Include early test releases** on the Updates tab to see it) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 

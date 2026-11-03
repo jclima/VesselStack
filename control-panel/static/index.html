@@ -14,75 +14,149 @@
   <header class="topbar">
     <div class="brand">
       <img class="brand-mark" src="/favicon.svg" alt="">
-      <div><strong>VesselStack</strong><span>Control Panel</span></div>
+      <span><strong>VesselStack Control Panel <span id="version-chip" class="ver" title="Installed version" hidden></span></strong><small id="boat-name"></small></span>
     </div>
-    <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Locked</span><button id="lock" type="button" hidden>Lock</button></div>
+    <div class="conn">
+      <span id="connection" class="conn-state" role="status"><span id="connection-dot" class="dot" aria-hidden="true"></span><span id="connection-label">Locked</span></span>
+      <button id="retry" type="button" hidden>Retry now</button>
+      <button id="lock" type="button" hidden>Lock</button>
+    </div>
   </header>
 
   <main>
     <section id="login" class="login card">
       <p class="eyebrow">Local administration</p>
-      <h1>Bring the whole stack into view.</h1>
-      <p>Enter the Control Panel token stored on the VesselStack host. It stays in this browser only.</p>
-      <form id="login-form">
+      <h1>Unlock the Control Panel</h1>
+      <p>Paste the Control Panel token from your boat computer. It stays in this browser only.</p>
+      <form id="login-form" novalidate>
         <label for="token">Control Panel token</label>
-        <div class="token-row"><input id="token" type="password" autocomplete="current-password" required><button class="primary" type="submit">Unlock</button></div>
+        <div class="tokrow"><input id="token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-help login-error" placeholder="Paste the token or the whole line"><button class="primary" type="submit">Unlock</button></div>
+        <p id="login-error" class="field-err" role="alert"></p>
+        <label class="sw show-token"><input type="checkbox" id="show-token"><span class="track"></span><span class="txt"><strong>Show token</strong></span></label>
+        <p class="small muted" id="token-help">Either form works: <span class="mono">CONTROL_PANEL_TOKEN=abc123…</span> or just <span class="mono">abc123…</span>.</p>
       </form>
+      <p class="label login-label">Don't have it? Run this on the boat computer:</p>
       <code>sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env</code>
-      <p id="login-error" class="error" role="alert"></p>
+      <details class="disc">
+        <summary>How do I reach this panel?</summary>
+        <p>By default the panel only answers on the boat computer itself, so nobody else on the dock network can open it. From your laptop, create a secure tunnel (SSH), then browse to the address below:</p>
+        <code>ssh -L 8780:127.0.0.1:8780 YOUR_USER@YOUR_PI.local</code>
+        <p class="after-code">Leave that window open, then visit <span class="mono">http://127.0.0.1:8780</span>. If you changed the panel port in Settings, use that number instead of 8780.</p>
+        <p class="small">Prefer to open it directly on your boat Wi-Fi? That is possible but sends the token unencrypted on that network. See the Control Panel guide before turning it on.</p>
+      </details>
     </section>
 
     <div id="app" hidden>
-      <section class="hero">
-        <div>
-          <p class="eyebrow">System overview</p>
-          <h1>Your boat computer,<br>from bridge to bilge.</h1>
-          <p id="summary">Loading component state…</p>
-        </div>
-        <div class="hero-actions">
-          <button class="primary" data-action="install">Install &amp; start</button>
-          <button data-action="preflight">Run preflight</button>
-          <button data-action="backup">Create backup</button>
-        </div>
-      </section>
-
       <nav class="tabs" role="tablist" aria-label="Control Panel sections">
-        <button id="tab-components" class="active" role="tab" aria-selected="true" aria-controls="components" data-tab="components" type="button">Components</button>
-        <button id="tab-configuration" role="tab" aria-selected="false" aria-controls="configuration" data-tab="configuration" type="button" tabindex="-1">Configuration</button>
+        <button id="tab-home" class="active" role="tab" aria-selected="true" aria-controls="home" data-tab="home" type="button">Home</button>
+        <button id="tab-settings" role="tab" aria-selected="false" aria-controls="settings" data-tab="settings" type="button" tabindex="-1">Settings</button>
+        <button id="tab-updates" role="tab" aria-selected="false" aria-controls="updates" data-tab="updates" type="button" tabindex="-1">Updates<span id="update-badge" class="badge" hidden></span></button>
         <button id="tab-maintenance" role="tab" aria-selected="false" aria-controls="maintenance" data-tab="maintenance" type="button" tabindex="-1">Maintenance</button>
       </nav>
 
-      <section id="components" class="tab-panel" role="tabpanel" aria-labelledby="tab-components">
-        <div class="section-heading"><div><p class="eyebrow">Runtime</p><h2>Components</h2></div><button id="refresh">Refresh status</button></div>
-        <div id="component-overview" class="overview" aria-label="Component overview"></div>
-        <p class="catalog-note">The catalog below covers the six managed core components. Signal K, AIS, and hardware integrations stay configuration-driven.</p>
-        <div class="component-toolbar"><label class="search-field" for="component-search">Search components<input id="component-search" type="search" placeholder="Name or description" autocomplete="off"></label><div class="filter-group" role="group" aria-label="Component filter"><button class="active" aria-pressed="true" data-component-filter="all" type="button">All</button><button aria-pressed="false" data-component-filter="enabled" type="button">Enabled</button><button aria-pressed="false" data-component-filter="available" type="button">Available</button></div></div>
-        <div id="component-grid" class="component-grid"></div>
+      <div id="notice" aria-live="polite"></div>
+      <div id="banner" aria-live="polite"></div>
+
+      <section id="home" class="tab-panel" role="tabpanel" aria-labelledby="tab-home">
+        <div class="pagehead"><h1>Home</h1></div>
+        <section id="band" class="band" aria-label="Status"></section>
+        <section aria-labelledby="comp-h">
+          <div class="sechead">
+            <div><h2 id="comp-h">Components</h2><p id="component-note" class="small"></p></div>
+            <div class="toolbar">
+              <div class="search"><label for="component-search">Search components</label><input id="component-search" type="search" placeholder="Name or what it does" autocomplete="off"></div>
+              <div class="filters" role="group" aria-label="Filter components">
+                <button type="button" data-component-filter="all" aria-pressed="true">All <span class="n"></span></button>
+                <button type="button" data-component-filter="running" aria-pressed="false">Running <span class="n"></span></button>
+                <button type="button" data-component-filter="stopped" aria-pressed="false">Stopped <span class="n"></span></button>
+                <button type="button" data-component-filter="disabled" aria-pressed="false">Disabled <span class="n"></span></button>
+              </div>
+            </div>
+          </div>
+          <div id="component-grid" class="grid"></div>
+        </section>
       </section>
 
-      <section id="configuration" class="tab-panel" role="tabpanel" aria-labelledby="tab-configuration" hidden>
-        <div class="section-heading"><div><p class="eyebrow">Settings</p><h2>Configuration</h2></div><div class="inline-actions"><button id="discard-config">Discard edits</button><button id="save-config" class="primary">Save configuration</button><button id="apply-config" data-action="apply" title="Apply the saved configuration to the installed system">Apply now</button></div></div>
-        <div class="notice">Secrets are write-only. Leave a secret field blank to keep its current value. Saving does not restart services. After review, use <strong>Apply now</strong> (or <strong>Apply configuration</strong> under Maintenance) to put the saved configuration into effect.</div>
-        <p id="config-status" class="form-status" aria-live="polite"></p><form id="config-form"></form>
-      </section>
-
-      <section id="maintenance" class="tab-panel" role="tabpanel" aria-labelledby="tab-maintenance" hidden>
-        <div class="section-heading"><div><p class="eyebrow">Lifecycle</p><h2>Maintenance</h2></div></div>
-        <div class="maintenance-grid">
-          <article class="card action-card"><h3>Configuration</h3><p>Validate, render, and apply the saved configuration without starting stopped services.</p><button data-action="apply">Apply configuration</button></article>
-          <article class="card action-card"><h3>History storage</h3><p>Create the InfluxDB storage buckets and the background job that builds the one-minute history averages. Safe to run again.</p><button data-action="bootstrap-history">Provision history</button></article>
-          <article class="card action-card"><h3>Stack lifecycle</h3><p>Start, stop, or restart the managed stack. The Control Panel stays available.</p><div class="inline-actions"><button data-action="start">Start</button><button data-action="restart">Restart</button><button class="danger" data-action="stop">Stop</button></div></article>
-          <article class="card action-card release-card"><h3>Maintenance updates</h3><p>Check the release catalog, review what will be installed, and keep a backup before the panel restarts.</p><div class="release-toolbar"><button id="check-releases" class="primary">Check for updates</button><label class="check-label"><input id="include-lab" type="checkbox"> Include early test releases (lab)</label></div><p id="release-versions" class="release-versions">Installed and running version: checking…</p><div id="release-warning" class="notice release-warning" hidden></div><label for="release-select">Available release</label><select id="release-select" disabled><option>Check for updates first</option></select><p id="release-detail" class="release-detail"></p><button id="install-release" class="primary" disabled>Back up &amp; install version</button><div id="release-progress" class="release-progress" aria-live="polite"></div><details class="advanced-update"><summary>Advanced: install a release you already downloaded and reviewed</summary><p>For a release that is already unpacked on this Pi, for example under /var/lib/vesselstack/releases. Most people should use <strong>Check for updates</strong> above instead.</p><label for="update-source">Folder containing the release</label><input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z"><button id="run-update">Back up &amp; update reviewed release</button></details></article>
-          <article class="card action-card"><h3>Panel recovery</h3><p>Restart only the Control Panel after a verified installation or when recovery guidance requires it.</p><button id="restart-panel">Restart Control Panel</button></article>
+      <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+        <div class="pagehead"><h1>Settings</h1><p>Edit as much as you like. Nothing changes on the boat until you <strong>Save</strong> and then <strong>Apply</strong>. Secrets are write-only: leave a secret blank to keep its current value.</p><p id="rollback-note" class="small mono"></p></div>
+        <form id="config-form" class="settings" novalidate></form>
+        <div class="savebar" id="savebar" role="region" aria-label="Unsaved changes">
+          <span class="state" id="sb-state" aria-live="polite">No changes</span>
+          <span class="note" id="sb-note"></span>
+          <span class="btns"><button type="button" id="sb-discard">Discard</button><button type="button" class="primary" id="sb-save">Save</button><button type="button" class="primary" id="sb-apply" data-action="apply" aria-describedby="sb-note">Apply</button></span>
         </div>
       </section>
 
-      <section class="operation card">
-        <div class="section-heading"><div><p class="eyebrow">Activity</p><h2>Operation log</h2></div><span id="operation-state" class="pill">Idle</span></div>
-        <p id="operation-progress" class="operation-progress" hidden></p><pre id="operation-output">No operation has run in this session.</pre>
+      <section id="updates" class="tab-panel" role="tabpanel" aria-labelledby="tab-updates" hidden>
+        <div class="pagehead"><h1>Updates</h1></div>
+        <div class="stack">
+          <section class="card" aria-labelledby="installed-h">
+            <p class="eyebrow" id="installed-h">Installed version</p>
+            <div class="ver-line"><span class="big" id="installed-version">…</span><span class="muted" id="running-note">Running now</span></div>
+            <hr class="rule">
+            <button type="button" class="primary" id="check-releases">Check for updates</button>
+            <span class="hint">Contacts github.com only when you press it. Nothing is sent about your boat.</span>
+            <div id="release-result" class="release-result" aria-live="polite"></div>
+          </section>
+          <section class="card">
+            <label class="sw"><input type="checkbox" id="include-lab"><span class="track"></span><span class="txt"><strong>Include early test releases</strong><span>Early releases are for testing and may have problems. Leave this off for a boat in regular use.</span></span></label>
+            <p class="small warn-text" id="early-note" hidden>Early test releases will be offered the next time you check. You can always go back to a stable release.</p>
+          </section>
+          <section class="card">
+            <details class="disc">
+              <summary>Advanced: install a reviewed release folder</summary>
+              <p>For a release you already downloaded, checked and unpacked on this Pi, for example under <span class="mono">/var/lib/vesselstack/releases</span>. Most people should use <strong>Check for updates</strong> instead.</p>
+              <label for="update-source">Folder containing the release</label>
+              <input id="update-source" placeholder="/var/lib/vesselstack/releases/vesselstack-x.y.z" autocomplete="off" spellcheck="false">
+              <button type="button" id="run-update" class="after-input">Back up &amp; update from folder</button>
+            </details>
+          </section>
+        </div>
+      </section>
+
+      <section id="maintenance" class="tab-panel" role="tabpanel" aria-labelledby="tab-maintenance" hidden>
+        <div class="pagehead"><h1>Maintenance</h1><p>Occasional jobs. Each one says what it will do before it does it.</p></div>
+        <div class="stack wide">
+          <section class="group" aria-labelledby="g-backup"><h2 id="g-backup">Backup</h2>
+            <div class="actions">
+              <div class="action"><div class="d"><strong>Back up now</strong><span>Saves your settings and data to the backup folder. Services pause while the copy is made, so this can take a few minutes.</span><span id="maint-backup-last" class="last-backup"></span></div><div class="b"><button type="button" class="primary" data-action="backup">Back up now</button></div></div>
+              <div class="card small flat"><strong>Restoring from a backup</strong><p>Restoring replaces current data, so it is done from the boat computer on purpose, not from this page. Check the file first, then restore:</p>
+<code>sudo vesselstackctl verify-backup &lt;backup-file&gt;
+sudo vesselstackctl restore &lt;backup-file&gt;</code></div>
+            </div>
+          </section>
+          <section class="group" aria-labelledby="g-power"><h2 id="g-power">Start &amp; stop</h2>
+            <div class="actions">
+              <div class="action"><div class="d"><strong>Start all</strong><span>Starts every enabled service that is stopped.</span></div><div class="b"><button type="button" data-action="start">Start all</button></div></div>
+              <div class="action"><div class="d"><strong>Restart all</strong><span>Stops and starts every service. Live data pauses for under a minute.</span></div><div class="b"><button type="button" data-action="restart">Restart all</button></div></div>
+              <div class="action"><div class="d"><strong>Stop all</strong><span>Turns off every service. The Control Panel stays available so you can start them again.</span></div><div class="b"><button type="button" class="danger" data-action="stop">Stop all</button></div></div>
+            </div>
+          </section>
+          <section class="group" aria-labelledby="g-repair"><h2 id="g-repair">Setup &amp; repair</h2>
+            <div class="actions">
+              <div class="action"><div class="d"><strong>Check setup</strong><span>Checks your saved settings and this Pi; changes nothing.</span></div><div class="b"><button type="button" class="primary" data-action="preflight">Check setup</button></div></div>
+              <div class="action"><div class="d"><strong>Reinstall &amp; start</strong><span>Re-applies your saved settings and restarts every service. Live data pauses for about a minute.</span></div><div class="b"><button type="button" data-action="install">Reinstall &amp; start</button></div></div>
+              <div class="action"><div class="d"><strong>Apply saved settings</strong><span>Putting a change into effect is done with the Apply button on the Settings tab, after you save.</span></div><div class="b"><button type="button" data-tab-link="settings">Go to Settings</button></div></div>
+            </div>
+          </section>
+          <section class="group" aria-labelledby="g-history"><h2 id="g-history">History storage</h2>
+            <div class="actions"><div class="action"><div class="d"><strong>Set up history storage</strong><span>Creates the places where your boat's history is kept and the small background job that builds the one-minute averages. Safe to run again; nothing is lost.</span></div><div class="b"><button type="button" data-action="bootstrap-history">Provision history</button></div></div></div>
+          </section>
+          <section class="group" aria-labelledby="g-panel"><h2 id="g-panel">Panel</h2>
+            <div class="actions"><div class="action"><div class="d"><strong>Restart Control Panel</strong><span>Only this page restarts. Boat services keep running. It reconnects in a few seconds.</span></div><div class="b"><button type="button" data-action="restart-panel">Restart Control Panel</button></div></div></div>
+          </section>
+        </div>
       </section>
     </div>
   </main>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title"><form method="dialog" id="confirm-form">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-intro"></p>
+    <ul id="confirm-items"></ul>
+    <p id="confirm-note" class="keep" hidden></p>
+    <div class="foot"><button type="button" id="confirm-cancel" autofocus>Cancel</button><button type="button" id="confirm-ok" class="primary"></button></div>
+  </form></dialog>
 
   <div id="toast" role="status" aria-live="polite"><span id="toast-text"></span><button id="toast-close" type="button" aria-label="Dismiss message" hidden>Dismiss</button></div>
   <script src="/app.js"></script>

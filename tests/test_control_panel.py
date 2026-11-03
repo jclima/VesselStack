@@ -234,7 +234,7 @@ class CommandAllowlistTests(unittest.TestCase):
 
     def test_signal_k_naming_units_choices_and_help_text(self) -> None:
         sections = {item["section"] for item in panel.FIELDS}
-        self.assertIn("Signal K", sections)
+        self.assertIn("Signal K & NMEA 2000", sections)
         self.assertNotIn("SignalK", sections)
         for item in panel.FIELDS:
             self.assertNotIn("SignalK", item["label"], item["key"])
@@ -243,7 +243,7 @@ class CommandAllowlistTests(unittest.TestCase):
         self.assertEqual(panel.FIELD_BY_KEY["SIGNALK_MODE"]["choices"], ["existing", "docker", "native"])
         for key in ("SIGNALK_MODE", "SOCKETCAN_BITRATE", "AIS_DEVICE", "BOAT_TYPE", "BOAT_TIMEZONE"):
             self.assertTrue(panel.FIELD_BY_KEY[key]["description"], key)
-        self.assertEqual(panel.FIELD_BY_KEY["BOAT_TIMEZONE"]["label"], "Timezone (for example Europe/Lisbon)")
+        self.assertEqual(panel.FIELD_BY_KEY["BOAT_TIMEZONE"]["label"], "Timezone")
 
     def test_displays_values_mirror_the_installer_checks(self) -> None:
         user = panel.FIELD_BY_KEY["DISPLAYS_BRIDGE_MQTT_USERNAME"]
@@ -521,6 +521,145 @@ class HttpApiTests(unittest.TestCase):
                 # A non-ASCII header value is a plain mismatch, not a TypeError.
                 handler.headers = {"X-VesselStack-Token": "t\u00f6ken"}
                 self.assertFalse(handler.authenticated())
+                # A pasted CONTROL_PANEL_TOKEN=... line, with or without quotes, is the same token.
+                for accepted in ("CONTROL_PANEL_TOKEN=test-panel-token", "  CONTROL_PANEL_TOKEN = test-panel-token \n",
+                                 "CONTROL_PANEL_TOKEN='test-panel-token'", "export CONTROL_PANEL_TOKEN=\"test-panel-token\"", " test-panel-token "):
+                    handler.headers = {"X-VesselStack-Token": accepted}
+                    self.assertTrue(handler.authenticated(), accepted)
+                for refused in ("CONTROL_PANEL_TOKEN=", "CONTROL_PANEL_TOKEN=wrong", "CONTROL_PANEL_TOKEN=test-panel-token-x", ""):
+                    handler.headers = {"X-VesselStack-Token": refused}
+                    self.assertFalse(handler.authenticated(), refused)
+
+    def test_normalize_token_strips_prefix_whitespace_and_quotes(self) -> None:
+        self.assertEqual(panel.normalize_token("CONTROL_PANEL_TOKEN=abc"), "abc")
+        self.assertEqual(panel.normalize_token("  abc  "), "abc")
+        self.assertEqual(panel.normalize_token("CONTROL_PANEL_TOKEN='a b'"), "a b")
+        self.assertEqual(panel.normalize_token("abc=def"), "abc=def")
+
+
+class SettingsValidationTests(unittest.TestCase):
+    def check(self, key: str, value: str) -> str:
+        return panel.validate_value(panel.FIELD_BY_KEY[key], value)
+
+    def test_timezone_must_exist(self) -> None:
+        for good in ("Europe/Lisbon", "America/Los_Angeles", "UTC", ""):
+            self.assertEqual(self.check("BOAT_TIMEZONE", good), good)
+        for bad in ("Mars/Olympus", "europe/lisbon", "Europe/Lisbn", "../etc/passwd", "Lisbon"):
+            with self.assertRaisesRegex(ValueError, "Timezone not recognised"):
+                self.check("BOAT_TIMEZONE", bad)
+
+    def test_timezone_is_not_blocked_without_a_timezone_database(self) -> None:
+        with mock.patch.object(panel.zoneinfo, "available_timezones", return_value=set()):
+            self.assertEqual(self.check("BOAT_TIMEZONE", "Mars/Olympus"), "Mars/Olympus")
+
+    def test_boat_size_ranges(self) -> None:
+        for key, good, bad in (
+            ("BOAT_LOA_M", ("13.2", "0.5", "500", ""), ("0", "-5", "500.1", "abc", "nan", "inf", "1e3", "1_0", "12 m", "13,2")),
+            ("BOAT_BEAM_M", ("4.1", "100", ""), ("0", "-1", "100.5", "1e400", "-0")),
+        ):
+            for value in good:
+                self.assertEqual(self.check(key, value), value)
+            for value in bad:
+                with self.assertRaises(ValueError, msg=f"{key}={value}"):
+                    self.check(key, value)
+
+    def test_can_bitrate_is_a_sensible_whole_number(self) -> None:
+        for good in ("250000", "10000", "1000000", ""):
+            self.assertEqual(self.check("SOCKETCAN_BITRATE", good), good)
+        for bad in ("0", "9999", "1000001", "250000.5", "-250000", "fast"):
+            with self.assertRaises(ValueError):
+                self.check("SOCKETCAN_BITRATE", bad)
+
+    def test_errors_are_reported_per_field_and_nothing_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vessel, chat, control = root / "vessel.env", root / "chat.env", root / "control.env"
+            panel.write_env(vessel, {"BOAT_NAME": "Old", "BOAT_TIMEZONE": "Mars/Olympus"}, [])
+            panel.write_env(chat, {}, [])
+            panel.write_env(control, {"CONTROL_PANEL_TOKEN": "t"}, [])
+            before = vessel.read_text()
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=chat, PANEL_ENV=control, CONFIG_BACKUP_ROOT=root / "backups"):
+                with self.assertRaises(panel.FieldErrors) as caught:
+                    panel._update_configuration({"BOAT_NAME": "New", "BOAT_TIMEZONE": "Mars/Phobos", "BOAT_LOA_M": "-5"})
+                self.assertEqual(set(caught.exception.fields), {"BOAT_TIMEZONE", "BOAT_LOA_M"})
+                self.assertEqual(vessel.read_text(), before)
+                # A stale invalid stored value never blocks saving an unrelated setting.
+                panel._update_configuration({"BOAT_NAME": "New"})
+                self.assertEqual(panel.parse_env(vessel)["BOAT_NAME"], "New")
+
+    def test_every_setting_has_plain_help_and_no_markdown(self) -> None:
+        for item in panel.FIELDS:
+            self.assertTrue(item["description"], item["key"])
+            self.assertNotIn("`", item["description"], item["key"])
+            self.assertNotIn("`", item["label"], item["key"])
+        names = {section["name"] for section in panel.SECTIONS}
+        self.assertEqual({item["section"] for item in panel.FIELDS}, names)
+
+
+class StatusFieldTests(unittest.TestCase):
+    def test_components_use_real_names_and_one_plain_status(self) -> None:
+        expected = {"signalk": "Signal K", "ais-catcher": "AIS-catcher", "socketcan": "SocketCAN", "node-exporter": "Node Exporter",
+                    "homeassistant": "Home Assistant", "influxdb": "InfluxDB", "mosquitto": "Mosquitto", "boat-chat": "Boat Chat",
+                    "telegram": "Telegram alerts", "prometheus": "Prometheus", "heimdall": "Heimdall", "displays-bridge": "Displays bridge"}
+        for name, label in expected.items():
+            self.assertEqual(panel.describe_component(name, "container", True, "running")["label"], label)
+        self.assertEqual(panel.describe_component("grafana", "container", True, "running")["status"], "running")
+        self.assertEqual(panel.describe_component("grafana", "container", True, "exited")["status"], "stopped")
+        self.assertEqual(panel.describe_component("grafana", "container", True, "unknown")["status"], "unknown")
+        failed = panel.describe_component("boat-chat", "systemd", True, "failed")
+        self.assertEqual((failed["status"], failed["detail"]), ("stopped", "failed"))
+        # Turned off in settings but still running: Disabled, never "Active and Available".
+        leftover = panel.describe_component("telegram", "systemd", False, "active")
+        self.assertEqual((leftover["status"], leftover["still_running"]), ("disabled", True))
+        self.assertEqual(panel.describe_component("telegram", "systemd", False, "inactive")["status"], "disabled")
+        for name in list(panel.COMPOSE_COMPONENTS) + list(panel.SYSTEMD_COMPONENTS):
+            info = panel.describe_component(name, "container", True, "running")
+            self.assertTrue(info["label"] and info["label"] == info["label"].strip(), name)
+            self.assertNotIn(info["label"], {"Signalk", "Ais Catcher", "Socketcan", "Node Exporter ", "Boat Chat ", "Displays Bridge"}, name)
+
+    def test_backup_status_reads_newest_checksummed_archive_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / "backups"
+            backup.mkdir()
+            old, new, orphan = backup / "vesselstack-20260101T000000Z.tar.gz", backup / "vesselstack-20260201T000000Z.tar.gz", backup / "vesselstack-20260301T000000Z.tar.gz"
+            for archive, when in ((old, 1_700_000_000), (new, 1_750_000_000), (orphan, 1_790_000_000)):
+                archive.write_bytes(b"x")
+                os.utime(archive, (when, when))
+            (backup / (old.name + ".sha256")).write_text("x")
+            (backup / (new.name + ".sha256")).write_text("x")
+            status = panel.backup_status({"VESSELSTACK_BACKUP": str(backup)})
+            self.assertEqual(status["last_backup_at"], 1_750_000_000)
+            self.assertEqual(status["mount"], "system_disk")
+            self.assertEqual(status["state"], "ok")
+            self.assertEqual({path.name for path in backup.iterdir()}, {old.name, new.name, orphan.name, old.name + ".sha256", new.name + ".sha256"})
+
+    def test_backup_status_unknown_or_missing_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(panel.backup_status({"VESSELSTACK_BACKUP": str(Path(directory) / "none")})["state"], "none")
+            empty = Path(directory) / "empty"
+            empty.mkdir()
+            self.assertIsNone(panel.backup_status({"VESSELSTACK_BACKUP": str(empty)})["last_backup_at"])
+        with mock.patch.object(panel.os.path, "ismount", return_value=False):
+            unmounted = panel.backup_status({"VESSELSTACK_BACKUP": "/media/backup-drive/vesselstack"})
+        self.assertEqual((unmounted["mount"], unmounted["state"], unmounted["last_backup_at"]), ("not_mounted", "unknown", None))
+        self.assertIn("not mounted", unmounted["message"])
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(panel.os, "scandir", side_effect=PermissionError("denied")):
+                denied = panel.backup_status({"VESSELSTACK_BACKUP": directory})
+        self.assertEqual((denied["state"], denied["last_backup_at"]), ("unknown", None))
+
+    def test_operation_summary_names_the_saved_file_or_the_reason(self) -> None:
+        ok = panel.summarize_operation({"label": "backup", "state": "succeeded", "output": ["copying", "/var/backups/vesselstack/vesselstack-20260101T000000Z.tar.gz"]})
+        self.assertEqual(ok["saved_path"], "/var/backups/vesselstack/vesselstack-20260101T000000Z.tar.gz")
+        bad = panel.summarize_operation({"label": "backup", "state": "failed", "output": ["ctl: running backup", "ERROR: backup mount /media/backup is not mounted"]})
+        self.assertEqual(bad["reason"], "backup mount /media/backup is not mounted")
+        self.assertEqual(panel.with_summary({"state": "running"}), {"state": "running"})
+
+    def test_restart_note_only_when_a_newer_panel_is_installed(self) -> None:
+        with mock.patch.object(panel, "installed_version", return_value="0.6.1"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
+            self.assertTrue(panel.restart_needed())
+        with mock.patch.object(panel, "installed_version", return_value="0.6.0"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
+            self.assertFalse(panel.restart_needed())
 
 
 if __name__ == "__main__":

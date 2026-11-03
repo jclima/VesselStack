@@ -14,11 +14,18 @@ Semantic Versioning.
   Back keeps your selections, Continue is blocked until the page has its address token, and
   after saving it shows the next commands to run. It also gains dark mode and screen-reader
   support.
-- Control Panel: Start, Restart, Stop and Remove ask for confirmation using the component's
-  name ("Live instrument data will pause briefly"), there is an "Apply now" button, error
-  messages stay until you dismiss them, and the rollback path stays visible. It also gains dark
-  mode, accessibility improvements, "Signal K" naming and plainer labels. Stored keys and values
-  are unchanged.
+- Control Panel: redesigned around four tabs (Home, Settings, Updates, Maintenance). Home shows
+  whether everything is running, the last backup and the backup drive, and whether an update is
+  known, with one **Back up now** button and the components with their real names. The result of
+  the latest operation stays in a dismissible banner with its log under Details, and every
+  stopping or interrupting action asks in an in-page dialog that lists what is affected. Settings
+  has a jump list, plain-language help for every field, Advanced sections that start collapsed,
+  inline field errors (timezone and numeric ranges are now validated), and one Save and Apply bar.
+  The login accepts a pasted `CONTROL_PANEL_TOKEN=...` line and explains how to reach the panel.
+  Updates are checked only when you press **Check for updates**. Dark mode, "Signal K" naming and
+  accessibility improvements remain. Stored keys and values are unchanged, and no action's
+  behaviour or command changed (the old Install & start and Run preflight buttons are now
+  **Reinstall & start** and **Check setup** under Maintenance).
 - Boat Chat: the credentials are now called "Access code" and "Admin code" in the interface
   (the environment variable names are unchanged). Phones get a "More" menu, and the header and
   overview status agree. Chat requests time out after 3 minutes, Clear is a two-step action,
