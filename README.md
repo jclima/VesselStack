@@ -444,6 +444,16 @@ by hand and run the update again:
 sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /opt/vesselstack/config/vesselstack.env
 ```
 
+**Backup drive not mounted (0.6.1).** When the backup folder is under `/media` or `/mnt` and the
+drive is not mounted, `get-vesselstack.sh` and (from an installed 0.6.1) `vesselstackctl update` and
+`vesselstackctl backup` no longer just stop: before anything is stopped or changed they ask
+whether to mount the drive from `/etc/fstab`, pick a connected USB drive, check again, or back up
+to the system disk once. See [Backups](#backups). A direct `sudo vesselstackctl update <dir>` run
+from an installed 0.6.0 or earlier controller does not show this menu (that controller is older
+than the fix); use `get-vesselstack.sh`, or mount the drive first, or run
+`sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` to back up to
+the system disk once.
+
 Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
 needs no other manual step.
 
@@ -1115,7 +1125,45 @@ USB drive cannot silently fill the SD card; pass
 `vesselstackctl backup --allow-unmounted DIR` (or set
 `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true`, which also applies to
 `vesselstackctl update`) to override. A warning is printed when the destination
-is on the same filesystem as the data. Besides the application and data trees the
+is on the same filesystem as the data.
+
+When the drive is not mounted and you run the command from a terminal, the update or backup
+shows a menu instead of stopping. Nothing has been changed or stopped at that point:
+
+```text
+The backup folder <DEST> is on <MOUNT_DIR>, which is not mounted.
+Backing up now would put the archive on the system disk (SD card).
+Nothing has been changed yet.
+  [1] Mount <MOUNT_DIR> now (it is listed in /etc/fstab)
+  [2] Choose a connected drive to mount at <MOUNT_DIR>
+  [3] I have plugged the drive in; check again
+  [4] Back up to the system disk this once (not recommended)
+  [c] Cancel the update
+```
+
+- **[1]** appears only when `/etc/fstab` has an entry for that folder; it runs `mount`.
+- **[2]** lists connected USB drives that are not mounted and not part of the system disk
+  (the disk holding `/`, `/boot/firmware` or the VesselStack data is never offered). Only
+  **ext4** (recommended) and **exFAT** are accepted; vfat/FAT32 is refused because of its 4 GiB
+  file limit, and other filesystems are listed with the reason. The mount point must be empty.
+  The drive is mounted with `nodev,nosuid,noexec` (exFAT also `uid=0,gid=0,umask=0077`) and stays
+  mounted until reboot; the menu prints the `/etc/fstab` line to add to mount it at boot.
+  VesselStack never edits `/etc/fstab` or formats a drive.
+- **[3]** checks the mount again after you plug the drive in.
+- **[4]** writes this one backup to the system disk after a warning. It is not offered when
+  the free space is smaller than the data (`du -skx`, 60 s limit) or when `vesselstack.env` sets
+  `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false`. Nothing is saved: the next backup asks again.
+- **[c]**, end of input or no answer within 5 minutes cancels without changing anything.
+  `vesselstackctl backup --require-mounted` (used by the Control Panel) offers only [1] to [3].
+
+Without a terminal (cron, systemd, the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) it
+still stops with `Refusing to back up: ... is not mounted ...` and a `To fix:` line. A direct
+`sudo vesselstackctl update` from an installed 0.6.0 or earlier controller does not show the
+menu; use `get-vesselstack.sh` (it asks before calling the controller) or
+`sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
+Rollback: unmount the drive with `umount`; remove the added `/etc/fstab` line if you do not want it.
+
+Besides the application and data trees the
 archive includes `/etc/systemd/system/vesselstack-*`,
 `/usr/local/sbin/vesselstack{ctl,-firewall}` and `/etc/vesselstack/update.env`
 when they exist, so a restore across versions is complete.
@@ -1195,7 +1243,10 @@ This is the one place in the README that describes updating and rolling back.
    release's `install.sh --dry-run` preflight, makes and verifies a full backup, then runs
    `install.sh --start`. Answer **n** to leave the system untouched; the installer prints
    the exact command to run later. Services restart briefly, so do not update while underway.
-   Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
+   If the backup drive is not mounted, the installer asks, before calling the controller and
+   before anything is stopped, whether to mount it, pick a USB drive, check again, or back up
+   to the system disk once (see [Backups](#backups)); `--yes` and `--defaults` never choose and
+   the update stops with the reason. Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
    directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.6.1`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
@@ -1279,6 +1330,15 @@ prints how to remove it (`docker volume rm vesselstack-esphome-cache`);
 
 Install the reported command and rerun `--dry-run`. Confirm `docker compose`
 works; the deprecated standalone `docker-compose` command is insufficient.
+
+### "Refusing to back up: ... is not mounted"
+
+The backup folder is under `/media` or `/mnt` and the drive is not mounted. From a terminal
+(`ssh -t`) the update or backup now asks what to do: mount it, pick a connected ext4 or exFAT
+USB drive, check again, or back up to the system disk once (see [Backups](#backups)). Without
+a terminal, or from an installed 0.6.0 or earlier controller, mount the drive and run again, or
+use `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` for one
+backup on the system disk. A FAT32 (vfat) drive is refused; use ext4 or exFAT.
 
 ### The installer stops on `BOAT_UNITS` or "cannot be written safely"
 

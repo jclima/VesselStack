@@ -4,6 +4,8 @@
 # Needs root and Linux (stat -c); a fake python3 records what would have been executed.
 
 set -euo pipefail
+# Nothing here may wait for an answer at a terminal.
+export VESSELSTACK_NONINTERACTIVE=true
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }

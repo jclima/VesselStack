@@ -48,6 +48,17 @@ for it to report the new version. The page reconnects by itself. See
 
 If the Control Panel is unavailable, use the pinned installer above.
 
+## When the backup drive is not mounted
+
+The pinned installer and (from an installed 0.6.1) `vesselstackctl update` and
+`vesselstackctl backup` ask, before anything is stopped, whether to mount the drive from
+`/etc/fstab`, pick a connected USB drive (ext4 recommended, exFAT allowed, vfat refused), check
+again, or back up to the system disk once. Without a terminal, with `--yes`, or in the Control
+Panel they stop and print a `To fix:` line instead. A direct `sudo vesselstackctl update <dir>` from
+an installed 0.6.0 or earlier controller has no menu: use the pinned installer, mount the drive
+first, or run `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
+See [Backups](../README.md#backups).
+
 ## From a source checkout
 
 Use a reviewed tag from a git clone, with the dry run first:

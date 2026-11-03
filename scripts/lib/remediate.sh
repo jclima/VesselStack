@@ -20,9 +20,20 @@
 # vs_printable VALUE           Prints VALUE with control characters replaced by "?".
 # EOF, a timeout (VESSELSTACK_PROMPT_TIMEOUT seconds, default 300) and "c" all cancel.
 
-# --- Slice 2 (backup drive): vs_backup_destination_fix DEST CONTEXT is added here. ---
+# vs_backup_destination_fix DEST CONTEXT [require-mounted]
+#                              Offered when DEST is under /media or /mnt and that mount point is not
+#                              mounted. CONTEXT is update, backup or bootstrap. Returns 0 when the
+#                              drive is now mounted, or when the owner chose to back up to the system
+#                              disk once (VS_BACKUP_ALLOW_ONCE=1). Returns 1 when non-interactive (after
+#                              printing the refusal and the fix). Cancelling exits 1. Inputs, all optional:
+#                              VS_BACKUP_ROOT, VS_BACKUP_DATA (sizes the backup), VS_BACKUP_ENV_FILE (the
+#                              installed env file; VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false there hides
+#                              the system-disk choice), VS_BACKUP_UPDATE_DIR (shown in the update hint).
+#                              The third argument offers only choices 1 to 3. fstab is never written.
 
 VS_PROMPT_FD=${VS_PROMPT_FD:-}
+VS_PROMPT_OWNED=${VS_PROMPT_OWNED:-0}
+VS_BACKUP_ALLOW_ONCE=${VS_BACKUP_ALLOW_ONCE:-0}
 
 vs_prompt_cancel() {
     echo "Cancelled. Nothing was changed." >&2
@@ -43,6 +54,7 @@ vs_prompt_open() {
         if [ -f "$VESSELSTACK_PROMPT_ANSWERS" ] && [ ! -L "$VESSELSTACK_PROMPT_ANSWERS" ] \
             && { : <"$VESSELSTACK_PROMPT_ANSWERS"; } 2>/dev/null; then
             exec {VS_PROMPT_FD}<"$VESSELSTACK_PROMPT_ANSWERS"
+            VS_PROMPT_OWNED=1
             return 0
         fi
         return 1
@@ -50,16 +62,19 @@ vs_prompt_open() {
     # Without a controlling terminal (cron, systemd, the Control Panel) the open fails.
     if { : </dev/tty; } 2>/dev/null; then
         exec {VS_PROMPT_FD}</dev/tty
+        VS_PROMPT_OWNED=1
         return 0
     fi
     return 1
 }
 
 vs_prompt_close() {
-    if [ -n "$VS_PROMPT_FD" ]; then
+    # A descriptor the caller supplied (VS_PROMPT_FD) stays open; only our own is closed.
+    if [ -n "$VS_PROMPT_FD" ] && [ "$VS_PROMPT_OWNED" -eq 1 ]; then
         exec {VS_PROMPT_FD}<&-
-        VS_PROMPT_FD=
     fi
+    VS_PROMPT_FD=
+    VS_PROMPT_OWNED=0
     return 0
 }
 
@@ -126,4 +141,263 @@ vs_prompt_input() {
         echo "The value cannot be empty." >&2
     done
     printf -v "$__var" '%s' "$__reply"
+}
+
+# ---------------------------------------------------------------- backup drive
+
+# Reads lsblk JSON on stdin; argument 1 lists device paths that hold the system (one per line).
+# Prints "OK<TAB>path<TAB>size<TAB>label<TAB>fstype<TAB>uuid" for a drive that can be offered and
+# "NO<TAB>...<TAB>reason" for a removable drive that is refused. Missing fields mean "not removable".
+VS_LSBLK_PY='
+import json, sys
+
+def flag(v):
+    return v is True or str(v).lower() in ("1", "true")
+
+def clean(v):
+    s = "" if v is None else str(v)
+    return "".join(c if c.isprintable() else "?" for c in s)
+
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+system_paths = {l for l in sys.argv[1].split("\n") if l}
+system_mounts = {"/", "/boot", "/boot/firmware"}
+rows = []
+
+def subtree(node):
+    yield node
+    for child in node.get("children") or []:
+        yield from subtree(child)
+
+def walk(node, removable, system):
+    removable = removable or flag(node.get("rm")) or flag(node.get("hotplug")) or node.get("tran") == "usb"
+    children = node.get("children") or []
+    kind = node.get("type")
+    if (kind == "part" or (kind == "disk" and not children)) and node.get("fstype") and not node.get("mountpoint"):
+        rows.append((node, removable, system))
+    for child in children:
+        walk(child, removable, system)
+
+for top in data.get("blockdevices") or []:
+    system = any(n.get("path") in system_paths or n.get("mountpoint") in system_mounts for n in subtree(top))
+    walk(top, False, system)
+
+for node, removable, system in sorted(rows, key=lambda r: str(r[0].get("path"))):
+    if system or not removable:
+        continue
+    fs = clean(node.get("fstype"))
+    fields = [clean(node.get("path")), clean(node.get("size")), clean(node.get("label")), fs]
+    if fs in ("ext4", "exfat"):
+        print("\t".join(["OK"] + fields + [clean(node.get("uuid"))]))
+    else:
+        print("\t".join(["NO"] + fields + [fs + " is not supported for backups; use ext4 (recommended) or exFAT"]))
+'
+
+# vs_mib KIB: whole MiB with a thousands-free digit string.
+vs_mib() {
+    printf '%s' "$(($1 / 1024))"
+}
+
+# Sets VS_BACKUP_OFFER_SYSTEM=1 when a backup to the system disk is allowed and fits, and prints why not.
+vs_backup_system_disk_check() {
+    local dest=$1 ancestor free_kib used_kib=0 size_kib du_status=0 du_out
+    VS_BACKUP_OFFER_SYSTEM=0
+    if [ -n "${VS_BACKUP_ENV_FILE:-}" ] && [ -r "$VS_BACKUP_ENV_FILE" ] \
+        && grep -Eq '^(export[[:space:]]+)?VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=["'"'"']?false' "$VS_BACKUP_ENV_FILE"; then
+        return 0
+    fi
+    ancestor=$dest
+    while [ ! -e "$ancestor" ] && [ "$ancestor" != / ]; do ancestor=$(dirname -- "$ancestor"); done
+    free_kib=$(df -Pk -- "$ancestor" 2>/dev/null | awk 'NR == 2 {print $4}')
+    case $free_kib in ''|*[!0-9]*) free_kib=0 ;; esac
+    du_out=$(timeout 60 du -skx -- "${VS_BACKUP_ROOT:-/opt/vesselstack}" "${VS_BACKUP_DATA:-/opt/vesselstack-data}" 2>/dev/null) || du_status=$?
+    if [ "$du_status" -eq 124 ]; then
+        echo "  The size of the VesselStack data could not be measured in 60 seconds (size unknown)." >&2
+        VS_BACKUP_OFFER_SYSTEM=1
+        return 0
+    fi
+    while read -r size_kib _; do
+        case $size_kib in ''|*[!0-9]*) continue ;; esac
+        used_kib=$((used_kib + size_kib))
+    done <<<"$du_out"
+    if [ "$free_kib" -lt "$used_kib" ]; then
+        echo "  The system disk has $(vs_mib "$free_kib") MiB free but the backup needs about $(vs_mib "$used_kib") MiB," >&2
+        echo "  so a backup to the system disk is not offered." >&2
+        return 0
+    fi
+    VS_BACKUP_OFFER_SYSTEM=1
+}
+
+# vs_backup_mount_device MOUNT_DIR DEVICE FSTYPE UUID: mounts the chosen drive. 0 mounted, 1 failed.
+vs_backup_mount_device() {
+    local mount_dir=$1 device=$2 fs=$3 uuid=$4 created=0 options fstab_options pass=2
+    if [[ ! $device =~ ^/dev/[A-Za-z0-9._/+-]+$ ]]; then
+        echo "Refusing to mount an unexpected device name." >&2
+        return 1
+    fi
+    if [ -L "$mount_dir" ] || { [ -e "$mount_dir" ] && [ ! -d "$mount_dir" ]; }; then
+        echo "$mount_dir exists but is not a plain folder; move it away first." >&2
+        return 1
+    fi
+    if [ -d "$mount_dir" ] && [ -n "$(ls -A -- "$mount_dir" 2>/dev/null)" ]; then
+        echo "$mount_dir is not empty (files hidden under a mount would be unreachable); move its contents first." >&2
+        return 1
+    fi
+    if [ ! -d "$mount_dir" ]; then
+        install -d -m 0700 -o root -g root -- "$mount_dir" || return 1
+        created=1
+    fi
+    case $fs in
+        ext4)
+            options=nodev,nosuid,noexec
+            fstab_options=nofail,noatime,nodev,nosuid,noexec
+            ;;
+        *)
+            options=nodev,nosuid,noexec,uid=0,gid=0,umask=0077
+            fstab_options=nofail,noatime,nodev,nosuid,noexec,uid=0,gid=0,umask=0077
+            pass=0
+            ;;
+    esac
+    if ! mount -t "$fs" -o "$options" "$device" "$mount_dir" || ! mountpoint -q "$mount_dir"; then
+        echo "Could not mount $device at $mount_dir." >&2
+        if [ "$created" -eq 1 ]; then rmdir -- "$mount_dir" 2>/dev/null || true; fi
+        return 1
+    fi
+    echo "Mounted $device at $mount_dir." >&2
+    if [[ $uuid =~ ^[A-Za-z0-9-]+$ ]]; then
+        echo "It stays mounted until reboot. To mount it at boot, add this line to /etc/fstab:" >&2
+        echo "UUID=$uuid $mount_dir $fs $fstab_options 0 $pass" >&2
+    fi
+    return 0
+}
+
+# vs_backup_pick_drive MOUNT_DIR: lists connected USB drives and mounts the chosen one.
+# 0 mounted, 1 nothing mounted (the caller shows the menu again).
+vs_backup_pick_drive() {
+    local mount_dir=$1 json='' sources='' target src listing kind path size label fs uuid reason shown label_text pick
+    local -a paths=() fss=() uuids=()
+    if ! command -v lsblk >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        echo "Listing drives needs lsblk and python3." >&2
+        return 1
+    fi
+    json=$(lsblk -J -p -o PATH,TYPE,SIZE,LABEL,FSTYPE,UUID,MOUNTPOINT,RM,HOTPLUG,TRAN,PKNAME 2>/dev/null) || json=
+    if [ -z "$json" ]; then
+        echo "Could not list the connected drives." >&2
+        return 1
+    fi
+    for target in / /boot/firmware "${VS_BACKUP_DATA:-}"; do
+        [ -n "$target" ] || continue
+        src=$(findmnt -n -o SOURCE --target "$target" 2>/dev/null | head -n 1) || src=
+        src=${src%%\[*}
+        case $src in /dev/*) sources+="$src"$'\n' ;; esac
+    done
+    listing=$(printf '%s' "$json" | python3 -I -c "$VS_LSBLK_PY" "$sources") || listing=
+    echo "Connected USB drives that are not mounted:" >&2
+    shown=0
+    while IFS=$'\t' read -r kind path size label fs uuid; do
+        [ -n "$kind" ] || continue
+        label_text='(no label)'
+        [ -z "$label" ] || label_text="\"$label\""
+        if [ "$kind" = OK ]; then
+            paths+=("$path"); fss+=("$fs"); uuids+=("$uuid")
+            echo "  [${#paths[@]}] $path  $size  $label_text  $fs" >&2
+        else
+            reason=$uuid
+            echo "      $path  $size  $label_text  $fs -- $reason" >&2
+        fi
+        shown=1
+    done <<<"$listing"
+    if [ "$shown" -eq 0 ]; then
+        echo "  (none found)" >&2
+    fi
+    if [ "${#paths[@]}" -eq 0 ]; then
+        echo "Plug in a drive formatted as ext4 (recommended) or exFAT, then choose [3] to check again." >&2
+        return 1
+    fi
+    echo "  [b] Back" >&2
+    pick=
+    vs_prompt_choice pick "$(seq -s ' ' 1 "${#paths[@]}") b"
+    [ "$pick" != b ] || return 1
+    vs_backup_mount_device "$mount_dir" "${paths[pick - 1]}" "${fss[pick - 1]}" "${uuids[pick - 1]}"
+}
+
+vs_backup_menu() {
+    local dest=$1 context=$2 strict=$3 mount_dir=$4 cancel_what=the\ update choice valid
+    local has_fstab=0
+    [ "$context" != backup ] || cancel_what='the backup'
+    if command -v findmnt >/dev/null 2>&1 && findmnt --fstab -n --mountpoint "$mount_dir" >/dev/null 2>&1; then
+        has_fstab=1
+    fi
+    VS_BACKUP_OFFER_SYSTEM=0
+    [ -n "$strict" ] || vs_backup_system_disk_check "$dest"
+    while :; do
+        {
+            echo
+            echo "The backup folder $(vs_printable "$dest") is on $mount_dir, which is not mounted."
+            echo "Backing up now would put the archive on the system disk (SD card)."
+            echo "Nothing has been changed yet."
+        } >&2
+        valid="2 3"
+        if [ "$has_fstab" -eq 1 ]; then
+            echo "  [1] Mount $mount_dir now (it is listed in /etc/fstab)" >&2
+            valid="1 $valid"
+        fi
+        echo "  [2] Choose a connected drive to mount at $mount_dir" >&2
+        echo "  [3] I have plugged the drive in; check again" >&2
+        if [ "$VS_BACKUP_OFFER_SYSTEM" -eq 1 ]; then
+            echo "  [4] Back up to the system disk this once (not recommended)" >&2
+            valid="$valid 4"
+        fi
+        echo "  [c] Cancel $cancel_what" >&2
+        choice=
+        vs_prompt_choice choice "$valid"
+        case $choice in
+            1)
+                if mount -- "$mount_dir" && mountpoint -q "$mount_dir"; then
+                    echo "Mounted $mount_dir." >&2
+                    return 0
+                fi
+                echo "Could not mount $mount_dir from /etc/fstab." >&2
+                ;;
+            2)
+                if vs_backup_pick_drive "$mount_dir"; then return 0; fi
+                ;;
+            3)
+                if mountpoint -q "$mount_dir"; then
+                    echo "$mount_dir is mounted." >&2
+                    return 0
+                fi
+                echo "$mount_dir is still not mounted." >&2
+                ;;
+            4)
+                echo "WARNING: the backup will be written to the system disk (SD card) this once. It will not survive loss of that disk, and the next backup asks again." >&2
+                VS_BACKUP_ALLOW_ONCE=1
+                return 0
+                ;;
+        esac
+    done
+}
+
+vs_backup_destination_fix() {
+    local dest=$1 context=${2:-update} strict=${3:-} mount_dir rc=0 update_dir=${VS_BACKUP_UPDATE_DIR:-<DIR>}
+    mount_dir=$(printf '%s' "$dest" | cut -d/ -f1-3)
+    VS_BACKUP_ALLOW_ONCE=0
+    if ! vs_prompt_open; then
+        {
+            echo "Refusing to back up: $mount_dir is not mounted, so the archive would land on the system disk (SD card). Nothing was changed."
+            if [ "$context" = backup ] && [ -n "$strict" ]; then
+                echo "To fix: mount the backup drive at $mount_dir and run again."
+            elif [ "$context" = backup ]; then
+                echo "To fix: mount the backup drive at $mount_dir and run again, or pass --allow-unmounted."
+            else
+                echo "To fix: mount the backup drive at $mount_dir and run again, or back up to the system disk this once: sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update $update_dir"
+            fi
+        } >&2
+        return 1
+    fi
+    vs_backup_menu "$dest" "$context" "$strict" "$mount_dir" || rc=$?
+    vs_prompt_close
+    return "$rc"
 }
