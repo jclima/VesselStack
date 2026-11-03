@@ -82,6 +82,8 @@ main{width:min(1180px,calc(100% - 2rem));margin:0 auto;padding:0 0 6rem}
 .banner.info{color:var(--sea);background:var(--sea-soft);border-color:var(--sea)}
 .banner .msg{flex:1;min-width:0;color:var(--ink)}
 .banner .msg strong{color:inherit}
+.banner .fix{margin-top:.5rem;overflow-wrap:anywhere}
+.banner .fix .mono{font-size:.88rem}
 .banner .icon{font-weight:800;font-size:1.1rem;line-height:1.5}
 .banner details{margin-top:.5rem}
 .banner summary,details.disc>summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-weight:600;color:var(--sea)}

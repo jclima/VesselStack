@@ -23,6 +23,8 @@ usage() {
     echo "             require container images to be loaded already (see README, Offline install)"
 }
 
+# The arguments as given, so a fix made at a prompt can restart this installer unchanged.
+ORIGINAL_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --config) CONFIG_FILE=$2; shift 2 ;;
@@ -35,6 +37,17 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$CONFIG_FILE" ] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# Prompt helpers for the fixes offered below (see scripts/lib/remediate.sh).
+# shellcheck source=scripts/lib/remediate.sh
+source "$SCRIPT_DIR/scripts/lib/remediate.sh"
+# After a fix this installer restarts itself with the answers descriptor still open; this process
+# owns it now, so vs_prompt_close closes it before anything is installed or started.
+if [ "${VESSELSTACK_REMEDIATION_ROUND:-0}" != 0 ] && [ -n "$VS_PROMPT_FD" ]; then VS_PROMPT_OWNED=1; fi
+# config_key_assigned KEY: true when CONFIG_FILE itself assigns KEY (so editing it can fix it).
+config_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }
+# Set below when an interactive run may offer to fix the value instead of stopping.
+FIX_BOAT_UNITS=0
+FIX_TOKEN_KEY=
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
@@ -82,6 +95,18 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
 : "${BOAT_UNITS:=us_customary}"
+# Older setup wizards offered "nautical" and installers before 0.5.7 did not check it, so
+# such configs exist. It is read as metric (knots and nautical miles are kept in both
+# systems), and the rewritten vesselstack.env persists "metric". Surrounding whitespace and
+# letter case are tolerated for the two supported values.
+BOAT_UNITS_INPUT=$BOAT_UNITS
+BOAT_UNITS=${BOAT_UNITS#"${BOAT_UNITS%%[![:space:]]*}"}
+BOAT_UNITS=${BOAT_UNITS%"${BOAT_UNITS##*[![:space:]]}"}
+BOAT_UNITS=${BOAT_UNITS,,}
+if [ "$BOAT_UNITS" = nautical ]; then
+    echo "Note: BOAT_UNITS=nautical is no longer a separate option; using metric (knots and nautical miles are kept)." >&2
+    BOAT_UNITS=metric
+fi
 : "${NODE_EXPORTER_ENABLE:=false}"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
@@ -160,7 +185,18 @@ for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_F
         *) echo "$key must be true or false" >&2; exit 1 ;;
     esac
 done
-case "$BOAT_UNITS" in us_customary|metric) ;; *) echo "BOAT_UNITS must be us_customary or metric" >&2; exit 1 ;; esac
+case "$BOAT_UNITS" in
+    us_customary|metric) ;;
+    *)
+        if config_key_assigned BOAT_UNITS && vs_prompt_open; then
+            FIX_BOAT_UNITS=1
+        else
+            echo "Refusing to continue: BOAT_UNITS=$(vs_printable "$BOAT_UNITS_INPUT") in $CONFIG_FILE is not supported." >&2
+            echo "To fix: set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $CONFIG_FILE" >&2
+            exit 1
+        fi
+        ;;
+esac
 # MQTT account names are written into the Mosquitto password and ACL files.
 for key in MQTT_USERNAME DISPLAYS_BRIDGE_MQTT_USERNAME; do
     if ! [[ "${!key}" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
@@ -171,6 +207,10 @@ done
 # The optional SignalK and Home Assistant tokens go into a systemd EnvironmentFile line.
 for key in DISPLAYS_SIGNALK_TOKEN DISPLAYS_HA_TOKEN; do
     if [[ "${!key}" =~ [[:cntrl:]] ]]; then
+        if config_key_assigned "$key" && vs_prompt_open; then
+            [ -n "$FIX_TOKEN_KEY" ] || FIX_TOKEN_KEY=$key
+            continue
+        fi
         echo "$key must not contain line breaks or control characters" >&2
         exit 1
     fi
@@ -496,6 +536,185 @@ env_line() {
 }
 # env-line-end
 
+# --- Interactive fixes -------------------------------------------------------
+# These run in the validation block, before the root check, the plugin staging and any
+# trap, so a Cancel (or a fix that cannot be applied safely) changes nothing else.
+
+# config_key_is_secret KEY: generated or preserved secrets. Replacing one here would
+# desynchronise a running service (see preserve_secret), so it is never offered.
+config_key_is_secret() {
+    case $1 in
+        INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
+        BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN) return 0 ;;
+    esac
+    return 1
+}
+
+# config_env_snapshot FILE KEY: in a clean subshell, sources FILE and prints the declared
+# state of every known setting except KEY (so a fix is checked against all the others).
+config_env_snapshot() {
+    local file=$1 skip=$2 key
+    (
+        set +eu
+        while IFS= read -r key; do unset "$key"; done < <(vesselstack_env_keys; extra_env_keys)
+        # shellcheck disable=SC1090
+        source "$file" >/dev/null 2>&1 || exit 3
+        while IFS= read -r key; do
+            [ "$key" = "$skip" ] && continue
+            declare -p "$key" 2>/dev/null || echo "unset $key"
+        done < <(vesselstack_env_keys; extra_env_keys)
+    )
+}
+
+# root_controlled_chain PATH: every existing component from PATH up to / is root-owned and not
+# group- or world-writable, so no other user can swap the file this installer is about to edit.
+root_controlled_chain() {
+    local resolved uid mode
+    resolved=$(realpath -m -- "$1") || return 1
+    while :; do
+        if [ -e "$resolved" ]; then
+            read -r uid mode < <(stat -c '%u %a' -- "$resolved") || return 1
+            if [ "$uid" != 0 ] || [ $((0$mode & 0022)) -ne 0 ]; then return 1; fi
+        fi
+        [ "$resolved" != / ] || return 0
+        resolved=$(dirname -- "$resolved")
+    done
+}
+
+# config_fix_key FILE KEY VALUE: sets KEY=VALUE in FILE (an env file this installer reads),
+# keeping a root-only copy, and restarts this installer with the original arguments.
+# Refuses (returns 1, FILE untouched) unless the result provably reads back the same for
+# every other setting and gives KEY exactly VALUE.
+config_fix_key() {
+    local file=$1 key=$2 value=$3 line stamp copy tmp n=1 got round restart_env
+    round=${VESSELSTACK_REMEDIATION_ROUND:-0}
+    [[ $round =~ ^[0-9]+$ ]] || round=0
+    if [ "$round" -ge 3 ]; then
+        echo "Too many fixes in one run. Nothing more was changed; run the installer again." >&2
+        return 1
+    fi
+    if [ -L "$file" ] || [ ! -f "$file" ]; then
+        echo "Not changing $file: it is not a regular file (or is a symbolic link)." >&2
+        return 1
+    fi
+    if [ "$(id -u)" -eq 0 ] && [ "$(stat -c '%u' "$file")" != 0 ]; then
+        echo "Not changing $file: it is not owned by root." >&2
+        return 1
+    fi
+    if [ "$(id -u)" -eq 0 ] && ! root_controlled_chain "$(dirname -- "$file")"; then
+        echo "Not changing $file: its folder (or a parent folder) is not root-owned, or can be changed by other users." >&2
+        return 1
+    fi
+    if env_value_problem "$value" >/dev/null || [[ $value =~ [[:cntrl:]] ]]; then
+        echo "Not changing $file: that value cannot be written safely." >&2
+        return 1
+    fi
+    line=$(env_line "$key" "$value")
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    copy="$file.before-fix-$stamp"
+    while [ -e "$copy" ]; do n=$((n + 1)); copy="$file.before-fix-$stamp.$n"; done
+    tmp=$(mktemp "$(dirname "$file")/.$(basename "$file").fix.XXXXXX") || {
+        echo "Not changing $file: its folder is not writable." >&2
+        return 1
+    }
+    if ! FIX_KEY=$key FIX_LINE=$line awk '
+        BEGIN { key = ENVIRON["FIX_KEY"]; line = ENVIRON["FIX_LINE"]; done = 0 }
+        index($0, key "=") == 1 || index($0, "export " key "=") == 1 {
+            if (!done) { print line; done = 1 }
+            next
+        }
+        { print }
+        END { if (!done) print line }' "$file" > "$tmp" \
+        || ! bash -n "$tmp" 2>/dev/null \
+        || [ "$(config_env_snapshot "$file" "$key"; echo x)" != "$(config_env_snapshot "$tmp" "$key"; echo x)" ]; then
+        rm -f -- "$tmp"
+        echo "Not changing $file: the edit could not be verified. Edit $key in it by hand." >&2
+        return 1
+    fi
+    got=$(
+        set +eu
+        # shellcheck disable=SC1090
+        source "$tmp" >/dev/null 2>&1 || exit 3
+        printf '%s' "${!key}"
+        echo x
+    ) || got=
+    if [ "$got" != "${value}x" ]; then
+        rm -f -- "$tmp"
+        echo "Not changing $file: the edit could not be verified. Edit $key in it by hand." >&2
+        return 1
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+        if ! install -m 0600 -o 0 -g 0 "$file" "$copy" || ! chown --reference="$file" "$tmp"; then
+            rm -f -- "$tmp" "$copy"
+            echo "Not changing $file: could not keep a copy." >&2
+            return 1
+        fi
+    else
+        install -m 0600 "$file" "$copy" \
+            || { rm -f -- "$tmp"; echo "Not changing $file: could not keep a copy." >&2; return 1; }
+    fi
+    chmod --reference="$file" "$tmp"
+    mv -f -- "$tmp" "$file"
+    echo "Changed $key in $file (previous copy: $copy). The copy is safe to delete once the install works." >&2
+    # The answers descriptor (if any) is handed on so scripted answers continue where they were.
+    restart_env=(VESSELSTACK_REMEDIATION_ROUND=$((round + 1)))
+    if [ -n "$VS_PROMPT_FD" ]; then restart_env+=(VS_PROMPT_FD="$VS_PROMPT_FD"); fi
+    exec env "${restart_env[@]}" "${BASH:-bash}" "$SCRIPT_DIR/install.sh" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
+}
+
+# BOAT_UNITS other than us_customary, metric or the nautical mapping (flagged above).
+fix_boat_units() {
+    local choice new
+    {
+        echo "BOAT_UNITS in $CONFIG_FILE is \"$(vs_printable "$BOAT_UNITS_INPUT")\", which is not supported."
+        echo "  [1] US customary (feet, °F, psi, US gallons)"
+        echo "  [2] Metric (metres, °C, kPa, litres)"
+        echo "  [c] Cancel (nothing is changed)"
+    } >&2
+    vs_prompt_choice choice "1 2"
+    case $choice in
+        1) new=us_customary ;;
+        2) new=metric ;;
+        *) echo "Unexpected answer; nothing was changed." >&2; exit 1 ;;
+    esac
+    config_fix_key "$CONFIG_FILE" BOAT_UNITS "$new" || {
+        echo "Edit it by hand instead: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=$new/' $CONFIG_FILE" >&2
+        exit 1
+    }
+}
+
+# fix_unsafe_value KEY REASON: asks for a replacement for a setting that cannot be written
+# safely. Values typed for secrets are hidden and never echoed or logged.
+fix_unsafe_value() {
+    local key=$1 reason=$2 choice new mode=
+    {
+        echo "$key in $CONFIG_FILE cannot be written safely ($reason)."
+        echo "  [1] Enter a new value for $key"
+        echo "  [c] Cancel (nothing is changed)"
+    } >&2
+    vs_prompt_choice choice "1"
+    if vs_is_secret_key "$key"; then mode=secret; fi
+    while :; do
+        vs_prompt_input new "$mode"
+        if reason=$(env_value_problem "$new"); then
+            echo "That value still cannot be written safely ($reason). Try another." >&2
+        elif [[ $new =~ [[:cntrl:]] ]]; then
+            echo "That value still cannot be written safely (control characters). Try another." >&2
+        else
+            break
+        fi
+    done
+    config_fix_key "$CONFIG_FILE" "$key" "$new" || {
+        echo "Edit $key in $CONFIG_FILE by hand, then run again. Nothing was changed." >&2
+        exit 1
+    }
+}
+
+if [ "$FIX_BOAT_UNITS" -eq 1 ]; then fix_boat_units; fi
+if [ -n "$FIX_TOKEN_KEY" ]; then
+    fix_unsafe_value "$FIX_TOKEN_KEY" "line breaks or control characters"
+fi
+
 # Env files are written to a 0600 temp file beside the target and renamed into
 # place only when every line was written, so a failure never leaves a truncated file.
 ENV_TEMPS=()
@@ -512,20 +731,36 @@ cleanup_env_temps() {
 # and control-panel.env, run before anything is changed and before the dry run
 # exits. Reports KEY names and reasons only, never values.
 env_values_preflight() {
-    local key bad=0 reason
+    local key bad=0 hard=0 fixable='' fix_reason='' reason secrets=0 report=''
     while IFS= read -r key; do
         if reason=$(env_value_problem "${!key:-}"); then
-            echo "  $key: $reason" >&2
+            report+="  $key: $reason"$'\n'
             bad=1
+            if config_key_is_secret "$key"; then
+                secrets=1; hard=1
+            elif config_key_assigned "$key"; then
+                if [ -z "$fixable" ]; then fixable=$key; fix_reason=$reason; fi
+            else
+                hard=1
+            fi
         fi
     done < <(vesselstack_env_keys; extra_env_keys)
     if reason=$(env_value_problem "$(<"$SCRIPT_DIR/VERSION")"); then
-        echo "  VERSION: $reason" >&2
-        bad=1
+        report+="  VERSION: $reason"$'\n'
+        bad=1; hard=1
     fi
     if [ "$bad" -ne 0 ]; then
+        # Only settings this file itself assigns, and that are not generated or preserved
+        # secrets, can be fixed here; one per round (the installer restarts after each fix).
+        if [ "$hard" -eq 0 ] && [ -n "$fixable" ] && vs_prompt_open; then
+            fix_unsafe_value "$fixable" "$fix_reason"
+        fi
+        printf '%s' "$report" >&2
         echo "Refusing to continue: the settings above cannot be written safely to the environment files." >&2
-        echo "Edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"Upgrading to 0.6.0\"." >&2
+        if [ "$secrets" -eq 1 ]; then
+            echo "A password or token that a running service already uses must be changed in that service first (replacing it here alone would lock the service out); then edit it in $CONFIG_FILE." >&2
+        fi
+        echo "To fix: edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"Upgrading to 0.6.0\"." >&2
         exit 1
     fi
 }
@@ -595,6 +830,7 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 # check covers the values that will actually be written; read-only, so it is
 # also safe ahead of the dry run.
 env_values_preflight
+vs_prompt_close
 
 PLUGIN_STAGE=
 if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ] && [ "$OFFLINE" = false ] && [ "$DRY_RUN" -eq 0 ]; then
@@ -1063,6 +1299,7 @@ install -m 0755 "$SCRIPT_DIR/scripts/vesselstack-firewall" "$SBIN_DIR/vesselstac
 install -d -m 0755 -o root -g root "$LIBEXEC_PARENT" "$LIBEXEC_DIR"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-update" "$SBIN_DIR/vesselstack-update"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
+install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"

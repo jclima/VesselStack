@@ -10,6 +10,7 @@ __pycache__/
 *.env
 !*.example.env
 *.secret
+*.env.before-fix-*
 *.sqlite
 *.sqlite3
 *.sqlite-wal

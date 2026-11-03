@@ -15,7 +15,7 @@ Re-run the pinned release installer over `ssh -t`. It finds the installed system
 installs and starts the release:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
 ```
 
 The command itself needs the unpacked release directory, so plain `vesselstackctl update`
@@ -23,8 +23,15 @@ with no argument fails. To run it by hand once a release is unpacked (the instal
 `/opt/vesselstack-release/<version>`):
 
 ```bash
-sudo vesselstackctl update /opt/vesselstack-release/0.6.0
+sudo vesselstackctl update /opt/vesselstack-release/0.6.1
 ```
+
+From a terminal (`ssh -t`) the installer now offers to fix an unsupported `BOAT_UNITS` value or
+a setting that cannot be written safely at a prompt instead of stopping (choose, or `c` to
+cancel with nothing changed). A root-only copy of the previous settings file is kept as
+`vesselstack.env.before-fix-<time>` next to it; delete these copies once the update works. Runs
+without a terminal (the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) still stop
+before changing anything and print the exact fix. Details: [Upgrading to 0.6.0](../README.md#upgrading-to-060).
 
 ## From the Control Panel
 
@@ -40,6 +47,21 @@ for it to report the new version. The page reconnects by itself. See
 [Control Panel](CONTROL_PANEL.md#updates).
 
 If the Control Panel is unavailable, use the pinned installer above.
+
+## When the backup drive is not mounted
+
+The pinned installer and (from an installed 0.6.1) `vesselstackctl update` and
+`vesselstackctl backup` ask, before anything is stopped, whether to mount the drive from
+`/etc/fstab`, pick a connected USB drive (ext4 recommended, exFAT allowed, vfat refused), check
+again, or back up to the system disk once. Cancelling in the pinned installer prints
+`Cancelled. The update was not started; your installed VesselStack was not changed.` (the packages
+and the release folder may already be in place). A drive mounted from the menu must have a
+root-owned top folder that others cannot write to, with no symbolic link or foreign-owned
+folder on the way to the backup folder; otherwise the backup is refused. Without a terminal, with `--yes`, or in the Control
+Panel they stop and print a `To fix:` line instead. A direct `sudo vesselstackctl update <dir>` from
+an installed 0.6.0 or earlier controller has no menu: use the pinned installer, mount the drive
+first, or run `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
+See [Backups](../README.md#backups).
 
 ## From a source checkout
 
@@ -100,7 +122,7 @@ sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.0.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.1.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -188,7 +210,7 @@ and `ssh-keygen` (part of OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.6.0
+scripts/verify-release-tag.sh v0.6.1
 ```
 
 The script takes `TAG [ALLOWED_SIGNERS_FILE [EXPECTED_COMMIT]]`. It checks that the tag is

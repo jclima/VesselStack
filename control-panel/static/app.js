@@ -470,8 +470,12 @@ function renderBanner(operation, context) {
         html = `<div class="banner ok" role="status"><span class="icon" aria-hidden="true">&#10003;</span><div class="msg"><strong>${escapeHtml(text.done)}${escapeHtml(when)}</strong>${tail}${log("Details")}</div><button type="button" class="x" id="banner-x" aria-label="Dismiss message">&#10005;</button></div>`;
       } else {
         const reason = String(summary.reason || "see the details below").replace(/[.\s]+$/, "");
-        const next = /mount/i.test(reason) && operation.label === "backup" ? "Plug in or mount the backup drive and try again." : text.next;
-        html = `<div class="banner fail" role="alert"><span class="icon" aria-hidden="true">!</span><div class="msg"><strong>${escapeHtml(text.failed)}</strong> — ${escapeHtml(reason)}. ${escapeHtml(next)}${log("Show details")}</div><button type="button" class="x" id="banner-x" aria-label="Dismiss message">&#10005;</button></div>`;
+        const fix = String(summary.fix || "").trim();
+        const next = fix ? "" : /mount/i.test(reason) && operation.label === "backup" ? "Plug in or mount the backup drive and try again." : text.next;
+        // The exact remedy the script printed; a trailing "sudo ..." command is set in monospace. Everything is escaped.
+        const split = fix.match(/^(.*?)(\bsudo\s.*)$/s);
+        const fixHtml = fix ? `<div class="fix"><strong>To fix:</strong> ${split ? `${escapeHtml(split[1])}<span class="mono">${escapeHtml(split[2])}</span>` : escapeHtml(fix)}</div>` : "";
+        html = `<div class="banner fail" role="alert"><span class="icon" aria-hidden="true">!</span><div class="msg"><strong>${escapeHtml(text.failed)}</strong> — ${escapeHtml(reason)}.${next ? ` ${escapeHtml(next)}` : ""}${fixHtml}${log("Show details")}</div><button type="button" class="x" id="banner-x" aria-label="Dismiss message">&#10005;</button></div>`;
       }
     }
   }

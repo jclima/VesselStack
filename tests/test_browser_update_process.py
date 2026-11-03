@@ -51,6 +51,12 @@ class ProcessRunnerTests(unittest.TestCase):
         self.assertLessEqual(len(result.stdout.encode()), self.updates.MAX_OUTPUT)
         self.assertIn(marker, operation["output"][-1])
 
+    def test_update_children_never_wait_for_a_terminal(self) -> None:
+        # The panel cannot answer prompts, so every child it launches runs non-interactively.
+        source = (ROOT / "control-panel" / "browser_updates.py").read_text()
+        self.assertRegex(source, r'child_env = dict\(os\.environ,[^\n]*VESSELSTACK_NONINTERACTIVE="true"')
+        self.assertIn("install_env = dict(child_env)", source)
+
     def test_nonzero_child_preserves_actionable_tail_and_never_completes(self) -> None:
         code = "import sys; print('backup mount is required before preflight'); print('actionable failure'); sys.exit(7)"
         operation = self.operation()

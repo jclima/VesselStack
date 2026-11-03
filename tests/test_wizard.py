@@ -28,11 +28,15 @@ class WizardTests(unittest.TestCase):
         self.assertIn(': "${BOAT_UNITS:=us_customary}"', installer)
         for good in ("us_customary", "metric"):
             self.assertEqual(wizard.validate({"BOAT_UNITS": good})["BOAT_UNITS"], good)
-        for bad in ("nautical", "imperial", "", "Metric"):
+        for bad in ("imperial", "", "metrics"):
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "BOAT_UNITS"):
                 wizard.validate({"BOAT_UNITS": bad})
+        # Legacy "nautical" (offered by older wizards) is read as metric, with a note; case and spaces are tolerated.
+        for legacy, expected in (("nautical", "metric"), ("Nautical", "metric"), (" metric", "metric"), ("Metric", "metric"), ("US_Customary", "us_customary")):
+            with self.subTest(legacy=legacy):
+                self.assertEqual(wizard.validate({"BOAT_UNITS": legacy})["BOAT_UNITS"], expected)
         self.assertEqual([name for name, _ in wizard.FIELD_INDEX["BOAT_UNITS"]["choices"]], ["us_customary", "metric"])
-        with self.assertRaises(ValueError): wizard.apply_settings(wizard.DEFAULTS.copy(), ["BOAT_UNITS=nautical"])
+        with self.assertRaises(ValueError): wizard.apply_settings(wizard.DEFAULTS.copy(), ["BOAT_UNITS=imperial"])
         app = (ROOT / "wizard" / "app.js").read_text()
         self.assertNotIn("nautical'", app.lower().replace("nautical miles", ""))
         self.assertNotIn("value=\"nautical", app)
@@ -195,11 +199,27 @@ class WizardHttpTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertFalse(self.output.exists())
 
-    def test_web_save_rejects_nautical_units_without_writing(self):
-        status, body = self.request("POST", "/api/save", {"values": {"BOAT_UNITS": "nautical"}}, self.good())
+    def test_web_save_rejects_unknown_units_without_writing(self):
+        status, body = self.request("POST", "/api/save", {"values": {"BOAT_UNITS": "imperial"}}, self.good())
         self.assertEqual(status, 400)
         self.assertIn(b"BOAT_UNITS", body)
         self.assertFalse(self.output.exists())
+
+    def test_legacy_nautical_units_in_an_existing_config_load_as_metric_with_a_note(self):
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "vesselstack.env"
+            base.write_text('BOAT_NAME="Old Boat"\nBOAT_UNITS=nautical\n')
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                values = wizard.validate({**wizard.DEFAULTS, **wizard.load_env(base)})
+                self.assertEqual(wizard.validate(wizard.load_env(base))["BOAT_UNITS"], "metric")
+            self.assertEqual((values["BOAT_NAME"], values["BOAT_UNITS"]), ("Old Boat", "metric"))
+            self.assertIn("BOAT_UNITS=nautical is no longer a separate option; using metric", err.getvalue())
+            result = subprocess.run([sys.executable, str(ROOT / "vesselstack-wizard.py"), "--validate", str(base)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("valid", result.stdout)
+            self.assertIn("using metric", result.stderr)
 
     def test_wizard_page_asks_the_lan_question_with_the_all_warning(self):
         source = (ROOT / "wizard" / "app.js").read_text()

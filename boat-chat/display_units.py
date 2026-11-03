@@ -34,7 +34,7 @@ _CONVERSION_FACTORS = {
 
 
 def normalize_preference(value: str | None) -> str:
-    return "metric" if str(value or "").strip().lower() in {"metric", "si", "metre", "meters"} else "us_customary"
+    return "metric" if str(value or "").strip().lower() in {"metric", "si", "metre", "meters", "nautical"} else "us_customary"
 
 
 def preference(setting_getter: Callable[[str, str], str] | None = None) -> str:

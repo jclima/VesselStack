@@ -6,6 +6,9 @@
 
 set -euo pipefail
 
+# Unattended: no run in this file may wait on a prompt.
+export VESSELSTACK_NONINTERACTIVE=true
+
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 # /tmp and (on GitHub runners) /opt are world-writable, so root-controlled

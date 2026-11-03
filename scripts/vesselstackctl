@@ -1478,6 +1478,82 @@ existing_ancestor() {
     printf '%s' "$path"
 }
 
+# The prompt helpers live in the installed, root-owned library. A copy that another user could
+# have changed is never sourced (it would run as root).
+load_remediation_lib() {
+    local lib=$LIBEXEC_DIR/remediate.sh uid mode top dir
+    [ -f "$lib" ] && [ ! -L "$lib" ] || return 1
+    read -r uid mode < <(stat -c '%u %a' -- "$lib") || return 1
+    [ "$uid" = 0 ] && [ $((0$mode & 0022)) -eq 0 ] || return 1
+    # Every folder above it, up to / (or the test root), must be root-controlled too.
+    top=/
+    [ -z "$SYSTEM_ROOT" ] || top=$(realpath -m -- "$SYSTEM_ROOT")
+    dir=$(realpath -m -- "$LIBEXEC_DIR") || return 1
+    while :; do
+        read -r uid mode < <(stat -c '%u %a' -- "$dir") || return 1
+        [ "$uid" = 0 ] && [ $((0$mode & 0022)) -eq 0 ] || return 1
+        { [ "$dir" = "$top" ] || [ "$dir" = / ]; } && break
+        dir=$(dirname -- "$dir")
+    done
+    # shellcheck source=scripts/lib/remediate.sh
+    source "$lib"
+}
+
+# Offers the owner a way out when the backup drive is not mounted. Returns 0 when the drive is
+# mounted now or the owner chose to back up to the system disk once (sets VS_BACKUP_ALLOW_ONCE=1),
+# 1 when the run cannot ask. Cancelling exits. Nothing has been stopped yet.
+fix_unmounted_backup() {
+    local destination=$1 mount_dir=$2 strict=${3:-} context=${VS_BACKUP_CONTEXT:-backup} update_dir=${VS_BACKUP_UPDATE_DIR:-<DIR>}
+    if load_remediation_lib; then
+        VS_BACKUP_ROOT=$VESSELSTACK_ROOT VS_BACKUP_DATA=$VESSELSTACK_DATA VS_BACKUP_ENV_FILE=$ENV_FILE \
+            vs_backup_destination_fix "$destination" "$context" "$strict"
+        return
+    fi
+    echo "Refusing to back up: $mount_dir is not mounted, so the archive would land on the system disk (SD card). Nothing was changed." >&2
+    if [ "$context" = backup ] && [ -n "$strict" ]; then
+        echo "To fix: mount the backup drive at $mount_dir and run again." >&2
+    elif [ "$context" = backup ]; then
+        echo "To fix: mount the backup drive at $mount_dir and run again, or pass --allow-unmounted." >&2
+    else
+        echo "To fix: mount the backup drive at $mount_dir and run again, or back up to the system disk this once: sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update $update_dir" >&2
+    fi
+    return 1
+}
+
+# verify_mounted_destination DESTINATION MOUNT_DIR: a drive mounted just now may carry anything.
+# The mount root must be root-owned and not group- or world-writable, and no folder under it on the
+# way to DESTINATION may be a symbolic link or belong to another user. Refuses before anything is written.
+verify_mounted_destination() {
+    local destination=$1 mount_dir=$2 resolved cur rel part uid mode shown
+    local -a parts=()
+    [ -d "$mount_dir" ] || return 0
+    shown=${destination//[![:print:]]/?}
+    resolved=$(realpath -m -- "$destination") || resolved=
+    if [ "$resolved" != "$destination" ]; then
+        echo "Refusing to back up: a folder of $shown on the newly mounted drive is a symbolic link. Nothing was written." >&2
+        return 1
+    fi
+    read -r uid mode < <(stat -c '%u %a' -- "$mount_dir") || return 1
+    if [ "$uid" != 0 ] || [ $((0$mode & 0022)) -ne 0 ]; then
+        echo "Refusing to back up: the top folder of the newly mounted drive is not owned by root or can be changed by other users. Nothing was written." >&2
+        echo "To fix: sudo chown root:root ${mount_dir//[![:print:]]/?} && sudo chmod 755 ${mount_dir//[![:print:]]/?}" >&2
+        return 1
+    fi
+    cur=$mount_dir
+    rel=${destination#"$mount_dir"}
+    IFS=/ read -r -a parts <<<"${rel#/}"
+    for part in ${parts[@]+"${parts[@]}"}; do
+        [ -n "$part" ] || continue
+        cur="$cur/$part"
+        [ -e "$cur" ] || [ -L "$cur" ] || break
+        read -r uid mode < <(stat -c '%u %a' -- "$cur") || return 1
+        if [ -L "$cur" ] || [ "$uid" != 0 ] || [ $((0$mode & 0022)) -ne 0 ]; then
+            echo "Refusing to back up: ${cur//[![:print:]]/?} on the newly mounted drive is a symbolic link, belongs to another user or can be changed by other users. Nothing was written." >&2
+            return 1
+        fi
+    done
+}
+
 check_backup_destination() {
     local destination=$1 allow_unmounted=$2 mount_dir ancestor
     case "$destination" in
@@ -1487,8 +1563,11 @@ check_backup_destination() {
                 if [ "$allow_unmounted" -eq 1 ] || [ "${VESSELSTACK_BACKUP_ALLOW_UNMOUNTED:-false}" = true ]; then
                     echo "WARNING: $mount_dir is not a mounted filesystem; the backup will be written to the system disk" >&2
                 else
-                    echo "Refusing to back up: $mount_dir is not mounted, so the archive would silently land on the system disk (SD card). Mount the backup device or pass --allow-unmounted." >&2
-                    return 1
+                    VS_BACKUP_ALLOW_ONCE=0
+                    fix_unmounted_backup "$destination" "$mount_dir" || return 1
+                    if [ "${VS_BACKUP_ALLOW_ONCE:-0}" != 1 ] && mountpoint -q "$mount_dir"; then
+                        verify_mounted_destination "$destination" "$mount_dir" || return 1
+                    fi
                 fi
             fi
             ;;
@@ -1523,7 +1602,10 @@ PY
         case "$destination" in
             /media/*|/mnt/*)
                 mount_dir=$(printf '%s' "$destination" | cut -d/ -f1-3)
-                mountpoint -q "$mount_dir" || { echo "Refusing backup: destination is not mounted: $mount_dir" >&2; exit 1; }
+                if ! mountpoint -q "$mount_dir"; then
+                    fix_unmounted_backup "$destination" "$mount_dir" require-mounted || exit 1
+                    verify_mounted_destination "$destination" "$mount_dir" || exit 1
+                fi
                 ;;
             *) echo "Refusing backup: --require-mounted requires a /media or /mnt destination" >&2; exit 1 ;;
         esac
@@ -1814,7 +1896,8 @@ update_stack() {
     [ "$offline" != true ] || install_args+=(--offline)
     [ -x "$source/install.sh" ] || { echo "Not a VesselStack release directory: $source" >&2; exit 1; }
     "$source/install.sh" "${install_args[@]}" --dry-run
-    backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}"
+    # The backup check runs before anything is stopped; it may ask where to back up.
+    VS_BACKUP_CONTEXT=update VS_BACKUP_UPDATE_DIR=$source backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}"
     "$source/install.sh" "${install_args[@]}" --start
 }
 
@@ -1857,7 +1940,7 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall" \
-        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py"
+        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then

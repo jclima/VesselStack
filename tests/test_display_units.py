@@ -18,6 +18,14 @@ class DisplayUnitsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.units = load_units()
 
+    def test_legacy_nautical_preference_is_metric(self):
+        u = self.units
+        self.assertEqual(u.normalize_preference("nautical"), "metric")
+        self.assertEqual(u.normalize_preference(" Nautical "), "metric")
+        self.assertEqual(u.preference(lambda key, default: "nautical"), "metric")
+        self.assertEqual(u.normalize_preference("us_customary"), "us_customary")
+        self.assertEqual(u.unit_for_measurement("depth", "nautical", "ft"), "m")
+
     def test_known_conversions(self):
         u = self.units
         self.assertAlmostEqual(u.convert(32, "F", "C"), 0.0, places=6)

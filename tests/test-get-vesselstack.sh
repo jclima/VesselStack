@@ -163,6 +163,7 @@ EOF2
 cat > "$FAKE_BIN/vesselstackctl" <<'EOF2'
 #!/bin/bash
 echo "ctl $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-} OFFLINE=${VESSELSTACK_OFFLINE:-}" >> "$LOG"
+echo "ctlenv $1 NONINTERACTIVE=${VESSELSTACK_NONINTERACTIVE:-} ALLOW=${VESSELSTACK_BACKUP_ALLOW_UNMOUNTED:-}" >> "$LOG"
 # Behave like the released v0.2.0/v0.3.0 controllers: "update" reads ONLY $1, as the
 # release directory, and fails on anything else (for example a leading --offline).
 if [ "$1" = update ]; then
@@ -182,6 +183,7 @@ printf 'deadbeef\n' > "$SRC/COMMIT"
 cat > "$SRC/install.sh" <<'EOF2'
 #!/bin/bash
 echo "install $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-}" >> "$LOG"
+echo "installenv $* NONINTERACTIVE=${VESSELSTACK_NONINTERACTIVE:-}" >> "$LOG"
 case " $* " in
     *" --dry-run "*) [ -z "${FAKE_FAIL_DRY:-}" ] || exit 1; exit 0 ;;
 esac
@@ -250,6 +252,9 @@ with open(out, "w") as handle:
 EOF2
 sed -i "s|@TEST_ROOT@|$TEST_ROOT|g; s|@REPO_ROOT@|$REPO_ROOT|g" "$SRC/vesselstack-wizard.py"
 chmod 0755 "$SRC/install.sh" "$SRC/scripts/prepare-offline-bundle.sh"
+# The release ships the prompt library the bootstrap uses for the unmounted-backup question.
+install -d "$SRC/scripts/lib"
+install -m 0644 "$REPO_ROOT/scripts/lib/remediate.sh" "$SRC/scripts/lib/remediate.sh"
 GOOD="$TEST_ROOT/good.tar.gz"
 tar -C "$TEST_ROOT/src" -czf "$GOOD" "vesselstack-$VER"
 GOOD_SHA=$(sha256sum "$GOOD" | cut -d' ' -f1)
@@ -465,6 +470,9 @@ if ! { [ -n "$dry" ] && [ -n "$real" ] && [ "$dry" -lt "$real" ]; }; then fail_t
 expect_log "^install --config $RELEASE_BASE/vesselstack.env --dry-run"
 expect_log "^install --config $RELEASE_BASE/vesselstack.env --start"
 expect_log "^ctl doctor"
+# --yes: the fresh-install installer calls must not ask either.
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --dry-run NONINTERACTIVE=true$"
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --start NONINTERACTIVE=true$"
 expect_log "^ctl urls"
 refuse_log "^wizard "
 refuse_log "^useradd"
@@ -1532,6 +1540,80 @@ expect_rc 0 "offline upgrade"
 expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse OFFLINE=true$"
 refuse_log "^ctl update --offline"
 expect_out "VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse vesselstackctl update"
+
+# --defaults: same for the fresh install (no prompt may open inside install.sh).
+reset_state
+run --defaults --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "fresh install with --defaults"
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --dry-run NONINTERACTIVE=true$"
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --start NONINTERACTIVE=true$"
+
+# ---- 9b. unmounted backup drive, asked before the installed ctl runs ----------------------
+BACKUP_MNT=/mnt/vs-get-backup-test
+trap 'rm -rf -- "$TEST_ROOT" "$BACKUP_MNT"; userdel vesselstack-wizard >/dev/null 2>&1 || true' EXIT
+backup_upgrade() {  # [extra env line for the installed vesselstack.env]
+    reset_state
+    rm -rf -- "$BACKUP_MNT"
+    install -d "$APP_ROOT/config" "$TEST_ROOT/opt/vesselstack-data"
+    echo 0.0.1 > "$APP_ROOT/config/installed-version"
+    printf 'VESSELSTACK_ROOT=%s\nVESSELSTACK_DATA=%s\nVESSELSTACK_BACKUP=%s/backups\n%s\n' \
+        "$APP_ROOT" "$TEST_ROOT/opt/vesselstack-data" "$BACKUP_MNT" "${1:-}" > "$APP_ROOT/config/vesselstack.env"
+}
+backup_upgrade
+printf 'y\ny\n4\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
+EXTRA_ENV=
+expect_rc 0 "backup drive: system disk once"
+expect_out "The backup folder $BACKUP_MNT/backups is on $BACKUP_MNT, which is not mounted"
+expect_out "\\[4\\] Back up to the system disk this once"
+expect_out "WARNING: the backup will be written to the system disk"
+expect_log "^ctl update $RELEASE_BASE/$VER "
+expect_log "^ctlenv update NONINTERACTIVE=true ALLOW=true$"
+test ! -e "$BACKUP_MNT"
+
+backup_upgrade
+printf 'y\ny\nc\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
+EXTRA_ENV=
+expect_rc 1 "backup drive: cancel"
+expect_out "Cancelled. The update was not started; your installed VesselStack was not changed."
+refuse_log "^ctl update"
+
+backup_upgrade
+printf 'y\ny\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
+EXTRA_ENV=
+expect_rc 1 "backup drive: input ends"
+expect_out "Cancelled. The update was not started; your installed VesselStack was not changed."
+refuse_log "^ctl update"
+
+# The env file pins false: the system-disk choice is not offered.
+backup_upgrade 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false'
+printf 'y\ny\n4\nc\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
+EXTRA_ENV=
+expect_rc 1 "backup drive: allow pinned to false"
+refuse_out "Back up to the system disk this once"
+refuse_log "^ctl update"
+
+# An already allowed or mounted destination asks nothing; --yes and --defaults never pick a fix.
+backup_upgrade 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true'
+printf 'y\ny\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
+EXTRA_ENV=
+expect_rc 0 "backup drive: unmounted allowed by configuration"
+refuse_out "which is not mounted"
+backup_upgrade
+run --yes
+expect_rc 0 "backup drive: --yes asks nothing"
+refuse_out "which is not mounted"
+expect_log "^ctlenv update NONINTERACTIVE=true ALLOW=$"
+backup_upgrade
+run --defaults
+expect_rc 0 "backup drive: --defaults asks nothing"
+refuse_out "which is not mounted"
+refuse_log "^ctl update"
+rm -rf -- "$BACKUP_MNT"
 
 # ---- 10. root-controlled release directory ------------------------------------------------
 reset_state

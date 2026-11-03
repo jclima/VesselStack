@@ -60,7 +60,7 @@ Do not build and upload files by hand.
    the workflow reads the copy at the tagged commit. The `v0.5.7` lab prerelease was an
    annotated unsigned tag because no SSH/GPG key was available; it is not signed and would now
    be refused. The `v0.5.1` tag is untouched and was not published because its release pipeline
-   caught the bridge startup-status race. `v0.6.0` is an SSH-signed tag, published first as a
+   caught the bridge startup-status race. `v0.6.1` is an SSH-signed tag, published first as a
    pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes
    (see the CHANGELOG).
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the

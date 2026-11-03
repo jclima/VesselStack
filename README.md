@@ -157,18 +157,18 @@ session), run the pinned release installer and answer the questions in the same 
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
 ```
 
-The same release is also selected by `VESSELSTACK_VERSION=0.6.0` or `--version 0.6.0`:
+The same release is also selected by `VESSELSTACK_VERSION=0.6.1` or `--version 0.6.1`:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.6.0 bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash -s -- --version 0.6.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.6.1 bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash -s -- --version 0.6.1
 ```
 
 > [!NOTE]
-> The pinned URL names the release explicitly, so it installs exactly 0.6.0 whatever
+> The pinned URL names the release explicitly, so it installs exactly 0.6.1 whatever
 > GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a prerelease, so that URL kept serving
@@ -215,10 +215,10 @@ that does not point at the exact commit being built, before building anything. T
 
 ```bash
 # defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 # every question's own default answer, nothing asked
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash -s -- --defaults
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash -s -- --defaults
 # a ready-made vesselstack.env (optionally with --set overrides)
 sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
 ```
@@ -357,8 +357,8 @@ script is wrapped in functions and ends with a single `main "$@"` call, so a
 truncated download cannot half-run. If you prefer to read it first (recommended):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -380,7 +380,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.6.0
+git checkout v0.6.1
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the optional browser wizard
 ```
@@ -427,7 +427,66 @@ before carrying an update to a boat without internet access.
 ## Upgrading to 0.6.0
 
 Read this before updating an installed system. Update from [Updating](#updating) with a backup
-on a mounted external drive, not while underway.
+on a mounted external drive, not while underway. This section applies to 0.6.0 and 0.6.1.
+
+**Settings that say `BOAT_UNITS=nautical` (fixed in 0.6.1).** Older setup wizards offered
+"nautical" as a units choice, and installers before 0.5.7 did not check it, so such a
+`vesselstack.env` may exist. 0.6.0 refused it with `BOAT_UNITS must be us_customary or metric`
+and stopped the update before changing anything. From 0.6.1 the installer reads `nautical` as
+`metric` (metres for depth; knots and nautical miles are kept in both systems), prints one
+`Note:` line, and a real install or update rewrites `vesselstack.env` with `BOAT_UNITS=metric`
+(a dry run only prints the note). The setup wizard and the Control Panel also show it as Metric
+without changing it. Any other unsupported value is still refused before anything is changed,
+now with a message naming the file and the fix. If you are stuck on 0.6.0, change the value
+by hand and run the update again:
+
+```bash
+sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /opt/vesselstack/config/vesselstack.env
+```
+
+**Backup drive not mounted (0.6.1).** When the backup folder is under `/media` or `/mnt` and the
+drive is not mounted, `get-vesselstack.sh` and (from an installed 0.6.1) `vesselstackctl update` and
+`vesselstackctl backup` no longer just stop: before anything is stopped or changed they ask
+whether to mount the drive from `/etc/fstab`, pick a connected USB drive, check again, or back up
+to the system disk once. See [Backups](#backups). A direct `sudo vesselstackctl update <dir>` run
+from an installed 0.6.0 or earlier controller does not show this menu (that controller is older
+than the fix); use `get-vesselstack.sh`, or mount the drive first, or run
+`sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` to back up to
+the system disk once.
+
+Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
+needs no other manual step.
+
+**Fix it at the prompt (0.6.1).** When you run the installer, an update or the pinned
+`get-vesselstack.sh` from a terminal (for example over `ssh -t`), an unsupported `BOAT_UNITS`
+value, or a setting in `vesselstack.env` that cannot be written safely (see below), no longer
+just stops the run. The installer asks what to do before changing anything else:
+
+```text
+BOAT_UNITS in /opt/vesselstack/config/vesselstack.env is "imperial", which is not supported.
+  [1] US customary (feet, °F, psi, US gallons)
+  [2] Metric (metres, °C, kPa, litres)
+  [c] Cancel (nothing is changed)
+Choice:
+```
+
+An unsafe value (a token or other setting with an apostrophe plus a backslash, double quote,
+dollar sign or backtick, a line break, or a control character) is offered as
+`[1] Enter a new value for <KEY>`; what you type for a token, password or key is hidden and is
+never printed or logged, and a replacement that is still unsafe is refused. Your answer is saved
+in the settings file, the installer prints `Changed <KEY> in <file> (previous copy: <file>.before-fix-<time>)`
+and starts over with the same options. The previous copy is root-only; delete the
+`*.before-fix-*` copies once the install works. `c`, an empty answer at the end of input or
+five minutes without an answer prints `Cancelled. Nothing was changed.` and leaves the file as
+it was. Limits: only settings written in the file you pass with `--config` are offered (a value
+that comes from the environment is not), generated or preserved passwords and tokens (InfluxDB,
+Grafana, MQTT, Boat Chat, Control Panel) are never offered because the running services still hold the
+old value (change it in the service first, then edit the file), and a symbolic link, a file not
+owned by root, a file in a folder (or under a parent folder) that other users can change, or a
+file whose edit cannot be verified is left untouched. For an unsupported units value the manual
+`sed` command is printed; for an unsafe value you are told to edit the setting by hand. Runs without a terminal (cron, a service, the Control Panel, `--yes`,
+`VESSELSTACK_NONINTERACTIVE=true`) never ask: they stop before changing anything and print the
+exact fix, as in 0.6.0. A dry run that you answer does save the fix you chose.
 
 **What changes for an existing boat**
 
@@ -494,14 +553,14 @@ command under Rollback below, fix the value, and update again.
 **Verify after updating**
 
 ```bash
-cat /opt/vesselstack/config/installed-version     # 0.6.0
+cat /opt/vesselstack/config/installed-version     # 0.6.1
 sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
 
 Open Boat Chat and the Control Panel, and confirm the dashboards show live values.
 
-**Rollback.** Downgrades are refused (`Downgrade from 0.6.0 to ... is not supported`). Restore the
+**Rollback.** Downgrades are refused (`Downgrade from 0.6.1 to ... is not supported`). Restore the
 verified pre-update backup instead:
 
 ```bash
@@ -614,26 +673,26 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-To work from the 0.6.0 release, check out its tag:
+To work from the 0.6.1 release, check out its tag:
 
 ```bash
 git fetch --tags
-git checkout v0.6.0
+git checkout v0.6.1
 ```
 
-`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against
+`v0.6.1` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against
 `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the
 maintainer's physical Raspberry Pi install passes; see the [CHANGELOG](CHANGELOG.md). Verify the
 tag yourself (needs `ssh-keygen`, which ships with OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.6.0
+scripts/verify-release-tag.sh v0.6.1
 # maintainers and owners: also bind the tag to the commit you recorded when it was built
 # (the full 40-character SHA from your release notes, not one read back from the tag itself)
-scripts/verify-release-tag.sh v0.6.0 .github/allowed_signers "$RECORDED_COMMIT"
+scripts/verify-release-tag.sh v0.6.1 .github/allowed_signers "$RECORDED_COMMIT"
 # equivalent plain git command:
-git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.0
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.1
 ```
 
 The script prints the signer and key fingerprint, and exits non-zero for an unsigned,
@@ -661,7 +720,7 @@ nano vesselstack.env
 | `BOAT_CHAT_ACCESS_TOKEN` | `GENERATE` (default) creates a random token, preserved on re-install; required for chat, status and data APIs |
 | `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
-| `BOAT_UNITS` | `us_customary` or `metric` |
+| `BOAT_UNITS` | `us_customary` or `metric` (the legacy value `nautical` is read as `metric`; case and surrounding spaces are ignored) |
 | `VESSELSTACK_USER` | Existing non-root service account |
 | `VESSELSTACK_UID`, `VESSELSTACK_GID` | Derived from the service account by the installer |
 | `VESSELSTACK_ROOT` | Application path; default `/opt/vesselstack` |
@@ -1067,7 +1126,55 @@ USB drive cannot silently fill the SD card; pass
 `vesselstackctl backup --allow-unmounted DIR` (or set
 `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true`, which also applies to
 `vesselstackctl update`) to override. A warning is printed when the destination
-is on the same filesystem as the data. Besides the application and data trees the
+is on the same filesystem as the data.
+
+When the drive is not mounted and you run the command from a terminal, the update or backup
+shows a menu instead of stopping. Nothing has been changed or stopped at that point:
+
+```text
+The backup folder <DEST> is on <MOUNT_DIR>, which is not mounted.
+Backing up now would put the archive on the system disk (SD card).
+Nothing has been changed yet.
+  [1] Mount <MOUNT_DIR> now (it is listed in /etc/fstab)
+  [2] Choose a connected drive to mount at <MOUNT_DIR>
+  [3] I have plugged the drive in; check again
+  [4] Back up to the system disk this once (not recommended)
+  [c] Cancel the update
+```
+
+- **[1]** appears only when `/etc/fstab` has an entry for that folder; it runs `mount`.
+- **[2]** lists connected USB drives that are not mounted and not part of the system disk
+  (the disk holding `/`, `/boot/firmware` or the VesselStack data is never offered). Only
+  **ext4** (recommended) and **exFAT** are accepted; vfat/FAT32 is refused because of its 4 GiB
+  file limit, and other filesystems are listed with the reason. A drive that `/etc/fstab` assigns
+  to a different mount point (for example a data SSD that failed to mount) is listed with that
+  reason and cannot be picked. If no unmounted drive is found, the menu says so and names a
+  removable ext4 or exFAT drive that is already mounted elsewhere (for example by the desktop
+  under `/media/<user>/...`); unmount it with `sudo umount <path>` and choose [3]. The mount point
+  must be empty. Before anything is written, the new mount's top folder must be owned by root and
+  not writable by others, and no folder from there to the backup folder may be a symbolic link or
+  owned by another user; otherwise the backup is refused.
+  The drive is mounted with `nodev,nosuid,noexec` (exFAT also `uid=0,gid=0,umask=0077`) and stays
+  mounted until reboot; the menu prints the `/etc/fstab` line to add to mount it at boot.
+  VesselStack never edits `/etc/fstab` or formats a drive.
+- **[3]** checks the mount again after you plug the drive in.
+- **[4]** writes this one backup to the system disk after a warning. It is not offered when
+  the free space is smaller than the data (`du -skx`, 60 s limit) or when `vesselstack.env` sets
+  `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false`. Nothing is saved: the next backup asks again.
+- **[c]**, end of input or no answer within 5 minutes cancels without changing anything (in
+  the pinned installer it prints `Cancelled. The update was not started; your installed VesselStack
+  was not changed.`; the packages and the release folder may already be in place). An answer must
+  be exactly one listed token: `1 2` is asked again.
+  `vesselstackctl backup --require-mounted` (used by the Control Panel) offers only [1] to [3].
+
+Without a terminal (cron, systemd, the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) it
+still stops with `Refusing to back up: ... is not mounted ...` and a `To fix:` line. A direct
+`sudo vesselstackctl update` from an installed 0.6.0 or earlier controller does not show the
+menu; use `get-vesselstack.sh` (it asks before calling the controller) or
+`sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
+Rollback: unmount the drive with `umount`; remove the added `/etc/fstab` line if you do not want it.
+
+Besides the application and data trees the
 archive includes `/etc/systemd/system/vesselstack-*`,
 `/usr/local/sbin/vesselstack{ctl,-firewall}` and `/etc/vesselstack/update.env`
 when they exist, so a restore across versions is complete.
@@ -1128,6 +1235,9 @@ live database files is insufficient.
 ## Updating
 
 This is the one place in the README that describes updating and rolling back.
+Updates and backups started from the Control Panel never prompt; when one stops
+for something you can fix, the result banner shows a **To fix:** line with the
+exact step.
 
 1. **Back up first** to a mounted external drive (see [Backups](#backups)):
 
@@ -1138,7 +1248,7 @@ This is the one place in the README that describes updating and rolling back.
 2. **Re-run the pinned release installer.** On the Pi, over `ssh -t`:
 
    ```bash
-   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
    ```
 
    The installer finds the installed system, never overwrites it silently, and offers
@@ -1147,8 +1257,11 @@ This is the one place in the README that describes updating and rolling back.
    release's `install.sh --dry-run` preflight, makes and verifies a full backup, then runs
    `install.sh --start`. Answer **n** to leave the system untouched; the installer prints
    the exact command to run later. Services restart briefly, so do not update while underway.
-   Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
-   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.6.0`.
+   If the backup drive is not mounted, the installer asks, before calling the controller and
+   before anything is stopped, whether to mount it, pick a USB drive, check again, or back up
+   to the system disk once (see [Backups](#backups)); `--yes` and `--defaults` never choose and
+   the update stops with the reason. Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
+   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.6.1`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
 
@@ -1165,13 +1278,13 @@ This is the one place in the README that describes updating and rolling back.
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
    backed up; configuration and data are.
 
-| Installed version | Update to 0.6.0 |
+| Installed version | Update to 0.6.1 |
 |---|---|
-| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.6.0 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
+| 0.5.7 | Control Panel or the pinned installer. 0.6.1 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.6.1 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 
-A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.6.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.6.1` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:
@@ -1187,7 +1300,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on a connected machine, carry it to the boat, and install with
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.0.tar.gz`.
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.1.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
 
 ## Stopping or removing services
@@ -1231,6 +1344,24 @@ prints how to remove it (`docker volume rm vesselstack-esphome-cache`);
 
 Install the reported command and rerun `--dry-run`. Confirm `docker compose`
 works; the deprecated standalone `docker-compose` command is insufficient.
+
+### "Refusing to back up: ... is not mounted"
+
+The backup folder is under `/media` or `/mnt` and the drive is not mounted. From a terminal
+(`ssh -t`) the update or backup now asks what to do: mount it, pick a connected ext4 or exFAT
+USB drive, check again, or back up to the system disk once (see [Backups](#backups)). Without
+a terminal, or from an installed 0.6.0 or earlier controller, mount the drive and run again, or
+use `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` for one
+backup on the system disk. A FAT32 (vfat) drive is refused; use ext4 or exFAT.
+
+### The installer stops on `BOAT_UNITS` or "cannot be written safely"
+
+Run it from a terminal (`ssh -t`) and answer the prompt: it offers to set the units or to
+enter a replacement value, keeps a root-only copy of the previous file as
+`<file>.before-fix-<time>` (safe to delete once the install works), and then continues. If it
+only prints the message, the run had no terminal, `--yes` or `VESSELSTACK_NONINTERACTIVE=true`
+was set, or the value is a generated password or token or comes from the environment: edit the
+named setting in the file as printed, then run again. See [Upgrading to 0.6.0](#upgrading-to-060).
 
 ### A port is already allocated
 

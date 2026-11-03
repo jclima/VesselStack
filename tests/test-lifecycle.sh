@@ -1,6 +1,8 @@
 #!/bin/bash
 
 set -euo pipefail
+# Nothing may wait at a terminal; interactive cases unset it and use VESSELSTACK_PROMPT_ANSWERS.
+export VESSELSTACK_NONINTERACTIVE=true
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
@@ -165,13 +167,58 @@ write_ss() {
 export FAKE_SS_FILE="$TEST_ROOT/ss.txt"
 write_ss '*:9876' '[::]:9877' 0.0.0.0:9878 127.0.0.1:8086 127.0.0.1:9090 127.0.0.1:1883 127.0.0.1:8780
 
-# Fake mountpoint: only paths listed (one per line) in $FAKE_MOUNTS are mounted.
+# Fake mountpoint: only paths listed (one per line) in $FAKE_MOUNTS are mounted. With
+# FAKE_MOUNT_AFTER=N the path FAKE_MOUNT_PATH reports "mounted" from its (N+1)th check on.
 cat > "$FAKE_BIN/mountpoint" <<'EOF'
 #!/bin/bash
 path=${2:-$1}
+if [ -n "${FAKE_MOUNT_AFTER:-}" ] && [ "$path" = "${FAKE_MOUNT_PATH:-}" ]; then
+    count=$(cat "$FAKE_MOUNT_COUNT" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$FAKE_MOUNT_COUNT"
+    [ "$count" -le "$FAKE_MOUNT_AFTER" ] || exit 0
+fi
 [ -n "${FAKE_MOUNTS:-}" ] && grep -Fxq -- "$path" "$FAKE_MOUNTS"
 EOF
-chmod +x "$FAKE_BIN/mountpoint"
+# Fake mount, findmnt and lsblk log their arguments; mount marks the last argument as mounted.
+cat > "$FAKE_BIN/mount" <<EOF
+#!/bin/bash
+echo "mount \$*" >> "$TEST_ROOT/mount.log"
+[ -z "\${FAKE_MOUNT_FAIL:-}" ] || { echo "mount: fake failure" >&2; exit 32; }
+echo "\${*: -1}" >> "\$FAKE_MOUNTS"
+# FAKE_MOUNT_CHOWN=uid hands the new mount root to that user; FAKE_MOUNT_LINK=1 puts a symbolic link in it.
+[ -z "\${FAKE_MOUNT_CHOWN:-}" ] || chown "\$FAKE_MOUNT_CHOWN" "\${*: -1}"
+if [ -n "\${FAKE_MOUNT_LINK:-}" ]; then ln -s /tmp "\${*: -1}/backups"; fi
+EOF
+cat > "$FAKE_BIN/findmnt" <<EOF
+#!/bin/bash
+echo "findmnt \$*" >> "$TEST_ROOT/findmnt.log"
+case " \$* " in
+    *" --fstab "*) grep -Fxq -- "\${*: -1}" "\${FAKE_FSTAB:-/dev/null}" ;;
+    *" --target "*) awk -v t="\${*: -1}" '\$1 == t {print \$2}' "\${FAKE_FINDMNT_SOURCES:-/dev/null}" ;;
+esac
+EOF
+cat > "$FAKE_BIN/lsblk" <<EOF
+#!/bin/bash
+echo "lsblk \$*" >> "$TEST_ROOT/lsblk.log"
+cat "\${FAKE_LSBLK:-/dev/null}"
+EOF
+# Fake df reports FAKE_DF_FREE KiB free when set.
+cat > "$FAKE_BIN/df" <<EOF
+#!/bin/bash
+if [ -n "\${FAKE_DF_FREE:-}" ]; then
+    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfake 1000 0 %s 0%% /\n' "\$FAKE_DF_FREE"
+    exit 0
+fi
+PATH=\$(printf '%s' "\$PATH" | tr ':' '\n' | grep -vxF "$FAKE_BIN" | paste -sd:)
+exec df "\$@"
+EOF
+chmod +x "$FAKE_BIN/mountpoint" "$FAKE_BIN/mount" "$FAKE_BIN/findmnt" "$FAKE_BIN/lsblk" "$FAKE_BIN/df"
+# The installed, root-owned prompt library the controller sources.
+LIBEXEC_TEST="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
+install -d -m 0755 "$LIBEXEC_TEST"
+install -m 0644 "$REPO_ROOT/scripts/lib/remediate.sh" "$LIBEXEC_TEST/remediate.sh"
+export FAKE_MOUNT_COUNT="$TEST_ROOT/mount-count"
 : > "$TEST_ROOT/mounts"
 printf 'unit one\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 printf '#!/bin/sh\necho ctl-one\n' > "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
@@ -428,6 +475,293 @@ rm -rf -- "$unmounted"
 override_archive=$(run_ctl backup --allow-unmounted "$unmounted/backups" 2>/dev/null | tail -n 1)
 test -s "$override_archive"
 rm -rf -- "$unmounted"
+
+# ---- Unmounted backup drive: the interactive menu (needs root: the controller only sources a
+# root-owned library). Answers come from VESSELSTACK_PROMPT_ANSWERS; nothing is stopped first.
+if [ "$(id -u)" -eq 0 ]; then
+    : > "$TEST_ROOT/mounts"
+    LSBLK_JSON="$TEST_ROOT/lsblk.json"
+    cat > "$LSBLK_JSON" <<EOF
+{"blockdevices":[
+ {"path":"/dev/mmcblk0","type":"disk","size":"58G","rm":false,"hotplug":false,"tran":null,"children":[
+  {"path":"/dev/mmcblk0p1","type":"part","size":"512M","fstype":"vfat","uuid":"AAAA-0001","mountpoint":"/boot/firmware","rm":false},
+  {"path":"/dev/mmcblk0p2","type":"part","size":"57G","fstype":"ext4","uuid":"sysroot","mountpoint":"/","rm":false}]},
+ {"path":"/dev/nvme0n1","type":"disk","size":"500G","rm":false,"hotplug":false,"tran":"nvme","children":[
+  {"path":"/dev/nvme0n1p1","type":"part","size":"500G","fstype":"ext4","uuid":"internal","mountpoint":null,"rm":false}]},
+ {"path":"/dev/sda","type":"disk","size":"58G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sda1","type":"part","size":"58G","label":"BACKUP","fstype":"ext4","uuid":"1111-aaaa","mountpoint":null,"rm":true}]},
+ {"path":"/dev/sdb","type":"disk","size":"29G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sdb1","type":"part","size":"29G","label":"CAMERA","fstype":"vfat","uuid":"2222-BBBB","mountpoint":null,"rm":true}]},
+ {"path":"/dev/sdc","type":"disk","size":"100G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sdc1","type":"part","size":"90G","label":"SSD-SPARE","fstype":"ext4","uuid":"3333-cccc","mountpoint":null,"rm":true},
+  {"path":"/dev/sdc2","type":"part","size":"10G","fstype":"ext4","uuid":"4444-dddd","mountpoint":null,"rm":true}]}
+]}
+EOF
+    printf '/ /dev/mmcblk0p2\n%s /dev/sdc2\n' "$DATA_ROOT" > "$TEST_ROOT/findmnt-sources"
+    : > "$TEST_ROOT/fstab"
+    export FAKE_LSBLK="$LSBLK_JSON" FAKE_FSTAB="$TEST_ROOT/fstab" FAKE_FINDMNT_SOURCES="$TEST_ROOT/findmnt-sources" \
+        FAKE_MOUNT_PATH="$unmounted"
+    ask_ctl() {  # answers-file args...: the controller with a (scripted) terminal
+        local answers=$1
+        shift
+        ( unset VESSELSTACK_NONINTERACTIVE; VESSELSTACK_PROMPT_ANSWERS=$answers run_ctl "$@" )
+    }
+    menu_run() {  # answers-text args...: sets MENU_RC, MENU_OUT (stdout) and MENU_ERR (stderr)
+        local text=$1
+        shift
+        printf '%s' "$text" > "$TEST_ROOT/answers"
+        : > "$TEST_ROOT/mount.log"
+        : > "$TEST_ROOT/mounts"
+        rm -f -- "$TEST_ROOT/mount-count"
+        MENU_RC=0
+        ask_ctl "$TEST_ROOT/answers" "$@" >"$TEST_ROOT/menu.out" 2>"$TEST_ROOT/menu.err" || MENU_RC=$?
+        MENU_OUT=$(<"$TEST_ROOT/menu.out")
+        MENU_ERR=$(<"$TEST_ROOT/menu.err")
+    }
+    want() {  # text: must appear on stderr
+        grep -qF -- "$1" <<<"$MENU_ERR" || { echo "menu output lacks: $1" >&2; echo "$MENU_ERR" >&2; exit 1; }
+    }
+    refuse_text() {
+        if grep -qF -- "$1" <<<"$MENU_ERR"; then echo "menu output must not contain: $1" >&2; echo "$MENU_ERR" >&2; exit 1; fi
+    }
+    rm -rf -- "$unmounted"
+    menu_calls="$TEST_ROOT/menu-calls.log"
+    export FAKE_CALL_LOG="$menu_calls"
+    env_backup="$TEST_ROOT/vesselstack.env.before-menu"
+    cp -p "$APP_ROOT/config/vesselstack.env" "$env_backup"
+    env_hash=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+
+    # The menu text, and cancel / end of input change and stop nothing.
+    : > "$menu_calls"
+    menu_run $'c\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "The backup folder $unmounted/backups is on $unmounted, which is not mounted."
+    want "Backing up now would put the archive on the system disk (SD card)."
+    want "Nothing has been changed yet."
+    want "[2] Choose a connected drive to mount at $unmounted"
+    want "[3] I have plugged the drive in; check again"
+    want "[4] Back up to the system disk this once (not recommended)"
+    want "[c] Cancel the backup"
+    refuse_text "[1] Mount"
+    want "Cancelled. Nothing was changed."
+    menu_run '' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "Cancelled. Nothing was changed."
+    test ! -s "$menu_calls"
+    test ! -s "$TEST_ROOT/mount.log"
+    test ! -e "$unmounted"
+    test "$(sha256sum "$APP_ROOT/config/vesselstack.env")" = "$env_hash"
+
+    # [1] only with an /etc/fstab entry, and then a plain "mount -- DIR".
+    menu_run $'1\nc\n' backup "$unmounted/backups"
+    want "Please enter one of: 2, 3, 4, or c"
+    test ! -s "$TEST_ROOT/mount.log"
+    printf '%s\n' "$unmounted" > "$TEST_ROOT/fstab"
+    : > "$menu_calls"
+    menu_run $'1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want "[1] Mount $unmounted now (it is listed in /etc/fstab)"
+    grep -qx -- "mount -- $unmounted" "$TEST_ROOT/mount.log"
+    grep -qx -- "findmnt --fstab -n --mountpoint $unmounted" "$TEST_ROOT/findmnt.log"
+    test -s "$MENU_OUT"
+    : > "$TEST_ROOT/fstab"
+    rm -rf -- "$unmounted"
+
+    # A mount that fails shows the error and the menu again.
+    printf '%s\n' "$unmounted" > "$TEST_ROOT/fstab"
+    FAKE_MOUNT_FAIL=1 menu_run $'1\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "Could not mount $unmounted from /etc/fstab."
+    : > "$TEST_ROOT/fstab"
+
+    # [2]: only unmounted, removable, non-system ext4/exFAT drives; vfat is refused, never offered.
+    : > "$menu_calls"
+    menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want '[1] /dev/sda1  58G  "BACKUP"  ext4'
+    want "/dev/sdb1  29G  \"CAMERA\"  vfat -- vfat is not supported for backups; use ext4 (recommended) or exFAT"
+    refuse_text "[2] /dev/sdb1"
+    refuse_text "/dev/sdc1"
+    refuse_text "/dev/sdc2"
+    refuse_text "/dev/nvme0n1p1"
+    refuse_text "/dev/mmcblk0"
+    grep -qx -- "mount -t ext4 -o nodev,nosuid,noexec /dev/sda1 $unmounted" "$TEST_ROOT/mount.log"
+    [ "$(wc -l < "$TEST_ROOT/mount.log")" -eq 1 ]
+    want "It stays mounted until reboot. To mount it at boot, add this line to /etc/fstab:"
+    want "UUID=1111-aaaa $unmounted ext4 nofail,noatime,nodev,nosuid,noexec 0 2"
+    grep -q -- '-J -p -o PATH,TYPE,SIZE,LABEL,FSTYPE,UUID,MOUNTPOINT,RM,HOTPLUG,TRAN,PKNAME' "$TEST_ROOT/lsblk.log"
+    test "$(stat -c %a "$unmounted")" = 700
+    test -s "$MENU_OUT"
+    grep -qx -- "$unmounted" "$TEST_ROOT/mounts"
+    rm -rf -- "$unmounted"
+    # Choosing the refused drive's number is not possible; "b" goes back to the menu.
+    menu_run $'2\nb\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    test ! -s "$TEST_ROOT/mount.log"
+    # No usable drive at all.
+    printf '{"blockdevices":[]}\n' > "$TEST_ROOT/lsblk-empty.json"
+    FAKE_LSBLK="$TEST_ROOT/lsblk-empty.json" menu_run $'2\nc\n' backup "$unmounted/backups"
+    want "(none found)"
+    want "Plug in a drive formatted as ext4"
+    want "No unmounted USB drive was found. If your desktop already mounted the drive (for example under /media/<user>/...), unmount it first: sudo umount <path>."
+    refuse_text "Already mounted elsewhere:"
+    # A removable ext4 partition the desktop mounted elsewhere is named in the hint.
+    cat > "$TEST_ROOT/lsblk-mounted.json" <<EOF
+{"blockdevices":[
+ {"path":"/dev/sde","type":"disk","size":"16G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sde1","type":"part","size":"16G","label":"USBSTICK","fstype":"ext4","uuid":"6666-ffff","mountpoint":"/media/pi/USBSTICK","rm":true}]}
+]}
+EOF
+    FAKE_LSBLK="$TEST_ROOT/lsblk-mounted.json" menu_run $'2\nc\n' backup "$unmounted/backups"
+    want "(none found)"
+    want "Already mounted elsewhere:"
+    want '/dev/sde1  16G  "USBSTICK"  ext4, mounted at /media/pi/USBSTICK'
+    # A drive that /etc/fstab assigns to another mount point (a data SSD that failed to mount) is
+    # not offered; one assigned to the backup folder's own mount point still is.
+    printf 'UUID=1111-aaaa /srv/data ext4 defaults,nofail 0 2\n' > "$TEST_ROOT/fstab-other"
+    VS_FSTAB_FILE="$TEST_ROOT/fstab-other" menu_run $'2\nc\n' backup "$unmounted/backups"
+    want "/dev/sda1  58G  \"BACKUP\"  ext4 -- listed in /etc/fstab for /srv/data; not offered here"
+    refuse_text "[1] /dev/sda1"
+    printf 'LABEL=BACKUP /srv/data ext4 defaults 0 2\n' > "$TEST_ROOT/fstab-other"
+    VS_FSTAB_FILE="$TEST_ROOT/fstab-other" menu_run $'2\nc\n' backup "$unmounted/backups"
+    refuse_text "[1] /dev/sda1"
+    printf 'UUID=1111-aaaa %s ext4 nofail 0 2\n' "$unmounted" > "$TEST_ROOT/fstab-other"
+    VS_FSTAB_FILE="$TEST_ROOT/fstab-other" menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want '[1] /dev/sda1  58G  "BACKUP"  ext4'
+    rm -rf -- "$unmounted"
+
+    # A drive mounted just now is checked before anything is written: a mount root owned by
+    # another user, or a symbolic link on the drive, is refused (nothing created, no archive).
+    FAKE_MOUNT_CHOWN=1234 menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "the top folder of the newly mounted drive is not owned by root or can be changed by other users"
+    test ! -e "$unmounted/backups"
+    rm -rf -- "$unmounted"
+    FAKE_MOUNT_LINK=1 menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "on the newly mounted drive is a symbolic link"
+    rm -rf -- "$unmounted"
+
+    # An unlabeled partition keeps its columns (an empty LABEL must not shift the fields) and is
+    # mounted with the right filesystem type and device.
+    cat > "$TEST_ROOT/lsblk-nolabel.json" <<EOF
+{"blockdevices":[
+ {"path":"/dev/sdd","type":"disk","size":"8G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sdd1","type":"part","size":"8G","label":null,"fstype":"ext4","uuid":"5555-eeee","mountpoint":null,"rm":true}]}
+]}
+EOF
+    FAKE_LSBLK="$TEST_ROOT/lsblk-nolabel.json" menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want '[1] /dev/sdd1  8G  (no label)  ext4'
+    grep -qx -- "mount -t ext4 -o nodev,nosuid,noexec /dev/sdd1 $unmounted" "$TEST_ROOT/mount.log"
+    want "UUID=5555-eeee $unmounted ext4 nofail,noatime,nodev,nosuid,noexec 0 2"
+    rm -rf -- "$unmounted"
+    # Only one listed token is an answer: "1 2" and "1 b" are asked again and mount nothing.
+    menu_run $'2\n1 2\n1 b\n c\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    test "$(grep -cF 'Please enter one of: 1, b, or c' <<<"$MENU_ERR")" -eq 2
+    test ! -s "$TEST_ROOT/mount.log"
+    rm -rf -- "$unmounted"
+    menu_run $'1 2\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "Please enter one of: 2, 3, 4, or c"
+    test ! -s "$TEST_ROOT/mount.log"
+
+    # A mount point that holds files is refused: they would be hidden by the mount.
+    install -d "$unmounted"
+    printf 'keep\n' > "$unmounted/precious.txt"
+    menu_run $'2\n1\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "$unmounted is not empty"
+    test ! -s "$TEST_ROOT/mount.log"
+    test -f "$unmounted/precious.txt"
+    rm -rf -- "$unmounted"
+
+    # [3]: checks again; the second check finds the drive.
+    FAKE_MOUNT_AFTER=2 menu_run $'3\n3\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want "$unmounted is still not mounted."
+    want "$unmounted is mounted."
+    test ! -s "$TEST_ROOT/mount.log"
+    rm -rf -- "$unmounted"
+
+    # [4]: one backup to the system disk, with a warning; nothing is saved for later.
+    menu_run $'4\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want "WARNING: the backup will be written to the system disk (SD card) this once."
+    test -s "$MENU_OUT"
+    test "$(sha256sum "$APP_ROOT/config/vesselstack.env")" = "$env_hash"
+    rm -rf -- "$unmounted"
+    # Hidden when the system disk is too small for the backup ...
+    FAKE_DF_FREE=1 menu_run $'4\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "so a backup to the system disk is not offered."
+    refuse_text "[4] Back up"
+    # ... and when the environment file pins false.
+    printf 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n' >> "$APP_ROOT/config/vesselstack.env"
+    menu_run $'4\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    refuse_text "[4] Back up"
+    want "Please enter one of: 2, 3, or c"
+    cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
+
+    # --require-mounted offers [1]-[3] only, even with the override in the file.
+    printf 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true\n' >> "$APP_ROOT/config/vesselstack.env"
+    menu_run $'4\nc\n' backup --require-mounted "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    refuse_text "[4] Back up"
+    want "[3] I have plugged the drive in; check again"
+    cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
+    rm -rf -- "$unmounted"
+
+    # Update: the question comes after the dry run and before anything is stopped.
+    sed -i "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=$unmounted/backups|" "$APP_ROOT/config/vesselstack.env"
+    : > "$TEST_ROOT/update-args"
+    : > "$menu_calls"
+    menu_run $'c\n' update "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 1
+    want "[c] Cancel the update"
+    test "$(cat "$TEST_ROOT/update-args")" = "--config $APP_ROOT/config/vesselstack.env --dry-run"
+    test ! -s "$menu_calls"
+    menu_run $'4\n' update "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 0
+    test "$(wc -l < "$TEST_ROOT/update-args")" -eq 3
+    tail -n 1 "$TEST_ROOT/update-args" | grep -q -- '--start'
+    : > "$TEST_ROOT/update-args"
+    rm -rf -- "$unmounted"
+
+    # Without a terminal the same refusal and fix are printed, per context.
+    : > "$menu_calls"
+    VESSELSTACK_NONINTERACTIVE=true run_ctl update "$UPDATE_SOURCE" >/dev/null 2>"$TEST_ROOT/menu.err" && exit 1
+    test "$(sed -n 1p "$TEST_ROOT/menu.err")" = "Refusing to back up: $unmounted is not mounted, so the archive would land on the system disk (SD card). Nothing was changed."
+    test "$(sed -n 2p "$TEST_ROOT/menu.err")" = "To fix: mount the backup drive at $unmounted and run again, or back up to the system disk this once: sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update $UPDATE_SOURCE"
+    test "$(wc -l < "$TEST_ROOT/menu.err")" -eq 2
+    test ! -s "$menu_calls"
+    run_ctl backup "$unmounted/backups" >/dev/null 2>"$TEST_ROOT/menu.err" && exit 1
+    test "$(sed -n 1p "$TEST_ROOT/menu.err")" = "Refusing to back up: $unmounted is not mounted, so the archive would land on the system disk (SD card). Nothing was changed."
+    test "$(sed -n 2p "$TEST_ROOT/menu.err")" = "To fix: mount the backup drive at $unmounted and run again, or pass --allow-unmounted."
+    run_ctl backup --require-mounted "$unmounted/backups" >/dev/null 2>"$TEST_ROOT/menu.err" && exit 1
+    test "$(sed -n 2p "$TEST_ROOT/menu.err")" = "To fix: mount the backup drive at $unmounted and run again."
+    # A library another user could change is never sourced; the same copy is printed instead.
+    chmod 0666 "$LIBEXEC_TEST/remediate.sh"
+    menu_run $'4\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    refuse_text "Choice:"
+    want "To fix: mount the backup drive at $unmounted and run again, or pass --allow-unmounted."
+    chmod 0644 "$LIBEXEC_TEST/remediate.sh"
+    # The folders above the library must be root-controlled too.
+    chmod 0777 "$SYSTEM_ROOT/usr/local/libexec"
+    menu_run $'4\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    refuse_text "Choice:"
+    want "To fix: mount the backup drive at $unmounted and run again, or pass --allow-unmounted."
+    chmod 0755 "$SYSTEM_ROOT/usr/local/libexec"
+    test ! -e "$unmounted"
+    cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
+    unset FAKE_CALL_LOG FAKE_MOUNT_PATH
+    : > "$TEST_ROOT/mounts"
+fi
 
 # Boat Chat memory index: `reindex` builds it as the service user, the helper is idempotent
 # and a damaged environment is reported with the one-line fix. Done before the first doctor

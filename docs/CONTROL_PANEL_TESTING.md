@@ -1,6 +1,6 @@
 # Control Panel component lifecycle lab test
 
-This is the release 0.6.0 lab recipe. It is a bounded acceptance test, not
+This is the release 0.6.1 lab recipe. It is a bounded acceptance test, not
 evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
@@ -8,19 +8,19 @@ positions, MMSIs, tokens, logs, and backups out of this repository.
 ## Fetch and verify the pinned prerelease
 
 Download the pinned bootstrap and the CI-generated checksum from the same
-`v0.6.0` GitHub release. Verify before reading or running it:
+`v0.6.1` GitHub release. Verify before reading or running it:
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
 ```
 
-0.6.0 release status: `v0.6.0` is an SSH-signed tag, published first as a pre-release and
+0.6.1 release status: `v0.6.1` is an SSH-signed tag, published first as a pre-release and
 marked Latest after the maintainer's physical Raspberry Pi install passes (see the CHANGELOG).
-Check the tag with `scripts/verify-release-tag.sh v0.6.0`. The checksum catches a corrupt or
+Check the tag with `scripts/verify-release-tag.sh v0.6.1`. The checksum catches a corrupt or
 truncated asset; it does not replace that signature check.
 
 ## Exercise the browser updater
@@ -28,13 +28,13 @@ truncated asset; it does not replace that signature check.
 Open the authenticated panel's **Updates** tab and press **Check for updates**. Before
 you press it, confirm the tab says nothing has been contacted. Confirm the catalog
 is `jclima/VesselStack`, stable releases are the default, and **Include early test
-releases** is opt-in. When the installed `0.6.0` release is current, the panel
+releases** is opt-in. When the installed `0.6.1` release is current, the panel
 correctly reports "You're up to date"; do not downgrade, retag, or force the
 same version. Exercise **Back up & install** only when a newer public release
-is available. A fresh `0.6.0` install is a CLI install; an existing `0.5.5`,
+is available. A fresh `0.6.1` install is a CLI install; an existing `0.5.5`,
 `0.5.6` or `0.5.7` install may use the panel upgrade path, after enabling
 **Include early test releases** (named **Include lab prereleases** in the 0.5.x panel) if
-0.6.0 is published as a prerelease. CI-controlled fixtures exercise the install
+0.6.1 is published as a prerelease. CI-controlled fixtures exercise the install
 orchestration, and the actual systemd restart is covered by the backend
 verifier. Full physical-Pi upgrade proof remains pending physical testing.
 Mount the configured external backup device first. Confirm the dialog and the Home tab
@@ -81,6 +81,17 @@ sudo vesselstackctl doctor
 Use the real backup mount path in place of `/media/vesselstack-backup`. A
 backup directory on the same system disk does not protect against disk failure;
 check available capacity manually before proceeding.
+
+To see the **To fix:** guidance in the Control Panel, unmount the backup
+target (or use a path that is not a mountpoint), then choose **Back up now** on
+Home and, separately, run an update from the Maintenance tab. Each stops with a
+red result banner that gives the reason, then a **To fix:** line naming the mount
+point (the update version also shows the one-off
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true` command in monospace). Confirm
+nothing was stopped or changed, that no prompt waited in the Details log, mount
+the drive, and run the operation again to see it succeed. Setting an unsupported
+value such as `BOAT_UNITS=imperial` in the settings file and starting an update
+shows the same kind of line with the exact `sed` command.
 
 If the backup media is intentionally unavailable in this disposable lab, the
 one-shot exception is explicit and temporary:

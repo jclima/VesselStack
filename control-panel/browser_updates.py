@@ -650,7 +650,7 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
         if not installer.is_file():
             raise ValueError("release installer missing")
 
-        child_env = dict(os.environ, VESSELSTACK_ROOT=str(root), VESSELSTACK_ENV=config)
+        child_env = dict(os.environ, VESSELSTACK_ROOT=str(root), VESSELSTACK_ENV=config, VESSELSTACK_NONINTERACTIVE="true")
         _validate_fixed_ctl()
         operation.update(phase="preflight"); write_operation(root, operation)
         run_command([str(installer), "--config", config, "--dry-run"], root, operation, 1800, child_env)

@@ -2,7 +2,7 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
@@ -24,7 +24,7 @@ set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="0.6.0"
+DEFAULT_VERSION="0.6.1"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
 
@@ -1240,6 +1240,47 @@ ensure_service_account() {
     changed "created the service account '$user' (system user, no login shell)"
 }
 
+# Before an upgrade, settles an unmounted backup drive with the owner. The installed vesselstackctl
+# may be an older release that only stops, so the question is asked here, using the release's own
+# library (trusted only after the archive was verified and its folder is root-controlled).
+# Sets BACKUP_ALLOW_ONCE=1 when the owner chose to back up to the system disk this once.
+BACKUP_ALLOW_ONCE=0
+settle_backup_destination() {
+    local env_file=$INSTALL_ROOT/config/vesselstack.env dest allow mount_dir lib=$RELEASE_DIR/scripts/lib/remediate.sh
+    local data_root app_root
+    [ "$ASSUME_YES" -eq 0 ] && [ "$DEFAULTS_ONLY" -eq 0 ] || return 0
+    [ -f "$env_file" ] && [ ! -L "$env_file" ] || return 0
+    dest=$(env_get "$env_file" VESSELSTACK_BACKUP 2>/dev/null) || dest=
+    allow=$(env_get "$env_file" VESSELSTACK_BACKUP_ALLOW_UNMOUNTED 2>/dev/null) || allow=
+    app_root=$(env_get "$env_file" VESSELSTACK_ROOT 2>/dev/null) || app_root=
+    data_root=$(env_get "$env_file" VESSELSTACK_DATA 2>/dev/null) || data_root=
+    dest=${dest:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
+    allow=${allow:-${VESSELSTACK_BACKUP_ALLOW_UNMOUNTED:-false}}
+    dest=$(realpath -m -- "$dest")
+    case $dest in
+        /media/*|/mnt/*) ;;
+        *) return 0 ;;
+    esac
+    [ "$allow" != true ] || return 0
+    mount_dir=$(printf '%s' "$dest" | cut -d/ -f1-3)
+    ! mountpoint -q "$mount_dir" || return 0
+    if [ ! -f "$lib" ] || [ -L "$lib" ] || ! require_root_controlled "$lib"; then
+        warn "Cannot ask about the unmounted backup drive: $lib is missing or not root-controlled. The update will stop if the drive stays unmounted."
+        return 0
+    fi
+    open_prompt || return 0
+    # shellcheck source=scripts/lib/remediate.sh
+    source "$lib"
+    say ""
+    VS_CANCEL_MESSAGE="Cancelled. The update was not started; your installed VesselStack was not changed." \
+        VS_PROMPT_FD=3 VS_BACKUP_ROOT=${app_root:-$INSTALL_ROOT} VS_BACKUP_DATA=${data_root:-/opt/vesselstack-data} \
+        VS_BACKUP_ENV_FILE=$env_file VS_BACKUP_UPDATE_DIR=$RELEASE_DIR \
+        vs_backup_destination_fix "$dest" bootstrap \
+        || die "The backup drive is not mounted, so the update did not start. Nothing was changed on the installed system." \
+               "Mount the drive at $mount_dir and run this installer again."
+    if [ "$VS_BACKUP_ALLOW_ONCE" = 1 ]; then BACKUP_ALLOW_ONCE=1; fi
+}
+
 step_install() {
     step 6 "Install and check"
     local install_args=(--config "$ENV_FILE") bundle_wheels='' offline_env=''
@@ -1296,19 +1337,27 @@ step_install() {
     fi
 
     local ctl
+    # --yes, --defaults and scripted answers never pick a fix, so neither ctl nor install.sh may ask.
+    local -a ctl_env=()
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DEFAULTS_ONLY" -eq 1 ] || [ -n "${VESSELSTACK_BOOTSTRAP_ANSWERS:-}" ]; then
+        ctl_env+=(VESSELSTACK_NONINTERACTIVE=true)
+    fi
     if [ "$UPGRADE" -eq 1 ]; then
         ctl=$(find_ctl) || die "vesselstackctl was not found, although VesselStack $INSTALLED_VERSION is installed." \
             "Run the installer directly: sudo $RELEASE_DIR/install.sh --config $INSTALL_ROOT/config/vesselstack.env --dry-run"
         # The installed ctl may be an old release whose "update" only reads $1 as the
         # directory, so the directory goes first and the mode travels in the environment
         # (read by old ctls' child install.sh and by the new ctl alike).
+        settle_backup_destination
+        # --yes, --defaults and scripted answers never pick a fix, so the ctl must not ask either.
+        if [ "$BACKUP_ALLOW_ONCE" -eq 1 ]; then ctl_env+=(VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true); fi
         say "  Running: ${offline_env}vesselstackctl update $RELEASE_DIR"
         if [ "$OFFLINE" -eq 1 ]; then
-            VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=$bundle_wheels "$ctl" update "$RELEASE_DIR" </dev/null \
+            env "${ctl_env[@]}" VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$ctl" update "$RELEASE_DIR" </dev/null \
                 || die "The update failed (see above). Your data and the pre-update backup are untouched." \
                        "See the README sections on updating and restoring."
         else
-            "$ctl" update "$RELEASE_DIR" </dev/null \
+            env "${ctl_env[@]}" "$ctl" update "$RELEASE_DIR" </dev/null \
                 || die "The update failed (see above). Your data and the pre-update backup are untouched." \
                        "See the README sections on updating and restoring."
         fi
@@ -1316,19 +1365,19 @@ step_install() {
     else
         say "  Preflight (changes nothing): install.sh ${install_args[*]} --dry-run"
         if [ -n "$bundle_wheels" ]; then
-            VESSELSTACK_WHEELHOUSE=$bundle_wheels "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
                        "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
-            VESSELSTACK_WHEELHOUSE=$bundle_wheels "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
                 || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
                        "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
         else
-            "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
                        "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
-            "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
                 || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
                        "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
         fi
