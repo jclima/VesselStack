@@ -210,12 +210,12 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.doesNotMatch(node('#banner').innerHTML, /Update failed/, 'no update wording for a backup');
   assert.match(node('#banner').innerHTML, /aria-label="Dismiss message"/);
   ui.renderOperation({ id: 4, label: 'backup', state: 'succeeded', started_at: now, finished_at: now, output: ['x'], summary: { saved_path: '/media/backup/vesselstack-1.tar.gz' } });
-  assert.match(node('#banner').innerHTML, /Backup finished [^<]* &#10003;<\/strong> — saved to <span class="mono">\/media\/backup\/vesselstack-1\.tar\.gz<\/span>/);
+  assert.match(node('#banner').innerHTML, /Backup finished [^<]*<\/strong> — saved to <span class="mono">\/media\/backup\/vesselstack-1\.tar\.gz<\/span>/);
   assert.doesNotMatch(node('#banner').innerHTML, /restart vesselstack-control-panel/, 'no routine restart advice on success');
   ui.renderOperation({ id: 5, label: 'stop grafana', state: 'running', started_at: now, output: [] });
   assert.match(node('#banner').innerHTML, /Stopping Grafana…/); assert.equal(ui.state.busy, true);
   ui.renderOperation({ id: 5, label: 'stop grafana', state: 'succeeded', started_at: now, finished_at: now, output: [] });
-  assert.match(node('#banner').innerHTML, /Grafana stopped [^<]*&#10003;/); assert.equal(ui.state.busy, false);
+  assert.match(node('#banner').innerHTML, /Grafana stopped [^<]*</); assert.equal(ui.state.busy, false);
   ui.renderOperation({ id: 6, label: 'update-release', state: 'succeeded', phase: 'complete', target_version: '0.6.1', running_version: '0.6.1', started_at: now, finished_at: now, output: [] });
   assert.match(node('#banner').innerHTML, /Installed 0\.6\.1/);
   ui.renderOperation({ id: 7, label: 'update-release', state: 'succeeded', phase: 'installing', target_version: '0.6.1', running_version: '0.6.0', started_at: now, output: [] });

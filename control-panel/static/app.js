@@ -467,7 +467,7 @@ function renderBanner(operation, context) {
         let tail = "";
         if (operation.label === "backup") tail = ` — saved to <span class="mono">${escapeHtml(summary.saved_path || state.status?.backup?.path || "the backup folder")}</span>`;
         if (operation.label === "update-release") tail = " — the Control Panel confirmed the new version.";
-        html = `<div class="banner ok" role="status"><span class="icon" aria-hidden="true">&#10003;</span><div class="msg"><strong>${escapeHtml(text.done)}${escapeHtml(when)} &#10003;</strong>${tail}${log("Details")}</div><button type="button" class="x" id="banner-x" aria-label="Dismiss message">&#10005;</button></div>`;
+        html = `<div class="banner ok" role="status"><span class="icon" aria-hidden="true">&#10003;</span><div class="msg"><strong>${escapeHtml(text.done)}${escapeHtml(when)}</strong>${tail}${log("Details")}</div><button type="button" class="x" id="banner-x" aria-label="Dismiss message">&#10005;</button></div>`;
       } else {
         const reason = String(summary.reason || "see the details below").replace(/[.\s]+$/, "");
         const next = /mount/i.test(reason) && operation.label === "backup" ? "Plug in or mount the backup drive and try again." : text.next;
