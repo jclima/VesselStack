@@ -100,6 +100,7 @@ Semantic Versioning.
   `.github/allowed_signers`. The release workflow fetches the real tag object, runs
   `scripts/verify-release-tag.sh` and fails on an unsigned, lightweight or wrongly signed tag
   before anything is built. Changing the allowed key needs a reviewed pull request to `main`.
+- Release tag verification also binds the tag's own name and the exact commit CI builds.
 
 ### Upgrade notes
 
@@ -140,7 +141,7 @@ Downgrades are refused. Restore the verified pre-update backup that the update t
   the installer uses that to restart the `signalk` container.
 - Wizard internals moved from the README to `docs/DEVELOPMENT.md` ("Wizard internals").
 - Version bump: `VERSION` and `DEFAULT_VERSION` in `scripts/get-vesselstack.sh` are 0.6.0.
-- `scripts/verify-release-tag.sh TAG [ALLOWED_SIGNERS_FILE]` verifies a release tag (annotated,
+- `scripts/verify-release-tag.sh TAG [ALLOWED_SIGNERS_FILE [EXPECTED_COMMIT]]` verifies a release tag (annotated,
   SSH-signed by an allowed principal) and prints the signer and key fingerprint;
   `tests/test-verify-release-tag.sh` covers it with throwaway keys and runs in CI.
 

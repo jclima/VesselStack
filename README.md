@@ -191,7 +191,8 @@ way to sign release tags (key held in 1Password) is in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#1-release-signing-with-an-ssh-signing-key).
 Release tags must be SSH-signed annotated tags: the release workflow runs
 `scripts/verify-release-tag.sh` against `.github/allowed_signers` and refuses an unsigned,
-lightweight or wrongly signed tag before building anything. To rotate the release key, change
+lightweight or wrongly signed tag, a tag object whose own name differs from its ref, and a tag
+that does not point at the exact commit being built, before building anything. To rotate the release key, change
 `.github/allowed_signers` in a reviewed pull request to `main` first, then tag.
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
@@ -594,6 +595,9 @@ tag yourself (needs `ssh-keygen`, which ships with OpenSSH):
 ```bash
 git fetch --tags
 scripts/verify-release-tag.sh v0.6.0
+# maintainers and owners: also bind the tag to the commit you recorded when it was built
+# (the full 40-character SHA from your release notes, not one read back from the tag itself)
+scripts/verify-release-tag.sh v0.6.0 .github/allowed_signers "$RECORDED_COMMIT"
 # equivalent plain git command:
 git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.0
 ```

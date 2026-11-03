@@ -52,7 +52,10 @@ Do not build and upload files by hand.
    and push the tag. The workflow refuses a tag whose commit is not on
    `main`, that differs from `VERSION`, or that is not an annotated tag SSH-signed by a key in
    `.github/allowed_signers` (checked with `scripts/verify-release-tag.sh`). Verify locally
-   first: `scripts/verify-release-tag.sh vX.Y.Z`. To rotate or add the release key, change
+   first: `scripts/verify-release-tag.sh vX.Y.Z`; the workflow also passes the built commit
+   (`scripts/verify-release-tag.sh TAG .github/allowed_signers "$GITHUB_SHA"`), requires the signed
+   tag object's own name to equal `TAG`, and refuses a tag that does not point directly at that
+   commit. Locally, pass the commit you expect as the third argument. To rotate or add the release key, change
    `.github/allowed_signers` in a pull request to `main` and merge it before creating the tag;
    the workflow reads the copy at the tagged commit. The `v0.5.7` lab prerelease was an
    annotated unsigned tag because no SSH/GPG key was available; it is not signed and would now

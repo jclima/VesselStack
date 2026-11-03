@@ -130,7 +130,9 @@ flow. **`install.sh` and `vesselstackctl update` do not verify signatures** of t
 tarball or directory they are given. On the boat, this recipe uses
 the sha256 recorded at build time (section 2) and the recorded commit. Release tags are
 SSH-signed, and the release workflow refuses any tag that `scripts/verify-release-tag.sh` does
-not accept against `.github/allowed_signers`; owners can run the same check on a clone.
+not accept against `.github/allowed_signers` (signature, the tag object's own name, and the exact
+commit the workflow builds); owners can run the same check on a clone, passing the commit recorded
+in section 2 as the optional third argument.
 
 ### Signing key in 1Password (recommended)
 
@@ -244,7 +246,11 @@ git merge-base --is-ancestor v0.6.0^{commit} origin/main
 ```
 
 Then verify the signature with `scripts/verify-release-tag.sh v0.6.0` and claim success only
-for a tag that passes it. Follow the tag-creation and signing gates in
+for a tag that passes it. When you have the commit recorded from the build output in section 2
+(`commit <sha>`, kept in your notes), bind the tag to it:
+`scripts/verify-release-tag.sh v0.6.0 .github/allowed_signers "$RECORDED_COMMIT"` (full SHA;
+abbreviations are refused). Do not take the value from `git rev-parse v0.6.0^{commit}`, which
+would only compare the tag with itself. Follow the tag-creation and signing gates in
 [DEVELOPMENT.md](DEVELOPMENT.md#release-checklist).
 
 ## 2. Cut and build
@@ -612,7 +618,7 @@ secrets. `vesselstack-update --rollback BACKUP_DIRECTORY` is only for code-only
 
 ## 7. Acceptance checklist
 
-- [ ] Release `v0.6.0`: tag signature verified (`scripts/verify-release-tag.sh v0.6.0`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
+- [ ] Release `v0.6.0`: tag signature verified (`scripts/verify-release-tag.sh v0.6.0 .github/allowed_signers "$RECORDED_COMMIT"`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
 - [ ] Lab: 48 h+ soak with daily `doctor` healthy; replay data visible in Grafana.
 - [ ] Lab: update from 0.3.0, backup/verify/restore, and offline install rehearsed.
 - [ ] Boat: sha256 of the carried tarball equals the recorded value.

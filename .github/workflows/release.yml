@@ -56,7 +56,9 @@ jobs:
           git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
           # The allowed signers file is the copy at the tagged commit, which the previous
           # step requires to be on main (changes to it need a reviewed pull request).
-          scripts/verify-release-tag.sh "$TAG" .github/allowed_signers
+          # GITHUB_SHA is the commit checked out and built below; the tag must point at
+          # exactly it, and the tag object's own name must equal $TAG.
+          scripts/verify-release-tag.sh "$TAG" .github/allowed_signers "$GITHUB_SHA"
       - name: Build and verify release files
         run: |
           VESSELSTACK_BUILD_REQUIRE_CLEAN=true ./build-package.sh
