@@ -36,7 +36,7 @@ Check the account and rollout first:
   your account.
 - Sign up or check your account at the [VesselTwin home page](https://www.vesseltwin.io/).
   Use the home page rather than bookmarking a direct signup route.
-- In VesselTwin, open **Settings > Integrations > SignalK**. If that entry is not
+- In VesselTwin, open **Settings > Integrations > Signal K**. If that entry is not
   available there, stop and ask about access before installing the plugin.
 - The upstream plugin currently requires **Node.js 20.3 or newer** and a
   **Signal K 2.x** server. Those are upstream requirements, not a promise that
@@ -176,7 +176,7 @@ VesselTwin. Remove or revoke the boat connection there as a separate step.
 | What you see | What to check |
 |---|---|
 | The Appstore has no VesselTwin entry | Confirm Signal K and Node requirements, then follow the [upstream install instructions](https://github.com/jclima/signalk-vesseltwin#install) for the actual managed configuration directory. |
-| Pairing is unavailable or account access is denied | Recheck **Settings > Integrations > SignalK** and the account plan/rollout. A paid plan does not by itself prove access is enabled. |
+| Pairing is unavailable or account access is denied | Recheck **Settings > Integrations > Signal K** and the account plan/rollout. A paid plan does not by itself prove access is enabled. |
 | It says paired, but no readings arrive | Confirm the master switch, the desired category switches, and the instance filters. Pairing alone sends nothing. |
 | A new engine, battery, or tank is missing | Check that Signal K is publishing a current value under a selected instance id, then save the plugin settings and wait for the next value. |
 | Values arrive but are not in the record | Open **Sensor channels** in VesselTwin, map each channel to equipment, and **Confirm** it. |

@@ -2,8 +2,10 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest published release and the default
-branch. Pre-release builds may change without compatibility guarantees.
+Security fixes are provided for the newest published release (the highest version
+number, whether or not GitHub marks it Latest or as a prerelease) and for the default
+branch. Older releases, including 0.4.x, receive no fixes: update to the newest release.
+Pre-release builds may change without compatibility guarantees.
 
 ## Reporting a vulnerability
 

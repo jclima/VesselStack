@@ -22,6 +22,7 @@ const state = {
   installedVersion: "unknown",
   runningVersion: "unknown",
   releaseCheckedAt: "",
+  rollbackPath: "",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -42,12 +43,32 @@ async function api(path, options = {}) {
   return payload;
 }
 
+const OPTION_LABELS = {
+  BOAT_UNITS: { us_customary: "US customary", metric: "Metric" },
+  SIGNALK_MODE: { docker: "Docker (built-in)", existing: "Existing server", native: "Native (on this Pi)" },
+  PROVIDER: { "": "None", local: "Local (built-in)", codex_cli: "Codex CLI", claude_cli: "Claude CLI", openai: "OpenAI", vercel: "Vercel AI Gateway", bedrock: "Amazon Bedrock", google: "Google Gemini", ollama: "Ollama", openai_compatible: "OpenAI-compatible API" },
+};
+const optionLabel = (key, choice) => {
+  const table = OPTION_LABELS[key] || (key.startsWith("BOAT_CHAT_") && key.endsWith("PROVIDER") ? OPTION_LABELS.PROVIDER : null);
+  return (table && table[choice]) || choice || "None";
+};
+const OPERATION_NAMES = {
+  apply: "Apply configuration", install: "Install and start", preflight: "Preflight check", backup: "Backup",
+  "bootstrap-history": "Provision history", update: "Reviewed release update", "update-release": "Release update",
+  "restart-panel": "Control Panel restart", start: "Start", stop: "Stop", restart: "Restart",
+};
+const operationName = (label) => OPERATION_NAMES[label] || String(label || "Operation");
+const componentName = (component) => String(component.label || component.id || "").replace(/^Signalk\b/, "Signal K");
+const LIVE_DATA_NOTE = "Live instrument data will pause briefly.";
+
 function toast(message, isError = false) {
   const node = $("#toast");
-  node.textContent = message;
+  $("#toast-text").textContent = message;
   node.className = isError ? "show error" : "show";
+  $("#toast-close").hidden = !isError;
   clearTimeout(node.timer);
-  node.timer = setTimeout(() => { node.className = ""; }, 4200);
+  // Errors stay until dismissed; confirmations fade on their own.
+  if (!isError) node.timer = setTimeout(() => { node.className = ""; }, 4200);
 }
 
 function setConnected(connected) {
@@ -71,6 +92,8 @@ function lock() {
   state.pendingOperation = null;
   state.lastOperationId = null;
   state.bootId = null;
+  state.rollbackPath = "";
+  $("#toast").className = "";
   $("#config-form").innerHTML = "";
   $("#operation-output").textContent = "No operation has run in this session.";
   $("#operation-state").textContent = "Idle";
@@ -128,8 +151,8 @@ function renderReleases(data) {
   state.releases = Array.isArray(data.releases) ? data.releases.filter((release) => Number.isInteger(release.id) && release.tag && release.version && release.name && releaseUrl(release.html_url)) : [];
   $("#release-versions").textContent = `Installed: ${state.installedVersion} · Running: ${state.runningVersion} · Checked ${state.releaseCheckedAt}`;
   $("#release-warning").hidden = data.channel !== "lab";
-  $("#release-warning").textContent = data.channel === "lab" ? "Lab releases are for testing. Read the release notes before installing." : "";
-  $("#release-select").innerHTML = state.releases.length ? state.releases.map((release) => `<option value="${release.id}">${escapeHtml(release.version)} — ${escapeHtml(release.name)}${release.prerelease ? " (prerelease)" : ""}</option>`).join("") : "<option>No newer releases available</option>";
+  $("#release-warning").textContent = data.channel === "lab" ? "Early test (lab) releases are for testing. Read the release notes before installing." : "";
+  $("#release-select").innerHTML = state.releases.length ? state.releases.map((release) => `<option value="${escapeHtml(release.id)}">${escapeHtml(release.version)} — ${escapeHtml(release.name)}${release.prerelease ? " (early test release)" : ""}</option>`).join("") : "<option>No newer releases available</option>";
   updateReleaseControls();
   updateReleaseDetail();
 }
@@ -175,7 +198,7 @@ function operationSucceeded(operation) {
 async function installSelectedRelease() {
   const release = selectedRelease();
   if (!release || state.busy) return;
-  if (isConfigDirty() && !window.confirm("Configuration has unsaved edits. Save them first; installation will not discard them.")) return;
+  if (isConfigDirty() && !window.confirm("You have unsaved configuration edits. They will be kept but not applied by this update. Continue?")) return;
   if (!window.confirm(`Back up and install ${release.version}? Services and this panel may be interrupted, and a writable backup mount is required.`)) return;
   startOperation({ action: "update-release", release_id: release.id, channel: state.releaseChannel });
 }
@@ -239,7 +262,7 @@ function renderComponents(components) {
   const query = state.componentQuery.toLowerCase();
   const filtered = state.components.filter((component) => {
     const availability = component.enabled ? "enabled" : "available";
-    const haystack = `${component.label || component.id} ${component.description || ""}`.toLowerCase();
+    const haystack = `${componentName(component)} ${component.description || ""}`.toLowerCase();
     return (state.componentFilter === "all" || state.componentFilter === availability) && (!query || haystack.includes(query));
   });
   const active = state.components.filter((item) => item.enabled && statusClass(item.state) === "active").length;
@@ -250,10 +273,10 @@ function renderComponents(components) {
     const stateLabel = escapeHtml(component.state || "unknown");
     const availabilityLabel = disabled ? "available" : "enabled";
     const componentId = escapeHtml(component.id);
-    const componentLabel = escapeHtml(component.label);
+    const componentLabel = escapeHtml(componentName(component));
     const description = escapeHtml(component.description || (component.kind === "container" ? "Docker Compose service" : "Host systemd service"));
     let actions;
-    const fallbackSections = { "signalk-native": "SignalK", socketcan: "SignalK", firewall: "Network", "ais-catcher": "AIS" };
+    const fallbackSections = { "signalk-native": "Signal K", socketcan: "Signal K", firewall: "Network", "ais-catcher": "AIS" };
     const configureSection = component.section || fallbackSections[component.id];
     const configure = configureSection ? `<button data-configure-section="${escapeHtml(configureSection)}">Configure</button>` : "";
     const controls = `<button data-component="${componentId}" data-verb="start" data-config-disabled="${disabled}" ${disabled ? "disabled" : ""}>Start</button><button data-component="${componentId}" data-verb="restart" data-config-disabled="${disabled}" ${disabled ? "disabled" : ""}>Restart</button><button data-component="${componentId}" data-verb="stop" data-config-disabled="${disabled}" ${disabled ? "disabled" : ""}>Stop</button>`;
@@ -368,31 +391,32 @@ function groupFields(fields) {
 
 function fieldMarkup(spec, value) {
   const id = `setting-${spec.key}`;
-  const help = spec.description ? `<small>${spec.description}</small>` : "";
+  const help = spec.description ? `<small id="${id}-help">${escapeHtml(spec.description)}</small>` : "";
+  const described = spec.description ? ` aria-describedby="${id}-help"` : "";
   const source = spec.source === "chat" ? "Boat Chat" : "VesselStack";
   const sourceNote = `<span class="field-source">${source}${spec.read_only ? " · read-only" : ""}</span>`;
   let input;
   if (spec.kind === "select") {
-    input = `<select id="${id}" name="${spec.key}" data-read-only="${spec.read_only}" ${spec.read_only ? "disabled" : ""}>${spec.choices.map((choice) => `<option value="${choice}" ${choice === value ? "selected" : ""}>${choice || "None"}</option>`).join("")}</select>`;
+    input = `<select id="${id}" name="${spec.key}" data-read-only="${spec.read_only}"${described} ${spec.read_only ? "disabled" : ""}>${spec.choices.map((choice) => `<option value="${escapeHtml(choice)}" ${choice === value ? "selected" : ""}>${escapeHtml(optionLabel(spec.key, choice))}</option>`).join("")}</select>`;
   } else if (spec.kind === "boolean") {
-    input = `<select id="${id}" name="${spec.key}" data-read-only="${spec.read_only}" ${spec.read_only ? "disabled" : ""}><option value="false" ${value !== "true" ? "selected" : ""}>Disabled</option><option value="true" ${value === "true" ? "selected" : ""}>Enabled</option></select>`;
+    input = `<select id="${id}" name="${spec.key}" data-read-only="${spec.read_only}"${described} ${spec.read_only ? "disabled" : ""}><option value="false" ${value !== "true" ? "selected" : ""}>Disabled</option><option value="true" ${value === "true" ? "selected" : ""}>Enabled</option></select>`;
   } else {
     const type = spec.kind === "secret" ? "password" : ["number", "port"].includes(spec.kind) ? "number" : "text";
     const shown = spec.kind === "secret" ? "" : escapeHtml(value || "");
     const placeholder = spec.kind === "secret" && value?.configured ? "Configured — leave blank to keep" : "";
     const numeric = spec.kind === "number" ? 'step="any"' : spec.kind === "port" ? 'step="1" min="1" max="65535"' : "";
-    input = `<input id="${id}" name="${spec.key}" type="${type}" data-read-only="${spec.read_only}" value="${shown}" placeholder="${placeholder}" ${numeric} ${spec.read_only ? "disabled" : ""}>`;
+    input = `<input id="${id}" name="${spec.key}" type="${type}" data-read-only="${spec.read_only}"${described} value="${shown}" placeholder="${placeholder}" ${numeric} ${spec.read_only ? "disabled" : ""}>`;
   }
   const clear = spec.kind === "secret" && value?.configured && !spec.read_only
     ? `<label class="clear-secret"><input type="checkbox" data-clear-secret="${spec.key}"> Clear stored value</label>`
     : "";
-  return `<div class="field ${spec.kind}"><label for="${id}">${spec.label}${sourceNote}</label>${input}${clear}${help}</div>`;
+  return `<div class="field ${spec.kind}"><label for="${id}">${escapeHtml(spec.label)}${sourceNote}</label>${input}${clear}${help}</div>`;
 }
 
 function renderConfiguration(config) {
   const sections = groupFields(config.fields);
   $("#config-form").innerHTML = Object.entries(sections).map(([name, fields]) => `
-    <section class="config-section"><h3>${name}</h3><div class="field-grid">${fields.map((spec) => fieldMarkup(spec, config.values[spec.key])).join("")}</div></section>
+    <section class="config-section"><h3>${escapeHtml(name)}</h3><div class="field-grid">${fields.map((spec) => fieldMarkup(spec, config.values[spec.key])).join("")}</div></section>
   `).join("");
   $("#config-form").oninput = () => updateConfigStatus();
   $("#config-form").onchange = () => updateConfigStatus();
@@ -438,7 +462,10 @@ function isConfigDirty() {
 
 function updateConfigStatus() {
   const dirty = isConfigDirty();
-  $("#config-status").textContent = dirty ? "Unsaved changes" : "All changes saved";
+  const rollback = state.rollbackPath ? ` Rollback copy of the previous configuration: ${state.rollbackPath}` : "";
+  $("#config-status").textContent = (dirty ? "Unsaved changes." : "All changes saved.") + rollback;
+  $("#config-status").classList.toggle("dirty", dirty);
+  $("#apply-config").disabled = dirty || state.busy || state.saving;
   $("#save-config").disabled = !dirty || state.busy || state.saving;
   $("#discard-config").disabled = !dirty || state.busy || state.saving;
 }
@@ -470,6 +497,8 @@ async function saveConfiguration() {
     if (session !== state.session || !state.token) return;
     state.config = result.configuration;
     renderConfiguration(state.config);
+    if (result.backup) state.rollbackPath = result.backup;
+    updateConfigStatus();
     toast(result.backup ? `Configuration saved. Rollback copy: ${result.backup}` : "Configuration saved. Apply it when ready.");
   } catch (error) {
     if (session !== state.session || !state.token) return;
@@ -493,7 +522,7 @@ async function startOperation(payload) {
     if (session !== state.session || !state.token) return;
     if (state.pendingOperation) state.pendingOperation.operationId = operation.id ?? null;
     renderOperation(operation);
-    toast(`Started: ${operation.label}`);
+    toast(`${operationName(operation.label)} started. Progress appears in the operation log below.`);
     refreshStatus();
   } catch (error) {
     if (session !== state.session || !state.token) return;
@@ -516,7 +545,9 @@ function runAction(action, extra = {}) {
   const confirmations = {
     install: "Install and start the configured VesselStack components?",
     apply: "Apply the saved configuration to the installed system?",
-    stop: "Stop the managed VesselStack services? The control panel will remain available.",
+    start: `Start the managed VesselStack services? ${LIVE_DATA_NOTE}`,
+    restart: `Restart the managed VesselStack services? ${LIVE_DATA_NOTE}`,
+    stop: "Stop the managed VesselStack services? The Control Panel will remain available.",
     update: "Create a backup and apply this reviewed release? The panel and services may be interrupted, and a writable backup mount is required.",
   };
   if (confirmations[action] && !window.confirm(confirmations[action])) return;
@@ -524,8 +555,12 @@ function runAction(action, extra = {}) {
 }
 
 function runComponent(component, action) {
-  if (action === "remove" && !window.confirm(`Remove ${component}? Existing data is preserved, but integrations may stop working.`)) return;
-  if (action === "stop" && !window.confirm(`Stop ${component}?`)) return;
+  const known = state.components.find((item) => item.id === component);
+  const name = known ? componentName(known) : component;
+  if (action === "remove" && !window.confirm(`Remove ${name}? Existing data is preserved, but integrations may stop working.`)) return;
+  if (action === "stop" && !window.confirm(`Stop ${name}? ${LIVE_DATA_NOTE}`)) return;
+  if (action === "restart" && !window.confirm(`Restart ${name}? ${LIVE_DATA_NOTE}`)) return;
+  if (action === "start" && !window.confirm(`Start ${name}? ${LIVE_DATA_NOTE}`)) return;
   startOperation({ component, action });
 }
 
@@ -546,9 +581,23 @@ $("#login-form").addEventListener("submit", (event) => {
   unlock();
 });
 $$('[data-tab]').forEach((button) => button.addEventListener("click", () => {
-  $$('[data-tab]').forEach((item) => item.classList.toggle("active", item === button));
+  $$('[data-tab]').forEach((item) => {
+    const selected = item === button;
+    item.classList.toggle("active", selected);
+    item.setAttribute("aria-selected", String(selected));
+    item.tabIndex = selected ? 0 : -1;
+  });
   $$('.tab-panel').forEach((panel) => { panel.hidden = panel.id !== button.dataset.tab; });
 }));
+$$('[data-tab]').forEach((button, index, tabs) => button.addEventListener("keydown", (event) => {
+  const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+  if (!step) return;
+  event.preventDefault();
+  const target = tabs[(index + step + tabs.length) % tabs.length];
+  target.click();
+  target.focus();
+}));
+$("#toast-close").addEventListener("click", () => { $("#toast").className = ""; });
 $$('[data-action]').forEach((button) => button.addEventListener("click", () => runAction(button.dataset.action)));
 $("#refresh").addEventListener("click", refreshStatus);
 $("#save-config").addEventListener("click", saveConfiguration);
@@ -558,16 +607,20 @@ $("#check-releases").addEventListener("click", checkReleases);
 $("#include-lab").addEventListener("change", checkReleases);
 $("#release-select").addEventListener("change", updateReleaseDetail);
 $("#install-release").addEventListener("click", installSelectedRelease);
-$("#restart-panel").addEventListener("click", () => { if (window.confirm("Restart the control panel? The panel will briefly disconnect.")) startOperation({ action: "restart-panel" }); });
+$("#restart-panel").addEventListener("click", () => { if (window.confirm("Restart the Control Panel? The panel will briefly disconnect.")) startOperation({ action: "restart-panel" }); });
 $("#lock").addEventListener("click", lock);
 $("#component-search").addEventListener("input", (event) => { state.componentQuery = event.target.value; renderComponents(state.components); });
 $$('[data-component-filter]').forEach((button) => button.addEventListener("click", () => {
   state.componentFilter = button.dataset.componentFilter;
-  $$('[data-component-filter]').forEach((item) => item.classList.toggle("active", item === button));
+  $$('[data-component-filter]').forEach((item) => {
+    item.classList.toggle("active", item === button);
+    item.setAttribute("aria-pressed", String(item === button));
+  });
   renderComponents(state.components);
 }));
-$$('[data-tab]').forEach((button) => button.addEventListener("click", () => {
-  if (button.dataset.tab === "configuration" && state.config) setTimeout(() => $("#config-form input:not([disabled]), #config-form select:not([disabled])")?.focus(), 0);
+$$('[data-tab]').forEach((button) => button.addEventListener("click", (event) => {
+  // Only a pointer click moves focus into the form; keyboard tab navigation stays on the tab.
+  if (button.dataset.tab === "configuration" && state.config && event.detail > 0) setTimeout(() => $("#config-form input:not([disabled]), #config-form select:not([disabled])")?.focus(), 0);
 }));
 
 window.addEventListener("beforeunload", (event) => { if (isConfigDirty()) { event.preventDefault(); event.returnValue = ""; } });

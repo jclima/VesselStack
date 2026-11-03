@@ -13,7 +13,7 @@ CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosqui
 
 DEFAULTS = {
  "SIGNALK_VESSELTWIN_PRELOAD":"true",
- "BOAT_NAME":"My Boat","BOAT_TYPE":"Motor vessel","BOAT_MMSI":"","BOAT_CALLSIGN":"","BOAT_LOA_M":"","BOAT_BEAM_M":"","BOAT_TIMEZONE":"UTC","BOAT_UNITS":"metric",
+ "BOAT_NAME":"My Boat","BOAT_TYPE":"Motor vessel","BOAT_MMSI":"","BOAT_CALLSIGN":"","BOAT_LOA_M":"","BOAT_BEAM_M":"","BOAT_TIMEZONE":"UTC","BOAT_UNITS":"us_customary",
  "VESSELSTACK_USER":"boat","VESSELSTACK_UID":"1000","VESSELSTACK_GID":"1000","VESSELSTACK_ROOT":"/opt/vesselstack","VESSELSTACK_DATA":"/opt/vesselstack-data","VESSELSTACK_BACKUP":"/media/vesselstack-backup/backups",
  "SIGNALK_MODE":"docker","SIGNALK_VERSION":"v2.27.0","SIGNALK_URL":"http://127.0.0.1:3000","SOCKETCAN_ENABLE":"false","VESSELSTACK_CAN_CREATE_VCAN":"false","SOCKETCAN_INTERFACE":"can0","SOCKETCAN_BITRATE":"250000",
  "AIS_ENABLE":"false","AIS_IMAGE":"ghcr.io/jvde-github/ais-catcher:v0.70","AIS_DEVICE":"/dev/bus/usb","AIS_CATCHER_ARGS":"-q -N 8100 -S 5011","AIS_WEB_PORT":"8100","AIS_TCP_PORT":"5011",
@@ -53,6 +53,7 @@ def validate(values):
         result[key]=value
     result["VESSELSTACK_DISABLED_COMPONENTS"] = normalize_disabled_components(result["VESSELSTACK_DISABLED_COMPONENTS"])
     if result["SIGNALK_MODE"] not in {"existing","docker","native"}: raise ValueError("Invalid SignalK mode")
+    if result["BOAT_UNITS"] not in {"us_customary","metric"}: raise ValueError("Invalid BOAT_UNITS: use us_customary or metric")
     if _any_ip(result["CONTROL_PANEL_HOST"]): raise ValueError("Invalid CONTROL_PANEL_HOST: enter an IP address")
     for key in ("SIGNALK_VESSELTWIN_PRELOAD","SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","NODE_EXPORTER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT"):
         if result[key] not in {"true","false"}: raise ValueError(f"Invalid boolean for {key}")
@@ -275,7 +276,7 @@ SECTIONS=[
  {"title":"Your boat","intro":"Names shown in dashboards and Boat Chat. Everything stays on this Raspberry Pi.","fields":[
   F("BOAT_NAME","Boat name","Shown in dashboards and Boat Chat. Letters, digits, spaces, dot, underscore, hyphen.",required=True,check=_re(r"[A-Za-z0-9_. -]{1,60}","Letters, digits, spaces, dot, underscore and hyphen only (up to 60).")),
   F("BOAT_TYPE","Boat type","For example Motor vessel, Sailing yacht, Catamaran. Free text.",required=True),
-  F("BOAT_UNITS","Units","How speeds, depths and distances are shown.","choice",choices=[("metric","metres, km/h, degrees C"),("us_customary","feet, mph, degrees F"),("nautical","knots, nautical miles, metres/fathoms")]),
+  F("BOAT_UNITS","Units","How depths, temperatures, pressures and volumes are shown. Speeds stay in knots and distances in nautical miles either way.","choice",choices=[("us_customary","feet, degrees F, psi, US gallons"),("metric","metres, degrees C, kPa, litres")]),
   F("BOAT_TIMEZONE","Timezone","Used for timestamps, daily summaries and charts. Detected from this computer when possible.",required=True,check=_timezone,hint=lambda s:"Detected from this computer: "+s.facts["timezone"] if s.facts.get("timezone") else None),
   F("@details","Add optional vessel details (MMSI, call sign, length, beam)?","All of these are optional and private: they are stored only in the root-only configuration on this Pi, never sent anywhere, and only used to label your own data (for example to recognise your own vessel in AIS). Skip them if unsure.","gate",
     default=lambda s:any(s.values[k] for k in ("BOAT_MMSI","BOAT_CALLSIGN","BOAT_LOA_M","BOAT_BEAM_M"))),

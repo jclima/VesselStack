@@ -513,13 +513,42 @@ def public_settings() -> dict[str, Any]:
     return payload
 
 
-def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
-    # Reject the whole request before writing anything: a newline/CR/NUL in a value
-    # would inject extra KEY=VALUE lines into the env file read by the services.
+# Settings that must never be saved as a blank string: the server, chat budget and
+# provider routing cannot run without a value. An explicit None is still an intentional
+# "reset to the built-in default" and keeps its existing semantics.
+REQUIRED_SETTING_KEYS = (
+    "BOAT_CHAT_PROVIDER",
+    "BOAT_CHAT_MODEL",
+    "BOAT_CHAT_MAX_TOKENS",
+    "BOAT_CHAT_CONTEXT_CHARS",
+    "BOAT_CHAT_HOST",
+    "BOAT_CHAT_PORT",
+)
+
+
+def validate_settings_update(updates: dict[str, Any]) -> None:
+    """Reject the whole request before anything is written."""
     for key, value in updates.items():
-        if key in SETTING_KEYS and value is not None:
-            if any(char in str(value) for char in ("\n", "\r", "\x00")):
-                raise ValueError(f"{key} contains unsupported characters")
+        if key not in SETTING_KEYS:
+            continue
+        if value is not None and any(char in str(value) for char in ("\n", "\r", "\x00")):
+            # A newline/CR/NUL would inject extra KEY=VALUE lines into the env file.
+            raise ValueError(f"{key} contains unsupported characters")
+        if key == "BOAT_CHAT_ACCESS_TOKEN" and access_token_required() and (value is None or not str(value).strip()):
+            # Clearing the code would lock out every API client (the Settings page never sends blanks).
+            raise ValueError("The access code cannot be cleared; set a new one instead.")
+        if key in REQUIRED_SETTING_KEYS:
+            if value is not None and not str(value).strip():
+                raise ValueError(f"{key} is required and cannot be blank")
+    for key in ("BOAT_CHAT_PORT", "BOAT_CHAT_MAX_TOKENS", "BOAT_CHAT_CONTEXT_CHARS"):
+        if key in updates and updates[key] is not None:
+            text = str(updates[key]).strip()
+            if not (text.isascii() and text.isdigit()) or int(text) < 1 or (key == "BOAT_CHAT_PORT" and int(text) > 65535):
+                raise ValueError(f"{key} must be a positive whole number" + (" up to 65535" if key == "BOAT_CHAT_PORT" else ""))
+
+
+def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
+    validate_settings_update(updates)
     with env_config.locked(ENV_CONFIG):
         current = parse_env_config()
         for key, value in updates.items():
@@ -5265,6 +5294,17 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
         return token_matches(provided, token)
 
+    def settings_access_header_allowed(self) -> bool:
+        """Access code sent in X-Boat-Chat-Access-Token, so one request can carry both
+        the access code and the admin code (X-Boat-Chat-Token) when they differ."""
+        token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
+        provided = (self.headers.get("X-Boat-Chat-Access-Token") or "").strip()
+        return bool(token) and bool(provided) and token_matches(provided, token)
+
+    def settings_read_allowed(self) -> bool:
+        """GET/HEAD /api/settings: the access code in either header, like POST."""
+        return self.access_allowed() or self.settings_access_header_allowed()
+
     def sensitive_access_allowed(self) -> bool:
         if not access_token_required():
             return True
@@ -5369,7 +5409,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             )
             return
         elif path == "/api/settings":
-            if not self.access_allowed():
+            if not self.settings_read_allowed():
                 self.send_json(401, {"error": "invalid or missing X-Boat-Chat-Token header"}); return
             self.send_json(200, public_settings())
             return
@@ -5392,7 +5432,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path in {"/health", "/api/settings"}:
-            self.send_response(401 if path == "/api/settings" and not self.access_allowed() else 200)
+            self.send_response(401 if path == "/api/settings" and not self.settings_read_allowed() else 200)
             self.end_headers()
             return
         self.send_static(self.static_target(path), include_body=False)
@@ -5414,6 +5454,10 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 return
         if path == "/api/settings":
             try:
+                # Same access check as GET /api/settings, then the admin (write) check.
+                if not self.settings_read_allowed():
+                    self.send_json(401, {"error": "invalid or missing X-Boat-Chat-Token header"})
+                    return
                 allowed, reason = self.settings_write_allowed()
                 if not allowed:
                     self.send_json(403, {"error": reason})

@@ -41,13 +41,13 @@ installer. `-t` gives the session a terminal so the installer can ask questions:
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
 ```
 
-The `latest/download` URL follows the latest stable release. The lab prerelease
-`v0.5.7` is not selected by that URL; use its explicit pinned URL or
-`--version 0.5.7` only when following the lab and offline-release instructions
-in [DEPLOYMENT.md](DEPLOYMENT.md).
+The URL pins release `v0.6.0`, so it installs that release whatever GitHub marks as Latest
+(`--version 0.6.0` selects the same release). The form `.../releases/latest/download/get-vesselstack.sh`
+points to whichever release GitHub marks Latest, which is not necessarily the newest one. For a
+lab Pi and an offline boat, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 
 The script checks the host first. It asks before installing missing Debian
 packages or Docker Engine and Compose v2 from Docker's official apt repository,
@@ -64,7 +64,8 @@ provider credentials.
 
 ![Example VesselStack preflight review](images/wizard-preflight.png)
 
-*Example of a preflight review; your host checks and values may differ.*
+*The optional browser wizard's preflight page, as an example. The terminal questions are the
+default path, and the wording, host checks and values may differ.*
 
 ## How to access it
 
@@ -89,9 +90,11 @@ ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI
 
 Then open `http://127.0.0.1:8780` and enter the token. Do not expose port 8780 directly to the
 internet. Exact ports, LAN presets, firewall behavior, token storage, and
-rollback are documented in the [main README reference](../README.md#quick-start-one-command-on-the-raspberry-pi).
+rollback are documented in [Network access and security](NETWORK.md) and the
+[Control Panel guide](CONTROL_PANEL.md).
 
-For a deliberate trusted-LAN setup, preview and apply only the panel listener:
+The SSH tunnel is the recommended default. Direct panel access from the boat network is an
+opt-in choice: for a deliberate trusted-LAN setup, preview and apply only the panel listener:
 `sudo vesselstackctl panel-access lan --dry-run`, then
 `sudo vesselstackctl panel-access lan`. This is unencrypted HTTP on all
 interfaces; a strict firewall may still block it. Roll back with
@@ -108,7 +111,7 @@ the offline installer cannot fetch them. Before leaving the lab, verify that
 the matching offline bundle contains every required Python dependency and
 container image.
 
-Follow [DEPLOYMENT.md](DEPLOYMENT.md) for the signed release workflow, offline
+Follow [DEPLOYMENT.md](DEPLOYMENT.md) for the pinned release workflow, offline
 bundle verification, dock-side update, and rollback. Internet is not required
 for the local Signal K/history/dashboard stack once its images and packages
 are present. It may still be required by an explicitly selected remote Boat
@@ -119,7 +122,7 @@ For a fresh offline managed Docker install, the default
 installed while online. If the plugin is absent, set
 `SIGNALK_VESSELTWIN_PRELOAD=false` in the carried configuration before
 installing offline; you can preload it later while online, and enabling,
-pairing, and readings remain separate owner choices. Native SignalK is
+pairing, and readings remain separate owner choices. Native Signal K is
 unsupported offline. If `DISPLAYS_ENABLE=true`, provision the displays bridge
 virtual environment on that Pi while it is online, or set
 `DISPLAYS_ENABLE=false`. See the
@@ -135,7 +138,7 @@ publish vessel positions, MMSIs, call signs, device identifiers, telemetry
 databases, backups, logs, or environment files.
 
 An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
-and explicit reading opt-ins. Managed Docker/native SignalK installs preload the
+and explicit reading opt-ins. Managed Docker/native Signal K installs preload the
 pinned plugin package by default; that preload does not enable the plugin, pair
 the account, or authorize readings. Consult the
 [VesselTwin integration guide](VESSELTWIN.md)
@@ -144,11 +147,12 @@ logbook records.
 
 ## If something goes wrong
 
-Start with the read-only checks in [Troubleshooting](README.md#troubleshooting):
+Start with the read-only checks in [Troubleshooting](../README.md#troubleshooting):
 `sudo vesselstackctl status`, `sudo vesselstackctl doctor`, and `sudo vesselstackctl urls`,
 then inspect the relevant service logs. Stop before changing CAN or boot settings if `can0` is
 missing. For release failures, use the deployment backup and rollback path;
 do not delete `/opt/vesselstack-data` while investigating.
 
 For deeper manual setup, every variable, port, service, security note, and
-rollback command remains in the [full README reference](../README.md#quick-start-one-command-on-the-raspberry-pi).
+rollback command remains in the [full README reference](../README.md#4-configure-the-vessel) and
+[Network access and security](NETWORK.md).

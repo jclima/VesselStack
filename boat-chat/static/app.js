@@ -5,9 +5,7 @@ if (new URLSearchParams(window.location.search).get("embedded") === "ha") {
 const form = document.querySelector("#chat-form");
 const input = document.querySelector("#message");
 const messages = document.querySelector("#messages");
-const context = document.querySelector("#context-json");
-const contextSummary = document.querySelector("#context-summary");
-const contextDrawer = document.querySelector(".context-drawer");
+const announcer = document.querySelector("#sr-announcer");
 const status = document.querySelector("#status");
 const routeStatus = document.querySelector("#route-status");
 const settingsDialog = document.querySelector("#settings-dialog");
@@ -96,6 +94,27 @@ answerMode.value = localStorage.getItem("boatChatAnswerMode") || "concise";
 answerMode.addEventListener("change",()=>localStorage.setItem("boatChatAnswerMode",answerMode.value));
 let activeController = null;
 let progressTimer = null;
+const CHAT_TIMEOUT_MS = 180000;
+
+function announce(text) {
+  // Separate polite live region: the conversation itself is not live, so restored
+  // history and the per-second counter are never read out.
+  announcer.textContent = "";
+  window.setTimeout(() => { announcer.textContent = text; }, 60);
+}
+function accessCode() { try { return sessionStorage.getItem("boatChatAccessToken") || ""; } catch { return ""; } }
+function describeHttpError(status, data) {
+  if (status === 401) return "Access code needed or not accepted. Choose Connect.";
+  if (status === 429) return "Too many requests. Wait a minute, then try again.";
+  return (data && typeof data.error === "string" && data.error) || `The boat returned an error (HTTP ${status}).`;
+}
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => null);
+  if (!response.ok) { const error = new Error(describeHttpError(response.status, data)); error.status = response.status; throw error; }
+  if (data === null) throw new Error("The boat returned a response that could not be read.");
+  return data;
+}
 
 function appendInline(parent, text) {
   // Deliberately small text-only markup parser. Never interpret model HTML.
@@ -160,6 +179,18 @@ function setStatus(text, state = "ready") {
   status.classList.toggle("is-busy", state === "busy");
   status.classList.toggle("is-error", state === "error");
 }
+// The header chip reports the same sources as the Overview (/health plus the boat
+// status request), so the two can never contradict each other.
+let healthState = "unknown";
+function refreshConnectionStatus() {
+  if (activeController) return;
+  if (accessTokenRequired && !accessCode()) setStatus("Not connected", "error");
+  else if (connectionState === "offline" || healthState === "offline") setStatus("Offline", "error");
+  else if (healthState === "limited") setStatus("Limited data", "error");
+  else if (connectionState === "connected" && lastBoatStatus) {
+    if (isStatusOutdated()) setStatus("Status outdated", "busy"); else setStatus("Connected");
+  } else setStatus("Checking…", "busy");
+}
 
 function providerName(value) {
   return providerLabels[value] || value || "none";
@@ -173,35 +204,6 @@ function setRoute(provider, fallbackProvider, models) {
     : primaryText;
   routeStatus.textContent = route;
   routeStatus.title = route;
-}
-
-function summarizeContext(payload) {
-  if (!payload || typeof payload !== "object" || !Object.keys(payload).length) {
-    return "No request yet";
-  }
-  const keys = Object.keys(payload).filter((key) => payload[key] !== undefined && payload[key] !== null);
-  const useful = keys.filter((key) => !["context_profile", "question"].includes(key));
-  const count = useful.length || keys.length;
-  return payload.evidence?.length ? `${payload.evidence.length} evidence item${payload.evidence.length === 1 ? "" : "s"}` : `${count} detail${count === 1 ? "" : "s"}`;
-}
-
-function setContext(payload) {
-  context.replaceChildren();
-  if (!payload) {
-    context.textContent = "No request yet.";
-    contextSummary.textContent = "No request yet";
-    contextDrawer.hidden = true;
-    return;
-  }
-  contextDrawer.hidden = false;
-  const list = document.createElement("ul"); list.className = "evidence-list";
-  (payload.evidence || []).forEach((item) => {
-    const row = document.createElement("li"); const label = document.createElement("strong"); const detail = document.createElement("span");
-    label.textContent = item.label; detail.textContent = item.detail; row.append(label, detail); list.appendChild(row);
-  });
-  if (!(payload.evidence || []).length) list.textContent = "No additional evidence details for this answer.";
-  context.appendChild(list);
-  contextSummary.textContent = summarizeContext(payload);
 }
 
 function setBusy(isBusy) {
@@ -224,22 +226,38 @@ let lastStatusReceived = 0;
 let connectionState = "disconnected";
 let accessTokenRequired = false;
 const connectDialog = document.querySelector("#connect-dialog");
-function showView(view) { document.body.dataset.view = view; }
+function showView(view) {
+  document.body.dataset.view = view;
+  [["overview", "#overview-open"], ["chat", "#chat-open"]].forEach(([name, selector]) => {
+    const button = document.querySelector(selector);
+    button.setAttribute("aria-pressed", String(view === name));
+    if (view === name) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+  });
+}
 function updateAccessControls() {
   const connectButton = document.querySelector("#connect-open");
   connectButton.hidden = !accessTokenRequired;
   if (!accessTokenRequired && connectDialog.open) connectDialog.close();
 }
+function statusSeconds() {
+  if (!lastBoatStatus) return null;
+  const age = lastBoatStatus.age_seconds;
+  const elapsed = Math.floor((Date.now() - lastStatusReceived) / 1000);
+  return age == null ? null : age + elapsed;
+}
+function isStatusOutdated() {
+  const seconds = statusSeconds();
+  return seconds == null || seconds > 600 || connectionState !== "connected";
+}
 function ageText() {
   const output = document.querySelector("#observation-age");
   if (!lastBoatStatus) return;
-  const age = lastBoatStatus.age_seconds;
-  const elapsed = Math.floor((Date.now() - lastStatusReceived) / 1000);
-  const seconds = age == null ? null : age + elapsed;
-  const outdated = seconds == null || seconds > 600 || connectionState !== "connected";
+  const seconds = statusSeconds();
+  const outdated = isStatusOutdated();
   output.textContent = `${connectionState === "offline" ? "Connection lost — retained observations. " : ""}${seconds == null ? "Observation time unavailable" : `Snapshot collected ${Math.floor(seconds / 60)} min ago`}. ${outdated ? "Outdated or incomplete — refresh before relying on it." : "Individual sensors may report less often."}`;
   document.querySelector("#owner-overview").dataset.outdated = String(outdated);
   if (outdated) document.querySelector("#boat-condition").textContent = "Status needs refreshing";
+  refreshConnectionStatus();
 }
 function renderBoatStatus(data) {
   lastBoatStatus = data; lastStatusReceived = Date.now();
@@ -272,33 +290,35 @@ function clearDeviceStatus(message) {
   document.querySelector("#owner-attention").textContent="Boat status has not been checked.";
   document.querySelector("#owner-system").textContent="Connect to check system status.";
   insightsContent.replaceChildren(); document.querySelector("#connect-open").textContent="Connect"; updateAccessControls();
+  refreshConnectionStatus();
 }
 async function loadBoatStatus() {
   if(statusBusy) return;
-  const token=sessionStorage.getItem("boatChatAccessToken") || "";
+  const token=accessCode();
   if(accessTokenRequired && !token) { connectionState="disconnected"; clearDeviceStatus("Connect this device to view boat observations."); return; }
   statusBusy=true;
   try {
     const response=await fetch("/api/status",{headers:{"X-Boat-Chat-Token":token},signal:AbortSignal.timeout(10000)});
-    if(response.status===401) { accessTokenRequired=true; updateAccessControls(); connectionState="disconnected"; clearDeviceStatus("Access token rejected. Choose Connect to sign in again."); return; }
+    if(response.status===401) { accessTokenRequired=true; updateAccessControls(); connectionState="disconnected"; clearDeviceStatus("Access code not accepted. Choose Connect to sign in again."); return; }
     if(!response.ok) throw new Error(`HTTP ${response.status}`);
     connectionState="connected"; renderBoatStatus(await response.json());
   } catch(error) {
     connectionState="offline";
     if(lastBoatStatus) ageText();
-    else { clearDeviceStatus("Cannot reach the boat. Check your boat Wi-Fi or ZeroTier connection, then refresh."); document.querySelector("#boat-condition").textContent="Boat connection unavailable"; }
-  } finally { statusBusy=false; }
+    else { clearDeviceStatus("Cannot reach the boat. Check that you are on the boat Wi-Fi or connected through your remote-access VPN, then refresh."); document.querySelector("#boat-condition").textContent="Boat connection unavailable"; }
+  } finally { statusBusy=false; refreshConnectionStatus(); }
 }
 document.querySelector("#overview-open").addEventListener("click",()=>{showView("overview");loadBoatStatus();});
 document.querySelector("#chat-open").addEventListener("click",()=>{showView("chat");input.focus();});
 document.querySelector("#refresh-status").addEventListener("click",loadBoatStatus);
-document.querySelector("#connect-open").addEventListener("click",()=>connectDialog.showModal());
+function openConnect() { connectDialog.showModal(); document.querySelector("#connect-token").focus(); }
+document.querySelector("#connect-open").addEventListener("click",openConnect);
 document.querySelector("#connect-close").addEventListener("click",()=>connectDialog.close());
 document.querySelector("#disconnect-device").addEventListener("click",()=>{sessionStorage.removeItem("boatChatAccessToken");connectionState="disconnected";clearDeviceStatus("Device disconnected.");connectDialog.close();});
 document.querySelector("#connect-form").addEventListener("submit",async(event)=>{
   event.preventDefault(); const field=document.querySelector("#connect-token"); const token=field.value.trim(); const message=document.querySelector("#connect-message"); message.textContent="Checking access…";
   try { const response=await fetch("/api/status",{headers:{"X-Boat-Chat-Token":token},signal:AbortSignal.timeout(10000)});
-    if(!response.ok) throw new Error(response.status===401 ? "Token not accepted. Check the Boat Chat access token and try again." : "Boat status is unavailable. Try again.");
+    if(!response.ok) throw new Error(response.status===401 ? "Access code not accepted. Check the Boat Chat access code and try again." : "Boat status is unavailable. Try again.");
     const data=await response.json(); sessionStorage.setItem("boatChatAccessToken",token); field.value=""; connectionState="connected";renderBoatStatus(data);message.textContent="";connectDialog.close();
   } catch(error) { message.textContent=error.message; }
 });
@@ -316,9 +336,9 @@ function hubCard(title, wide = false) {
 }
 
 async function saveMaintenance(task) {
-  const token=sessionStorage.getItem("boatChatAccessToken") || "";
-  const response=await fetch("/api/maintenance",{method:"POST",headers:{"Content-Type":"application/json","X-Boat-Chat-Token":token},body:JSON.stringify(task)});
-  const data=await response.json(); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); await loadInsights();
+  const token=accessCode();
+  await fetchJson("/api/maintenance",{method:"POST",headers:{"Content-Type":"application/json","X-Boat-Chat-Token":token},body:JSON.stringify(task)});
+  await loadInsights();
 }
 
 function alertSignature(data) {
@@ -330,7 +350,7 @@ function processProactiveAlerts(data) {
   localStorage.setItem("boatChatAlertSignature",signature);
   if (previous !== null && signature && signature !== previous && localStorage.getItem("boatChatBrowserAlerts")==="on" && Notification.permission==="granted") {
     const warnings=(data.alerts || []).filter((item)=>item.severity!=="ok");
-    new Notification("VesselStack boat alert",{body:warnings.map((item)=>`${item.label}: ${item.value}`).join(" · "),tag:"boat-health",renotify:true});
+    new Notification("Boat Chat alert",{body:warnings.map((item)=>`${item.label}: ${item.value}`).join(" · "),tag:"boat-health",renotify:true});
   }
 }
 
@@ -346,35 +366,58 @@ function addAisRadar(card, ais) {
   if (!targets.length) { const empty=document.createElement("p"); empty.className="empty-state"; empty.textContent=ais?.error ? `AIS unavailable: ${ais.error}` : "No positioned AIS targets nearby."; card.appendChild(empty); return; }
   const range=Math.max(1,Math.min(10,Math.ceil(Math.max(...targets.map((item)=>Number(item.distance_nm))))));
   const svg=document.createElementNS("http://www.w3.org/2000/svg","svg"); svg.classList.add("radar"); svg.setAttribute("viewBox","0 0 300 300"); svg.setAttribute("role","img"); svg.setAttribute("aria-label",`${targets.length} AIS targets within ${range} nautical miles`);
-  [50,100,140].forEach((radius)=>{const circle=document.createElementNS(svg.namespaceURI,"circle"); circle.setAttribute("cx","150"); circle.setAttribute("cy","150"); circle.setAttribute("r",String(radius)); circle.setAttribute("fill","none"); circle.setAttribute("stroke","#bdd0d2"); circle.setAttribute("stroke-width","1"); svg.appendChild(circle);});
-  const own=document.createElementNS(svg.namespaceURI,"circle"); own.setAttribute("cx","150"); own.setAttribute("cy","150"); own.setAttribute("r","6"); own.setAttribute("fill","currentColor"); svg.appendChild(own);
-  targets.forEach((target)=>{const angle=(Number(target.bearing_deg)-90)*Math.PI/180; const radius=Math.min(136,(Number(target.distance_nm)/range)*136); const dot=document.createElementNS(svg.namespaceURI,"circle"); dot.setAttribute("cx",String(150+Math.cos(angle)*radius)); dot.setAttribute("cy",String(150+Math.sin(angle)*radius)); dot.setAttribute("r",target.position_stale ? "3" : "5"); dot.setAttribute("fill",target.position_stale ? "#d98a17" : "#176b70"); const title=document.createElementNS(svg.namespaceURI,"title"); title.textContent=`${target.name || "Unknown"}: ${target.distance_nm} nm`; dot.appendChild(title); svg.appendChild(dot);}); card.appendChild(svg);
+  [50,100,140].forEach((radius)=>{const circle=document.createElementNS(svg.namespaceURI,"circle"); circle.setAttribute("class","radar-ring"); circle.setAttribute("cx","150"); circle.setAttribute("cy","150"); circle.setAttribute("r",String(radius)); svg.appendChild(circle);});
+  const own=document.createElementNS(svg.namespaceURI,"circle"); own.setAttribute("class","radar-own"); own.setAttribute("cx","150"); own.setAttribute("cy","150"); own.setAttribute("r","6"); svg.appendChild(own);
+  targets.forEach((target)=>{const angle=(Number(target.bearing_deg)-90)*Math.PI/180; const radius=Math.min(136,(Number(target.distance_nm)/range)*136); const dot=document.createElementNS(svg.namespaceURI,"circle"); dot.setAttribute("cx",String(150+Math.cos(angle)*radius)); dot.setAttribute("cy",String(150+Math.sin(angle)*radius)); dot.setAttribute("r",target.position_stale ? "3" : "5"); dot.setAttribute("class",target.position_stale ? "radar-target is-stale" : "radar-target"); const title=document.createElementNS(svg.namespaceURI,"title"); title.textContent=`${target.name || "Unknown"}: ${target.distance_nm} nm`; dot.appendChild(title); svg.appendChild(dot);}); card.appendChild(svg);
   const list=document.createElement("ol"); list.className="ais-list"; targets.slice(0,5).forEach((target)=>{const row=document.createElement("li"); row.textContent=`${target.name || "Unknown"} · ${target.distance_nm} nm · ${target.bearing_deg}°${target.position_stale ? " · stale" : ""}`; list.appendChild(row);}); card.appendChild(list);
 }
 
 function downloadTripReport(trip) {
-  const lines=["VesselStack trip report",`Window: ${trip.start_local} to ${trip.stop_local}`,`Duration: ${trip.duration_minutes ?? "unknown"} minutes`,"",trip.trip_summary || "No summary recorded."];
-  const blob=new Blob([`${lines.join("\n")}\n`],{type:"text/plain"}); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download=`theoffice-trip-${(trip.start_local || "report").slice(0,10)}.txt`; link.click(); URL.revokeObjectURL(url);
+  const lines=["Boat trip report",`Window: ${trip.start_local} to ${trip.stop_local}`,`Duration: ${trip.duration_minutes ?? "unknown"} minutes`,"",trip.trip_summary || "No summary recorded."];
+  const blob=new Blob([`${lines.join("\n")}\n`],{type:"text/plain"}); const url=URL.createObjectURL(blob); const link=document.createElement("a"); link.href=url; link.download=`vesselstack-trip-${(trip.start_local || "report").slice(0,10)}.txt`; link.click(); URL.revokeObjectURL(url);
 }
 
+function dueLabel(status) { return status === "overdue" ? "Overdue" : status === "soon" ? "Due soon" : ""; }
+
 async function loadInsights() {
-  const token=sessionStorage.getItem("boatChatAccessToken") || "";
-  insightsContent.textContent="Loading boat insights…";
+  const token=accessCode();
+  insightsContent.textContent="Loading Boat Hub…";
   if (accessTokenRequired && !token) { insightsContent.textContent="Choose Connect to sign in to this device and view your trips and maintenance."; return; }
   try {
-    const response=await fetch("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); const data=await response.json();
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); insightsContent.replaceChildren();
+    const data=await fetchJson("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); insightsContent.replaceChildren();
     const alerts=hubCard(`Boat · ${data.status.condition}`); const alertList=document.createElement("ul"); alertList.className="alert-list";
-    data.alerts.forEach((item)=>{const row=document.createElement("li"); row.className="alert-row"; row.dataset.severity=item.severity; const label=document.createElement("span"); label.className="alert-label"; const dot=document.createElement("i"); dot.className="alert-dot"; const name=document.createElement("span"); name.textContent=item.label; label.append(dot,name); const value=document.createElement("strong"); value.textContent=item.value; row.append(label,value); alertList.appendChild(row);}); alerts.appendChild(alertList); const enableAlerts=document.createElement("button"); enableAlerts.type="button"; enableAlerts.className="alert-opt-in"; enableAlerts.textContent=localStorage.getItem("boatChatBrowserAlerts")==="on" ? "Browser alerts enabled" : "Enable browser alerts"; enableAlerts.addEventListener("click",()=>enableBrowserAlerts(enableAlerts)); alerts.appendChild(enableAlerts); processProactiveAlerts(data);
+    data.alerts.forEach((item)=>{const row=document.createElement("li"); row.className="alert-row"; row.dataset.severity=item.severity; const label=document.createElement("span"); label.className="alert-label"; const dot=document.createElement("i"); dot.className="alert-dot"; dot.setAttribute("aria-hidden","true"); const name=document.createElement("span"); name.textContent=item.label; label.append(dot,name); const value=document.createElement("strong"); const level=document.createElement("span"); level.className="sr-only"; level.textContent=`${item.severity}: `; value.append(level,document.createTextNode(item.value)); row.append(label,value); alertList.appendChild(row);}); alerts.appendChild(alertList); const enableAlerts=document.createElement("button"); enableAlerts.type="button"; enableAlerts.className="alert-opt-in"; enableAlerts.textContent=localStorage.getItem("boatChatBrowserAlerts")==="on" ? "Browser alerts enabled" : "Enable browser alerts"; enableAlerts.addEventListener("click",()=>enableBrowserAlerts(enableAlerts)); alerts.appendChild(enableAlerts); processProactiveAlerts(data);
     const trip=hubCard("Last recorded trip");
     if (data.trip) { const summary=document.createElement("p"); summary.textContent=data.trip.trip_summary || `${data.trip.start_local} to ${data.trip.stop_local}`; const actions=document.createElement("div"); actions.className="trip-actions"; const askTrip=document.createElement("button"); askTrip.type="button"; askTrip.textContent="Analyze trip"; askTrip.addEventListener("click",()=>{insightsDialog.close();ask("Give me a detailed report for the last trip");}); const download=document.createElement("button"); download.type="button"; download.textContent="Download report"; download.addEventListener("click",()=>downloadTripReport(data.trip)); actions.append(askTrip,download); trip.append(summary,actions); } else { const empty=document.createElement("p"); empty.className="empty-state"; empty.textContent="No recorded trip window is available yet."; trip.appendChild(empty); }
     const position=hubCard("Vessel position");
-    if (data.position) { const coords=document.createElement("strong"); coords.textContent=data.position.label; const note=document.createElement("p"); note.className="empty-state"; note.textContent="Kept local; no coordinates are sent to a map provider."; position.append(coords,note); } else { const empty=document.createElement("p"); empty.className="empty-state"; empty.textContent="Position is not present in the cached SignalK snapshot."; position.appendChild(empty); }
+    if (data.position) { const coords=document.createElement("strong"); coords.textContent=data.position.label; const note=document.createElement("p"); note.className="empty-state"; note.textContent="Kept local; no coordinates are sent to a map provider."; position.append(coords,note); } else { const empty=document.createElement("p"); empty.className="empty-state"; empty.textContent="Position is not present in the latest Signal K data."; position.appendChild(empty); }
     const ais=hubCard(`Nearby AIS · ${data.ais?.target_count || 0}`,true); addAisRadar(ais,data.ais);
     const maintenance=hubCard(`Maintenance · ${data.maintenance_counts?.open || 0} open${data.maintenance_counts?.overdue ? ` · ${data.maintenance_counts.overdue} overdue` : ""}`,true); const list=document.createElement("ul"); list.className="maintenance-list";
+    const maintenanceError=document.createElement("p"); maintenanceError.className="form-error"; maintenanceError.setAttribute("role","alert"); maintenanceError.hidden=true;
+    const showMaintenanceError=(error)=>{ maintenanceError.textContent=`Could not save: ${error.message}`; maintenanceError.hidden=false; };
     if (!data.maintenance.length) { const empty=document.createElement("li"); empty.className="empty-state"; empty.textContent="No maintenance tasks yet."; list.appendChild(empty); }
-    data.maintenance.forEach((task)=>{const row=document.createElement("li"); row.className="maintenance-row"; row.dataset.due=task.due_status; const check=document.createElement("input"); check.type="checkbox"; check.checked=task.completed; check.addEventListener("change",()=>saveMaintenance({...task,completed:check.checked})); const copy=document.createElement("span"); copy.className="maintenance-copy"; const titleText=document.createElement("strong"); titleText.textContent=`${task.title}${task.due_date ? ` · due ${task.due_date}` : ""}`; copy.appendChild(titleText); if(task.notes){const note=document.createElement("small"); note.textContent=task.notes; copy.appendChild(note);} const edit=document.createElement("button"); edit.type="button"; edit.textContent="Notes"; edit.addEventListener("click",()=>{const notes=window.prompt("Maintenance notes",task.notes || ""); if(notes!==null) saveMaintenance({...task,notes});}); row.append(check,copy,edit); list.appendChild(row);});
-    const addForm=document.createElement("form"); addForm.className="maintenance-form"; const title=document.createElement("input"); title.required=true; title.placeholder="New maintenance task"; const due=document.createElement("input"); due.type="date"; const add=document.createElement("button"); add.type="submit"; add.textContent="Add task"; addForm.append(title,due,add); addForm.addEventListener("submit",async(event)=>{event.preventDefault(); add.disabled=true; try { await saveMaintenance({title:title.value,due_date:due.value}); } catch(error) { window.alert(error.message); add.disabled=false; }}); maintenance.append(list,addForm);
+    data.maintenance.forEach((task)=>{
+      const row=document.createElement("li"); row.className="maintenance-row"; row.dataset.due=task.due_status;
+      const check=document.createElement("input"); check.type="checkbox"; check.checked=task.completed; check.setAttribute("aria-label",`Mark done: ${task.title}`);
+      check.addEventListener("change",async()=>{ maintenanceError.hidden=true; check.disabled=true; try { await saveMaintenance({...task,completed:check.checked}); } catch(error) { check.checked=!check.checked; check.disabled=false; showMaintenanceError(error); } });
+      const copy=document.createElement("span"); copy.className="maintenance-copy"; const titleText=document.createElement("strong"); titleText.textContent=`${task.title}${task.due_date ? ` · due ${task.due_date}` : ""}`;
+      if (dueLabel(task.due_status)) { const badge=document.createElement("span"); badge.className="due-badge"; badge.textContent=dueLabel(task.due_status); titleText.appendChild(badge); }
+      copy.appendChild(titleText); if(task.notes){const note=document.createElement("small"); note.textContent=task.notes; copy.appendChild(note);}
+      const edit=document.createElement("button"); edit.type="button"; edit.textContent="Notes"; edit.setAttribute("aria-label",`Edit notes: ${task.title}`);
+      edit.addEventListener("click",()=>{
+        if (copy.querySelector(".inline-form")) return;
+        const noteForm=document.createElement("form"); noteForm.className="inline-form";
+        const noteInput=document.createElement("input"); noteInput.value=task.notes || ""; noteInput.setAttribute("aria-label",`Maintenance notes for ${task.title}`);
+        const saveNote=document.createElement("button"); saveNote.type="submit"; saveNote.textContent="Save notes";
+        const cancelNote=document.createElement("button"); cancelNote.type="button"; cancelNote.textContent="Cancel"; cancelNote.addEventListener("click",()=>noteForm.remove());
+        noteForm.addEventListener("submit",async(event)=>{ event.preventDefault(); maintenanceError.hidden=true; saveNote.disabled=true; try { await saveMaintenance({...task,notes:noteInput.value}); } catch(error) { saveNote.disabled=false; showMaintenanceError(error); } });
+        noteForm.append(noteInput,saveNote,cancelNote); copy.appendChild(noteForm); noteInput.focus();
+      });
+      row.append(check,copy,edit); list.appendChild(row);
+    });
+    const addForm=document.createElement("form"); addForm.className="maintenance-form"; const title=document.createElement("input"); title.required=true; title.placeholder="New maintenance task"; title.setAttribute("aria-label","New maintenance task"); const due=document.createElement("input"); due.type="date"; due.setAttribute("aria-label","Due date (optional)"); const add=document.createElement("button"); add.type="submit"; add.textContent="Add task"; addForm.append(title,due,add);
+    addForm.addEventListener("submit",async(event)=>{event.preventDefault(); maintenanceError.hidden=true; add.disabled=true; try { await saveMaintenance({title:title.value,due_date:due.value}); } catch(error) { showMaintenanceError(error); add.disabled=false; }});
+    maintenance.append(list,addForm,maintenanceError);
     insightsContent.append(alerts,trip,position,ais,maintenance);
   } catch(error) { insightsContent.textContent=`Boat Hub unavailable: ${error.message}`; }
 }
@@ -383,28 +426,39 @@ function addFeedbackControls(messageElement, requestId, question, feedbackSessio
   if (!requestId) return;
   const controls = document.createElement("div");
   controls.className = "feedback-controls";
+  const noteForm = document.createElement("form"); noteForm.className = "inline-form"; noteForm.hidden = true;
+  const noteInput = document.createElement("input"); noteInput.placeholder = "What could be improved? (optional)"; noteInput.setAttribute("aria-label", "What could be improved? (optional)");
+  const noteSend = document.createElement("button"); noteSend.type = "submit"; noteSend.textContent = "Send feedback";
+  const noteCancel = document.createElement("button"); noteCancel.type = "button"; noteCancel.textContent = "Cancel";
+  const noteError = document.createElement("p"); noteError.className = "form-error"; noteError.setAttribute("role", "alert"); noteError.hidden = true;
+  noteForm.append(noteInput, noteSend, noteCancel);
+  let pendingRating = "";
+  async function sendFeedback(rating, note, button) {
+    const token = accessCode();
+    const headers = {"Content-Type":"application/json"};
+    if (token) headers["X-Boat-Chat-Token"] = token;
+    button.disabled = true; noteError.hidden = true;
+    try {
+      const response = await fetch("/api/feedback", {method:"POST", headers, body:JSON.stringify({request_id:requestId, session_id:feedbackSessionId, rating, note})});
+      if (!response.ok) throw new Error("Feedback could not be saved");
+      controls.textContent = "Feedback saved"; noteForm.remove(); noteError.remove();
+    } catch {
+      button.disabled = false; noteError.textContent = "Feedback could not be saved. Try again."; noteError.hidden = false;
+    }
+  }
+  noteForm.addEventListener("submit", (event) => { event.preventDefault(); sendFeedback(pendingRating, noteInput.value.trim(), noteSend); });
+  noteCancel.addEventListener("click", () => { noteForm.hidden = true; noteError.hidden = true; });
   [["Helpful", "helpful"], ["Incomplete", "incomplete"], ["Wrong", "wrong"]].forEach(([label, rating]) => {
     const button = document.createElement("button");
     button.type = "button"; button.textContent = label;
-    button.addEventListener("click", async () => {
-      const token = sessionStorage.getItem("boatChatAccessToken") || "";
-      const headers = {"Content-Type":"application/json"};
-      if (token) headers["X-Boat-Chat-Token"] = token;
-      const note = rating === "helpful" ? "" : (window.prompt("What could be improved? (optional)", "") || "");
-      button.disabled = true;
-      try {
-        const response = await fetch("/api/feedback", {method:"POST", headers, body:JSON.stringify({request_id:requestId, session_id:feedbackSessionId, rating, note})});
-        if (!response.ok) throw new Error("Feedback could not be saved");
-        controls.textContent = "Feedback saved";
-      } catch {
-        button.disabled = false;
-        button.textContent = "Retry feedback";
-      }
+    button.addEventListener("click", () => {
+      if (rating === "helpful") { sendFeedback(rating, "", button); return; }
+      pendingRating = rating; noteForm.hidden = false; noteInput.focus();
     });
     controls.appendChild(button);
   });
   const save=document.createElement("button"); save.type="button"; save.textContent="Save question"; save.addEventListener("click",()=>{saveQuestion(question); save.textContent="Saved";}); controls.appendChild(save);
-  messageElement.appendChild(controls);
+  messageElement.append(controls, noteForm, noteError);
 }
 
 function addMetricCards(messageElement, metrics) {
@@ -441,45 +495,58 @@ async function ask(message) {
   addMessage("user", message);
   const pending = addMessage("assistant", "Waiting for your boat's answer…");
   pending.classList.add("is-pending");
+  const counter = document.createElement("span"); counter.className = "count-hint"; counter.setAttribute("aria-hidden", "true");
+  (pending.querySelector("p") || pending).appendChild(counter);
   setStatus("Working", "busy"); setBusy(true);
+  messages.setAttribute("aria-busy", "true");
   const controller = new AbortController(); activeController = controller;
+  let timedOut = false; let statusIsError = false;
+  const timeoutId = setTimeout(() => { timedOut = true; controller.abort(); }, CHAT_TIMEOUT_MS);
   const began = Date.now();
-  progressTimer = setInterval(() => { pending.textContent = `Waiting for your boat's answer… ${Math.floor((Date.now() - began) / 1000)}s`; }, 1000);
+  progressTimer = setInterval(() => { counter.textContent = ` ${Math.floor((Date.now() - began) / 1000)}s`; }, 1000);
   try {
-    const token = sessionStorage.getItem("boatChatAccessToken") || "";
+    const token = accessCode();
     const headers = {"Content-Type": "application/json"};
     if (token) headers["X-Boat-Chat-Token"] = token;
     const response = await fetch("/api/chat", {method:"POST", headers, signal:controller.signal,
       body:JSON.stringify({message, history, session_id:requestSession, answer_mode:answerMode.value})});
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) { const error = new Error(data.error || `HTTP ${response.status}`); error.status = response.status; throw error; }
-    if (typeof data.answer !== "string" || !data.answer.trim()) throw new Error("The boat returned an empty answer.");
+    const data = await response.json().catch(() => null);
+    if (!response.ok) { const error = new Error((data && data.error) || `HTTP ${response.status}`); error.status = response.status; throw error; }
+    if (!data || typeof data.answer !== "string" || !data.answer.trim()) throw new Error("The boat returned an empty answer.");
     clearInterval(progressTimer);
     pending.classList.remove("is-pending"); pending.replaceChildren(); renderAnswer(pending, data.answer);
     const turn = {role:"assistant", content:data.answer, experience:data.experience || {}, request_id:data.request_id,
       answered_at:new Date().toISOString(), session_id:requestSession};
     decorateAnswer(pending, turn, message);
     conversation.push({role:"user", content:message}, turn); conversation = conversation.slice(-8);
-    setContext(null);
-    setStatus(persistConversation() ? "Answer ready" : "Answer ready · history not saved");
+    const saved = persistConversation();
+    announce(saved ? "Answer ready" : "Answer ready. History could not be saved in this browser.");
     messages.scrollTop = messages.scrollHeight;
   } catch (error) {
     clearInterval(progressTimer); pending.classList.remove("is-pending"); pending.replaceChildren();
-    const cancelled = error.name === "AbortError";
-    const explanation = cancelled ? "Stopped waiting. The boat may still finish processing this question." :
-      error.status === 401 ? "Connect this device to ask questions. Your question is kept below." :
-      error.status === 429 ? "Boat Chat is busy. Wait a moment, then retry." : "Couldn't get an answer. Check your connection and try again.";
+    const cancelled = error.name === "AbortError" && !timedOut;
+    const explanation = timedOut ? "The boat did not answer within 3 minutes. Your question is back in the message box; try again or ask something simpler." :
+      cancelled ? "Stopped waiting. The boat may still finish processing this question. Your question is back in the message box." :
+      error.status === 401 ? "Connect this device to ask questions. Your question is back in the message box." :
+      error.status === 429 ? "Boat Chat is busy. Wait a moment, then try again. Your question is back in the message box." :
+      "Couldn't get an answer. Check your connection and try again. Your question is back in the message box.";
     renderAnswer(pending, explanation);
+    announce(explanation);
+    // Put the question back so nothing typed is lost (unless the user already started a new one).
+    if (!input.value.trim()) { input.value = message; resizeInput(); }
     // A cancelled/failed request can still finish on the server. Isolate its session
     // so that an unseen answer cannot contaminate the next conversational turn.
     sessionId = createSessionId(); sessionStorage.setItem("boatChatSessionId", sessionId);
     const actions = document.createElement("div"); actions.className = "followups";
-    if(error.status === 401) { const connect=document.createElement("button"); connect.type="button"; connect.textContent="Connect"; connect.addEventListener("click",()=>connectDialog.showModal()); actions.appendChild(connect); }
-    const retry=document.createElement("button"); retry.type="button"; retry.textContent="Retry question"; retry.addEventListener("click",()=>ask(message));
-    const edit=document.createElement("button"); edit.type="button"; edit.textContent="Edit question"; edit.addEventListener("click",()=>{input.value=message;resizeInput();input.focus();}); actions.append(retry,edit); pending.appendChild(actions);
-    setStatus(cancelled ? "Stopped waiting" : error.status === 401 ? "Sign-in needed" : "Try again", cancelled ? "ready" : "error");
+    if(error.status === 401) { const connect=document.createElement("button"); connect.type="button"; connect.textContent="Connect"; connect.addEventListener("click",openConnect); actions.appendChild(connect); }
+    const retry=document.createElement("button"); retry.type="button"; retry.textContent="Retry question"; retry.addEventListener("click",()=>{ if (input.value.trim() === message) { input.value = ""; resizeInput(); } ask(message); });
+    actions.appendChild(retry); pending.appendChild(actions);
+    statusIsError = !cancelled;
+    setStatus(timedOut ? "Timed out" : cancelled ? "Stopped waiting" : error.status === 401 ? "Sign-in needed" : "Try again", cancelled ? "ready" : "error");
   } finally {
-    clearInterval(progressTimer); progressTimer = null; activeController = null; setBusy(false);
+    clearTimeout(timeoutId); clearInterval(progressTimer); progressTimer = null; activeController = null; setBusy(false);
+    messages.removeAttribute("aria-busy");
+    if (!statusIsError) refreshConnectionStatus();
   }
 }
 
@@ -488,15 +555,17 @@ cancelButton.addEventListener("click", () => activeController?.abort());
 async function loadHealth() {
   try {
     const response = await fetch("/health");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     accessTokenRequired = data.access_token_required === true;
     updateAccessControls();
-    setStatus(data.ready ? "Connected" : "Limited data", data.ready ? "ready" : "error");
+    healthState = data.ready ? "ready" : "limited";
     setRoute(data.provider || "local", data.fallback_provider || "", data.models || {});
   } catch (error) {
-    setStatus("Offline", "error");
+    healthState = "offline";
     setRoute("local", "", {});
   }
+  refreshConnectionStatus();
 }
 
 function setSettingValue(name, value) {
@@ -605,7 +674,7 @@ function updateProviderSettingsState() {
     const providers = String(section.dataset.providerConfig || "")
       .split(/\s+/)
       .filter(Boolean);
-    section.classList.toggle("is-relevant", providers.includes(primary) || providers.includes(fallback));
+    section.hidden = !(providers.includes(primary) || providers.includes(fallback));
   });
 }
 
@@ -620,15 +689,36 @@ async function loadModelCatalog() {
   }
 }
 
+let settingsLoaded = false;
+let initialSettings = {};
+const REQUIRED_SETTING_LABELS = {
+  BOAT_CHAT_PROVIDER: "Primary provider",
+  BOAT_CHAT_MAX_TOKENS: "Max tokens",
+  BOAT_CHAT_CONTEXT_CHARS: "Context chars",
+  BOAT_CHAT_HOST: "Host",
+  BOAT_CHAT_PORT: "Port",
+};
+
+function currentSettingValues() {
+  const values = {};
+  for (const [key, value] of new FormData(settingsForm).entries()) values[key] = String(value).trim();
+  values.__model = selectedModel("primary");
+  values.__fallbackModel = selectedModel("fallback");
+  return values;
+}
+
 async function loadSettings() {
-  const accessToken = sessionStorage.getItem("boatChatAccessToken") || "";
+  settingsLoaded = false;
+  const accessToken = accessCode();
   const response = await fetch("/api/settings", { headers: accessToken ? { "X-Boat-Chat-Token": accessToken } : {} });
-  const data = await response.json();
+  const data = await response.json().catch(() => null);
   if (response.status === 401) {
-    throw new Error("Connect this device (access token) before opening settings.");
+    const error = new Error("Connect this device with your access code before opening Settings.");
+    error.status = 401;
+    throw error;
   }
-  if (!response.ok) {
-    throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok || !data || typeof data !== "object") {
+    throw new Error((data && data.error) || `The boat returned an error (HTTP ${response.status}).`);
   }
   loadedSettings = data.settings || {};
   const currentSettingsToken = document.querySelector("#setting-current-token");
@@ -670,6 +760,9 @@ async function loadSettings() {
     const key = item.dataset.secret;
     item.textContent = data.secrets?.[key] ? "saved" : "";
   });
+  document.querySelectorAll("#settings-form input[type=password]").forEach((field) => { if (field.name) field.value = ""; });
+  initialSettings = currentSettingValues();
+  settingsLoaded = true;
 }
 
 function settingsToken() {
@@ -678,32 +771,71 @@ function settingsToken() {
   return typed || sessionStorage.getItem("boatChatSettingsToken") || "";
 }
 
+function showSettingsError(message, needsConnect) {
+  settingsForm.dataset.state = "error";
+  document.querySelector("#settings-error").hidden = false;
+  document.querySelector("#settings-error-text").textContent = message;
+  document.querySelector("#settings-connect").hidden = !needsConnect;
+  settingsMessage.textContent = "";
+}
+function showSettingsReady() {
+  settingsForm.dataset.state = "ok";
+  document.querySelector("#settings-error").hidden = true;
+}
+async function openSettings() {
+  settingsMessage.textContent = "";
+  try {
+    await loadModelCatalog();
+    await loadSettings();
+    showSettingsReady();
+  } catch (error) {
+    settingsLoaded = false;
+    showSettingsError(error.status === 401 ? error.message : `Settings could not be loaded: ${error.message}`, error.status === 401);
+  }
+  if (!settingsDialog.open) settingsDialog.showModal();
+}
+
+// Only fields the user actually changed are sent, so an untouched or partly loaded form
+// can never overwrite saved settings with blanks.
+function changedSettings() {
+  const now = currentSettingValues();
+  const settings = {};
+  for (const [key, value] of Object.entries(now)) {
+    if (key.startsWith("__")) continue;
+    if (secretKeys.has(key)) { if (value) settings[key] = value; continue; }
+    if (value === (initialSettings[key] ?? "")) continue;
+    if (value === "" && REQUIRED_SETTING_LABELS[key]) throw new Error(`${REQUIRED_SETTING_LABELS[key]} cannot be blank.`);
+    settings[key] = value === "" ? null : value;
+  }
+  const provider = now.BOAT_CHAT_PROVIDER || "";
+  const primaryKey = primaryModelKey(provider);
+  if (now.__model !== initialSettings.__model || provider !== (initialSettings.BOAT_CHAT_PROVIDER ?? "")) {
+    settings[primaryKey] = now.__model || null;
+    // Clear the generic key so a stale value can't shadow the CLI model.
+    if (primaryKey !== "BOAT_CHAT_MODEL" && loadedSettings.BOAT_CHAT_MODEL) settings.BOAT_CHAT_MODEL = null;
+  }
+  const fallbackProvider = now.BOAT_CHAT_FALLBACK_PROVIDER || "";
+  if (now.__fallbackModel !== initialSettings.__fallbackModel || fallbackProvider !== (initialSettings.BOAT_CHAT_FALLBACK_PROVIDER ?? "")) {
+    settings.BOAT_CHAT_FALLBACK_MODEL = fallbackProvider ? (now.__fallbackModel || null) : null;
+  }
+  return settings;
+}
+
 async function saveSettings(event) {
   event.preventDefault();
+  if (!settingsLoaded) { settingsMessage.textContent = "Settings are not loaded. Close this window and open Settings again."; return; }
+  let settings;
+  try { settings = changedSettings(); } catch (error) { settingsMessage.textContent = error.message; return; }
+  if (!Object.keys(settings).length) { settingsMessage.textContent = "No changes to save."; return; }
   settingsMessage.textContent = "Saving...";
-  const formData = new FormData(settingsForm);
-  const settings = {};
-  for (const [key, value] of formData.entries()) {
-    const text = String(value).trim();
-    if (secretKeys.has(key) && !text) continue;
-    settings[key] = text;
-  }
-
-  const primaryProvider = settings.BOAT_CHAT_PROVIDER || "";
-  const primaryModel = selectedModel("primary");
-  const primaryKey = primaryModelKey(primaryProvider);
-  settings[primaryKey] = primaryModel;
-  if (primaryKey !== "BOAT_CHAT_MODEL") {
-    // Clear the generic key so a stale value can't shadow the CLI model.
-    settings.BOAT_CHAT_MODEL = "";
-  }
-  settings.BOAT_CHAT_FALLBACK_MODEL = settings.BOAT_CHAT_FALLBACK_PROVIDER ? selectedModel("fallback") : "";
 
   const token = settingsToken();
+  const accessToken = accessCode();
   const headers = { "Content-Type": "application/json" };
-  if (token) {
-    headers["X-Boat-Chat-Token"] = token;
-  }
+  // X-Boat-Chat-Token carries the admin code; the access code travels separately so one
+  // request can prove both when they differ.
+  if (token || accessToken) headers["X-Boat-Chat-Token"] = token || accessToken;
+  if (accessToken) headers["X-Boat-Chat-Access-Token"] = accessToken;
 
   try {
     const response = await fetch("/api/settings", {
@@ -711,9 +843,11 @@ async function saveSettings(event) {
       headers,
       body: JSON.stringify({ settings }),
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
+      if (response.status === 401) throw new Error("Access code needed or not accepted. Close Settings and choose Connect.");
+      if (response.status === 403) throw new Error("Settings can only be changed from this device, or with the correct admin code.");
+      throw new Error((data && data.error) || `HTTP ${response.status}`);
     }
     if (settings.BOAT_CHAT_SETTINGS_TOKEN || token) {
       sessionStorage.setItem("boatChatSettingsToken", settings.BOAT_CHAT_SETTINGS_TOKEN || token);
@@ -750,6 +884,8 @@ input.addEventListener("focus", () => {
 });
 
 input.addEventListener("keydown", (event) => {
+  // Enter confirms an IME composition (e.g. Japanese, Chinese); it must not send.
+  if (event.isComposing || event.keyCode === 229) return;
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     const message = input.value.trim();
@@ -767,43 +903,51 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
   });
 });
 
+let clearArmTimer = null;
+function disarmClear() {
+  clearTimeout(clearArmTimer); clearArmTimer = null;
+  clearButton.textContent = "Clear";
+  clearButton.removeAttribute("aria-label");
+}
 clearButton.addEventListener("click", () => {
+  if (conversation.length && !clearArmTimer) {
+    // Two-step confirmation: the second press within 5 seconds clears.
+    clearButton.textContent = "Confirm clear";
+    clearButton.setAttribute("aria-label", "Confirm: clear this conversation");
+    announce("Press Clear again to confirm clearing this conversation.");
+    clearArmTimer = setTimeout(disarmClear, 5000);
+    return;
+  }
+  disarmClear();
   const clearedSession = sessionId;
   sessionId = createSessionId();
   sessionStorage.setItem("boatChatSessionId", sessionId);
   conversation = [];
   sessionStorage.removeItem("boatChatConversation");
-  const token = sessionStorage.getItem("boatChatAccessToken") || "";
+  const token = accessCode();
   const headers = {"Content-Type":"application/json"};
   if (token) headers["X-Boat-Chat-Token"] = token;
   fetch("/api/session/clear", {method:"POST", headers, body:JSON.stringify({session_id:clearedSession})}).catch(() => {});
   messages.replaceChildren();
-  setContext(null);
   addWelcomeMessage();
+  announce("Conversation cleared");
   input.focus();
 });
 
 document.querySelector("#capabilities-open").addEventListener("click", async () => {
-  capabilitiesContent.textContent = "Loading capabilities…"; capabilitiesDialog.showModal();
-  try { const data=await (await fetch("/api/capabilities")).json(); capabilitiesContent.replaceChildren(); data.groups.forEach((group)=>{ const section=document.createElement("section"); section.className="capability-group"; const title=document.createElement("h2"); title.textContent=group.name; const prompts=document.createElement("div"); prompts.className="capability-prompts"; group.prompts.forEach((prompt)=>{ const button=document.createElement("button"); button.type="button"; button.textContent=prompt; button.addEventListener("click",()=>{capabilitiesDialog.close(); ask(prompt);}); prompts.appendChild(button); }); section.append(title,prompts); capabilitiesContent.appendChild(section); }); } catch(error) { capabilitiesContent.textContent="Capabilities are unavailable."; }
+  capabilitiesContent.textContent = "Loading the list of things you can ask…"; capabilitiesDialog.showModal();
+  try { const data=await fetchJson("/api/capabilities"); capabilitiesContent.replaceChildren(); data.groups.forEach((group)=>{ const section=document.createElement("section"); section.className="capability-group"; const title=document.createElement("h2"); title.textContent=group.name; const prompts=document.createElement("div"); prompts.className="capability-prompts"; group.prompts.forEach((prompt)=>{ const button=document.createElement("button"); button.type="button"; button.textContent=prompt; button.addEventListener("click",()=>{capabilitiesDialog.close(); ask(prompt);}); prompts.appendChild(button); }); section.append(title,prompts); capabilitiesContent.appendChild(section); }); } catch(error) { capabilitiesContent.textContent=`The list of things you can ask is unavailable: ${error.message}`; }
 });
 document.querySelector("#capabilities-close").addEventListener("click",()=>capabilitiesDialog.close());
 document.querySelector("#insights-open").addEventListener("click",()=>{insightsDialog.showModal();loadInsights();});
 document.querySelector("#maintenance-open").addEventListener("click",()=>{insightsDialog.showModal();loadInsights();});
 document.querySelector("#insights-close").addEventListener("click",()=>insightsDialog.close());
 
-setInterval(async()=>{if(localStorage.getItem("boatChatBrowserAlerts")!=="on") return; const token=sessionStorage.getItem("boatChatAccessToken")||""; if(accessTokenRequired && !token) return; try {const response=await fetch("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); if(response.ok) processProactiveAlerts(await response.json());} catch(error) { /* Retry on the next interval. */ }},60000);
+setInterval(async()=>{if(localStorage.getItem("boatChatBrowserAlerts")!=="on") return; const token=accessCode(); if(accessTokenRequired && !token) return; try {const response=await fetch("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); if(response.ok) processProactiveAlerts(await response.json());} catch(error) { /* Retry on the next interval. */ }},60000);
 
-document.querySelector("#settings-open").addEventListener("click", async () => {
-  settingsMessage.textContent = "";
-  try {
-    await loadModelCatalog();
-    await loadSettings();
-  } catch (error) {
-    settingsMessage.textContent = `Load failed: ${error.message}`;
-  }
-  settingsDialog.showModal();
-});
+document.querySelector("#settings-open").addEventListener("click", openSettings);
+document.querySelector("#settings-retry").addEventListener("click", openSettings);
+document.querySelector("#settings-connect").addEventListener("click", () => { settingsDialog.close(); openConnect(); });
 
 document.querySelector("#settings-close").addEventListener("click", () => {
   settingsDialog.close();
@@ -837,12 +981,25 @@ function addWelcomeMessage() {
   }
   addMessage(
     "assistant",
-    "Ask about the boat now, investigate a change, or review a trip. I’ll show the evidence with each answer."
+    "Ask about the boat now, look into a change, or review a trip. Each answer shows where its information came from."
   );
 }
 
-setContext(null);
 addWelcomeMessage();
 renderSavedQuestions();
 loadHealth();
 loadBoatStatus();
+
+// Header: on phones everything except the two view toggles lives under "More".
+const moreMenu = document.querySelector(".more-menu");
+const narrowHeader = window.matchMedia("(max-width: 480px)");
+function syncMoreMenu() { moreMenu.open = !narrowHeader.matches; }
+syncMoreMenu();
+narrowHeader.addEventListener("change", syncMoreMenu);
+moreMenu.querySelector(".more-items").addEventListener("click", (event) => {
+  if (narrowHeader.matches && event.target.closest("button")) moreMenu.open = false;
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && narrowHeader.matches && moreMenu.open) { moreMenu.open = false; moreMenu.querySelector("summary").focus(); }
+});
+showView(document.body.dataset.view || "overview");

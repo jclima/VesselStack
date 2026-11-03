@@ -50,7 +50,7 @@ then be updated with the new credential.
 
 Saving settings writes mode-600 configuration atomically but does not restart
 services. Review changes, run **Preflight**, then use **Apply configuration** or
-**Install & start**. Hardware probes and the existing SignalK connectivity
+**Install & start**. Hardware probes and the existing Signal K connectivity
 check still gate installer actions. Listener changes require a shell restart:
 
 ```bash

@@ -2,17 +2,18 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-const source = fs.readFileSync('control-panel/static/app.js', 'utf8') + '\nthis.__ui = { state, statusClass, isConfigDirty, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, updateReleaseControls };';
+const source = fs.readFileSync('control-panel/static/app.js', 'utf8') + '\nthis.__ui = { state, statusClass, isConfigDirty, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, updateReleaseControls, runComponent, runAction, toast, fieldMarkup, optionLabel, updateConfigStatus };';
 const nodes = new Map();
 const node = (id) => nodes.get(id) || nodes.set(id, { value: '', checked: false, disabled: false, textContent: '', hidden: false, className: '', innerHTML: '', classList: { toggle() {} }, addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } }).get(id);
 const fields = {};
 const formControls = [];
 let confirmCalls = 0;
+const confirmMessages = [];
 let fetchImpl = async () => ({ ok: true, json: async () => ({ configuration: context.__ui.state.config }) });
 const context = {
   console, setTimeout: () => 0, clearTimeout() {}, confirm: () => { confirmCalls += 1; return true; },
   sessionStorage: { values: {}, getItem(key) { return this.values[key] || ''; }, setItem(key, value) { this.values[key] = value; }, removeItem(key) { delete this.values[key]; } },
-  window: { addEventListener() {}, confirm: () => { confirmCalls += 1; return true; } },
+  window: { addEventListener() {}, confirm: (message) => { confirmCalls += 1; confirmMessages.push(message); return true; } },
   document: { querySelector: (selector) => node(selector), querySelectorAll: (selector) => selector.includes('#config-form') ? formControls : [] },
   FormData: class { constructor() {} entries() { return Object.entries(fields).filter(([key]) => !formControls.some((control) => control.name === key && control.disabled)); } },
   URL,
@@ -70,6 +71,34 @@ assert.equal(node('#install-release').disabled, true, 'no eligible release keeps
 ui.setBusy(false); assert.equal(node('#install-release').disabled, true, 'setBusy cannot enable install without candidate');
 assert.equal(ui.operationSucceeded({ label: 'backup', state: 'succeeded', output: [] }), true, 'legacy ordinary success without phase is terminal');
 assert.equal(ui.operationSucceeded({ label: 'restart grafana', state: 'succeeded' }), true, 'component restart is not panel restart verification');
+
+// Copy and accessibility polish (pre-0.6.0).
+assert.equal(ui.optionLabel('BOAT_UNITS', 'us_customary'), 'US customary');
+assert.equal(ui.optionLabel('SIGNALK_MODE', 'docker'), 'Docker (built-in)');
+assert.equal(ui.optionLabel('BOAT_CHAT_FALLBACK_PROVIDER', ''), 'None');
+const selectMarkup = ui.fieldMarkup({ key: 'SIGNALK_MODE', label: 'Signal K mode', kind: 'select', choices: ['docker', 'existing'], description: 'Help <b>text</b>', read_only: false }, 'existing');
+assert.match(selectMarkup, /<option value="docker" >Docker \(built-in\)<\/option>/, 'select options show human labels but keep stored values');
+assert.match(selectMarkup, /aria-describedby="setting-SIGNALK_MODE-help"/, 'help text is tied to its control');
+assert.match(selectMarkup, /Help &lt;b&gt;text&lt;\/b&gt;/, 'help text is escaped');
+ui.state.components = [{ id: 'grafana', label: 'Grafana' }, { id: 'signalk', label: 'Signalk' }];
+confirmMessages.length = 0;
+ui.runComponent('signalk', 'restart');
+assert.equal(confirmMessages[0], 'Restart Signal K? Live instrument data will pause briefly.', 'component restart confirms with its human label');
+ui.runComponent('grafana', 'start');
+assert.equal(confirmMessages[1], 'Start Grafana? Live instrument data will pause briefly.');
+ui.runAction('restart');
+assert.match(confirmMessages[2], /Live instrument data will pause briefly\./);
+ui.toast('Something failed', true);
+assert.match(node('#toast').className, /error/);
+assert.equal(node('#toast-close').hidden, false, 'error toast offers a dismiss button and has no auto-hide timer');
+ui.toast('Fine');
+assert.equal(node('#toast-close').hidden, true);
+ui.state.config = { fields: [], values: {} };
+ui.state.rollbackPath = '/opt/backups/vesselstack.env.1';
+ui.updateConfigStatus();
+assert.match(node('#config-status').textContent, /All changes saved\..*\/opt\/backups\/vesselstack\.env\.1/, 'rollback path stays visible in the status line');
+const source_ = fs.readFileSync('control-panel/static/app.js', 'utf8');
+assert.doesNotMatch(source_, /SignalK|Started:/, 'prose uses Signal K and friendly operation text');
 
 (async () => {
   ui.state.token = 'async-token'; ui.state.busy = false; ui.state.operationRunning = false;

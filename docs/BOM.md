@@ -18,6 +18,7 @@ manufacturer instructions before ordering.
 | Network | Ethernet cable preferred; Wi-Fi optional | Use Ethernet for initial setup and stable telemetry where practical. |
 | Backup | Separate USB SSD/flash drive | Must mount outside `VESSELSTACK_DATA`; remove or replicate off-boat periodically. |
 | Optional AIS | Linux-compatible USB AIS receiver and antenna system | VesselStack supports AIS-catcher only when explicitly enabled. |
+| Optional display (preview) | Waveshare ESP32-S3-Touch-LCD-2.8C, one per display | Shows Signal K values from the Pi over MQTT on a 2.8 inch round touch screen. It is separate from the NMEA interface and runs only with `DISPLAYS_ENABLE=true`; see [Instrument displays](DISPLAYS.md). |
 
 ## NMEA interface
 

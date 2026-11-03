@@ -4,19 +4,20 @@ Purpose: first-run access, settings, telemetry refresh, host metrics, and unit a
 
 [Back to README](../README.md) · [Documentation index](README.md)
 
-Open `http://HOST:8765`. Chat requires the access token
+Open `http://HOST:8765`. Chat requires the access code
 (`BOAT_CHAT_ACCESS_TOKEN` in `config/boat-chat.env`) and refuses requests without
 it unless `BOAT_CHAT_ALLOW_OPEN=true` is set. The `local` provider returns gathered context without
 sending it to an external model. Configure an optional provider in Settings.
-Retrieve the settings token locally when needed:
+Retrieve the admin code (the settings token) locally when needed:
 
 ```bash
 sudo grep '^BOAT_CHAT_SETTINGS_TOKEN=' \
   /opt/vesselstack/config/boat-chat.env
 ```
 
-Boat Chat retains this settings credential only for the current browser tab;
-closing the tab clears it.
+Boat Chat retains the access code and admin code only for the current browser tab;
+closing the tab clears them. The web app labels them **Access code** and **Admin code**;
+the environment variable names (`BOAT_CHAT_ACCESS_TOKEN`, `BOAT_CHAT_SETTINGS_TOKEN`) are unchanged.
 
 Boat Chat rejects oversized or malformed API requests and sends defensive
 browser headers while remaining embeddable in the Home Assistant dashboard.
@@ -52,7 +53,7 @@ time so slow model calls cannot exhaust the Raspberry Pi.
 The installer generates `BOAT_CHAT_ACCESS_TOKEN` (random, preserved on
 re-install) and writes it to `config/boat-chat.env`. Chat, feedback, session,
 live status, insights, and maintenance endpoints all require it in the
-`X-Boat-Chat-Token` header; the web UI asks for it through **Connect** and keeps
+`X-Boat-Chat-Token` header; the web UI asks for the access code through **Connect** and keeps
 it only in session storage, and the Telegram bridge sends it automatically. Find
 it with:
 
@@ -63,7 +64,7 @@ sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' /opt/vesselstack/config/boat-chat.env
 An empty token **fails closed**: all of those endpoints return 401. A reviewed,
 trusted installation can opt out by adding `BOAT_CHAT_ALLOW_OPEN=true` to
 `config/boat-chat.env`; this key is deliberately not editable from the Settings
-page. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN` is retired and no longer disables
+page. `BOAT_CHAT_REQUIRE_ACCESS_TOKEN` is retired and does not disable
 protection.
 
 ## Settings and configuration precedence
@@ -80,15 +81,24 @@ the same way (`boat-chat/env_config.py`):
 Saving a value on the Settings page that equals the base value stores no
 override. Saving a Boat Chat field in the control panel removes that key from
 the override file so the new value takes effect, and the panel marks any field
-that is currently overridden. Settings writes require `BOAT_CHAT_SETTINGS_TOKEN`
-from any address; with no settings token they are accepted from loopback only
-(private-LAN addresses are no longer trusted). `TELEGRAM_ALLOWED_CHAT_IDS` is a
+that is currently overridden. `GET` and `POST /api/settings` require the access code.
+Settings writes also require the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) from any
+address; with no admin code they are accepted from loopback only (private-LAN
+addresses are not trusted). The access code goes in `X-Boat-Chat-Token`, or, when it
+differs from the admin code, in the optional `X-Boat-Chat-Access-Token` header while
+`X-Boat-Chat-Token` carries the admin code; `GET`, `HEAD` and `POST` all accept that header.
+The access code cannot be cleared through the API (blank or `null` returns 400) unless
+`BOAT_CHAT_ALLOW_OPEN=true`; set a new one instead. A save that blanks
+`BOAT_CHAT_PROVIDER`, `BOAT_CHAT_MODEL`, `BOAT_CHAT_MAX_TOKENS`, `BOAT_CHAT_CONTEXT_CHARS`,
+`BOAT_CHAT_HOST` or `BOAT_CHAT_PORT`, or gives an invalid number, returns 400. The
+Settings page only opens once the current values have loaded and saves only the fields
+you changed. `TELEGRAM_ALLOWED_CHAT_IDS` is a
 secret setting and is never returned by `GET /api/settings`.
 
 Settings updates are serialized and written atomically. Blank secret fields
 keep the saved value; an explicit JSON `null` stores an empty override so an
-inherited credential cannot reappear. Use the current settings token to
-authenticate a save and the separate replacement field to rotate it. Tokens
+inherited credential cannot reappear. Use the current admin code to
+authenticate a save and the separate replacement field to rotate it. The codes
 remain in this browser tab's session storage. JSON write requests require
 `Content-Type: application/json`; supplied browser origins must match the
 request authority.
@@ -187,7 +197,7 @@ release packages. Settings values containing a newline, carriage return or NUL
 byte are rejected (HTTP 400, nothing written), matching the control panel.
 
 `vesselstackctl urls` reports the **real** bind state of each service from the
-listening sockets (`ss -ltn`), so the host-networked SignalK (always) and Home Assistant
+listening sockets (`ss -ltn`), so the host-networked Signal K (always) and Home Assistant
 (unless limited by `HOMEASSISTANT_BIND_ADDRESS`) show up as listening on every interface
 although their client URLs say `127.0.0.1`. It prints this machine's reachable addresses (`HOSTNAME.local`
 and every non-loopback IPv4 address, ignoring Docker bridges and veth links) as
@@ -225,7 +235,7 @@ descriptor).
 `root:<service group>` mode 0750: the service user can traverse it but cannot
 create, rename, replace or symlink anything directly in it. Only the leaf mount
 roots belong to the accounts that must write them: `influxdb` (uid/gid 1000),
-`grafana` (uid 472, gid 0) and `boat-chat` (service user; native SignalK state
+`grafana` (uid 472, gid 0) and `boat-chat` (service user; native Signal K state
 `signalk` likewise; with `SIGNALK_MODE=docker` `signalk` is uid/gid 1000, the
 `node` user of the signalk-server image, created before `compose up`; a
 root-owned one left by Docker is chowned to 1000:1000 on rerun, non-recursively

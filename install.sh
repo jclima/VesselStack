@@ -381,75 +381,154 @@ if [ "$OFFLINE" = true ]; then
         echo "WARNING: load the images before running with --start or starting services." >&2
     fi
 fi
-PLUGIN_STAGE=
-if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ] && [ "$OFFLINE" = false ] && [ "$DRY_RUN" -eq 0 ]; then
-    PLUGIN_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-signalk-plugin-stage.XXXXXX")
-    chmod 0700 "$PLUGIN_STAGE"
-    trap 'rm -rf -- "$PLUGIN_STAGE"' EXIT
-    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" --mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" \
-        --stage "$PLUGIN_STAGE" --prepare
-fi
-# Everything the MQTT access sync would reject is checked here, read-only and
-# before anything is changed, so a dry run (and "vesselstackctl update", which
-# runs one before taking a backup) fails early instead of partway through.
-# Secrets travel in the child environment only. The release's own tool and
-# compose template are used because the installed copies may be older.
-MOSQUITTO_COMPOSE="$SCRIPT_DIR/templates/compose.yml"
-displays_preflight() {
-    PYTHONDONTWRITEBYTECODE=1 \
-        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="${MQTT_PASSWORD:-}" \
-        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
-        DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
-        DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
-        python3 "$SCRIPT_DIR/displays/displayctl.py" preflight \
-        --root "$VESSELSTACK_ROOT" --compose "$MOSQUITTO_COMPOSE" "$@"
+# Environment-file values. One predicate decides what cannot be written safely so
+# the preflight below and env_line can never disagree.
+# env-line-begin
+vesselstack_env_keys() {
+    cat <<'EOF'
+BOAT_NAME
+BOAT_TYPE
+BOAT_MMSI
+BOAT_CALLSIGN
+BOAT_LOA_M
+BOAT_BEAM_M
+BOAT_TIMEZONE
+BOAT_UNITS
+VESSELSTACK_USER
+VESSELSTACK_UID
+VESSELSTACK_GID
+VESSELSTACK_ROOT
+VESSELSTACK_DATA
+VESSELSTACK_BACKUP
+SIGNALK_MODE
+SIGNALK_VERSION
+SIGNALK_URL
+SIGNALK_VESSELTWIN_PRELOAD
+SOCKETCAN_ENABLE
+SOCKETCAN_INTERFACE
+SOCKETCAN_BITRATE
+VESSELSTACK_CAN_CREATE_VCAN
+AIS_ENABLE
+AIS_IMAGE
+AIS_DEVICE
+AIS_CATCHER_ARGS
+AIS_WEB_PORT
+AIS_TCP_PORT
+VESSELSTACK_DISABLED_COMPONENTS
+VESSELSTACK_UNTRUSTED_INTERFACE
+VESSELSTACK_FIREWALL_ENABLE
+VESSELSTACK_FIREWALL_STRICT
+VESSELSTACK_FIREWALL_ALLOW_TCP
+VESSELSTACK_FIREWALL_ALLOW_UDP
+CONTROL_PANEL_HOST
+CONTROL_PANEL_PORT
+TELEGRAM_ENABLE
+TELEMETRY_INDEXER_ENABLE
+NODE_EXPORTER_ENABLE
+DISPLAYS_ENABLE
+DISPLAYS_BRIDGE_MQTT_USERNAME
+DISPLAYS_SIGNALK_TOKEN
+DISPLAYS_HA_TOKEN
+HOME_ASSISTANT_URL
+HOME_ASSISTANT_TOKEN
+INFLUXDB_URL
+INFLUXDB_PORT
+INFLUXDB_CONTAINER_NAME
+INFLUXDB_ORG
+INFLUXDB_USERNAME
+INFLUXDB_RAW_BUCKET
+INFLUXDB_HISTORY_BUCKET
+INFLUXDB_HOME_ASSISTANT_BUCKET
+INFLUXDB_AIS_BUCKET
+INFLUXDB_RAW_RETENTION
+INFLUXDB_PASSWORD
+INFLUXDB_TOKEN
+GRAFANA_ADMIN_PASSWORD
+GRAFANA_PORT
+HEIMDALL_PORT
+HEIMDALL_HTTPS_PORT
+PROMETHEUS_PORT
+PROMETHEUS_RETENTION
+MQTT_USERNAME
+MQTT_PASSWORD
+MQTT_PORT
+VESSELSTACK_DATA_BIND_ADDRESS
+VESSELSTACK_WEB_BIND_ADDRESS
+HOMEASSISTANT_BIND_ADDRESS
+EOF
+}
+# Keys written to boat-chat.env and control-panel.env beyond the list above.
+extra_env_keys() {
+    printf '%s\n' BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT \
+        BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN CONTROL_PANEL_TOKEN
+}
+# env_value_problem VALUE: prints the reason and returns 0 when VALUE cannot be
+# written. Compose cannot parse the '\'' idiom, so a value with a single quote is
+# double-quoted, which is only portable when it has no \ " $ or backtick.
+env_value_problem() {
+    local value=$1
+    case $value in
+        *$'\n'*|*$'\r'*) echo "a multi-line value"; return 0 ;;
+    esac
+    if [[ $value == *\'* && $value == *[\\\"\$\`]* ]]; then
+        echo "a single quote combined with a backslash, double quote, dollar sign or backtick"
+        return 0
+    fi
+    return 1
+}
+# env_line KEY VALUE: one env-file line that bash (`source`), systemd
+# EnvironmentFile, Python shlex and Docker Compose all read back identically.
+# Plain values stay bare; others are POSIX single-quoted; a value with a single
+# quote is double-quoted (see env_value_problem for what is refused).
+env_line() {
+    local key=$1 value=$2 reason
+    if reason=$(env_value_problem "$value"); then
+        echo "Refusing value for $key: $reason" >&2
+        exit 1
+    fi
+    if [ -n "$value" ] && [[ $value =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+        printf '%s=%s\n' "$key" "$value"
+    elif [[ $value != *\'* ]]; then
+        printf "%s='%s'\n" "$key" "$value"
+    else
+        printf '%s="%s"\n' "$key" "$value"
+    fi
+}
+# env-line-end
+
+# Env files are written to a 0600 temp file beside the target and renamed into
+# place only when every line was written, so a failure never leaves a truncated file.
+ENV_TEMPS=()
+new_env_temp() {
+    NEW_ENV_TEMP=$(mktemp "$VESSELSTACK_ROOT/config/.$1.XXXXXX")
+    ENV_TEMPS+=("$NEW_ENV_TEMP")
+}
+cleanup_env_temps() {
+    [ "${#ENV_TEMPS[@]}" -eq 0 ] || rm -f -- "${ENV_TEMPS[@]}"
+    return 0
 }
 
-
-if [ "$DRY_RUN" -eq 1 ]; then
-    displays_preflight --check-image
-    echo "Preflight passed"
-    [ "$OFFLINE" = true ] && echo "Offline mode: Python packages from $VESSELSTACK_WHEELHOUSE, no image pulls"
-    echo "Would install to $VESSELSTACK_ROOT with data in $VESSELSTACK_DATA"
-    echo "SignalK mode: $SIGNALK_MODE ($SIGNALK_URL)"
-    exit 0
-fi
-
-[ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
-# Same checks as the dry run; a missing Mosquitto image is pulled now, before
-# any file is changed, so an offline boat fails here with nothing touched.
-displays_preflight --pull-image
-install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
-
-# Transactional ordering: the network/package-dependent step runs FIRST, into a
-# staging virtualenv. Only when it succeeds is anything else rewritten, and the
-# staged venv is swapped in later. A failed (or offline) run therefore changes
-# nothing: no env, units, code or installed-version are touched.
-install -d -m 0755 "$VESSELSTACK_ROOT"
-STAGING_DIR=$(mktemp -d "$VESSELSTACK_ROOT/.venv-staging.XXXXXX")
-trap 'rm -rf -- "$STAGING_DIR" ${PLUGIN_STAGE:+"$PLUGIN_STAGE"}' EXIT
-STAGING_VENV="$STAGING_DIR/venv"
-pip_args=(install --disable-pip-version-check --only-binary=:all: --require-hashes)
-if [ "$OFFLINE" = true ]; then
-    pip_args+=(--no-index --find-links "$VESSELSTACK_WHEELHOUSE")
-fi
-if ! python3 -m venv "$STAGING_VENV" \
-    || ! "$STAGING_VENV/bin/pip" "${pip_args[@]}" -r "$PIP_LOCK"; then
-    echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable, and is there a wheel in boat-chat/requirements.lock for this platform? use --offline with a prepared bundle)")." >&2
-    echo "Nothing was changed on this system." >&2
-    exit 1
-fi
-
-# Only boats that opt in need the extra network download. It runs before
-# anything is rendered, so an offline boat fails here with the installation
-# untouched. The environment is root-owned but readable by the service user
-# (see the helper for why this cannot rely on this script's umask 077).
-if [ "$DISPLAYS_ENABLE" = true ]; then
-    install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/displays"
-    "$SCRIPT_DIR/scripts/install-displays-venv.sh" \
-        "$VESSELSTACK_ROOT/displays/.venv" "$SCRIPT_DIR/displays/requirements.txt"
-fi
-
+# Read-only check of every value that will reach vesselstack.env, boat-chat.env
+# and control-panel.env, run before anything is changed and before the dry run
+# exits. Reports KEY names and reasons only, never values.
+env_values_preflight() {
+    local key bad=0 reason
+    while IFS= read -r key; do
+        if reason=$(env_value_problem "${!key:-}"); then
+            echo "  $key: $reason" >&2
+            bad=1
+        fi
+    done < <(vesselstack_env_keys; extra_env_keys)
+    if reason=$(env_value_problem "$(<"$SCRIPT_DIR/VERSION")"); then
+        echo "  VERSION: $reason" >&2
+        bad=1
+    fi
+    if [ "$bad" -ne 0 ]; then
+        echo "Refusing to continue: the settings above cannot be written safely to the environment files." >&2
+        echo "Edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"Upgrading to 0.6.0\"." >&2
+        exit 1
+    fi
+}
 generate_secret() {
     local current=$1
     if [ -z "$current" ] || [ "$current" = GENERATE ]; then
@@ -511,6 +590,97 @@ BOAT_CHAT_SETTINGS_TOKEN=$(generate_secret "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE
 BOAT_CHAT_ACCESS_TOKEN=$(generate_secret "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}")
 CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
+
+# Secrets are resolved (preserved or generated) before the preflight so the
+# check covers the values that will actually be written; read-only, so it is
+# also safe ahead of the dry run.
+env_values_preflight
+
+PLUGIN_STAGE=
+if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ] && [ "$OFFLINE" = false ] && [ "$DRY_RUN" -eq 0 ]; then
+    PLUGIN_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-signalk-plugin-stage.XXXXXX")
+    chmod 0700 "$PLUGIN_STAGE"
+    trap 'rm -rf -- "$PLUGIN_STAGE"; cleanup_env_temps' EXIT
+    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" --mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" \
+        --stage "$PLUGIN_STAGE" --prepare
+fi
+# Everything the MQTT access sync would reject is checked here, read-only and
+# before anything is changed, so a dry run (and "vesselstackctl update", which
+# runs one before taking a backup) fails early instead of partway through.
+# Secrets travel in the child environment only. The release's own tool and
+# compose template are used because the installed copies may be older.
+MOSQUITTO_COMPOSE="$SCRIPT_DIR/templates/compose.yml"
+displays_preflight() {
+    PYTHONDONTWRITEBYTECODE=1 \
+        MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="${MQTT_PASSWORD:-}" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
+        DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
+        python3 "$SCRIPT_DIR/displays/displayctl.py" preflight \
+        --root "$VESSELSTACK_ROOT" --compose "$MOSQUITTO_COMPOSE" "$@"
+}
+
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    displays_preflight --check-image
+    echo "Preflight passed"
+    [ "$OFFLINE" = true ] && echo "Offline mode: Python packages from $VESSELSTACK_WHEELHOUSE, no image pulls"
+    echo "Would install to $VESSELSTACK_ROOT with data in $VESSELSTACK_DATA"
+    echo "SignalK mode: $SIGNALK_MODE ($SIGNALK_URL)"
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+
+# Remove temp files left in config/ by an earlier run that was killed between
+# creating and renaming an env file. Only the exact names new_env_temp creates
+# (.vesselstack.env.XXXXXX, .boat-chat.env.XXXXXX, .control-panel.env.XXXXXX with
+# six alphanumeric characters); nothing else is touched.
+remove_stale_env_temps() {
+    local dir="$VESSELSTACK_ROOT/config" name file
+    [ -d "$dir" ] || return 0
+    for name in vesselstack.env boat-chat.env control-panel.env; do
+        for file in "$dir/.$name."??????; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            [[ ${file##*/."$name".} =~ ^[A-Za-z0-9]{6}$ ]] || continue
+            rm -f -- "$file"
+        done
+    done
+}
+remove_stale_env_temps
+# Same checks as the dry run; a missing Mosquitto image is pulled now, before
+# any file is changed, so an offline boat fails here with nothing touched.
+displays_preflight --pull-image
+install -d -m 0755 "$SYSTEMD_DIR" "$SBIN_DIR"
+
+# Transactional ordering: the network/package-dependent step runs FIRST, into a
+# staging virtualenv. Only when it succeeds is anything else rewritten, and the
+# staged venv is swapped in later. A failed (or offline) run therefore changes
+# nothing: no env, units, code or installed-version are touched.
+install -d -m 0755 "$VESSELSTACK_ROOT"
+STAGING_DIR=$(mktemp -d "$VESSELSTACK_ROOT/.venv-staging.XXXXXX")
+trap 'rm -rf -- "$STAGING_DIR" ${PLUGIN_STAGE:+"$PLUGIN_STAGE"}; cleanup_env_temps' EXIT
+STAGING_VENV="$STAGING_DIR/venv"
+pip_args=(install --disable-pip-version-check --only-binary=:all: --require-hashes)
+if [ "$OFFLINE" = true ]; then
+    pip_args+=(--no-index --find-links "$VESSELSTACK_WHEELHOUSE")
+fi
+if ! python3 -m venv "$STAGING_VENV" \
+    || ! "$STAGING_VENV/bin/pip" "${pip_args[@]}" -r "$PIP_LOCK"; then
+    echo "ERROR: could not build the Python environment$([ "$OFFLINE" = true ] && echo " from $VESSELSTACK_WHEELHOUSE" || echo " (is the network reachable, and is there a wheel in boat-chat/requirements.lock for this platform? use --offline with a prepared bundle)")." >&2
+    echo "Nothing was changed on this system." >&2
+    exit 1
+fi
+
+# Only boats that opt in need the extra network download. It runs before
+# anything is rendered, so an offline boat fails here with the installation
+# untouched. The environment is root-owned but readable by the service user
+# (see the helper for why this cannot rely on this script's umask 077).
+if [ "$DISPLAYS_ENABLE" = true ]; then
+    install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/displays"
+    "$SCRIPT_DIR/scripts/install-displays-venv.sh" \
+        "$VESSELSTACK_ROOT/displays/.venv" "$SCRIPT_DIR/displays/requirements.txt"
+fi
 
 # Ownership model for VESSELSTACK_DATA: the directory itself and every managed
 # intermediate component is ROOT-owned and not writable by the service user, so the
@@ -714,6 +884,7 @@ restore_telemetry_on_exit() {
         echo "Installer staging cleanup failed" >&2
         if [ "$rc" -eq 0 ]; then rc=1; fi
     fi
+    cleanup_env_temps
     if [ "$rc" -ne 0 ] || [ "$START" -eq 0 ]; then
         if [ "$telemetry_sample_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-sample.timer 2>/dev/null || true; fi
         if [ "$telemetry_indexer_was_active" -eq 1 ]; then systemctl start vesselstack-telemetry-indexer.timer 2>/dev/null || true; fi
@@ -901,108 +1072,15 @@ install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-signalk.service.in" \
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-socketcan.service.in" \
     "$VESSELSTACK_ROOT/systemd/vesselstack-socketcan.service.in"
 
-# env_line KEY VALUE: one env-file line that bash (`source`), systemd
-# EnvironmentFile, Python shlex and Docker Compose all read back identically.
-# Plain values stay bare; others are POSIX single-quoted. Compose cannot parse the
-# '\'' idiom, so a value with a single quote is double-quoted instead, which is
-# only portable when it has no \ " $ or backtick (such values are rejected).
-# env-line-begin
-env_line() {
-    local key=$1 value=$2
-    case $value in
-        *$'\n'*|*$'\r'*) echo "Refusing multi-line value for $key" >&2; exit 1 ;;
-    esac
-    if [ -n "$value" ] && [[ $value =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
-        printf '%s=%s\n' "$key" "$value"
-    elif [[ $value != *\'* ]]; then
-        printf "%s='%s'\n" "$key" "$value"
-    elif [[ $value == *[\\\"\$\`]* ]]; then
-        echo "Refusing value for $key: a single quote cannot be combined with backslash, double quote, dollar or backtick" >&2
-        exit 1
-    else
-        printf '%s="%s"\n' "$key" "$value"
-    fi
-}
-# env-line-end
-
-install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/vesselstack.env"
+new_env_temp vesselstack.env; vs_env_tmp=$NEW_ENV_TEMP
 while IFS= read -r key; do
-    env_line "$key" "${!key:-}" >> "$VESSELSTACK_ROOT/config/vesselstack.env"
-done <<'EOF'
-BOAT_NAME
-BOAT_TYPE
-BOAT_MMSI
-BOAT_CALLSIGN
-BOAT_LOA_M
-BOAT_BEAM_M
-BOAT_TIMEZONE
-BOAT_UNITS
-VESSELSTACK_USER
-VESSELSTACK_UID
-VESSELSTACK_GID
-VESSELSTACK_ROOT
-VESSELSTACK_DATA
-VESSELSTACK_BACKUP
-SIGNALK_MODE
-SIGNALK_VERSION
-SIGNALK_URL
-SIGNALK_VESSELTWIN_PRELOAD
-SOCKETCAN_ENABLE
-SOCKETCAN_INTERFACE
-SOCKETCAN_BITRATE
-VESSELSTACK_CAN_CREATE_VCAN
-AIS_ENABLE
-AIS_IMAGE
-AIS_DEVICE
-AIS_CATCHER_ARGS
-AIS_WEB_PORT
-AIS_TCP_PORT
-VESSELSTACK_DISABLED_COMPONENTS
-VESSELSTACK_UNTRUSTED_INTERFACE
-VESSELSTACK_FIREWALL_ENABLE
-VESSELSTACK_FIREWALL_STRICT
-VESSELSTACK_FIREWALL_ALLOW_TCP
-VESSELSTACK_FIREWALL_ALLOW_UDP
-CONTROL_PANEL_HOST
-CONTROL_PANEL_PORT
-TELEGRAM_ENABLE
-TELEMETRY_INDEXER_ENABLE
-NODE_EXPORTER_ENABLE
-DISPLAYS_ENABLE
-DISPLAYS_BRIDGE_MQTT_USERNAME
-DISPLAYS_SIGNALK_TOKEN
-DISPLAYS_HA_TOKEN
-HOME_ASSISTANT_URL
-HOME_ASSISTANT_TOKEN
-INFLUXDB_URL
-INFLUXDB_PORT
-INFLUXDB_CONTAINER_NAME
-INFLUXDB_ORG
-INFLUXDB_USERNAME
-INFLUXDB_RAW_BUCKET
-INFLUXDB_HISTORY_BUCKET
-INFLUXDB_HOME_ASSISTANT_BUCKET
-INFLUXDB_AIS_BUCKET
-INFLUXDB_RAW_RETENTION
-INFLUXDB_PASSWORD
-INFLUXDB_TOKEN
-GRAFANA_ADMIN_PASSWORD
-GRAFANA_PORT
-HEIMDALL_PORT
-HEIMDALL_HTTPS_PORT
-PROMETHEUS_PORT
-PROMETHEUS_RETENTION
-MQTT_USERNAME
-MQTT_PASSWORD
-MQTT_PORT
-VESSELSTACK_DATA_BIND_ADDRESS
-VESSELSTACK_WEB_BIND_ADDRESS
-HOMEASSISTANT_BIND_ADDRESS
-EOF
+    env_line "$key" "${!key:-}" >> "$vs_env_tmp"
+done < <(vesselstack_env_keys)
+mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
 
 # Retain provider credentials and optional Boat Chat settings across installer
 # re-renders while replacing the integration values owned by VesselStack.
-boat_chat_temp=$(mktemp)
+new_env_temp boat-chat.env; boat_chat_temp=$NEW_ENV_TEMP
 if [ -r "$VESSELSTACK_ROOT/config/boat-chat.env" ]; then
     cp "$VESSELSTACK_ROOT/config/boat-chat.env" "$boat_chat_temp"
 fi
@@ -1049,16 +1127,16 @@ done
     env_line INFLUXDB_HOME_ASSISTANT_BUCKET "$INFLUXDB_HOME_ASSISTANT_BUCKET"
     env_line INFLUXDB_AIS_BUCKET "$INFLUXDB_AIS_BUCKET"
 } >> "$boat_chat_temp"
-install -m 0600 "$boat_chat_temp" "$VESSELSTACK_ROOT/config/boat-chat.env"
-rm -f -- "$boat_chat_temp"
-chown "$VESSELSTACK_USER:$VESSELSTACK_USER" "$VESSELSTACK_ROOT/config/boat-chat.env"
+chown "$VESSELSTACK_USER:$VESSELSTACK_USER" "$boat_chat_temp"
+mv -f -- "$boat_chat_temp" "$VESSELSTACK_ROOT/config/boat-chat.env"
 
-install -m 0600 /dev/null "$VESSELSTACK_ROOT/config/control-panel.env"
+new_env_temp control-panel.env; control_panel_temp=$NEW_ENV_TEMP
 {
     env_line CONTROL_PANEL_HOST "$CONTROL_PANEL_HOST"
     env_line CONTROL_PANEL_PORT "$CONTROL_PANEL_PORT"
     env_line CONTROL_PANEL_TOKEN "$CONTROL_PANEL_TOKEN"
-} >> "$VESSELSTACK_ROOT/config/control-panel.env"
+} >> "$control_panel_temp"
+mv -f -- "$control_panel_temp" "$VESSELSTACK_ROOT/config/control-panel.env"
 
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)
 # application directory and renamed into place; the service user can only read it.

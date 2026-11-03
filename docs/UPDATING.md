@@ -4,7 +4,38 @@ Purpose: update a running VesselStack with a reviewed release, roll back, and in
 
 [Back to README](../README.md) · [Documentation index](README.md)
 
-Back up configuration and data, then use a reviewed release:
+Back up first (see [Backups](../README.md#backups)); updating and rolling back are summarised
+in the README under [Updating](../README.md#updating) and
+[Upgrading to 0.6.0](../README.md#upgrading-to-060).
+
+## From the pinned installer
+
+Re-run the pinned release installer over `ssh -t`. It finds the installed system and offers
+`vesselstackctl update <release dir>`, which runs preflight, makes a verified backup and then
+installs and starts the release:
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+```
+
+The command itself needs the unpacked release directory, so plain `vesselstackctl update`
+with no argument fails. To run it by hand once a release is unpacked (the installer unpacks to
+`/opt/vesselstack-release/<version>`):
+
+```bash
+sudo vesselstackctl update /opt/vesselstack-release/0.6.0
+```
+
+## From the Control Panel
+
+An authenticated Control Panel session can check releases and run **Back up & install**.
+Releases that GitHub publishes as prereleases appear only after you enable
+**Include lab prereleases**. It needs a mounted external backup drive under `/media` or
+`/mnt`; see [Control Panel](CONTROL_PANEL.md).
+
+## From a source checkout
+
+Use a reviewed tag from a git clone, with the dry run first:
 
 ```bash
 cd VesselStack
@@ -21,85 +52,47 @@ sudo ./install.sh \
 
 Review Compose and release notes before applying container changes. Prefer the
 installed configuration as input. If you do re-run with a file that still says
-`GENERATE` (for example a fresh copy of the example), the installer now keeps
+`GENERATE` (for example a fresh copy of the example), the installer keeps
 the already-installed InfluxDB, Grafana, MQTT, Boat Chat and control-panel
 secrets instead of generating new ones. A non-`GENERATE` value you set
 explicitly still wins.
 
-Once a reviewed release directory is downloaded, the lifecycle command can
-perform preflight, a verified pre-update backup, installation, and startup:
+Once a reviewed release directory is downloaded, the lifecycle command performs
+preflight, a verified pre-update backup, installation, and startup:
 
 ```bash
-sudo vesselstackctl update /path/to/VesselStack-release
-sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
-  vesselstackctl update /path/to/VesselStack-release   # no network
+sudo vesselstackctl update /path/to/reviewed-release
 ```
 
-For Control Panel updates, stage the reviewed release beneath its restricted
-root first. The panel rejects symlinks, missing release metadata, paths outside
-this directory, and any entry anywhere in the release tree (`scripts/`,
-`boat-chat/`, `templates/`, `systemd/`, ...) that is a symlink, owned by a user
-other than root/the panel account, or group/world-writable:
+Before it rewrites the installation the installer checks every value it will write to
+`vesselstack.env`, `boat-chat.env` and `control-panel.env`, then builds the Python
+environment in a staging directory and checks the upgrade path. A failed or
+offline-without-bundle run stops with "Nothing was changed" and leaves the previous
+installation, `vesselstack.env`, units and version marker as they were. A value the
+installer refuses to write (an apostrophe combined with a backslash, double quote, dollar
+sign or backtick, or a multi-line value) is caught by `--dry-run` itself, so `vesselstackctl
+update` and the Control Panel updater stop before the backup, naming only the setting's key;
+see [Upgrading to 0.6.0](../README.md#upgrading-to-060). The env files are then written
+atomically (temporary file, then rename), so a failed run never leaves one truncated. When
+the code, units and `compose.yml` have been replaced, the staged virtualenv is swapped
+in and `installed-version` is written last.
+
+## Rollback
+
+Downgrades are refused. Rolling back a completed or half-finished upgrade is a restore of
+the pre-update backup that `vesselstackctl update` takes automatically:
 
 ```bash
-sudo install -d -m 0755 /var/lib/vesselstack/releases
-sudo cp -a /path/to/vesselstack-x.y.z /var/lib/vesselstack/releases/
-sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-x.y.z
-sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-x.y.z
+sudo vesselstackctl verify-backup /path/to/vesselstack-TIMESTAMP.tar.gz
+sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 ```
-
-Then enter `/var/lib/vesselstack/releases/vesselstack-x.y.z` in the panel.
-Shell-initiated `vesselstackctl update` remains available for a trusted operator
-and is not limited to the panel staging directory.
-
-The installer records the configuration schema in
-`/opt/vesselstack/config/installed-version`. Any upgrade from 0.0.1 or newer to a
-newer release is accepted: when a release needs no data change only the version
-marker moves, and releases that do need one ship an executable
-`scripts/migrations/<version>.sh` that runs once, in version order.
-The first release (0.0.1, formerly 1.0.0) migrates pre-release "0.1" layouts and
-retains legacy InfluxDB names when the new bucket settings are absent.
-
-**Version renumbering (2026-10-25).** The project is pre-1.0, so the former
-1.x releases were renumbered: 1.0.0 is now 0.0.1, 1.0.1 is 0.0.2, and 1.1.0,
-1.2.0, 1.3.0, 1.4.0, 1.4.1 are 0.1.0, 0.2.0, 0.3.0, 0.4.0, 0.4.1 (see the
-CHANGELOG for the table). Former `v1.x` tags and releases were removed. A machine
-that installed a former 1.x release has `1.x.y` in `installed-version`, which
-would look like a downgrade to `0.4.1`. `migrate.sh` and `get-vesselstack.sh`
-therefore treat an installed `1.M.P` as `0.M.P` (1.0.0 and 1.0.1 as 0.0.1 and
-0.0.2) when the target is a 0.x release, so `vesselstackctl update` and
-`get-vesselstack.sh` upgrade it normally and rewrite the marker. If an older
-`migrate.sh` refuses it anyway, run `sudo vesselstackctl backup`, then either
-write the matching new number into `/opt/vesselstack/config/installed-version`
-(for example `echo 0.4.1 | sudo tee /opt/vesselstack/config/installed-version`
-for a 1.4.1 install; the configuration format is unchanged by the renumbering) or
-reinstall 0.4.1 and `sudo vesselstackctl restore` the backup. To roll back the
-renumbering itself, restore that backup on the previous release.
-
-**Downgrades are not supported.** Configuration and data may already use the
-newer schema, so `install.sh` (including `--dry-run`) and `migrate.sh` refuse to
-install an older release over a newer one and change nothing. To go back, restore
-a backup taken before the upgrade (`sudo vesselstackctl restore ...`, see
-Backups) or install the newer release again. Unknown or malformed version
-markers are refused instead of guessed at.
-
-Install order is transactional. Preflight (`--dry-run` runs the same checks)
-validates the upgrade path, the Compose template and, offline, the wheelhouse and
-local images **before** any installed file is touched. The Python environment is
-then built in a staging virtualenv next to the install; only if that succeeds are
-the environment, units and code rewritten, the staged virtualenv swapped in, and
-`installed-version` written last. A failed or offline-without-bundle run
-therefore leaves the previous installation, `vesselstack.env`, units and version
-marker exactly as they were (the installer says "Nothing was changed").
-Rollback of a completed upgrade is a restore of the pre-update backup that
-`vesselstackctl update` takes automatically.
 
 ## Offline install (no internet on the boat)
 
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.5.7.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.0.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -144,11 +137,11 @@ root-owned and not group/world-writable. `install.sh --offline` also requires
 `VESSELSTACK_WHEELHOUSE` to be the `wheelhouse/` directory of such a bundle, then
 runs `pip install --no-index --find-links $VESSELSTACK_WHEELHOUSE
 --only-binary=:all: --require-hashes -r boat-chat/requirements.lock`, so even a
-bundle forged consistently cannot install a wheel the signed release did not
+bundle forged consistently cannot install a wheel the pinned release did not
 pin. Containers start with `docker compose up -d --pull never`. If an image is
 missing the installer lists it with the `docker load` hint: `--start` fails
 before changing anything, while a plain render only warns. Offline mode never
-contacts a registry or PyPI; SignalK/InfluxDB version bumps still need a new
+contacts a registry or PyPI; Signal K/InfluxDB version bumps still need a new
 bundle. Image tarballs are covered by the manifest and the root-controlled path
 check but, unlike wheels, are not pinned by digest in the release (Compose images
 are tag-pinned).
@@ -175,6 +168,5 @@ versions would read it as the directory, so the guided installer and the docs us
 variable) passes
 `--offline` to both the preflight and the install of that release; any value other
 than `true`/`false` in `VESSELSTACK_OFFLINE` is rejected. Without the flag or
-variable the behaviour is unchanged apart from the hash-pinned lock. Rollback:
-restore the pre-update backup; to return to the previous behaviour revert this
-change (the lock file is inert for older releases).
+variable the install runs online, with the hash-pinned lock. Rollback: restore the
+pre-update backup (the lock file is inert for older releases).

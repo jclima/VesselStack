@@ -232,6 +232,19 @@ class CommandAllowlistTests(unittest.TestCase):
         self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]["kind"], "secret")
         self.assertEqual(panel.FIELD_BY_KEY["DISPLAYS_HA_TOKEN"]["section"], "Displays")
 
+    def test_signal_k_naming_units_choices_and_help_text(self) -> None:
+        sections = {item["section"] for item in panel.FIELDS}
+        self.assertIn("Signal K", sections)
+        self.assertNotIn("SignalK", sections)
+        for item in panel.FIELDS:
+            self.assertNotIn("SignalK", item["label"], item["key"])
+            self.assertNotIn("SignalK", item["description"], item["key"])
+        self.assertEqual(panel.FIELD_BY_KEY["BOAT_UNITS"]["choices"], ["us_customary", "metric"])
+        self.assertEqual(panel.FIELD_BY_KEY["SIGNALK_MODE"]["choices"], ["existing", "docker", "native"])
+        for key in ("SIGNALK_MODE", "SOCKETCAN_BITRATE", "AIS_DEVICE", "BOAT_TYPE", "BOAT_TIMEZONE"):
+            self.assertTrue(panel.FIELD_BY_KEY[key]["description"], key)
+        self.assertEqual(panel.FIELD_BY_KEY["BOAT_TIMEZONE"]["label"], "Timezone (for example Europe/Lisbon)")
+
     def test_displays_values_mirror_the_installer_checks(self) -> None:
         user = panel.FIELD_BY_KEY["DISPLAYS_BRIDGE_MQTT_USERNAME"]
         for good in ("vesselstack-bridge", "a", "A_b.c-9", "x" * 64, ""):

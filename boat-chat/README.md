@@ -4,9 +4,8 @@ First-run access, settings, telemetry refresh, units and timezone are in [Boat C
 
 Local read-only diagnostic chatbot for VesselStack.
 
-This guide follows current `main`. The `0.5.7` lab prerelease includes
-selectable unit presentation and separate telemetry sampling and indexing
-timers.
+This guide follows current `main`. Release 0.6.0 includes selectable unit
+presentation and separate telemetry sampling and indexing timers.
 
 ## Run
 
@@ -41,7 +40,7 @@ Without a configured model provider, the app still gathers and returns local con
 Boat Chat keeps context in tiers so common questions stay fast and small local models do not have to infer stable facts from long runbooks:
 
 - Tier 0: stable boat facts from `boat-chat/boat_facts.json` such as vessel name, model, MMSI, call sign, host, telemetry stack, and engine layout.
-- Tier 1: live SignalK and Home Assistant state, fetched only when relevant.
+- Tier 1: live Signal K and Home Assistant state, fetched only when relevant.
 - Tier 2: InfluxDB historical summaries, fetched only for questions that need history such as engine runtime or fuel usage.
 - Tier 3: local docs and runbooks from the SQLite memory index, limited to the top matches.
 
@@ -53,7 +52,7 @@ Runtime behavior is governed by `boat-chat/BOAT_CHAT_AGENT.md`. It is optimized 
 
 Complex questions use semantic signal groups instead of requiring every query word to appear in one measurement name. Boat Chat can gather multiple requested signals, exact local windows (including the recorded last trip), min/max timestamps, aligned values at notable times, port/starboard comparisons, RPM-matched comparisons, threshold durations, and correlations. Engine diagnostics include a separate engine-running view so normal engine-off zero readings do not become false low-pressure or fuel-flow findings.
 
-Current SignalK values are converted to the configured `BOAT_UNITS` display units before model reasoning, and timestamps use the effective `BOAT_TIMEZONE` configured at service startup. Source instants, offsets, and unit labels remain authoritative; unknown units are not guessed. Nearby-vessel/AIS questions use the SignalK `/vessels` feed and include target distance, speed, course, position timestamp, and staleness. Home Assistant contributes current states, unavailable/stale review lists, and relevant retained state transitions for complex alert, shore-power, trip, bilge, and service questions.
+Current Signal K values are converted to the configured `BOAT_UNITS` display units before model reasoning, and timestamps use the effective `BOAT_TIMEZONE` configured at service startup. Source instants, offsets, and unit labels remain authoritative; unknown units are not guessed. Nearby-vessel/AIS questions use the Signal K `/vessels` feed and include target distance, speed, course, position timestamp, and staleness. Home Assistant contributes current states, unavailable/stale review lists, and relevant retained state transitions for complex alert, shore-power, trip, bilge, and service questions.
 
 The web and Telegram clients send the last few conversation turns with each request. A short answer to a clarification, such as `last 30 days`, is combined with the prior user question instead of being treated as a new unrelated question. Telegram `/clear` and the web Clear button reset that context.
 
@@ -80,7 +79,7 @@ Use the `Settings` button in the web app to configure:
 - Context budget, output budget, and CLI timeout.
 - Codex CLI, Claude CLI, Ollama, OpenAI, Vercel AI Gateway, AWS Bedrock, Google, and OpenAI-compatible provider settings.
 - Telegram bot token and allowed chat IDs.
-- Server host/port and an optional settings write token.
+- Server host/port and an optional admin code (`BOAT_CHAT_SETTINGS_TOKEN`) that protects settings changes.
 
 Base settings are stored in `/opt/vesselstack/config/boat-chat.env`; Settings-page changes are written to the service-user override file at `$VESSELSTACK_DATA/boat-chat/boat-chat.env`. Provider, model, token, and credential changes are read dynamically by the next chat request. Host/port changes require:
 
@@ -90,7 +89,7 @@ sudo systemctl restart vesselstack-chat.service
 
 Secrets are not shown back in the browser; blank password fields keep the existing saved value.
 
-Settings writes (`POST /api/settings`) require loopback when no settings token is configured. If `BOAT_CHAT_SETTINGS_TOKEN` is configured, the matching `X-Boat-Chat-Token` header is required from every address, including loopback and private LAN addresses. The web UI remembers the token only in browser session storage after you enter it in the Server section. Closing the tab clears it. Keep the app off the public internet.
+Settings requests (`GET` and `POST /api/settings`) require the access code (`BOAT_CHAT_ACCESS_TOKEN`). `POST` also needs the admin code where one is configured: without `BOAT_CHAT_SETTINGS_TOKEN` it is accepted from loopback only, and with it the matching `X-Boat-Chat-Token` header is required from every address, including loopback and private LAN addresses. The access code normally travels in `X-Boat-Chat-Token`; when it differs from the admin code, send the access code in the optional `X-Boat-Chat-Access-Token` header and the admin code in `X-Boat-Chat-Token`; `GET`, `HEAD` and `POST` all accept that header. The access code cannot be cleared (blank or `null` returns 400 with "The access code cannot be cleared; set a new one instead.") unless `BOAT_CHAT_ALLOW_OPEN=true`. A save that blanks provider, model, max tokens, context characters, host or port, or gives an invalid number, is rejected with a 400. The web app calls these the **Access code** and **Admin code** and keeps them only in browser session storage; closing the tab clears them. Settings does not open until the current values have loaded, and it saves only the fields you changed. Keep the app off the public internet.
 
 ## Telemetry cache
 
@@ -129,7 +128,7 @@ journalctl -u vesselstack-telemetry-indexer.service --since "1 hour ago"
 - `BOAT_CHAT_MAX_TOKENS` — optional, defaults to `1200`.
 - `BOAT_CHAT_CONTEXT_CHARS` — optional local-context budget for the prompt. Lower values such as `4000` keep simple small-model requests compact; complex historical questions automatically receive up to at least 18,000 characters so aligned evidence is not discarded.
 - `BOAT_CHAT_OLLAMA_NUM_CTX` — optional Ollama context window in tokens; defaults to `8192` so a larger context budget can never be silently truncated. Ollama calls also pass `keep_alive: -1` to keep the model resident in RAM (~2 GB for a 3B Q4 model), and the prompt places stable context before the question so Ollama can reuse its KV prefix cache — warm repeat calls drop from ~85 s to a few seconds.
-- `BOAT_CHAT_SETTINGS_TOKEN` — optional write token for `POST /api/settings` (sent as `X-Boat-Chat-Token`).
+- `BOAT_CHAT_SETTINGS_TOKEN` — optional admin code for `POST /api/settings` (sent as `X-Boat-Chat-Token`); the access code `BOAT_CHAT_ACCESS_TOKEN` is also required and, when different, is sent as `X-Boat-Chat-Access-Token`.
 - `BOAT_CHAT_CODEX_MODEL` — optional model for `codex_cli`; defaults to `gpt-5.4-mini` for lighter subscription usage.
 - `BOAT_CHAT_CODEX_EFFORT` — optional Codex reasoning effort; defaults to `low`.
 - `BOAT_CHAT_CODEX_BIN` — optional Codex binary path; defaults to `codex`.
@@ -330,8 +329,8 @@ If `TELEGRAM_BOT_TOKEN` is unset, the worker idles and logs that it is waiting f
 
 ## Read-only data sources
 
-- SignalK self telemetry: `http://127.0.0.1:3000/signalk/v1/api/vessels/self`
-- SignalK nearby AIS traffic: `http://127.0.0.1:3000/signalk/v1/api/vessels`
+- Signal K self telemetry: `http://127.0.0.1:3000/signalk/v1/api/vessels/self`
+- Signal K nearby AIS traffic: `http://127.0.0.1:3000/signalk/v1/api/vessels`
 - Home Assistant: local REST API using the installed environment's configured bearer token (with `.mcp.json` retained as a compatibility fallback where supported).
 - InfluxDB: Flux queries using the installed environment's configured credentials (with `.mcp.json` retained as a compatibility fallback where supported).
 - Curated local docs: `boat-chat/BOAT_CHAT_AGENT.md`, `boat-chat/boat_facts.json`, `boat-chat/README.md`, and `boat-chat/knowledge/*.md`.
