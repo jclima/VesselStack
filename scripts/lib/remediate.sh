@@ -36,7 +36,7 @@ VS_PROMPT_OWNED=${VS_PROMPT_OWNED:-0}
 VS_BACKUP_ALLOW_ONCE=${VS_BACKUP_ALLOW_ONCE:-0}
 
 vs_prompt_cancel() {
-    echo "Cancelled. Nothing was changed." >&2
+    echo "${VS_CANCEL_MESSAGE:-Cancelled. Nothing was changed.}" >&2
     exit 1
 }
 
@@ -51,7 +51,10 @@ vs_prompt_open() {
         VS_PROMPT_FD=
     fi
     if [ -n "${VESSELSTACK_PROMPT_ANSWERS:-}" ]; then
+        # Honoured only for a regular file owned by this user that nobody else can write.
         if [ -f "$VESSELSTACK_PROMPT_ANSWERS" ] && [ ! -L "$VESSELSTACK_PROMPT_ANSWERS" ] \
+            && [ "$(stat -c '%u' -- "$VESSELSTACK_PROMPT_ANSWERS" 2>/dev/null)" = "$(id -u)" ] \
+            && [[ $(stat -c '%a' -- "$VESSELSTACK_PROMPT_ANSWERS" 2>/dev/null) =~ ^[0-7]*[0145][0145]$ ]] \
             && { : <"$VESSELSTACK_PROMPT_ANSWERS"; } 2>/dev/null; then
             exec {VS_PROMPT_FD}<"$VESSELSTACK_PROMPT_ANSWERS"
             VS_PROMPT_OWNED=1
@@ -110,7 +113,7 @@ vs_read_answer() {
 }
 
 vs_prompt_choice() {
-    local __var=$1 __valid=" $2 " __reply='' __tries=0
+    local __var=$1 __valid=" $2 " __reply='' __tries=0 __ok
     while :; do
         printf 'Choice: ' >&2
         vs_read_answer __reply
@@ -118,9 +121,14 @@ vs_prompt_choice() {
         __reply=${__reply%"${__reply##*[![:space:]]}"}
         __reply=${__reply,,}
         [ "$__reply" != c ] || vs_prompt_cancel
-        case $__valid in
-            *" $__reply "*) [ -z "$__reply" ] || break ;;
-        esac
+        # Exactly one listed token: "1 2" or "1 b" is a bad answer, never a guess.
+        __ok=0
+        if [ -n "$__reply" ] && [[ $__reply != *[[:space:]]* ]]; then
+            case $__valid in
+                *" $__reply "*) __ok=1 ;;
+            esac
+        fi
+        [ "$__ok" -eq 0 ] || break
         __tries=$((__tries + 1))
         [ "$__tries" -lt 10 ] || vs_prompt_cancel
         echo "Please enter one of: ${2// /, }, or c to cancel." >&2
@@ -146,8 +154,11 @@ vs_prompt_input() {
 # ---------------------------------------------------------------- backup drive
 
 # Reads lsblk JSON on stdin; argument 1 lists device paths that hold the system (one per line).
-# Prints "OK<TAB>path<TAB>size<TAB>label<TAB>fstype<TAB>uuid" for a drive that can be offered and
-# "NO<TAB>...<TAB>reason" for a removable drive that is refused. Missing fields mean "not removable".
+# Argument 2 lists fstab entries as "source<TAB>mountpoint" lines (other mount points only).
+# Prints "OK<US>path<US>size<US>label<US>fstype<US>uuid" (US = byte 0x1f, so an empty label keeps its
+# column) for a drive that can be offered, "NO<US>...<US>reason" for a removable drive that is refused
+# and "MOUNTED<US>path<US>size<US>label<US>fstype<US>mountpoint" for a removable ext4/exFAT partition
+# that is already mounted elsewhere. Missing fields mean "not removable".
 VS_LSBLK_PY='
 import json, sys
 
@@ -164,7 +175,20 @@ except ValueError:
     sys.exit(1)
 system_paths = {l for l in sys.argv[1].split("\n") if l}
 system_mounts = {"/", "/boot", "/boot/firmware"}
+fstab = {}
+for l in (sys.argv[2] if len(sys.argv) > 2 else "").split("\n"):
+    src, _, mp = l.partition("\t")
+    if src and mp:
+        fstab[src] = mp
 rows = []
+mounted = []
+
+def fstab_mount(node):
+    for key in (node.get("path"), "UUID=" + str(node.get("uuid") or ""), "LABEL=" + str(node.get("label") or ""),
+                "/dev/disk/by-uuid/" + str(node.get("uuid") or ""), "/dev/disk/by-label/" + str(node.get("label") or "")):
+        if key in fstab:
+            return fstab[key]
+    return None
 
 def subtree(node):
     yield node
@@ -177,6 +201,8 @@ def walk(node, removable, system):
     kind = node.get("type")
     if (kind == "part" or (kind == "disk" and not children)) and node.get("fstype") and not node.get("mountpoint"):
         rows.append((node, removable, system))
+    elif (kind == "part" or (kind == "disk" and not children)) and node.get("mountpoint") and node.get("fstype") in ("ext4", "exfat"):
+        mounted.append((node, removable, system))
     for child in children:
         walk(child, removable, system)
 
@@ -189,10 +215,19 @@ for node, removable, system in sorted(rows, key=lambda r: str(r[0].get("path")))
         continue
     fs = clean(node.get("fstype"))
     fields = [clean(node.get("path")), clean(node.get("size")), clean(node.get("label")), fs]
-    if fs in ("ext4", "exfat"):
-        print("\t".join(["OK"] + fields + [clean(node.get("uuid"))]))
+    elsewhere = fstab_mount(node)
+    if elsewhere:
+        print("\x1f".join(["NO"] + fields + ["listed in /etc/fstab for " + clean(elsewhere) + "; not offered here"]))
+    elif fs in ("ext4", "exfat"):
+        print("\x1f".join(["OK"] + fields + [clean(node.get("uuid"))]))
     else:
-        print("\t".join(["NO"] + fields + [fs + " is not supported for backups; use ext4 (recommended) or exFAT"]))
+        print("\x1f".join(["NO"] + fields + [fs + " is not supported for backups; use ext4 (recommended) or exFAT"]))
+
+for node, removable, system in sorted(mounted, key=lambda r: str(r[0].get("path"))):
+    if system or not removable:
+        continue
+    print("\x1f".join(["MOUNTED", clean(node.get("path")), clean(node.get("size")), clean(node.get("label")),
+                       clean(node.get("fstype")), clean(node.get("mountpoint"))]))
 '
 
 # vs_mib KIB: whole MiB with a thousands-free digit string.
@@ -277,6 +312,7 @@ vs_backup_mount_device() {
 # 0 mounted, 1 nothing mounted (the caller shows the menu again).
 vs_backup_pick_drive() {
     local mount_dir=$1 json='' sources='' target src listing kind path size label fs uuid reason shown label_text pick
+    local fstab_file=${VS_FSTAB_FILE:-/etc/fstab} fstab_src fstab_mp fstab_rest fstab_lines='' elsewhere=''
     local -a paths=() fss=() uuids=()
     if ! command -v lsblk >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
         echo "Listing drives needs lsblk and python3." >&2
@@ -293,14 +329,25 @@ vs_backup_pick_drive() {
         src=${src%%\[*}
         case $src in /dev/*) sources+="$src"$'\n' ;; esac
     done
-    listing=$(printf '%s' "$json" | python3 -I -c "$VS_LSBLK_PY" "$sources") || listing=
+    # Drives that /etc/fstab assigns to another mount point (a data SSD that failed to mount) are not offered.
+    if [ -r "$fstab_file" ]; then
+        while read -r fstab_src fstab_mp fstab_rest; do
+            case $fstab_src in ''|'#'*) continue ;; esac
+            [ "$fstab_mp" != "$mount_dir" ] || continue
+            fstab_lines+="$fstab_src"$'\t'"$fstab_mp"$'\n'
+        done <"$fstab_file"
+    fi
+    listing=$(printf '%s' "$json" | python3 -I -c "$VS_LSBLK_PY" "$sources" "$fstab_lines") || listing=
     echo "Connected USB drives that are not mounted:" >&2
     shown=0
-    while IFS=$'\t' read -r kind path size label fs uuid; do
+    while IFS=$'\x1f' read -r kind path size label fs uuid; do
         [ -n "$kind" ] || continue
         label_text='(no label)'
         [ -z "$label" ] || label_text="\"$label\""
-        if [ "$kind" = OK ]; then
+        if [ "$kind" = MOUNTED ]; then
+            elsewhere+="  $path  $size  $label_text  $fs, mounted at $uuid"$'\n'
+            continue
+        elif [ "$kind" = OK ]; then
             paths+=("$path"); fss+=("$fs"); uuids+=("$uuid")
             echo "  [${#paths[@]}] $path  $size  $label_text  $fs" >&2
         else
@@ -313,6 +360,11 @@ vs_backup_pick_drive() {
         echo "  (none found)" >&2
     fi
     if [ "${#paths[@]}" -eq 0 ]; then
+        echo "No unmounted USB drive was found. If your desktop already mounted the drive (for example under /media/<user>/...), unmount it first: sudo umount <path>." >&2
+        if [ -n "$elsewhere" ]; then
+            echo "Already mounted elsewhere:" >&2
+            printf '%s' "$elsewhere" >&2
+        fi
         echo "Plug in a drive formatted as ext4 (recommended) or exFAT, then choose [3] to check again." >&2
         return 1
     fi

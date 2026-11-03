@@ -652,7 +652,8 @@ fix_boat_units() {
     vs_prompt_choice choice "1 2"
     case $choice in
         1) new=us_customary ;;
-        *) new=metric ;;
+        2) new=metric ;;
+        *) echo "Unexpected answer; nothing was changed." >&2; exit 1 ;;
     esac
     config_fix_key "$CONFIG_FILE" BOAT_UNITS "$new" || {
         echo "Edit it by hand instead: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=$new/' $CONFIG_FILE" >&2

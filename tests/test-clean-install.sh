@@ -796,6 +796,26 @@ printf 'x\n1\n' > "$ANS"
 xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1
 grep -q 'Please enter one of: 1, 2, or c to cancel.' "$TEST_ROOT/fix.out"
 grep -qx 'BOAT_UNITS=us_customary' "$FRESH"
+# Anything but exactly one listed token is a bad answer: "1 2" and "1 b" are asked again and
+# never guess (a bad answer must not fall through to metric).
+fresh_config fix-units-multi
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+printf '1 2\n1 b\n 2 1 \n1\n' > "$ANS"
+xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1
+test "$(grep -c 'Please enter one of: 1, 2, or c to cancel.' "$TEST_ROOT/fix.out")" -eq 3
+grep -qx 'BOAT_UNITS=us_customary' "$FRESH"
+fresh_config fix-units-multi-cancel
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+multi_before=$(sha256sum "$FRESH")
+printf '1 2\nc\n' > "$ANS"
+if xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "a multi-token answer was accepted" >&2
+    exit 1
+fi
+test "$multi_before" = "$(sha256sum "$FRESH")"
+test -z "$(copies_of "$FRESH")"
 
 # Cancel and end of input leave the file byte-identical and print one clear line.
 fresh_config fix-cancel
@@ -898,6 +918,16 @@ test -z "$(copies_of "$FRESH")"
 
 # Unattended, with and without a terminal that is not available: the old message, nothing asked.
 printf '2\n' > "$ANS"
+# The answers hook is ignored unless the file is private to this user: a group- or world-writable
+# file or a symbolic link is never read.
+chmod 0666 "$ANS"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_PROMPT_ANSWERS="$ANS" \
+    "$inst" --config "$IMPERIAL" --dry-run >"$TEST_ROOT/fix.out" 2>&1 </dev/null; then
+    echo "a world-writable answers file was honoured" >&2
+    exit 1
+fi
+if grep -q 'Choice:' "$TEST_ROOT/fix.out"; then echo "a world-writable answers file was read" >&2; exit 1; fi
+chmod 0600 "$ANS"
 if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_PROMPT_ANSWERS="$ANS" \
     "$inst" --config "$IMPERIAL" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
     echo "an unattended run accepted an unsupported value" >&2

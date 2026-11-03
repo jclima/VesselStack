@@ -1272,7 +1272,8 @@ settle_backup_destination() {
     # shellcheck source=scripts/lib/remediate.sh
     source "$lib"
     say ""
-    VS_PROMPT_FD=3 VS_BACKUP_ROOT=${app_root:-$INSTALL_ROOT} VS_BACKUP_DATA=${data_root:-/opt/vesselstack-data} \
+    VS_CANCEL_MESSAGE="Cancelled. The update was not started; your installed VesselStack was not changed." \
+        VS_PROMPT_FD=3 VS_BACKUP_ROOT=${app_root:-$INSTALL_ROOT} VS_BACKUP_DATA=${data_root:-/opt/vesselstack-data} \
         VS_BACKUP_ENV_FILE=$env_file VS_BACKUP_UPDATE_DIR=$RELEASE_DIR \
         vs_backup_destination_fix "$dest" bootstrap \
         || die "The backup drive is not mounted, so the update did not start. Nothing was changed on the installed system." \
@@ -1336,6 +1337,11 @@ step_install() {
     fi
 
     local ctl
+    # --yes, --defaults and scripted answers never pick a fix, so neither ctl nor install.sh may ask.
+    local -a ctl_env=()
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DEFAULTS_ONLY" -eq 1 ] || [ -n "${VESSELSTACK_BOOTSTRAP_ANSWERS:-}" ]; then
+        ctl_env+=(VESSELSTACK_NONINTERACTIVE=true)
+    fi
     if [ "$UPGRADE" -eq 1 ]; then
         ctl=$(find_ctl) || die "vesselstackctl was not found, although VesselStack $INSTALLED_VERSION is installed." \
             "Run the installer directly: sudo $RELEASE_DIR/install.sh --config $INSTALL_ROOT/config/vesselstack.env --dry-run"
@@ -1344,10 +1350,6 @@ step_install() {
         # (read by old ctls' child install.sh and by the new ctl alike).
         settle_backup_destination
         # --yes, --defaults and scripted answers never pick a fix, so the ctl must not ask either.
-        local -a ctl_env=()
-        if [ "$ASSUME_YES" -eq 1 ] || [ "$DEFAULTS_ONLY" -eq 1 ] || [ -n "${VESSELSTACK_BOOTSTRAP_ANSWERS:-}" ]; then
-            ctl_env+=(VESSELSTACK_NONINTERACTIVE=true)
-        fi
         if [ "$BACKUP_ALLOW_ONCE" -eq 1 ]; then ctl_env+=(VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true); fi
         say "  Running: ${offline_env}vesselstackctl update $RELEASE_DIR"
         if [ "$OFFLINE" -eq 1 ]; then
@@ -1363,19 +1365,19 @@ step_install() {
     else
         say "  Preflight (changes nothing): install.sh ${install_args[*]} --dry-run"
         if [ -n "$bundle_wheels" ]; then
-            VESSELSTACK_WHEELHOUSE=$bundle_wheels "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
                        "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
-            VESSELSTACK_WHEELHOUSE=$bundle_wheels "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
                 || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
                        "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
         else
-            "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
                        "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
-            "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
+            env ${ctl_env[@]+"${ctl_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
                 || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
                        "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
         fi

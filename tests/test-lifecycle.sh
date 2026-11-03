@@ -601,6 +601,31 @@ EOF
     want "(none found)"
     want "Plug in a drive formatted as ext4"
 
+    # An unlabeled partition keeps its columns (an empty LABEL must not shift the fields) and is
+    # mounted with the right filesystem type and device.
+    cat > "$TEST_ROOT/lsblk-nolabel.json" <<EOF
+{"blockdevices":[
+ {"path":"/dev/sdd","type":"disk","size":"8G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sdd1","type":"part","size":"8G","label":null,"fstype":"ext4","uuid":"5555-eeee","mountpoint":null,"rm":true}]}
+]}
+EOF
+    FAKE_LSBLK="$TEST_ROOT/lsblk-nolabel.json" menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want '[1] /dev/sdd1  8G  (no label)  ext4'
+    grep -qx -- "mount -t ext4 -o nodev,nosuid,noexec /dev/sdd1 $unmounted" "$TEST_ROOT/mount.log"
+    want "UUID=5555-eeee $unmounted ext4 nofail,noatime,nodev,nosuid,noexec 0 2"
+    rm -rf -- "$unmounted"
+    # Only one listed token is an answer: "1 2" and "1 b" are asked again and mount nothing.
+    menu_run $'2\n1 2\n1 b\n c\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    test "$(grep -cF 'Please enter one of: 1, b, or c' <<<"$MENU_ERR")" -eq 2
+    test ! -s "$TEST_ROOT/mount.log"
+    rm -rf -- "$unmounted"
+    menu_run $'1 2\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "Please enter one of: 2, 3, 4, or c"
+    test ! -s "$TEST_ROOT/mount.log"
+
     # A mount point that holds files is refused: they would be hidden by the mount.
     install -d "$unmounted"
     printf 'keep\n' > "$unmounted/precious.txt"

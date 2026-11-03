@@ -183,6 +183,7 @@ printf 'deadbeef\n' > "$SRC/COMMIT"
 cat > "$SRC/install.sh" <<'EOF2'
 #!/bin/bash
 echo "install $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-}" >> "$LOG"
+echo "installenv $* NONINTERACTIVE=${VESSELSTACK_NONINTERACTIVE:-}" >> "$LOG"
 case " $* " in
     *" --dry-run "*) [ -z "${FAKE_FAIL_DRY:-}" ] || exit 1; exit 0 ;;
 esac
@@ -469,6 +470,9 @@ if ! { [ -n "$dry" ] && [ -n "$real" ] && [ "$dry" -lt "$real" ]; }; then fail_t
 expect_log "^install --config $RELEASE_BASE/vesselstack.env --dry-run"
 expect_log "^install --config $RELEASE_BASE/vesselstack.env --start"
 expect_log "^ctl doctor"
+# --yes: the fresh-install installer calls must not ask either.
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --dry-run NONINTERACTIVE=true$"
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --start NONINTERACTIVE=true$"
 expect_log "^ctl urls"
 refuse_log "^wizard "
 refuse_log "^useradd"
@@ -1537,6 +1541,13 @@ expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE=$TEST_ROOT/bundle/wheelhou
 refuse_log "^ctl update --offline"
 expect_out "VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=$TEST_ROOT/bundle/wheelhouse vesselstackctl update"
 
+# --defaults: same for the fresh install (no prompt may open inside install.sh).
+reset_state
+run --defaults --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "fresh install with --defaults"
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --dry-run NONINTERACTIVE=true$"
+expect_log "^installenv --config $RELEASE_BASE/vesselstack.env --start NONINTERACTIVE=true$"
+
 # ---- 9b. unmounted backup drive, asked before the installed ctl runs ----------------------
 BACKUP_MNT=/mnt/vs-get-backup-test
 trap 'rm -rf -- "$TEST_ROOT" "$BACKUP_MNT"; userdel vesselstack-wizard >/dev/null 2>&1 || true' EXIT
@@ -1565,7 +1576,7 @@ printf 'y\ny\nc\n' > "$TEST_ROOT/answers"
 EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
 EXTRA_ENV=
 expect_rc 1 "backup drive: cancel"
-expect_out "Cancelled. Nothing was changed."
+expect_out "Cancelled. The update was not started; your installed VesselStack was not changed."
 refuse_log "^ctl update"
 
 backup_upgrade
@@ -1573,7 +1584,7 @@ printf 'y\ny\n' > "$TEST_ROOT/answers"
 EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
 EXTRA_ENV=
 expect_rc 1 "backup drive: input ends"
-expect_out "Cancelled. Nothing was changed."
+expect_out "Cancelled. The update was not started; your installed VesselStack was not changed."
 refuse_log "^ctl update"
 
 # The env file pins false: the system-disk choice is not offered.
