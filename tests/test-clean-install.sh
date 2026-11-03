@@ -725,6 +725,28 @@ HOME_ASSISTANT_TOKEN="it's fine"
 CFG
 xinstall "$X_APP/installer/install.sh" --config "$GOODVAL" --dry-run | grep -q 'Preflight passed'
 
+# 1b-bis. Legacy BOAT_UNITS=nautical (offered by older wizards, unchecked before 0.5.7) is read as
+# metric: the dry run prints one note and changes nothing; a real run persists metric. Any other
+# unsupported value is refused before anything changes, with a message naming the file and fix.
+NAUTICAL="$TEST_ROOT/nautical.env"
+grep -v '^BOAT_UNITS=' "$XENV" > "$NAUTICAL"
+printf 'BOAT_UNITS=nautical\n' >> "$NAUTICAL"
+env_before=$(sha256sum "$XENV")
+xinstall "$X_APP/installer/install.sh" --config "$NAUTICAL" --dry-run >"$TEST_ROOT/nautical.out" 2>&1
+grep -q 'Preflight passed' "$TEST_ROOT/nautical.out"
+test "$(grep -c 'BOAT_UNITS=nautical is no longer a separate option; using metric (knots and nautical miles are kept)' "$TEST_ROOT/nautical.out")" -eq 1
+test "$env_before" = "$(sha256sum "$XENV")"
+IMPERIAL="$TEST_ROOT/imperial.env"
+grep -v '^BOAT_UNITS=' "$XENV" > "$IMPERIAL"
+printf 'BOAT_UNITS=imperial\n' >> "$IMPERIAL"
+expect_unchanged_failure "dry-run with unsupported units" xinstall "$X_APP/installer/install.sh" --config "$IMPERIAL" --dry-run
+grep -qF "BOAT_UNITS=imperial in $IMPERIAL is not supported. Set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $IMPERIAL" "$TEST_ROOT/failure.out"
+expect_unchanged_failure "real run with unsupported units" xinstall "$X_APP/installer/install.sh" --config "$IMPERIAL"
+grep -q 'BOAT_UNITS=imperial' "$TEST_ROOT/failure.out"
+xinstall "$X_APP/installer/install.sh" --config "$NAUTICAL" >/dev/null 2>&1
+grep -q "^BOAT_UNITS=metric$" "$XENV"
+if grep -q nautical "$XENV"; then echo "the installed config still says nautical" >&2; exit 1; fi
+
 # 1c. Stale env temp files (exact mktemp names) are removed by a real run; a dry run
 # leaves them, and similarly named files are never touched.
 for stale in .vesselstack.env.AbC123 .boat-chat.env.xYz789 .control-panel.env.000000; do : > "$X_APP/config/$stale"; done

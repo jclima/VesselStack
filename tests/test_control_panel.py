@@ -32,6 +32,20 @@ class EnvironmentFileTests(unittest.TestCase):
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_legacy_nautical_units_display_as_metric_without_rewriting_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vessel = root / "vessel.env"
+            vessel.write_text("BOAT_NAME=Old Boat\nBOAT_UNITS=nautical\n")
+            before = vessel.read_bytes()
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=root / "chat.env", PANEL_ENV=root / "control.env"):
+                values = panel.public_configuration()["values"]
+            self.assertEqual(values["BOAT_UNITS"], "metric")
+            self.assertEqual(vessel.read_bytes(), before)
+            self.assertIn(values["BOAT_UNITS"], panel.FIELD_BY_KEY["BOAT_UNITS"]["choices"])
+        with self.assertRaises(ValueError):
+            panel.validate_value(panel.FIELD_BY_KEY["BOAT_UNITS"], "imperial")
+
     def test_public_configuration_redacts_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

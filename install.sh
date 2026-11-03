@@ -82,6 +82,18 @@ BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
 : "${BOAT_UNITS:=us_customary}"
+# Older setup wizards offered "nautical" and installers before 0.5.7 did not check it, so
+# such configs exist. It is read as metric (knots and nautical miles are kept in both
+# systems), and the rewritten vesselstack.env persists "metric". Surrounding whitespace and
+# letter case are tolerated for the two supported values.
+BOAT_UNITS_INPUT=$BOAT_UNITS
+BOAT_UNITS=${BOAT_UNITS#"${BOAT_UNITS%%[![:space:]]*}"}
+BOAT_UNITS=${BOAT_UNITS%"${BOAT_UNITS##*[![:space:]]}"}
+BOAT_UNITS=${BOAT_UNITS,,}
+if [ "$BOAT_UNITS" = nautical ]; then
+    echo "Note: BOAT_UNITS=nautical is no longer a separate option; using metric (knots and nautical miles are kept)." >&2
+    BOAT_UNITS=metric
+fi
 : "${NODE_EXPORTER_ENABLE:=false}"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
@@ -160,7 +172,13 @@ for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_F
         *) echo "$key must be true or false" >&2; exit 1 ;;
     esac
 done
-case "$BOAT_UNITS" in us_customary|metric) ;; *) echo "BOAT_UNITS must be us_customary or metric" >&2; exit 1 ;; esac
+case "$BOAT_UNITS" in
+    us_customary|metric) ;;
+    *)
+        echo "BOAT_UNITS=$BOAT_UNITS_INPUT in $CONFIG_FILE is not supported. Set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $CONFIG_FILE" >&2
+        exit 1
+        ;;
+esac
 # MQTT account names are written into the Mosquitto password and ACL files.
 for key in MQTT_USERNAME DISPLAYS_BRIDGE_MQTT_USERNAME; do
     if ! [[ "${!key}" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then

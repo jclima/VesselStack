@@ -63,7 +63,7 @@ terminal. The Pi needs no screen, keyboard, or browser, and nothing has to be
 opened or tunnelled:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
 ```
 
 The terminal questions come in short sections (boat, Signal K, NMEA 2000 / CAN,
@@ -110,7 +110,7 @@ changed the panel port in Settings, use that number. See the
 **Without questions** (scripts, repeatable installs, or when no terminal is available):
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 ```
 
@@ -123,7 +123,7 @@ installer stops before changing anything and lists these options. `--web-wizard`
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
 The pinned URL above works for any published release, including a prerelease; add
-`--version 0.6.0` (`| sudo bash -s -- --version 0.6.0`) or set `VESSELSTACK_VERSION=0.6.0` for
+`--version 0.6.1` (`| sudo bash -s -- --version 0.6.1`) or set `VESSELSTACK_VERSION=0.6.1` for
 the same effect. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 points to whichever release GitHub marks Latest, which is not necessarily the newest release
 (every 0.5.x release was a prerelease), so it is a secondary option. The script installs the Debian
@@ -142,8 +142,8 @@ page, or pass `--sha256 HASH`. To read the script first (recommended for the fir
 install):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -251,7 +251,7 @@ Skip sections 5 and 6 if you used the one-line installer.
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.6.0
+git checkout v0.6.1
 python3 vesselstack-wizard.py --cli     # questions in the terminal, works over plain SSH
 # python3 vesselstack-wizard.py         # the optional browser wizard (below)
 ```

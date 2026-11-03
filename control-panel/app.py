@@ -521,6 +521,8 @@ def public_configuration() -> dict[str, Any]:
     for spec in FIELDS:
         source = chat if spec["source"] == "chat" else vessel
         value = source.get(spec["key"], "")
+        if spec["key"] == "BOAT_UNITS" and value.strip().lower() == "nautical":
+            value = "metric"  # legacy value from older setup wizards: show Metric, not an unknown choice
         if spec["key"] in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             value = panel.get(spec["key"], value)
         result[spec["key"]] = {"configured": bool(value)} if spec["kind"] == "secret" else value

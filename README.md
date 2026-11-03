@@ -157,18 +157,18 @@ session), run the pinned release installer and answer the questions in the same 
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
 ```
 
-The same release is also selected by `VESSELSTACK_VERSION=0.6.0` or `--version 0.6.0`:
+The same release is also selected by `VESSELSTACK_VERSION=0.6.1` or `--version 0.6.1`:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.6.0 bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash -s -- --version 0.6.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.6.1 bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash -s -- --version 0.6.1
 ```
 
 > [!NOTE]
-> The pinned URL names the release explicitly, so it installs exactly 0.6.0 whatever
+> The pinned URL names the release explicitly, so it installs exactly 0.6.1 whatever
 > GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a prerelease, so that URL kept serving
@@ -215,10 +215,10 @@ that does not point at the exact commit being built, before building anything. T
 
 ```bash
 # defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 # every question's own default answer, nothing asked
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash -s -- --defaults
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash -s -- --defaults
 # a ready-made vesselstack.env (optionally with --set overrides)
 sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
 ```
@@ -357,8 +357,8 @@ script is wrapped in functions and ends with a single `main "$@"` call, so a
 truncated download cannot half-run. If you prefer to read it first (recommended):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -380,7 +380,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.6.0
+git checkout v0.6.1
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the optional browser wizard
 ```
@@ -427,7 +427,25 @@ before carrying an update to a boat without internet access.
 ## Upgrading to 0.6.0
 
 Read this before updating an installed system. Update from [Updating](#updating) with a backup
-on a mounted external drive, not while underway.
+on a mounted external drive, not while underway. This section applies to 0.6.0 and 0.6.1.
+
+**Settings that say `BOAT_UNITS=nautical` (fixed in 0.6.1).** Older setup wizards offered
+"nautical" as a units choice, and installers before 0.5.7 did not check it, so such a
+`vesselstack.env` may exist. 0.6.0 refused it with `BOAT_UNITS must be us_customary or metric`
+and stopped the update before changing anything. From 0.6.1 the installer reads `nautical` as
+`metric` (metres for depth; knots and nautical miles are kept in both systems), prints one
+`Note:` line, and a real install or update rewrites `vesselstack.env` with `BOAT_UNITS=metric`
+(a dry run only prints the note). The setup wizard and the Control Panel also show it as Metric
+without changing it. Any other unsupported value is still refused before anything is changed,
+now with a message naming the file and the fix. If you are stuck on 0.6.0, change the value
+by hand and run the update again:
+
+```bash
+sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /opt/vesselstack/config/vesselstack.env
+```
+
+Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
+needs no other manual step.
 
 **What changes for an existing boat**
 
@@ -494,14 +512,14 @@ command under Rollback below, fix the value, and update again.
 **Verify after updating**
 
 ```bash
-cat /opt/vesselstack/config/installed-version     # 0.6.0
+cat /opt/vesselstack/config/installed-version     # 0.6.1
 sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
 
 Open Boat Chat and the Control Panel, and confirm the dashboards show live values.
 
-**Rollback.** Downgrades are refused (`Downgrade from 0.6.0 to ... is not supported`). Restore the
+**Rollback.** Downgrades are refused (`Downgrade from 0.6.1 to ... is not supported`). Restore the
 verified pre-update backup instead:
 
 ```bash
@@ -614,26 +632,26 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-To work from the 0.6.0 release, check out its tag:
+To work from the 0.6.1 release, check out its tag:
 
 ```bash
 git fetch --tags
-git checkout v0.6.0
+git checkout v0.6.1
 ```
 
-`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against
+`v0.6.1` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against
 `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the
 maintainer's physical Raspberry Pi install passes; see the [CHANGELOG](CHANGELOG.md). Verify the
 tag yourself (needs `ssh-keygen`, which ships with OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.6.0
+scripts/verify-release-tag.sh v0.6.1
 # maintainers and owners: also bind the tag to the commit you recorded when it was built
 # (the full 40-character SHA from your release notes, not one read back from the tag itself)
-scripts/verify-release-tag.sh v0.6.0 .github/allowed_signers "$RECORDED_COMMIT"
+scripts/verify-release-tag.sh v0.6.1 .github/allowed_signers "$RECORDED_COMMIT"
 # equivalent plain git command:
-git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.0
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.1
 ```
 
 The script prints the signer and key fingerprint, and exits non-zero for an unsigned,
@@ -661,7 +679,7 @@ nano vesselstack.env
 | `BOAT_CHAT_ACCESS_TOKEN` | `GENERATE` (default) creates a random token, preserved on re-install; required for chat, status and data APIs |
 | `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
 | `BOAT_TIMEZONE` | IANA timezone, such as `America/Los_Angeles` |
-| `BOAT_UNITS` | `us_customary` or `metric` |
+| `BOAT_UNITS` | `us_customary` or `metric` (the legacy value `nautical` is read as `metric`; case and surrounding spaces are ignored) |
 | `VESSELSTACK_USER` | Existing non-root service account |
 | `VESSELSTACK_UID`, `VESSELSTACK_GID` | Derived from the service account by the installer |
 | `VESSELSTACK_ROOT` | Application path; default `/opt/vesselstack` |
@@ -1138,7 +1156,7 @@ This is the one place in the README that describes updating and rolling back.
 2. **Re-run the pinned release installer.** On the Pi, over `ssh -t`:
 
    ```bash
-   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.0/get-vesselstack.sh | sudo bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
    ```
 
    The installer finds the installed system, never overwrites it silently, and offers
@@ -1148,7 +1166,7 @@ This is the one place in the README that describes updating and rolling back.
    `install.sh --start`. Answer **n** to leave the system untouched; the installer prints
    the exact command to run later. Services restart briefly, so do not update while underway.
    Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
-   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.6.0`.
+   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.6.1`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
 
@@ -1165,13 +1183,13 @@ This is the one place in the README that describes updating and rolling back.
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
    backed up; configuration and data are.
 
-| Installed version | Update to 0.6.0 |
+| Installed version | Update to 0.6.1 |
 |---|---|
-| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.6.0 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
+| 0.5.7 | Control Panel or the pinned installer. 0.6.1 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.6.1 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 
-A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.6.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.6.1` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:
@@ -1187,7 +1205,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on a connected machine, carry it to the boat, and install with
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.0.tar.gz`.
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.1.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
 
 ## Stopping or removing services

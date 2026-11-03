@@ -3,6 +3,20 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.6.1 - 2026-11-03
+
+### Fixes
+
+- Upgrading a boat whose settings say `BOAT_UNITS=nautical` (offered by older setup wizards) no
+  longer stops the update; it is read as metric, and knots and nautical miles are kept.
+- A clearer message, naming the file and the fix, for any other unsupported `BOAT_UNITS` value.
+
+### Release status
+
+`v0.6.1` is an SSH-signed tag verified by the release workflow against `.github/allowed_signers`.
+It is published first as a pre-release and marked Latest after the maintainer's physical
+Raspberry Pi install passes.
+
 ## 0.6.0 - 2026-11-02
 
 ### Highlights

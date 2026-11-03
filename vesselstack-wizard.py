@@ -44,6 +44,14 @@ def system_report():
     interfaces=sorted(p.name for p in Path("/sys/class/net").glob("*") if p.name.startswith(("eth","en","wlan","wl","can")))
     return {"architecture":platform.machine(),"os":platform.platform(),"docker":bool(shutil.which("docker")),"compose":compose_available(),"interfaces":interfaces,"can0":"can0" in interfaces,"memory_gib":round(os.sysconf("SC_PAGE_SIZE")*os.sysconf("SC_PHYS_PAGES")/2**30,1),"output":str(OUTPUT)}
 
+def normalize_units(value):
+    """Older wizards offered "nautical"; it is read as metric (knots and nautical miles are kept anyway)."""
+    text=value.strip().lower() if isinstance(value,str) else value
+    if text=="nautical":
+        print("Note: BOAT_UNITS=nautical is no longer a separate option; using metric (knots and nautical miles are kept).",file=sys.stderr)
+        return "metric"
+    return text if text in {"us_customary","metric"} else value
+
 def validate(values):
     unknown=set(values)-set(DEFAULTS)
     if unknown: raise ValueError("Unknown settings: "+", ".join(sorted(unknown)))
@@ -53,6 +61,7 @@ def validate(values):
         result[key]=value
     result["VESSELSTACK_DISABLED_COMPONENTS"] = normalize_disabled_components(result["VESSELSTACK_DISABLED_COMPONENTS"])
     if result["SIGNALK_MODE"] not in {"existing","docker","native"}: raise ValueError("Invalid SignalK mode")
+    result["BOAT_UNITS"]=normalize_units(result["BOAT_UNITS"])
     if result["BOAT_UNITS"] not in {"us_customary","metric"}: raise ValueError("Invalid BOAT_UNITS: use us_customary or metric")
     if _any_ip(result["CONTROL_PANEL_HOST"]): raise ValueError("Invalid CONTROL_PANEL_HOST: enter an IP address")
     for key in ("SIGNALK_VESSELTWIN_PRELOAD","SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","NODE_EXPORTER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT"):
