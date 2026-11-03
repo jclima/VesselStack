@@ -1007,7 +1007,7 @@ lan|local` changes only that bind. Sign in with the token from
   menu, Disable.
 - **Settings** has a jump list, help for every field, Advanced sections that start collapsed,
   inline field errors, and one save bar: **Save** writes the settings, **Apply** renders and installs
-  them (it does not recreate containers; restart a component to use the new values).
+  them (it does not recreate containers and restarts only the displays bridge; restart a component to use the new values).
 - **Updates** checks only when you press **Check for updates**, which contacts github.com.
 - **Maintenance** holds Back up now, Start all, Restart all, Stop all, **Check setup**,
   **Reinstall & start**, **Provision history** and **Restart Control Panel**.

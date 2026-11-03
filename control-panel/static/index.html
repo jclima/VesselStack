@@ -122,7 +122,7 @@
               <div class="action"><div class="d"><strong>Back up now</strong><span>Saves your settings and data to the backup folder. Services pause while the copy is made, so this can take a few minutes.</span><span id="maint-backup-last" class="last-backup"></span></div><div class="b"><button type="button" class="primary" data-action="backup">Back up now</button></div></div>
               <div class="card small flat"><strong>Restoring from a backup</strong><p>Restoring replaces current data, so it is done from the boat computer on purpose, not from this page. Check the file first, then restore:</p>
 <code>sudo vesselstackctl verify-backup &lt;backup-file&gt;
-sudo vesselstackctl restore &lt;backup-file&gt;</code></div>
+sudo vesselstackctl restore &lt;backup-file&gt; --yes</code></div>
             </div>
           </section>
           <section class="group" aria-labelledby="g-power"><h2 id="g-power">Start &amp; stop</h2>

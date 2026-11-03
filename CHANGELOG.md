@@ -21,6 +21,9 @@ Semantic Versioning.
   stopping or interrupting action asks in an in-page dialog that lists what is affected. Settings
   has a jump list, plain-language help for every field, Advanced sections that start collapsed,
   inline field errors (timezone and numeric ranges are now validated), and one Save and Apply bar.
+  The Apply dialog now states what Apply does: it writes the saved settings into the service files,
+  running services keep running until their next restart, and only the displays bridge restarts.
+  The Maintenance restore hint now shows `sudo vesselstackctl restore <backup-file> --yes`.
   The login accepts a pasted `CONTROL_PANEL_TOKEN=...` line and explains how to reach the panel.
   Updates are checked only when you press **Check for updates**. Dark mode, "Signal K" naming and
   accessibility improvements remain. Stored keys and values are unchanged, and no action's

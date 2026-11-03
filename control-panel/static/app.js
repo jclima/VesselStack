@@ -112,7 +112,7 @@ const CONFIRMS = {
   restart: { title: "Restart all services?", intro: "Every service stops and starts again. Live data pauses for under a minute.", ok: "Restart all" },
   start: { title: "Start all services?", intro: `Starts every enabled service that is stopped. ${LIVE_DATA_NOTE}`, ok: "Start all" },
   install: { title: "Reinstall & start?", intro: "This re-applies your saved settings and restarts every service.", items: ["Live data pauses for about a minute", "Unsaved edits on the Settings page are not included", "Your data and backups are not touched"], ok: "Reinstall & start" },
-  apply: { title: "Apply saved settings?", intro: "Your saved settings are put into effect on the boat computer.", items: ["Services whose settings changed restart, and live data pauses for about a minute", "Services that are stopped stay stopped"], ok: "Apply" },
+  apply: { title: "Apply saved settings?", intro: "Writes your saved settings into VesselStack's service files. Running services keep running; changes take effect the next time each service restarts.", items: ["The displays bridge, if it is running, restarts now", "Other services are not restarted: restart a service from Home, or use Restart all, to use the new values", "Services that are stopped stay stopped"], ok: "Apply" },
   "restart-panel": { title: "Restart the Control Panel?", intro: "This page will disconnect for a few seconds and reconnect by itself. Boat services are not affected.", ok: "Restart panel" },
 };
 const updateConfirm = (extra = {}) => ({

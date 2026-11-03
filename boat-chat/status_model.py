@@ -67,7 +67,7 @@ def normalize(cached):
     mode = 'Underway' if underway == 'on' else f'{watch} watch' if watch.lower() in {'dock','away','anchor'} else 'Unavailable'
     card('mode', 'Watch mode', mode, 'normal' if mode != 'Unavailable' else 'unknown', 'Give me a current boat status briefing')
     charging = state('binary_sensor.shore_power_connected')
-    card('shore', 'Charging proxy', {'on':'Charging detected','off':'No charging detected'}.get(charging,'Unavailable'), 'normal' if charging in {'on','off'} else 'unknown', 'What is the current shore power status?')
+    card('shore', 'Charging', {'on':'Charging detected','off':'No charging detected'}.get(charging,'Unavailable'), 'normal' if charging in {'on','off'} else 'unknown', 'What is the current shore power status?')
     soc = measured('electrical.batteries.shunt.capacity.stateOfCharge', True)
     voltage = measured('electrical.batteries.shunt.voltage')
     card('battery','Battery',display(soc,'%')+' · '+display(voltage,' V','.2f'), 'unknown' if soc is None or voltage is None else 'warning' if soc < 20 else 'normal', 'Tell me about the battery right now')

@@ -239,9 +239,10 @@ what is affected and has a plain **Cancel**.
 configuration but does not recreate containers or restart Boat Chat, Telegram or
 the Control Panel; it restarts only the displays bridge, if it is running. To make
 a running service use the new values, restart that component from its Home card,
-or use **Restart all** or **Reinstall & start**. (The Apply dialog's wording about
-services restarting is broader than this; `install.sh` without `--start` is what
-runs.) Hardware probes and the Signal K connectivity
+or use **Restart all** or **Reinstall & start**. The Apply dialog says the same:
+saved settings are written into the service files, running services keep running
+and take the changes at their next restart, and the displays bridge restarts now.
+Hardware probes and the Signal K connectivity
 check still gate installer actions.
 
 ## When the panel cannot connect
