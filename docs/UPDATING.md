@@ -28,10 +28,18 @@ sudo vesselstackctl update /opt/vesselstack-release/0.6.0
 
 ## From the Control Panel
 
-An authenticated Control Panel session can check releases and run **Back up & install**.
-Releases that GitHub publishes as prereleases appear only after you enable
-**Include lab prereleases**. It needs a mounted external backup drive under `/media` or
-`/mnt`; see [Control Panel](CONTROL_PANEL.md).
+Open the **Updates** tab and press **Check for updates**. This is the only thing that
+contacts `github.com`; nothing about your boat is sent. A newer release is listed with a
+link to its notes and a **Back up & install** button. Releases that GitHub publishes as
+prereleases appear only after you turn on **Include early test releases** (0.5.x panels
+call the same switch "Include lab prereleases"). **Back up & install** downloads the
+archive, checks its size and SHA-256 checksum, runs the installer's `--dry-run` check,
+takes a backup with `--require-mounted` (so the update stops if the external backup drive
+under `/media` or `/mnt` is not mounted), installs, restarts the Control Panel and waits
+for it to report the new version. The page reconnects by itself. See
+[Control Panel](CONTROL_PANEL.md#updates).
+
+If the Control Panel is unavailable, use the pinned installer above.
 
 ## From a source checkout
 
@@ -170,3 +178,26 @@ variable) passes
 than `true`/`false` in `VESSELSTACK_OFFLINE` is rejected. Without the flag or
 variable the install runs online, with the hash-pinned lock. Rollback: restore the
 pre-update backup (the lock file is inert for older releases).
+
+## Verify a release tag
+
+A checksum shows a download is intact; it is not signed provenance. Release tags are
+SSH-signed annotated tags, and `scripts/verify-release-tag.sh` checks one against the
+release key listed in `.github/allowed_signers`. It needs a clone that contains the tag
+and `ssh-keygen` (part of OpenSSH):
+
+```bash
+git fetch --tags
+scripts/verify-release-tag.sh v0.6.0
+```
+
+The script takes `TAG [ALLOWED_SIGNERS_FILE [EXPECTED_COMMIT]]`. It checks that the tag is
+annotated, that its own name equals `TAG`, that it points directly at a commit, that the
+signature is Good from an allowed key and that the signer is the release principal. Pass a
+full 40 or 64 character commit SHA as the third argument to also bind the tag to the commit
+you recorded when the release was built (use `""` as the second argument to keep the default
+signers file). It exits non-zero, with an error on stderr, for an unsigned, lightweight or
+wrongly signed tag. Older `v0.5.x` tags are unsigned and fail by design. The Control Panel
+updater and `vesselstackctl update` check the archive checksum only; they do not run this
+script. How maintainers sign a release with a key held in 1Password is in
+[Deployment: release signing](DEPLOYMENT.md#1-release-signing-with-an-ssh-signing-key).

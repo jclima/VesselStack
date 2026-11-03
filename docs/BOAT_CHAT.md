@@ -19,6 +19,60 @@ Boat Chat retains the access code and admin code only for the current browser ta
 closing the tab clears them. The web app labels them **Access code** and **Admin code**;
 the environment variable names (`BOAT_CHAT_ACCESS_TOKEN`, `BOAT_CHAT_SETTINGS_TOKEN`) are unchanged.
 
+## A tour of the interface
+
+![Boat Chat Overview: boat condition, observations, needs attention and suggested actions](images/boat-chat-overview.png)
+
+*Overview: the boat's condition, how recent the observations are, what needs attention, and
+what you might want to do next.*
+
+The header has a connection status, an **Overview** and **Chat** switch, and a **More** menu.
+
+- **Overview** opens first. It shows the boat condition, the latest observations with their age,
+  **Needs attention**, and **What would you like to do?** with **Prepare for an outing**,
+  **Review my last trip** and **Trips & maintenance**. **System status** expands underneath.
+  **Refresh** re-reads the boat.
+- **Chat** is the question box. Example questions sit above it. **Answer style** offers Concise,
+  Explain, Diagnose and Checklist. **Ask** sends, **Cancel** stops a running request (requests
+  time out after 3 minutes), and **Clear** is a two-step action that confirms before it clears
+  the conversation.
+
+- **More** holds **Connect** (when an access code is needed), **Boat Hub**, **Prompts** and
+  **Settings**. **Boat Hub** shows safety, trip, position and maintenance at a glance, and the
+  trip report downloads as `vesselstack-trip-<date>.txt`. **Prompts** lists what Boat Chat can
+  do. Under each answer, **Helpful**, **Incomplete** and **Wrong** record feedback, with an
+  inline note form.
+- **Connect** asks for the **Access code**, keeps it in that browser tab only, and
+  **Disconnect** forgets it.
+- **Settings** (opens only once the current values have loaded) shows Models, Budgets, and the
+  settings for each provider. Under **Advanced** are Telegram and the Server section, which has
+  the **Access code**, the **Admin code** and a field for a new admin code. If Settings reports
+  that an access code is needed, choose **Connect** from the message. Saving sends only the
+  fields you changed; blank secret fields keep their saved value.
+
+![Boat Chat on a phone in dark mode with the More menu](images/boat-chat-phone-dark.png)
+
+*On a phone the header collapses to the More menu, and the page follows the device's dark mode.*
+
+### Access code, admin code and the API
+
+The **Access code** (`BOAT_CHAT_ACCESS_TOKEN`) gets you in. The **Admin code**
+(`BOAT_CHAT_SETTINGS_TOKEN`) is needed to change Settings. Scripts follow the same rules as the
+page, exactly:
+
+| Request | What it needs |
+|---|---|
+| `POST /api/chat`, `/api/feedback`, `/api/session/clear` | Access code in `X-Boat-Chat-Token` |
+| `GET /api/status`, `/api/insights`, `POST /api/maintenance` | Access code in `X-Boat-Chat-Token` |
+| `GET` / `HEAD /api/settings` | Access code in `X-Boat-Chat-Token` or `X-Boat-Chat-Access-Token` |
+| `POST /api/settings` | The same access code check, then the admin code: with `BOAT_CHAT_SETTINGS_TOKEN` set, `X-Boat-Chat-Token` must carry it from every address; with none set, only loopback (a `localhost` or `127.0.0.1` Host name) may write |
+
+When the two codes differ, send the access code in `X-Boat-Chat-Access-Token` and the admin code
+in `X-Boat-Chat-Token` on the same request. Without the right header the server returns 401
+(access) or 403 (admin).
+
+## Setup and operations
+
 Boat Chat rejects oversized or malformed API requests and sends defensive
 browser headers while remaining embeddable in the Home Assistant dashboard.
 It also provides deterministic time-window and signal planning, durable local
@@ -125,7 +179,7 @@ Threshold regressions run with `python3 -m unittest tests.test_metric_presentati
 the mocked CLI lifecycle regressions run with `sudo tests/test-lifecycle.sh` on
 Linux and do not control host services.
 
-The installer enables the schedules for boot; **Install & start** or
+The installer enables the schedules for boot; **Reinstall & start** (Control Panel → Maintenance → Setup & repair) or
 `vesselstackctl start` starts them immediately. Render-only installation keeps
 previously active schedules active. Backup, restore, and installation stop the
 timers and running jobs before touching their state. Inspect or run them with:
@@ -144,8 +198,8 @@ while missing optional entities remain unknown.
 
 ## Optional host metrics
 
-Enable **Host metrics** in the Control Panel's Prometheus settings, save, and
-use **Install & start**. Equivalently, set `NODE_EXPORTER_ENABLE=true` in the
+Enable **Host metrics** in the Control Panel's Prometheus settings (Settings → Advanced), **Save**, and
+use **Reinstall & start** on the Maintenance tab. Equivalently, set `NODE_EXPORTER_ENABLE=true` in the
 installed vessel configuration and apply it with the reviewed installer.
 The pinned exporter runs on the private Compose network without publishing
 port 9100. Its read-only host mounts support CPU, memory, disk, filesystem,
@@ -159,7 +213,7 @@ scrape target. Existing Prometheus data, retention, and listener settings are
 preserved. Offline bundles must be rebuilt with this release so the exporter
 image is available before enabling it offline.
 
-**Apply configuration** followed by **Start** also applies exporter scrape
+**Apply** (Settings tab) followed by **Start all** (Maintenance tab) also applies exporter scrape
 changes to a running Prometheus instance. The controller records the last
 successfully applied configuration hash in `config/.prometheus-conf.sha256`;
 render-only Apply does not advance it. Missing or changed hashes cause only
@@ -289,6 +343,6 @@ By default, Boat Chat uses the configured `BOAT_TIMEZONE` for query windows and
 displayed timestamps and `BOAT_UNITS` for presentation. A user may request a
 grounded display timezone or unit conversion; that changes presentation only,
 not the application's resolved query window. Source instants, authoritative
-unit labels, and canonical cache values are preserved. Apply configuration and
-restart the service after changing the timezone. Updated local knowledge is
+unit labels, and canonical cache values are preserved. Save and **Apply** the setting
+and restart the service after changing the timezone. Updated local knowledge is
 picked up by the existing telemetry index refresh path.

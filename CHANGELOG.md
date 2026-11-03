@@ -63,6 +63,13 @@ Semantic Versioning.
 - Boat Chat: the access code can no longer be cleared (blank or `null` for
   `BOAT_CHAT_ACCESS_TOKEN` is rejected with a 400) unless `BOAT_CHAT_ALLOW_OPEN=true`, so an
   API-only save cannot lock every client out. Set a new code instead.
+- Control Panel: saving settings accepted any text for the timezone. The server now rejects a
+  timezone that is not in the system's timezone list (`Europe/Lisbon` is accepted, `Lisbon` is
+  not) with a 400 that names the field, and writes nothing.
+- Control Panel: numeric settings accepted any number. The server now rejects a value that is
+  not a plain number (no units, signs or exponents), a decimal where a whole number is needed,
+  or a value outside the allowed range for that setting, with a 400 that names each offending
+  field. The page shows these messages beside the fields.
 - Installer: an unsafe env value used to be refused only during `--start`, after services were
   stopped and files replaced, and the installed `vesselstack.env` had already been truncated.
   The check now runs first (see Security), and each env file is written to a temporary file in
@@ -121,8 +128,9 @@ Semantic Versioning.
   access code in `X-Boat-Chat-Access-Token` when it differs from the admin code.
 - Owners on 0.4.x: update once from the CLI with the pinned installer. The 0.5.0 Mosquitto access
   list cuts off MQTT users that were added by hand to the old password file.
-- Owners on 0.5.5 to 0.5.7 can use the Control Panel updater; enable "Include lab prereleases"
-  while 0.6.0 is still a pre-release.
+- Owners on 0.5.5 to 0.5.7 can use the Control Panel updater; while 0.6.0 is still a
+  pre-release, turn on the switch that lists prereleases (called "Include lab prereleases" in
+  the 0.5.x panel and "Include early test releases" in 0.6.0).
 
 ### Rollback
 

@@ -72,7 +72,7 @@ Purpose-built telemetry questions are also answered deterministically before any
 
 ## Settings UI
 
-Use the `Settings` button in the web app to configure:
+Open **More** then **Settings** in the web app (it opens only after the current values have loaded). The interface is described in [Boat Chat setup](../docs/BOAT_CHAT.md#a-tour-of-the-interface). The page shows Models, Budgets and the provider sections; **Advanced** holds Telegram and the Server section with the **Access code** and **Admin code**. Settings configures:
 
 - Primary and fallback providers and models, all via dropdowns. Model dropdowns are provider-aware: Ollama lists the models actually installed (live from `/api/tags`), other providers show curated suggestions, and a `Custom...` entry accepts any exact model ID. Suggestions come from `GET /api/models`.
 - The primary model is stored in the right env key automatically: `BOAT_CHAT_CODEX_MODEL` for `codex_cli`, `BOAT_CHAT_CLAUDE_MODEL` for `claude_cli`, `BOAT_CHAT_MODEL` for everything else (and the generic key is cleared when a CLI provider is chosen, so a stale value cannot shadow it). Fallback models always use `BOAT_CHAT_FALLBACK_MODEL`.

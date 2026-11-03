@@ -9,7 +9,7 @@ the boat's local network when the internet is unavailable.
 
 ## Contents
 
-- [What you need](#what-you-need) and [where to go next](#where-to-go-next)
+- [What it looks like](#what-it-looks-like), [what you need](#what-you-need) and [where to go next](#where-to-go-next)
 - [What you get](#what-you-get) and [optional integrations](#optional-integrations): VesselTwin and instrument displays
 - [Quick start: one command on the Raspberry Pi](#quick-start-one-command-on-the-raspberry-pi), [before and after installation](#before-and-after-installation) and [manual guided installation](#advanced-manual-guided-installation)
 - [Upgrading to 0.6.0](#upgrading-to-060)
@@ -18,6 +18,22 @@ the boat's local network when the internet is unavailable.
 - [Backups](#backups), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
 - [Troubleshooting](#troubleshooting)
 - [Developer validation](#developer-validation), [Documentation policy](#documentation-policy), [License and security](#license-and-security), [Moved sections](#moved-sections)
+
+## What it looks like
+
+![Control Panel Home: services, backup and software status, one Back up now button and the component cards](docs/images/control-panel-home.png)
+
+*The Control Panel Home tab shows whether everything is running, the last backup and
+whether an update is known. [Control Panel guide](docs/CONTROL_PANEL.md).*
+
+![Boat Chat Overview: boat condition, observations, what needs attention and suggested actions](docs/images/boat-chat-overview.png)
+
+*Boat Chat answers questions from your boat's own recorded data. Its Overview shows
+condition and what needs attention. [Boat Chat guide](docs/BOAT_CHAT.md).*
+
+![Boat Chat on a phone in dark mode](docs/images/boat-chat-phone-dark.png)
+
+*Both web apps work on a phone and follow the device's light or dark setting.*
 
 ## What you need
 
@@ -372,14 +388,18 @@ python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 The terminal wizard (`--cli`) asks in the terminal and writes `vesselstack.env`; add
 `--defaults` and `--set KEY=VALUE` to configure without questions, `--base FILE` to start
 from an existing file, and `--validate FILE` to check an existing env file with the wizard's
-rules (exit 0 if valid, 1 otherwise, no server started). The browser wizard prints a per-run
+rules (exit 0 if valid, 1 otherwise, no server started). The browser wizard walks seven steps
+(Preflight, Hardware, Vessel, Storage, Signal K, Network, Review); Back keeps your choices and
+Continue stays blocked until the page has its address token. It prints a per-run
 loopback address of the form `http://127.0.0.1:PORT/#token=...`; open that exact address, on
 the Pi or through an `ssh -L` tunnel. Both wizards write a private `vesselstack.env` and
 change nothing else: no boot firmware, firewall rules, marine wiring or services. The browser
 wizard's options, token handling and request protections are described in
-[Development: wizard internals](docs/DEVELOPMENT.md#wizard-internals). Then run
-`sudo ./install.sh --config vesselstack.env --dry-run` and `--start` as described in the
-sections below.
+[Development: wizard internals](docs/DEVELOPMENT.md#wizard-internals). When the browser wizard
+saves the file, its last page shows the commands to run next (a `--dry-run` check, then
+`--start`, then `sudo vesselstackctl doctor`) and the wizard may then stop by itself, which is
+expected. Run `sudo ./install.sh --config vesselstack.env --dry-run` and `--start` as described
+in the sections below. The pages are shown with screenshots in [Getting started](docs/GETTING_STARTED.md#the-optional-browser-wizard).
 
 Rollback: delete the generated `vesselstack.env`; if a browser-wizard run was killed with
 SIGKILL, remove its temporary account with `sudo userdel vesselstack-wizard`.
@@ -430,6 +450,13 @@ on a mounted external drive, not while underway.
 - **Unauthenticated loopback settings writes require a local `Host` name** (a defense
   against DNS rebinding). Reach Boat Chat through `127.0.0.1` or `localhost`, or send the
   token.
+- **The Control Panel looks different.** It now has four tabs (Home, Settings, Updates,
+  Maintenance). **Install & start** is **Reinstall & start** and **Run preflight** is **Check
+  setup**, both under Maintenance → Setup & repair, and they run the same commands as before.
+  Saving settings and applying them are two steps (**Save**, then **Apply**). The Updates tab
+  contacts GitHub only when you press **Check for updates**. Stored settings and keys are
+  unchanged. Boat Chat's credentials are labelled **Access code** and **Admin code**; the
+  variable names are unchanged.
 - **Docker Signal K may restart once.** If the update newly preloads the pinned
   `signalk-vesseltwin` 0.2.3 plugin into an already-running Signal K container, the
   installer restarts that container so the plugin loads. An existing preloaded copy is never
@@ -498,8 +525,8 @@ buckets, provisions the one-minute downsample task expected by Boat Chat,
 provisions Grafana datasources and a system-health dashboard, and installs the
 `vesselstackctl` lifecycle command. It also installs a local-first, token-
 authenticated Control Panel that can inspect and operate every managed
-container and host service, edit redacted configuration, run preflight, apply
-configuration, create backups, and apply a reviewed release update.
+container and host service, edit redacted configuration, check the setup, save and apply
+settings, create backups, and check for and install release updates.
 
 All container tags are release-pinned and checked for Linux ARM64 availability;
 VesselStack does not rely on floating `latest` tags.
@@ -949,25 +976,45 @@ reusable versions in the repository so reinstallations remain reproducible.
 
 ### Boat Chat
 
-Open `http://HOST:8765` and enter the access code (`BOAT_CHAT_ACCESS_TOKEN` in
-`config/boat-chat.env`); the default `local` provider sends nothing to an external model.
-Settings, the admin code, telemetry refresh, optional host metrics, timezone and units
-are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in [Boat Chat providers](boat-chat/README.md).
+Open `http://HOST:8765`. The page opens on **Overview** (boat condition, observations, what
+needs attention and suggested actions); **Chat** is the question box. **More** holds
+**Boat Hub** (trips, position and maintenance), **Prompts** and **Settings**. When an access
+code is required, choose **Connect** and enter it; it is kept in that browser tab only. The
+access code is `BOAT_CHAT_ACCESS_TOKEN` in `config/boat-chat.env`, and the **Admin code**
+(`BOAT_CHAT_SETTINGS_TOKEN`) authorizes changing Settings. The default `local` provider sends
+nothing to an external model.
+
+![Boat Chat Overview in a browser](docs/images/boat-chat-overview.png)
+
+Settings, the admin code, API access rules, telemetry refresh, optional host metrics, timezone
+and units are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in
+[Boat Chat providers](boat-chat/README.md).
 
 ### Control Panel
 
-The Control Panel is the browser administration surface. It listens on loopback by default
-(`http://127.0.0.1:8780` through an SSH tunnel); `sudo vesselstackctl panel-access lan|local`
-changes only that bind. See [Control Panel](docs/CONTROL_PANEL.md) for the full guide.
+The Control Panel is the browser page for looking after VesselStack. It listens on loopback by
+default (`http://127.0.0.1:8780` through an SSH tunnel); `sudo vesselstackctl panel-access
+lan|local` changes only that bind. Sign in with the token from
+`sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
+`CONTROL_PANEL_TOKEN=...` line works too. The full tour is in the
+[Control Panel guide](docs/CONTROL_PANEL.md).
 
-Its four tabs are **Home** (a status band with service state, last backup and backup drive, and one
-**Back up now** button, then the components), **Settings** (jump list, help for every field, Advanced
-sections collapsed, one Save and Apply bar), **Updates** (checked only when you press **Check for
-updates**, which contacts github.com) and **Maintenance** (Start, Restart and Stop all, **Check setup**,
-**Reinstall & start**). Interrupting actions ask in an in-page dialog first. Sign in with the token or the
-whole pasted `CONTROL_PANEL_TOKEN=...` line. Last backup and backup drive are read-only and show
-"unknown" when they cannot be read. Rollback: `git revert` of this change restores the previous page; stored
-settings keys are unchanged.
+![Control Panel Home tab](docs/images/control-panel-home.png)
+
+- **Home** is status only: services running or stopped, the last backup and backup drive (read-only;
+  "unknown" when they cannot be read) and whether an update is known, with one **Back up now**
+  button and the components below. Component cards offer Start, Stop, Restart and, in a **⋯**
+  menu, Disable.
+- **Settings** has a jump list, help for every field, Advanced sections that start collapsed,
+  inline field errors, and one save bar: **Save** writes the settings, **Apply** renders and installs
+  them (it does not recreate containers; restart a component to use the new values).
+- **Updates** checks only when you press **Check for updates**, which contacts github.com.
+- **Maintenance** holds Back up now, Start all, Restart all, Stop all, **Check setup**,
+  **Reinstall & start**, **Provision history** and **Restart Control Panel**.
+
+Stopping or interrupting actions ask first in an in-page dialog. If the connection drops the
+header shows Disconnected with **Retry now**. Rollback: restore the previous release from a
+backup as described under [Updating](#updating); stored settings keys are unchanged.
 
 ### Heimdall
 
@@ -1101,8 +1148,7 @@ This is the one place in the README that describes updating and rolling back.
 3. **Or use the Control Panel.** An authenticated session can check the public
    `jclima/VesselStack` releases. Stable releases are shown by default; enable
    **Include early test releases** on the Updates tab to list prereleases as well, which you need for any release
-   GitHub publishes as a prerelease. The panel shows the installed and running version, the
-   release channel and a link to the release notes. Nothing contacts GitHub until you press
+   GitHub publishes as a prerelease. The panel shows the installed version and, for a newer release, a link to its release notes. Nothing contacts GitHub until you press
    **Check for updates**. **Back up & install** asks for confirmation in a dialog, verifies the downloaded SHA-256 manifest, safely extracts the
    release, runs preflight, then makes and verifies a backup on a mounted external drive
    (`/media` or `/mnt`; the browser cannot change the destination). A failed or unmounted
@@ -1114,7 +1160,7 @@ This is the one place in the README that describes updating and rolling back.
 
 | Installed version | Update to 0.6.0 |
 |---|---|
-| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (enable **Include early test releases** on the Updates tab to see it) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
+| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.6.0 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 

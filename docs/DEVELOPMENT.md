@@ -349,6 +349,7 @@ docker compose --env-file vesselstack.example.env \
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 python3 displays/displayctl.py validate
 python3 -m unittest discover -s tests -p 'test_control_panel.py' -v
+node tests/test_control_panel_ui.cjs   # Control Panel interface (tabs, dialogs, banner, validation)
 ```
 
 Build a sanitized release:
@@ -647,6 +648,6 @@ Use `sudo vesselstackctl component remove ID` to persist a removal and run
 `sudo vesselstackctl component add ID` to persist inclusion and start it. Adding
 Mosquitto refreshes its managed access files; adding InfluxDB runs its bootstrap
 when available. Do not edit the membership field in the Control Panel directly;
-use its Components controls. CLI and Control Panel lifecycle operations should
+use the Disable (⋯ menu) and Enable controls on the Home tab's component cards. CLI and Control Panel lifecycle operations should
 be run one at a time because external CLI requests are not cross-process
 serialized.

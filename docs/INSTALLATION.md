@@ -100,6 +100,13 @@ firewall may block it); restore the default with
 change. The command requires the existing root-owned config files and a
 non-empty panel token, and restarts only the control-panel service.
 
+**First sign-in.** Run the tunnel command above on your own computer, open
+`http://127.0.0.1:8780`, and paste the token from
+`sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env` into **Control
+Panel token** (the whole `CONTROL_PANEL_TOKEN=…` line works too), then press **Unlock**. If you
+changed the panel port in Settings, use that number. See the
+[Control Panel guide](CONTROL_PANEL.md) for a tour of the four tabs.
+
 **Without questions** (scripts, repeatable installs, or when no terminal is available):
 
 ```bash
@@ -258,14 +265,25 @@ ssh -L 8088:127.0.0.1:8088 YOUR_USER@YOUR_PI
 ```
 
 Then open the same printed address (with its `#token=...`) locally. The assistant inventories the host,
-walks through the BOM and deployment choices, and writes `vesselstack.env` with
-mode 600. Stop it with Ctrl-C when finished.
+walks seven steps (**Preflight**, **Hardware**, **Vessel**, **Storage**, **Signal K**,
+**Network**, **Review**) and writes `vesselstack.env` with mode 600. The last page shows the
+commands to run next; if the wizard has already stopped by itself, that is expected, and
+otherwise stop it with Ctrl-C.
 
-![Optional browser wizard: system preflight](images/wizard-preflight.png)
+![Optional browser wizard, step 1 Preflight: host, memory, Docker Compose and can0 checks](images/wizard-preflight.png)
 
-![Optional browser wizard: NMEA configuration](images/wizard-nmea.png)
+*Step 1 checks the host for information only; nothing is changed.*
 
-*Both screenshots show the optional browser wizard (`--web-wizard`). The terminal questions are the default path, and wording may differ.*
+![Optional browser wizard, step 5 Signal K and NMEA 2000, with the CAN interface warning](images/wizard-nmea.png)
+
+*Step 5: enable SocketCAN only after the vendor overlay is installed and `can0` appears.*
+
+![Optional browser wizard, last page: Configuration saved, with the install commands to run next](images/wizard-done.png)
+
+*After saving, the page lists `sudo ./install.sh --config FILE --dry-run`, then `--start`, then
+`sudo vesselstackctl doctor`. Nothing is installed yet.*
+
+These screenshots show the optional browser wizard (`--web-wizard`). The terminal questions are the default path, and wording may differ.
 
 ## 6. Preflight, install, and start
 

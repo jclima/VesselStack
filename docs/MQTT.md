@@ -124,7 +124,7 @@ Operational notes:
   run repeats the same checks and pulls a missing image *before* it changes any
   file, then syncs the MQTT access files **before** it installs the new
   `compose.yml` and `config/mosquitto/mosquitto.conf`, so a failure leaves the
-  previous broker definition in place. Apply configuration and install may
+  previous broker definition in place. **Apply** and **Reinstall & start** may
   pull the pinned Mosquitto image on first use and send `SIGHUP` to a running
   broker.
 - Upgrade impact: the Mosquitto container is recreated (a brief MQTT
@@ -136,7 +136,7 @@ Operational notes:
   `config/mosquitto.conf` and reads the legacy `passwords` file in
   `$VESSELSTACK_DATA/mosquitto`, so existing clients keep working, but the new
   ACL, the bridge account and the display accounts do **not** exist on that
-  broker. A render-only run (Control Panel "Apply configuration", or
+  broker. A render-only run (Control Panel **Apply**, or
   `install.sh --config ...` without `--start`) writes the new files but never
   recreates containers; it prints a `NOTICE` when the running broker predates
   the new definition (and when the displays bridge is enabled but not running)

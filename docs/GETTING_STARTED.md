@@ -62,10 +62,42 @@ and the optional Boat Chat provider are configured there. Boat Chat defaults to
 a local provider. A remote provider is optional and may require internet and
 provider credentials.
 
-![Example VesselStack preflight review](images/wizard-preflight.png)
+### The optional browser wizard
 
-*The optional browser wizard's preflight page, as an example. The terminal questions are the
-default path, and the wording, host checks and values may differ.*
+`--web-wizard` (or `python3 vesselstack-wizard.py` on its own) serves a browser version of the
+same questions on loopback only. It prints a per-run address of the form
+`http://127.0.0.1:PORT/#token=...`; open that exact address on the Pi, or from your laptop
+through `ssh -L PORT:127.0.0.1:PORT YOUR_USER@YOUR_PI.local`. It has seven steps:
+**Preflight**, **Hardware**, **Vessel**, **Storage**, **Signal K**, **Network** and **Review**.
+**Back** keeps what you entered, and **Continue** stays blocked until the page has its address
+token.
+
+![Browser wizard Preflight step showing the host, memory, Docker Compose and can0 checks](images/wizard-preflight.png)
+
+*Step 1, Preflight: host architecture and memory, Docker Compose, network interfaces and
+whether `can0` is present. The checks are for information only.*
+
+Steps 2 to 4 are a hardware checklist for your reference (not saved), the boat name, type,
+timezone and units (US customary or metric; knots and nautical miles are always kept), and the
+service account and paths. **Signal K** chooses a managed or existing server and, if you enable
+NMEA 2000, the CAN interface:
+
+![Browser wizard Signal K and NMEA 2000 step with the CAN interface warning](images/wizard-nmea.png)
+
+*Step 5, Signal K and NMEA 2000: enable SocketCAN only after the vendor overlay is installed
+and `can0` appears.*
+
+**Network** asks who can reach the dashboards and who can open the Control Panel, with an optional
+firewall for Wi-Fi. **Review** writes the file with mode 600; credentials, including the Boat
+Chat access code, are generated later, during installation.
+
+![Browser wizard final page: Configuration saved, with the commands to run next](images/wizard-done.png)
+
+*The last page after saving: nothing is installed yet. Run the `--dry-run` command, then the
+`--start` command, then `sudo vesselstackctl doctor`. If the wizard has stopped by itself, that is
+expected.*
+
+The terminal wizard asks the same things; its wording and values may differ slightly.
 
 ## How to access it
 
@@ -74,7 +106,9 @@ and Boat Chat. Open those addresses from a computer on the same trusted boat
 network. It also prints a command to read the Boat Chat access token locally;
 keep that token private and never commit `config/*.env`.
 
-The control panel is administration-only and binds to loopback by default. On
+## First sign-in to the Control Panel
+
+The Control Panel is administration-only and binds to loopback by default. On
 the Pi, retrieve its token locally:
 
 ```bash
@@ -88,8 +122,13 @@ SSH tunnel from your own computer:
 ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI
 ```
 
-Then open `http://127.0.0.1:8780` and enter the token. Do not expose port 8780 directly to the
-internet. Exact ports, LAN presets, firewall behavior, token storage, and
+Then open `http://127.0.0.1:8780`, paste the token (or the whole `CONTROL_PANEL_TOKEN=…`
+line) into **Control Panel token** and press **Unlock**. If you changed the panel port in
+Settings, use that number. Do not expose port 8780 directly to the internet.
+
+![Control Panel unlock screen](images/control-panel-login.png)
+
+A first look at each tab is in the [Control Panel guide](CONTROL_PANEL.md). Exact ports, LAN presets, firewall behavior, token storage, and
 rollback are documented in [Network access and security](NETWORK.md) and the
 [Control Panel guide](CONTROL_PANEL.md).
 
