@@ -641,7 +641,7 @@ remove_stale_env_temps() {
     [ -d "$dir" ] || return 0
     for name in vesselstack.env boat-chat.env control-panel.env; do
         for file in "$dir/.$name."??????; do
-            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            if [ ! -f "$file" ] || [ -L "$file" ]; then continue; fi
             [[ ${file##*/."$name".} =~ ^[A-Za-z0-9]{6}$ ]] || continue
             rm -f -- "$file"
         done

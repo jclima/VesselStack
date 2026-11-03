@@ -15,7 +15,7 @@ expected_principal=${VESSELSTACK_RELEASE_PRINCIPAL:-jc@linuxzone.org}
 
 die() { echo "verify-release-tag: $*" >&2; exit 1; }
 
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: $0 TAG [ALLOWED_SIGNERS_FILE]"
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then die "usage: $0 TAG [ALLOWED_SIGNERS_FILE]"; fi
 tag=$1
 case "$tag" in
     ''|-*) die "invalid tag name: $tag" ;;
@@ -50,7 +50,7 @@ line=$(printf '%s\n' "$output" | grep -E '^Good "git" signature for ' | tail -n 
 principal=${line#Good \"git\" signature for }
 principal=${principal%% with *}
 fingerprint=${line##* key }
-[ -n "$principal" ] && [ -n "$fingerprint" ] || die "could not parse signer from: $line"
+if [ -z "$principal" ] || [ -z "$fingerprint" ]; then die "could not parse signer from: $line"; fi
 
 [ "$principal" = "$expected_principal" ] || die "$tag is signed by $principal, but the release principal is $expected_principal"
 

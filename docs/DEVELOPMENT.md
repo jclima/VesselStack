@@ -293,9 +293,10 @@ info-level findings) on the shell scripts it lists, and they currently pass
 with no findings. The style `A && B || handler` is avoided (SC2015); use
 `if ! { A && B; }; then ... fi` instead.
 Run local checks with `shellcheck -S info` (and default severity) over
-`install.sh`, `build-package.sh`, `scripts/*` and `tests/*.sh`, since CI does; a
-recent ShellCheck (0.11.0) and the Debian bookworm one (0.9.0) both report no
-findings.
+`install.sh`, `build-package.sh`, `scripts/*` and `tests/*.sh`, since CI does.
+Check with ShellCheck 0.9.0 (the Ubuntu and Debian bookworm package, which CI
+installs): ShellCheck 0.11.0 does not report SC2015 for `A && B || continue`, so
+a clean local 0.11 run can still fail CI.
 
 Root-controlled test fixtures (`tests/test-offline-install.sh`,
 `tests/test-update-launcher.sh`) are created under `/usr/local/share/vs-test`,

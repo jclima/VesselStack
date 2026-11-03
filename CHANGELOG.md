@@ -128,6 +128,9 @@ Downgrades are refused. Restore the verified pre-update backup that the update t
 
 ### For contributors
 
+- ShellCheck-clean at every severity on the CI runner's ShellCheck 0.9: `install.sh` stale-temp
+  cleanup and `scripts/verify-release-tag.sh` argument and signer checks use explicit `if` blocks
+  instead of `A && B || C` (no behavior change).
 - `tests/test-distribution.sh` checks the pinned ESPHome digest and version in `README.md` or
   `docs/DISPLAYS.md`.
 - The board registry validator rejects a board that lists a layout the firmware generator cannot

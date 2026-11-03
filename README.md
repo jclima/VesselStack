@@ -1316,3 +1316,6 @@ Earlier versions of this README held these sections. Old links to them land here
 
 Historical release scope and review-fix notes are kept in
 [Development: Historical notes](docs/DEVELOPMENT.md#historical-notes). Release notes are in `CHANGELOG.md`.
+
+Contributors: CI runs ShellCheck 0.9.0 from the Ubuntu package at info severity; a clean run of a newer
+local ShellCheck is not enough (see [Development](docs/DEVELOPMENT.md)).
