@@ -29,6 +29,13 @@ Semantic Versioning.
   settings writes require a local `Host` name (DNS-rebinding defense).
 - Power tracking splits sign-crossing intervals at zero and floors peak
   inferred charge at 0 W.
+- The VesselTwin preload now pins `signalk-vesseltwin` 0.2.3 (0.2.2 was never
+  published). An existing preloaded copy is never overwritten; existing boats
+  update through the Signal K Appstore. In Docker mode, a re-run that newly
+  preloads the plugin restarts the running `signalk` container (the helper exits
+  with status 10 when it installed something). `docs/VESSELTWIN.md` now lists
+  plugin enablement as its own step for preloaded and Appstore installs, explains
+  how to reach the admin page, and matches the plugin's status messages.
 - The VesselTwin preload also lists `signalk-vesseltwin` in
   `signalk/package.json` dependencies so Signal K App Store installs do not
   prune it.

@@ -711,7 +711,7 @@ nano vesselstack.env
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
 | `SIGNALK_VERSION` | Pinned SignalK release used by managed modes |
 | `SIGNALK_URL` | Existing SignalK endpoint |
-| `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.1 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
+| `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
 | `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
@@ -882,9 +882,12 @@ uid/gid 1000, the image's `node` user, so the container can write it). With
 first-run admin onboarding at `http://HOST:3000`.
 
 Managed Docker and native installs preload the pinned, zero-runtime-dependency
-`signalk-vesseltwin` 0.2.1 package before SignalK starts. The archive is
+`signalk-vesseltwin` 0.2.3 package before SignalK starts. The archive is
 integrity-checked before publication; an existing plugin directory is preserved
-and never overwritten. The preload also lists the plugin in
+and never overwritten, so a boat that already has the plugin updates it from the
+Signal K App Store. When a re-run newly preloads the plugin into an
+already-running Docker Signal K container, the installer restarts that container
+so the plugin loads. The preload also lists the plugin in
 `signalk/package.json` `dependencies` (created if missing, other keys kept) so a
 later Signal K App Store `npm install --save` does not prune it. Preloading is
 separate from plugin enablement, pairing, and reading switches, which remain

@@ -1133,6 +1133,7 @@ if [ "$SIGNALK_MODE" = native ]; then
     SIGNALK_CONTAINER_UID=$VESSELSTACK_UID
     SIGNALK_CONTAINER_GID=$VESSELSTACK_GID
 fi
+SIGNALK_PLUGIN_INSTALLED=0
 if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ]; then
     preload_args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID")
     if [ "$OFFLINE" = true ]; then
@@ -1140,7 +1141,15 @@ if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ]; 
     else
         preload_args+=(--stage "$PLUGIN_STAGE" --publish)
     fi
-    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" "${preload_args[@]}"
+    # Exit status 10 means this run newly installed the plugin; a running Signal K
+    # container only sees it after a restart (native mode restarts below anyway).
+    preload_rc=0
+    python3 "$SCRIPT_DIR/scripts/preload-signalk-vesseltwin.py" "${preload_args[@]}" || preload_rc=$?
+    case "$preload_rc" in
+        0) ;;
+        10) SIGNALK_PLUGIN_INSTALLED=1 ;;
+        *) exit "$preload_rc" ;;
+    esac
 fi
 
 # Home Assistant bind address: add, update or remove the managed http block in its
@@ -1188,6 +1197,11 @@ if [ "$START" -eq 1 ]; then
     }; then
         "${compose_up[@]}" --force-recreate prometheus || exit 1
         write_prometheus_stamp || exit 1
+    fi
+    # "compose up -d" leaves a running Signal K container alone, so a plugin that this
+    # run newly preloaded would stay unloaded until the next restart.
+    if [ "$SIGNALK_MODE" = docker ] && [ "$SIGNALK_PLUGIN_INSTALLED" -eq 1 ]; then
+        compose restart signalk
     fi
     [ "$NODE_EXPORTER_ENABLE" = true ] || compose rm --stop --force node-exporter 2>/dev/null || true
     # A changed compose definition is recreated by "compose up -d" itself; a

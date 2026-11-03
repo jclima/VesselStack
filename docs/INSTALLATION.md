@@ -346,7 +346,7 @@ doctor`. 0.4.3 and later build the index during installation, on upgrade and on
 
 ## Managed SignalK and VesselTwin preload
 
-Managed Docker/native SignalK preloads pinned `signalk-vesseltwin` 0.2.1 when
+Managed Docker/native SignalK preloads pinned `signalk-vesseltwin` 0.2.3 when
 `SIGNALK_VESSELTWIN_PRELOAD=true`. Preload, enablement, pairing, and reading
 permissions are separate steps; see [VESSELTWIN.md](VESSELTWIN.md). Offline
 Docker installs reuse a valid existing plugin and fail before mutation when it

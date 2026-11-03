@@ -4,9 +4,10 @@ from __future__ import annotations
 import argparse, base64, ctypes, errno, hashlib, io, json, os, shutil, stat, sys, tarfile, tempfile, urllib.request
 from pathlib import Path
 
-URL = "https://registry.npmjs.org/signalk-vesseltwin/-/signalk-vesseltwin-0.2.1.tgz"
-SHA512 = "VDrKGAtLUuk4kYhS2O03nfONKzKgMb/443eS/rQkLqSpCLv0HONb8UiHR+H9gV7xRoq0eX+rhrQwU8k/AcPvrg=="
-NAME, VERSION = "signalk-vesseltwin", "0.2.1"
+URL = "https://registry.npmjs.org/signalk-vesseltwin/-/signalk-vesseltwin-0.2.3.tgz"
+SHA512 = "wEIzPshHvLWr5XZ1qaFgzmojs7RzbyaSPs2eOABgkg2Z45IPYVxLw09FqGG35I1M5Tu9qSNcjeHpdZ1WKIwKYg=="
+NAME, VERSION = "signalk-vesseltwin", "0.2.3"
+EXIT_INSTALLED = 10  # exit status when this run newly installed the plugin (callers may restart Signal K)
 MAX_ARCHIVE, MAX_UNPACKED, MAX_MEMBERS = 2 * 1024 * 1024, 8 * 1024 * 1024, 2000
 
 def fail(message: str) -> "NoReturn":
@@ -15,7 +16,7 @@ def fail(message: str) -> "NoReturn":
 def checked(raw: bytes) -> bytes:
     if len(raw) > MAX_ARCHIVE: fail("archive exceeds the 2 MiB safety limit")
     if base64.b64encode(hashlib.sha512(raw).digest()).decode() != SHA512:
-        fail("archive integrity check failed (expected the immutable 0.2.1 pin)")
+        fail("archive integrity check failed (expected the immutable 0.2.3 pin)")
     return raw
 
 def validate(raw: bytes) -> list[tuple[str, bytes, bool]]:
@@ -49,7 +50,7 @@ def validate(raw: bytes) -> list[tuple[str, bytes, bool]]:
     try: metadata = json.loads(next(d for p, d, _ in entries if p == "package/package.json"))
     except Exception as exc: fail(f"package.json is unreadable: {exc}")
     if metadata.get("name") != NAME or metadata.get("version") != VERSION:
-        fail("package.json identity does not match signalk-vesseltwin 0.2.1")
+        fail("package.json identity does not match signalk-vesseltwin 0.2.3")
     if metadata.get("dependencies") or metadata.get("optionalDependencies"):
         fail("pinned plugin unexpectedly declares runtime dependencies")
     return entries
@@ -144,7 +145,8 @@ def ensure_dependency(sfd: int) -> None:
         except OSError: pass
         print(f"VesselTwin preload: WARN: could not update signalk/package.json ({exc}); add {NAME} to its dependencies manually", file=sys.stderr)
 
-def publish(raw: bytes, args, target: Path) -> None:
+def publish(raw: bytes, args, target: Path) -> bool:
+    """Publish the plugin; True only when this call installed it (False: an existing copy was kept)."""
     entries = validate(raw); signalk = args.data / "signalk"
     try: sfd = os.open(signalk, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc: fail(f"managed SignalK directory is unavailable: {exc}")
@@ -161,7 +163,7 @@ def publish(raw: bytes, args, target: Path) -> None:
         try:
             os.fchdir(nfd)
             if os.path.lexists(NAME):
-                existing(Path(NAME)); return
+                existing(Path(NAME)); return False
             # Keep the extraction path relative to the already-open node_modules fd;
             # absolute temp paths would retraverse a parent the dropped uid cannot enter.
             temp = Path(Path(tempfile.mkdtemp(prefix=f".{NAME}.", dir=".")).name); leaf = temp / NAME
@@ -177,15 +179,17 @@ def publish(raw: bytes, args, target: Path) -> None:
                 try:
                     rename_noreplace(f"{temp.name.rsplit('/', 1)[-1]}/{NAME}", NAME, nfd)
                 except FileExistsError:
-                    existing(Path(NAME))
+                    existing(Path(NAME)); return False
                 else:
                     temp.rmdir()
                 ensure_dependency(sfd)
+                return True
             finally:
                 if temp.exists(): shutil.rmtree(temp, ignore_errors=True)
         finally: os.close(nfd)
     except OSError as exc: fail(f"could not publish prepared plugin: {exc}")
     finally: os.close(sfd)
+    return False
 
 def main() -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--mode", choices=("existing", "docker", "native"), required=True)
@@ -203,6 +207,8 @@ def main() -> int:
     if args.prepare:
         args.stage.mkdir(mode=0o700, parents=True, exist_ok=True); raw = fetch_archive(args); validate(raw)
         (args.stage / "plugin.tgz").write_bytes(checked(raw)); os.chmod(args.stage / "plugin.tgz", 0o600); return 0
-    raw = load_staged(args.stage); publish(checked(raw), args, target); print(f"Preloaded {NAME}@{VERSION} at {target}"); return 0
+    raw = load_staged(args.stage)
+    if not publish(checked(raw), args, target): return 0
+    print(f"Preloaded {NAME}@{VERSION} at {target}"); return EXIT_INSTALLED
 
-if __name__ == "__main__": main()
+if __name__ == "__main__": raise SystemExit(main())

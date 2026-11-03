@@ -13,8 +13,12 @@ account. Pairing is optional, and pairing by itself does not send readings.
 ## Before you install anything
 
 Managed Docker and native installs preload the pinned `signalk-vesseltwin`
-0.2.1 package by default. Preloading the package does not enable the plugin,
-pair the account, or send readings. The preload also lists the plugin under
+0.2.3 package by default. Preloading the package does not enable the plugin,
+pair the account, or send readings. An existing copy of the plugin is never
+overwritten, so a boat that already has the plugin keeps its version; update it
+from the Signal K Appstore. If a re-run of the installer newly preloads the
+plugin into a running Docker Signal K container, the installer restarts that
+container so the plugin loads. The preload also lists the plugin under
 `dependencies` in `signalk/package.json` (created if missing, other keys kept),
 because a later `npm install --save` from the Signal K Appstore removes
 packages that file does not list. Existing mode is untouched;
@@ -40,7 +44,7 @@ Check the account and rollout first:
   [plugin's current requirements](https://github.com/jclima/signalk-vesseltwin#requirements)
   before upgrading a managed installation.
 
-For existing SignalK mode, do not assume that the Signal K Appstore listing is
+For existing Signal K mode, do not assume that the Signal K Appstore listing is
 present immediately. If it is not listed, use the upstream installation
 instructions and identify the configuration directory used by your actual
 Signal K service first. Managed
@@ -78,30 +82,42 @@ directory and administrator account as private.
 Do this while safely alongside, with Signal K security enabled and an
 administrator session open.
 
-1. Make the plugin available. If the VesselStack installer preloaded it, restart
-   Signal K if needed. Otherwise, in the Signal K admin UI, open **Appstore**,
-   search for **VesselTwin**, install it, and restart the Signal K server. In
-   both cases, then open **Server > Plugin Config** and enable the
-   **VesselTwin** plugin; preloading or installing never enables it.
-2. Open **Webapps > VesselTwin** and choose **Pair**. The admin-only page shows
-   a link and a short link code. Open the displayed link, sign in to VesselTwin,
-   enter the code, choose the boat, and approve it. The code expires after 10
-   minutes.
-3. Wait for the page to say **Paired with …**. Pairing alone sends no readings.
-4. Return to **Server > Plugin Config > VesselTwin**. Turn on the master switch
+1. Install the plugin if the VesselStack installer did not preload it: in the
+   Signal K admin UI, open **Appstore**, search for **VesselTwin**, choose
+   **Install**, and restart Signal K.
+2. Open **Server > Plugin Config**, enable **VesselTwin**, and save. Preloading
+   or installing never enables the plugin, so this step applies to everyone.
+3. Open **Webapps > VesselTwin** and choose **Pair**. The page shows a link and
+   a short code. Open the link, sign in to VesselTwin, enter the code, choose
+   the boat, and approve it. The code expires after 10 minutes; choose
+   **Try again** if it does.
+4. Wait for the page to say **Paired with …**. Pairing alone sends no readings.
+5. Return to **Server > Plugin Config > VesselTwin**. Turn on the master switch
    **Send readings to VesselTwin**, then explicitly choose the categories you
    want. Engine/generator hours, battery readings, and tank levels are off by
    default.
-5. For each category, choose **All instances** or **Only the ids listed**.
+6. For each category, choose **All instances** or **Only the ids listed below**.
    Prefer the narrow list when you know which engine, battery bank, or tank you
-   want. Save the settings.
-6. In VesselTwin, open the boat **Details > Sensor channels** panel. Map each
+   want. Instance ids are the names Signal K uses in its paths: `main` for
+   `propulsion.main.runTime`, `house` for `electrical.batteries.house.voltage`,
+   and `fuel.0` for `tanks.fuel.0.currentLevel` (tank type, a dot, then the tank
+   id). A list with no valid entries records nothing for that category. Save
+   the settings.
+7. In VesselTwin, open the boat **Details > Sensor channels** panel. Map each
    channel to the proper equipment or boat-level meter. For an engine or
    generator runtime channel, compare the sensor value with the current physical
    hour-meter reading. If they differ, explicitly choose the offset you want;
    the plugin does not calibrate it automatically. Then choose **Confirm**. A
    transmitted value is not written to the maintenance record until you
    complete this step.
+
+After you save, the plugin's status line reads `Sending is on; waiting for
+readings from Signal K.` until the first reading is recorded, and `Sending
+readings to VesselTwin.` after that. The first readings go out a few minutes
+after the plugin starts, then at most as often as the send interval you
+configured (once a day by default). Signal K keeps current values in memory
+only, so after a restart a reading appears once the device sends a value again;
+engine hours, for example, show up the next time the engine runs.
 
 Signal K must publish a current runtime sample before the plugin can send an
 engine or generator channel. That sample is separate from the owner's physical
@@ -124,6 +140,26 @@ waiting values, so do not describe this as unlimited offline storage. VesselStac
 monitoring, automation, and history can continue when the internet is down if
 those local services are configured; the cloud connection cannot.
 
+## Reaching the admin page
+
+Open the Signal K admin UI on the boat network at `http://<boat-host>:3000`, or
+from elsewhere through an SSH tunnel:
+
+```sh
+ssh -L 3000:127.0.0.1:3000 <user>@<boat-host>
+```
+
+then browse to `http://localhost:3000`. Open **Webapps > VesselTwin** from that
+same admin UI tab: the plugin rejects requests that come from other sites or
+through a proxy that rewrites the address.
+
+The plugin documents its pairing page as admin-only when Signal K security is
+enabled. If Signal K security is off, anyone on the boat network can open the
+page, see the code, and pair, so turn security on first. In a throwaway test of
+Signal K 2.27.0 with security enabled and read-only access allowed, anonymous
+requests to the plugin's routes were refused (HTTP 401) while the read-only API
+answered; that test did not cover the logged-in administrator flow.
+
 ## Privacy and disconnecting
 
 The integration is outbound-only. It does not open an inbound port and does not
@@ -144,8 +180,15 @@ VesselTwin. Remove or revoke the boat connection there as a separate step.
 | It says paired, but no readings arrive | Confirm the master switch, the desired category switches, and the instance filters. Pairing alone sends nothing. |
 | A new engine, battery, or tank is missing | Check that Signal K is publishing a current value under a selected instance id, then save the plugin settings and wait for the next value. |
 | Values arrive but are not in the record | Open **Sensor channels** in VesselTwin, map each channel to equipment, and **Confirm** it. |
+| Status says to update the plugin | VesselTwin no longer supports this plugin version. Update VesselTwin in the Signal K Appstore and restart Signal K; queued readings are kept. |
+| Status says "Can't reach VesselTwin right now. The plugin will keep trying." | A network problem or VesselTwin is down. Check the boat's internet connection; the plugin retries by itself and queued readings are kept for up to 7 days. |
 | It stopped after a restart | Check the Signal K plugin status and wait briefly for the next instrument value. Verify Signal K's clock, network, and the account connection before re-pairing. |
 | You want to stop sending temporarily | Turn off **Send readings to VesselTwin** and save. Remember that queued waiting values are cleared when sending is off. |
+
+## Replaying CAN logs
+
+Turn **Send readings to VesselTwin** off before replaying `candump` logs onto
+`vcan0`, or the old values upload as current readings.
 
 ## About this guide
 
