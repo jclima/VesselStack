@@ -23,7 +23,7 @@ the scripts in this repository; where a thing does not exist the text says so.
 Related: [INSTALLATION.md](INSTALLATION.md) (hardware and first install),
 [README.md](../README.md) (reference for every variable and command).
 
-0.6.0 release status: `v0.6.0` is an SSH-signed tag (verified in CI against
+0.6.0 release status: `v0.6.0` is an SSH-signed tag (verified by the release workflow against
 `.github/allowed_signers`), published first as a pre-release and marked Latest after the
 maintainer's physical Raspberry Pi install passes (recorded in the CHANGELOG). Physical
 Raspberry Pi acceptance is a separate gate (section 7).

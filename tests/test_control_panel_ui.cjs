@@ -342,6 +342,16 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   await ui.refreshStatus();
   assert.equal(node('#login-error').textContent, 'Your session ended. Unlock again. Your unsaved edits are kept.');
   assert.equal(ui.state.token, '');
+  // Numeric settings render as text inputs so a non-numeric saved value is shown as stored and is not an edit.
+  const lengthMarkup = ui.fieldMarkup({ key: 'BOAT_LOA_M', label: 'Length overall (m)', kind: 'number', description: 'x', read_only: false }, '12m');
+  assert.match(lengthMarkup, /type="text"/); assert.match(lengthMarkup, /inputmode="decimal"/); assert.match(lengthMarkup, /value="12m"/); assert.doesNotMatch(lengthMarkup, /type="number"/);
+  assert.match(ui.fieldMarkup({ key: 'CONTROL_PANEL_PORT', label: 'Port', kind: 'port', description: 'x', read_only: false }, '8780'), /type="text" [^>]*value="8780"/);
+  formControls.length = 0; control('BOAT_LOA_M', '12m'); ui.state.config = { fields: [{ key: 'BOAT_LOA_M', kind: 'number', read_only: false }], values: { BOAT_LOA_M: '12m' } };
+  assert.deepEqual(ui.dirtyKeys(), [], 'an untouched non-numeric saved length is not counted as edited');
+  formControls.length = 0; control('BOAT_LOA_M', '13');
+  assert.deepEqual(ui.dirtyKeys(), ['BOAT_LOA_M'], 'changing the value is an edit');
+  formControls.length = 0; ui.state.config = null;
+
   // Inline per-field errors come back from the server and are placed next to the field.
   const invalidField = { classList: { add() { this.added = true; }, contains: () => false, remove() {} }, querySelector: () => errorNode };
   const errorNode = { textContent: '' };

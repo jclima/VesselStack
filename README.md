@@ -457,6 +457,13 @@ on a mounted external drive, not while underway.
   contacts GitHub only when you press **Check for updates**. Stored settings and keys are
   unchanged. Boat Chat's credentials are labelled **Access code** and **Admin code**; the
   variable names are unchanged.
+- **The Control Panel checks a few settings as you save.** The timezone must be a valid IANA
+  name such as `Europe/Lisbon` (some legacy aliases such as `US/Eastern` may be rejected on
+  newer systems where they moved to the `tzdata-legacy` package). Boat length must be more
+  than 0 and at most 500, beam more than 0 and at most 100 (plain numbers in metres, no
+  units), and CAN speed a whole number from 10000 to 1000000. The checks apply only to fields
+  you edit, so an existing saved value you do not touch is never rejected or cleared; errors
+  appear next to the field.
 - **Docker Signal K may restart once.** If the update newly preloads the pinned
   `signalk-vesseltwin` 0.2.3 plugin into an already-running Signal K container, the
   installer restarts that container so the plugin loads. An existing preloaded copy is never
@@ -614,7 +621,7 @@ git fetch --tags
 git checkout v0.6.0
 ```
 
-`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified in CI against
+`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against
 `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the
 maintainer's physical Raspberry Pi install passes; see the [CHANGELOG](CHANGELOG.md). Verify the
 tag yourself (needs `ssh-keygen`, which ships with OpenSSH):

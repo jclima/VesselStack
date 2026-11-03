@@ -114,8 +114,11 @@ Nothing changes on the boat until you press **Save** and then **Apply**.
   Services & ports, AIS receiver, Home Assistant and Installation. Advanced
   sections start collapsed; Installation is read-only here.
 - Every field has plain help text. Mistakes show inline, next to the field. The
-  server checks the timezone against the system's timezone list and every
-  plain-number setting against its allowed range, and a save with any problem
+  server checks the timezone against the system's timezone list (a valid IANA
+  name such as `Europe/Lisbon`; some legacy aliases like `US/Eastern` may be
+  rejected on systems that moved them to `tzdata-legacy`), boat length (above 0,
+  up to 500 m), beam (above 0, up to 100 m) and CAN speed (whole number, 10000
+  to 1000000). Only fields you edit are checked, and a save with any problem
   is rejected with a message per field, so nothing is half-saved.
 - Secrets are write-only. The panel reports only whether one is set; leave a
   secret blank to keep its value, or use the explicit **Clear stored value**

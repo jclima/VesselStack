@@ -729,11 +729,13 @@ function fieldMarkup(spec, value) {
   if (spec.kind === "select") {
     input = `<select id="${id}" name="${spec.key}" data-read-only="${spec.read_only}"${described}${readOnly}>${spec.choices.map((choice) => `<option value="${escapeHtml(choice)}" ${choice === value ? "selected" : ""}>${escapeHtml(optionLabel(spec.key, choice))}</option>`).join("")}</select>`;
   } else {
-    const type = spec.kind === "secret" ? "password" : ["number", "port"].includes(spec.kind) ? "number" : "text";
+    const type = spec.kind === "secret" ? "password" : "text";
     const shown = spec.kind === "secret" ? "" : escapeHtml(value || "");
     const configured = spec.kind === "secret" && value?.configured;
     const placeholder = spec.kind === "secret" ? (configured ? "••••••••••••" : "Not set") : "";
-    const numeric = spec.kind === "number" ? 'step="any" inputmode="decimal"' : spec.kind === "port" ? 'step="1" min="1" max="65535"' : "";
+    // Numeric settings stay text inputs so a saved value such as "12m" is shown as stored
+    // (a type=number input would display it blank and the next Save would clear it).
+    const numeric = spec.kind === "number" ? 'inputmode="decimal"' : spec.kind === "port" ? 'inputmode="numeric"' : "";
     const secretAttrs = spec.kind === "secret" ? ' autocomplete="new-password"' : ' autocomplete="off"';
     input = `<input id="${id}" name="${spec.key}" type="${type}" data-read-only="${spec.read_only}"${described} value="${shown}" placeholder="${placeholder}" ${numeric}${secretAttrs} spellcheck="false"${readOnly}>`;
   }

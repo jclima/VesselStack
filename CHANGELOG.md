@@ -58,6 +58,7 @@ Semantic Versioning.
 
 ### Fixes
 
+- Control Panel no longer blanks a non-numeric saved boat length or beam on save.
 - Boat Chat: a Settings save could blank the server configuration when settings had failed to
   load. Settings no longer opens without loading, and it saves only the fields you changed.
   Saves that blank `BOAT_CHAT_PROVIDER`, `BOAT_CHAT_MODEL`, `BOAT_CHAT_MAX_TOKENS`,
@@ -143,7 +144,7 @@ Downgrades are refused. Restore the verified pre-update backup that the update t
 
 ### Release status
 
-`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified in CI against `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes.
+`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes.
 
 ### For contributors
 
