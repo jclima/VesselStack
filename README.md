@@ -189,6 +189,10 @@ write-only publish job, draft first, reproducible tarball on Linux); maintainers
 release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#release-checklist). The recommended
 way to sign release tags (key held in 1Password) is in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#1-release-signing-with-an-ssh-signing-key).
+Release tags must be SSH-signed annotated tags: the release workflow runs
+`scripts/verify-release-tag.sh` against `.github/allowed_signers` and refuses an unsigned,
+lightweight or wrongly signed tag before building anything. To rotate the release key, change
+`.github/allowed_signers` in a reviewed pull request to `main` first, then tag.
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
 
@@ -582,8 +586,22 @@ git fetch --tags
 git checkout v0.6.0
 ```
 
-0.6.0 release status: recorded in the [CHANGELOG](CHANGELOG.md) at release time.
-Check the tag and the release page before relying on either for a production boat.
+`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified in CI against
+`.github/allowed_signers`). It is published first as a pre-release and marked Latest after the
+maintainer's physical Raspberry Pi install passes; see the [CHANGELOG](CHANGELOG.md). Verify the
+tag yourself (needs `ssh-keygen`, which ships with OpenSSH):
+
+```bash
+git fetch --tags
+scripts/verify-release-tag.sh v0.6.0
+# equivalent plain git command:
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.0
+```
+
+The script prints the signer and key fingerprint, and exits non-zero for an unsigned,
+lightweight or wrongly signed tag. The release key fingerprint is
+`SHA256:01UcXtAoMkJ7zfQ2n7gIc4fUjPa3+0BVvHJ2VHIuTIw`. Older tags (`v0.5.x`) are unsigned and
+fail this check by design.
 
 ## 4. Configure the vessel
 
@@ -1083,11 +1101,11 @@ This is the one place in the README that describes updating and rolling back.
 
 | Installed version | Update to 0.6.0 |
 |---|---|
-| 0.5.7 | Control Panel (enable **Include lab prereleases** if 0.6.0 is published as a prerelease) or the pinned installer |
+| 0.5.7 | Control Panel or the pinned installer. 0.6.0 is published first as a pre-release (enable **Include lab prereleases** to see it) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 
-A checksum shows a download is intact; it is not signed provenance. 0.6.0 release status: recorded in the [CHANGELOG](CHANGELOG.md) at release time.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.6.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:

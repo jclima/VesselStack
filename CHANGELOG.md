@@ -96,6 +96,10 @@ Semantic Versioning.
   form some readers would misparse. A preflight checks every value for `vesselstack.env`,
   `boat-chat.env` and `control-panel.env` before anything changes, including under
   `--dry-run`, and names only the offending keys, never the values.
+- Release tags must now be annotated tags SSH-signed by the release key in
+  `.github/allowed_signers`. The release workflow fetches the real tag object, runs
+  `scripts/verify-release-tag.sh` and fails on an unsigned, lightweight or wrongly signed tag
+  before anything is built. Changing the allowed key needs a reviewed pull request to `main`.
 
 ### Upgrade notes
 
@@ -109,8 +113,8 @@ Semantic Versioning.
   access code in `X-Boat-Chat-Access-Token` when it differs from the admin code.
 - Owners on 0.4.x: update once from the CLI with the pinned installer. The 0.5.0 Mosquitto access
   list cuts off MQTT users that were added by hand to the old password file.
-- Owners on 0.5.5 to 0.5.7 can use the Control Panel updater; enable "Include lab prereleases" if
-  0.6.0 is published as a prerelease.
+- Owners on 0.5.5 to 0.5.7 can use the Control Panel updater; enable "Include lab prereleases"
+  while 0.6.0 is still a pre-release.
 
 ### Rollback
 
@@ -120,7 +124,7 @@ Downgrades are refused. Restore the verified pre-update backup that the update t
 
 ### Release status
 
-RELEASE-STATUS-PENDING
+`v0.6.0` is an SSH-signed tag (Ed25519 release key, verified in CI against `.github/allowed_signers`). It is published first as a pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes.
 
 ### For contributors
 
@@ -133,6 +137,9 @@ RELEASE-STATUS-PENDING
   the installer uses that to restart the `signalk` container.
 - Wizard internals moved from the README to `docs/DEVELOPMENT.md` ("Wizard internals").
 - Version bump: `VERSION` and `DEFAULT_VERSION` in `scripts/get-vesselstack.sh` are 0.6.0.
+- `scripts/verify-release-tag.sh TAG [ALLOWED_SIGNERS_FILE]` verifies a release tag (annotated,
+  SSH-signed by an allowed principal) and prints the signer and key fingerprint;
+  `tests/test-verify-release-tag.sh` covers it with throwaway keys and runs in CI.
 
 ## 0.5.7 - 2026-11-01
 

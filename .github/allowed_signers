@@ -1,0 +1,6 @@
+# VesselStack release signers for `git verify-tag` (ssh-keygen allowed_signers format).
+# Release tags (vX.Y.Z) must be SSH-signed by the key below; release.yml refuses anything else.
+# To rotate: add the new key line (and remove the old one only when retiring it) in a pull
+# request to main, get it reviewed and merged, then create the next tag. This file must change
+# only in a reviewed PR to main; the release workflow reads the copy at the tagged commit.
+jc@linuxzone.org namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFHdnlLvuVxMDHUxoZg1Y1KHgevAzl7d2mU6tIGZx8mB VesselStack release signing

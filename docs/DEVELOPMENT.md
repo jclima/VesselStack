@@ -50,18 +50,23 @@ Do not build and upload files by hand.
 3. Tag the merged `main` commit (signed tag, see [DEPLOYMENT.md](DEPLOYMENT.md)
    section 1; the recommended 1Password-held signing key is the first subsection there)
    and push the tag. The workflow refuses a tag whose commit is not on
-   `main`, or that differs from `VERSION`. The `v0.5.7` lab prerelease was an annotated
-   unsigned tag because no SSH/GPG key was available; it was not a stable promotion and is not
-   signed. The `v0.5.1` tag is untouched and was not published because its release pipeline
-   caught the bridge startup-status race. The signing and Latest status of `v0.6.0` is
-   recorded in the CHANGELOG at release time.
+   `main`, that differs from `VERSION`, or that is not an annotated tag SSH-signed by a key in
+   `.github/allowed_signers` (checked with `scripts/verify-release-tag.sh`). Verify locally
+   first: `scripts/verify-release-tag.sh vX.Y.Z`. To rotate or add the release key, change
+   `.github/allowed_signers` in a pull request to `main` and merge it before creating the tag;
+   the workflow reads the copy at the tagged commit. The `v0.5.7` lab prerelease was an
+   annotated unsigned tag because no SSH/GPG key was available; it is not signed and would now
+   be refused. The `v0.5.1` tag is untouched and was not published because its release pipeline
+   caught the bridge startup-status race. `v0.6.0` is an SSH-signed tag, published first as a
+   pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes
+   (see the CHANGELOG).
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate
    job with write access creates a **draft** release (`--draft --latest=false`) with
    the four files and both sha256 values in the notes. It skips creation if a release
-   for the tag already exists. It does not verify the tag signature; do that locally
-   before pushing the tag.
+   for the tag already exists. The build job verifies the tag signature (step 3) before building,
+   so a bad tag fails there and no draft is created.
 5. Take the sha256 values from the draft's notes (or the workflow log). Download the
    draft's assets and test **those exact files** on the home-lab Pi (see
    [DEPLOYMENT.md](DEPLOYMENT.md)): `sha256sum -c`, then the install and update

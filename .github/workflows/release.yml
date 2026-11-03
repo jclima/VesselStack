@@ -2,8 +2,11 @@ name: Release
 
 # Runs only when a version tag is pushed (never on pull requests or branch pushes).
 # 1. ci:      the full CI workflow, reused unchanged, against the tagged commit.
-# 2. build:   read-only; checks the tag, builds the release files, uploads them as
-#             workflow artifacts.
+# 2. build:   read-only; checks the tag (VERSION match, commit on main, and an SSH
+#             signature from the release key in .github/allowed_signers, verified by
+#             scripts/verify-release-tag.sh), then builds the release files and uploads
+#             them as workflow artifacts. Unsigned, lightweight or wrongly signed tags
+#             fail before anything is built.
 # 3. publish: the only job with write access; creates a DRAFT release from those
 #             artifacts. The draft is the authoritative release: test its assets, then
 #             publish it by hand (see docs/DEVELOPMENT.md).
@@ -44,6 +47,16 @@ jobs:
             echo "Tagged commit $GITHUB_SHA is not an ancestor of main; merge it first, then tag main." >&2
             exit 1
           }
+      - name: Tag must be an annotated tag SSH-signed by the release key
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # actions/checkout can leave a lightweight ref pointing at the commit, which has
+          # no signature. Replace it with the real annotated tag object from origin.
+          git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          # The allowed signers file is the copy at the tagged commit, which the previous
+          # step requires to be on main (changes to it need a reviewed pull request).
+          scripts/verify-release-tag.sh "$TAG" .github/allowed_signers
       - name: Build and verify release files
         run: |
           VESSELSTACK_BUILD_REQUIRE_CLEAN=true ./build-package.sh

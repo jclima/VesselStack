@@ -18,9 +18,10 @@ less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
 ```
 
-0.6.0 release status (signed or unsigned tag, prerelease or Latest): recorded in the
-CHANGELOG at release time. The checksum catches a corrupt or truncated asset; it does not
-replace review of the release provenance.
+0.6.0 release status: `v0.6.0` is an SSH-signed tag, published first as a pre-release and
+marked Latest after the maintainer's physical Raspberry Pi install passes (see the CHANGELOG).
+Check the tag with `scripts/verify-release-tag.sh v0.6.0`. The checksum catches a corrupt or
+truncated asset; it does not replace that signature check.
 
 ## Exercise the browser updater
 

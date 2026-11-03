@@ -23,9 +23,10 @@ the scripts in this repository; where a thing does not exist the text says so.
 Related: [INSTALLATION.md](INSTALLATION.md) (hardware and first install),
 [README.md](../README.md) (reference for every variable and command).
 
-0.6.0 release status: recorded in the CHANGELOG at release time. Check the release page
-and the tag (section 1) before you rely on either. Physical Raspberry Pi acceptance is a
-separate gate (section 7).
+0.6.0 release status: `v0.6.0` is an SSH-signed tag (verified in CI against
+`.github/allowed_signers`), published first as a pre-release and marked Latest after the
+maintainer's physical Raspberry Pi install passes (recorded in the CHANGELOG). Physical
+Raspberry Pi acceptance is a separate gate (section 7).
 
 History: `v0.5.7` was published as an unsigned lab prerelease that was not marked latest, and
 `v0.4.4` stayed the release GitHub marks Latest through the 0.5.x series. The `v0.5.1` tag is
@@ -127,8 +128,9 @@ branch tip to have a valid commit signature **or** a validly signed tag pointing
 at it. It needs network access to `origin`, so it is a home-lab/connected-machine
 flow. **`install.sh` and `vesselstackctl update` do not verify signatures** of the
 tarball or directory they are given. On the boat, this recipe uses
-the sha256 recorded at build time (section 2) and the recorded commit; a signed tag, when
-the release has one, is verified on the maintainer machine.
+the sha256 recorded at build time (section 2) and the recorded commit. Release tags are
+SSH-signed, and the release workflow refuses any tag that `scripts/verify-release-tag.sh` does
+not accept against `.github/allowed_signers`; owners can run the same check on a clone.
 
 ### Signing key in 1Password (recommended)
 
@@ -169,7 +171,14 @@ and each signature needs the owner's approval (biometric or password prompt).
    ```
 
 Then `git tag -s vX.Y.Z -m "VesselStack X.Y.Z"` prompts for approval in 1Password, and
-`git verify-tag vX.Y.Z` checks it. The file-based instructions below remain as the
+`scripts/verify-release-tag.sh vX.Y.Z` checks it against the committed
+`.github/allowed_signers` (the project's allowed-signers file, principal `jc@linuxzone.org`;
+the step 3 file above is for the on-Pi updater).
+
+**Key rotation.** Add the new public key line to `.github/allowed_signers` in a pull request to
+`main`, get it reviewed and merged, and only then create the next tag with the new key. Keep
+the old line only as long as old tags must verify; the release workflow reads the file at the
+tagged commit, so it never trusts a key that is not on `main`. The file-based instructions below remain as the
 alternative when 1Password is not available.
 
 ### Signing key as a file (alternative)
@@ -234,9 +243,9 @@ git rev-parse v0.6.0^{commit}
 git merge-base --is-ancestor v0.6.0^{commit} origin/main
 ```
 
-Record in the CHANGELOG whether `v0.6.0` is a signed or an annotated unsigned tag, and claim
-`git verify-tag` success only for a tag that passes it. Follow the tag-creation and signing
-gates in [DEVELOPMENT.md](DEVELOPMENT.md#release-checklist).
+Then verify the signature with `scripts/verify-release-tag.sh v0.6.0` and claim success only
+for a tag that passes it. Follow the tag-creation and signing gates in
+[DEVELOPMENT.md](DEVELOPMENT.md#release-checklist).
 
 ## 2. Cut and build
 
@@ -603,7 +612,7 @@ secrets. `vesselstack-update --rollback BACKUP_DIRECTORY` is only for code-only
 
 ## 7. Acceptance checklist
 
-- [ ] Release `v0.6.0`: tag type (signed or unsigned) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
+- [ ] Release `v0.6.0`: tag signature verified (`scripts/verify-release-tag.sh v0.6.0`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
 - [ ] Lab: 48 h+ soak with daily `doctor` healthy; replay data visible in Grafana.
 - [ ] Lab: update from 0.3.0, backup/verify/restore, and offline install rehearsed.
 - [ ] Boat: sha256 of the carried tarball equals the recorded value.
@@ -642,9 +651,11 @@ machine only.
 - The `vcan` systemd unit (`vesselstack-socketcan.service` with
   `VESSELSTACK_CAN_CREATE_VCAN=true`) is rendered/tested but has not been
   exercised across a real boot.
-- **Real SSH signature verification** against a signed tag has only been tested
-  with fixtures; do the first real `git verify-tag` and `vesselstack-update`
-  against the allowed-signers file on the lab Pi.
+- **Real SSH signature verification** on the Pi (`vesselstack-update` against its
+  allowed-signers file) has only been tested with fixtures; do the first real run on the lab
+  Pi. The release workflow's tag check (`scripts/verify-release-tag.sh`) is covered by
+  `tests/test-verify-release-tag.sh` with throwaway keys; its first real run is the `v0.6.0`
+  tag push.
 - The **arm64 offline bundle** (wheels for `manylinux*_aarch64`, `linux/arm64`
   images) has not been built and installed on a real Pi; section 3.5.3 is that
   rehearsal. Image tarballs are manifest-checked but not digest-pinned.
