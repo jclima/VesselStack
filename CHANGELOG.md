@@ -34,6 +34,13 @@ Semantic Versioning.
   prune it.
 - Documentation corrections: README structure, version references, VesselTwin
   wording, and historical 1.0 scope and validation labels.
+- Documentation: the hardware guide now recommends the Copperhill/SK Pang
+  PiCAN-M as the NMEA 2000 HAT, with power guidance per Pi model and USB and
+  ESP32 alternatives. Galvanically isolated interfaces are listed first as
+  preferred (safest); the non-isolated PiCAN-M is documented as field-proven
+  with explicit grounding caveats. Wizard text (terminal and browser) now
+  states the same preferred/caveats framing. Installation docs add a PiCAN-M
+  `config.txt` example.
 
 ## 0.5.7 - 2026-11-01
 

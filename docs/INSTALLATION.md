@@ -151,10 +151,14 @@ restore and uninstall sections; unpacked releases stay under
 Use the [bill of materials](BOM.md). Before ordering the CAN interface, verify:
 
 1. Raspberry Pi 5 support and a current 64-bit Raspberry Pi OS driver/overlay.
-2. Galvanic isolation between CAN and the Pi.
+2. An isolated interface is preferred (safest); a non-isolated interface such
+   as the PiCAN-M works with caveats (see docs/BOM.md).
 3. Mechanical compatibility with the cooler, power hardware, and enclosure.
 4. The vessel connector family and the correct drop cable/T-piece.
 5. Whether the interface powers the Pi; design exactly one Pi power source.
+   For the PiCAN-M on a Pi 5, buy the variant without SMPS and power the Pi
+   from a dedicated fused 5 V / 5 A class supply; the SMPS variant is not
+   suitable for a Pi 5.
 
 Record the power circuit, fuse, device model, overlay lines, and rollback in the
 boat's electrical documentation.
@@ -163,8 +167,10 @@ boat's electrical documentation.
 
 Leave the NMEA backbone disconnected. Fit the Active Cooler, CAN interface, and
 SSD according to their manufacturers. Check jumper voltage, oscillator, CAN
-channel, and termination settings. The reference build uses the isolated NMEA
-channel, 3.3 V logic where selectable, and termination **off** for a normal drop.
+channel, and termination settings. The reference build uses 3.3 V logic where
+selectable, the isolated NMEA channel if the interface has one (isolated is preferred;
+non-isolated interfaces such as the PiCAN-M work with caveats, see docs/BOM.md), and termination
+**off** for a normal drop.
 
 Use the official Pi supply during bench setup. Do not connect marine power at
 the same time.
@@ -209,6 +215,18 @@ VesselStack intentionally does not edit boot firmware. Reboot, then verify:
 ```bash
 ip -details link show can0
 ```
+
+For the recommended PiCAN-M, add these lines to `/boot/firmware/config.txt`
+(the vendor guide uses `/boot/config.txt`, the pre-Bookworm location):
+
+```ini
+dtparam=spi=on
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+```
+
+Add `enable_uart=1` and `dtparam=i2c_arm=on` only if you use its NMEA 0183
+port or Qwiic connector. For NMEA 0183 on a Pi 5, check `ls -l /dev/serial0`
+rather than assuming `ttyS0`.
 
 If `can0` is absent, stop here. Inspect `dmesg`, `/boot/firmware/config.txt`, the
 overlay name, oscillator frequency, SPI assignment, and HAT vendor guide. Do

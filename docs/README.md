@@ -9,7 +9,7 @@ Boat Chat provider that sends data elsewhere.
 - [Getting started](GETTING_STARTED.md) — prerequisites, first boot, SSH access,
   local addresses, tokens, and the difference between a lab Pi and a boat Pi.
 - [Hardware bill of materials](BOM.md) — the reference Pi, storage, power,
-  enclosure, network, and isolated CAN choices.
+  enclosure, network, and NMEA 2000 interface choices.
 - [End-to-end installation](INSTALLATION.md) — assemble, configure, verify, and
   recover a new installation.
 
