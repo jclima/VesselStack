@@ -8,6 +8,7 @@ Semantic Versioning.
 ### Highlights
 
 - Upgrades and installs now offer to fix an unsupported units setting or an unsafe saved value at the prompt, instead of stopping; unattended runs still stop safely and print the exact fix. Each fix keeps a root-only `*.before-fix-*` copy of the previous settings file, which you can delete once the install works.
+- The Control Panel shows the exact fix when an update or backup stops for something you can fix (for example an unmounted backup drive).
 - When the backup drive isn't mounted, updates and backups offer to mount it, pick a connected USB drive, check again, or back up to the system disk once, instead of stopping.
 
 ### Fixes

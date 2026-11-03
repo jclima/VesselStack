@@ -884,6 +884,9 @@ def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
 ERROR_LINE = re.compile(r"^(?:\[[^\]]*\]\s*)?(?:ERROR|Error|error|FATAL|Refusing[^:]*|Backup[^:]*failed)[:\s]+(.*)$")
 
 
+FIX_PREFIX = "To fix:"
+
+
 def summarize_operation(operation: dict[str, Any]) -> dict[str, Any]:
     """Plain facts about a finished operation, read from its output only."""
     lines = [str(line).strip() for line in operation.get("output") or [] if str(line).strip()]
@@ -895,12 +898,21 @@ def summarize_operation(operation: dict[str, Any]) -> dict[str, Any]:
                 break
     if operation.get("state") == "failed" and lines:
         reason = lines[-1]
-        for line in reversed(lines):
-            found = ERROR_LINE.match(line)
+        matched = None
+        for index in range(len(lines) - 1, -1, -1):
+            found = ERROR_LINE.match(lines[index])
             if found:
-                reason = found.group(1).strip() or line
+                reason = found.group(1).strip() or lines[index]
+                matched = index
                 break
         summary["reason"] = reason[:400]
+        # The scripts print the exact remedy as "To fix: ..." right after a refusal; these lines never carry secrets.
+        for line in lines[(matched + 1 if matched is not None else 0):]:
+            if line.startswith(FIX_PREFIX):
+                fix = line[len(FIX_PREFIX):].strip()
+                if fix:
+                    summary["fix"] = fix[:600]
+                    break
     return summary
 
 
@@ -957,6 +969,7 @@ class OperationStore:
     def _run(self, operation: dict[str, Any], command: list[str], slot_fd) -> None:
         environment = os.environ.copy()
         environment["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
+        environment["VESSELSTACK_NONINTERACTIVE"] = "true"  # the panel cannot answer prompts; scripts print "To fix:" guidance instead
         exit_code = 1
         succeeded = False
         try:

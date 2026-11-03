@@ -669,6 +669,57 @@ class StatusFieldTests(unittest.TestCase):
         self.assertEqual(bad["reason"], "backup mount /media/backup is not mounted")
         self.assertEqual(panel.with_summary({"state": "running"}), {"state": "running"})
 
+    def test_operations_run_non_interactively(self) -> None:
+        seen: dict = {}
+
+        class FakeProcess:
+            stdout = iter(["done\n"])
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(command, **kwargs):
+            seen.update(kwargs["env"])
+            return FakeProcess()
+
+        local_store = panel.OperationStore()
+        operation = {"label": "backup", "state": "running", "output": panel.deque(maxlen=10), "exit_code": None, "finished_at": None}
+        with mock.patch.object(panel.subprocess, "Popen", side_effect=fake_popen), mock.patch.object(panel, "release_lifecycle_slot"):
+            local_store._run(operation, ["true"], None)
+        self.assertEqual(seen.get("VESSELSTACK_NONINTERACTIVE"), "true")
+
+    def test_operation_summary_carries_the_to_fix_line(self) -> None:
+        def failed(*lines: str) -> dict:
+            return panel.summarize_operation({"label": "update", "state": "failed", "output": list(lines)})
+
+        update = failed(
+            "Refusing to back up: /media/backup is not mounted, so the archive would land on the system disk (SD card). Nothing was changed.",
+            "To fix: mount the backup drive at /media/backup and run again, or back up to the system disk this once: sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update /opt/vesselstack-0.6.1",
+        )
+        self.assertTrue(update["reason"].startswith("/media/backup is not mounted"))
+        self.assertTrue(update["fix"].startswith("mount the backup drive at /media/backup and run again, or back up to the system disk this once: sudo env "))
+        backup = failed(
+            "Refusing to back up: /media/backup is not mounted, so the archive would land on the system disk (SD card). Nothing was changed.",
+            "To fix: mount the backup drive at /media/backup and run again, or pass --allow-unmounted.",
+        )
+        self.assertEqual(backup["fix"], "mount the backup drive at /media/backup and run again, or pass --allow-unmounted.")
+        units = failed(
+            "Refusing to continue: BOAT_UNITS=imperial in /etc/vesselstack/vesselstack.env is not supported.",
+            "To fix: set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /etc/vesselstack/vesselstack.env",
+        )
+        self.assertEqual(units["reason"], "BOAT_UNITS=imperial in /etc/vesselstack/vesselstack.env is not supported.")
+        self.assertTrue(units["fix"].startswith("set it to us_customary or metric, for example: sudo sed -i "))
+        unsafe = failed(
+            "  MQTT_PASSWORD: a multi-line value",
+            "Refusing to continue: the settings above cannot be written safely to the environment files.",
+            "To fix: edit them in /etc/vesselstack/vesselstack.env (values cannot span lines), then run again. Nothing was changed.",
+        )
+        self.assertEqual(unsafe["reason"], "the settings above cannot be written safely to the environment files.")
+        self.assertTrue(unsafe["fix"].startswith("edit them in /etc/vesselstack/vesselstack.env"))
+        self.assertNotIn("fix", failed("ERROR: boom"))
+        # A To fix line printed before the refusal belongs to something else.
+        self.assertNotIn("fix", failed("To fix: earlier", "ERROR: boom"))
+
     def test_restart_note_only_when_a_newer_panel_is_installed(self) -> None:
         with mock.patch.object(panel, "installed_version", return_value="0.6.1"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
             self.assertTrue(panel.restart_needed())

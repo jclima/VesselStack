@@ -209,6 +209,9 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.match(node('#banner').innerHTML, /<details class="disc"><summary>Show details<\/summary><pre class="log"[^>]*>ctl: running backup\nERROR/, 'details hold the operation log');
   assert.doesNotMatch(node('#banner').innerHTML, /Update failed/, 'no update wording for a backup');
   assert.match(node('#banner').innerHTML, /aria-label="Dismiss message"/);
+  ui.renderOperation({ id: 5, label: 'backup', state: 'failed', started_at: now - 5, finished_at: now, output: ['x'], summary: { reason: 'backup mount /media/backup is not mounted', fix: 'mount the backup drive at /media/backup and run again, or pass <b>--allow-unmounted</b>. sudo env X=1 vesselstackctl update <i>' } });
+  assert.match(node('#banner').innerHTML, /<div class="fix"><strong>To fix:<\/strong> mount the backup drive at \/media\/backup and run again, or pass &lt;b&gt;--allow-unmounted&lt;\/b&gt;\. <span class="mono">sudo env X=1 vesselstackctl update &lt;i&gt;<\/span><\/div>/, 'the fix is shown escaped with the command in monospace');
+  assert.doesNotMatch(node('#banner').innerHTML, /<b>|<i>/, 'no injected markup');
   ui.renderOperation({ id: 4, label: 'backup', state: 'succeeded', started_at: now, finished_at: now, output: ['x'], summary: { saved_path: '/media/backup/vesselstack-1.tar.gz' } });
   assert.match(node('#banner').innerHTML, /Backup finished [^<]*<\/strong> — saved to <span class="mono">\/media\/backup\/vesselstack-1\.tar\.gz<\/span>/);
   assert.doesNotMatch(node('#banner').innerHTML, /restart vesselstack-control-panel/, 'no routine restart advice on success');

@@ -82,6 +82,17 @@ Use the real backup mount path in place of `/media/vesselstack-backup`. A
 backup directory on the same system disk does not protect against disk failure;
 check available capacity manually before proceeding.
 
+To see the **To fix:** guidance in the Control Panel, unmount the backup
+target (or use a path that is not a mountpoint), then choose **Back up now** on
+Home and, separately, run an update from the Maintenance tab. Each stops with a
+red result banner that gives the reason, then a **To fix:** line naming the mount
+point (the update version also shows the one-off
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true` command in monospace). Confirm
+nothing was stopped or changed, that no prompt waited in the Details log, mount
+the drive, and run the operation again to see it succeed. Setting an unsupported
+value such as `BOAT_UNITS=imperial` in the settings file and starting an update
+shows the same kind of line with the exact `sed` command.
+
 If the backup media is intentionally unavailable in this disposable lab, the
 one-shot exception is explicit and temporary:
 

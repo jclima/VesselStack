@@ -1224,6 +1224,9 @@ live database files is insufficient.
 ## Updating
 
 This is the one place in the README that describes updating and rolling back.
+Updates and backups started from the Control Panel never prompt; when one stops
+for something you can fix, the result banner shows a **To fix:** line with the
+exact step.
 
 1. **Back up first** to a mounted external drive (see [Backups](#backups)):
 

@@ -188,7 +188,8 @@ case "$BOAT_UNITS" in
         if config_key_assigned BOAT_UNITS && vs_prompt_open; then
             FIX_BOAT_UNITS=1
         else
-            echo "BOAT_UNITS=$BOAT_UNITS_INPUT in $CONFIG_FILE is not supported. Set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $CONFIG_FILE" >&2
+            echo "Refusing to continue: BOAT_UNITS=$BOAT_UNITS_INPUT in $CONFIG_FILE is not supported." >&2
+            echo "To fix: set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $CONFIG_FILE" >&2
             exit 1
         fi
         ;;
@@ -736,7 +737,7 @@ env_values_preflight() {
         if [ "$secrets" -eq 1 ]; then
             echo "A password or token that a running service already uses must be changed in that service first (replacing it here alone would lock the service out); then edit it in $CONFIG_FILE." >&2
         fi
-        echo "Edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"Upgrading to 0.6.0\"." >&2
+        echo "To fix: edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"Upgrading to 0.6.0\"." >&2
         exit 1
     fi
 }

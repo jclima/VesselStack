@@ -743,7 +743,8 @@ IMPERIAL="$TEST_ROOT/imperial.env"
 grep -v '^BOAT_UNITS=' "$XENV" > "$IMPERIAL"
 printf 'BOAT_UNITS=imperial\n' >> "$IMPERIAL"
 expect_unchanged_failure "dry-run with unsupported units" xinstall "$X_APP/installer/install.sh" --config "$IMPERIAL" --dry-run
-grep -qF "BOAT_UNITS=imperial in $IMPERIAL is not supported. Set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $IMPERIAL" "$TEST_ROOT/failure.out"
+grep -qF "Refusing to continue: BOAT_UNITS=imperial in $IMPERIAL is not supported." "$TEST_ROOT/failure.out"
+grep -qF "To fix: set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $IMPERIAL" "$TEST_ROOT/failure.out"
 expect_unchanged_failure "real run with unsupported units" xinstall "$X_APP/installer/install.sh" --config "$IMPERIAL"
 grep -q 'BOAT_UNITS=imperial' "$TEST_ROOT/failure.out"
 xinstall "$X_APP/installer/install.sh" --config "$NAUTICAL" >/dev/null 2>&1
@@ -902,7 +903,8 @@ if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK
     echo "an unattended run accepted an unsupported value" >&2
     exit 1
 fi
-grep -qF "BOAT_UNITS=imperial in $IMPERIAL is not supported. Set it to us_customary or metric" "$TEST_ROOT/fix.out"
+grep -qF "BOAT_UNITS=imperial in $IMPERIAL is not supported." "$TEST_ROOT/fix.out"
+grep -qF "To fix: set it to us_customary or metric" "$TEST_ROOT/fix.out"
 if grep -q 'Choice:' "$TEST_ROOT/fix.out"; then echo "an unattended run asked a question" >&2; exit 1; fi
 if env -u VESSELSTACK_NONINTERACTIVE PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     setsid "$inst" --config "$IMPERIAL" --dry-run </dev/null >"$TEST_ROOT/fix.out" 2>&1; then

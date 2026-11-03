@@ -214,8 +214,13 @@ disabled so lifecycle changes cannot overlap.
 
 The result of the latest operation stays in a banner under the tabs until you
 dismiss it. Success shows the time and, for a backup, where the file was saved;
-failure shows the reason and what to try next. **Details** opens the command
-output.
+failure shows the reason and what to try next. When an update or backup stops
+for something you can fix (for example an unmounted backup drive, an unsupported
+`BOAT_UNITS` value, or a saved value that cannot be written safely), the banner
+adds a **To fix:** line with the exact step, and any command to run over SSH is
+shown in monospace. The Control Panel never asks questions or changes your
+settings itself; run the fix, then start the operation again. **Details** opens
+the command output.
 
 ![Control Panel Home with a green banner reporting that a backup finished and where it was saved](images/control-panel-backup-result.png)
 
