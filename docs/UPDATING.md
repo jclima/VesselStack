@@ -26,6 +26,13 @@ with no argument fails. To run it by hand once a release is unpacked (the instal
 sudo vesselstackctl update /opt/vesselstack-release/0.6.1
 ```
 
+From a terminal (`ssh -t`) the installer now offers to fix an unsupported `BOAT_UNITS` value or
+a setting that cannot be written safely at a prompt instead of stopping (choose, or `c` to
+cancel with nothing changed). A root-only copy of the previous settings file is kept as
+`vesselstack.env.before-fix-<time>` next to it; delete these copies once the update works. Runs
+without a terminal (the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) still stop
+before changing anything and print the exact fix. Details: [Upgrading to 0.6.0](../README.md#upgrading-to-060).
+
 ## From the Control Panel
 
 Open the **Updates** tab and press **Check for updates**. This is the only thing that

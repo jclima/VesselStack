@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# Unattended by default: nothing in this file may block on a prompt. The interactive
+# cases below unset it for their own runs and feed answers from a file.
+export VESSELSTACK_NONINTERACTIVE=true
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -260,17 +263,17 @@ test "$(sed -n 's/^BOAT_CHAT_ACCESS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
 # config (which still says GENERATE): InfluxDB/Grafana/MQTT ignore changed
 # credentials after first start, so regenerating would desynchronise them.
 secret_keys=(INFLUXDB_PASSWORD INFLUXDB_TOKEN GRAFANA_ADMIN_PASSWORD MQTT_PASSWORD)
-declare -A secret_before=()
+declare -A pw_before=()
 for key in "${secret_keys[@]}"; do
-    secret_before[$key]=$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")
-    [[ "${secret_before[$key]}" =~ ^[a-f0-9]{64}$ ]] || { echo "$key was not generated" >&2; exit 1; }
+    pw_before[$key]=$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")
+    [[ "${pw_before[$key]}" =~ ^[a-f0-9]{64}$ ]] || { echo "$key was not generated" >&2; exit 1; }
 done
 influx_token_chat_before=$(sed -n 's/^INFLUXDB_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
 settings_token_before=$(sed -n 's/^BOAT_CHAT_SETTINGS_TOKEN=//p' "$APP_ROOT/config/boat-chat.env")
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 for key in "${secret_keys[@]}"; do
-    test "$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")" = "${secret_before[$key]}"
+    test "$(sed -n "s/^${key}=//p" "$APP_ROOT/config/vesselstack.env")" = "${pw_before[$key]}"
 done
 # A configuration that really sets BOAT_CHAT_HOST (here the wizard-style original) does apply it.
 grep -qx 'BOAT_CHAT_HOST=0.0.0.0' "$APP_ROOT/config/boat-chat.env"
@@ -746,6 +749,185 @@ grep -q 'BOAT_UNITS=imperial' "$TEST_ROOT/failure.out"
 xinstall "$X_APP/installer/install.sh" --config "$NAUTICAL" >/dev/null 2>&1
 grep -q "^BOAT_UNITS=metric$" "$XENV"
 if grep -q nautical "$XENV"; then echo "the installed config still says nautical" >&2; exit 1; fi
+
+# 1b-ter. Interactive fixes (VESSELSTACK_PROMPT_ANSWERS is the test hook for the terminal):
+# an unsupported units value or an unsafe saved value is fixed at the prompt, a copy of the
+# previous file is kept (root-only), and the installer restarts with the same arguments.
+# Cancel, end of input and unattended runs change nothing; generated secrets are never offered.
+ANS="$TEST_ROOT/answers"
+xask() { # ANSWERS_FILE COMMAND... : run with the terminal replaced by the answers file
+    local answers=$1
+    shift
+    env -u VESSELSTACK_NONINTERACTIVE VESSELSTACK_PROMPT_ANSWERS="$answers" PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$@"
+}
+fresh_config() { # NAME : a copy of the installed config; sets FRESH
+    FRESH="$TEST_ROOT/$1.env"
+    cp "$XENV" "$FRESH"
+}
+copies_of() { compgen -G "$1.before-fix-*" || true; }
+inst="$X_APP/installer/install.sh"
+
+# Units: [2] metric.
+fresh_config fix-units
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+printf '2\n' > "$ANS"
+xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1
+grep -q 'Preflight passed' "$TEST_ROOT/fix.out"
+grep -qF "BOAT_UNITS in $FRESH is \"imperial\", which is not supported." "$TEST_ROOT/fix.out"
+grep -qF '[1] US customary (feet, °F, psi, US gallons)' "$TEST_ROOT/fix.out"
+grep -qF '[2] Metric (metres, °C, kPa, litres)' "$TEST_ROOT/fix.out"
+grep -qF '[c] Cancel (nothing is changed)' "$TEST_ROOT/fix.out"
+grep -q "^Changed BOAT_UNITS in $FRESH (previous copy: $FRESH.before-fix-" "$TEST_ROOT/fix.out"
+grep -qx 'BOAT_UNITS=metric' "$FRESH"
+test "$(grep -c '^BOAT_UNITS=' "$FRESH")" -eq 1
+test "$(copies_of "$FRESH" | wc -l)" -eq 1
+fix_copy=$(copies_of "$FRESH")
+test "$(stat -c '%a %u:%g' "$fix_copy")" = "600 0:0"
+grep -qx 'BOAT_UNITS=imperial' "$fix_copy"
+test "$(stat -c '%a' "$FRESH")" = "$(stat -c '%a' "$XENV")"
+test -z "$(find "$TEST_ROOT" -maxdepth 1 -name '.*.fix.*' -print -quit)"
+# A bad choice is asked again; [1] is US customary; the dry run changed nothing installed.
+fresh_config fix-units1
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+printf 'x\n1\n' > "$ANS"
+xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1
+grep -q 'Please enter one of: 1, 2, or c to cancel.' "$TEST_ROOT/fix.out"
+grep -qx 'BOAT_UNITS=us_customary' "$FRESH"
+
+# Cancel and end of input leave the file byte-identical and print one clear line.
+fresh_config fix-cancel
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+cancel_before=$(sha256sum "$FRESH")
+for answers in 'c\n' 'C\n' ''; do
+    # shellcheck disable=SC2059
+    printf "$answers" > "$ANS"
+    if xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+        echo "a cancelled prompt succeeded" >&2
+        exit 1
+    fi
+    grep -qx 'Cancelled. Nothing was changed.' "$TEST_ROOT/fix.out"
+    test "$cancel_before" = "$(sha256sum "$FRESH")"
+    test -z "$(copies_of "$FRESH")"
+done
+
+# Unsafe saved value: hidden re-entry, nothing printed, an unsafe replacement is refused.
+fresh_config fix-token
+# shellcheck disable=SC2016  # literal $ in the fixture
+printf 'HOME_ASSISTANT_TOKEN="it'"'"'s \\$SECRET"\n' >> "$FRESH"
+# shellcheck disable=SC2016  # literal $ in the fixture
+printf '1\nzqbad'"'"'\\$x\nnew-token-value\n' > "$ANS"
+xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1
+grep -q 'Preflight passed' "$TEST_ROOT/fix.out"
+grep -qF 'HOME_ASSISTANT_TOKEN in' "$TEST_ROOT/fix.out"
+grep -qF '[1] Enter a new value for HOME_ASSISTANT_TOKEN' "$TEST_ROOT/fix.out"
+grep -q 'That value still cannot be written safely' "$TEST_ROOT/fix.out"
+for secret in SECRET zqbad 'new-token-value'; do
+    if grep -q "$secret" "$TEST_ROOT/fix.out"; then echo "the prompt printed a typed or saved value" >&2; exit 1; fi
+done
+grep -qx 'HOME_ASSISTANT_TOKEN=new-token-value' "$FRESH"
+test "$(grep -c '^HOME_ASSISTANT_TOKEN=' "$FRESH")" -eq 1
+test "$(copies_of "$FRESH" | wc -l)" -eq 1
+grep -q 'SECRET' "$(copies_of "$FRESH")"
+# A control character in a display token is fixed the same way, after a units fix in the same
+# run (two restarts; the answers carry over).
+fresh_config fix-two
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\nDISPLAYS_SIGNALK_TOKEN="a\tb"\n' >> "$FRESH"
+printf '2\n1\nclean-token\n' > "$ANS"
+xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1
+grep -q 'Preflight passed' "$TEST_ROOT/fix.out"
+grep -qx 'BOAT_UNITS=metric' "$FRESH"
+grep -qx 'DISPLAYS_SIGNALK_TOKEN=clean-token' "$FRESH"
+test "$(copies_of "$FRESH" | wc -l)" -eq 2
+
+# Generated or preserved secrets are never offered for replacement (the service still
+# holds the old one); the hard stop explains. Unattended runs behave exactly as before.
+fresh_config fix-secret
+# shellcheck disable=SC2016  # literal $ in the fixture
+printf 'INFLUXDB_PASSWORD="it'"'"'s \\$x"\n' >> "$FRESH"
+hardstop_before=$(sha256sum "$FRESH")
+printf '1\nreplacement\n' > "$ANS"
+if xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "a bad secret was accepted" >&2
+    exit 1
+fi
+grep -q 'INFLUXDB_PASSWORD' "$TEST_ROOT/fix.out"
+grep -q 'must be changed in that service first' "$TEST_ROOT/fix.out"
+grep -q 'Nothing was changed' "$TEST_ROOT/fix.out"
+if grep -q 'Enter a new value' "$TEST_ROOT/fix.out"; then echo "a secret was offered for replacement" >&2; exit 1; fi
+test "$hardstop_before" = "$(sha256sum "$FRESH")"
+test -z "$(copies_of "$FRESH")"
+
+# A value that does not come from the file cannot be fixed by editing it: hard stop.
+fresh_config fix-env
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf '2\n' > "$ANS"
+if BOAT_UNITS=imperial xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "an unsupported environment value was accepted" >&2
+    exit 1
+fi
+grep -qF "BOAT_UNITS=imperial in $FRESH is not supported." "$TEST_ROOT/fix.out"
+test -z "$(copies_of "$FRESH")"
+
+# A symbolic link is never rewritten; the round cap stops a restart loop.
+fresh_config fix-link-target
+grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+ln -s "$FRESH" "$TEST_ROOT/fix-link.env"
+link_before=$(sha256sum "$FRESH")
+printf '2\n' > "$ANS"
+if xask "$ANS" "$inst" --config "$TEST_ROOT/fix-link.env" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "a symbolic-link config was rewritten" >&2
+    exit 1
+fi
+grep -q 'it is not a regular file' "$TEST_ROOT/fix.out"
+grep -q 'Edit it by hand instead' "$TEST_ROOT/fix.out"
+test "$link_before" = "$(sha256sum "$FRESH")"
+printf '2\n' > "$ANS"
+if VESSELSTACK_REMEDIATION_ROUND=3 xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "the restart cap did not stop the run" >&2
+    exit 1
+fi
+grep -q 'Too many fixes in one run' "$TEST_ROOT/fix.out"
+test "$link_before" = "$(sha256sum "$FRESH")"
+test -z "$(copies_of "$FRESH")"
+
+# Unattended, with and without a terminal that is not available: the old message, nothing asked.
+printf '2\n' > "$ANS"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_PROMPT_ANSWERS="$ANS" \
+    "$inst" --config "$IMPERIAL" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "an unattended run accepted an unsupported value" >&2
+    exit 1
+fi
+grep -qF "BOAT_UNITS=imperial in $IMPERIAL is not supported. Set it to us_customary or metric" "$TEST_ROOT/fix.out"
+if grep -q 'Choice:' "$TEST_ROOT/fix.out"; then echo "an unattended run asked a question" >&2; exit 1; fi
+if env -u VESSELSTACK_NONINTERACTIVE PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    setsid "$inst" --config "$IMPERIAL" --dry-run </dev/null >"$TEST_ROOT/fix.out" 2>&1; then
+    echo "a run without a terminal accepted an unsupported value" >&2
+    exit 1
+fi
+grep -qF "BOAT_UNITS=imperial in $IMPERIAL is not supported." "$TEST_ROOT/fix.out"
+test -z "$(copies_of "$IMPERIAL")"
+
+# The real thing: a pseudo-terminal, answers typed on stdin of `script`.
+if command -v script >/dev/null 2>&1 && command -v setsid >/dev/null 2>&1; then
+    fresh_config fix-pty
+    grep -v '^BOAT_UNITS=' "$XENV" > "$FRESH"
+    printf 'BOAT_UNITS=imperial\n' >> "$FRESH"
+    pty_cmd="env -u VESSELSTACK_NONINTERACTIVE PATH=$FAKE_BIN:$PATH VESSELSTACK_SYSTEM_ROOT=$SYSTEM_ROOT $inst --config $FRESH --dry-run"
+    # Give the installer a moment to reach the prompt; the pty keeps early input queued anyway.
+    { sleep 2; printf '2\n'; sleep 3; } | timeout 120 setsid script -qec "$pty_cmd" /dev/null >"$TEST_ROOT/pty.out" 2>&1 || true
+    grep -q 'Preflight passed' "$TEST_ROOT/pty.out"
+    grep -qx 'BOAT_UNITS=metric' "$FRESH"
+    test "$(copies_of "$FRESH" | wc -l)" -eq 1
+else
+    echo "SKIP: pty smoke test (script or setsid not installed)"
+fi
+# Nothing above touched the installed tree or left temp files beside the configs.
+test -z "$(find "$TEST_ROOT" -maxdepth 1 -name '.*.fix.*' -print -quit)"
 
 # 1c. Stale env temp files (exact mktemp names) are removed by a real run; a dry run
 # leaves them, and similarly named files are never touched.

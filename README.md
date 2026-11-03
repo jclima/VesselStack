@@ -447,6 +447,36 @@ sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /opt/vesselstack/config/vessel
 Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
 needs no other manual step.
 
+**Fix it at the prompt (0.6.1).** When you run the installer, an update or the pinned
+`get-vesselstack.sh` from a terminal (for example over `ssh -t`), an unsupported `BOAT_UNITS`
+value, or a setting in `vesselstack.env` that cannot be written safely (see below), no longer
+just stops the run. The installer asks what to do before changing anything else:
+
+```text
+BOAT_UNITS in /opt/vesselstack/config/vesselstack.env is "imperial", which is not supported.
+  [1] US customary (feet, °F, psi, US gallons)
+  [2] Metric (metres, °C, kPa, litres)
+  [c] Cancel (nothing is changed)
+Choice:
+```
+
+An unsafe value (a token or other setting with an apostrophe plus a backslash, double quote,
+dollar sign or backtick, a line break, or a control character) is offered as
+`[1] Enter a new value for <KEY>`; what you type for a token, password or key is hidden and is
+never printed or logged, and a replacement that is still unsafe is refused. Your answer is saved
+in the settings file, the installer prints `Changed <KEY> in <file> (previous copy: <file>.before-fix-<time>)`
+and starts over with the same options. The previous copy is root-only; delete the
+`*.before-fix-*` copies once the install works. `c`, an empty answer at the end of input or
+five minutes without an answer prints `Cancelled. Nothing was changed.` and leaves the file as
+it was. Limits: only settings written in the file you pass with `--config` are offered (a value
+that comes from the environment is not), generated or preserved passwords and tokens (InfluxDB,
+Grafana, MQTT, Boat Chat, Control Panel) are never offered because the running services still hold the
+old value (change it in the service first, then edit the file), and a symbolic link, a file not
+owned by root or a file whose edit cannot be verified is left untouched with the manual `sed`
+command printed. Runs without a terminal (cron, a service, the Control Panel, `--yes`,
+`VESSELSTACK_NONINTERACTIVE=true`) never ask: they stop before changing anything and print the
+exact fix, as in 0.6.0. A dry run that you answer does save the fix you chose.
+
 **What changes for an existing boat**
 
 - **Env-file values are checked more strictly.** The installer refuses a value that holds an
@@ -1249,6 +1279,15 @@ prints how to remove it (`docker volume rm vesselstack-esphome-cache`);
 
 Install the reported command and rerun `--dry-run`. Confirm `docker compose`
 works; the deprecated standalone `docker-compose` command is insufficient.
+
+### The installer stops on `BOAT_UNITS` or "cannot be written safely"
+
+Run it from a terminal (`ssh -t`) and answer the prompt: it offers to set the units or to
+enter a replacement value, keeps a root-only copy of the previous file as
+`<file>.before-fix-<time>` (safe to delete once the install works), and then continues. If it
+only prints the message, the run had no terminal, `--yes` or `VESSELSTACK_NONINTERACTIVE=true`
+was set, or the value is a generated password or token or comes from the environment: edit the
+named setting in the file as printed, then run again. See [Upgrading to 0.6.0](#upgrading-to-060).
 
 ### A port is already allocated
 

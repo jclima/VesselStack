@@ -5,6 +5,10 @@ Semantic Versioning.
 
 ## 0.6.1 - 2026-11-03
 
+### Highlights
+
+- Upgrades and installs now offer to fix an unsupported units setting or an unsafe saved value at the prompt, instead of stopping; unattended runs still stop safely and print the exact fix. Each fix keeps a root-only `*.before-fix-*` copy of the previous settings file, which you can delete once the install works.
+
 ### Fixes
 
 - Upgrading a boat whose settings say `BOAT_UNITS=nautical` (offered by older setup wizards) no
