@@ -3,7 +3,7 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## 0.6.1 - 2026-11-03
+## 0.6.1 - 2026-11-02
 
 ### Highlights
 
@@ -12,6 +12,11 @@ Semantic Versioning.
 - When the backup drive isn't mounted, updates and backups offer to mount it, pick a connected USB drive, check again, or back up to the system disk once, instead of stopping.
 
 ### Fixes
+
+- The backup-drive menu now lists a USB drive that has no label (its columns were shifted, so the wrong value reached `mount`), accepts only exactly one listed answer (`1 2` is asked again, never guessed), and is not offered drives that `/etc/fstab` assigns to another mount point. An empty list says how to unmount a drive your desktop already mounted.
+- Fresh installs started with `--yes`, `--defaults` or scripted answers no longer let the installer ask questions.
+- A drive mounted from the menu is checked before anything is written: its top folder must be owned by root and not writable by others, and no folder on the way to the backup folder may be a symbolic link or belong to another user.
+- The prompt library, its parent folders and the folder of a settings file being fixed must be root-controlled; the scripted-answers test hook (`VESSELSTACK_PROMPT_ANSWERS`) is read only from a private file you own. `vesselstackctl uninstall` also removes the prompt library.
 
 - Upgrading a boat whose settings say `BOAT_UNITS=nautical` (offered by older setup wizards) no
   longer stops the update; it is read as metric, and knots and nautical miles are kept.

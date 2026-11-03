@@ -40,6 +40,9 @@ done
 # Prompt helpers for the fixes offered below (see scripts/lib/remediate.sh).
 # shellcheck source=scripts/lib/remediate.sh
 source "$SCRIPT_DIR/scripts/lib/remediate.sh"
+# After a fix this installer restarts itself with the answers descriptor still open; this process
+# owns it now, so vs_prompt_close closes it before anything is installed or started.
+if [ "${VESSELSTACK_REMEDIATION_ROUND:-0}" != 0 ] && [ -n "$VS_PROMPT_FD" ]; then VS_PROMPT_OWNED=1; fi
 # config_key_assigned KEY: true when CONFIG_FILE itself assigns KEY (so editing it can fix it).
 config_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }
 # Set below when an interactive run may offer to fix the value instead of stopping.
@@ -188,7 +191,7 @@ case "$BOAT_UNITS" in
         if config_key_assigned BOAT_UNITS && vs_prompt_open; then
             FIX_BOAT_UNITS=1
         else
-            echo "Refusing to continue: BOAT_UNITS=$BOAT_UNITS_INPUT in $CONFIG_FILE is not supported." >&2
+            echo "Refusing to continue: BOAT_UNITS=$(vs_printable "$BOAT_UNITS_INPUT") in $CONFIG_FILE is not supported." >&2
             echo "To fix: set it to us_customary or metric, for example: sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' $CONFIG_FILE" >&2
             exit 1
         fi
@@ -563,6 +566,21 @@ config_env_snapshot() {
     )
 }
 
+# root_controlled_chain PATH: every existing component from PATH up to / is root-owned and not
+# group- or world-writable, so no other user can swap the file this installer is about to edit.
+root_controlled_chain() {
+    local resolved uid mode
+    resolved=$(realpath -m -- "$1") || return 1
+    while :; do
+        if [ -e "$resolved" ]; then
+            read -r uid mode < <(stat -c '%u %a' -- "$resolved") || return 1
+            if [ "$uid" != 0 ] || [ $((0$mode & 0022)) -ne 0 ]; then return 1; fi
+        fi
+        [ "$resolved" != / ] || return 0
+        resolved=$(dirname -- "$resolved")
+    done
+}
+
 # config_fix_key FILE KEY VALUE: sets KEY=VALUE in FILE (an env file this installer reads),
 # keeping a root-only copy, and restarts this installer with the original arguments.
 # Refuses (returns 1, FILE untouched) unless the result provably reads back the same for
@@ -581,6 +599,10 @@ config_fix_key() {
     fi
     if [ "$(id -u)" -eq 0 ] && [ "$(stat -c '%u' "$file")" != 0 ]; then
         echo "Not changing $file: it is not owned by root." >&2
+        return 1
+    fi
+    if [ "$(id -u)" -eq 0 ] && ! root_controlled_chain "$(dirname -- "$file")"; then
+        echo "Not changing $file: its folder (or a parent folder) is not root-owned, or can be changed by other users." >&2
         return 1
     fi
     if env_value_problem "$value" >/dev/null || [[ $value =~ [[:cntrl:]] ]]; then

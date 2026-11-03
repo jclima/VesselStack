@@ -482,8 +482,9 @@ it was. Limits: only settings written in the file you pass with `--config` are o
 that comes from the environment is not), generated or preserved passwords and tokens (InfluxDB,
 Grafana, MQTT, Boat Chat, Control Panel) are never offered because the running services still hold the
 old value (change it in the service first, then edit the file), and a symbolic link, a file not
-owned by root or a file whose edit cannot be verified is left untouched with the manual `sed`
-command printed. Runs without a terminal (cron, a service, the Control Panel, `--yes`,
+owned by root, a file in a folder (or under a parent folder) that other users can change, or a
+file whose edit cannot be verified is left untouched. For an unsupported units value the manual
+`sed` command is printed; for an unsafe value you are told to edit the setting by hand. Runs without a terminal (cron, a service, the Control Panel, `--yes`,
 `VESSELSTACK_NONINTERACTIVE=true`) never ask: they stop before changing anything and print the
 exact fix, as in 0.6.0. A dry run that you answer does save the fix you chose.
 
@@ -1145,7 +1146,14 @@ Nothing has been changed yet.
 - **[2]** lists connected USB drives that are not mounted and not part of the system disk
   (the disk holding `/`, `/boot/firmware` or the VesselStack data is never offered). Only
   **ext4** (recommended) and **exFAT** are accepted; vfat/FAT32 is refused because of its 4 GiB
-  file limit, and other filesystems are listed with the reason. The mount point must be empty.
+  file limit, and other filesystems are listed with the reason. A drive that `/etc/fstab` assigns
+  to a different mount point (for example a data SSD that failed to mount) is listed with that
+  reason and cannot be picked. If no unmounted drive is found, the menu says so and names a
+  removable ext4 or exFAT drive that is already mounted elsewhere (for example by the desktop
+  under `/media/<user>/...`); unmount it with `sudo umount <path>` and choose [3]. The mount point
+  must be empty. Before anything is written, the new mount's top folder must be owned by root and
+  not writable by others, and no folder from there to the backup folder may be a symbolic link or
+  owned by another user; otherwise the backup is refused.
   The drive is mounted with `nodev,nosuid,noexec` (exFAT also `uid=0,gid=0,umask=0077`) and stays
   mounted until reboot; the menu prints the `/etc/fstab` line to add to mount it at boot.
   VesselStack never edits `/etc/fstab` or formats a drive.
@@ -1153,7 +1161,10 @@ Nothing has been changed yet.
 - **[4]** writes this one backup to the system disk after a warning. It is not offered when
   the free space is smaller than the data (`du -skx`, 60 s limit) or when `vesselstack.env` sets
   `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false`. Nothing is saved: the next backup asks again.
-- **[c]**, end of input or no answer within 5 minutes cancels without changing anything.
+- **[c]**, end of input or no answer within 5 minutes cancels without changing anything (in
+  the pinned installer it prints `Cancelled. The update was not started; your installed VesselStack
+  was not changed.`; the packages and the release folder may already be in place). An answer must
+  be exactly one listed token: `1 2` is asked again.
   `vesselstackctl backup --require-mounted` (used by the Control Panel) offers only [1] to [3].
 
 Without a terminal (cron, systemd, the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) it

@@ -273,11 +273,11 @@ vs_backup_mount_device() {
         return 1
     fi
     if [ -L "$mount_dir" ] || { [ -e "$mount_dir" ] && [ ! -d "$mount_dir" ]; }; then
-        echo "$mount_dir exists but is not a plain folder; move it away first." >&2
+        echo "$(vs_printable "$mount_dir") exists but is not a plain folder; move it away first." >&2
         return 1
     fi
     if [ -d "$mount_dir" ] && [ -n "$(ls -A -- "$mount_dir" 2>/dev/null)" ]; then
-        echo "$mount_dir is not empty (files hidden under a mount would be unreachable); move its contents first." >&2
+        echo "$(vs_printable "$mount_dir") is not empty (files hidden under a mount would be unreachable); move its contents first." >&2
         return 1
     fi
     if [ ! -d "$mount_dir" ]; then
@@ -296,14 +296,14 @@ vs_backup_mount_device() {
             ;;
     esac
     if ! mount -t "$fs" -o "$options" "$device" "$mount_dir" || ! mountpoint -q "$mount_dir"; then
-        echo "Could not mount $device at $mount_dir." >&2
+        echo "Could not mount $device at $(vs_printable "$mount_dir")." >&2
         if [ "$created" -eq 1 ]; then rmdir -- "$mount_dir" 2>/dev/null || true; fi
         return 1
     fi
-    echo "Mounted $device at $mount_dir." >&2
+    echo "Mounted $device at $(vs_printable "$mount_dir")." >&2
     if [[ $uuid =~ ^[A-Za-z0-9-]+$ ]]; then
         echo "It stays mounted until reboot. To mount it at boot, add this line to /etc/fstab:" >&2
-        echo "UUID=$uuid $mount_dir $fs $fstab_options 0 $pass" >&2
+        echo "UUID=$uuid $(vs_printable "$mount_dir") $fs $fstab_options 0 $pass" >&2
     fi
     return 0
 }
@@ -312,7 +312,7 @@ vs_backup_mount_device() {
 # 0 mounted, 1 nothing mounted (the caller shows the menu again).
 vs_backup_pick_drive() {
     local mount_dir=$1 json='' sources='' target src listing kind path size label fs uuid reason shown label_text pick
-    local fstab_file=${VS_FSTAB_FILE:-/etc/fstab} fstab_src fstab_mp fstab_rest fstab_lines='' elsewhere=''
+    local fstab_file=${VS_FSTAB_FILE:-/etc/fstab} fstab_src fstab_mp fstab_lines='' elsewhere=''
     local -a paths=() fss=() uuids=()
     if ! command -v lsblk >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
         echo "Listing drives needs lsblk and python3." >&2
@@ -331,7 +331,7 @@ vs_backup_pick_drive() {
     done
     # Drives that /etc/fstab assigns to another mount point (a data SSD that failed to mount) are not offered.
     if [ -r "$fstab_file" ]; then
-        while read -r fstab_src fstab_mp fstab_rest; do
+        while read -r fstab_src fstab_mp _; do
             case $fstab_src in ''|'#'*) continue ;; esac
             [ "$fstab_mp" != "$mount_dir" ] || continue
             fstab_lines+="$fstab_src"$'\t'"$fstab_mp"$'\n'
@@ -393,10 +393,10 @@ vs_backup_menu() {
         } >&2
         valid="2 3"
         if [ "$has_fstab" -eq 1 ]; then
-            echo "  [1] Mount $mount_dir now (it is listed in /etc/fstab)" >&2
+            echo "  [1] Mount $(vs_printable "$mount_dir") now (it is listed in /etc/fstab)" >&2
             valid="1 $valid"
         fi
-        echo "  [2] Choose a connected drive to mount at $mount_dir" >&2
+        echo "  [2] Choose a connected drive to mount at $(vs_printable "$mount_dir")" >&2
         echo "  [3] I have plugged the drive in; check again" >&2
         if [ "$VS_BACKUP_OFFER_SYSTEM" -eq 1 ]; then
             echo "  [4] Back up to the system disk this once (not recommended)" >&2
@@ -408,20 +408,20 @@ vs_backup_menu() {
         case $choice in
             1)
                 if mount -- "$mount_dir" && mountpoint -q "$mount_dir"; then
-                    echo "Mounted $mount_dir." >&2
+                    echo "Mounted $(vs_printable "$mount_dir")." >&2
                     return 0
                 fi
-                echo "Could not mount $mount_dir from /etc/fstab." >&2
+                echo "Could not mount $(vs_printable "$mount_dir") from /etc/fstab." >&2
                 ;;
             2)
                 if vs_backup_pick_drive "$mount_dir"; then return 0; fi
                 ;;
             3)
                 if mountpoint -q "$mount_dir"; then
-                    echo "$mount_dir is mounted." >&2
+                    echo "$(vs_printable "$mount_dir") is mounted." >&2
                     return 0
                 fi
-                echo "$mount_dir is still not mounted." >&2
+                echo "$(vs_printable "$mount_dir") is still not mounted." >&2
                 ;;
             4)
                 echo "WARNING: the backup will be written to the system disk (SD card) this once. It will not survive loss of that disk, and the next backup asks again." >&2
@@ -438,13 +438,13 @@ vs_backup_destination_fix() {
     VS_BACKUP_ALLOW_ONCE=0
     if ! vs_prompt_open; then
         {
-            echo "Refusing to back up: $mount_dir is not mounted, so the archive would land on the system disk (SD card). Nothing was changed."
+            echo "Refusing to back up: $(vs_printable "$mount_dir") is not mounted, so the archive would land on the system disk (SD card). Nothing was changed."
             if [ "$context" = backup ] && [ -n "$strict" ]; then
-                echo "To fix: mount the backup drive at $mount_dir and run again."
+                echo "To fix: mount the backup drive at $(vs_printable "$mount_dir") and run again."
             elif [ "$context" = backup ]; then
-                echo "To fix: mount the backup drive at $mount_dir and run again, or pass --allow-unmounted."
+                echo "To fix: mount the backup drive at $(vs_printable "$mount_dir") and run again, or pass --allow-unmounted."
             else
-                echo "To fix: mount the backup drive at $mount_dir and run again, or back up to the system disk this once: sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update $update_dir"
+                echo "To fix: mount the backup drive at $(vs_printable "$mount_dir") and run again, or back up to the system disk this once: sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update $update_dir"
             fi
         } >&2
         return 1

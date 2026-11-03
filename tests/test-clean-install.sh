@@ -6,7 +6,14 @@ set -euo pipefail
 # cases below unset it for their own runs and feed answers from a file.
 export VESSELSTACK_NONINTERACTIVE=true
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TEST_ROOT=$(mktemp -d)
+# The installer edits a config file only inside root-controlled folders, so a root run keeps its
+# scratch space under /usr/local/share rather than the sticky, world-writable /tmp.
+if [ "$(id -u)" -eq 0 ]; then
+    mkdir -p /usr/local/share/vs-test
+    TEST_ROOT=$(mktemp -d /usr/local/share/vs-test/vs-ci.XXXXXX)
+else
+    TEST_ROOT=$(mktemp -d)
+fi
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 FAKE_BIN="$TEST_ROOT/bin"
 APP_ROOT="$TEST_ROOT/opt/vesselstack"
@@ -816,6 +823,25 @@ if xask "$ANS" "$inst" --config "$FRESH" --dry-run >"$TEST_ROOT/fix.out" 2>&1; t
 fi
 test "$multi_before" = "$(sha256sum "$FRESH")"
 test -z "$(copies_of "$FRESH")"
+
+# A config in a folder other users can change is never edited, even when the answer is valid.
+if [ "$(id -u)" -eq 0 ]; then
+    open_dir="$TEST_ROOT/open-dir"
+    mkdir -p "$open_dir"
+    chmod 0777 "$open_dir"
+    grep -v '^BOAT_UNITS=' "$XENV" > "$open_dir/vs.env"
+    printf 'BOAT_UNITS=imperial\n' >> "$open_dir/vs.env"
+    open_before=$(sha256sum "$open_dir/vs.env")
+    printf '2\n' > "$ANS"
+    if xask "$ANS" "$inst" --config "$open_dir/vs.env" --dry-run >"$TEST_ROOT/fix.out" 2>&1; then
+        echo "a config in a world-writable folder was edited" >&2
+        exit 1
+    fi
+    grep -qF "its folder (or a parent folder) is not root-owned, or can be changed by other users" "$TEST_ROOT/fix.out"
+    grep -qF "Edit it by hand instead:" "$TEST_ROOT/fix.out"
+    test "$open_before" = "$(sha256sum "$open_dir/vs.env")"
+    test -z "$(copies_of "$open_dir/vs.env")"
+fi
 
 # Cancel and end of input leave the file byte-identical and print one clear line.
 fresh_config fix-cancel

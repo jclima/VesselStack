@@ -186,6 +186,9 @@ cat > "$FAKE_BIN/mount" <<EOF
 echo "mount \$*" >> "$TEST_ROOT/mount.log"
 [ -z "\${FAKE_MOUNT_FAIL:-}" ] || { echo "mount: fake failure" >&2; exit 32; }
 echo "\${*: -1}" >> "\$FAKE_MOUNTS"
+# FAKE_MOUNT_CHOWN=uid hands the new mount root to that user; FAKE_MOUNT_LINK=1 puts a symbolic link in it.
+[ -z "\${FAKE_MOUNT_CHOWN:-}" ] || chown "\$FAKE_MOUNT_CHOWN" "\${*: -1}"
+if [ -n "\${FAKE_MOUNT_LINK:-}" ]; then ln -s /tmp "\${*: -1}/backups"; fi
 EOF
 cat > "$FAKE_BIN/findmnt" <<EOF
 #!/bin/bash
@@ -600,6 +603,45 @@ EOF
     FAKE_LSBLK="$TEST_ROOT/lsblk-empty.json" menu_run $'2\nc\n' backup "$unmounted/backups"
     want "(none found)"
     want "Plug in a drive formatted as ext4"
+    want "No unmounted USB drive was found. If your desktop already mounted the drive (for example under /media/<user>/...), unmount it first: sudo umount <path>."
+    refuse_text "Already mounted elsewhere:"
+    # A removable ext4 partition the desktop mounted elsewhere is named in the hint.
+    cat > "$TEST_ROOT/lsblk-mounted.json" <<EOF
+{"blockdevices":[
+ {"path":"/dev/sde","type":"disk","size":"16G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sde1","type":"part","size":"16G","label":"USBSTICK","fstype":"ext4","uuid":"6666-ffff","mountpoint":"/media/pi/USBSTICK","rm":true}]}
+]}
+EOF
+    FAKE_LSBLK="$TEST_ROOT/lsblk-mounted.json" menu_run $'2\nc\n' backup "$unmounted/backups"
+    want "(none found)"
+    want "Already mounted elsewhere:"
+    want '/dev/sde1  16G  "USBSTICK"  ext4, mounted at /media/pi/USBSTICK'
+    # A drive that /etc/fstab assigns to another mount point (a data SSD that failed to mount) is
+    # not offered; one assigned to the backup folder's own mount point still is.
+    printf 'UUID=1111-aaaa /srv/data ext4 defaults,nofail 0 2\n' > "$TEST_ROOT/fstab-other"
+    VS_FSTAB_FILE="$TEST_ROOT/fstab-other" menu_run $'2\nc\n' backup "$unmounted/backups"
+    want "/dev/sda1  58G  \"BACKUP\"  ext4 -- listed in /etc/fstab for /srv/data; not offered here"
+    refuse_text "[1] /dev/sda1"
+    printf 'LABEL=BACKUP /srv/data ext4 defaults 0 2\n' > "$TEST_ROOT/fstab-other"
+    VS_FSTAB_FILE="$TEST_ROOT/fstab-other" menu_run $'2\nc\n' backup "$unmounted/backups"
+    refuse_text "[1] /dev/sda1"
+    printf 'UUID=1111-aaaa %s ext4 nofail 0 2\n' "$unmounted" > "$TEST_ROOT/fstab-other"
+    VS_FSTAB_FILE="$TEST_ROOT/fstab-other" menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 0
+    want '[1] /dev/sda1  58G  "BACKUP"  ext4'
+    rm -rf -- "$unmounted"
+
+    # A drive mounted just now is checked before anything is written: a mount root owned by
+    # another user, or a symbolic link on the drive, is refused (nothing created, no archive).
+    FAKE_MOUNT_CHOWN=1234 menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "the top folder of the newly mounted drive is not owned by root or can be changed by other users"
+    test ! -e "$unmounted/backups"
+    rm -rf -- "$unmounted"
+    FAKE_MOUNT_LINK=1 menu_run $'2\n1\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    want "on the newly mounted drive is a symbolic link"
+    rm -rf -- "$unmounted"
 
     # An unlabeled partition keeps its columns (an empty LABEL must not shift the fields) and is
     # mounted with the right filesystem type and device.
@@ -708,6 +750,13 @@ EOF
     refuse_text "Choice:"
     want "To fix: mount the backup drive at $unmounted and run again, or pass --allow-unmounted."
     chmod 0644 "$LIBEXEC_TEST/remediate.sh"
+    # The folders above the library must be root-controlled too.
+    chmod 0777 "$SYSTEM_ROOT/usr/local/libexec"
+    menu_run $'4\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    refuse_text "Choice:"
+    want "To fix: mount the backup drive at $unmounted and run again, or pass --allow-unmounted."
+    chmod 0755 "$SYSTEM_ROOT/usr/local/libexec"
     test ! -e "$unmounted"
     cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
     unset FAKE_CALL_LOG FAKE_MOUNT_PATH

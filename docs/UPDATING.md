@@ -53,7 +53,11 @@ If the Control Panel is unavailable, use the pinned installer above.
 The pinned installer and (from an installed 0.6.1) `vesselstackctl update` and
 `vesselstackctl backup` ask, before anything is stopped, whether to mount the drive from
 `/etc/fstab`, pick a connected USB drive (ext4 recommended, exFAT allowed, vfat refused), check
-again, or back up to the system disk once. Without a terminal, with `--yes`, or in the Control
+again, or back up to the system disk once. Cancelling in the pinned installer prints
+`Cancelled. The update was not started; your installed VesselStack was not changed.` (the packages
+and the release folder may already be in place). A drive mounted from the menu must have a
+root-owned top folder that others cannot write to, with no symbolic link or foreign-owned
+folder on the way to the backup folder; otherwise the backup is refused. Without a terminal, with `--yes`, or in the Control
 Panel they stop and print a `To fix:` line instead. A direct `sudo vesselstackctl update <dir>` from
 an installed 0.6.0 or earlier controller has no menu: use the pinned installer, mount the drive
 first, or run `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
