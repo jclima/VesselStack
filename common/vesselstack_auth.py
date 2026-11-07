@@ -350,7 +350,7 @@ class AuthStore:
         try:
             uid, gid = self._parent_owner()
         except FileNotFoundError:
-            return None
+            raise StoreError("the service's sign-in directory does not exist yet; root does not create it") from None
         return (uid, gid) if uid != 0 else None
 
     def _helper_call(self, owner: tuple[int, int], args: list[str], payload: dict[str, Any]) -> dict[str, Any]:

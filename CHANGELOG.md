@@ -45,6 +45,12 @@ Semantic Versioning.
   Control Panel or Boat Chat passphrase is an atomic compare-and-set: a concurrent change returns 409
   "passphrase changed, try again" instead of overwriting.
 
+- The installer asks for sign-in: `get-vesselstack.sh` offers to set a Control Panel passphrase, a Boat Chat
+  crew passphrase and a pairing link (skipped with `--yes`/`--defaults`, which print the commands instead).
+  Both wizards gain optional passphrase fields; they write only scrypt hashes (`CONTROL_PANEL_PASSPHRASE_HASH`,
+  `BOAT_CHAT_PASSPHRASE_HASH`) that `install.sh` imports and then removes from the env file. New
+  `vesselstackctl passphrase set-hash`. The first-sign-in docs now lead with the passphrase or pairing link.
+
 ### Upgrade notes
 
 - Reaching the panel through a name other than localhost or the boat's own names now needs

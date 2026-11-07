@@ -178,6 +178,19 @@ if [ "$1" = update ]; then
     else [ "$#" -eq 2 ] || { echo "old ctl: unexpected extra arguments" >&2; exit 1; }; fi
 fi
 case "$1" in urls) echo "Boat Chat  http://0.0.0.0:8765" ;; esac
+# Sign-in stubs: "passphrase set SCOPE --stdin" reads the passphrase from standard input (never argv) and keeps
+# a copy in $TEST_ROOT/pass-SCOPE so a test can compare it; policy: at least 8 characters.
+if [ "$1" = passphrase ]; then
+    case "$2" in
+        status) if [ -e "$TEST_ROOT/pass-$3" ]; then echo "$3 passphrase: set"; else echo "$3 passphrase: not set"; fi
+                echo "$3 signed-in devices: 0"; exit 0 ;;
+        set) [ "$4" = --stdin ] || exit 2
+             IFS= read -r pw
+             if [ "${#pw}" -lt 8 ]; then echo "Use at least 8 characters; a few random words work well." >&2; exit 1; fi
+             printf '%s' "$pw" > "$TEST_ROOT/pass-$3"; exit 0 ;;
+    esac
+fi
+if [ "$1" = panel-link ]; then echo "PAIRING-LINK for $*"; echo "QR-CODE-BLOCK"; exit 0; fi
 [ -z "${FAKE_CTL_FAIL:-}" ] || [ "$1" != "${FAKE_CTL_FAIL}" ]
 EOF2
 chmod 0755 "$FAKE_BIN"/*
@@ -493,7 +506,7 @@ for leftover in "$RELEASE_BASE"/.stage.*; do
 done
 expect_out "This run changed"
 expect_out "unpacked release to"
-expect_out "Show the Boat Chat access token"
+expect_out "can still use the long tokens"
 
 # Re-running is safe: installed-version now exists, so it reports and stops.
 before=$(wc -l < "$LOG")
@@ -631,7 +644,7 @@ expect_no_web_wizard() {
 
 # Full walk with the default answer to every question (Enter): confirmation, 16 prompts, review, install.
 reset_state
-{ printf 'y\n'; blank 20; } > "$ANSWERS"
+{ printf 'y\n'; blank 22; } > "$ANSWERS"
 run_asking
 expect_rc 0 "terminal wizard, all defaults"
 expect_out "Review \\(secrets are never shown\\)"
@@ -667,6 +680,7 @@ SECRET=sekrit-token-value-123
     printf '%s\n' y n '' ''                                      # CAN on, no vcan, interface, bitrate
     printf '%s\n' y ''                                           # AIS on, device
     printf '%s\n' '' '?' "$SECRET" 1 n                           # HA url, help, HA token, provider, telegram
+    printf '%s\n' '' ''                                         # sign-in passphrases: skip both
     printf '%s\n' y '' n 22,8080 -                               # firewall on ...
     printf '%s\n' 14d '' '' n                                    # retention, LAN access, panel access, no advanced
     printf '%s\n' s y                                            # save, install
@@ -704,7 +718,7 @@ expect_no_web_wizard
 
 # Quitting at the review, and input that ends early, install nothing.
 reset_state
-{ printf 'y\n'; blank 17; printf 'q\n'; } > "$ANSWERS"
+{ printf 'y\n'; blank 19; printf 'q\n'; } > "$ANSWERS"
 run_asking
 expect_rc 1 "quit at the review"
 expect_out "Quit without saving"
@@ -721,7 +735,7 @@ refuse_log "^install "
 
 # Edit a section from the review screen, then save.
 reset_state
-{ printf 'y\n'; blank 17; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
+{ printf 'y\n'; blank 19; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
 run_asking
 expect_rc 0 "edit a section at the review"
 expect_saved "BOAT_NAME='Edited Boat'"
@@ -1638,6 +1652,72 @@ expect_rc 0 "backup drive: --defaults asks nothing"
 refuse_out "which is not mounted"
 refuse_log "^ctl update"
 rm -rf -- "$BACKUP_MNT"
+
+# ---- 9b. sign-in passphrase questions after the install -----------------------------------------
+# --yes and --defaults ask nothing and print the commands for later.
+reset_state
+rm -f "$TEST_ROOT"/pass-*
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "--yes skips the passphrase questions"
+expect_out "were not asked"
+expect_out "sudo vesselstackctl passphrase set panel"
+expect_out "sudo vesselstackctl passphrase set chat"
+expect_out "sudo vesselstackctl panel-link --for chat"
+refuse_out "Set a Control Panel passphrase now"
+refuse_log "^ctl passphrase set"
+# The summary says how to sign in; the token command stays, but second.
+expect_out "Control Panel: set a passphrase with"
+expect_out "sudo grep '\\^CONTROL_PANEL_TOKEN=' .*control-panel.env"
+
+reset_state
+rm -f "$TEST_ROOT"/pass-*
+run --defaults --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "--defaults skips the passphrase questions"
+expect_out "were not asked"
+refuse_log "^ctl passphrase set"
+
+# Interactive (scripted terminal): panel passphrase typed twice; chat first too short (policy error shown, retry),
+# then accepted; pairing link offered and accepted. Nothing secret reaches argv, the log or the output.
+reset_state
+rm -f "$TEST_ROOT"/pass-*
+PANEL_PW='panel pass phrase one'; CHAT_SHORT='short'; CHAT_PW='crew pass two'
+printf '%s\n' y y y "$PANEL_PW" "$PANEL_PW" y "$CHAT_SHORT" "$CHAT_SHORT" "$CHAT_PW" "$CHAT_PW" y > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" EXTRA_ENV2=VESSELSTACK_SIGNIN_QUESTIONS=1 run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=; EXTRA_ENV2=
+expect_rc 0 "interactive passphrase questions"
+expect_out "Set a Control Panel passphrase now\\? \\(recommended\\)"
+expect_out "Control Panel passphrase set"
+expect_out "Use at least 8 characters"
+expect_out "Boat Chat crew passphrase set"
+expect_out "Pair this phone/laptop with Boat Chat now"
+expect_out "QR-CODE-BLOCK"
+expect_log "^ctl passphrase set panel --stdin "
+expect_log "^ctl passphrase set chat --stdin "
+expect_log "^ctl panel-link --for chat "
+[ "$(cat "$TEST_ROOT/pass-panel")" = "$PANEL_PW" ] || fail_test "panel passphrase did not arrive on stdin"
+[ "$(cat "$TEST_ROOT/pass-chat")" = "$CHAT_PW" ] || fail_test "chat passphrase did not arrive on stdin"
+refuse_out "$PANEL_PW"; refuse_out "$CHAT_PW"; refuse_log "$PANEL_PW"; refuse_log "$CHAT_PW"
+expect_out "Control Panel: enter the passphrase you chose"
+expect_out "Boat Chat: enter the crew passphrase you chose"
+
+# Declining, an empty answer, or a passphrase already set: nothing is set, nothing is asked twice.
+reset_state
+rm -f "$TEST_ROOT"/pass-*
+printf '%s\n' y y n n n > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" EXTRA_ENV2=VESSELSTACK_SIGNIN_QUESTIONS=1 run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=; EXTRA_ENV2=
+expect_rc 0 "declining the passphrase questions"
+refuse_log "^ctl passphrase set"
+refuse_log "^ctl panel-link"
+reset_state
+echo set > "$TEST_ROOT/pass-panel"
+printf '%s\n' y y n n > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" EXTRA_ENV2=VESSELSTACK_SIGNIN_QUESTIONS=1 run --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=; EXTRA_ENV2=
+expect_rc 0 "panel passphrase already set"
+refuse_out "Set a Control Panel passphrase now"
+expect_out "Set a Boat Chat crew passphrase now"
+rm -f "$TEST_ROOT"/pass-*
 
 # ---- 10. root-controlled release directory ------------------------------------------------
 reset_state

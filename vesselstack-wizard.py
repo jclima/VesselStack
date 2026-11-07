@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Loopback-only first-run configuration wizard for VesselStack."""
 
-import argparse, contextlib, hmac, ipaddress, json, os, platform, re, secrets, shlex, shutil, subprocess, sys, threading
+import argparse, contextlib, hmac, importlib.util, ipaddress, json, os, platform, re, secrets, shlex, shutil, subprocess, sys, threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,7 +23,39 @@ DEFAULTS = {
  "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780",
  "DISPLAYS_ENABLE":"false","DISPLAYS_BRIDGE_MQTT_USERNAME":"vesselstack-bridge","DISPLAYS_SIGNALK_TOKEN":"","DISPLAYS_HA_TOKEN":"",
  "VESSELSTACK_DISABLED_COMPONENTS":"",
+ "CONTROL_PANEL_PASSPHRASE_HASH":"","BOAT_CHAT_PASSPHRASE_HASH":"",
 }
+# Sign-in passphrases are hashed here (scrypt, the shared module) and only the hash is ever written; install.sh
+# imports each hash into its sign-in store and removes the key. The plaintext never reaches validate() or render().
+HASH_KEYS=("CONTROL_PANEL_PASSPHRASE_HASH","BOAT_CHAT_PASSPHRASE_HASH")
+PASSPHRASE_PSEUDO={"PANEL_PASSPHRASE":("CONTROL_PANEL_PASSPHRASE_HASH",12,"Control Panel"),"CHAT_PASSPHRASE":("BOAT_CHAT_PASSPHRASE_HASH",8,"Boat Chat")}
+_AUTH=None
+def auth_module():
+    global _AUTH
+    if _AUTH is None:
+        spec=importlib.util.spec_from_file_location("vesselstack_auth",ROOT/"common"/"vesselstack_auth.py")
+        if not spec or not spec.loader or not (ROOT/"common"/"vesselstack_auth.py").is_file(): raise ValueError("common/vesselstack_auth.py is missing; sign-in passphrases cannot be set here")
+        module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); _AUTH=module
+    return _AUTH
+
+def hash_signin(pseudo,passphrase,values):
+    """Check a typed passphrase with the stores' own rules and return its hash (never the text)."""
+    key,minimum,name=PASSPHRASE_PSEUDO[pseudo]; module=auth_module()
+    if not isinstance(passphrase,str): raise ValueError(f"{name} passphrase must be text")
+    try: module.check_new_passphrase(passphrase,minimum)
+    except module.AuthError as exc: raise ValueError(f"{name} passphrase: {exc}") from None
+    other=values.get("BOAT_CHAT_PASSPHRASE_HASH" if key=="CONTROL_PANEL_PASSPHRASE_HASH" else "CONTROL_PANEL_PASSPHRASE_HASH","")
+    if other and module.verify_passphrase(passphrase,other): raise ValueError("Choose different passphrases for the Control Panel and Boat Chat.")
+    return module.hash_passphrase(passphrase)
+
+def expand_signin(values):
+    """Web API: replace PANEL_PASSPHRASE / CHAT_PASSPHRASE (typed text, or empty to skip) by their hashes."""
+    if not isinstance(values,dict) or not any(k in values for k in PASSPHRASE_PSEUDO): return values
+    values=dict(values); typed={k:values.pop(k) for k in PASSPHRASE_PSEUDO if k in values}
+    typed={k:v for k,v in typed.items() if v!=""}
+    if len(typed)==2 and typed["PANEL_PASSPHRASE"]==typed["CHAT_PASSPHRASE"]: raise ValueError("Choose different passphrases for the Control Panel and Boat Chat.")
+    for pseudo,text in typed.items(): values[PASSPHRASE_PSEUDO[pseudo][0]]=hash_signin(pseudo,text,{})
+    return values
 
 def normalize_disabled_components(value):
     items=[item.strip() for item in value.split(",") if item.strip()]
@@ -57,6 +89,9 @@ def validate(values):
     if unknown: raise ValueError("Unknown settings: "+", ".join(sorted(unknown)))
     result=DEFAULTS.copy()
     for key,value in values.items():
+        if key in HASH_KEYS:
+            if not isinstance(value,str) or (value and not auth_module().valid_hash(value)): raise ValueError(f"Invalid value for {key}: it must be a hash made by this wizard")
+            result[key]=value; continue
         if not isinstance(value,str) or "\n" in value or "\r" in value or not ALLOWED.fullmatch(value): raise ValueError(f"Invalid value for {key}")
         result[key]=value
     result["VESSELSTACK_DISABLED_COMPONENTS"] = normalize_disabled_components(result["VESSELSTACK_DISABLED_COMPONENTS"])
@@ -153,7 +188,7 @@ class Handler(SimpleHTTPRequestHandler):
             size=int(self.headers.get("Content-Length","0"))
             if size>65536: raise ValueError("Request too large")
             values=json.loads(self.rfile.read(size)).get("values",{})
-            save_env(OUTPUT,render(expand_lan_access(values)))
+            save_env(OUTPUT,render(expand_signin(expand_lan_access(values))))
             self.reply(200,{"saved":str(OUTPUT),"next":f"sudo ./install.sh --config {OUTPUT.name} --dry-run"})
             if type(self).exit_after_save: threading.Thread(target=self.server.shutdown,daemon=True).start()
         except (ValueError,json.JSONDecodeError,OSError,AttributeError) as exc: self.reply(400,{"error":str(exc)})
@@ -333,6 +368,9 @@ SECTIONS=[
   F("BOAT_CHAT_PORT","Boat Chat port","TCP port of Boat Chat.",advanced=True,required=True,check=PORT),
   _secret("BOAT_CHAT_ACCESS_TOKEN","Boat Chat access token","Needed to open Boat Chat from another device."),
   _secret("BOAT_CHAT_SETTINGS_TOKEN","Boat Chat settings token","Protects the Boat Chat settings page.")]},
+ {"title":"Sign-in passphrases","intro":"Optional. A passphrase is easier to type than the long access tokens, and with it other devices can be remembered. Skip both (Enter) and set them later.","fields":[
+  F("CONTROL_PANEL_PASSPHRASE_HASH","Control Panel passphrase (optional)","At least 12 characters; a few random words work well. It is typed twice, hashed right here and only the salted hash is saved; the installer stores the hash and the text is never written. Later: sudo vesselstackctl passphrase set panel. Type - to clear.","secret",optional=True,passphrase=("PANEL_PASSPHRASE",),confirm=True),
+  F("BOAT_CHAT_PASSPHRASE_HASH","Boat Chat crew passphrase (optional)","At least 8 characters and different from the Control Panel one. Hashed here; only the hash is saved. Later: sudo vesselstackctl passphrase set chat. Type - to clear.","secret",optional=True,passphrase=("CHAT_PASSPHRASE",),confirm=True)]},
  {"title":"Network protection (firewall)","intro":"Optionally block administration ports on an untrusted network such as marina Wi-Fi.","fields":[
   F("VESSELSTACK_FIREWALL_ENABLE","Enable the VesselStack firewall rules?","Blocks administration ports on the untrusted interface. Turn it on only after confirming the interface name and that you have another way in (for example Ethernet or a VPN).","bool",hint=_fw_hint),
   F("VESSELSTACK_UNTRUSTED_INTERFACE","Untrusted network interface","The interface to protect, usually the Wi-Fi adapter.",required=True,check=_re(r"[A-Za-z][A-Za-z0-9_.-]{0,14}","Letters, digits, dot, underscore, hyphen; up to 15 characters."),when=lambda s:s.values["VESSELSTACK_FIREWALL_ENABLE"]=="true"),
@@ -463,6 +501,13 @@ def normalize(field,raw,values):
         elif raw.lower() in names: value=raw.lower()
         elif key == "CONTROL_PANEL_HOST": value=raw
         else: return None,"Choose a number from 1 to "+str(len(names))+" or one of: "+", ".join(names)+"."
+    elif field.get("passphrase"):
+        if raw=="": return None,"This setting cannot be empty."
+        try: value=hash_signin(field["passphrase"][0],raw,values)
+        except ValueError as exc: return None,str(exc)
+        try: validate({**values,key:value})
+        except ValueError as exc: return None,str(exc)
+        return value,None
     else:
         value=raw
         if kind=="secret" and field.get("generate") and raw.lower()=="generate": value="GENERATE"
@@ -492,6 +537,9 @@ def apply_settings(values,pairs):
     for pair in pairs:
         key,separator,raw=pair.partition("=")
         if not separator: raise ValueError(f"--set needs KEY=VALUE (got {key!r} without a value)")
+        if key in HASH_KEYS:
+            if not raw or auth_module().valid_hash(raw): values[key]=raw; continue
+            raise ValueError(f"{key}: give a hash made by this wizard, never a passphrase")
         field=FIELD_INDEX.get(key)
         if field is None: raise ValueError(f"Unknown setting {key}: see vesselstack.example.env for the settings VesselStack knows")
         value,message=normalize(field,raw,values)
@@ -559,6 +607,8 @@ def ask_field(session,field):
             console.say("    This setting cannot be cleared. Press Enter to keep it, or type ? for help."); continue
         value,message=normalize(field,raw,session.values)
         if message: console.say("    "+message+" (type ? for help)"); continue
+        if field.get("confirm") and console.ask("  Repeat it: ",secret=True)!=raw:
+            console.say("    The two entries differ; nothing was changed. Try again."); continue
         if field["key"]=="LAN_ACCESS":
             apply_lan_preset(session.values,value)
             for note in lan_notes(session.values): console.say("    NOTE: "+note)

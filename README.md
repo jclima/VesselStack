@@ -1157,6 +1157,20 @@ release; older versions ignore `control-panel-auth.json` and only the token work
 `sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
 [Control Panel guide](docs/CONTROL_PANEL.md).
 
+**Passphrases at install time (unreleased):** `get-vesselstack.sh` asks, after a successful install or update
+and only on a real terminal without `--yes`/`--defaults`, "Set a Control Panel passphrase now? (recommended)",
+the same for a Boat Chat crew passphrase (hidden, typed twice, up to 3 tries, policy errors shown, Enter skips) and
+"Pair this phone/laptop with Boat Chat now?" (default no; prints `vesselstackctl panel-link --for chat`). Passphrases
+reach `vesselstackctl passphrase set SCOPE --stdin` on standard input only. With `--yes` or `--defaults` nothing is
+asked and the commands for later are printed; the final summary says how to sign in (passphrase if set, else
+`sudo vesselstackctl passphrase set panel` / `panel-link`) and keeps the token commands as a secondary fallback.
+The terminal wizard and browser wizard have optional passphrase fields; they hash with `common/vesselstack_auth.py`
+(scrypt) and write only `CONTROL_PANEL_PASSPHRASE_HASH` / `BOAT_CHAT_PASSPHRASE_HASH`. `install.sh` strictly validates
+the hash format before changing anything (refusing otherwise), imports each into its sign-in store (panel store as
+root; Boat Chat store through the privilege-dropping helper), then deletes the key from the env file; the hashes are
+never kept in `vesselstack.env` and are never printed. `vesselstackctl passphrase set-hash panel|chat` (hash on
+standard input) is the underlying command. Rollback: `sudo vesselstackctl passphrase clear panel|chat`.
+
 **Pairing links and QR codes (unreleased):** `sudo vesselstackctl panel-link [--for panel|chat] [--admin]
 [--label TEXT]` prints a single-use link (`http://HOST:PORT/#pair=CODE`, `$(hostname).local` plus each IPv4
 address; the SSH-tunnel form when the service is loopback-only), the code as `XXXXX-XXXXX`, its expiry and a

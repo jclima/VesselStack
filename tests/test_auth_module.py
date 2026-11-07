@@ -692,3 +692,47 @@ class PairLinkCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallerImportTests(unittest.TestCase):
+    """install.sh imports wizard hashes with `vesselstack_authctl.py passphrase set-hash` and keeps them out of env files."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        (self.root / "config").mkdir()
+        (self.root / "data" / "boat-chat").mkdir(parents=True)
+
+    def run_ctl(self, scope: str, text: str):
+        import subprocess, sys
+        env = {"PATH": os.environ.get("PATH", ""), "VESSELSTACK_ROOT": str(self.root), "VESSELSTACK_DATA": str(self.root / "data")}
+        return subprocess.run([sys.executable, "-I", str(ROOT / "common" / "vesselstack_authctl.py"), "passphrase", "set-hash", scope],
+                              input=text + "\n", capture_output=True, text=True, env=env)
+
+    def test_valid_hash_is_imported_into_each_store(self) -> None:
+        for scope, relative in (("panel", "config/control-panel-auth.json"), ("chat", "data/boat-chat/auth.json")):
+            encoded = auth.hash_passphrase("imported passphrase")
+            done = self.run_ctl(scope, encoded)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue(auth.AuthStore(self.root / relative).check_passphrase("imported passphrase"))
+            self.assertNotIn("imported passphrase", done.stdout + done.stderr)
+
+    def test_malformed_hash_is_refused_and_nothing_is_written(self) -> None:
+        for bad in ("imported passphrase", "scrypt:15:8:1:AAAA:BBBB", "", "scrypt:99:8:1:" + "A" * 22 + "==:" + "A" * 43 + "="):
+            done = self.run_ctl("panel", bad)
+            self.assertNotEqual(done.returncode, 0, bad)
+        self.assertFalse((self.root / "config" / "control-panel-auth.json").exists())
+
+    def test_installer_lists_and_scrubs_the_hash_keys(self) -> None:
+        text = (ROOT / "install.sh").read_text()
+        keys = ("CONTROL_PANEL_PASSPHRASE_HASH", "BOAT_CHAT_PASSPHRASE_HASH")
+        extra = text[text.index("extra_env_keys() {"):text.index("# env_value_problem VALUE")]
+        secret = text[text.index("config_key_is_secret() {"):text.index("# config_env_snapshot")]
+        written = text[text.index("vesselstack_env_keys() {"):text.index("# Keys written to boat-chat.env")]
+        for key in keys:
+            self.assertIn(key, extra)
+            self.assertIn(key, secret)
+            self.assertNotIn(key, written, "never written to vesselstack.env")
+        self.assertIn("scrub_signin_hashes", text)
+        self.assertIn("passphrase set-hash", text)

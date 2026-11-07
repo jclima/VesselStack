@@ -80,6 +80,8 @@ source "$CONFIG_FILE"
 : "${VESSELSTACK_FIREWALL_STRICT:=false}"
 : "${VESSELSTACK_FIREWALL_ALLOW_TCP=22}"
 : "${VESSELSTACK_FIREWALL_ALLOW_UDP=}"
+: "${CONTROL_PANEL_PASSPHRASE_HASH:=}"
+: "${BOAT_CHAT_PASSPHRASE_HASH:=}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
 # Whether the INPUT configuration really sets BOAT_CHAT_HOST: the installed vesselstack.env
@@ -500,7 +502,8 @@ EOF
 # Keys written to boat-chat.env and control-panel.env beyond the list above.
 extra_env_keys() {
     printf '%s\n' BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT \
-        BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN CONTROL_PANEL_TOKEN
+        BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN CONTROL_PANEL_TOKEN \
+        CONTROL_PANEL_PASSPHRASE_HASH BOAT_CHAT_PASSPHRASE_HASH
 }
 # env_value_problem VALUE: prints the reason and returns 0 when VALUE cannot be
 # written. Compose cannot parse the '\'' idiom, so a value with a single quote is
@@ -545,7 +548,8 @@ env_line() {
 config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
-        BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN) return 0 ;;
+        BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN|\
+        CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH) return 0 ;;
     esac
     return 1
 }
@@ -830,6 +834,20 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 # check covers the values that will actually be written; read-only, so it is
 # also safe ahead of the dry run.
 env_values_preflight
+# Sign-in passphrases chosen in the wizard arrive as scrypt hashes (never as text). Anything else is refused
+# before a single change is made; only the key name is reported.
+for hash_key in CONTROL_PANEL_PASSPHRASE_HASH BOAT_CHAT_PASSPHRASE_HASH; do
+    if [ -n "${!hash_key}" ] && ! python3 -I -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("vesselstack_auth", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.exit(0 if module.valid_hash(sys.stdin.readline().rstrip("\n")) else 1)
+' "$SCRIPT_DIR/common/vesselstack_auth.py" <<<"${!hash_key}"; then
+        echo "Refusing to continue: $hash_key is not a valid passphrase hash (it must come from the VesselStack wizard). Nothing was changed." >&2
+        exit 1
+    fi
+done
 vs_prompt_close
 
 PLUGIN_STAGE=
@@ -1378,6 +1396,32 @@ new_env_temp control-panel.env; control_panel_temp=$NEW_ENV_TEMP
     env_line CONTROL_PANEL_TOKEN "$CONTROL_PANEL_TOKEN"
 } >> "$control_panel_temp"
 mv -f -- "$control_panel_temp" "$VESSELSTACK_ROOT/config/control-panel.env"
+
+# Import sign-in passphrase hashes chosen in the wizard, then drop the keys from the env files: they live only
+# in the sign-in stores (the Control Panel one is root-only; Boat Chat's is written by the helper process that
+# runs as the service user, never by root in that directory). A failure only means setting it later by hand.
+import_signin_hash() {
+    local key=$1 scope=$2 label=$3 hash=${!1:-}
+    [ -n "$hash" ] || return 0
+    if env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        python3 -I "$VESSELSTACK_ROOT/common/vesselstack_authctl.py" passphrase set-hash "$scope" <<<"$hash" >/dev/null; then
+        echo "$label passphrase from the wizard stored (hash only)."
+        return 0
+    fi
+    echo "WARNING: could not store the $label passphrase from the wizard. Set it with: sudo vesselstackctl passphrase set $scope" >&2
+    return 1
+}
+scrub_signin_hashes() {
+    local file
+    for file in "$CONFIG_FILE" "$VESSELSTACK_ROOT/config/vesselstack.env"; do
+        if [ -f "$file" ] && [ ! -L "$file" ]; then sed -i -e '/^CONTROL_PANEL_PASSPHRASE_HASH=/d' -e '/^BOAT_CHAT_PASSPHRASE_HASH=/d' "$file"; fi
+    done
+}
+signin_import_failed=0
+import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH panel "Control Panel" || signin_import_failed=1
+import_signin_hash BOAT_CHAT_PASSPHRASE_HASH chat "Boat Chat" || signin_import_failed=1
+if [ "$signin_import_failed" -eq 0 ]; then scrub_signin_hashes; fi
+CONTROL_PANEL_PASSPHRASE_HASH=; BOAT_CHAT_PASSPHRASE_HASH=
 
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)
 # application directory and renamed into place; the service user can only read it.

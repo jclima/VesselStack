@@ -320,6 +320,67 @@ class WizardHttpTests(unittest.TestCase):
         with self.assertRaises(ValueError): wizard.render({"VESSELSTACK_FIREWALL_STRICT": "maybe"})
         with self.assertRaises(ValueError): wizard.render({"VESSELSTACK_FIREWALL_ALLOW_TCP": "22,abc"})
 
+class SignInPassphraseTests(unittest.TestCase):
+    PANEL = "panel passphrase 123"
+    CREW = "crew pass 1"
+
+    def test_web_save_writes_only_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            text = wizard.render(wizard.expand_signin({"BOAT_NAME": "T", "PANEL_PASSPHRASE": self.PANEL, "CHAT_PASSPHRASE": self.CREW}))
+            wizard.save_env(out, text)
+            written = out.read_text()
+        self.assertNotIn(self.PANEL, written)
+        self.assertNotIn(self.CREW, written)
+        self.assertNotIn("PANEL_PASSPHRASE=", written.replace("CONTROL_PANEL_PASSPHRASE_HASH=", ""))
+        auth = wizard.auth_module()
+        hashes = dict(line.split("=", 1) for line in written.splitlines() if "PASSPHRASE_HASH=" in line)
+        self.assertTrue(auth.verify_passphrase(self.PANEL, hashes["CONTROL_PANEL_PASSPHRASE_HASH"].strip("'")))
+        self.assertTrue(auth.verify_passphrase(self.CREW, hashes["BOAT_CHAT_PASSPHRASE_HASH"].strip("'")))
+
+    def test_empty_skips_and_policy_is_enforced(self):
+        result = wizard.render(wizard.expand_signin({"PANEL_PASSPHRASE": "", "CHAT_PASSPHRASE": ""}))
+        self.assertIn("CONTROL_PANEL_PASSPHRASE_HASH=''", result)
+        for values in ({"PANEL_PASSPHRASE": "short"}, {"CHAT_PASSPHRASE": "short"}, {"PANEL_PASSPHRASE": "same long passphrase", "CHAT_PASSPHRASE": "same long passphrase"}):
+            with self.assertRaises(ValueError):
+                wizard.expand_signin(values)
+
+    def test_hash_keys_must_be_real_hashes(self):
+        for bad in ("plain text passphrase", "scrypt:15:8:1:x:y", "a" * 300):
+            with self.assertRaises(ValueError):
+                wizard.validate({"CONTROL_PANEL_PASSPHRASE_HASH": bad})
+        with self.assertRaises(ValueError):
+            wizard.apply_settings(wizard.DEFAULTS.copy(), ["BOAT_CHAT_PASSPHRASE_HASH=my crew passphrase"])
+
+    def test_terminal_wizard_hashes_after_confirmation(self):
+        facts = {"interfaces": [], "timezone": "UTC"}
+        values = wizard.initial_values(facts)
+        script = Scripted([self.PANEL, self.PANEL, self.CREW, "different one"], strict=True)
+        session = wizard.Session(script.console(), values, facts)
+        field_panel, field_chat = wizard.FIELD_INDEX["CONTROL_PANEL_PASSPHRASE_HASH"], wizard.FIELD_INDEX["BOAT_CHAT_PASSPHRASE_HASH"]
+        self.assertIsNone(wizard.ask_field(session, field_panel))
+        auth = wizard.auth_module()
+        self.assertTrue(auth.verify_passphrase(self.PANEL, values["CONTROL_PANEL_PASSPHRASE_HASH"]))
+        script.answers = iter([self.CREW, "different one", self.CREW, self.CREW])
+        self.assertIsNone(wizard.ask_field(session, field_chat))
+        self.assertIn("differ", script.text)
+        self.assertTrue(auth.verify_passphrase(self.CREW, values["BOAT_CHAT_PASSPHRASE_HASH"]))
+        shown = wizard.describe(field_panel, values["CONTROL_PANEL_PASSPHRASE_HASH"])
+        self.assertEqual(shown, "set (hidden)")
+        self.assertNotIn(self.PANEL, script.text)
+        self.assertNotIn(values["CONTROL_PANEL_PASSPHRASE_HASH"], script.text)
+
+    def test_terminal_wizard_refuses_the_panel_passphrase_for_chat(self):
+        facts = {"interfaces": [], "timezone": "UTC"}
+        values = wizard.initial_values(facts)
+        values["CONTROL_PANEL_PASSPHRASE_HASH"] = wizard.auth_module().hash_passphrase(self.PANEL)
+        script = Scripted([self.PANEL, "b"], strict=True)
+        session = wizard.Session(script.console(), values, facts)
+        wizard.ask_field(session, wizard.FIELD_INDEX["BOAT_CHAT_PASSPHRASE_HASH"])
+        self.assertIn("different", script.text)
+        self.assertEqual(values["BOAT_CHAT_PASSPHRASE_HASH"], "")
+
+
 class WizardCommandLineTests(unittest.TestCase):
     def test_output_and_exit_after_save_flags(self):
         import subprocess, urllib.request, re as regex
@@ -429,7 +490,7 @@ class CliWizardTests(unittest.TestCase):
                    "y", "12345", "123456789", "b", "", "ABCD1", "11.5", "3.8",
                    "2", "http://192.0.2.10:3000",
                    "y", "y", "", "",   # CAN on, vcan on (interface becomes vcan0), interface, bitrate
-                   "n", "", "?", "", "1", "y", "y", "", "n", "22,8080", "-", "14d", "", "", "n", "s"]
+                   "n", "", "?", "", "1", "y", "", "", "y", "", "n", "22,8080", "-", "14d", "", "", "n", "s"]
         result, output = drive(answers, strict=True)
         self.assertIsInstance(result, dict, output)
         self.assertEqual(result["BOAT_NAME"], "Sea Wolf")
@@ -484,14 +545,14 @@ class CliWizardTests(unittest.TestCase):
         self.assertNotIn("123456789", output); self.assertNotIn("ABCD1", output)
 
     def test_quit_and_ended_input(self):
-        self.assertIsNone(drive([""] * 17 + ["q"], strict=True)[0])
+        self.assertIsNone(drive([""] * 19 + ["q"], strict=True)[0])
         self.assertEqual(drive([""] * 3, strict=True)[0], "aborted")
-        self.assertEqual(drive([""] * 17, strict=True)[0], "aborted")   # no review answer
+        self.assertEqual(drive([""] * 19, strict=True)[0], "aborted")   # no review answer
 
     def test_edit_a_section_from_the_review(self):
-        result, _ = drive([""] * 17 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
+        result, _ = drive([""] * 19 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
         self.assertEqual(result["BOAT_NAME"], "Edited")
-        result, output = drive([""] * 17 + ["e", "99", "x", "s"], strict=True)
+        result, output = drive([""] * 19 + ["e", "99", "x", "s"], strict=True)
         self.assertIn("Please enter a section number", output)
 
     def test_set_option_uses_the_same_rules(self):
@@ -694,7 +755,7 @@ class CliCommandTests(unittest.TestCase):
     def test_answers_from_a_descriptor_and_early_end(self):
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "vesselstack.env"
-            answers = Path(directory) / "answers"; answers.write_text("Piped Boat\n" + "\n" * 17 + "s\n")
+            answers = Path(directory) / "answers"; answers.write_text("Piped Boat\n" + "\n" * 19 + "s\n")
             with open(answers, "rb") as handle:
                 result = subprocess.run([sys.executable, "-I", str(ROOT / "vesselstack-wizard.py"), "--cli", "--input-fd", str(handle.fileno()), "--output", str(out)],
                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, pass_fds=(handle.fileno(),))
