@@ -1502,6 +1502,8 @@ Run `python3 -m unittest discover -s tests -p 'test_*.py'` and the shell suites 
 (protected temporary roots, CI jobs, and the ESPHome config test) as described in
 [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 
+Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
+
 ## Documentation policy
 
 Every repository change must update this README in the same pull request. CI

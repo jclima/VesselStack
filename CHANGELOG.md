@@ -31,6 +31,7 @@ Planned for 0.6.2 (`VERSION` is not bumped here).
   now writes to `/var/backups/vesselstack` and leaves the unmounted `/media` or `/mnt` folder empty,
   so the drive can still be mounted there later. An older installed controller still writes into that
   folder.
+- Tests: the VesselTwin preload listing assertion no longer depends on filesystem directory order.
 
 ### Upgrade notes
 
