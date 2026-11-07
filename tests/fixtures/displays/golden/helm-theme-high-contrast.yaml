@@ -569,7 +569,7 @@ script:
             id(ins_anchor_drawn_sev) = sev;
             uint32_t bg = 0x37474F, fg = 0xE0E6EB;
             if (sev == 1) { bg = 0x0B6B25; fg = 0xFFFFFF; }
-            if (sev == 2) { bg = 0xFFC107; fg = 0x000000; }
+            if (sev == 2) { bg = 0x8A5A00; fg = 0xFFFFFF; }
             if (sev == 3) { bg = 0xB71C1C; fg = 0xFFFFFF; }
             if (id(night_active)) {
               bg = 0x000000; fg = 0x5A1200;
@@ -589,7 +589,7 @@ script:
             id(ins_fuel_drawn_sev) = sev;
             uint32_t bg = 0x37474F, fg = 0xE0E6EB;
             if (sev == 1) { bg = 0x0B6B25; fg = 0xFFFFFF; }
-            if (sev == 2) { bg = 0xFFC107; fg = 0x000000; }
+            if (sev == 2) { bg = 0x8A5A00; fg = 0xFFFFFF; }
             if (sev == 3) { bg = 0xB71C1C; fg = 0xFFFFFF; }
             if (id(night_active)) {
               bg = 0x000000; fg = 0x5A1200;
@@ -636,7 +636,7 @@ script:
             id(ins_water_drawn_sev) = sev;
             uint32_t bg = 0x37474F, fg = 0xE0E6EB;
             if (sev == 1) { bg = 0x0B6B25; fg = 0xFFFFFF; }
-            if (sev == 2) { bg = 0xFFC107; fg = 0x000000; }
+            if (sev == 2) { bg = 0x8A5A00; fg = 0xFFFFFF; }
             if (sev == 3) { bg = 0xB71C1C; fg = 0xFFFFFF; }
             if (id(night_active)) {
               bg = 0x000000; fg = 0x5A1200;
@@ -771,7 +771,7 @@ script:
             id(ins_shore_drawn_sev) = sev;
             uint32_t bg = 0x37474F, fg = 0xE0E6EB;
             if (sev == 1) { bg = 0x0B6B25; fg = 0xFFFFFF; }
-            if (sev == 2) { bg = 0xFFC107; fg = 0x000000; }
+            if (sev == 2) { bg = 0x8A5A00; fg = 0xFFFFFF; }
             if (sev == 3) { bg = 0xB71C1C; fg = 0xFFFFFF; }
             if (id(night_active)) {
               bg = 0x000000; fg = 0x5A1200;

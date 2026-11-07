@@ -1349,15 +1349,21 @@ missing roles, and enforces: stale/unknown colours are never green (hue 75-165 d
 grey); night colours are red to amber (hue 0-50 degrees, red the strongest channel) or near-black;
 day `ok`, `warn` and `alarm` are green, amber and red; and, for the day palette, value text on the
 tile is at least 4.5:1, label text at least 3:1 and each severity pair at least 4.5:1 (3:1 for the
-muted `unknown` pair; WCAG contrast ratio). The dim night palette is not held to the contrast floors.
+muted `unknown` pair; WCAG contrast ratio). The theme's label colour is also drawn on severity tiles,
+so every theme except `classic` and `ocean` needs the day label to reach 3:1 on each day severity
+tile background (`classic` is 2.13 / 1.25 / 2.25 on ok / warn / alarm and `ocean` 2.18 / 1.22 / 2.29,
+because it reuses the classic tiles; both are exempt and unchanged). The dim night palette is not held to the contrast floors.
 Every built-in theme passes these rules; a custom `themes.json` is not supported (the file is part of
 the installed code and is replaced on update).
 
 **Limits.** Colours were checked by the validator and by generating and validating (`esphome config`)
 firmware for every theme, not by looking at a device; real-panel legibility, in particular of the
 light themes in sunlight and the pastel severity tiles, is not verified. The label colour is not
-changed by severity, so on severity tiles it keeps the theme's label colour (readable on the pastel
-`daylight` tiles, weaker on the saturated tiles of the dark themes, as in `classic`).
+changed by severity, so on severity tiles it keeps the theme's label colour: readable on the
+`daylight` and `high-contrast` tiles, but weak on the saturated green, amber and red tiles of
+`classic` and `ocean` (the amber one is about 1.2:1; the large value text stays black or white and
+readable). The `high-contrast` warn tile was a bright amber that made its label unreadable; it is now
+dark amber `#8A5A00` with white text.
 
 **Upgrade and rollback.** Nothing changes until you run `set-theme` and reflash. To go back, run
 `set-theme ID classic` (it removes the key), then `display build ID` and `display flash ID ...`, or

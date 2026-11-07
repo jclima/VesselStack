@@ -102,7 +102,7 @@
         "day": {
           "unknown": ["#37474F", "#E0E6EB"],
           "ok": ["#0B6B25", "#FFFFFF"],
-          "warn": ["#FFC107", "#000000"],
+          "warn": ["#8A5A00", "#FFFFFF"],
           "alarm": ["#B71C1C", "#FFFFFF"]
         },
         "night": {

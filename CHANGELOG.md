@@ -5,6 +5,7 @@ Semantic Versioning.
 
 ## Unreleased
 
+- The `high-contrast` display theme's warning tile is now dark amber with white text, so its label is readable on it (it was unreadable on the old bright amber). Rebuild and reflash a display that uses `high-contrast` to get it. Theme validation now also requires every theme except `classic` and `ocean` to keep its label legible on severity tiles.
 - Instrument displays can use a colour theme per display: `classic` (the default, unchanged), `high-contrast`, `daylight` and `ocean`. List them with `vesselstackctl display themes [--json]` and choose one with `sudo vesselstackctl display set-theme ID THEME` (`ui.theme` in `displays.json`), then rebuild and reflash that display. Night mode keeps the red palette on every theme and the alarm banner is not themed. A display on `classic` (or without `ui.theme`) generates byte-identical firmware, so nothing needs reflashing. **Before downgrading VesselStack, run `set-theme ID classic` on every themed display:** older versions reject the `theme` key and the displays bridge exits.
 - Display colours and tile shape come from `displays/themes.json`.
 

@@ -892,6 +892,12 @@ CONTRAST_VALUE = 4.5
 CONTRAST_LABEL = 3.0
 CONTRAST_SEV = 4.5
 CONTRAST_SEV_UNKNOWN = 3.0          # the stale/unknown pair is deliberately muted
+CONTRAST_LABEL_ON_SEV = 3.0         # the theme label colour is drawn on the severity tile too
+# `classic` keeps its severity tiles (changing them would change every existing display's firmware) and
+# fails the label-on-severity floor: label/ok 2.13, label/warn 1.25, label/alarm 2.25. `ocean` reuses
+# the classic severity tiles (2.18, 1.22, 2.29; unknown 2.98 with its own label). Both are exempt until
+# their tiles are revisited; every other theme must pass.
+LABEL_ON_SEV_EXEMPT = frozenset({"classic", "ocean"})
 
 
 def theme_rgb(text: str) -> int:
@@ -1036,7 +1042,7 @@ def _validate_theme(name: str, theme, errors: list) -> None:
                 and all(set(sev.get(m, {})) == set(SEV_NAMES) and set(gauge.get(m, {})) == set(GAUGE_NAMES)
                         for m in THEME_MODES))
     if complete:   # the rules need every colour; structural errors were reported above
-        _validate_theme_rules(where, modes, sev, gauge, errors)
+        _validate_theme_rules(where, modes, sev, gauge, errors, name)
 
 
 def _validate_shape(shape, where: str, errors: list) -> None:
@@ -1060,7 +1066,8 @@ def _validate_shape(shape, where: str, errors: list) -> None:
         errors.append(f"{where}.tile_border: a border width above 0 needs a colour")
 
 
-def _validate_theme_rules(where: str, modes: dict, sev: dict, gauge: dict, errors: list) -> None:
+def _validate_theme_rules(where: str, modes: dict, sev: dict, gauge: dict, errors: list,
+                          name: str = "") -> None:
     day, night = modes["day"], modes["night"]
     # Stale/unknown colours are never green.
     unknown = {"day.dot_unknown": day["dot_unknown"], "night.dot_unknown": night["dot_unknown"]}
@@ -1099,6 +1106,10 @@ def _validate_theme_rules(where: str, modes: dict, sev: dict, gauge: dict, error
         floor = CONTRAST_SEV_UNKNOWN if key == "unknown" else CONTRAST_SEV
         if contrast_ratio(bg, fg) < floor:
             errors.append(f"{where}.sev.day.{key}: text/background contrast must be at least {floor}:1")
+        # The label is not recoloured by severity, so it must also be legible on the severity tile.
+        if name not in LABEL_ON_SEV_EXEMPT and contrast_ratio(day["label"], bg) < CONTRAST_LABEL_ON_SEV:
+            errors.append(f"{where}.sev.day.{key}: day.label on the tile background must be at least "
+                          f"{CONTRAST_LABEL_ON_SEV}:1")
 
 
 def validate_themes(data) -> list[str]:

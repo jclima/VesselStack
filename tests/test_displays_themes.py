@@ -163,5 +163,36 @@ class ValidatorRuleTests(unittest.TestCase):
         self.assertTrue(any("classic" in e for e in schema.validate_themes(data)))
 
 
+class LabelOnSeverityTests(unittest.TestCase):
+    def themed(self, name, mutate):
+        data = copy.deepcopy(THEMES)
+        mutate(data["themes"][name])
+        return schema.validate_themes(data)
+
+    def test_high_contrast_warn_tile_is_legible(self):
+        warn = THEMES["themes"]["high-contrast"]["sev"]["day"]["warn"]
+        self.assertEqual(warn, ["#8A5A00", "#FFFFFF"])
+        label = schema.theme_rgb(THEMES["themes"]["high-contrast"]["day"]["label"])
+        self.assertGreaterEqual(schema.contrast_ratio(label, schema.theme_rgb(warn[0])), 3.0)
+        self.assertGreaterEqual(schema.contrast_ratio(schema.theme_rgb(warn[1]), schema.theme_rgb(warn[0])), 4.5)
+
+    def test_old_bright_warn_tile_is_rejected_for_high_contrast(self):
+        errors = self.themed("high-contrast", lambda t: t["sev"]["day"].update(warn=["#FFC107", "#000000"]))
+        self.assertTrue(any("sev.day.warn" in e and "day.label" in e for e in errors), errors)
+
+    def test_every_non_exempt_theme_passes_the_rule(self):
+        for name, theme in THEMES["themes"].items():
+            if name in schema.LABEL_ON_SEV_EXEMPT:
+                continue
+            label = schema.theme_rgb(theme["day"]["label"])
+            for key, (bg, _fg) in theme["sev"]["day"].items():
+                with self.subTest(theme=name, sev=key):
+                    self.assertGreaterEqual(schema.contrast_ratio(label, schema.theme_rgb(bg)), 3.0)
+
+    def test_classic_is_exempt_and_stays_unchanged(self):
+        self.assertIn("classic", schema.LABEL_ON_SEV_EXEMPT)
+        self.assertEqual(THEMES["themes"]["classic"]["sev"]["day"]["warn"], ["#F2A900", "#000000"])
+
+
 if __name__ == "__main__":
     unittest.main()
