@@ -148,6 +148,8 @@ sudo vesselstackctl display status
 Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash`.
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
 
+Display colours come from `displays/themes.json` (the built-in `classic` theme, output unchanged, nothing to do on an existing install; selectable themes are planned, see [Themes](docs/DISPLAYS.md#themes)).
+
 ## Quick start: one command on the Raspberry Pi
 
 **Headless is the normal case: the Pi needs no screen, keyboard or browser.** On a

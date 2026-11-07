@@ -3,6 +3,10 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+- Instrument display colours and tile shape now come from `displays/themes.json` (one built-in theme, `classic`). Generated firmware is byte-identical to before, so there is nothing to change or reflash; selectable themes are planned.
+
 ## 0.6.1 - 2026-11-02
 
 ### Highlights

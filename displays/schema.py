@@ -11,6 +11,7 @@ import conversions
 
 MODULE_DIR = Path(__file__).resolve().parent
 DEFAULT_REGISTRY = MODULE_DIR / "boards" / "registry.json"
+DEFAULT_THEMES = MODULE_DIR / "themes.json"
 ICONS_FILE = MODULE_DIR / "esphome" / "fonts" / "icons.json"   # bundled icon font: name -> hex codepoint
 
 INSTRUMENT_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -853,3 +854,264 @@ def load_json(path):
 
 def load_registry(path=DEFAULT_REGISTRY):
     return load_json(path)
+
+
+# --- display themes (displays/themes.json) ---------------------------------------------
+
+HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
+THEME_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+THEME_TOP_KEYS = {"schema", "themes"}
+THEME_KEYS = {"day", "night", "sev", "gauge", "shape"}
+THEME_ROLES = ("page_bg", "tile", "label", "value", "clock", "title", "dot_ok", "dot_bad",
+               "dot_unknown", "page_hi", "page_lo", "track")
+SEV_NAMES = ("unknown", "ok", "warn", "alarm")
+GAUGE_NAMES = SEV_NAMES + ("neutral",)
+SHAPE_KEYS = {"tile_radius", "tile_pad", "tile_border_width", "tile_border"}
+THEME_MODES = ("day", "night")
+
+# Validator thresholds. Hue is in degrees; 0xRRGGBB values are compared after parsing.
+NOT_GREEN_SATURATION = 0.15         # a colour this grey may sit in the green band
+GREEN_HUES = (75.0, 165.0)
+AMBER_HUES = (25.0, 65.0)
+RED_HUE_MAX = 15.0                  # red is [345, 360) or [0, 15]
+NIGHT_HUE_MAX = 50.0                # night colours: red to amber, red the strongest channel
+NIGHT_NEAR_BLACK = 0x30             # every channel at or below this counts as near-black
+CONTRAST_VALUE = 4.5
+CONTRAST_LABEL = 3.0
+CONTRAST_SEV = 4.5
+CONTRAST_SEV_UNKNOWN = 3.0          # the stale/unknown pair is deliberately muted
+
+
+def theme_rgb(text: str) -> int:
+    return int(text[1:], 16)
+
+
+def _hsv(rgb: int) -> tuple:
+    r, g, b = ((rgb >> 16) & 255) / 255, ((rgb >> 8) & 255) / 255, (rgb & 255) / 255
+    high, low = max(r, g, b), min(r, g, b)
+    span = high - low
+    if span == 0:
+        hue = 0.0
+    elif high == r:
+        hue = (60 * ((g - b) / span)) % 360
+    elif high == g:
+        hue = 60 * ((b - r) / span) + 120
+    else:
+        hue = 60 * ((r - g) / span) + 240
+    return hue, (0.0 if high == 0 else span / high), high
+
+
+def relative_luminance(rgb: int) -> float:
+    def lin(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lin((rgb >> 16) & 255) + 0.7152 * lin((rgb >> 8) & 255) + 0.0722 * lin(rgb & 255)
+
+
+def contrast_ratio(a: int, b: int) -> float:
+    hi, lo = sorted((relative_luminance(a), relative_luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _in_green(rgb: int) -> bool:
+    hue, sat, _ = _hsv(rgb)
+    return sat >= NOT_GREEN_SATURATION and GREEN_HUES[0] <= hue <= GREEN_HUES[1]
+
+
+def _is_red(rgb: int) -> bool:
+    hue, sat, _ = _hsv(rgb)
+    return sat >= NOT_GREEN_SATURATION and (hue <= RED_HUE_MAX or hue >= 360 - RED_HUE_MAX)
+
+
+def _is_amber(rgb: int) -> bool:
+    hue, sat, _ = _hsv(rgb)
+    return sat >= NOT_GREEN_SATURATION and AMBER_HUES[0] <= hue <= AMBER_HUES[1]
+
+
+def _night_ok(rgb: int) -> bool:
+    channels = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255)
+    if max(channels) <= NIGHT_NEAR_BLACK:
+        return True
+    hue, _, _ = _hsv(rgb)
+    return channels[0] == max(channels) and 0 <= hue <= NIGHT_HUE_MAX
+
+
+def _theme_colour(value, where: str, errors: list) -> int | None:
+    if not isinstance(value, str) or not HEX_COLOR.match(value):
+        errors.append(f"{where}: must be a colour string like \"#RRGGBB\"")
+        return None
+    return theme_rgb(value)
+
+
+def _theme_block(block, where: str, keys, errors: list) -> dict:
+    """Validate an object whose values are all colours and whose keys are exactly ``keys``."""
+    if not isinstance(block, dict):
+        errors.append(f"{where}: must be an object")
+        return {}
+    for key in block:
+        if key not in keys:
+            errors.append(f"{where}.{key}: unknown key")
+    out = {}
+    for key in keys:
+        if key not in block:
+            errors.append(f"{where}.{key}: required")
+        else:
+            colour = _theme_colour(block[key], f"{where}.{key}", errors)
+            if colour is not None:
+                out[key] = colour
+    return out
+
+
+def _theme_pair_block(block, where: str, errors: list) -> dict:
+    if not isinstance(block, dict):
+        errors.append(f"{where}: must be an object")
+        return {}
+    for key in block:
+        if key not in SEV_NAMES:
+            errors.append(f"{where}.{key}: unknown key")
+    out = {}
+    for key in SEV_NAMES:
+        pair = block.get(key)
+        if key not in block:
+            errors.append(f"{where}.{key}: required")
+        elif not isinstance(pair, list) or len(pair) != 2:
+            errors.append(f"{where}.{key}: must be a [background, text] pair of colours")
+        else:
+            bg = _theme_colour(pair[0], f"{where}.{key}[0]", errors)
+            fg = _theme_colour(pair[1], f"{where}.{key}[1]", errors)
+            if bg is not None and fg is not None:
+                out[key] = (bg, fg)
+    return out
+
+
+def _validate_theme(name: str, theme, errors: list) -> None:
+    where = f"$.themes.{name}"
+    if not isinstance(theme, dict):
+        errors.append(f"{where}: must be an object")
+        return
+    for key in theme:
+        if key not in THEME_KEYS:
+            errors.append(f"{where}.{key}: unknown key")
+    for key in sorted(THEME_KEYS - set(theme)):
+        errors.append(f"{where}.{key}: required")
+    modes = {m: _theme_block(theme[m], f"{where}.{m}", THEME_ROLES, errors) for m in THEME_MODES if m in theme}
+    sev, gauge = {}, {}
+    for kind, store in (("sev", sev), ("gauge", gauge)):
+        section = theme.get(kind)
+        if kind in theme and not isinstance(section, dict):
+            errors.append(f"{where}.{kind}: must be an object")
+            continue
+        for extra in (section or {}):
+            if extra not in THEME_MODES:
+                errors.append(f"{where}.{kind}.{extra}: unknown key")
+        for mode in THEME_MODES:
+            if section is None:
+                break
+            if mode not in section:
+                errors.append(f"{where}.{kind}.{mode}: required")
+            elif kind == "sev":
+                store[mode] = _theme_pair_block(section[mode], f"{where}.sev.{mode}", errors)
+            else:
+                store[mode] = _theme_block(section[mode], f"{where}.gauge.{mode}", GAUGE_NAMES, errors)
+    shape = theme.get("shape")
+    if "shape" in theme:
+        _validate_shape(shape, f"{where}.shape", errors)
+    complete = (len(modes) == 2 and all(len(m) == len(THEME_ROLES) for m in modes.values())
+                and all(set(sev.get(m, {})) == set(SEV_NAMES) and set(gauge.get(m, {})) == set(GAUGE_NAMES)
+                        for m in THEME_MODES))
+    if complete:   # the rules need every colour; structural errors were reported above
+        _validate_theme_rules(where, modes, sev, gauge, errors)
+
+
+def _validate_shape(shape, where: str, errors: list) -> None:
+    if not isinstance(shape, dict):
+        errors.append(f"{where}: must be an object")
+        return
+    for key in shape:
+        if key not in SHAPE_KEYS:
+            errors.append(f"{where}.{key}: unknown key")
+    for key in ("tile_radius", "tile_pad", "tile_border_width"):
+        value = shape.get(key)
+        if key not in shape:
+            errors.append(f"{where}.{key}: required")
+        elif isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 64:
+            errors.append(f"{where}.{key}: must be an integer from 0 to 64")
+    if "tile_border" not in shape:
+        errors.append(f"{where}.tile_border: required (a colour, or null for no border colour)")
+    elif shape["tile_border"] is not None:
+        _theme_colour(shape["tile_border"], f"{where}.tile_border", errors)
+    elif shape.get("tile_border_width") not in (0, None):
+        errors.append(f"{where}.tile_border: a border width above 0 needs a colour")
+
+
+def _validate_theme_rules(where: str, modes: dict, sev: dict, gauge: dict, errors: list) -> None:
+    day, night = modes["day"], modes["night"]
+    # Stale/unknown colours are never green.
+    unknown = {"day.dot_unknown": day["dot_unknown"], "night.dot_unknown": night["dot_unknown"]}
+    for mode in THEME_MODES:
+        unknown[f"sev.{mode}.unknown[0]"], unknown[f"sev.{mode}.unknown[1]"] = sev[mode]["unknown"]
+        unknown[f"gauge.{mode}.unknown"] = gauge[mode]["unknown"]
+    for label, rgb in unknown.items():
+        if _in_green(rgb):
+            errors.append(f"{where}.{label}: a stale/unknown colour must not be green "
+                          f"(hue {GREEN_HUES[0]:.0f}-{GREEN_HUES[1]:.0f} degrees)")
+    # Night keeps to red/amber (or near-black) so night vision survives.
+    night_colours = {f"night.{k}": v for k, v in night.items()}
+    for kind, section in (("sev", sev["night"]), ("gauge", gauge["night"])):
+        for key, value in section.items():
+            for i, rgb in enumerate(value if isinstance(value, tuple) else (value,)):
+                night_colours[f"{kind}.night.{key}" + (f"[{i}]" if isinstance(value, tuple) else "")] = rgb
+    for label, rgb in night_colours.items():
+        if not _night_ok(rgb):
+            errors.append(f"{where}.{label}: a night colour must be red to amber (hue 0-{NIGHT_HUE_MAX:.0f} "
+                          "degrees, red the strongest channel) or near-black")
+    # Day severity colours sit in their hue bands.
+    bands = (("ok", _in_green, "green"), ("warn", _is_amber, "amber"), ("alarm", _is_red, "red"))
+    for key, check, band in bands:
+        if not check(sev["day"][key][0]):
+            errors.append(f"{where}.sev.day.{key}[0]: must be {band}")
+        if not check(gauge["day"][key]):
+            errors.append(f"{where}.gauge.day.{key}: must be {band}")
+    # Contrast (WCAG). Day only: the night palette is deliberately dim, so its contrast is not
+    # held to these floors (classic night value/tile is about 3.1:1 and label/tile about 1.7:1).
+    if contrast_ratio(day["value"], day["tile"]) < CONTRAST_VALUE:
+        errors.append(f"{where}.day.value: contrast against day.tile must be at least {CONTRAST_VALUE}:1")
+    if contrast_ratio(day["label"], day["tile"]) < CONTRAST_LABEL:
+        errors.append(f"{where}.day.label: contrast against day.tile must be at least {CONTRAST_LABEL}:1")
+    # Severity pairs, day. The unknown pair is deliberately muted (classic is about 3.85:1).
+    for key, (bg, fg) in sev["day"].items():
+        floor = CONTRAST_SEV_UNKNOWN if key == "unknown" else CONTRAST_SEV
+        if contrast_ratio(bg, fg) < floor:
+            errors.append(f"{where}.sev.day.{key}: text/background contrast must be at least {floor}:1")
+
+
+def validate_themes(data) -> list[str]:
+    """Validate a parsed themes.json; return the list of problems (empty when valid)."""
+    if not isinstance(data, dict):
+        return ["$: themes file must be an object"]
+    errors: list = []
+    for key in data:
+        if key not in THEME_TOP_KEYS:
+            errors.append(f"$.{key}: unknown key")
+    if data.get("schema") != 1:
+        errors.append("$.schema: must be 1")
+    themes = data.get("themes")
+    if not isinstance(themes, dict) or not themes:
+        errors.append("$.themes: must be a non-empty object")
+        return errors
+    if "classic" not in themes:
+        errors.append("$.themes.classic: required (the built-in theme)")
+    for name, theme in themes.items():
+        if not THEME_ID.match(name):
+            errors.append(f"$.themes.{name}: theme id must be lowercase letters, digits and hyphens")
+        _validate_theme(name, theme, errors)
+    return errors
+
+
+def load_themes(path=None):
+    """Load and validate themes.json; raise ValueError listing every problem."""
+    data = load_json(path or DEFAULT_THEMES)
+    problems = validate_themes(data)
+    if problems:
+        raise ValueError("invalid themes file:\n  " + "\n  ".join(problems))
+    return data

@@ -1299,6 +1299,29 @@ point):
   rebuilt and reflashed to show icons. Rollback: remove the `icon` keys, rebuild
   and reflash, or flash the previous firmware.
 
+### Themes
+
+Display colours and tile shape come from `displays/themes.json`, which is installed with the rest
+of `displays/`. It holds one theme, `classic`, and generating firmware from it is byte-identical to
+before: there is no new setting and no change to a display you have already flashed. Selectable
+themes are planned; nothing in `displays.json` chooses a theme yet.
+
+A theme has `day` and `night` blocks of roles (`page_bg`, `tile`, `label`, `value`, `clock`,
+`title`, `dot_ok`, `dot_bad`, `dot_unknown`, `page_hi`, `page_lo`, `track`), `sev` and `gauge`
+palettes for each of day and night (`unknown`, `ok`, `warn`, `alarm`, plus `neutral` for gauges;
+`sev` entries are `[tile background, text]` pairs), and a `shape` block (`tile_radius`, `tile_pad`,
+`tile_border_width`, `tile_border`; no border colour is written while the width is 0). Colours are
+`"#RRGGBB"`. The alarm banner and its white text are deliberately not themed, and fonts are not part
+of a theme. `night.page_bg` is required but not used yet.
+
+`displays/schema.py` (`load_themes`, `validate_themes`) rejects unknown keys, bad colour strings and
+missing roles, and enforces: stale/unknown colours are never green (hue 75-165 degrees unless nearly
+grey); night colours are red to amber (hue 0-50 degrees, red the strongest channel) or near-black;
+day `ok`, `warn` and `alarm` are green, amber and red; and, for the day palette, value text on the
+tile is at least 4.5:1, label text at least 3:1 and each severity pair at least 4.5:1 (3:1 for the
+muted `unknown` pair; WCAG contrast ratio). The dim night palette is not held to the contrast floors.
+Rollback: restore the previous `displays/themes.json` and `displays/render.py`.
+
 ### Board registry schema 2
 
 `displays/boards/registry.json` uses `schema` 2, where each layout is an

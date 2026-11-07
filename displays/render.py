@@ -81,23 +81,69 @@ HEADER_TITLE_WIDTH = 200
 PAGE_DOT_SIZE = 8
 PAGE_DOT_GAP = 8
 CLOCK_GLYPHS = "0123456789:-"
-# Day and night palettes (RGB). Night keeps to the red/amber end of the spectrum so night vision
+# Palettes come from displays/themes.json (schema.load_themes); render_device_yaml uses "classic"
+# until themes become selectable. Night keeps to the red/amber end of the spectrum so night vision
 # survives; only an alarm tile's text is deliberately bright. The alarm banner is never themed.
-DAY = {"tile": 0x101820, "name": 0x9AA5B1, "value": 0xFFFFFF, "clock": 0xFFFFFF, "title": 0x9AA5B1,
-       "dot_ok": 0x1E7B34, "dot_bad": 0xC62828, "dot_unknown": 0x37474F, "page_hi": 0xFFFFFF,
-       "page_lo": 0x37474F}
-NIGHT = {"tile": 0x000000, "name": 0x6A1600, "value": 0xB02400, "clock": 0xA02000, "title": 0x6A1600,
-         "dot_ok": 0x6B3000, "dot_bad": 0xB00000, "dot_unknown": 0x2A0A00, "page_hi": 0xA02000,
-         "page_lo": 0x2A0A00}
-NIGHT_SEV_COLORS = {0: (0x000000, 0x5A1200), 1: (0x2A0800, 0xC02800), 2: (0x7A3E00, 0xF0B060),
-                    3: (0xB00000, 0xFFB090)}
+THEMES_FILE = MODULE_DIR / "themes.json"
+SEV_NUMBERS = {0: "unknown", 1: "ok", 2: "warn", 3: "alarm"}          # severity number -> theme key
+GAUGE_NUMBERS = {**SEV_NUMBERS, 4: "neutral"}                         # gauge state -> theme key
+
+
+@dataclass(frozen=True)
+class Palette:
+    """One theme resolved to the integer colours the generator prints (themes.json "#RRGGBB" -> int).
+
+    ``day`` / ``night`` are keyed by role, with the theme's ``label`` role under ``"name"`` (the
+    historical key); ``sev`` / ``sev_night`` map severity number -> (background, text); ``gauge_day`` /
+    ``gauge_night`` map gauge state -> colour; ``track`` is keyed "day" / "night".
+    """
+    name: str
+    day: dict
+    night: dict
+    sev: dict
+    sev_night: dict
+    gauge_day: dict
+    gauge_night: dict
+    track: dict
+    tile_radius: int
+    tile_pad: int
+    tile_border_width: int
+    tile_border: int | None
+
+
+def _rgb(text: str) -> int:
+    return int(text[1:], 16)
+
+
+def load_palette(name: str = "classic", path=None) -> Palette:
+    """Resolve one theme of themes.json (validated by schema.load_themes) to a Palette."""
+    theme = schema.load_themes(path or THEMES_FILE)["themes"][name]
+
+    def roles(mode: str) -> dict:   # the page background is kept; the track has its own mapping
+        return {("name" if k == "label" else k): _rgb(v) for k, v in theme[mode].items() if k != "track"}
+
+    shape = theme["shape"]
+    return Palette(
+        name=name, day=roles("day"), night=roles("night"),
+        sev={n: tuple(_rgb(c) for c in theme["sev"]["day"][k]) for n, k in SEV_NUMBERS.items()},
+        sev_night={n: tuple(_rgb(c) for c in theme["sev"]["night"][k]) for n, k in SEV_NUMBERS.items()},
+        gauge_day={n: _rgb(theme["gauge"]["day"][k]) for n, k in GAUGE_NUMBERS.items()},
+        gauge_night={n: _rgb(theme["gauge"]["night"][k]) for n, k in GAUGE_NUMBERS.items()},
+        track={"day": _rgb(theme["day"]["track"]), "night": _rgb(theme["night"]["track"])},
+        tile_radius=shape["tile_radius"], tile_pad=shape["tile_pad"],
+        tile_border_width=shape["tile_border_width"],
+        tile_border=None if shape["tile_border"] is None else _rgb(shape["tile_border"]))
+
+
+CLASSIC = load_palette("classic")
+# Module-level views onto the classic palette (kept for existing imports and tests).
+DAY, NIGHT = CLASSIC.day, CLASSIC.night
+SEV_COLORS, NIGHT_SEV_COLORS = CLASSIC.sev, CLASSIC.sev_night
+GAUGE_DAY, GAUGE_NIGHT, TRACK_COLOR = CLASSIC.gauge_day, CLASSIC.gauge_night, CLASSIC.track
 # Bars and arcs (display dashboard slice S6). Indicator colours per state: 0 unknown/stale, 1 ok,
 # 2 warn, 3 alarm, 4 fresh but the instrument has no thresholds (neither green nor a warning).
 GAUGE_LAYOUTS = ("tank-bars", "gauge-arc")
-GAUGE_DAY = {0: 0x37474F, 1: 0x1E7B34, 2: 0xF2A900, 3: 0xC62828, 4: 0x2E86C1}
-GAUGE_NIGHT = {0: 0x2A0A00, 1: 0x6B3000, 2: 0xB06A00, 3: 0xC00000, 4: 0x8A4A00}
 GAUGE_NEUTRAL = 4
-TRACK_COLOR = {"day": 0x263238, "night": 0x1A0800}
 BAR_WIDTH = 60            # at most 60 px, whatever the number of bars
 BAR_HEIGHT = 210
 BAR_RANGE = 100
@@ -458,9 +504,10 @@ def display_has_icons(config: dict, display: dict) -> bool:
     return bool(icon_glyphs(config, display))
 
 
-def _icon_label(ind: str, pi: int, iid: str, config: dict, key: str, themed: bool, extra: str = "") -> str:
+def _icon_label(ind: str, pi: int, iid: str, config: dict, key: str, themed: bool, extra: str = "",
+                pal: Palette = CLASSIC) -> str:
     return (f"{ind}- label: {{{_label_id(pi, iid, 'icon', themed)}text: {lit(icon_char(item_icon(config, iid)))}, "
-            f"text_font: {ICON_FONTS[key]}, text_color: 0x{DAY['name']:06X}{extra}}}")
+            f"text_font: {ICON_FONTS[key]}, text_color: 0x{pal.day['name']:06X}{extra}}}")
 
 
 def _icon_row(ind: str, width: str = "SIZE_CONTENT") -> list:
@@ -472,9 +519,9 @@ def _icon_row(ind: str, width: str = "SIZE_CONTENT") -> list:
     return lines
 
 
-def _icon_night(config: dict, pi: int, iid: str) -> list:
+def _icon_night(config: dict, pi: int, iid: str, pal: Palette = CLASSIC) -> list:
     """The icon follows the colour of its label (nothing for an item without an icon)."""
-    return [_text_night(pi, iid, "icon", "name")] if item_icon(config, iid) else []
+    return [_text_night(pi, iid, "icon", "name", pal=pal)] if item_icon(config, iid) else []
 
 
 def _small_glyphs(config: dict, display: dict) -> str:
@@ -506,24 +553,19 @@ def _label_id(pi: int, iid: str, part: str, themed: bool) -> str:
 
 
 def _tile_widgets(ind: str, pi: int, iid: str, inst: dict, value_font: str, themed: bool = False,
-                  config: dict | None = None) -> list:
+                  config: dict | None = None, pal: Palette = CLASSIC) -> list:
     name = [f"{ind}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
-            "text_font: font_small, text_color: 0x9AA5B1}"]
+            f"text_font: font_small, text_color: 0x{pal.day['name']:06X}}}"]
     if config is not None and item_icon(config, iid):   # icon and label side by side
         inner = ind + "      "
-        name = [*_icon_row(ind), _icon_label(inner, pi, iid, config, "md", themed), f"{inner}{name[0][len(ind):]}"]
+        name = [*_icon_row(ind), _icon_label(inner, pi, iid, config, "md", themed, pal=pal), f"{inner}{name[0][len(ind):]}"]
     return [
         *name,
         f"{ind}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {value_font}, "
-        "text_color: 0xFFFFFF}",
+        f"text_color: 0x{pal.day['value']:06X}}}",
         f"{ind}- label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
-        "text_font: font_small, text_color: 0x9AA5B1}",
+        f"text_font: font_small, text_color: 0x{pal.day['name']:06X}}}",
     ]
-
-
-# Severity palette: sev number -> (tile background, value text colour). 0 is unknown/stale.
-SEV_COLORS = {0: (0x37474F, 0x9AA5B1), 1: (0x1E7B34, 0xFFFFFF), 2: (0xF2A900, 0x000000),
-              3: (0xC62828, 0xFFFFFF)}
 
 
 def has_thresholds(inst: dict) -> bool:
@@ -573,7 +615,7 @@ def _status_glyphs(config: dict, display: dict) -> dict:
 
 
 def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: int, cols: int,
-                 themed: bool = False, icon_key: str = "lg", name_width: int | None = None) -> list:
+                 themed: bool = False, icon_key: str = "lg", name_width: int | None = None, pal: Palette = CLASSIC) -> list:
     """One status-grid cell: static label, then the state word (notification) or value + unit."""
     notification = is_word(config, iid)
     lines = [f"{ind}- obj:"]
@@ -594,22 +636,22 @@ def _status_cell(config: dict, ind: str, pi: int, iid: str, font: str, index: in
     label = _item_label(config, iid)
     icon = item_icon(config, iid)
     name = (f"- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, "
-            f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
+            f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, {fit}, long_mode: DOT}}")
     if icon and name_width is not None:      # 3-row grid: icon left of the label
         name = name.replace(fit, f"width: {name_width}, text_align: LEFT")
         lines += _icon_row(inner, "100%")
-        lines.append(_icon_label(inner + "      ", pi, iid, config, icon_key, themed))
+        lines.append(_icon_label(inner + "      ", pi, iid, config, icon_key, themed, pal=pal))
         lines.append(f"{inner}      {name}")
     else:
         if icon:                             # icon above the label
-            lines.append(_icon_label(inner, pi, iid, config, icon_key, themed, f", {fit}"))
+            lines.append(_icon_label(inner, pi, iid, config, icon_key, themed, f", {fit}", pal=pal))
         lines.append(f"{inner}{name}")
     lines.append(f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: {font}, "
-                 f"text_color: 0xFFFFFF, {fit}, long_mode: CLIP}}")
+                 f"text_color: 0x{pal.day['value']:06X}, {fit}, long_mode: CLIP}}")
     if not notification:
         lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'unit', themed)}"
                      f"text: {lit(config['instruments'][iid]['unit'])}, "
-                     f"text_font: font_small, text_color: 0x9AA5B1, {fit}, long_mode: DOT}}")
+                     f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, {fit}, long_mode: DOT}}")
     return lines
 
 
@@ -753,22 +795,22 @@ BOX_RESET = ["bg_opa: TRANSP", "border_width: 0", "pad_all: 0", "scrollable: fal
 
 
 def _bar_column(ind: str, pi: int, iid: str, inst: dict, width: int, themed: bool,
-                config: dict | None = None) -> list:
+                config: dict | None = None, pal: Palette = CLASSIC) -> list:
     fit = "width: 100%, text_align: CENTER"
     inner = ind + "      "
     lines = [f"{ind}- obj:", f"{ind}    width: {width}", f"{ind}    height: 100%"]
     lines += [f"{ind}    {line}" for line in BOX_RESET]
     lines += [f"{ind}    {BAR_COLUMN}", f"{ind}    widgets:"]
     if config is not None and item_icon(config, iid):   # icon above the label
-        lines.append(_icon_label(inner, pi, iid, config, "md", themed, f", {fit}"))
+        lines.append(_icon_label(inner, pi, iid, config, "md", themed, f", {fit}", pal=pal))
     lines.append(f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
-                 f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
+                 f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, {fit}, long_mode: DOT}}")
     lines += [
         f"{inner}- bar:", f"{inner}    id: p{pi}_{iid}_bar", f"{inner}    width: {BAR_WIDTH}",
         f"{inner}    height: {BAR_HEIGHT}", f"{inner}    min_value: 0", f"{inner}    max_value: {BAR_RANGE}",
-        f"{inner}    value: 0", f"{inner}    mode: NORMAL", f"{inner}    bg_color: 0x{TRACK_COLOR['day']:06X}",
+        f"{inner}    value: 0", f"{inner}    mode: NORMAL", f"{inner}    bg_color: 0x{pal.track['day']:06X}",
         f"{inner}    bg_opa: COVER", f"{inner}    border_width: 0", f"{inner}    radius: 8",
-        f"{inner}    indicator:", f"{inner}      bg_color: 0x{GAUGE_DAY[0]:06X}", f"{inner}      bg_opa: COVER",
+        f"{inner}    indicator:", f"{inner}      bg_color: 0x{pal.gauge_day[0]:06X}", f"{inner}      bg_opa: COVER",
         f"{inner}      radius: 8",
         f"{inner}- obj:", f"{inner}    width: 100%", f"{inner}    height: SIZE_CONTENT",
     ]
@@ -778,14 +820,14 @@ def _bar_column(ind: str, pi: int, iid: str, inst: dict, width: int, themed: boo
         "flex_align_cross: END, pad_column: 2}",
         f"{inner}    widgets:",
         f"{inner}      - label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_value_bar, "
-        f"text_color: 0x{DAY['value']:06X}, long_mode: CLIP}}",
+        f"text_color: 0x{pal.day['value']:06X}, long_mode: CLIP}}",
         f"{inner}      - label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
-        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
+        f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, long_mode: CLIP}}",
     ]
     return lines
 
 
-def _tank_bars_page(config: dict, board: dict, pi: int, page: dict, themed: bool) -> list:
+def _tank_bars_page(config: dict, board: dict, pi: int, page: dict, themed: bool, pal: Palette = CLASSIC) -> list:
     cw, ch = board["content_width"], board["content_height"]
     width = bar_column_width(cw, len(page["items"]))
     lines = [
@@ -797,7 +839,7 @@ def _tank_bars_page(config: dict, board: dict, pi: int, page: dict, themed: bool
         "            widgets:",
     ]
     for iid in page["items"]:
-        lines += _bar_column("              ", pi, iid, config["instruments"][iid], width, themed, config)
+        lines += _bar_column("              ", pi, iid, config["instruments"][iid], width, themed, config, pal=pal)
     return lines
 
 
@@ -805,11 +847,11 @@ def _arc_style(width: int, color: int) -> list:
     return [f"arc_width: {width}", f"arc_color: 0x{color:06X}", "arc_rounded: false"]
 
 
-def _arc_widgets(board: dict, display: dict, pi: int, inst: dict) -> list:
+def _arc_widgets(board: dict, display: dict, pi: int, inst: dict, pal: Palette = CLASSIC) -> list:
     """The track arc and the static warn and alarm zone arcs of a page (gauge-arc and electrical)."""
     diameter = gauge_diameter(board)
     start = arc_start_angle(display)
-    track = f"0x{TRACK_COLOR['day']:06X}"
+    track = f"0x{pal.track['day']:06X}"
     common = ["align: CENTER", "clickable: false", "scrollable: false", "min_value: 0",
               f"max_value: {ARC_RANGE}", "value: 0", f"start_angle: {start}", f"end_angle: {arc_end_angle(start)}",
               "rotation: 0", "adjustable: false", "mode: NORMAL", "bg_opa: TRANSP", "border_width: 0",
@@ -819,7 +861,7 @@ def _arc_widgets(board: dict, display: dict, pi: int, inst: dict) -> list:
     lines += [f"            {line}" for line in common]
     lines += [f"            arc_width: {ARC_WIDTH}", f"            arc_color: {track}", "            arc_rounded: false",
               "            indicator:"]
-    lines += [f"              {line}" for line in _arc_style(ARC_WIDTH, GAUGE_DAY[0])]
+    lines += [f"              {line}" for line in _arc_style(ARC_WIDTH, pal.gauge_day[0])]
     lines += ["            knob:", "              bg_opa: TRANSP", "              pad_all: 0"]
     zone_d = arc_zone_diameter(diameter)
     for k, (severity, first, last) in enumerate(zone_arcs(inst, start)):
@@ -827,16 +869,16 @@ def _arc_widgets(board: dict, display: dict, pi: int, inst: dict) -> list:
                   f"            height: {zone_d}"]
         lines += [f"            {line}" for line in common if not line.startswith(("start_angle", "end_angle"))]
         lines += [f"            start_angle: {first}", f"            end_angle: {last}",
-                  *[f"            {line}" for line in _arc_style(ZONE_WIDTH, GAUGE_DAY[severity])],
+                  *[f"            {line}" for line in _arc_style(ZONE_WIDTH, pal.gauge_day[severity])],
                   "            indicator:", "              arc_opa: TRANSP", "            knob:",
                   "              bg_opa: TRANSP", "              pad_all: 0"]
     return lines
 
 
-def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool) -> list:
+def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool, pal: Palette = CLASSIC) -> list:
     iid = page["items"][0]
     inst = config["instruments"][iid]
-    lines = _arc_widgets(board, display, pi, inst)
+    lines = _arc_widgets(board, display, pi, inst, pal=pal)
     box_w, box_h = arc_text_box(gauge_diameter(board))
     fit = "width: 100%, text_align: CENTER"
     lines += [
@@ -845,23 +887,23 @@ def _gauge_arc_page(config: dict, board: dict, display: dict, pi: int, page: dic
         "            widgets:",
     ]
     name = (f"- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, "
-            f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
+            f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, {fit}, long_mode: DOT}}")
     if item_icon(config, iid):   # icon left of the label
         lines += [*_icon_row("              ", "100%"),
-                  _icon_label("                    ", pi, iid, config, "md", themed),
+                  _icon_label("                    ", pi, iid, config, "md", themed, pal=pal),
                   f"                    {name.replace(f'{fit}, ', '')}"]
     else:
         lines.append(f"              {name}")
     lines += [
         f"              - label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_value_single, "
-        f"text_color: 0x{DAY['value']:06X}, {fit}, long_mode: CLIP}}",
+        f"text_color: 0x{pal.day['value']:06X}, {fit}, long_mode: CLIP}}",
         f"              - label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, "
-        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}",
+        f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, {fit}, long_mode: DOT}}",
     ]
     return lines
 
 
-def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool) -> list:
+def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool, pal: Palette = CLASSIC) -> list:
     """Bar level, arc angle and indicator colour for one instrument; colours only on change.
 
     Not fresh means level 0 and the grey indicator; the text is "--" through render_tiles.
@@ -893,15 +935,15 @@ def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: b
         f"          uint8_t g = fresh ? {state} : 0;",
         f"          if (g != id(ins_{iid}_gdrawn)) {{",
         f"            id(ins_{iid}_gdrawn) = g;",
-        f"            uint32_t c = 0x{GAUGE_DAY[0]:06X};",
+        f"            uint32_t c = 0x{pal.gauge_day[0]:06X};",
     ]
     for number in (1, 2, 3, GAUGE_NEUTRAL):
-        lines.append(f"            if (g == {number}) c = 0x{GAUGE_DAY[number]:06X};")
+        lines.append(f"            if (g == {number}) c = 0x{pal.gauge_day[number]:06X};")
     if night:
         lines.append("            if (id(night_active)) {")
-        lines.append(f"              c = 0x{GAUGE_NIGHT[0]:06X};")
+        lines.append(f"              c = 0x{pal.gauge_night[0]:06X};")
         for number in (1, 2, 3, GAUGE_NEUTRAL):
-            lines.append(f"              if (g == {number}) c = 0x{GAUGE_NIGHT[number]:06X};")
+            lines.append(f"              if (g == {number}) c = 0x{pal.gauge_night[number]:06X};")
         lines.append("            }")
     for pi, page in pages:
         if page["layout"] == "tank-bars":
@@ -914,41 +956,41 @@ def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: b
     return lines
 
 
-def _gauge_night_lines(config: dict, display: dict, pi: int, page: dict) -> list:
+def _gauge_night_lines(config: dict, display: dict, pi: int, page: dict, pal: Palette = CLASSIC) -> list:
     """Night palette for the text, the tracks and the zone arcs of one bar or arc page."""
     lines = []
     for iid in page["items"]:
         for part, key in (("name", "name"), ("value", "value"), ("unit", "name")):
             lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_{part}), lv_color_hex("
-                         f"n ? 0x{NIGHT[key]:06X} : 0x{DAY[key]:06X}), LV_PART_MAIN);")
+                         f"n ? 0x{pal.night[key]:06X} : 0x{pal.day[key]:06X}), LV_PART_MAIN);")
             if part == "name":
-                lines += _icon_night(config, pi, iid)
+                lines += _icon_night(config, pi, iid, pal=pal)
         if page["layout"] == "tank-bars":
-            track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
+            track = f"n ? 0x{pal.track['night']:06X} : 0x{pal.track['day']:06X}"
             lines.append(f"            lv_obj_set_style_bg_color(id(p{pi}_{iid}_bar), lv_color_hex({track}), "
                          "LV_PART_MAIN);")
             continue
-        lines += _arc_night_lines(config, display, pi, iid)
+        lines += _arc_night_lines(config, display, pi, iid, pal=pal)
     return lines
 
 
-def _arc_night_lines(config: dict, display: dict, pi: int, iid: str) -> list:
+def _arc_night_lines(config: dict, display: dict, pi: int, iid: str, pal: Palette = CLASSIC) -> list:
     """Night palette for the track and the zone arcs of the arc that shows this instrument."""
-    track = f"n ? 0x{TRACK_COLOR['night']:06X} : 0x{TRACK_COLOR['day']:06X}"
+    track = f"n ? 0x{pal.track['night']:06X} : 0x{pal.track['day']:06X}"
     lines = [f"            lv_obj_set_style_arc_color(id(p{pi}_arc), lv_color_hex({track}), LV_PART_MAIN);"]
     start = arc_start_angle(display)
     for k, (severity, _, _) in enumerate(zone_arcs(config["instruments"][iid], start)):
         lines.append(f"            lv_obj_set_style_arc_color(id(p{pi}_zone{k}), lv_color_hex("
-                     f"n ? 0x{GAUGE_NIGHT[severity]:06X} : 0x{GAUGE_DAY[severity]:06X}), LV_PART_MAIN);")
+                     f"n ? 0x{pal.gauge_night[severity]:06X} : 0x{pal.gauge_day[severity]:06X}), LV_PART_MAIN);")
     return lines
 
 
-def _text_night(pi: int, iid: str, part: str, key: str) -> str:
+def _text_night(pi: int, iid: str, part: str, key: str, pal: Palette = CLASSIC) -> str:
     return (f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_{part}), lv_color_hex("
-            f"n ? 0x{NIGHT[key]:06X} : 0x{DAY[key]:06X}), LV_PART_MAIN);")
+            f"n ? 0x{pal.night[key]:06X} : 0x{pal.day[key]:06X}), LV_PART_MAIN);")
 
 
-def _electrical_night_lines(config: dict, display: dict, pi: int, page: dict) -> list:
+def _electrical_night_lines(config: dict, display: dict, pi: int, page: dict, pal: Palette = CLASSIC) -> list:
     """Night palette for the text, the SoC ring and its zones of one electrical page.
 
     The shore pill background and a notification pill's text are repainted by the guarded
@@ -956,16 +998,16 @@ def _electrical_night_lines(config: dict, display: dict, pi: int, page: dict) ->
     """
     lines = []
     for role, iid in electrical_slots(page).items():
-        lines.append(_text_night(pi, iid, "name", "name"))
-        lines += _icon_night(config, pi, iid)
+        lines.append(_text_night(pi, iid, "name", "name", pal=pal))
+        lines += _icon_night(config, pi, iid, pal=pal)
         if is_word(config, iid):
             continue
-        lines.append(_text_night(pi, iid, "value", "value"))
+        lines.append(_text_night(pi, iid, "value", "value", pal=pal))
         if role != "shore":
-            lines.append(_text_night(pi, iid, "unit", "name"))
+            lines.append(_text_night(pi, iid, "unit", "name", pal=pal))
         if role == "current":
-            lines.append(_text_night(pi, iid, "word", "value"))
-    lines += _arc_night_lines(config, display, pi, electrical_slots(page)["soc"])
+            lines.append(_text_night(pi, iid, "word", "value", pal=pal))
+    lines += _arc_night_lines(config, display, pi, electrical_slots(page)["soc"], pal=pal)
     return lines
 
 
@@ -980,55 +1022,55 @@ def electrical_stack_height(page: dict) -> int:
     return sum(rows) + ELEC_PAD_ROW * (len(rows) - 1)
 
 
-def _elec_icon(inner: str, config: dict | None, pi: int, iid: str, themed: bool, iconic: bool) -> list:
+def _elec_icon(inner: str, config: dict | None, pi: int, iid: str, themed: bool, iconic: bool, pal: Palette = CLASSIC) -> list:
     """The icon slot at the start of an electrical row: the icon, or a same-width spacer so the
     names stay aligned when only some rows of the page have an icon."""
     if not iconic:
         return []
     if item_icon(config, iid):
-        return [_icon_label(inner, pi, iid, config, "md", themed, f", width: {ICON_SIZES['md']}, text_align: CENTER")]
+        return [_icon_label(inner, pi, iid, config, "md", themed, f", width: {ICON_SIZES['md']}, text_align: CENTER", pal=pal)]
     return [f"{inner}- obj: {{width: {ICON_SIZES['md']}, height: 1, bg_opa: TRANSP, border_width: 0, "
             "pad_all: 0, scrollable: false}"]
 
 
 def _elec_row(ind: str, pi: int, iid: str, inst: dict, themed: bool, word: bool = False,
-              config: dict | None = None, iconic: bool = False) -> list:
+              config: dict | None = None, iconic: bool = False, pal: Palette = CLASSIC) -> list:
     """name, value, unit (and a fixed-width state word) on one line."""
     lines = [f"{ind}- obj:", f"{ind}    width: 100%", f"{ind}    height: SIZE_CONTENT"]
     lines += [f"{ind}    {line}" for line in BOX_RESET]
     lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
               "pad_column: 6}", f"{ind}    widgets:"]
     inner = ind + "      "
-    lines += _elec_icon(inner, config, pi, iid, themed, iconic)
+    lines += _elec_icon(inner, config, pi, iid, themed, iconic, pal=pal)
     lines += [
         f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(inst['label'])}, text_font: font_small, "
-        f"text_color: 0x{DAY['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
+        f"text_color: 0x{pal.day['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
         f"{inner}- label: {{id: p{pi}_{iid}_value, text: {yq(BLANK_VALUE)}, text_font: font_small, "
-        f"text_color: 0x{DAY['value']:06X}, long_mode: CLIP}}",
+        f"text_color: 0x{pal.day['value']:06X}, long_mode: CLIP}}",
         f"{inner}- label: {{{_label_id(pi, iid, 'unit', themed)}text: {lit(inst['unit'])}, text_font: font_small, "
-        f"text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
+        f"text_color: 0x{pal.day['name']:06X}, long_mode: CLIP}}",
     ]
     if word:
         lines.append(f"{inner}- label: {{id: p{pi}_{iid}_word, text: {lit('')}, text_font: font_small, "
-                     f"text_color: 0x{DAY['value']:06X}, width: {ELEC_WORD_WIDTH}, text_align: LEFT, "
+                     f"text_color: 0x{pal.day['value']:06X}, width: {ELEC_WORD_WIDTH}, text_align: LEFT, "
                      "long_mode: CLIP}")
     return lines
 
 
-def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool, iconic: bool = False) -> list:
+def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool, iconic: bool = False, pal: Palette = CLASSIC) -> list:
     """The shore power pill: the item's label, then a rounded box holding a fixed word."""
     notification = is_word(config, iid)
     label = _item_label(config, iid)
-    grey, grey_text = SEV_COLORS[0] if notification else (GAUGE_DAY[0], DAY["value"])
+    grey, grey_text = pal.sev[0] if notification else (pal.gauge_day[0], pal.day["value"])
     lines = [f"{ind}- obj:", f"{ind}    width: 100%", f"{ind}    height: SIZE_CONTENT"]
     lines += [f"{ind}    {line}" for line in BOX_RESET]
     lines += [f"{ind}    layout: {{type: FLEX, flex_flow: ROW, flex_align_main: CENTER, flex_align_cross: CENTER, "
               "pad_column: 6}", f"{ind}    widgets:"]
     inner = ind + "      "
-    lines += _elec_icon(inner, config, pi, iid, themed, iconic)
+    lines += _elec_icon(inner, config, pi, iid, themed, iconic, pal=pal)
     lines += [
         f"{inner}- label: {{{_label_id(pi, iid, 'name', themed)}text: {lit(label)}, text_font: font_small, "
-        f"text_color: 0x{DAY['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
+        f"text_color: 0x{pal.day['name']:06X}, width: {ELEC_NAME_WIDTH}, text_align: RIGHT, long_mode: DOT}}",
         f"{inner}- obj:", f"{inner}    id: {tile_id(pi, iid, ELECTRICAL)}", f"{inner}    width: {ELEC_PILL_WIDTH}",
         f"{inner}    height: {ELEC_PILL_HEIGHT}", f"{inner}    radius: {ELEC_PILL_HEIGHT // 2}",
         f"{inner}    bg_color: 0x{grey:06X}", f"{inner}    bg_opa: COVER", f"{inner}    border_width: 0",
@@ -1040,12 +1082,12 @@ def _elec_shore_row(ind: str, config: dict, pi: int, iid: str, themed: bool, ico
     return lines
 
 
-def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool) -> list:
+def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: dict, themed: bool, pal: Palette = CLASSIC) -> list:
     """SoC ring (the gauge-arc ring), voltage in the middle, SoC and current rows, shore pill, solar row."""
     slots = electrical_slots(page)
     inst = config["instruments"]
     volt = inst[slots["voltage"]]
-    lines = _arc_widgets(board, display, pi, inst[slots["soc"]])
+    lines = _arc_widgets(board, display, pi, inst[slots["soc"]], pal=pal)
     fit = "width: 100%, text_align: CENTER"
     iconic = any(item_icon(config, iid) for iid in page["items"])
     lines += [
@@ -1056,10 +1098,10 @@ def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: di
         "            widgets:",
     ]
     name = (f"- label: {{{_label_id(pi, slots['voltage'], 'name', themed)}text: {lit(volt['label'])}, "
-            f"text_font: font_small, text_color: 0x{DAY['name']:06X}, {fit}, long_mode: DOT}}")
+            f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, {fit}, long_mode: DOT}}")
     if item_icon(config, slots["voltage"]):   # icon left of the voltage label
         lines += [*_icon_row("              ", "100%"),
-                  _icon_label("                    ", pi, slots["voltage"], config, "md", themed),
+                  _icon_label("                    ", pi, slots["voltage"], config, "md", themed, pal=pal),
                   f"                    {name.replace(f'{fit}, ', '')}"]
     else:
         lines.append(f"              {name}")
@@ -1070,18 +1112,18 @@ def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: di
         "pad_column: 4}",
         "                  widgets:",
         f"                    - label: {{id: p{pi}_{slots['voltage']}_value, text: {yq(BLANK_VALUE)}, "
-        f"text_font: font_value_grid, text_color: 0x{DAY['value']:06X}, long_mode: CLIP}}",
+        f"text_font: font_value_grid, text_color: 0x{pal.day['value']:06X}, long_mode: CLIP}}",
         f"                    - label: {{{_label_id(pi, slots['voltage'], 'unit', themed)}text: {lit(volt['unit'])}, "
-        f"text_font: font_small, text_color: 0x{DAY['name']:06X}, long_mode: CLIP}}",
+        f"text_font: font_small, text_color: 0x{pal.day['name']:06X}, long_mode: CLIP}}",
     ]
-    lines += _elec_row("              ", pi, slots["soc"], inst[slots["soc"]], themed, config=config, iconic=iconic)
+    lines += _elec_row("              ", pi, slots["soc"], inst[slots["soc"]], themed, config=config, iconic=iconic, pal=pal)
     lines += _elec_row("              ", pi, slots["current"], inst[slots["current"]], themed, word=True,
-                       config=config, iconic=iconic)
+                       config=config, iconic=iconic, pal=pal)
     if "shore" in slots:
-        lines += _elec_shore_row("              ", config, pi, slots["shore"], themed, iconic)
+        lines += _elec_shore_row("              ", config, pi, slots["shore"], themed, iconic, pal=pal)
     if "solar" in slots:
         lines += _elec_row("              ", pi, slots["solar"], inst[slots["solar"]], themed, config=config,
-                           iconic=iconic)
+                           iconic=iconic, pal=pal)
     return lines
 
 
@@ -1103,7 +1145,7 @@ def _state_branches(pages: list, iid: str, part: str, state: str, words: dict) -
     return lines
 
 
-def _electrical_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool) -> list:
+def _electrical_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool, pal: Palette = CLASSIC) -> list:
     """CHG / DSG for the current and the ON / OFF pill for an instrument-backed shore slot.
 
     Both read a state gated on freshness, so a stale or unknown reading gives an empty word and
@@ -1127,14 +1169,14 @@ def _electrical_lines(config: dict, display: dict, iid: str, heartbeat: int, nig
             f"          uint8_t s = fresh ? (id(ins_{iid}_num) > {cfloat(SHORE_ON_ABOVE)} ? 1 : 2) : 0;",
             f"          if (s != id(ins_{iid}_sdrawn)) {{",
             f"            id(ins_{iid}_sdrawn) = s;",
-            f"            uint32_t c = 0x{GAUGE_DAY[SHORE_STATE_COLOR[0]]:06X};",
+            f"            uint32_t c = 0x{pal.gauge_day[SHORE_STATE_COLOR[0]]:06X};",
         ]
         for number in (1, 2):
-            lines.append(f"            if (s == {number}) c = 0x{GAUGE_DAY[SHORE_STATE_COLOR[number]]:06X};")
+            lines.append(f"            if (s == {number}) c = 0x{pal.gauge_day[SHORE_STATE_COLOR[number]]:06X};")
         if night:
-            lines += ["            if (id(night_active)) {", f"              c = 0x{GAUGE_NIGHT[SHORE_STATE_COLOR[0]]:06X};"]
+            lines += ["            if (id(night_active)) {", f"              c = 0x{pal.gauge_night[SHORE_STATE_COLOR[0]]:06X};"]
             for number in (1, 2):
-                lines.append(f"              if (s == {number}) c = 0x{GAUGE_NIGHT[SHORE_STATE_COLOR[number]]:06X};")
+                lines.append(f"              if (s == {number}) c = 0x{pal.gauge_night[SHORE_STATE_COLOR[number]]:06X};")
             lines.append("            }")
         for pi in shore:
             lines.append(f"            lv_obj_set_style_bg_color(id({tile_id(pi, iid, ELECTRICAL)}), "
@@ -1180,7 +1222,7 @@ def _touch_layer(display: dict, pi: int) -> list:
     return lines
 
 
-def _header_lines(registry_board: dict, display: dict, pi: int, page: dict, ha: bool = False) -> list:
+def _header_lines(registry_board: dict, display: dict, pi: int, page: dict, ha: bool = False, pal: Palette = CLASSIC) -> list:
     """Clock and status dots in the narrow top row, the page title below, page dots at the bottom.
 
     Everything is static except colours and the clock digits, which render_header sets.
@@ -1189,7 +1231,7 @@ def _header_lines(registry_board: dict, display: dict, pi: int, page: dict, ha: 
     y, n_pages = ring["header_y"], len(display["pages"])
     lines = [
         f"        - label: {{id: p{pi}_clock, text: {yq('--:--')}, text_font: font_small, "
-        f"text_color: 0x{DAY['clock']:06X}, align: TOP_MID, x: {HEADER_CLOCK_X}, y: {y}}}",
+        f"text_color: 0x{pal.day['clock']:06X}, align: TOP_MID, x: {HEADER_CLOCK_X}, y: {y}}}",
     ]
     dots = list(zip(("sk", "bridge", "mqtt"), HEADER_DOT_X)) + ([("ha", HEADER_DOT_HA_X)] if ha else [])
     for name, x in dots:
@@ -1197,12 +1239,12 @@ def _header_lines(registry_board: dict, display: dict, pi: int, page: dict, ha: 
             "        - obj:", f"            id: p{pi}_dot_{name}", "            align: TOP_MID",
             f"            x: {x}", f"            y: {y + 6}", f"            width: {HEADER_DOT_SIZE}",
             f"            height: {HEADER_DOT_SIZE}", f"            radius: {HEADER_DOT_SIZE // 2}",
-            f"            bg_color: 0x{DAY['dot_unknown']:06X}", "            bg_opa: COVER",
+            f"            bg_color: 0x{pal.day['dot_unknown']:06X}", "            bg_opa: COVER",
             "            border_width: 0", "            pad_all: 0", "            scrollable: false",
         ]
     lines.append(
         f"        - label: {{id: p{pi}_title, text: {lit(page['title'])}, text_font: font_small, "
-        f"text_color: 0x{DAY['title']:06X}, align: TOP_MID, y: {y + HEADER_TITLE_ROW}, "
+        f"text_color: 0x{pal.day['title']:06X}, align: TOP_MID, y: {y + HEADER_TITLE_ROW}, "
         f"width: {HEADER_TITLE_WIDTH}, text_align: CENTER, long_mode: DOT}}")
     if n_pages > 1:
         lines += [
@@ -1216,19 +1258,19 @@ def _header_lines(registry_board: dict, display: dict, pi: int, page: dict, ha: 
             "            widgets:",
         ]
         for j in range(n_pages):
-            color = DAY["page_hi"] if j == pi else DAY["page_lo"]
+            color = pal.day["page_hi"] if j == pi else pal.day["page_lo"]
             lines.append(f"              - obj: {{width: {PAGE_DOT_SIZE}, height: {PAGE_DOT_SIZE}, "
                          f"radius: {PAGE_DOT_SIZE // 2}, bg_color: 0x{color:06X}, bg_opa: COVER, "
                          "border_width: 0, pad_all: 0}")
     return lines
 
 
-def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page: dict) -> list:
+def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page: dict, pal: Palette = CLASSIC) -> list:
     n_pages = len(display["pages"])
     cw, ch = registry_board["content_width"], registry_board["content_height"]
     layout = page["layout"]
     themed = night_enabled(display)
-    lines = [f"    - id: page_{pi}", "      bg_color: 0x000000", "      widgets:"]
+    lines = [f"    - id: page_{pi}", f"      bg_color: 0x{pal.day['page_bg']:06X}", "      widgets:"]
     if layout == "single":
         iid = page["items"][0]
         lines += [
@@ -1243,7 +1285,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             "            widgets:",
         ]
         lines += _tile_widgets("              ", pi, iid, config["instruments"][iid], "font_value_single",
-                               themed, config)
+                               themed, config, pal=pal)
     elif layout == "grid-2x2":
         lines += [
             "        - obj:",
@@ -1278,7 +1320,7 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
                 "                  widgets:",
             ]
             lines += _tile_widgets("                    ", pi, iid, config["instruments"][iid],
-                                   "font_value_grid", themed, config)
+                                   "font_value_grid", themed, config, pal=pal)
     elif layout == "status-grid":
         cols, rows = status_grid_shape(len(page["items"]))
         lines += [
@@ -1305,18 +1347,18 @@ def _page_lines(config: dict, registry_board: dict, display: dict, pi: int, page
             name_width = (status_cell_size(cw, ch, len(page["items"]))[0] - 8 - ICON_SIZES["md"] - ICON_GAP)
         for index, iid in enumerate(page["items"]):
             lines += _status_cell(config, "              ", pi, iid, font, index, cols, themed,
-                                  icon_size_key(page), name_width)
+                                  icon_size_key(page), name_width, pal=pal)
     elif layout == "tank-bars":
-        lines += _tank_bars_page(config, registry_board, pi, page, themed)
+        lines += _tank_bars_page(config, registry_board, pi, page, themed, pal=pal)
     elif layout == "gauge-arc":
-        lines += _gauge_arc_page(config, registry_board, display, pi, page, themed)
+        lines += _gauge_arc_page(config, registry_board, display, pi, page, themed, pal=pal)
     elif layout == ELECTRICAL:
-        lines += _electrical_page(config, registry_board, display, pi, page, themed)
+        lines += _electrical_page(config, registry_board, display, pi, page, themed, pal=pal)
     else:
         assert layout not in schema.SUPPORTED_LAYOUTS, layout   # a supported layout needs a branch above
         raise RenderError(f"layout {layout!r} is not supported by the firmware generator yet", 2)
     if header_enabled(display):
-        lines += _header_lines(registry_board, display, pi, page, has_ha(config))
+        lines += _header_lines(registry_board, display, pi, page, has_ha(config), pal=pal)
     if touch_managed(display):
         if touch_layer_enabled(display):
             lines += _touch_layer(display, pi)
@@ -1482,7 +1524,7 @@ def _word_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     return lines
 
 
-def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool = False) -> list:
+def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: bool = False, pal: Palette = CLASSIC) -> list:
     """Guarded colour update for one thresholded instrument, on every page that shows it."""
     limit_ms = item_limit_ms(config, iid, heartbeat)
     sets = []
@@ -1498,16 +1540,16 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: boo
         f"          uint8_t sev = fresh ? id(ins_{iid}_sev) : 0;",
         f"          if (sev != id(ins_{iid}_drawn_sev)) {{",
         f"            id(ins_{iid}_drawn_sev) = sev;",
-        "            uint32_t bg = 0x%06X, fg = 0x%06X;" % (SEV_COLORS[0][0], SEV_COLORS[0][1]),
+        "            uint32_t bg = 0x%06X, fg = 0x%06X;" % (pal.sev[0][0], pal.sev[0][1]),
     ]
     for number in (1, 2, 3):
-        bg, fg = SEV_COLORS[number]
+        bg, fg = pal.sev[number]
         lines.append(f"            if (sev == {number}) {{ bg = 0x{bg:06X}; fg = 0x{fg:06X}; }}")
     if night:
         lines.append("            if (id(night_active)) {")
-        lines.append("              bg = 0x%06X; fg = 0x%06X;" % NIGHT_SEV_COLORS[0])
+        lines.append("              bg = 0x%06X; fg = 0x%06X;" % pal.sev_night[0])
         for number in (1, 2, 3):
-            bg, fg = NIGHT_SEV_COLORS[number]
+            bg, fg = pal.sev_night[number]
             lines.append(f"              if (sev == {number}) {{ bg = 0x{bg:06X}; fg = 0x{fg:06X}; }}")
         lines.append("            }")
     for tile, value in sets:
@@ -1755,11 +1797,11 @@ def _clock_handler(display: dict) -> list:
     return lines + _after_ui_change(display)
 
 
-def _color_expr(name: str, night: bool) -> str:
-    return f"(nt ? 0x{NIGHT[name]:06X} : 0x{DAY[name]:06X})" if night else f"0x{DAY[name]:06X}"
+def _color_expr(name: str, night: bool, pal: Palette = CLASSIC) -> str:
+    return f"(nt ? 0x{pal.night[name]:06X} : 0x{pal.day[name]:06X})" if night else f"0x{pal.day[name]:06X}"
 
 
-def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False) -> list:
+def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False, pal: Palette = CLASSIC) -> list:
     """Clock digits (generated with snprintf from two integers) and status colours, only on change."""
     night = night_enabled(display)
     pages = range(len(display["pages"]))
@@ -1789,9 +1831,9 @@ def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False)
         "          int state = dsk | (dbr << 2) | (dmq << 4) | (nt ? 64 : 0)" + (" | (dha << 7);" if ha else ";"),
         "          if (state != id(hdr_drawn)) {",
         "            id(hdr_drawn) = state;",
-        f"            uint32_t good = {_color_expr('dot_ok', night)}, bad = {_color_expr('dot_bad', night)}, "
-        f"unk = {_color_expr('dot_unknown', night)};",
-        f"            uint32_t hi = {_color_expr('page_hi', night)}, lo = {_color_expr('page_lo', night)};",
+        f"            uint32_t good = {_color_expr('dot_ok', night, pal=pal)}, bad = {_color_expr('dot_bad', night, pal=pal)}, "
+        f"unk = {_color_expr('dot_unknown', night, pal=pal)};",
+        f"            uint32_t hi = {_color_expr('page_hi', night, pal=pal)}, lo = {_color_expr('page_lo', night, pal=pal)};",
         "            uint32_t sk = dsk == 1 ? good : (dsk == 2 ? bad : unk);",
         "            uint32_t br = dbr == 1 ? good : bad;",
         "            uint32_t mt = dmq == 1 ? good : bad;",
@@ -1803,9 +1845,9 @@ def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False)
             f"            lv_obj_set_style_bg_color(id(p{pi}_dot_bridge), lv_color_hex(br), LV_PART_MAIN);",
             f"            lv_obj_set_style_bg_color(id(p{pi}_dot_mqtt), lv_color_hex(mt), LV_PART_MAIN);",
             *([f"            lv_obj_set_style_bg_color(id(p{pi}_dot_ha), lv_color_hex(hc), LV_PART_MAIN);"] if ha else []),
-            f"            lv_obj_set_style_text_color(id(p{pi}_clock), lv_color_hex({_color_expr('clock', night)}),"
+            f"            lv_obj_set_style_text_color(id(p{pi}_clock), lv_color_hex({_color_expr('clock', night, pal=pal)}),"
             " LV_PART_MAIN);",
-            f"            lv_obj_set_style_text_color(id(p{pi}_title), lv_color_hex({_color_expr('title', night)}),"
+            f"            lv_obj_set_style_text_color(id(p{pi}_title), lv_color_hex({_color_expr('title', night, pal=pal)}),"
             " LV_PART_MAIN);",
         ]
         if len(display["pages"]) > 1:
@@ -1818,7 +1860,7 @@ def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False)
     return lines
 
 
-def _night_script(config: dict, display: dict, used: list) -> list:
+def _night_script(config: dict, display: dict, used: list, pal: Palette = CLASSIC) -> list:
     """Resolve night (schedule flag or manual, with the override) and repaint the palette on change."""
     schedule = night_mode(display) == "schedule"
     lines = [
@@ -1832,26 +1874,26 @@ def _night_script(config: dict, display: dict, used: list) -> list:
     ]
     for pi, page in enumerate(display["pages"]):
         if page["layout"] in GAUGE_LAYOUTS:
-            lines += _gauge_night_lines(config, display, pi, page)
+            lines += _gauge_night_lines(config, display, pi, page, pal=pal)
             continue
         if page["layout"] == ELECTRICAL:
-            lines += _electrical_night_lines(config, display, pi, page)
+            lines += _electrical_night_lines(config, display, pi, page, pal=pal)
             continue
         for iid in page["items"]:
             notification = is_word(config, iid)
             tile = tile_id(pi, iid, page["layout"])
             lines += [
                 f"            lv_obj_set_style_bg_color(id({tile}), lv_color_hex("
-                f"n ? 0x{NIGHT['tile']:06X} : 0x{DAY['tile']:06X}), LV_PART_MAIN);",
+                f"n ? 0x{pal.night['tile']:06X} : 0x{pal.day['tile']:06X}), LV_PART_MAIN);",
                 f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_name), lv_color_hex("
-                f"n ? 0x{NIGHT['name']:06X} : 0x{DAY['name']:06X}), LV_PART_MAIN);",
-                *_icon_night(config, pi, iid),
+                f"n ? 0x{pal.night['name']:06X} : 0x{pal.day['name']:06X}), LV_PART_MAIN);",
+                *_icon_night(config, pi, iid, pal=pal),
                 f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_value), lv_color_hex("
-                f"n ? 0x{NIGHT['value']:06X} : 0x{DAY['value']:06X}), LV_PART_MAIN);",
+                f"n ? 0x{pal.night['value']:06X} : 0x{pal.day['value']:06X}), LV_PART_MAIN);",
             ]
             if not notification:
                 lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_unit), lv_color_hex("
-                             f"n ? 0x{NIGHT['name']:06X} : 0x{DAY['name']:06X}), LV_PART_MAIN);")
+                             f"n ? 0x{pal.night['name']:06X} : 0x{pal.day['name']:06X}), LV_PART_MAIN);")
     for iid in used:   # the guarded severity colours must repaint with the new palette
         if severity_tile(config, display, iid):
             lines.append(f"            id(ins_{iid}_drawn_sev) = 255;")
@@ -1905,7 +1947,7 @@ def _dim_interval(display: dict) -> list:
     ]
 
 
-def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str) -> str:
+def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str, pal: Palette = CLASSIC) -> str:
     config = effective_config(config)
     display = config["displays"][display_id]
     board = registry["boards"][display["board"]]
@@ -2003,17 +2045,17 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines += _word_lines(config, display, iid, heartbeat)
     for iid in used:
         if severity_tile(config, display, iid):
-            lines += _sev_lines(config, display, iid, heartbeat, night_enabled(display))
+            lines += _sev_lines(config, display, iid, heartbeat, night_enabled(display), pal=pal)
         if not is_word(config, iid) and on_gauge_page(display, iid):
-            lines += _gauge_lines(config, display, iid, heartbeat, night_enabled(display))
+            lines += _gauge_lines(config, display, iid, heartbeat, night_enabled(display), pal=pal)
         if not is_word(config, iid):
-            lines += _electrical_lines(config, display, iid, heartbeat, night_enabled(display))
+            lines += _electrical_lines(config, display, iid, heartbeat, night_enabled(display), pal=pal)
     if takeover:
         lines += _alarm_script(config, used, heartbeat)
     if header_enabled(display):
-        lines += _header_script(board, display, heartbeat, has_ha(config))
+        lines += _header_script(board, display, heartbeat, has_ha(config), pal=pal)
     if night_enabled(display):
-        lines += _night_script(config, display, used)
+        lines += _night_script(config, display, used, pal=pal)
     if power_enabled(display):
         lines += _power_script(display)
     lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles"]
@@ -2030,10 +2072,13 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         lines += _dim_interval(display)
     lines += ["", "lvgl:", "  displays: [board_display]", "  touchscreens: [board_touch]",
               "  buffer_size: 100%", "  style_definitions:", "    - id: tile_style",
-              "      bg_color: 0x101820", "      bg_opa: COVER", "      border_width: 0",
-              "      radius: 14", "      pad_all: 4", "  pages:"]
+              f"      bg_color: 0x{pal.day['tile']:06X}", "      bg_opa: COVER",
+              f"      border_width: {pal.tile_border_width}", f"      radius: {pal.tile_radius}",
+              f"      pad_all: {pal.tile_pad}",
+              *([f"      border_color: 0x{pal.tile_border:06X}"]
+                if pal.tile_border_width and pal.tile_border is not None else []), "  pages:"]
     for pi, page in enumerate(display["pages"]):
-        lines += _page_lines(config, board, display, pi, page)
+        lines += _page_lines(config, board, display, pi, page, pal=pal)
     if takeover:
         lines += _alarm_banner(board)
     return "\n".join(lines) + "\n"
