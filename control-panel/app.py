@@ -124,7 +124,7 @@ FIELDS = [
     field("BOAT_MMSI", "MMSI", SEC_VESSEL, kind="secret", description="Optional. Your vessel's radio identity number. Kept private on this boat computer; never commit it."),
     field("BOAT_CALLSIGN", "Call sign", SEC_VESSEL, kind="secret", description="Optional. Kept private on this boat computer; never commit it."),
     # Network & access
-    field("VESSELSTACK_WEB_BIND_ADDRESS", "Web pages visible to", SEC_NETWORK, description="Grafana and Heimdall listen on this address. 127.0.0.1 means this device only; 0.0.0.0 means every device on the boat network."),
+    field("VESSELSTACK_WEB_BIND_ADDRESS", "Web pages visible to", SEC_NETWORK, description="Grafana and the home page listen on this address. 127.0.0.1 means this device only; 0.0.0.0 means every device on the boat network."),
     field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services visible to", SEC_NETWORK, description="InfluxDB, Prometheus and MQTT listen on this address. Keep 127.0.0.1 unless another device must connect over a network you trust."),
     field("HOMEASSISTANT_BIND_ADDRESS", "Home Assistant visible to", SEC_NETWORK, description="127.0.0.1 means this device only; 0.0.0.0 means every device on the boat network. Applied through a managed http block in Home Assistant's configuration.yaml when you apply your settings or run sudo vesselstackctl lan. Signal K has no such setting."),
     field("CONTROL_PANEL_HOST", "Control Panel address", SEC_NETWORK, description="Keep 127.0.0.1 to reach the panel through an SSH tunnel only. To open it to a trusted network, run sudo vesselstackctl panel-access lan on the boat computer; that exposes unencrypted HTTP on every interface and a strict firewall may still block it. Undo it with sudo vesselstackctl panel-access local."),
@@ -187,8 +187,7 @@ FIELDS = [
     field("INFLUXDB_PORT", "InfluxDB port", SEC_SERVICES, kind="port", description="The port InfluxDB is published on."),
     field("INFLUXDB_CONTAINER_NAME", "InfluxDB container name", SEC_SERVICES, description="The Docker container name. Change only if it clashes with another container."),
     field("GRAFANA_PORT", "Grafana port", SEC_SERVICES, kind="port", description="The port Grafana is published on."),
-    field("HEIMDALL_PORT", "Heimdall HTTP port", SEC_SERVICES, kind="port", description="The port Heimdall's start page is published on."),
-    field("HEIMDALL_HTTPS_PORT", "Heimdall HTTPS port", SEC_SERVICES, kind="port", description="The secure port Heimdall is published on."),
+    field("HOMEPAGE_PORT", "Home page port", SEC_SERVICES, kind="port", description="The port the home page (Homepage) is published on."),
     field("PROMETHEUS_PORT", "Prometheus port", SEC_SERVICES, kind="port", description="The port Prometheus is published on."),
     field("MQTT_USERNAME", "MQTT username", SEC_SERVICES, description="The account name used for the Mosquitto message broker."),
     field("MQTT_PASSWORD", "MQTT password", SEC_SERVICES, kind="secret", description="Applied to the Mosquitto password file on the next apply or start; update Home Assistant's MQTT integration to match."),
@@ -218,12 +217,12 @@ COMPOSE_COMPONENTS = {
     "grafana": "grafana",
     "prometheus": "prometheus",
     "mosquitto": "mosquitto",
-    "heimdall": "heimdall",
+    "homepage": "homepage",
     "signalk": "signalk",
     "ais-catcher": "ais-catcher",
     "node-exporter": "node-exporter",
 }
-CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
+CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "homepage")
 # Display name, plain description and the Settings section that configures it.
 COMPONENT_INFO = {
     "homeassistant": ("Home Assistant", "Dashboards and automations for the boat.", SEC_HA),
@@ -231,7 +230,7 @@ COMPONENT_INFO = {
     "grafana": ("Grafana", "Charts of your history: trips, batteries, temperatures.", SEC_SERVICES),
     "prometheus": ("Prometheus", "Collects Pi and service health numbers.", SEC_STORAGE),
     "mosquitto": ("Mosquitto", "Passes messages between devices (MQTT).", SEC_SERVICES),
-    "heimdall": ("Heimdall", "A start page with links to every boat web page.", SEC_SERVICES),
+    "homepage": ("Home page", "The boat's start page, with a tile for every boat web page.", SEC_SERVICES),
     "signalk": ("Signal K", "Reads boat data and shares it with everything else.", SEC_SIGNALK),
     "ais-catcher": ("AIS-catcher", "Shows nearby ships from your AIS receiver.", SEC_AIS),
     "node-exporter": ("Node Exporter", "Reports Pi health (temperature, disk) for Prometheus.", SEC_SERVICES),

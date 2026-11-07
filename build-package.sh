@@ -63,7 +63,7 @@ done
 for required_runtime in \
     boat-chat/display_units.py boat-chat/telemetry_indexer.py \
     systemd/vesselstack-telemetry-indexer.timer systemd/vesselstack-telemetry-sample.service.in \
-    systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml; do
+    systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml scripts/render-homepage.py; do
     [ -s "$STAGE/$PACKAGE_NAME/$required_runtime" ] || {
         echo "Refusing to package without required runtime asset: $required_runtime" >&2
         exit 1

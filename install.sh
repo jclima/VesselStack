@@ -55,8 +55,7 @@ source "$CONFIG_FILE"
 : "${INFLUXDB_RAW_BUCKET:=vesselstack_raw}"
 : "${INFLUXDB_HISTORY_BUCKET:=vesselstack_1m}"
 : "${GRAFANA_PORT:=43000}"
-: "${HEIMDALL_PORT:=80}"
-: "${HEIMDALL_HTTPS_PORT:=443}"
+: "${HOMEPAGE_PORT:=80}"
 : "${INFLUXDB_PORT:=8086}"
 : "${INFLUXDB_CONTAINER_NAME:=vesselstack-influxdb}"
 : "${PROMETHEUS_PORT:=9090}"
@@ -119,7 +118,7 @@ fi
 : "${PROMETHEUS_RETENTION:=30d}"
 : "${VESSELSTACK_DISABLED_COMPONENTS:=}"
 
-CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
 disabled_input=$VESSELSTACK_DISABLED_COMPONENTS
 VESSELSTACK_DISABLED_COMPONENTS=""
 component_disabled() { case ",${VESSELSTACK_DISABLED_COMPONENTS}," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
@@ -221,7 +220,7 @@ for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
         exit 1
     }
 done
-for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
+for key in GRAFANA_PORT HOMEPAGE_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
     CONTROL_PANEL_PORT; do
     port_value=${!key}
@@ -233,6 +232,10 @@ for key in GRAFANA_PORT HEIMDALL_PORT HEIMDALL_HTTPS_PORT INFLUXDB_PORT \
         exit 1
     fi
 done
+[[ "${HOMEPAGE_ALLOWED_HOSTS_EXTRA:-}" =~ ^[A-Za-z0-9_.:,-]*$ ]] || {
+    echo "HOMEPAGE_ALLOWED_HOSTS_EXTRA must be comma-separated host names or HOST:PORT entries" >&2
+    exit 1
+}
 for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST VESSELSTACK_DATA_BIND_ADDRESS \
     VESSELSTACK_WEB_BIND_ADDRESS HOMEASSISTANT_BIND_ADDRESS; do
     python3 - "${!key}" <<'PY' || { echo "$key must be an IPv4 address" >&2; exit 1; }
@@ -260,8 +263,7 @@ register_port InfluxDB "$INFLUXDB_PORT"
 register_port Grafana "$GRAFANA_PORT"
 register_port Prometheus "$PROMETHEUS_PORT"
 register_port MQTT "$MQTT_PORT"
-register_port HeimdallHTTP "$HEIMDALL_PORT"
-register_port HeimdallHTTPS "$HEIMDALL_HTTPS_PORT"
+register_port Homepage "$HOMEPAGE_PORT"
 register_port BoatChat "$BOAT_CHAT_PORT"
 register_port ControlPanel "$CONTROL_PANEL_PORT"
 if [ "$AIS_ENABLE" = true ]; then
@@ -485,8 +487,9 @@ INFLUXDB_PASSWORD
 INFLUXDB_TOKEN
 GRAFANA_ADMIN_PASSWORD
 GRAFANA_PORT
-HEIMDALL_PORT
-HEIMDALL_HTTPS_PORT
+HOMEPAGE_PORT
+HOMEPAGE_ALLOWED_HOSTS
+HOMEPAGE_ALLOWED_HOSTS_EXTRA
 PROMETHEUS_PORT
 PROMETHEUS_RETENTION
 MQTT_USERNAME
@@ -1475,6 +1478,13 @@ env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_ENV="$VESSELSTACK_ROOT/conf
     VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$SBIN_DIR/vesselstackctl" ha-http sync || \
     echo "WARN: could not apply HOMEASSISTANT_BIND_ADDRESS to Home Assistant; run: sudo vesselstackctl ha-http sync" >&2
 
+# Home page (Homepage): render its configuration from the installed settings and refresh
+# HOMEPAGE_ALLOWED_HOSTS before any container starts. Your own tiles in
+# config/homepage-custom/ are created once and never overwritten.
+env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_ENV="$VESSELSTACK_ROOT/config/vesselstack.env" \
+    VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$SBIN_DIR/vesselstackctl" homepage sync || \
+    echo "WARN: could not render the home page configuration; run: sudo vesselstackctl homepage sync" >&2
+
 # Boat Chat reports "not ready" until its memory index has content, and nothing else
 # builds it. Do it here, after the code, facts file and virtualenv are in place and the
 # state directory exists, as the service user (see scripts/memory-index.sh). `ensure` is
@@ -1493,6 +1503,11 @@ if [ "$START" -eq 1 ]; then
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
     install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
+    # Heimdall (the previous start page) held port 80; remove its container and image
+    # before Homepage is started. Its data directory is never touched.
+    env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_ENV="$VESSELSTACK_ROOT/config/vesselstack.env" \
+        VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$SBIN_DIR/vesselstackctl" homepage remove-heimdall || \
+        echo "WARN: could not remove the old Heimdall container; run: sudo vesselstackctl homepage remove-heimdall" >&2
     # Broker access files were already rendered by sync_mqtt_access above.
     selected_services=()
     for core in "${CORE_COMPONENTS[@]}"; do

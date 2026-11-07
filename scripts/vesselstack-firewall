@@ -7,14 +7,15 @@
 #   print   render the rules that apply would load, without root or changes
 #
 # Default policy: drop the administrative TCP ports (MQTT, InfluxDB, Prometheus,
-# Grafana) arriving on the untrusted interface.
+# Grafana) and the Homepage front door (HOMEPAGE_PORT, default 80, matched on its
+# published port) arriving on the untrusted interface.
 #
 # Strict policy (VESSELSTACK_FIREWALL_STRICT=true): drop EVERYTHING arriving on the
 # untrusted interface except replies to connections this host started, ICMP, DHCP
 # client traffic and an explicit allow-list (VESSELSTACK_FIREWALL_ALLOW_TCP, default
 # 22; VESSELSTACK_FIREWALL_ALLOW_UDP, default empty). This covers host-networked
 # services (SignalK 3000, AIS) and Boat Chat 8765 through INPUT, and published
-# container ports (Heimdall 80/443, Grafana, ...) through DOCKER-USER.
+# container ports (Homepage 80, Grafana, ...) through DOCKER-USER.
 #
 # Chain contents are replaced atomically with iptables-restore --noflush, so there
 # is never a moment where an existing chain is empty. DOCKER-USER only exists once
@@ -73,6 +74,12 @@ for number in $(tr ':,' '  ' <<<"$allow_tcp $allow_udp"); do
     fi
 done
 
+homepage_port=${HOMEPAGE_PORT:-80}
+if ! [[ $homepage_port =~ ^[0-9]{1,5}$ ]] || [ "$homepage_port" -lt 1 ] || [ "$homepage_port" -gt 65535 ]; then
+    echo "Invalid HOMEPAGE_PORT: $homepage_port" >&2
+    exit 1
+fi
+
 host_ports="${MQTT_PORT:-1883},${INFLUXDB_PORT:-8086},${PROMETHEUS_PORT:-9090},${GRAFANA_PORT:-43000}"
 
 # Rules for one chain, in iptables-restore syntax (without the table header).
@@ -84,6 +91,9 @@ chain_rules() {
             echo "-A VESSELSTACK-INPUT -i $interface -p tcp -m multiport --dports $host_ports -j DROP"
         else
             echo "-A VESSELSTACK-DOCKER -i $interface -p tcp -m multiport --dports 1883,3000,8086,9090 -j DROP"
+            # Homepage is a published container port: match its published (original)
+            # port explicitly instead of relying on the container port 3000 above.
+            echo "-A VESSELSTACK-DOCKER -i $interface -p tcp -m conntrack --ctorigdstport $homepage_port -j DROP"
         fi
         return
     fi
