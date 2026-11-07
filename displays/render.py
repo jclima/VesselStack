@@ -185,6 +185,10 @@ class RenderError(Exception):
         self.code = code
 
 
+class BuildBusy(RenderError):
+    """The per-display build lock is held by a running build, flash or edit."""
+
+
 def pinned_image() -> str:
     """The single source of truth for the pinned ESPHome image (displays/esphome/IMAGE)."""
     text = (ESPHOME_DIR / "IMAGE").read_text(encoding="utf-8").strip()
@@ -787,6 +791,63 @@ def arc_text_box(diameter: int) -> tuple:
     inner = arc_zone_diameter(diameter) // 2 - ZONE_WIDTH
     side = int(inner * 1.4142) // 2 * 2
     return side, side * 4 // 5
+
+
+# --- preview geometry (pure; the Control Panel draws from this and never repeats the maths) -------
+
+def _box(x: float, y: float, w: float, h: float) -> dict:
+    return {"x": round(x), "y": round(y), "width": round(w), "height": round(h)}
+
+
+def preview_geometry(board: dict, layout: str, count: int, header: bool = False) -> dict:
+    """Where a page puts its items on the screen, in screen pixels (origin top-left).
+
+    ``board`` is a registry board, ``count`` the number of items on the page and ``header`` whether
+    ``ui.header`` is on. The result uses the same helpers as the generator (``status_cell_size``,
+    ``bar_column_width``, ``gauge_diameter``, ``arc_start_angle``...), so a preview cannot drift from the
+    firmware. ``cells`` has one box per item for the tile layouts; ``arc`` describes the ring of
+    ``gauge-arc`` and ``electrical`` (angles are LVGL: 0 = 3 o'clock, clockwise).
+    """
+    width, height = board["width"], board["height"]
+    cw, ch = board["content_width"], board["content_height"]
+    left, top = (width - cw) / 2, (height - ch) / 2
+    out = {"layout": layout, "screen": {"width": width, "height": height, "shape": board["shape"]},
+           "content": _box(left, top, cw, ch), "cells": []}
+    ring = board.get("ring")
+    if header and ring:
+        out["header"] = _box(0, ring["header_y"], width, ring["header_h"])
+    if layout == "single":
+        out["cells"] = [_box(left, top, cw, ch)]
+    elif layout == "grid-2x2":
+        cell_w, cell_h = (cw - 6) / 2, (ch - 6) / 2
+        out["cells"] = [_box(left + (i % 2) * (cell_w + 6), top + (i // 2) * (cell_h + 6), cell_w, cell_h)
+                        for i in range(min(count, 4))]
+    elif layout == "status-grid":
+        cols, _rows = status_grid_shape(count)
+        cell_w, cell_h = status_cell_size(cw, ch, count)
+        out["cells"] = [_box(left + (i % cols) * (cell_w + STATUS_GAP), top + (i // cols) * (cell_h + STATUS_GAP),
+                             cell_w, cell_h) for i in range(count)]
+        out["status_font"] = status_font(count)
+    elif layout == "tank-bars" and count > 0:
+        column = bar_column_width(cw, count)
+        gap = (cw - column * count) / (count + 1)    # SPACE_EVENLY
+        bar_w = min(BAR_WIDTH, column)
+        out["cells"] = [_box(left + gap * (i + 1) + column * i + (column - bar_w) / 2, top + (ch - BAR_HEIGHT) / 2,
+                             bar_w, BAR_HEIGHT) for i in range(count)]
+    elif layout in ("gauge-arc", ELECTRICAL):
+        diameter = gauge_diameter(board)
+        start = arc_start_angle({"ui": {"header": True}} if header else {})
+        out["arc"] = {"diameter": diameter, "box": _box((width - diameter) / 2, (height - diameter) / 2,
+                                                         diameter, diameter),
+                      "width": ARC_WIDTH, "start_angle": start, "end_angle": arc_end_angle(start),
+                      "sweep": ARC_SWEEP}
+        if layout == "gauge-arc":
+            text_w, text_h = arc_text_box(diameter)
+            out["text_box"] = _box((width - text_w) / 2, (height - text_h) / 2, text_w, text_h)
+            out["cells"] = [out["text_box"]] if count else []
+        else:
+            out["text_box"] = _box((width - ELEC_WIDTH) / 2, top, ELEC_WIDTH, ch)
+    return out
 
 
 BAR_COLUMN = (f"layout: {{type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, "
@@ -2140,6 +2201,40 @@ def _read_package(relative: str) -> bytes:
     return path.read_bytes()
 
 
+def secrets_yaml(config: dict, display_id: str, wifi: dict, entry: dict) -> str:
+    """The text of the project's secrets.yaml for these Wi-Fi and per-display credentials."""
+    values = {"wifi_ssid": wifi["ssid"], "wifi_password": wifi["password"],
+              "mqtt_host": config["mqtt_host"], "mqtt_password": entry["mqtt_password"],
+              "ota_password": entry["ota_password"]}
+    if config["displays"][display_id].get("home_assistant_api", False):
+        values["api_encryption_key"] = entry["api_encryption_key"]
+    return render_secrets_yaml(values)
+
+
+def source_files(config: dict, registry: dict, display_id: str) -> dict:
+    """The rendered project without secrets.yaml and README.txt (what ``firmware.source_hash`` covers).
+
+    Pure and read-only: ``collect`` adds the secrets and README on top, ``display show`` compares it
+    with the stored firmware manifest without touching any credential.
+    """
+    display = config["displays"][display_id]
+    package = registry["boards"][display["board"]]["esphome_package"]
+    prefix = display_id
+    files: dict = {}
+    files[f"{prefix}/{package}"] = _read_package(package)
+    files[f"{prefix}/app/vesselstack.yaml"] = _read_package("app/vesselstack.yaml")
+    if display.get("home_assistant_api", False):
+        files[f"{prefix}/app/api.yaml"] = _read_package("app/api.yaml")
+    fonts = sorted(FONT_FILES.values()) + [FONT_LICENSE]
+    if display_has_icons(effective_config(config), display):
+        fonts += [ICON_FONT_FILE, ICON_FONT_LICENSE]
+    for font in fonts:
+        files[f"{prefix}/fonts/{font}"] = _read_package(f"fonts/{font}")
+    device = render_device_yaml(config, registry, display_id, board_package=package)
+    files[f"{prefix}/{display_id}.yaml"] = device.encode("utf-8")
+    return files
+
+
 def collect(ctx, display_id: str, allow_missing_wifi: bool = False) -> Rendered:
     """Validate everything and build the in-memory project (generates missing secrets)."""
     registry = lifecycle.load_registry()
@@ -2162,34 +2257,16 @@ def collect(ctx, display_id: str, allow_missing_wifi: bool = False) -> Rendered:
             result.warnings.append(PLACEHOLDER_NOTE)
         entry = ensure_display_secrets(cfg_dir, secret_data, display_id)
     display = config["displays"][display_id]
-    board_id = display["board"]
-    board = registry["boards"][board_id]
-    package = board["esphome_package"]
     host = config["mqtt_host"]
     if host.lower().endswith(".local"):
         result.warnings.append(
             f"mqtt_host {host!r} is an mDNS name. ESP-IDF builds resolve .local names through "
             "lwIP's mDNS query hook, but that is not verified on the display hardware and fails on "
             "networks that block multicast; prefer a fixed IP address or a DNS name")
+    result.files.update(source_files(config, registry, display_id))
     files = result.files
     prefix = display_id
-    files[f"{prefix}/{package}"] = _read_package(package)
-    files[f"{prefix}/app/vesselstack.yaml"] = _read_package("app/vesselstack.yaml")
-    if display.get("home_assistant_api", False):
-        files[f"{prefix}/app/api.yaml"] = _read_package("app/api.yaml")
-    fonts = sorted(FONT_FILES.values()) + [FONT_LICENSE]
-    if display_has_icons(effective_config(config), display):
-        fonts += [ICON_FONT_FILE, ICON_FONT_LICENSE]
-    for font in fonts:
-        files[f"{prefix}/fonts/{font}"] = _read_package(f"fonts/{font}")
-    device = render_device_yaml(config, registry, display_id, board_package=package)
-    files[f"{prefix}/{display_id}.yaml"] = device.encode("utf-8")
-    secret_values = {"wifi_ssid": wifi["ssid"], "wifi_password": wifi["password"],
-                     "mqtt_host": host, "mqtt_password": entry["mqtt_password"],
-                     "ota_password": entry["ota_password"]}
-    if display.get("home_assistant_api", False):
-        secret_values["api_encryption_key"] = entry["api_encryption_key"]
-    files[f"{prefix}/secrets.yaml"] = render_secrets_yaml(secret_values).encode("utf-8")
+    files[f"{prefix}/secrets.yaml"] = secrets_yaml(config, display_id, wifi, entry).encode("utf-8")
     files[f"{prefix}/README.txt"] = readme_text(display_id, display, bool(result.warnings)).encode("utf-8")
     return result
 
@@ -2350,7 +2427,7 @@ def build_lock(ctx, display_id: str, create: bool = True, notify=None, timeout=N
                 if exc.errno not in (errno.EAGAIN, errno.EACCES):
                     raise
             if time.monotonic() >= deadline:
-                raise RenderError(f"another build/flash for {display_id} is running (waited "
+                raise BuildBusy(f"another build/flash for {display_id} is running (waited "
                                   f"{timeout:g} s); try again when it has finished")
             if not told:
                 notify(f"another build/flash for {display_id} is running; waiting up to "

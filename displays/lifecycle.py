@@ -194,13 +194,17 @@ def read_secrets(cfg_dir: ConfigDir) -> dict:
     return data
 
 
+def config_text(config: dict) -> str:
+    """The exact text ``write_config`` stores (and whose sha256 is the configuration revision)."""
+    return json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+
+
 def write_config(cfg_dir: ConfigDir, config: dict, registry: dict) -> None:
     errors = schema.validate_config(config, registry)
     if errors:
         raise LifecycleError(
             f"the resulting {DISPLAYS_NAME} would be invalid ({errors[0]}); nothing written", 2)
-    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
-    cfg_dir.write_text(DISPLAYS_NAME, text, DISPLAYS_MODE)
+    cfg_dir.write_text(DISPLAYS_NAME, config_text(config), DISPLAYS_MODE)
 
 
 def write_secrets(cfg_dir: ConfigDir, data: dict) -> None:

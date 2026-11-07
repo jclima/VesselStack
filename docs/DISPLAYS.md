@@ -206,6 +206,12 @@ sudo vesselstackctl display remove helm --yes
 | `flash ID (--serial DEVICE \| --ota HOST) [--previous] [--force]` | Optional. Uploads the stored firmware (never compiles) over USB serial or Wi-Fi; `--previous` rolls back; refuses firmware built with credentials that are no longer current unless `--force`. Root. |
 | `themes [--json]` | Nothing. Lists the display themes with a one-line description; `--json` prints the full palettes. `displayctl.py themes` itself needs no root; through `vesselstackctl` run it with `sudo` like the other `display` commands. See [Themes](#themes). |
 | `set-theme ID THEME` | Root. Sets `displays.ID.ui.theme` in `displays.json` (validated and written atomically like the other changing commands); `classic` deletes the key instead (and the `ui` object when that leaves it empty), so the file stays readable by older versions. An unknown theme or display is refused with exit status 2 and the valid ids. It takes the per-display build lock first and the configuration lock inside it (see the lock table below), so it waits for a running build or flash of that display (30 s). It changes nothing on the device: it prints the next steps, `display build ID` then `display flash ID ...`. Setting the theme a display already has changes nothing. |
+| `catalog [--live] [--json]` | Nothing. The data list a page can pick from: about forty common Signal K values (see [Data catalog](#data-catalog)), each with the right unit for `BOAT_UNITS`, merged with what is already in `displays.json`. `--live` also asks the configured `SIGNALK_URL` once which values really have data. `--json` is what the Control Panel reads. Needs no root if `displays.json` is readable. |
+| `show ID [--json]` | Nothing. Everything needed to edit one display: its pages, `ui` and theme, the board geometry, the layouts the board offers (capacity, minimum items, accepted item types, electrical slot roles), a preview box for every item computed by `render.py` (the Control Panel never repeats layout maths), the configuration `revision` (sha256 of `displays.json`) and a `readiness` block (displays enabled, MQTT password and Wi-Fi stored as yes/no, MQTT reachable from the network, Docker, ESPHome image and toolchain cache present, free disk bytes, stored firmware `none`/`current`/`outdated`, last flash). Never prints a secret value. |
+| `set-pages ID --if-revision SHA --stdin` | Root. Replaces the pages of a display from a JSON request on standard input (`{"pages": [...], "theme"?, "new_instruments"?, "new_notifications"?, "instrument_edits"?}`) and prints a JSON result. See [Editing pages](#editing-pages-backups-and-restore). |
+| `history [--json]` | Root. Lists the `displays.json` backups, newest first. |
+| `restore-config STAMP [--if-revision SHA]` | Root. Puts the backup `STAMP` back as `displays.json` (validated; the file it replaces is backed up first) and prints a JSON result. |
+| `serial-ports [--json]` | Nothing. The USB serial devices under `/dev/serial/by-id` that `flash --serial` would accept. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it and also deletes `secrets.yaml` from every already rendered tree of every display id under `build/displays/` (`ID/project`, `ID/project.new`, `ID/project.prev`, an old-layout `ID/secrets.yaml`, and the old siblings `ID.new/` and `ID.prev/`), each under that display's build lock without following symlinks (a display whose build is running is skipped with a warning); it does this even when no Wi-Fi credentials were stored, so a rerun after a failed or partial clear still cleans up; a changed password prints a notice instead. In both cases projects rendered and firmware built earlier still contain the old Wi-Fi credentials until `render`/`build` runs again (the firmware cannot be scrubbed; `flash` refuses it without `--force`). Nothing is echoed. |
 | `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the Signal K link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
@@ -246,6 +252,91 @@ is removed when it ends.
 Rollback: `remove` and `rotate` are not reversible (the old password is gone);
 restore `config/displays.json` and `config/displays.secrets.json` from a
 `vesselstackctl backup` archive and run `vesselstackctl display sync-mqtt`.
+
+## Data catalog
+
+`displays/catalog.json` (schema 1, read by `displays/catalog.py`, standard library only) lists the common
+Signal K values a page can show, so the Control Panel Displays tab can offer a list instead of asking
+you to type paths. Each entry has a `key`, a `path` (a `*` segment stands for an instance: `electrical.batteries.*.voltage`),
+a `group` (Navigation, Wind, Depth & water, Electrical, Tanks, Engine, Environment, Notifications), a `label`
+(`{0}` is the matched instance), an `icon` from [Icons](#icons), a `quantity`, `precision`, `stale_after_s`,
+optional `min_interval_ms`, a `range` per unit system (used as the instrument `min`/`max`, so the entry can
+sit on a bar or an arc) and `suggested_thresholds` per unit system. The catalog has 38 instruments and 4
+notifications (anchor, man overboard, fire, flooding).
+
+The quantity decides the conversion and unit from `BOAT_UNITS` (`metric` or `us_customary`; the legacy
+`nautical` value is read as `metric`, like the rest of VesselStack; unset or anything else is
+`us_customary`): depth `m` or `ft`, temperature `K->C` or `K->F`, fluid pressure `bar` or `psi`, barometric
+pressure `hPa`, volume `L` or `gal`, flow `L/h` or `gal/h`, speed `kn`, heading `deg_360`, angle `deg_signed`,
+ratio `%`, `rpm`, charge `Ah`, distance `nmi`, engine hours `h`; volts, amperes and watts are shown as they
+are. Only conversions that exist in `displays/conversions.py` are used.
+
+**Live data.** `catalog --live` makes one `GET {SIGNALK_URL}/signalk/v1/api/vessels/self` (Bearer token only when
+`DISPLAYS_SIGNALK_TOKEN` is set, redirects refused, 5 s timeout, 4 MiB cap, no proxy) and keeps only
+`{path, si_units, age_s, value}` of numeric leaves, plus the names (never the text) of active
+notifications. Positions (`*.position*`), destinations, `navigation.anchor.position`, and anything named
+`mmsi`, `uuid`, `name` or `callsign` are never kept, and the raw document is neither stored nor cached.
+Only the configured `SIGNALK_URL` is contacted. If the server cannot be reached the command still succeeds and
+says why (`live.ok` is false). Concrete entries are marked `live` or `no_live_data`; a wildcard entry
+expands to one row per live match (`electrical.batteries.house.voltage`, `...start.voltage`), or appears once
+as a template with a default instance you can edit (`house`, `main`, `0`); live numeric values the catalog
+does not know come under **Uncatalogued** with defaults taken from `meta.units`: no limits, no icon, the last path
+segment as the label (16 characters, glyphs the display font lacks removed), unit `none` and no unit text when
+the units are unknown. A row already in `displays.json` (same path and conversion) is shown as configured and
+lists the displays that use it, never added twice.
+
+**Suggested limits are never applied by default.** An instrument with `thresholds` counts in the boat-wide alarm
+summary and can raise the alarm banner and take over the screen, so `suggested_thresholds` are shown as
+suggestions only; a row's `definition` has none, and `materialise(..., apply_thresholds=True)` is the only way
+to get them. New notifications are written with `"alarm": false` for the same reason. Oil pressure has no
+suggestion because it reads 0 with the engine stopped.
+
+## Editing pages, backups and restore
+
+The Control Panel Displays tab calls only fixed `vesselstackctl display ...` commands. The write commands
+(`set-pages`, `restore-config`) print JSON; a failure prints `{"ok": false, "code": N, "errors": [...]}` on
+standard output and the first error on standard error.
+
+| Exit status | Meaning |
+| --- | --- |
+| `0` | Done. |
+| `1` | Operational error (not root, configuration lock timeout, unreadable files). |
+| `2` | Invalid request or configuration: the `errors` list holds every problem; nothing was written. |
+| `3` | `--if-revision` no longer matches `displays.json` (someone changed it); `current_revision` is in the reply. |
+| `4` | A build or flash for the display is running; try again when it has finished. |
+
+`set-pages` takes the per-display build lock **without waiting** (a running build or flash makes it refuse with
+status 4, unlike `set-theme`, which waits 30 s), then the configuration lock, checks the revision, applies
+the request to a copy, validates the whole result (`schema.validate_config` and the font glyph check) and writes it
+atomically with `lifecycle.write_config`. The request is `pages` (required, replaces the display's pages),
+`theme` (a theme id; `classic` removes the key), `new_instruments` and `new_notifications` (id to definition; an existing id with
+a different definition is refused), and `instrument_edits` (id to `{field: value}`, `null` removes a field;
+`path` cannot be edited). The result has `changed`, the new `revision`, the `backup` stamp, `added_instruments`,
+`added_notifications`, `new_alarm_sources` (items that now count in the alarm summary), `rebuild_needed` (displays
+whose firmware would change: rebuild and reflash them) and `bridge_restart`.
+
+The displays bridge reads `displays.json` only when it starts (`bridge.main` loads it once). So when anything the
+bridge reads changed (instruments, notifications, Home Assistant items, heartbeat, night schedule, or whether any display wants the
+clock through `ui.header` or `ui.night`; not pages or themes), and `DISPLAYS_ENABLE=true`, the command runs `systemctl try-restart vesselstack-displays-bridge.service`.
+`bridge_restart` is `not_needed`, `skipped_displays_disabled`, `restarted` or `failed: ...` (the file is written either way; restart
+the bridge by hand if it failed). A change to pages or the theme alone never restarts it.
+
+**Backups.** Before every change `set-pages` and `restore-config` copy the current `displays.json` to
+`$VESSELSTACK_ROOT/config/displays-backups/displays-STAMP.json` (`STAMP` is UTC `YYYYMMDDTHHMMSSZ`, with `-2`,
+`-3` for changes within one second). The directory is `root` `0700`, the files `0600`, symlinks are refused, and the newest 20
+are kept. The backups hold the same content as `displays.json` and no secrets, are included in `vesselstackctl backup`
+with the rest of `config/`, and are never committed (`displays-backups` is in `.gitignore` and `scripts/check-public-tree.py`).
+`history` lists them (stamp, size, revision); `restore-config STAMP` accepts only a strictly formed stamp of an existing backup,
+validates it against the current version (a backup that is no longer valid is refused with status 2), backs the current file up
+and writes the backup byte for byte. **Rollback** of any edit: `sudo vesselstackctl display history`, then
+`sudo vesselstackctl display restore-config STAMP`; rebuild and reflash the displays named in `rebuild_needed` if the firmware
+was already rebuilt.
+
+`show` reads the stored firmware manifest and compares it with a read-only re-render (no secret is created or printed):
+`outdated` means the configuration (or, when Wi-Fi and credentials are complete, the credentials) changed since it was built.
+Without root the build folder is unreadable and the status is `unknown`. `last_flash` is read from
+`build/displays/ID/last-flash.json` when a future release writes one (only `at`, `method`, `ok`, `firmware_built_at` and `error`
+are passed on); its absence is normal.
 
 ## Firmware: generate, build and flash
 
@@ -293,7 +384,7 @@ Where files live:
 | Path | Owner | Mode | Notes |
 | --- | --- | --- | --- |
 | `$VESSELSTACK_ROOT/build/` and `build/displays/` | `root:root` | `0700` | Deliberately **not** under `$VESSELSTACK_DATA` (service-user owned: root writing there is a symlink hazard). Created and swapped with directory-relative, no-follow operations; a symlink anywhere in the path is refused. Files the build container produced are read only after a regular-file check and with `O_NONBLOCK|O_NOFOLLOW`, so a FIFO planted at an artifact path is refused instead of hanging the build. |
-| `build/displays/.ID.lock` | `root:root` | `0600` | Per-display build lock (no-follow `flock`). `render`, `export`, `build`, `flash` (and `remove`) of the same display hold it for their whole run, so two of them can never delete, rename or half-read each other's tree, or let a build rotate `firmware/` while `flash` is uploading it. A second command waits, says so, and fails after 30 s with "another build/flash for ID is running" (builds are long; try again when the first has finished). Different displays do not block each other. It is separate from the 10 s `config/.displays.lock`; the build lock is always taken first and the configuration lock only briefly inside it, so the two cannot deadlock. The empty lock file stays in place; it holds no data. |
+| `build/displays/.ID.lock` | `root:root` | `0600` | Per-display build lock (no-follow `flock`). `render`, `export`, `build`, `flash` (and `remove`) of the same display hold it for their whole run, so two of them can never delete, rename or half-read each other's tree, or let a build rotate `firmware/` while `flash` is uploading it. A second command waits, says so, and fails after 30 s with "another build/flash for ID is running" (builds are long; try again when the first has finished). Different displays do not block each other. `set-pages` and `restore-config` take it without waiting and refuse with exit status 4 instead. It is separate from the 10 s `config/.displays.lock`; the build lock is always taken first and the configuration lock only briefly inside it, so the two cannot deadlock. The empty lock file stays in place; it holds no data. |
 | `build/displays/ID/project/` | `root:root` | dirs `0700`, files `0600` | The self-contained ESPHome project, including `secrets.yaml`, and the **only** directory the compile container mounts (as `/config`, writable, so never trusted afterwards: `flash` re-renders into a private staging directory instead). Rendering again keeps the previous project as `project.prev/` (one generation). |
 | `build/displays/ID/firmware/` and `firmware.prev/` | `root:root` | dirs `0700`, files `0600` | Only after `display build`: `firmware.factory.bin`, `firmware.ota.bin` and `manifest.json` of the newest and the previous build. They sit **beside** `project/`, never inside it and never mounted into a container, so a compromised build (the toolchain and components are downloaded into a persistent cache) cannot rewrite the stored images or their manifests, nor poison the `--previous` rollback. `render` replaces only `project/` and never touches these directories. |
 
@@ -1369,7 +1460,9 @@ dark amber `#8A5A00` with white text.
 `set-theme ID classic` (it removes the key), then `display build ID` and `display flash ID ...`, or
 flash the previous firmware (`display flash ID --previous`). **Run `set-theme ID classic` on every
 display before downgrading VesselStack to a version without themes**: those versions reject the
-`theme` key as unknown, so the configuration is invalid and the displays bridge exits at start-up.
+`theme` key as unknown (checked against 0.6.1: `$.displays.helm.ui.theme: unknown key`), so the configuration
+is invalid and the displays bridge exits at start-up with status 2, which its systemd unit does not restart
+(`RestartPreventExitStatus=2 3`). A backup from `displays-backups` taken before the theme was set is another way back.
 Restoring only `displays/themes.json` and `displays/render.py` is not enough for the same reason.
 
 ### Board registry schema 2

@@ -15,6 +15,9 @@ Pure-logic core for configurable live-instrument displays. The full reference is
 - `firmware.py` - `build` and `flash`: optional on-host firmware compile and upload in one-shot containers of the pinned ESPHome image (stored firmware plus `manifest.json` beside, not inside, the mounted `project/`; per-display build lock; sha256 and credential fingerprint verified before every flash, which uploads a private verified copy and never recompiles)
 - `mqtt_auth.py` - MQTT account, secrets and ACL rendering used by `sync-mqtt`
 - `boards/registry.json` - supported boards and layouts
+- `catalog.json` - the data a page can show: about forty common Signal K paths with label, icon, quantity, ranges and (never applied by default) suggested thresholds ([docs/DISPLAYS.md](../docs/DISPLAYS.md#data-catalog))
+- `catalog.py` - loads and validates `catalog.json`, `fetch_live` (one read-only request to the configured Signal K server, numeric leaves only, no positions/MMSI/names, nothing stored), `merged_catalog` and `materialise`; standard library only
+- `editor.py` - the Control Panel's backend behind `displayctl.py catalog|show|set-pages|history|restore-config|serial-ports`: JSON results, non-blocking build lock, revision check (exit 3), validated writes with 20 rotated backups in `config/displays-backups/`, bridge restart when the bridge's input changed
 - `themes.json` - display colour/shape themes (`classic`, `high-contrast`, `daylight`, `ocean`; chosen per display with `ui.theme`), loaded and validated by `schema.load_themes()` and consumed by `render.py` ([docs/DISPLAYS.md](../docs/DISPLAYS.md#themes))
 - `displays.example.json` - example configuration (runtime `displays.json` is never committed)
 

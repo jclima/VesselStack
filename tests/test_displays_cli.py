@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import importlib.util
 import io
 import json
 import os
@@ -16,10 +17,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "displays"))
+sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 
+import catalog  # noqa: E402
 import displayctl  # noqa: E402
+import editor  # noqa: E402
+import fake_signalk  # noqa: E402
+import firmware  # noqa: E402
 import lifecycle  # noqa: E402
 import mqtt_auth  # noqa: E402
+import render  # noqa: E402
+import schema  # noqa: E402
 
 EXAMPLE = json.loads((ROOT / "displays" / "displays.example.json").read_text())
 BOARD = "waveshare-esp32-s3-touch-lcd-2.8c"
@@ -875,5 +883,645 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
+SK_TOKEN = "signalk-token-secret"
+
+
+class EditorTests(unittest.TestCase):
+    """catalog / show / set-pages / history / restore-config / serial-ports."""
+
+    write_config = CliTests.write_config
+    ctx = CliTests.ctx
+    cfg = CliTests.cfg
+    sec = CliTests.sec
+    add = CliTests.add
+    output = CliTests.output
+    run_cli = CliTests.run_cli
+    make_build_tree = CliTests.make_build_tree
+
+    def setUp(self):
+        CliTests.setUp(self)
+        self.add("helm")
+        secrets = self.sec()
+        secrets["wifi"] = {"ssid": "boat-net-ssid", "password": WIFI_PASSWORD}
+        self.secrets.write_text(json.dumps(secrets))
+        self.backups = self.root / "config" / editor.BACKUP_DIR
+        self.runner.calls.clear()
+
+    # --- helpers ---
+
+    def revision(self):
+        return editor.revision_of(self.config.read_text())
+
+    def pages(self, title="Nav", items=("sog", "depth"), layout="grid-2x2"):
+        return [{"title": title, "layout": layout, "items": list(items)}]
+
+    def set_pages(self, payload, rev=None, ctx=None, display="helm"):
+        return editor.set_pages(ctx or self.ctx(), display, rev or self.revision(), json.dumps(payload))
+
+    def run_stdin(self, text, *argv, **env):
+        stdin = io.TextIOWrapper(io.BytesIO(text.encode()), encoding="utf-8")
+        with mock.patch.object(sys, "stdin", stdin):
+            return self.run_cli(*argv, **env)
+
+    def restarts(self):
+        return [c for c in self.runner.calls if c[:1] == ["systemctl"]]
+
+    def stamps(self):
+        return sorted(p.name for p in self.backups.iterdir())
+
+    # --- show ---
+
+    def test_show_describes_the_display_the_board_and_the_layouts(self):
+        info = editor.show(self.ctx(), "helm")
+        self.assertEqual(info["revision"], self.revision())
+        self.assertEqual(info["display"]["id"], "helm")
+        self.assertEqual(info["theme"], "classic")
+        self.assertEqual([t["id"] for t in info["themes"]], ["classic", "daylight", "high-contrast", "ocean"])
+        board = info["board"]
+        self.assertEqual((board["width"], board["height"], board["shape"]), (480, 480, "round"))
+        self.assertEqual(board["content_width"], 340)
+        self.assertEqual(sorted(info["layouts"]), sorted(board["layouts"]))
+        self.assertNotIn("list-6", info["layouts"])
+        self.assertEqual(info["layouts"]["grid-2x2"]["capacity"], 4)
+        self.assertTrue(info["layouts"]["tank-bars"]["needs_range"])
+        self.assertEqual([s["role"] for s in info["layouts"]["electrical"]["slots"]],
+                         ["voltage", "soc", "current", "shore", "solar"])
+        self.assertEqual(info["layouts"]["electrical"]["min_items"], 3)
+        self.assertEqual(info["layouts"]["status-grid"]["types"], ["instrument", "notification", "ha"])
+        self.assertEqual(len(info["preview"]), len(info["display"]["pages"]))
+        self.assertEqual(info["preview"][0]["layout"], "grid-2x2")
+        self.assertEqual(len(info["preview"][0]["cells"]), 4)
+        self.assertEqual(info["instruments"]["sog"]["used_on"], ["helm"])
+        self.assertEqual(info["alarm_sources"], [])
+
+    def test_preview_geometry_is_computed_by_the_render_helpers(self):
+        board = schema.load_registry()["boards"][BOARD]
+        grid = render.preview_geometry(board, "status-grid", 9, header=True)
+        cell_w, cell_h = render.status_cell_size(340, 340, 9)
+        self.assertEqual((grid["cells"][0]["width"], grid["cells"][0]["height"]), (cell_w, cell_h))
+        self.assertEqual(grid["cells"][1]["x"] - grid["cells"][0]["x"], cell_w + render.STATUS_GAP)
+        self.assertEqual(grid["header"]["y"], board["ring"]["header_y"])
+        arc = render.preview_geometry(board, "gauge-arc", 1, header=True)["arc"]
+        self.assertEqual(arc["diameter"], render.gauge_diameter(board))
+        self.assertEqual(arc["start_angle"], render.ARC_START_GAP_TOP)
+        self.assertEqual(render.preview_geometry(board, "gauge-arc", 1)["arc"]["start_angle"],
+                         render.ARC_START_GAP_BOTTOM)
+        bars = render.preview_geometry(board, "tank-bars", 3)["cells"]
+        self.assertEqual(len(bars), 3)
+        self.assertEqual(bars[0]["width"], min(render.BAR_WIDTH, render.bar_column_width(340, 3)))
+
+    def test_show_json_never_contains_a_secret_value(self):
+        secrets = self.sec()
+        values = [WIFI_PASSWORD, ADMIN_PASSWORD, "boat-net-ssid", SK_TOKEN,
+                  *secrets["displays"]["helm"].values()]
+        self.assertTrue(all(isinstance(v, str) and len(v) > 8 for v in values))
+        ctx = self.ctx(runner=self.runner)
+        ctx.env["DISPLAYS_SIGNALK_TOKEN"] = SK_TOKEN
+        ctx.env["SIGNALK_URL"] = "http://192.0.2.5:3000"
+        text = json.dumps(editor.show(ctx, "helm"))
+        for value in values:
+            self.assertNotIn(value, text)
+        self.assertNotIn("192.0.2.5", text)
+        ready = json.loads(text)["readiness"]
+        self.assertIs(ready["mqtt_password_stored"], True)
+        self.assertIs(ready["wifi_stored"], True)
+        code, out, err = self.run_cli("show", "helm", "--json", "--allow-non-root", DISPLAYS_SIGNALK_TOKEN=SK_TOKEN)
+        self.assertEqual(code, 0, err)
+        for value in values:
+            self.assertNotIn(value, out)
+
+    def test_show_readiness_flags(self):
+        ready = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]
+        self.assertIs(ready["displays_enabled"], True)
+        self.assertIs(ready["docker_available"], True)
+        self.assertIs(ready["esphome_image_present"], True)
+        self.assertFalse(ready["data_bind_non_loopback"])
+        self.assertIn("lan", ready["data_bind_hint"])
+        self.assertEqual(ready["firmware"]["status"], "none")
+        self.assertIsNone(ready["last_flash"])
+        self.assertIsInstance(ready["free_disk_bytes"], int)
+        ctx = self.ctx(runner=self.runner)
+        ctx.env["VESSELSTACK_DATA_BIND_ADDRESS"] = "192.0.2.10"
+        ready = editor.show(ctx, "helm")["readiness"]
+        self.assertTrue(ready["data_bind_non_loopback"])
+        self.assertIsNone(ready["data_bind_hint"])
+        for loopback in ("127.0.0.1", "127.0.1.1", "::1", "localhost"):
+            ctx.env["VESSELSTACK_DATA_BIND_ADDRESS"] = loopback
+            self.assertFalse(editor.show(ctx, "helm")["readiness"]["data_bind_non_loopback"], loopback)
+
+    def test_show_readiness_without_docker_wifi_or_secrets(self):
+        secrets = self.sec()
+        del secrets["wifi"]
+        self.secrets.write_text(json.dumps(secrets))
+        failing = mock.Mock(side_effect=FileNotFoundError("docker"))
+        ready = editor.show(self.ctx(runner=failing), "helm")["readiness"]
+        self.assertFalse(ready["docker_available"])
+        self.assertFalse(ready["esphome_image_present"])
+        self.assertIs(ready["wifi_stored"], False)
+        self.secrets.unlink()
+        ready = editor.show(self.ctx(runner=failing), "helm")["readiness"]
+        self.assertIs(ready["mqtt_password_stored"], False)
+
+    def firmware_manifest(self, files, **override):
+        base = self.root / "build" / "displays" / "helm"
+        (base / "firmware").mkdir(parents=True, mode=0o700, exist_ok=True)
+        manifest = {"schema": 1, "display": "helm", "built_at_utc": "2026-01-01T00:00:00Z",
+                    "esphome_version": "2026.10.0",
+                    "source_sha256": firmware.source_hash(files, "helm"),
+                    "secrets_sha256": firmware.secrets_fingerprint(files, "helm")}
+        manifest.update(override)
+        (base / "firmware" / "manifest.json").write_text(json.dumps(manifest))
+        return base
+
+    def test_show_firmware_status_current_then_outdated(self):
+        files = render.collect(self.ctx(), "helm").files
+        self.firmware_manifest(files)
+        state = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["firmware"]
+        self.assertEqual((state["status"], state["reasons"], state["credentials_checked"]),
+                         ("current", [], True))
+        self.assertEqual(state["built_at_utc"], "2026-01-01T00:00:00Z")
+        text = json.dumps(state)
+        self.assertNotIn(json.loads((self.root / "build/displays/helm/firmware/manifest.json").read_text())
+                         ["source_sha256"], text)
+        # A page change makes the stored firmware outdated.
+        self.set_pages({"pages": self.pages(items=("sog", "awa"))})
+        state = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["firmware"]
+        self.assertEqual(state["status"], "outdated")
+        self.assertIn("configuration", state["reasons"][0])
+
+    def test_show_firmware_outdated_when_credentials_changed(self):
+        files = render.collect(self.ctx(), "helm").files
+        self.firmware_manifest(files)
+        lifecycle.rotate(self.ctx(), "helm")
+        state = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["firmware"]
+        self.assertEqual(state["status"], "outdated")
+        self.assertIn("credentials", " ".join(state["reasons"]))
+
+    def test_show_last_flash_passes_only_known_keys(self):
+        files = render.collect(self.ctx(), "helm").files
+        base = self.firmware_manifest(files)
+        (base / "last-flash.json").write_text(json.dumps(
+            {"at": "2026-01-02T00:00:00Z", "method": "serial", "ok": True, "device": "/dev/ttyACM0",
+             "host": "192.0.2.77", "password": "hunter2-secret"}))
+        flash = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"]
+        self.assertEqual(flash, {"at": "2026-01-02T00:00:00Z", "method": "serial", "ok": True})
+        (base / "last-flash.json").write_text("not json")
+        self.assertIsNone(editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"])
+
+    def test_show_unknown_display_and_cli_exit_codes(self):
+        code, out, _ = self.run_cli("show", "ghost", "--json", "--allow-non-root")
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out)["ok"], False)
+        code, out, _ = self.run_cli("show", "helm", "--allow-non-root")     # text form
+        self.assertEqual(code, 0)
+        self.assertIn("Revision:", out)
+
+    # --- set-pages ---
+
+    def test_set_pages_writes_validates_backs_up_and_reports(self):
+        before = self.config.read_text()
+        result = self.set_pages({"pages": self.pages("Wind", ("awa", "sog")), "theme": "ocean"})
+        self.assertEqual((result["ok"], result["changed"]), (True, True))
+        config = self.cfg()
+        self.assertEqual(config["displays"]["helm"]["pages"][0]["items"], ["awa", "sog"])
+        self.assertEqual(config["displays"]["helm"]["ui"]["theme"], "ocean")
+        self.assertEqual(result["revision"], self.revision())
+        self.assertEqual(result["rebuild_needed"], ["helm"])
+        self.assertEqual(schema.validate_config(config, schema.load_registry()), [])
+        backup = self.backups / f"displays-{result['backup']}.json"
+        self.assertEqual(backup.read_text(), before)
+        self.assertEqual(oct(backup.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct(self.backups.stat().st_mode & 0o777), "0o700")
+        self.assertEqual(oct(self.config.stat().st_mode & 0o777), "0o644")
+
+    def test_theme_classic_removes_the_key_like_set_theme(self):
+        self.set_pages({"pages": self.pages(), "theme": "daylight"})
+        self.set_pages({"pages": self.pages(), "theme": "classic"})
+        self.assertNotIn("ui", self.cfg()["displays"]["helm"])
+
+    def test_new_instruments_and_edits(self):
+        new = {"depth_b": {"path": "environment.depth.belowKeel", "label": "Keel", "convert": "m->ft", "unit": "ft",
+                           "precision": 1, "stale_after_s": 10}}
+        result = self.set_pages({"pages": self.pages(items=("sog", "depth_b")), "new_instruments": new,
+                                 "instrument_edits": {"sog": {"precision": 2, "icon": "speed", "min_interval_ms": None}}})
+        config = self.cfg()
+        self.assertEqual(config["instruments"]["depth_b"]["path"], "environment.depth.belowKeel")
+        self.assertEqual(config["instruments"]["sog"]["precision"], 2)
+        self.assertNotIn("min_interval_ms", config["instruments"]["sog"])
+        self.assertEqual(result["added_instruments"], ["depth_b"])
+        self.assertEqual(result["new_alarm_sources"], [])
+
+    def test_edits_cannot_touch_the_path_or_unknown_fields(self):
+        for edit in ({"path": "navigation.position"}, {"bogus": 1}):
+            with self.assertRaises(editor.EditError) as caught:
+                self.set_pages({"pages": self.pages(), "instrument_edits": {"sog": edit}})
+            self.assertEqual(caught.exception.code, 2)
+        with self.assertRaises(editor.EditError):
+            self.set_pages({"pages": self.pages(), "instrument_edits": {"ghost": {"precision": 1}}})
+        with self.assertRaises(editor.EditError):   # an existing id with another definition is not overwritten
+            self.set_pages({"pages": self.pages(), "new_instruments": {"sog": {
+                "path": "navigation.speedThroughWater", "label": "STW", "convert": "none", "unit": "",
+                "precision": 1, "stale_after_s": 10}}})
+
+    def test_adding_thresholds_reports_new_alarm_sources(self):
+        result = self.set_pages({"pages": self.pages(), "instrument_edits": {
+            "depth": {"thresholds": {"alarm_below": 4, "warn_below": 8}}}})
+        self.assertEqual(result["new_alarm_sources"], ["depth"])
+
+    def test_new_notifications(self):
+        note = {"anchor": {"path": "notifications.navigation.anchor", "label": "Anchor", "absent": "ok",
+                           "alarm": False}}
+        result = self.set_pages({"pages": [{"title": "S", "layout": "status-grid", "items": ["sog", "anchor"]}],
+                                 "new_notifications": note})
+        self.assertEqual(result["added_notifications"], ["anchor"])
+        self.assertEqual(self.cfg()["notifications"]["anchor"]["alarm"], False)
+
+    def test_validation_errors_are_a_json_list_with_exit_2_and_nothing_changes(self):
+        before = self.config.read_text()
+        cases = [
+            {"pages": self.pages(items=("sog", "nope"))},
+            {"pages": self.pages(items=("sog",), layout="tank-bars")},         # no min/max
+            {"pages": self.pages(layout="warp")},
+            {"pages": []},
+            {"pages": self.pages(), "theme": "neon"},
+            {"pages": self.pages(title="✓ tick")},   # nothing wrong with a title without a header... see glyph test
+        ]
+        for payload in cases[:5]:
+            code, out, err = self.run_stdin(json.dumps(payload), "set-pages", "helm", "--if-revision",
+                                            self.revision(), "--stdin", "--allow-non-root")
+            self.assertEqual(code, 2, payload)
+            body = json.loads(out)
+            self.assertEqual((body["ok"], body["code"]), (False, 2))
+            self.assertIsInstance(body["errors"], list)
+            self.assertTrue(body["errors"])
+            self.assertEqual(self.config.read_text(), before)
+        self.assertFalse(self.backups.exists())
+
+    def test_glyph_errors_are_reported(self):
+        new = {"x": {"path": "navigation.speedOverGround", "label": "Spd✓", "convert": "none", "unit": "",
+                     "precision": 1, "stale_after_s": 10}}
+        with self.assertRaises(editor.EditError) as caught:
+            self.set_pages({"pages": self.pages(items=("x",)), "new_instruments": new})
+        self.assertIn("glyph", " ".join(caught.exception.errors))
+        self.assertFalse(self.backups.exists())
+
+    def test_bad_requests(self):
+        for text in ("not json", "[]", '{"pages": 1}', '{"pages": [], "bogus": 1}', '{"pages": [], "pages": []}',
+                     "{}", "x" * (editor.STDIN_MAX_BYTES + 1)):
+            with self.assertRaises(editor.EditError, msg=text[:20]) as caught:
+                editor.set_pages(self.ctx(), "helm", self.revision(), text)
+            self.assertEqual(caught.exception.code, 2)
+        for rev in ("", "abc", "G" * 64, "A" * 64):
+            with self.assertRaises(editor.EditError):
+                editor.set_pages(self.ctx(), "helm", rev, json.dumps({"pages": self.pages()}))
+
+    def test_wrong_revision_exits_3_and_changes_nothing(self):
+        before = self.config.read_text()
+        code, out, err = self.run_stdin(json.dumps({"pages": self.pages("Other")}), "set-pages", "helm",
+                                        "--if-revision", "0" * 64, "--stdin", "--allow-non-root")
+        self.assertEqual(code, 3)
+        body = json.loads(out)
+        self.assertEqual((body["ok"], body["code"], body["current_revision"]), (False, 3, self.revision()))
+        self.assertEqual(self.config.read_text(), before)
+        self.assertFalse(self.backups.exists())
+
+    def test_set_pages_cli_success_and_required_flags(self):
+        code, out, err = self.run_stdin(json.dumps({"pages": self.pages("Cli")}), "set-pages", "helm",
+                                        "--if-revision", self.revision(), "--stdin", "--allow-non-root")
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertEqual(json.loads(out)["revision"], self.revision())
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                displayctl.main(["set-pages", "helm", "--stdin"])
+        with self.assertRaises(SystemExit):
+            with redirect_stderr(io.StringIO()):
+                displayctl.main(["set-pages", "helm", "--if-revision", "0" * 64])
+
+    def test_a_running_build_makes_set_pages_refuse_with_exit_4(self):
+        self.make_build_tree("helm")
+        before = self.config.read_text()
+        with render.build_lock(self.ctx(), "helm"):
+            code, out, err = self.run_stdin(json.dumps({"pages": self.pages("Busy")}), "set-pages", "helm",
+                                            "--if-revision", self.revision(), "--stdin", "--allow-non-root")
+        self.assertEqual(code, 4)
+        self.assertIn("build/flash for helm is running", json.loads(out)["errors"][0])
+        self.assertEqual(self.config.read_text(), before)
+        self.assertFalse(self.backups.exists())
+        self.set_pages({"pages": self.pages("Free")})       # released: the same call now works
+
+    def test_set_pages_does_not_wait_for_the_build_lock(self):
+        import time
+        self.make_build_tree("helm")
+        with render.build_lock(self.ctx(), "helm"):
+            started = time.monotonic()
+            with self.assertRaises(editor.EditError) as caught:
+                self.set_pages({"pages": self.pages("Busy")}, ctx=self.ctx(build_lock_timeout=30.0))
+            self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(caught.exception.code, 4)
+
+    def test_set_pages_waits_for_the_config_lock_then_gives_up(self):
+        with lifecycle.ConfigDir(self.ctx()) as held:
+            held.lock()
+            with self.assertRaises(lifecycle.LifecycleError) as caught:
+                self.set_pages({"pages": self.pages("Locked")})
+        self.assertIn("another displayctl", str(caught.exception))
+
+    def test_set_pages_needs_root(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root")
+        with self.assertRaises(lifecycle.LifecycleError):
+            self.set_pages({"pages": self.pages()}, ctx=self.ctx(require_root=True))
+
+    def test_unchanged_request_is_a_noop(self):
+        current = self.cfg()["displays"]["helm"]["pages"]
+        result = self.set_pages({"pages": current})
+        self.assertEqual((result["changed"], result["backup"]), (False, None))
+        self.assertFalse(self.backups.exists())
+        self.assertEqual(self.restarts(), [])
+
+    # --- bridge restart ---
+
+    def test_bridge_restarts_only_when_what_it_reads_changes(self):
+        self.set_pages({"pages": self.pages("A")})
+        self.set_pages({"pages": self.pages("B", ("awa",)), "theme": "ocean"})
+        self.assertEqual(self.restarts(), [])
+        new = {"keel": {"path": "environment.depth.belowKeel", "label": "Keel", "convert": "none", "unit": "m",
+                        "precision": 1, "stale_after_s": 10}}
+        result = self.set_pages({"pages": self.pages("C", ("keel",)), "new_instruments": new})
+        self.assertEqual(self.restarts(), [["systemctl", "try-restart", "vesselstack-displays-bridge.service"]])
+        self.assertEqual(result["bridge_restart"], "restarted")
+        self.set_pages({"pages": self.pages("C", ("keel",)), "instrument_edits": {"keel": {"label": "Keel 2"}}})
+        self.assertEqual(len(self.restarts()), 2)
+        self.set_pages({"pages": self.pages("D", ("keel",))})
+        self.assertEqual(len(self.restarts()), 2)
+
+    def test_no_restart_when_displays_are_disabled_and_failures_are_reported(self):
+        new = {"keel": {"path": "environment.depth.belowKeel", "label": "Keel", "convert": "none", "unit": "m",
+                        "precision": 1, "stale_after_s": 10}}
+        result = self.set_pages({"pages": self.pages(items=("keel",)), "new_instruments": new},
+                                ctx=self.ctx(enabled="false"))
+        self.assertEqual(result["bridge_restart"], "skipped_displays_disabled")
+        self.assertEqual(self.restarts(), [])
+        failing = mock.Mock(return_value=subprocess.CompletedProcess([], 5, "", "boom"))
+        result = self.set_pages({"pages": self.pages("T", ("keel",)),
+                                 "instrument_edits": {"keel": {"label": "K3"}}}, ctx=self.ctx(runner=failing))
+        self.assertTrue(result["bridge_restart"].startswith("failed"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.cfg()["instruments"]["keel"]["label"], "K3")
+
+    # --- backups, history, restore ---
+
+    def test_backups_rotate_at_twenty_with_unique_stamps(self):
+        fixed = mock.Mock(return_value=editor._now().replace(year=2026, month=1, day=1, hour=0, minute=0, second=0))
+        with mock.patch.object(editor, "_now", fixed):
+            for index in range(25):
+                self.set_pages({"pages": self.pages(f"P{index}")})
+        names = self.stamps()
+        self.assertEqual(len(names), 20)
+        self.assertEqual(names[0], "displays-20260101T000000Z-10.json")      # -2 .. -5 and the first are gone
+        self.assertIn("displays-20260101T000000Z-25.json", names)
+        self.assertNotIn("displays-20260101T000000Z.json", names)
+        self.assertTrue(all(oct((self.backups / n).stat().st_mode & 0o777) == "0o600" for n in names))
+
+    def test_history_lists_newest_first_with_revisions(self):
+        stamps = iter(["20260101T000001Z", "20260101T000002Z", "20260101T000003Z"])
+        clock = mock.Mock(side_effect=lambda: __import__("datetime").datetime.strptime(
+            next(stamps), "%Y%m%dT%H%M%SZ").replace(tzinfo=__import__("datetime").timezone.utc))
+        texts = []
+        with mock.patch.object(editor, "_now", clock):
+            for index in range(3):
+                texts.append(self.config.read_text())
+                self.set_pages({"pages": self.pages(f"H{index}")})
+        info = editor.history(self.ctx())
+        self.assertEqual([b["stamp"] for b in info["backups"]],
+                         ["20260101T000003Z", "20260101T000002Z", "20260101T000001Z"])
+        self.assertEqual([b["revision"] for b in info["backups"]], [editor.revision_of(t) for t in reversed(texts)])
+        self.assertEqual(info["backups"][0]["size"], len(texts[-1].encode()))
+        self.assertEqual(info["current_revision"], self.revision())
+        code, out, _ = self.run_cli("history", "--json", "--allow-non-root")
+        self.assertEqual((code, json.loads(out)["keep"]), (0, 20))
+        code, out, _ = self.run_cli("history", "--allow-non-root")
+        self.assertIn("20260101T000003Z", out)
+
+    def test_history_without_backups_is_empty_and_creates_nothing(self):
+        self.assertEqual(editor.history(self.ctx())["backups"], [])
+        self.assertFalse(self.backups.exists())
+
+    def test_restore_puts_the_exact_backup_back_after_backing_up_the_current_file(self):
+        original = self.config.read_text()
+        first = self.set_pages({"pages": self.pages("One")})
+        self.set_pages({"pages": self.pages("Two", ("awa",))})
+        changed = self.config.read_text()
+        result = editor.restore_config(self.ctx(), first["backup"])
+        self.assertEqual(self.config.read_text(), original)
+        self.assertEqual(result["revision"], editor.revision_of(original))
+        self.assertEqual(result["previous_revision"], editor.revision_of(changed))
+        self.assertEqual((self.backups / f"displays-{result['backup']}.json").read_text(), changed)
+        self.assertEqual(result["rebuild_needed"], ["helm"])
+
+    def test_restore_cli_and_revision_guard(self):
+        first = self.set_pages({"pages": self.pages("One")})
+        code, out, _ = self.run_cli("restore-config", first["backup"], "--if-revision", "0" * 64, "--allow-non-root")
+        self.assertEqual((code, json.loads(out)["code"]), (3, 3))
+        code, out, err = self.run_cli("restore-config", first["backup"], "--if-revision", self.revision(),
+                                      "--allow-non-root")
+        self.assertEqual((code, json.loads(out)["ok"]), (0, True), err)
+
+    def test_restore_validates_the_stamp_strictly(self):
+        self.set_pages({"pages": self.pages("One")})
+        outside = self.root / "config" / "displays-evil.json"
+        outside.write_text(self.config.read_text())
+        for stamp in ("../displays", "../../etc/passwd", "20260101T000000Z/../x", "20260101T000000", "", "latest",
+                      "20260101T000000Z-", "20260101T000000Zx", "2026-01-01", "20260101T000000Z.json", " 20260101T000000Z",
+                      "20260101T000000Z\n", "..", ".", "/etc/passwd", "evil"):
+            code, out, _ = self.run_cli("restore-config", stamp, "--allow-non-root")
+            self.assertEqual(code, 2, repr(stamp))
+            self.assertEqual(json.loads(out)["code"], 2)
+        code, out, _ = self.run_cli("restore-config", "20990101T000000Z", "--allow-non-root")
+        self.assertEqual(code, 2)
+        self.assertIn("no backup", json.loads(out)["errors"][0])
+
+    def test_restore_refuses_a_backup_that_is_no_longer_valid(self):
+        self.set_pages({"pages": self.pages("One")})
+        bad = json.loads(self.config.read_text())
+        bad["displays"]["helm"]["board"] = "no-such-board"
+        (self.backups / "displays-20260101T000000Z.json").write_text(json.dumps(bad))
+        (self.backups / "displays-20260101T000001Z.json").write_text("{not json")
+        before = self.config.read_text()
+        for stamp in ("20260101T000000Z", "20260101T000001Z"):
+            code, out, _ = self.run_cli("restore-config", stamp, "--allow-non-root")
+            self.assertEqual(code, 2, stamp)
+            self.assertEqual(self.config.read_text(), before)
+
+    def test_restore_waits_for_no_build_and_restarts_the_bridge_for_instrument_changes(self):
+        base = self.set_pages({"pages": self.pages("One")})
+        new = {"keel": {"path": "environment.depth.belowKeel", "label": "Keel", "convert": "none", "unit": "m",
+                        "precision": 1, "stale_after_s": 10}}
+        self.set_pages({"pages": self.pages("Two", ("keel",)), "new_instruments": new})
+        self.runner.calls.clear()
+        self.make_build_tree("helm")
+        with render.build_lock(self.ctx(), "helm"):
+            with self.assertRaises(editor.EditError) as caught:
+                editor.restore_config(self.ctx(), base["backup"])
+        self.assertEqual(caught.exception.code, 4)
+        self.assertEqual(self.restarts(), [])
+        result = editor.restore_config(self.ctx(), base["backup"])
+        self.assertNotIn("keel", self.cfg()["instruments"])
+        self.assertEqual(result["bridge_restart"], "restarted")
+        self.assertEqual(len(self.restarts()), 1)
+
+    # --- serial ports ---
+
+    def test_serial_ports_lists_only_devices_flash_would_accept(self):
+        by_id = Path(self._tmp.name) / "by-id"
+        by_id.mkdir()
+        for name in ("usb-Fake_Board_0001-if00", "usb-Other-if00", "bad-link"):
+            (by_id / name).write_text("")
+        import stat as stat_module
+
+        def lstat(path):
+            mode = stat_module.S_IFLNK if "by-id" in path else stat_module.S_IFCHR
+            return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+        def realpath(path):
+            return "/dev/ttyACM0" if "Fake_Board" in path else "/dev/sda" if "bad-link" in path else "/dev/ttyUSB0"
+
+        info = editor.serial_ports(self.ctx(), by_id=by_id, lstat=lstat, realpath=realpath)
+        self.assertEqual([p["device"] for p in info["ports"]], ["/dev/ttyACM0", "/dev/ttyUSB0"])
+        self.assertTrue(all(p["path"].startswith("/dev/serial/by-id/") for p in info["ports"]))
+        self.assertEqual(editor.serial_ports(self.ctx(), by_id=Path(self._tmp.name) / "missing")["ports"], [])
+        code, out, _ = self.run_cli("serial-ports", "--json", "--allow-non-root")
+        self.assertEqual(code, 0)
+        self.assertIn("ports", json.loads(out))
+
+    # --- catalog ---
+
+    def serve(self, **kw):
+        server, _thread = fake_signalk.serve_rest(0, **kw)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, f"http://127.0.0.1:{server.server_port}"
+
+    def test_catalog_cli_without_live_data(self):
+        code, out, err = self.run_cli("catalog", "--json", "--allow-non-root", BOAT_UNITS="metric")
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual((data["schema"], data["units"]), (1, "metric"))
+        self.assertEqual(data["live"], {"requested": False, "ok": None, "error": None, "truncated": False,
+                                        "leaf_count": 0, "notification_count": 0})
+        rows = {r["row_id"]: r for r in data["rows"]}
+        self.assertEqual(rows["depth"]["convert"], "none")
+        self.assertEqual(rows["sog"]["configured_as"], "sog")          # the example config already has it
+        self.assertEqual(rows["sog"]["used_on"], ["helm"])
+        self.assertTrue(all(r["live_state"] == "unknown" for r in data["rows"]))
+        self.assertEqual(data["groups"][0], "Navigation")
+        code, out, _ = self.run_cli("catalog", "--allow-non-root", BOAT_UNITS="")
+        self.assertEqual(code, 0)
+        self.assertIn("Navigation", out)
+        code, out, _ = self.run_cli("catalog", "--json", "--allow-non-root")
+        self.assertEqual(json.loads(out)["units"], "us_customary")
+        code, out, _ = self.run_cli("catalog", "--json", "--allow-non-root", BOAT_UNITS="nautical")
+        self.assertEqual(json.loads(out)["units"], "metric")
+
+    def test_catalog_cli_live_filters_private_data_and_hides_the_token(self):
+        server, url = self.serve(token=SK_TOKEN)
+        code, out, err = self.run_cli("catalog", "--live", "--json", "--allow-non-root", SIGNALK_URL=url,
+                                      DISPLAYS_SIGNALK_TOKEN=SK_TOKEN, BOAT_UNITS="us_customary")
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertTrue(data["live"]["ok"])
+        self.assertGreater(data["live"]["leaf_count"], 10)
+        for secret in (*[getattr(fake_signalk, n) for n in ("FAKE_MMSI", "FAKE_NAME", "FAKE_CALLSIGN", "FAKE_UUID",
+                                                           "FAKE_DESTINATION")], "latitude", "longitude", SK_TOKEN):
+            self.assertNotIn(secret, out)
+            self.assertNotIn(secret, err)
+        rows = {r["row_id"]: r for r in data["rows"]}
+        self.assertEqual(rows["depth"]["convert"], "m->ft")
+        self.assertEqual(rows["depth"]["live_state"], "live")
+        self.assertEqual(rows["batt_voltage:house"]["live_state"], "live")
+        self.assertIn("Uncatalogued", data["groups"])
+        self.assertEqual(server.handler_class.seen[-1][1], f"Bearer {SK_TOKEN}")
+
+    def test_catalog_cli_with_an_unreachable_server_reports_the_error(self):
+        server, url = self.serve()
+        server.shutdown()
+        server.server_close()
+        code, out, _ = self.run_cli("catalog", "--live", "--json", "--allow-non-root", SIGNALK_URL=url)
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["live"]["ok"], False)
+        self.assertTrue(data["live"]["error"])
+        self.assertEqual(len(data["rows"]), 42)
+
+    def test_catalog_only_asks_the_configured_server(self):
+        server, url = self.serve()
+        other, other_url = self.serve()
+        self.run_cli("catalog", "--live", "--json", "--allow-non-root", SIGNALK_URL=url)
+        self.assertEqual(len(server.handler_class.seen), 1)
+        self.assertEqual(other.handler_class.seen, [])
+        code, out, _ = self.run_cli("catalog", "--live", "--json", "--allow-non-root", SIGNALK_URL="")
+        self.assertEqual(json.loads(out)["live"]["ok"], False)
+
+    def test_picking_catalog_rows_never_adds_thresholds_or_alarm_sources(self):
+        server, url = self.serve()
+        code, out, _ = self.run_cli("catalog", "--live", "--json", "--allow-non-root", SIGNALK_URL=url,
+                                    BOAT_UNITS="metric")
+        rows = {r["row_id"]: r for r in json.loads(out)["rows"]}
+        picks = [rows[k] for k in ("stw", "depth_keel", "tank_fuel:0", "batt_soc:house", "anchor")]
+        new_instruments = {r["proposed_id"]: r["definition"] for r in picks if r["kind"] == "instrument"}
+        new_notifications = {r["proposed_id"]: r["definition"] for r in picks if r["kind"] == "notification"}
+        items = [r["proposed_id"] for r in picks]
+        result = self.set_pages({"pages": [{"title": "Mix", "layout": "status-grid", "items": items}],
+                                 "new_instruments": new_instruments, "new_notifications": new_notifications})
+        config = self.cfg()
+        self.assertTrue(all("thresholds" not in i for i in config["instruments"].values()))
+        self.assertFalse(schema.counts_for_alarm_summary(config))
+        self.assertEqual(result["new_alarm_sources"], [])
+        self.assertEqual(result["added_notifications"], ["anchor"])
+
+    # --- plumbing ---
+
+    def test_vesselstackctl_passes_the_catalog_environment(self):
+        text = (ROOT / "scripts" / "vesselstackctl").read_text()
+        body = text[text.index("display_command() {"):text.index("memory_index_helper() {")]
+        for name in ("SIGNALK_URL", "DISPLAYS_SIGNALK_TOKEN", "BOAT_UNITS", "VESSELSTACK_DATA_BIND_ADDRESS"):
+            self.assertIn(f'{name}="${{{name}', body)
+        for command in ("catalog", "show", "set-pages", "history", "restore-config", "serial-ports"):
+            self.assertIn(command, text[:text.index("display_command() {")])
+
+    def test_backups_and_last_flash_are_never_committed(self):
+        self.assertIn("displays-backups/", (ROOT / ".gitignore").read_text())
+        spec = importlib.util.spec_from_file_location("check_public_tree", ROOT / "scripts" / "check-public-tree.py")
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        for path in ("config/displays-backups/displays-20260101T000000Z.json",
+                     "displays-backups/displays-20260101T000000Z-2.json",
+                     "build/displays/helm/last-flash.json", "last-flash.json"):
+            self.assertTrue(checker.findings(path, b"{}"), path)
+        self.assertFalse(checker.findings("displays/catalog.json", b"{}"))
+
+    def test_bridge_view_follows_what_the_bridge_reads(self):
+        config = self.cfg()
+        view = editor._bridge_view(config)
+        pages_only = json.loads(json.dumps(config))
+        pages_only["displays"]["helm"]["pages"][0]["title"] = "Other"
+        pages_only["displays"]["helm"]["ui"] = {"theme": "ocean"}
+        self.assertEqual(editor._bridge_view(pages_only), view)
+        clock = json.loads(json.dumps(config))
+        clock["displays"]["helm"]["ui"] = {"header": True}
+        self.assertNotEqual(editor._bridge_view(clock), view)       # the bridge publishes the clock only then
+        inst = json.loads(json.dumps(config))
+        inst["instruments"]["sog"]["precision"] = 3
+        self.assertNotEqual(editor._bridge_view(inst), view)
+
+    def test_restore_restarts_the_bridge_when_only_the_clock_need_changes(self):
+        config = self.cfg()
+        config["displays"]["helm"]["ui"] = {"header": True}
+        self.config.write_text(json.dumps(config, indent=2) + "\n")
+        first = self.set_pages({"pages": self.pages("Hdr")})     # the backup it makes still has the header
+        config = self.cfg()
+        del config["displays"]["helm"]["ui"]
+        self.config.write_text(json.dumps(config, indent=2) + "\n")
+        self.runner.calls.clear()
+        result = editor.restore_config(self.ctx(), first["backup"])
+        self.assertEqual(result["bridge_restart"], "restarted")
