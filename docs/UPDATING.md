@@ -8,6 +8,12 @@ Back up first (see [Backups](../README.md#backups)); updating and rolling back a
 in the README under [Updating](../README.md#updating) and
 [Upgrading to 0.6.0](../README.md#upgrading-to-060).
 
+**Heimdall to Homepage.** An update (`install.sh` or `vesselstackctl update`) stops and removes an
+existing `vesselstack-heimdall` container and its image if unused, then starts Homepage on port 80
+(443 is no longer published). `/opt/vesselstack-data/heimdall` is left on disk, with a one-line
+notice; delete it yourself when you no longer need it. Heimdall tiles are not migrated; add custom
+tiles in `config/homepage-custom/`. Rollback: restore the backup of the previous release.
+
 ## From the pinned installer
 
 Re-run the pinned release installer over `ssh -t`. It finds the installed system and offers

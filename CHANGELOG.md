@@ -3,6 +3,17 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+- Homepage (gethomepage.dev, `ghcr.io/gethomepage/homepage:v2.7.0` pinned by multi-arch digest) replaces
+  Heimdall as the front door on port 80 (`HOMEPAGE_PORT`). Tiles follow the enabled components and are
+  rendered by `vesselstackctl homepage sync` without secrets; custom tiles live in
+  `config/homepage-custom/`. `HOMEPAGE_ALLOWED_HOSTS` is managed and regenerated at each start. The
+  firewall has an explicit rule for Homepage (trusted interfaces only). Port 443 is no longer published.
+- Heimdall is removed. Install/update and `vesselstackctl start` stop and remove an existing Heimdall
+  container and image and print a notice; `$VESSELSTACK_DATA/heimdall` is left on disk untouched.
+  The `heimdall` component name is replaced by `homepage`.
+
 ## 0.6.2 - 2026-11-07
 
 ### Highlights

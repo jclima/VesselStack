@@ -172,7 +172,7 @@ Do not hardcode a preview port. On the Home tab's component grid:
    integration; it must not silently auto-configure unrelated services.
 
 The six core catalog entries are Home Assistant, InfluxDB, Grafana, Prometheus,
-Mosquitto, and Heimdall. Hardware and systemd services remain
+Mosquitto, and Homepage. Hardware and systemd services remain
 configuration-driven. A passing lab result does not claim physical Pi,
 hardware, or production evidence.
 
