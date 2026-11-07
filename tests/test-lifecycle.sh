@@ -190,11 +190,20 @@ echo "\${*: -1}" >> "\$FAKE_MOUNTS"
 [ -z "\${FAKE_MOUNT_CHOWN:-}" ] || chown "\$FAKE_MOUNT_CHOWN" "\${*: -1}"
 if [ -n "\${FAKE_MOUNT_LINK:-}" ]; then ln -s /tmp "\${*: -1}/backups"; fi
 EOF
+# Fake umount logs its arguments and drops the folder from the mounted list.
+cat > "$FAKE_BIN/umount" <<EOF
+#!/bin/bash
+echo "umount \$*" >> "$TEST_ROOT/mount.log"
+grep -Fvx -- "\${*: -1}" "\$FAKE_MOUNTS" > "\$FAKE_MOUNTS.new" || true
+mv "\$FAKE_MOUNTS.new" "\$FAKE_MOUNTS"
+EOF
 cat > "$FAKE_BIN/findmnt" <<EOF
 #!/bin/bash
 echo "findmnt \$*" >> "$TEST_ROOT/findmnt.log"
 case " \$* " in
     *" --fstab "*) grep -Fxq -- "\${*: -1}" "\${FAKE_FSTAB:-/dev/null}" ;;
+    # The UUID of the filesystem mounted at a folder: the drive that backup-drive mount chose, unless the test says otherwise.
+    *" -o UUID "*) printf '%s\n' "\${FAKE_MOUNT_UUID:-1111-aaaa}" ;;
     *" --target "*) awk -v t="\${*: -1}" '\$1 == t {print \$2}' "\${FAKE_FINDMNT_SOURCES:-/dev/null}" ;;
 esac
 EOF
@@ -206,6 +215,7 @@ EOF
 # Fake df reports FAKE_DF_FREE KiB free when set.
 cat > "$FAKE_BIN/df" <<EOF
 #!/bin/bash
+echo "df \$*" >> "$TEST_ROOT/df.log"
 if [ -n "\${FAKE_DF_FREE:-}" ]; then
     printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfake 1000 0 %s 0%% /\n' "\$FAKE_DF_FREE"
     exit 0
@@ -213,7 +223,15 @@ fi
 PATH=\$(printf '%s' "\$PATH" | tr ':' '\n' | grep -vxF "$FAKE_BIN" | paste -sd:)
 exec df "\$@"
 EOF
-chmod +x "$FAKE_BIN/mountpoint" "$FAKE_BIN/mount" "$FAKE_BIN/findmnt" "$FAKE_BIN/lsblk" "$FAKE_BIN/df"
+# Fake du fails like a timeout (exit 124) when FAKE_DU_TIMEOUT is set.
+cat > "$FAKE_BIN/du" <<EOF
+#!/bin/bash
+[ -z "\${FAKE_DU_TIMEOUT:-}" ] || exit 124
+PATH=\$(printf '%s' "\$PATH" | tr ':' '\n' | grep -vxF "$FAKE_BIN" | paste -sd:)
+exec du "\$@"
+EOF
+chmod +x "$FAKE_BIN/du"
+chmod +x "$FAKE_BIN/umount" "$FAKE_BIN/mountpoint" "$FAKE_BIN/mount" "$FAKE_BIN/findmnt" "$FAKE_BIN/lsblk" "$FAKE_BIN/df"
 # The installed, root-owned prompt library the controller sources.
 LIBEXEC_TEST="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 install -d -m 0755 "$LIBEXEC_TEST"
@@ -690,7 +708,14 @@ EOF
     menu_run $'4\n' backup "$unmounted/backups"
     test "$MENU_RC" -eq 0
     want "WARNING: the backup will be written to the system disk (SD card) this once."
+    want "It goes to $SYSTEM_ROOT/var/backups/vesselstack; $unmounted stays empty."
     test -s "$MENU_OUT"
+    # The archive lands in the system-disk folder; the unmounted mount folder is never created.
+    case "$(tail -n 1 "$TEST_ROOT/menu.out")" in
+        "$SYSTEM_ROOT/var/backups/vesselstack/vesselstack-"*.tar.gz) ;;
+        *) echo "menu choice [4] wrote the archive somewhere else: $(tail -n 1 "$TEST_ROOT/menu.out")" >&2; exit 1 ;;
+    esac
+    test ! -e "$unmounted"
     test "$(sha256sum "$APP_ROOT/config/vesselstack.env")" = "$env_hash"
     rm -rf -- "$unmounted"
     # Hidden when the system disk is too small for the backup ...
@@ -705,6 +730,17 @@ EOF
     refuse_text "[4] Back up"
     want "Please enter one of: 2, 3, or c"
     cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
+    # ... and when the lock is only in the process environment.
+    VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false menu_run $'4\nc\n' backup "$unmounted/backups"
+    test "$MENU_RC" -eq 1
+    refuse_text "[4] Back up"
+    want "Please enter one of: 2, 3, or c"
+    # The system-disk folder is where the free space is measured (the archive goes there), not the unmounted folder.
+    ancestor_of() { local d=$1; while [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname -- "$d"); done; printf '%s' "$d"; }
+    : > "$TEST_ROOT/df.log"
+    menu_run $'c\n' backup "$unmounted/backups"
+    grep -qxF -- "df -Pk -- $(ancestor_of "$SYSTEM_ROOT/var/backups/vesselstack")" "$TEST_ROOT/df.log"
+    rm -rf -- "$unmounted"
 
     # --require-mounted offers [1]-[3] only, even with the override in the file.
     printf 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true\n' >> "$APP_ROOT/config/vesselstack.env"
@@ -712,6 +748,196 @@ EOF
     test "$MENU_RC" -eq 1
     refuse_text "[4] Back up"
     want "[3] I have plugged the drive in; check again"
+    cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
+    rm -rf -- "$unmounted"
+
+    # ---- Control Panel helpers: backup --system-disk-once, update --backup-choice, backup-drive.
+    sed -i "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=$unmounted/backups|" "$APP_ROOT/config/vesselstack.env"
+    sdo_env="$TEST_ROOT/vesselstack.env.sdo"
+    cp -p "$APP_ROOT/config/vesselstack.env" "$sdo_env"
+    sdo_hash=$(sha256sum "$APP_ROOT/config/vesselstack.env")
+    sdo_run() {  # args...: the controller without a terminal; sets MENU_RC, MENU_OUT, MENU_ERR
+        : > "$TEST_ROOT/mount.log"
+        : > "$TEST_ROOT/mounts"
+        : > "$TEST_ROOT/update-args"
+        : > "$menu_calls"
+        MENU_RC=0
+        VESSELSTACK_NONINTERACTIVE=true run_ctl "$@" >"$TEST_ROOT/menu.out" 2>"$TEST_ROOT/menu.err" </dev/null || MENU_RC=$?
+        MENU_OUT=$(<"$TEST_ROOT/menu.out")
+        MENU_ERR=$(<"$TEST_ROOT/menu.err")
+    }
+
+    # backup --system-disk-once: system-disk folder, a warning, the unmounted folder stays absent.
+    sdo_run backup --system-disk-once
+    test "$MENU_RC" -eq 0
+    want "WARNING: the backup will be written to the system disk (SD card) this once."
+    case "$(tail -n 1 "$TEST_ROOT/menu.out")" in
+        "$SYSTEM_ROOT/var/backups/vesselstack/vesselstack-"*.tar.gz) ;;
+        *) echo "--system-disk-once wrote somewhere else" >&2; exit 1 ;;
+    esac
+    test ! -e "$unmounted"
+    test "$(sha256sum "$APP_ROOT/config/vesselstack.env")" = "$sdo_hash"
+    # It cannot be combined with the strict or override flags, or with a folder.
+    for combo in "--require-mounted" "--allow-unmounted" "$BACKUP_ROOT"; do
+        sdo_run backup --system-disk-once "$combo"
+        test "$MENU_RC" -eq 2
+        test ! -s "$menu_calls"
+    done
+    # The lock pinned in the environment file refuses it before anything is stopped.
+    printf 'VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n' >> "$APP_ROOT/config/vesselstack.env"
+    sdo_run backup --system-disk-once
+    test "$MENU_RC" -eq 1
+    want "VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set"
+    test ! -s "$menu_calls"
+    sdo_run update --backup-choice=system-disk-once "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 1
+    test ! -s "$TEST_ROOT/update-args"
+    sdo_run update --backup-choice=skip "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 1
+    want "Refusing to update without the configured backup"
+    test ! -s "$TEST_ROOT/update-args"
+    test ! -s "$menu_calls"
+    cp -p "$sdo_env" "$APP_ROOT/config/vesselstack.env"
+    # A system disk that is too small refuses it before anything is stopped.
+    FAKE_DF_FREE=1 sdo_run backup --system-disk-once
+    test "$MENU_RC" -eq 1
+    want "so a backup to the system disk is not offered."
+    test ! -s "$menu_calls"
+    test ! -e "$unmounted"
+    # A data size that cannot be measured in time refuses the non-interactive choice (the menu only says "size unknown").
+    FAKE_DU_TIMEOUT=1 sdo_run backup --system-disk-once
+    test "$MENU_RC" -eq 1
+    want "could not be measured"
+    test ! -s "$menu_calls"
+    test ! -e "$unmounted"
+    # update: the chosen handling follows the dry run, and nothing is written to the unmounted folder.
+    sdo_run update --backup-choice=system-disk-once "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 0
+    test "$(wc -l < "$TEST_ROOT/update-args")" -eq 2
+    tail -n 1 "$TEST_ROOT/update-args" | grep -q -- '--start'
+    test ! -e "$unmounted"
+    sdo_run update --backup-choice=skip "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 0
+    want "WARNING: backup skipped at the owner's request for this update; there is no archive to restore from."
+    test "$(wc -l < "$TEST_ROOT/update-args")" -eq 2
+    test ! -s "$menu_calls"
+    test ! -e "$unmounted"
+    sdo_run update --backup-choice=bogus "$UPDATE_SOURCE"
+    test "$MENU_RC" -eq 2
+    test ! -s "$TEST_ROOT/update-args"
+
+    # backup-drive list --json: only usable drives are listed; refused and already-mounted ones carry reasons.
+    json_check() {  # python-expression-on-d
+        python3 -I - "$TEST_ROOT/menu.out" "$1" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+# The expressions are literals written in this test file, never external input.
+if not eval(sys.argv[2]):
+    sys.exit("json check failed: %s\n%s" % (sys.argv[2], json.dumps(d, indent=1)))
+PY
+    }
+    sdo_run backup-drive list --json
+    test "$MENU_RC" -eq 0
+    json_check '[x["uuid"] for x in d["drives"]] == ["1111-aaaa"] and d["drives"][0]["device"] == "/dev/sda1"'
+    json_check 'any(x["device"] == "/dev/sdb1" and "not supported" in x["reason"] for x in d["refused"])'
+    json_check 'd["mounted"] is False and d["fstab_mount"] is False and d["mount_dir"] == "'"$unmounted"'"'
+    printf '%s\n' "$unmounted" > "$TEST_ROOT/fstab"
+    sdo_run backup-drive list --json
+    json_check 'd["fstab_mount"] is True'
+    : > "$TEST_ROOT/fstab"
+    FAKE_LSBLK="$TEST_ROOT/lsblk-mounted.json" sdo_run backup-drive list --json
+    json_check 'd["drives"] == [] and d["mounted_elsewhere"][0]["mountpoint"] == "/media/pi/USBSTICK"'
+    sdo_run backup-drive list --json
+    printf '%s\n' "$unmounted" > "$TEST_ROOT/mounts"
+    ( VESSELSTACK_NONINTERACTIVE=true run_ctl backup-drive list --json ) > "$TEST_ROOT/menu.out" 2>/dev/null </dev/null
+    json_check 'd["mounted"] is True and d["drives"] == []'
+    : > "$TEST_ROOT/mounts"
+    sdo_run backup-drive list
+    test "$MENU_RC" -eq 2
+
+    # backup-drive mount --uuid: re-lists, mounts exactly that drive, never edits /etc/fstab or the env file.
+    sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 0
+    grep -qx -- "mount -t ext4 -o nodev,nosuid,noexec /dev/sda1 $unmounted" "$TEST_ROOT/mount.log"
+    [ "$(wc -l < "$TEST_ROOT/mount.log")" -eq 1 ]
+    want "UUID=1111-aaaa $unmounted ext4 nofail,noatime,nodev,nosuid,noexec 0 2"
+    test "$(stat -c %a "$unmounted")" = 700
+    test "$(sha256sum "$APP_ROOT/config/vesselstack.env")" = "$sdo_hash"
+    test ! -s "$TEST_ROOT/fstab"
+    rm -rf -- "$unmounted"
+    # A drive that is not in the list, a refused filesystem, a malformed id and a duplicate id mount nothing.
+    for bad in 9999-zzzz 2222-BBBB 3333-cccc; do
+        sdo_run backup-drive mount --uuid "$bad"
+        test "$MENU_RC" -eq 1
+        test ! -s "$TEST_ROOT/mount.log"
+    done
+    for bad in '/dev/sda1' 'a b' "\$(id)" ''; do
+        sdo_run backup-drive mount --uuid "$bad"
+        test "$MENU_RC" -eq 2
+        test ! -s "$TEST_ROOT/mount.log"
+    done
+    sdo_run backup-drive mount --uuid
+    test "$MENU_RC" -eq 2
+    sdo_run backup-drive mount /dev/sda1
+    test "$MENU_RC" -eq 2
+    cat > "$TEST_ROOT/lsblk-dup.json" <<EOF
+{"blockdevices":[
+ {"path":"/dev/sda","type":"disk","size":"58G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sda1","type":"part","size":"58G","fstype":"ext4","uuid":"1111-aaaa","mountpoint":null,"rm":true}]},
+ {"path":"/dev/sdb","type":"disk","size":"58G","rm":true,"hotplug":true,"tran":"usb","children":[
+  {"path":"/dev/sdb1","type":"part","size":"58G","fstype":"ext4","uuid":"1111-aaaa","mountpoint":null,"rm":true}]}
+]}
+EOF
+    FAKE_LSBLK="$TEST_ROOT/lsblk-dup.json" sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 1
+    test ! -s "$TEST_ROOT/mount.log"
+    # Already mounted, a non-empty mount folder and a failing mount are refused.
+    sdo_run backup-drive list --json
+    : > "$TEST_ROOT/mount.log"
+    printf '%s\n' "$unmounted" > "$TEST_ROOT/mounts"
+    ( VESSELSTACK_NONINTERACTIVE=true run_ctl backup-drive mount --uuid 1111-aaaa ) >/dev/null 2>"$TEST_ROOT/menu.err" </dev/null && exit 1
+    if grep -q '^mount ' "$TEST_ROOT/mount.log"; then echo 'mounted an already mounted folder' >&2; exit 1; fi
+    rm -rf -- "$unmounted"
+    install -d "$unmounted"
+    printf 'keep\n' > "$unmounted/precious.txt"
+    sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 1
+    want "is not empty"
+    test ! -s "$TEST_ROOT/mount.log"
+    rm -rf -- "$unmounted"
+    FAKE_MOUNT_FAIL=1 sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 1
+    rm -rf -- "$unmounted"
+    # A mount whose root another user owns is unmounted again.
+    FAKE_MOUNT_CHOWN=1234 sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 1
+    want "not owned by root"
+    grep -qx -- "umount -- $unmounted" "$TEST_ROOT/mount.log"
+    if grep -qx -- "$unmounted" "$TEST_ROOT/mounts"; then echo 'the folder stayed mounted' >&2; exit 1; fi
+    rm -rf -- "$unmounted"
+    # A different filesystem at the folder than the chosen UUID is unmounted again and refused.
+    FAKE_MOUNT_UUID=ffff-ffff sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 1
+    want "is not the drive that was chosen"
+    grep -qx -- "umount -- $unmounted" "$TEST_ROOT/mount.log"
+    if grep -qx -- "$unmounted" "$TEST_ROOT/mounts"; then echo 'the folder stayed mounted' >&2; exit 1; fi
+    rm -rf -- "$unmounted"
+    # --fstab needs an entry for the folder; then it is a plain "mount -- DIR".
+    sdo_run backup-drive mount --fstab
+    test "$MENU_RC" -eq 1
+    want "is not listed in /etc/fstab"
+    test ! -s "$TEST_ROOT/mount.log"
+    printf '%s\n' "$unmounted" > "$TEST_ROOT/fstab"
+    sdo_run backup-drive mount --fstab
+    test "$MENU_RC" -eq 0
+    grep -qx -- "mount -o nodev,nosuid,noexec -- $unmounted" "$TEST_ROOT/mount.log"
+    : > "$TEST_ROOT/fstab"
+    rm -rf -- "$unmounted"
+    # A backup folder outside /media and /mnt has no drive to mount.
+    sed -i "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=$BACKUP_ROOT|" "$APP_ROOT/config/vesselstack.env"
+    sdo_run backup-drive mount --uuid 1111-aaaa
+    test "$MENU_RC" -eq 1
+    test ! -s "$TEST_ROOT/mount.log"
     cp -p "$env_backup" "$APP_ROOT/config/vesselstack.env"
     rm -rf -- "$unmounted"
 
@@ -726,6 +952,7 @@ EOF
     test ! -s "$menu_calls"
     menu_run $'4\n' update "$UPDATE_SOURCE"
     test "$MENU_RC" -eq 0
+    test ! -e "$unmounted"
     test "$(wc -l < "$TEST_ROOT/update-args")" -eq 3
     tail -n 1 "$TEST_ROOT/update-args" | grep -q -- '--start'
     : > "$TEST_ROOT/update-args"

@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const appSource = fs.readFileSync('control-panel/static/app.js', 'utf8');
 const html = fs.readFileSync('control-panel/static/index.html', 'utf8');
 const css = fs.readFileSync('control-panel/static/styles.css', 'utf8');
-const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, setNotice, showFieldErrors, renderConfiguration, selectTab };';
+const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, askBackupChoice, confirmWithBackup, backupOptions, setNotice, showFieldErrors, renderConfiguration, selectTab };';
 
 const nodes = new Map();
 const makeNode = () => ({
@@ -29,6 +29,15 @@ dialog.showModal = function showModal() {
   if (this.onclose) this.onclose();
 };
 dialog.close = function close(value) { this.returnValue = value; };
+const backupDialog = node('#backup-choice-dialog');
+const backupShown = [];
+let backupDriver = null;
+backupDialog.showModal = function showModal() {
+  this.open = true; this.returnValue = '';
+  backupShown.push({ title: node('#backup-choice-title').textContent, intro: node('#backup-choice-intro').textContent, options: node('#backup-choice-options').innerHTML, notes: node('#backup-choice-notes').innerHTML, ok: node('#backup-choice-ok').textContent, okClass: node('#backup-choice-ok').className });
+  setImmediate(async () => { if (backupDriver) await backupDriver(); else backupDialog.close('cancel'); });
+};
+backupDialog.close = function close(value) { this.returnValue = value; this.open = false; if (this.onclose) this.onclose(); };
 let fetchImpl = async () => ({ ok: true, json: async () => ({ configuration: context.__ui.state.config }) });
 const context = {
   console, setTimeout: () => 0, clearTimeout() {},
@@ -59,6 +68,9 @@ assert.match(html, /Reinstall &amp; start/); assert.match(html, /Check setup/);
 ['Home', 'Settings', 'Updates', 'Maintenance'].forEach((name) => assert.match(html, new RegExp(`role="tab"[^>]*>${name}`)));
 assert.equal((html.match(/role="tab"/g) || []).length, 4);
 assert.match(html, /<dialog id="confirm-dialog"/);
+assert.match(html, /<dialog id="backup-choice-dialog"/); assert.match(html, /id="backup-choice-ack"/);
+assert.match(html, /I understand there is no backup|backup-choice-ack-text/);
+assert.match(appSource, /I understand there is no backup to restore if this update fails/);
 assert.match(html, /How do I reach this panel\?/); assert.match(html, /ssh -L 8780:127\.0\.0\.1:8780/); assert.match(html, /id="show-token"/);
 assert.match(html, /Contacts github\.com only when you press it/);
 assert.match(html, /id="banner" aria-live="polite"/);
@@ -137,6 +149,110 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   ui.state.releases = [{ id: 9, tag: 'v0.6.1', version: '0.6.1', name: 'Fixes', html_url: 'https://github.com/jclima/VesselStack/releases/tag/v0.6.1' }];
   const install = await askedFor(() => ui.installRelease(9));
   assert.equal(install[0].title, 'Back up & install 0.6.1?'); assert.equal(posts.length, 0);
+  // ---- backup choice: the normal dialog when the backup works, a choice dialog when it does not ----------
+  {
+    const pre = (extra = {}) => ({ path: '/media/backup-drive/backups', mount: 'not_mounted', default_ok: false, fstab_mount: false, drives: [], refused: [], mounted_elsewhere: [],
+      system_disk_once: { offered: true, reason: '', target: '/var/backups/vesselstack' }, skip: { offered: true }, ...extra });
+    const drive = { uuid: 'AB12-CD34', label: 'BACKUP <b>', size: '58G', fstype: 'ext4', device: '/dev/sda1' };
+    const originalFetch = fetchImpl;
+    let preflights = [];
+    const configPosts = [];
+    const useBackupFetch = () => {
+      fetchImpl = async (path, options = {}) => {
+        if (path === '/api/backup-preflight') { if (preflights.length === 0) throw new Error('offline'); const next = preflights.length > 1 ? preflights.shift() : preflights[0]; if (next instanceof Error) throw next; return ok(next); }
+        if (path === '/api/config' && options.method === 'POST') { configPosts.push(JSON.parse(options.body)); return ok({ configuration: ui.state.config }); }
+        if (options.method === 'POST') { posts.push({ path, body: JSON.parse(options.body) }); return ok({ id: 1, label: 'x', state: 'running', output: [] }); }
+        return ok({ components: [], operation: { state: 'idle' }, installed_version: '0.6.0', running_version: '0.6.0' });
+      };
+    };
+    const reset = () => { ui.state.busy = false; ui.state.pendingOperation = null; posts.length = 0; backupShown.length = 0; dialogTitles.length = 0; configPosts.length = 0; node('#backup-choice-ack').checked = false; node('#backup-choice-path').value = ''; };
+    const pick = (value) => node('#backup-choice-options').onchange({ target: { value } });
+    useBackupFetch();
+
+    // The backup works: today's confirmation, nothing else, and no backup field in the request.
+    reset(); preflights = [pre({ default_ok: true, mount: 'mounted' })]; dialogAnswer = 'ok';
+    await ui.installRelease(9); await tick();
+    assert.equal(backupShown.length, 0, 'a working backup never shows the choice dialog');
+    assert.equal(dialogTitles[0].title, 'Back up & install 0.6.1?');
+    assert.deepEqual(posts[0].body, { action: 'update-release', release_id: 9, channel: ui.state.releaseChannel }, 'the default request is unchanged');
+    // A failed lookup falls back to the same confirmation (the server still requires a mounted backup).
+    reset(); preflights = [];
+    await ui.installRelease(9); await tick();
+    assert.equal(backupShown.length, 0); assert.equal(dialogTitles[0].title, 'Back up & install 0.6.1?');
+    assert.equal(Object.hasOwn(posts[0].body, 'backup'), false);
+
+    // Not mounted: the choice dialog lists drives, refused and already-mounted ones, and escapes names.
+    const listing = pre({ fstab_mount: true, drives: [drive],
+      refused: [{ device: '/dev/sdb1', label: 'CAMERA', size: '29G', fstype: 'vfat', reason: 'vfat is not supported for backups' }],
+      mounted_elsewhere: [{ device: '/dev/sde1', label: '', size: '16G', fstype: 'ext4', mountpoint: '/media/pi/USBSTICK' }] });
+    reset(); preflights = [listing]; backupDriver = async () => { backupDialog.close('cancel'); };
+    await ui.installRelease(9); await tick();
+    assert.equal(dialogTitles.length, 0, 'the usual confirmation is replaced by the choice dialog'); assert.equal(backupShown.length, 1); assert.equal(posts.length, 0, 'cancel starts nothing');
+    const shown = backupShown[0];
+    assert.equal(shown.title, 'Back up & install 0.6.1?'); assert.match(shown.intro, /not mounted \(\/media\/backup-drive\)/);
+    assert.match(shown.options, /Mount the backup drive now/); assert.match(shown.options, /Mount &quot;BACKUP &lt;b&gt;&quot; \(58G, ext4\)/); assert.doesNotMatch(shown.options, /<b>/, 'drive names are escaped');
+    assert.match(shown.options, /check again/); assert.match(shown.options, /system disk this once \(not recommended\)/); assert.match(shown.options, /different backup folder/); assert.match(shown.options, /Install without a backup/);
+    assert.match(shown.options, /value="fstab" checked/, 'the first safe choice is preselected, never the skip');
+    assert.match(shown.notes, /\/dev\/sdb1 29G &quot;CAMERA&quot; vfat: vfat is not supported/); assert.match(shown.notes, /already mounted at \/media\/pi\/USBSTICK/);
+
+    // Each choice posts exactly its backup object.
+    const choose = async (value, action = 'update-release') => {
+      reset(); preflights = [listing];
+      backupDriver = async () => { pick(value); await node('#backup-choice-ok').onclick(); };
+      if (action === 'update') await ui.runAction('update', { source_directory: '/var/lib/vesselstack/releases/x' }); else await ui.installRelease(9);
+      await tick();
+      return posts.at(-1)?.body;
+    };
+    assert.deepEqual((await choose('fstab')).backup, { mode: 'mount_fstab' });
+    assert.deepEqual((await choose('drive:AB12-CD34')).backup, { mode: 'mount_drive', uuid: 'AB12-CD34' });
+    assert.deepEqual((await choose('system')).backup, { mode: 'system_disk_once', confirm: 'system-disk-once' });
+    const folderUpdate = await choose('drive:AB12-CD34', 'update');
+    assert.deepEqual(folderUpdate, { action: 'update', source_directory: '/var/lib/vesselstack/releases/x', backup: { mode: 'mount_drive', uuid: 'AB12-CD34' } }, 'update from a folder offers the same choices');
+
+    // Skipping needs the checkbox and uses the danger button.
+    reset(); preflights = [listing]; let blocked;
+    backupDriver = async () => {
+      pick('skip');
+      assert.equal(node('#backup-choice-skip-ack').hidden, false); assert.equal(node('#backup-choice-ok').disabled, true, 'the button is off until the box is ticked');
+      assert.equal(node('#backup-choice-ok').className, 'danger solid'); assert.equal(node('#backup-choice-ok').textContent, 'Install without a backup');
+      assert.equal(node('#backup-choice-ack-text').textContent, 'I understand there is no backup to restore if this update fails');
+      await node('#backup-choice-ok').onclick(); blocked = backupDialog.open;
+      node('#backup-choice-ack').checked = true; node('#backup-choice-ack').onchange();
+      assert.equal(node('#backup-choice-ok').disabled, false);
+      await node('#backup-choice-ok').onclick();
+    };
+    await ui.installRelease(9); await tick();
+    assert.equal(blocked, true, 'pressing the disabled button does nothing');
+    assert.deepEqual(posts.at(-1).body.backup, { mode: 'skip', confirm: 'install-without-backup' });
+    pick('fstab'); assert.equal(node('#backup-choice-skip-ack').hidden, true, 'the checkbox only shows for the skip choice');
+
+    // Turned off by the lock: neither the system disk nor the skip is offered, and the reason is shown.
+    reset(); preflights = [pre({ drives: [drive], system_disk_once: { offered: false, reason: 'Turned off: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set in the configuration.', target: '' }, skip: { offered: false } })];
+    backupDriver = async () => { backupDialog.close('cancel'); };
+    await ui.installRelease(9); await tick();
+    assert.doesNotMatch(backupShown[0].options, /system disk this once|Install without a backup/); assert.match(backupShown[0].notes, /ALLOW_UNMOUNTED=false/);
+
+    // "Check again": a drive that turned up means the normal backup, so no backup field is sent.
+    reset(); preflights = [pre(), pre({ default_ok: true, mount: 'mounted' })];
+    backupDriver = async () => { pick('recheck'); await node('#backup-choice-ok').onclick(); };
+    await ui.installRelease(9); await tick();
+    assert.equal(Object.hasOwn(posts.at(-1).body, 'backup'), false);
+    // ... and a drive that is still missing keeps the dialog open with a refreshed list.
+    reset(); preflights = [pre(), pre({ drives: [drive] })];
+    backupDriver = async () => { pick('recheck'); await node('#backup-choice-ok').onclick(); assert.match(node('#backup-choice-options').innerHTML, /AB12-CD34/); backupDialog.close('cancel'); };
+    await ui.installRelease(9); await tick();
+    assert.equal(posts.length, 0);
+
+    // A different folder is saved through the settings call, then the check runs again.
+    reset(); preflights = [pre(), pre({ default_ok: true, mount: 'mounted', path: '/media/other/backups' })];
+    backupDriver = async () => { pick('folder'); assert.equal(node('#backup-choice-ok').disabled, true, 'an empty folder cannot be saved'); node('#backup-choice-path').value = '/media/other/backups'; node('#backup-choice-path').oninput(); await node('#backup-choice-ok').onclick(); };
+    await ui.installRelease(9); await tick();
+    assert.deepEqual(configPosts, [{ settings: { VESSELSTACK_BACKUP: '/media/other/backups' } }]);
+    assert.equal(Object.hasOwn(posts.at(-1).body, 'backup'), false);
+    backupDriver = null; dialogAnswer = 'cancel'; preflights = [];
+    fetchImpl = originalFetch;
+    reset();
+  }
   // Edits are never discarded and the panel never locks without asking.
   formControls[0].value = 'Edited'; ui.state.config = { fields: [{ key: 'BOAT_NAME', kind: 'text', read_only: false }], values: { BOAT_NAME: 'Original' } };
   assert.equal((await askedFor(() => ui.discardEdits()))[0].title, 'Discard your edits?');
@@ -235,6 +351,12 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.match(ui.describeOperation({ label: 'remove grafana' }).done, /disabled/);
   assert.equal(ui.operationSucceeded({ label: 'backup', state: 'succeeded', output: [] }), true);
   assert.equal(ui.operationSucceeded({ label: 'restart grafana', state: 'succeeded' }), true);
+
+  assert.match(ui.describeOperation({ label: 'update-release', target_version: '0.6.2', backup_skipped: true }).running, /without a backup/);
+  assert.match(ui.describeOperation({ label: 'update-release', target_version: '0.6.2', backup_mode: 'skip' }).done, /no backup was made/);
+  assert.doesNotMatch(JSON.stringify(ui.describeOperation({ label: 'update-release', target_version: '0.6.2', backup_skipped: true })), /backed up first/, 'a skipped backup is never described as made');
+  assert.match(ui.describeOperation({ label: 'update', backup_skipped: true }).running, /without a backup/);
+  assert.match(ui.describeOperation({ label: 'update-release', target_version: '0.6.2' }).running, /Backing up, then installing 0\.6\.2/);
 
   // ---- field markup ----------------------------------------------------------
   assert.equal(ui.optionLabel('BOAT_UNITS', 'us_customary'), 'US customary');

@@ -43,7 +43,98 @@ MAX_MEMBERS = 10000
 MAX_ARCHIVE_EXPANDED = 1024 * 1024 * 1024
 FIXED_CTL = "/usr/local/sbin/vesselstackctl"
 OPERATION_FILE_NAME = "browser-update.json"
+DEFAULT_BACKUP_DIR = "/var/backups/vesselstack"
+
+# One-shot choices for an upgrade whose backup drive is not mounted. They live only in the per-job
+# request and the operation record; nothing is ever written to vesselstack.env. The same rules run
+# in the panel (admission) and again in the detached worker, which is a copy of this file.
+BACKUP_UUID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+BACKUP_CONFIRM = {"system_disk_once": "system-disk-once", "skip": "install-without-backup"}
+BACKUP_MODES = ("require_mounted", "mount_fstab", "mount_drive", "system_disk_once", "skip")
+BACKUP_LOCK = re.compile(r"^(export[ \t]+)?VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=[\"']?false", re.MULTILINE)
+BACKUP_SKIP_WARNING = "WARNING: backup skipped at the owner's request for this update; there is no archive to restore from."
 PROCESS_BOOT_ID = uuid.uuid4().hex
+
+
+def _env_value(config: Path, key: str) -> str:
+    """Last KEY=value in an env file, without quotes. Empty when absent or unreadable."""
+    try:
+        text = Path(config).read_text(errors="replace")
+    except OSError:
+        return ""
+    value = ""
+    for line in text.splitlines():
+        match = re.match(rf"^(?:export[ \t]+)?{re.escape(key)}=(.*)$", line.strip())
+        if match:
+            value = match.group(1).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+    return value
+
+
+def backup_locked(config: Path) -> bool:
+    """True when vesselstack.env pins VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false (absent means not locked)."""
+    try:
+        return bool(BACKUP_LOCK.search(Path(config).read_text(errors="replace")))
+    except OSError:
+        return False
+
+
+def backup_destination(config: Path) -> tuple[str, str]:
+    """(resolved backup folder, mounted | not_mounted | system_disk), derived like vesselstackctl backup."""
+    value = _env_value(config, "VESSELSTACK_BACKUP") or os.environ.get("VESSELSTACK_BACKUP") or DEFAULT_BACKUP_DIR
+    destination = os.path.realpath(value)
+    parts = Path(destination).parts
+    if len(parts) >= 3 and parts[1] in {"media", "mnt"}:
+        return destination, "mounted" if os.path.ismount(os.path.join("/", parts[1], parts[2])) else "not_mounted"
+    return destination, "system_disk"
+
+
+def normalize_backup_choice(raw: Any, locked: bool) -> dict[str, str] | None:
+    """Validate the optional backup object. None means the default (require a mounted backup).
+
+    Unknown keys or modes are refused. system_disk_once and skip need their exact confirmation word
+    and are refused while the environment file pins VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("backup must be an object")
+    mode = raw.get("mode")
+    if not isinstance(mode, str) or mode not in BACKUP_MODES:
+        raise ValueError("unknown backup mode")
+    allowed = {"mode"} | ({"uuid"} if mode == "mount_drive" else set()) | ({"confirm"} if mode in BACKUP_CONFIRM else set())
+    if set(raw) - allowed:
+        raise ValueError("unexpected backup field")
+    if mode == "require_mounted":
+        return None
+    if mode == "mount_drive":
+        uuid_value = raw.get("uuid")
+        if not isinstance(uuid_value, str) or not BACKUP_UUID.fullmatch(uuid_value):
+            raise ValueError("backup drive id is invalid")
+        return {"mode": mode, "uuid": uuid_value}
+    if mode in BACKUP_CONFIRM:
+        if locked:
+            raise ValueError("This option is turned off: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set")
+        if raw.get("confirm") != BACKUP_CONFIRM[mode]:
+            raise ValueError("backup confirmation is missing")
+        return {"mode": mode, "confirm": BACKUP_CONFIRM[mode]}
+    return {"mode": mode}
+
+
+def effective_backup_choice(choice: dict[str, str] | None, config: Path) -> tuple[dict[str, str] | None, str]:
+    """Falls back to the default when the drive got mounted after the choice was made.
+
+    Returns (choice or None, a note for the log; empty when nothing changed).
+    """
+    if choice is None:
+        return None, ""
+    _, mount = backup_destination(config)
+    if mount == "mounted":
+        return None, "The backup drive is mounted now, so the normal backup is used."
+    if mount == "system_disk" and choice["mode"] in {"mount_fstab", "mount_drive"}:
+        return None, "The backup folder is not on a removable drive, so the normal backup is used."
+    return choice, ""
 
 
 def _require_trusted_path(path: Path) -> Path:
@@ -323,7 +414,7 @@ def release_slot(fd) -> None:
     os.close(fd)
 
 
-def start_detached(action: str, root: Path, old_identity: dict[str, str], release_id: int | None = None, channel: str | None = None, ctl: str = FIXED_CTL, target_version: str | None = None, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+def start_detached(action: str, root: Path, old_identity: dict[str, str], release_id: int | None = None, channel: str | None = None, ctl: str = FIXED_CTL, target_version: str | None = None, snapshot: dict[str, Any] | None = None, backup: dict[str, str] | None = None) -> dict[str, Any]:
     state = read_operation(root)
     if state.get("state") == "running":
         raise ValueError("Another operation is already running")
@@ -344,9 +435,13 @@ def start_detached(action: str, root: Path, old_identity: dict[str, str], releas
     request = {"id": int(time.time() * 1000), "action": action, "root": str(root), "config": str(root / "config" / "vesselstack.env"), "ctl": ctl, "old_boot_id": old_identity.get("boot_id", ""), "target_version": target_version, "release_id": release_id, "channel": channel}
     if action == "update-release":
         request["release_snapshot"] = snapshot
+        if backup is not None:
+            request["backup"] = backup
     (job / "request.json").write_text(json.dumps(request, sort_keys=True)); os.chmod(job / "request.json", 0o600)
     shutil.copy2(Path(__file__), job / "runner.py"); os.chmod(job / "runner.py", 0o700)
     operation = {"id": request["id"], "label": action, "state": "running", "phase": "queued", "target_version": request["target_version"], "backup_path": None, "started_at": int(time.time()), "finished_at": None, "exit_code": None, "output": [], "boot_id": old_identity.get("boot_id"), "running_version": old_identity.get("running_version")}
+    if action == "update-release" and backup is not None:
+        operation["backup_mode"] = backup["mode"]
     write_operation(root, operation)
     command = ["systemd-run", "--unit=vesselstack-browser-update", "--collect", "--property=Type=exec", "/usr/bin/python3", "-I", str(job / "runner.py"), "--worker", str(job / "request.json")]
     try:
@@ -601,6 +696,15 @@ def safe_extract(archive: Path, destination: Path, expected_version: str | None 
         raise ValueError("archive is missing required release structure")
 
 
+def ctl_supports(token: str, ctl: str = FIXED_CTL) -> bool:
+    """True when the installed vesselstackctl lists the command or option (older ones cannot)."""
+    try:
+        result = subprocess.run([ctl, "--help"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return token in (result.stdout or "")
+
+
 def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -> None:
     """Execute the reviewed update sequence for a detached worker request."""
     release_id = int(request["release_id"])
@@ -609,6 +713,8 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
     saved = request.get("release_snapshot")
     if not isinstance(saved, dict):
         raise ValueError("release snapshot is required")
+    # The choice was validated at admission; it is checked again here, against the env file as it is now.
+    choice = normalize_backup_choice(request.get("backup"), backup_locked(Path(config)))
     fresh = release_snapshot(release_id, channel, root)
     assert_snapshot_unchanged(saved, fresh)
     target_version = fresh["version"]
@@ -654,25 +760,60 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
         _validate_fixed_ctl()
         operation.update(phase="preflight"); write_operation(root, operation)
         run_command([str(installer), "--config", config, "--dry-run"], root, operation, 1800, child_env)
-        operation.update(phase="backing-up"); write_operation(root, operation)
-        backup_result = run_command([FIXED_CTL, "backup", "--require-mounted"], root, operation, 1800, child_env)
-        output = (backup_result.stdout or "").splitlines()
-        if not output or not output[-1].strip():
-            raise ValueError("backup did not report an archive path")
-        operation["backup_path"] = output[-1].strip()
-        write_operation(root, operation)
+        choice, note = effective_backup_choice(choice, Path(config))
+        mode = choice["mode"] if choice else "require_mounted"
+        # The record names the handling that is really used (a fallback to the normal backup clears it).
+        if choice:
+            operation["backup_mode"] = mode
+        else:
+            operation.pop("backup_mode", None)
+        if mode in {"mount_fstab", "mount_drive"}:
+            if not ctl_supports("backup-drive"):
+                raise ValueError("The installed vesselstackctl is older than this Control Panel and cannot mount the backup drive. Mount the drive by hand, or run the update from a terminal.")
+            operation.update(phase="mounting-backup-drive"); write_operation(root, operation)
+            mount_argv = [FIXED_CTL, "backup-drive", "mount"] + (["--fstab"] if mode == "mount_fstab" else ["--uuid", choice["uuid"]])
+            run_command(mount_argv, root, operation, 300, child_env)
+        elif mode == "system_disk_once" and not ctl_supports("--system-disk-once"):
+            raise ValueError("The installed vesselstackctl is older than this Control Panel and cannot back up to the system disk this once. Mount the drive by hand, or run the update from a terminal.")
+        if mode in {"skip", "system_disk_once"} and (backup_locked(Path(config)) or os.environ.get("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED") == "false"):
+            raise ValueError("This backup option is turned off: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set. Nothing was changed.")
+        if mode == "skip":
+            # No backup is made and the backup command is never called.
+            operation.update(phase="backing-up", backup_skipped=True, backup_path=None,
+                             output=[BACKUP_SKIP_WARNING] + [line for line in operation.get("output") or [] if line != BACKUP_SKIP_WARNING])
+            write_operation(root, operation)
+        else:
+            operation.update(phase="backing-up"); write_operation(root, operation)
+            backup_argv = [FIXED_CTL, "backup", "--system-disk-once"] if mode == "system_disk_once" else [FIXED_CTL, "backup", "--require-mounted"]
+            backup_result = run_command(backup_argv, root, operation, 1800, child_env)
+            output = (backup_result.stdout or "").splitlines()
+            if not output or not output[-1].strip():
+                raise ValueError("backup did not report an archive path")
+            operation["backup_path"] = output[-1].strip()
+            if note:
+                operation["output"] = [note] + list(operation.get("output") or [])
+            write_operation(root, operation)
         operation.update(phase="installing"); write_operation(root, operation)
         install_env = dict(child_env)
         install_env["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
         install_env["VESSELSTACK_ROOT"] = str(root)
         install_env["VESSELSTACK_ENV"] = config
         run_command([str(installer), "--config", config, "--start"], root, operation, 1800, install_env)
+        keep_skip_warning(operation)
         operation.update(phase="restarting"); write_operation(root, operation)
         run_command(["systemctl", "restart", "vesselstack-control-panel.service"], root, operation, 60)
+        keep_skip_warning(operation)
         operation.update(phase="verifying-restart"); write_operation(root, operation)
         identity = verify_restart(root, str(request["old_boot_id"]), target_version)
+        keep_skip_warning(operation)
         operation.update(state="succeeded", phase="complete", finished_at=int(time.time()), exit_code=0,
                          boot_id=identity["boot_id"], running_version=identity["running_version"])
+
+
+def keep_skip_warning(operation: dict[str, Any]) -> None:
+    """Every command replaces the logged output, so the skipped-backup warning is put back on top."""
+    if operation.get("backup_skipped"):
+        operation["output"] = [BACKUP_SKIP_WARNING] + [line for line in operation.get("output") or [] if line != BACKUP_SKIP_WARNING]
 
 
 def run_worker(request_path: Path) -> None:
@@ -702,6 +843,7 @@ def run_worker(request_path: Path) -> None:
         prior = list(operation.get("output") or [])
         prior.append(str(exc)[:MAX_OUTPUT])
         operation.update(state="failed", phase="failed", finished_at=int(time.time()), exit_code=1, output=prior[-400:])
+        keep_skip_warning(operation)
     finally:
         write_operation(root, operation); release_slot(lock)
 

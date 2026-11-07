@@ -137,5 +137,133 @@ class Fixture(unittest.TestCase):
         self.assertEqual((self.root / "config" / "vesselstack.env").read_bytes(), before)
 
 
+    # ---- one-shot backup choices over HTTP
+
+    def serve(self):
+        server = self.panel.ThreadingHTTPServer(("127.0.0.1", 0), self.panel.ControlPanelHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def get(self, server, path: str, token: str | None = "test-token") -> tuple[int, dict[str, object]]:
+        headers = {"X-VesselStack-Token": token} if token else {}
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}{path}", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def post_update(self, server, backup: object = "absent") -> tuple[int, dict[str, object], mock.Mock]:
+        payload: dict[str, object] = {"action": "update-release", "release_id": 42, "channel": "stable"}
+        if backup != "absent":
+            payload["backup"] = backup
+        with mock.patch.object(self.panel, "release_snapshot", return_value={"version": "0.6.2"}), \
+                mock.patch.object(self.panel, "start_detached", return_value={"state": "running", "id": 1}) as start:
+            status, body = self.request(server, "/api/action", payload)
+        return status, body, start
+
+    def test_release_upgrade_default_call_is_unchanged_without_a_backup_choice(self) -> None:
+        server = self.serve()
+        for backup in ("absent", None, {"mode": "require_mounted"}):
+            with self.subTest(backup=backup):
+                status, _, start = self.post_update(server, backup)
+                self.assertEqual(status, 202)
+                start.assert_called_once_with("update-release", self.root, self.panel.RUNNING_IDENTITY, 42, "stable", target_version="0.6.2", snapshot={"version": "0.6.2"})
+
+    def test_release_upgrade_passes_each_valid_choice_to_the_worker_request(self) -> None:
+        server = self.serve()
+        (self.root / "config" / "vesselstack.env").write_text("VESSELSTACK_BACKUP=/media/backup-drive/backups\n")
+        valid = ({"mode": "mount_fstab"}, {"mode": "mount_drive", "uuid": "AB12-CD34"},
+                 {"mode": "system_disk_once", "confirm": "system-disk-once"}, {"mode": "skip", "confirm": "install-without-backup"})
+        with mock.patch.object(self.panel.os.path, "ismount", return_value=False), mock.patch.object(self.updates.os.path, "ismount", return_value=False), \
+                mock.patch.object(self.panel, "effective_backup_choice", side_effect=lambda c, _: (c, "")):
+            for backup in valid:
+                with self.subTest(backup=backup):
+                    status, _, start = self.post_update(server, backup)
+                    self.assertEqual(status, 202)
+                    self.assertEqual(start.call_args.kwargs["backup"], backup)
+
+    def test_release_upgrade_rejects_bad_choices_before_starting(self) -> None:
+        server = self.serve()
+        bad = ({"mode": "format"}, {"mode": "mount_drive"}, {"mode": "mount_drive", "uuid": "/dev/sda1"}, {"mode": "mount_drive", "uuid": "a b"},
+               {"mode": "mount_fstab", "device": "/dev/sda1"}, {"mode": "mount_fstab", "path": "/media/x"}, {"mode": "skip"},
+               {"mode": "skip", "confirm": "system-disk-once"}, {"mode": "system_disk_once", "confirm": "install-without-backup"},
+               {"mode": "system_disk_once"}, {"mode": "require_mounted", "confirm": "x"}, "skip", ["skip"], 7)
+        for backup in bad:
+            with self.subTest(backup=backup):
+                status, body, start = self.post_update(server, backup)
+                self.assertEqual(status, 400, body)
+                start.assert_not_called()
+
+    def test_lock_in_the_environment_file_refuses_skip_and_system_disk(self) -> None:
+        server = self.serve()
+        (self.root / "config" / "vesselstack.env").write_text("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n")
+        for backup in ({"mode": "skip", "confirm": "install-without-backup"}, {"mode": "system_disk_once", "confirm": "system-disk-once"}):
+            with self.subTest(backup=backup):
+                status, body, start = self.post_update(server, backup)
+                self.assertEqual(status, 400)
+                self.assertIn("turned off", str(body))
+                start.assert_not_called()
+        with mock.patch.object(self.panel.os.path, "ismount", return_value=False), mock.patch.object(self.panel, "effective_backup_choice", side_effect=lambda c, _: (c, "")):
+            status, _, start = self.post_update(server, {"mode": "mount_fstab"})
+        self.assertEqual(status, 202)
+
+    def test_backup_choice_is_refused_for_other_actions(self) -> None:
+        server = self.serve()
+        for action in ("backup", "restart-panel", "restart", "unknown"):
+            with self.subTest(action=action), mock.patch.object(self.panel.OPERATIONS, "start", return_value={"state": "running"}) as start, \
+                    mock.patch.object(self.panel, "start_detached", return_value={"state": "running"}) as detached:
+                status, body = self.request(server, "/api/action", {"action": action, "backup": {"mode": "skip", "confirm": "install-without-backup"}})
+                self.assertEqual(status, 400, body)
+                start.assert_not_called(); detached.assert_not_called()
+
+    def test_process_environment_lock_refuses_skip_over_http(self) -> None:
+        server = self.serve()
+        with mock.patch.dict(self.panel.os.environ, {"VESSELSTACK_BACKUP_ALLOW_UNMOUNTED": "false"}):
+            status, body, start = self.post_update(server, {"mode": "skip", "confirm": "install-without-backup"})
+        self.assertEqual(status, 400)
+        start.assert_not_called()
+
+    def test_folder_update_choices_are_validated_and_run_the_mount_as_a_separate_step(self) -> None:
+        server = self.serve()
+        (self.root / "config" / "vesselstack.env").write_text("VESSELSTACK_BACKUP=/media/backup-drive/backups\n")
+        def post(backup):
+            with mock.patch.object(self.panel.OPERATIONS, "start", return_value={"state": "running"}) as start, \
+                    mock.patch.object(self.panel, "effective_backup_choice", side_effect=lambda c, _: (c, "")), \
+                    mock.patch.object(self.panel, "ctl_supports", return_value=True):
+                payload = {"action": "update", "source_directory": "/var/lib/vesselstack/releases/x"}
+                if backup != "absent":
+                    payload["backup"] = backup
+                status, body = self.request(server, "/api/action", payload)
+            return status, body, start
+        status, _, start = post("absent")
+        self.assertEqual(status, 202)
+        self.assertEqual(start.call_args.args[0], "update"); self.assertEqual(start.call_args.kwargs, {})
+        status, _, start = post({"mode": "mount_drive", "uuid": "AB12-CD34"})
+        self.assertEqual(status, 202)
+        self.assertEqual(start.call_args.kwargs["extra"], {"backup_mode": "mount_drive"})
+        self.assertEqual(start.call_args.kwargs["before"]()[0][-2:], ["--uuid", "AB12-CD34"])
+        status, _, start = post({"mode": "skip", "confirm": "install-without-backup"})
+        self.assertEqual(start.call_args.kwargs["extra"], {"backup_mode": "skip", "backup_skipped": True})
+        self.assertEqual(start.call_args.kwargs["before"](), [])
+        for bad in ({"mode": "skip"}, {"mode": "mount_drive", "uuid": "../x"}, {"mode": "nope"}):
+            status, _, start = post(bad)
+            self.assertEqual(status, 400)
+            start.assert_not_called()
+
+    def test_preflight_requires_the_token_and_is_read_only(self) -> None:
+        server = self.serve()
+        self.assertEqual(self.get(server, "/api/backup-preflight", token=None)[0], 401)
+        self.assertEqual(self.get(server, "/api/backup-preflight", token="wrong")[0], 401)
+        before = (self.root / "config" / "vesselstack.env").read_bytes()
+        with mock.patch.object(self.panel, "command_stdout", return_value=(1, "")):
+            status, body = self.get(server, "/api/backup-preflight")
+        self.assertEqual(status, 200)
+        self.assertIn("default_ok", body)
+        self.assertEqual((self.root / "config" / "vesselstack.env").read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

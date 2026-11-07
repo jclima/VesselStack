@@ -10,6 +10,8 @@ CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
+# Where "back up to the system disk this once" writes, so an unmounted /media or /mnt folder stays empty.
+SYSTEM_BACKUP_DIR="$SYSTEM_ROOT/var/backups/vesselstack"
 LIBEXEC_DIR="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 
 usage() {
@@ -51,6 +53,13 @@ Commands:
                                whole stack briefly). Refuses /media and /mnt
                                destinations that are not mounted unless
                                --allow-unmounted is given
+  backup --system-disk-once    Back up to the system disk (not the unmounted drive's
+                               folder) this once; refused when the system disk is too
+                               small or VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false
+  backup-drive list --json     List the connected USB drives that could hold backups
+  backup-drive mount --fstab | --uuid UUID
+                               Mount the backup folder's drive (from /etc/fstab, or the
+                               listed drive with that UUID); never edits /etc/fstab
   verify-backup ARCHIVE        Verify an archive and its checksum
   restore ARCHIVE --yes [--skip-installer]
                                Stage and verify a backup, then swap it in; the
@@ -1505,8 +1514,10 @@ load_remediation_lib() {
 fix_unmounted_backup() {
     local destination=$1 mount_dir=$2 strict=${3:-} context=${VS_BACKUP_CONTEXT:-backup} update_dir=${VS_BACKUP_UPDATE_DIR:-<DIR>}
     if load_remediation_lib; then
-        VS_BACKUP_ROOT=$VESSELSTACK_ROOT VS_BACKUP_DATA=$VESSELSTACK_DATA VS_BACKUP_ENV_FILE=$ENV_FILE \
-            vs_backup_destination_fix "$destination" "$context" "$strict"
+        local locked=0
+        if backup_system_disk_locked; then locked=1; fi
+        VS_BACKUP_ROOT=$VESSELSTACK_ROOT VS_BACKUP_DATA=$VESSELSTACK_DATA VS_BACKUP_ENV_FILE=$ENV_FILE VS_BACKUP_LOCKED=$locked \
+            VS_BACKUP_SYSTEM_DIR=$SYSTEM_BACKUP_DIR vs_backup_destination_fix "$destination" "$context" "$strict"
         return
     fi
     echo "Refusing to back up: $mount_dir is not mounted, so the archive would land on the system disk (SD card). Nothing was changed." >&2
@@ -1554,8 +1565,11 @@ verify_mounted_destination() {
     done
 }
 
+# Sets BACKUP_REDIRECT to the system-disk folder when the owner chose "this once" at the menu.
+BACKUP_REDIRECT=
 check_backup_destination() {
     local destination=$1 allow_unmounted=$2 mount_dir ancestor
+    BACKUP_REDIRECT=
     case "$destination" in
         /media/*|/mnt/*)
             mount_dir=$(printf '%s' "$destination" | cut -d/ -f1-3)
@@ -1564,8 +1578,17 @@ check_backup_destination() {
                     echo "WARNING: $mount_dir is not a mounted filesystem; the backup will be written to the system disk" >&2
                 else
                     VS_BACKUP_ALLOW_ONCE=0
+                    VS_BACKUP_ONCE_TARGET=
                     fix_unmounted_backup "$destination" "$mount_dir" || return 1
-                    if [ "${VS_BACKUP_ALLOW_ONCE:-0}" != 1 ] && mountpoint -q "$mount_dir"; then
+                    if [ "${VS_BACKUP_ALLOW_ONCE:-0}" = 1 ]; then
+                        if backup_system_disk_locked; then
+                            echo "Refusing to back up to the system disk: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set. Nothing was changed." >&2
+                            return 1
+                        fi
+                        # The unmounted folder stays empty: the archive goes to the system-disk folder.
+                        BACKUP_REDIRECT=${VS_BACKUP_ONCE_TARGET:-$SYSTEM_BACKUP_DIR}
+                        destination=$BACKUP_REDIRECT
+                    elif mountpoint -q "$mount_dir"; then
                         verify_mounted_destination "$destination" "$mount_dir" || return 1
                     fi
                 fi
@@ -1579,18 +1602,94 @@ check_backup_destination() {
     fi
 }
 
+# True (0) when vesselstack.env, or the environment, pins VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false.
+backup_system_disk_locked() {
+    [ "${VESSELSTACK_BACKUP_ALLOW_UNMOUNTED:-}" = false ] && return 0
+    [ -r "$ENV_FILE" ] && grep -Eq '^(export[[:space:]]+)?VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=["'"'"']?false' "$ENV_FILE"
+}
+
+# Prints the folder for "back up to the system disk this once": the system-disk folder when the
+# configured destination sits on an unmounted /media or /mnt folder, otherwise the configured one.
+# Refuses (exit 1) when the owner pinned VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false or the archive
+# will not fit on the system disk. Nothing has been stopped yet.
+system_disk_once_target() {
+    local configured mount_dir='' target redirected=0
+    if backup_system_disk_locked; then
+        echo "Refusing to back up to the system disk: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set. Nothing was changed." >&2
+        return 1
+    fi
+    configured=$(realpath -m -- "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}") || return 1
+    target=$configured
+    case "$configured" in
+        /media/*|/mnt/*)
+            mount_dir=$(printf '%s' "$configured" | cut -d/ -f1-3)
+            if mountpoint -q "$mount_dir"; then
+                echo "$mount_dir is mounted, so the backup goes to the drive as usual." >&2
+            else
+                target=$SYSTEM_BACKUP_DIR
+                redirected=1
+            fi
+            ;;
+    esac
+    if ! load_remediation_lib; then
+        echo "Refusing to back up to the system disk: the installed prompt library could not be trusted, so the free space cannot be checked. Nothing was changed." >&2
+        return 1
+    fi
+    VS_BACKUP_ROOT=$VESSELSTACK_ROOT VS_BACKUP_DATA=$VESSELSTACK_DATA VS_BACKUP_ENV_FILE=$ENV_FILE \
+        VS_BACKUP_SPACE_LABEL=$([ "$redirected" -eq 1 ] && echo "system disk" || echo "backup drive") \
+        vs_backup_system_disk_check "$target"
+    if [ "${VS_BACKUP_OFFER_SYSTEM:-0}" != 1 ]; then
+        if [ "$redirected" -eq 1 ]; then
+            echo "Refusing to back up to the system disk. Nothing was changed." >&2
+        else
+            echo "Refusing to back up: the backup drive has too little free space. Nothing was changed." >&2
+        fi
+        return 1
+    fi
+    if [ "${VS_BACKUP_SIZE_UNKNOWN:-0}" = 1 ]; then
+        echo "Refusing to back up: the size of the VesselStack data could not be measured, so the free space cannot be checked. Nothing was changed." >&2
+        return 1
+    fi
+    if [ "$redirected" -eq 1 ]; then
+        echo "WARNING: the backup will be written to the system disk (SD card) this once. It will not survive loss of that disk." >&2
+        echo "It goes to $target; $mount_dir stays empty." >&2
+    fi
+    printf '%s\n' "$target"
+}
+
+check_backup_tree_overlap() {
+    python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$1" <<'PY'
+import pathlib
+import sys
+
+root, data, backup = (pathlib.Path(value).resolve(strict=False) for value in sys.argv[1:])
+if backup == pathlib.Path("/"):
+    raise SystemExit("Backup destination must be a specific directory, not /")
+if backup == root or root in backup.parents or backup == data or data in backup.parents:
+    raise SystemExit("Backup destination must be outside the VesselStack application and data trees")
+PY
+}
+
 backup_stack() {
-    local allow_unmounted=0 require_mounted=0 destination=''
+    local allow_unmounted=0 require_mounted=0 system_once=0 destination='' mount_dir
     while [ $# -gt 0 ]; do
         case "$1" in
             --require-mounted) require_mounted=1 ;;
             --allow-unmounted) allow_unmounted=1 ;;
+            --system-disk-once) system_once=1 ;;
             -*) echo "Unknown backup option: $1" >&2; exit 2 ;;
             *) [ -z "$destination" ] || { echo "backup takes at most one directory" >&2; exit 2; }
                destination=$1 ;;
         esac
         shift
     done
+    if [ "$system_once" -eq 1 ]; then
+        if [ "$require_mounted" -eq 1 ] || [ "$allow_unmounted" -eq 1 ] || [ -n "$destination" ]; then
+            echo "--system-disk-once cannot be combined with --require-mounted, --allow-unmounted or a directory" >&2
+            exit 2
+        fi
+        destination=$(system_disk_once_target) || exit 1
+    fi
     destination=${destination:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
     destination=$(python3 - "$destination" <<'PY'
 import os, sys
@@ -1612,17 +1711,12 @@ PY
     fi
     local stamp archive manifest sample_timer_active=0 indexer_timer_active=0 chat_active=0 telegram_active=0 displays_active=0 signalk_active=0 socketcan_active=0
     local -a extras was_compose_services=()
-    python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$destination" <<'PY'
-import pathlib
-import sys
-
-root, data, backup = (pathlib.Path(value).resolve(strict=False) for value in sys.argv[1:])
-if backup == pathlib.Path("/"):
-    raise SystemExit("Backup destination must be a specific directory, not /")
-if backup == root or root in backup.parents or backup == data or data in backup.parents:
-    raise SystemExit("Backup destination must be outside the VesselStack application and data trees")
-PY
+    check_backup_tree_overlap "$destination"
     check_backup_destination "$destination" "$allow_unmounted"
+    if [ -n "$BACKUP_REDIRECT" ]; then
+        destination=$BACKUP_REDIRECT
+        check_backup_tree_overlap "$destination"
+    fi
     mapfile -t extras < <(extra_backup_paths)
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     archive="$destination/vesselstack-$stamp.tar.gz"
@@ -1878,11 +1972,152 @@ PY
     echo "Verify the system, then remove them to free disk space: sudo rm -rf -- '$root.pre-restore-$stamp' '$data.pre-restore-$stamp'"
 }
 
+# ---------------------------------------------------------------- backup drive (control panel helpers)
+# The Control Panel never names a device or a folder: it passes a drive UUID that this side found
+# in its own list, and the folder always derives from the configured VESSELSTACK_BACKUP.
+
+# Sets BD_DEST (resolved backup folder) and BD_MOUNT_DIR (its /media or /mnt mount folder).
+backup_drive_target() {
+    BD_DEST=$(python3 -I - "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}" <<'PY'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY
+) || return 1
+    case "$BD_DEST" in
+        /media/*|/mnt/*) BD_MOUNT_DIR=$(printf '%s' "$BD_DEST" | cut -d/ -f1-3) ;;
+        *)
+            echo "Refusing: the backup folder ${BD_DEST//[![:print:]]/?} is not under /media or /mnt, so there is no drive to mount. Nothing was changed." >&2
+            return 1
+            ;;
+    esac
+}
+
+backup_drive_list_json() {
+    local mounted=false fstab=false listing='' listing_error='' errfile removable=true
+    BD_DEST=$(python3 -I - "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}" <<'PY'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY
+)
+    BD_MOUNT_DIR=
+    case "$BD_DEST" in
+        /media/*|/mnt/*) BD_MOUNT_DIR=$(printf '%s' "$BD_DEST" | cut -d/ -f1-3) ;;
+        *) removable=false ;;
+    esac
+    if [ "$removable" = true ]; then
+        if mountpoint -q "$BD_MOUNT_DIR"; then mounted=true; fi
+        if command -v findmnt >/dev/null 2>&1 && findmnt --fstab -n --mountpoint "$BD_MOUNT_DIR" >/dev/null 2>&1; then fstab=true; fi
+        if [ "$mounted" = false ]; then
+            if load_remediation_lib; then
+                errfile=$(mktemp)
+                listing=$(VS_BACKUP_DATA=$VESSELSTACK_DATA vs_backup_list_drives "$BD_MOUNT_DIR" 2>"$errfile") || listing_error=$(head -c 300 "$errfile" | tr -c '[:print:]' '?')
+                rm -f -- "$errfile"
+            else
+                listing_error="The installed drive library could not be trusted."
+            fi
+        fi
+    fi
+    if load_remediation_lib; then
+        printf '%s' "$listing" | vs_backup_drives_json | python3 -I -c '
+import json, sys
+data = json.load(sys.stdin)
+data.update(path=sys.argv[1], mount_dir=sys.argv[2], removable=sys.argv[3] == "true",
+            mounted=sys.argv[4] == "true", fstab_mount=sys.argv[5] == "true", listing_error=sys.argv[6])
+print(json.dumps(data, sort_keys=True))
+' "$BD_DEST" "$BD_MOUNT_DIR" "$removable" "$mounted" "$fstab" "$listing_error"
+    else
+        echo "The installed drive library could not be trusted." >&2
+        exit 1
+    fi
+}
+
+backup_drive_mount() {
+    local mode='' uuid='' kind path size label fs id listing count=0 dev='' devfs='' actual=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fstab) [ -z "$mode" ] || { usage >&2; exit 2; }; mode=fstab ;;
+            --uuid)
+                [ -z "$mode" ] && [ $# -ge 2 ] || { usage >&2; exit 2; }
+                mode=uuid; uuid=$2; shift ;;
+            *) usage >&2; exit 2 ;;
+        esac
+        shift
+    done
+    [ -n "$mode" ] || { usage >&2; exit 2; }
+    if [ "$mode" = uuid ] && [[ ! $uuid =~ ^[A-Za-z0-9-]{1,64}$ ]]; then
+        echo "Refusing to mount: that is not a drive id. Nothing was changed." >&2
+        exit 2
+    fi
+    if ! load_remediation_lib; then
+        echo "Refusing to mount: the installed drive library could not be trusted. Nothing was changed." >&2
+        exit 1
+    fi
+    backup_drive_target || exit 1
+    if mountpoint -q "$BD_MOUNT_DIR"; then
+        echo "Refusing to mount: $(vs_printable "$BD_MOUNT_DIR") is already mounted. Nothing was changed." >&2
+        exit 1
+    fi
+    if [ -L "$BD_MOUNT_DIR" ] || { [ -e "$BD_MOUNT_DIR" ] && [ ! -d "$BD_MOUNT_DIR" ]; }; then
+        echo "Refusing to mount: $(vs_printable "$BD_MOUNT_DIR") exists but is not a plain folder. Nothing was changed." >&2
+        exit 1
+    fi
+    if [ -d "$BD_MOUNT_DIR" ] && [ -n "$(ls -A -- "$BD_MOUNT_DIR" 2>/dev/null)" ]; then
+        echo "Refusing to mount: $(vs_printable "$BD_MOUNT_DIR") is not empty (files hidden under a mount would be unreachable). Nothing was changed." >&2
+        exit 1
+    fi
+    if [ "$mode" = fstab ]; then
+        if ! command -v findmnt >/dev/null 2>&1 || ! findmnt --fstab -n --mountpoint "$BD_MOUNT_DIR" >/dev/null 2>&1; then
+            echo "Refusing to mount: $(vs_printable "$BD_MOUNT_DIR") is not listed in /etc/fstab. Nothing was changed." >&2
+            exit 1
+        fi
+        if ! mount -o nodev,nosuid,noexec -- "$BD_MOUNT_DIR" || ! mountpoint -q "$BD_MOUNT_DIR"; then
+            echo "Could not mount $(vs_printable "$BD_MOUNT_DIR") from /etc/fstab." >&2
+            exit 1
+        fi
+        echo "Mounted $(vs_printable "$BD_MOUNT_DIR")." >&2
+    else
+        listing=$(VS_BACKUP_DATA=$VESSELSTACK_DATA vs_backup_list_drives "$BD_MOUNT_DIR") || exit 1
+        while IFS=$'\x1f' read -r kind path size label fs id; do
+            [ "$kind" = OK ] && [ "$id" = "$uuid" ] || continue
+            count=$((count + 1)); dev=$path; devfs=$fs
+        done <<<"$listing"
+        if [ "$count" -ne 1 ]; then
+            echo "Refusing to mount: the drive is not (or no longer) listed exactly once as a usable backup drive. Nothing was changed." >&2
+            exit 1
+        fi
+        vs_backup_mount_device "$BD_MOUNT_DIR" "$dev" "$devfs" "$uuid" || exit 1
+        actual=$(findmnt -n -o UUID --mountpoint "$BD_MOUNT_DIR" 2>/dev/null | head -n 1)
+        if [ "${actual,,}" != "${uuid,,}" ]; then
+            umount -- "$BD_MOUNT_DIR" || echo "WARNING: could not unmount $(vs_printable "$BD_MOUNT_DIR") again; unmount it by hand: sudo umount $(printf '%q' "$BD_MOUNT_DIR")" >&2
+            echo "Refusing to use the drive: what is mounted at $(vs_printable "$BD_MOUNT_DIR") is not the drive that was chosen. It was unmounted again." >&2
+            exit 1
+        fi
+    fi
+    if ! verify_mounted_destination "$BD_DEST" "$BD_MOUNT_DIR"; then
+        umount -- "$BD_MOUNT_DIR" || echo "WARNING: could not unmount $BD_MOUNT_DIR again; unmount it by hand: sudo umount $(printf '%q' "$BD_MOUNT_DIR")" >&2
+        exit 1
+    fi
+    echo "Backup drive mounted at $(vs_printable "$BD_MOUNT_DIR")"
+}
+
+backup_drive_command() {
+    [ $# -ge 1 ] || { usage >&2; exit 2; }
+    local sub=$1
+    shift
+    case "$sub" in
+        list) [ $# -eq 1 ] && [ "$1" = --json ] || { usage >&2; exit 2; }; backup_drive_list_json ;;
+        mount) backup_drive_mount "$@" ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
 update_stack() {
-    local source='' offline=${VESSELSTACK_OFFLINE:-false} argument
+    local source='' offline=${VESSELSTACK_OFFLINE:-false} argument choice=''
     for argument in "$@"; do
         case "$argument" in
             --offline) offline=true ;;
+            # Used by the Control Panel only (see README); not advertised for terminal use.
+            --backup-choice=system-disk-once|--backup-choice=skip) choice=${argument#--backup-choice=} ;;
             -*) usage >&2; exit 2 ;;
             *) [ -z "$source" ] || { usage >&2; exit 2; }; source=$argument ;;
         esac
@@ -1895,9 +2130,17 @@ update_stack() {
     local install_args=(--config "$ENV_FILE")
     [ "$offline" != true ] || install_args+=(--offline)
     [ -x "$source/install.sh" ] || { echo "Not a VesselStack release directory: $source" >&2; exit 1; }
+    if [ -n "$choice" ] && backup_system_disk_locked; then
+        echo "Refusing to update without the configured backup: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set. Nothing was changed." >&2
+        exit 1
+    fi
     "$source/install.sh" "${install_args[@]}" --dry-run
-    # The backup check runs before anything is stopped; it may ask where to back up.
-    VS_BACKUP_CONTEXT=update VS_BACKUP_UPDATE_DIR=$source backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}"
+    case "$choice" in
+        system-disk-once) VS_BACKUP_CONTEXT=update VS_BACKUP_UPDATE_DIR=$source backup_stack --system-disk-once ;;
+        skip) echo "WARNING: backup skipped at the owner's request for this update; there is no archive to restore from." >&2 ;;
+        # The backup check runs before anything is stopped; it may ask where to back up.
+        *) VS_BACKUP_CONTEXT=update VS_BACKUP_UPDATE_DIR=$source backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}" ;;
+    esac
     "$source/install.sh" "${install_args[@]}" --start
 }
 
@@ -1986,6 +2229,7 @@ case "$command" in
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
     component) [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
     backup) backup_stack "$@" ;;
+    backup-drive) backup_drive_command "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;
     restore) [ $# -ge 2 ] || { usage; exit 2; }; restore_stack "$@" ;;
     update) [ $# -ge 1 ] || { usage; exit 2; }; update_stack "$@" ;;

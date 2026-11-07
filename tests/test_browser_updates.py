@@ -2,6 +2,7 @@
 import importlib.util
 import hashlib
 import io
+import json
 import shutil
 import tarfile
 import tempfile
@@ -212,6 +213,198 @@ class BrowserUpdateTests(unittest.TestCase):
             with tarfile.open(archive, "w:gz") as handle:
                 info = tarfile.TarInfo("../escape"); info.size = 1; handle.addfile(info, io.BytesIO(b"x"))
             with self.assertRaises(ValueError): updates.safe_extract(archive, target)
+
+
+    # ---- one-shot backup choices (backup drive not mounted)
+
+    def _run_choice(self, backup, mount="not_mounted", env_text="", supports=True, fail_on=None):
+        """Runs run_update with a fake control binary; returns (operation, calls, error, mocks)."""
+        directory = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, directory, True)
+        root = Path(directory); archive, checksum, digest = self._release_fixture(directory)
+        config = root / "vesselstack.env"; config.write_text(env_text)
+        snapshot = {"id": 9, "tag": "v0.6.0", "version": "0.6.0", "prerelease": False, "updated_at": "u",
+                    "assets": {"archive": {"id": 1, "name": archive.name, "size": archive.stat().st_size, "updated_at": "a", "digest": f"sha256:{digest}", "url": "https://github.com/a"},
+                               "checksum": {"id": 2, "name": checksum.name, "size": checksum.stat().st_size, "updated_at": "a", "digest": None, "url": "https://github.com/c"}}}
+        request = {"release_id": 9, "channel": "lab", "config": str(config), "old_boot_id": "old", "release_snapshot": snapshot}
+        if backup is not None:
+            request["backup"] = backup
+        operation = {"id": 1, "state": "running", "phase": "queued", "backup_path": None}
+        if isinstance(backup, dict):
+            operation["backup_mode"] = backup.get("mode")  # as start_detached records it
+        calls = []
+        def download(url, dest, **kwargs): shutil.copy2(archive if dest.suffix == ".gz" else checksum, dest)
+        def run(argv, root_arg=None, op=None, *args, **kw):
+            calls.append(list(argv))
+            if isinstance(op, dict):
+                op["output"] = ["output of " + Path(argv[0]).name]  # like the real runner, each command replaces the log
+            if fail_on and argv[:len(fail_on)] == fail_on:
+                raise RuntimeError("step failed")
+            return mock.Mock(stdout="/backup/archive.tar.gz\n")
+        error = None
+        with mock.patch.object(updates, "release_snapshot", side_effect=[snapshot, snapshot]), mock.patch.object(updates, "bounded_download", side_effect=download) as downloaded, \
+                mock.patch.object(updates, "verify_restart", return_value={"boot_id": "new", "running_version": "0.6.0"}), mock.patch.object(updates, "_validate_fixed_ctl"), \
+                mock.patch.object(updates, "backup_destination", return_value=("/media/backup/backups", mount)), \
+                mock.patch.object(updates, "ctl_supports", return_value=supports) as supported, mock.patch.object(updates, "run_command", side_effect=run):
+            try:
+                updates.run_update(request, operation, root)
+            except Exception as exc:  # the caller inspects it
+                error = exc
+        return operation, calls, error, {"downloaded": downloaded, "supported": supported, "root": root}
+
+    def test_default_run_never_probes_or_mounts(self):
+        operation, calls, error, mocks = self._run_choice(None)
+        self.assertIsNone(error)
+        self.assertEqual([c for c in calls if "backup" in c[1:2] or "backup-drive" in c], [[updates.FIXED_CTL, "backup", "--require-mounted"]])
+        mocks["supported"].assert_not_called()
+        self.assertNotIn("backup_skipped", operation)
+        self.assertEqual(operation["backup_path"], "/backup/archive.tar.gz")
+        _, calls, error, _ = self._run_choice({"mode": "require_mounted"})
+        self.assertIsNone(error)
+        self.assertIn([updates.FIXED_CTL, "backup", "--require-mounted"], calls)
+
+    def test_mount_modes_mount_after_preflight_and_before_backup(self):
+        for backup, mount_argv in (({"mode": "mount_fstab"}, [updates.FIXED_CTL, "backup-drive", "mount", "--fstab"]),
+                                   ({"mode": "mount_drive", "uuid": "AB12-CD34"}, [updates.FIXED_CTL, "backup-drive", "mount", "--uuid", "AB12-CD34"])):
+            with self.subTest(backup=backup):
+                operation, calls, error, mocks = self._run_choice(backup)
+                self.assertIsNone(error)
+                backup_call = [updates.FIXED_CTL, "backup", "--require-mounted"]
+                dry = next(i for i, c in enumerate(calls) if c[-1] == "--dry-run")
+                self.assertLess(dry, calls.index(mount_argv))
+                self.assertLess(calls.index(mount_argv), calls.index(backup_call))
+                self.assertLess(calls.index(backup_call), next(i for i, c in enumerate(calls) if c[-1] == "--start"))
+                mocks["supported"].assert_called_with("backup-drive")
+                self.assertEqual(operation["state"], "succeeded")
+
+    def test_mount_failure_stops_before_backup_and_install(self):
+        operation, calls, error, _ = self._run_choice({"mode": "mount_drive", "uuid": "AB12-CD34"}, fail_on=[updates.FIXED_CTL, "backup-drive"])
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(any(c[:2] == [updates.FIXED_CTL, "backup"] for c in calls))
+        self.assertFalse(any(c[-1] == "--start" for c in calls))
+        self.assertFalse(any(c[:2] == ["systemctl", "restart"] for c in calls))
+
+    def test_system_disk_once_uses_the_one_shot_backup_flag(self):
+        operation, calls, error, mocks = self._run_choice({"mode": "system_disk_once", "confirm": "system-disk-once"})
+        self.assertIsNone(error)
+        self.assertIn([updates.FIXED_CTL, "backup", "--system-disk-once"], calls)
+        self.assertNotIn([updates.FIXED_CTL, "backup", "--require-mounted"], calls)
+        mocks["supported"].assert_called_with("--system-disk-once")
+        self.assertEqual(updates.read_operation(mocks["root"]).get("backup_path"), "/backup/archive.tar.gz")
+
+    def test_skip_installs_without_calling_backup(self):
+        operation, calls, error, mocks = self._run_choice({"mode": "skip", "confirm": "install-without-backup"})
+        self.assertIsNone(error)
+        self.assertFalse(any(c[:2] == [updates.FIXED_CTL, "backup"] for c in calls))
+        self.assertTrue(any(c[-1] == "--start" for c in calls))
+        self.assertIs(operation["backup_skipped"], True)
+        self.assertIsNone(operation["backup_path"])
+        self.assertEqual(operation["state"], "succeeded")
+        self.assertEqual(operation["backup_mode"], "skip")
+        self.assertEqual(operation["output"][0], updates.BACKUP_SKIP_WARNING, "the warning survives the commands that replace the log")
+        self.assertEqual(operation["output"].count(updates.BACKUP_SKIP_WARNING), 1)
+        self.assertIn("backup skipped at the owner's request", updates.BACKUP_SKIP_WARNING)
+
+    def test_skip_keeps_earlier_log_below_the_warning(self) -> None:
+        snapshots = []
+        real_write = updates.write_operation
+        def spy(root_arg, op):
+            if op.get("phase") == "backing-up":
+                snapshots.append(list(op.get("output") or []))
+            return real_write(root_arg, op)
+        with mock.patch.object(updates, "write_operation", side_effect=spy):
+            operation, calls, error, _ = self._run_choice({"mode": "skip", "confirm": "install-without-backup"})
+        self.assertIsNone(error)
+        self.assertEqual(snapshots[-1][0], updates.BACKUP_SKIP_WARNING)
+        self.assertIn("output of install.sh", snapshots[-1][1:], "the dry-run log is kept below the warning")
+
+    def test_worker_rechecks_the_lock_before_skip_or_system_disk(self) -> None:
+        for backup in ({"mode": "skip", "confirm": "install-without-backup"}, {"mode": "system_disk_once", "confirm": "system-disk-once"}):
+            with self.subTest(backup=backup):
+                original = updates.run_command
+                directory_holder = {}
+                def locking_run(argv, root_arg=None, op=None, *args, **kw):
+                    if argv[-1] == "--dry-run":
+                        (directory_holder["config"]).write_text("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n")  # locked after admission
+                    return mock.Mock(stdout="/backup/archive.tar.gz\n")
+                directory = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, directory, True)
+                root = Path(directory); archive, checksum, digest = self._release_fixture(directory)
+                config = root / "vesselstack.env"; config.write_text(""); directory_holder["config"] = config
+                snapshot = {"id": 9, "tag": "v0.6.0", "version": "0.6.0", "prerelease": False, "updated_at": "u",
+                            "assets": {"archive": {"id": 1, "name": archive.name, "size": archive.stat().st_size, "updated_at": "a", "digest": f"sha256:{digest}", "url": "https://github.com/a"},
+                                       "checksum": {"id": 2, "name": checksum.name, "size": checksum.stat().st_size, "updated_at": "a", "digest": None, "url": "https://github.com/c"}}}
+                request = {"release_id": 9, "channel": "lab", "config": str(config), "old_boot_id": "old", "release_snapshot": snapshot, "backup": backup}
+                operation = {"id": 1, "state": "running", "phase": "queued", "backup_path": None}
+                seen = []
+                def download(url, dest, **kwargs): shutil.copy2(archive if dest.suffix == ".gz" else checksum, dest)
+                def run(argv, *args, **kw):
+                    seen.append(list(argv)); return locking_run(argv, *args, **kw)
+                with mock.patch.object(updates, "release_snapshot", side_effect=[snapshot, snapshot]), mock.patch.object(updates, "bounded_download", side_effect=download), \
+                        mock.patch.object(updates, "_validate_fixed_ctl"), mock.patch.object(updates, "backup_destination", return_value=("/media/backup/backups", "not_mounted")), \
+                        mock.patch.object(updates, "ctl_supports", return_value=True), mock.patch.object(updates, "run_command", side_effect=run):
+                    with self.assertRaisesRegex(ValueError, "turned off"):
+                        updates.run_update(request, operation, root)
+                self.assertFalse(any(c[-1] == "--start" or c[:2] == [updates.FIXED_CTL, "backup"] for c in seen))
+
+    def test_worker_refuses_invalid_or_locked_choices_before_downloading(self):
+        for backup, env_text in (({"mode": "format_disk"}, ""), ({"mode": "mount_drive", "uuid": "../../dev/sda1"}, ""), ({"mode": "mount_drive"}, ""),
+                                 ({"mode": "skip"}, ""), ({"mode": "skip", "confirm": "yes"}, ""), ({"mode": "mount_fstab", "device": "/dev/sda1"}, ""),
+                                 ({"mode": "skip", "confirm": "install-without-backup"}, "VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n"),
+                                 ({"mode": "system_disk_once", "confirm": "system-disk-once"}, "export VESSELSTACK_BACKUP_ALLOW_UNMOUNTED='false'\n"),
+                                 ("skip", ""), ([], "")):
+            with self.subTest(backup=backup, env=env_text):
+                operation, calls, error, mocks = self._run_choice(backup, env_text=env_text)
+                self.assertIsInstance(error, ValueError)
+                self.assertEqual(calls, [])
+                mocks["downloaded"].assert_not_called()
+
+    def test_choice_falls_back_to_the_default_when_the_drive_is_mounted_now(self):
+        for backup in ({"mode": "mount_fstab"}, {"mode": "system_disk_once", "confirm": "system-disk-once"}, {"mode": "skip", "confirm": "install-without-backup"}):
+            with self.subTest(backup=backup):
+                operation, calls, error, _ = self._run_choice(backup, mount="mounted")
+                self.assertIsNone(error)
+                self.assertIn([updates.FIXED_CTL, "backup", "--require-mounted"], calls)
+                self.assertFalse(any("backup-drive" in c or "--system-disk-once" in c for c in calls))
+                self.assertNotIn("backup_skipped", operation)
+                self.assertNotIn("backup_mode", operation, "the record never claims a handling that was not used")
+
+    def test_older_control_binary_is_reported_before_anything_changes(self):
+        for backup in ({"mode": "mount_fstab"}, {"mode": "system_disk_once", "confirm": "system-disk-once"}):
+            with self.subTest(backup=backup):
+                operation, calls, error, _ = self._run_choice(backup, supports=False)
+                self.assertIsInstance(error, ValueError)
+                self.assertIn("older than this Control Panel", str(error))
+                self.assertFalse(any(c[:2] == [updates.FIXED_CTL, "backup"] or c[-1] == "--start" for c in calls))
+
+    def test_normalize_backup_choice(self):
+        normalize = updates.normalize_backup_choice
+        self.assertIsNone(normalize(None, False))
+        self.assertIsNone(normalize({"mode": "require_mounted"}, True))
+        self.assertEqual(normalize({"mode": "mount_drive", "uuid": "AB12-CD34"}, True), {"mode": "mount_drive", "uuid": "AB12-CD34"})
+        self.assertEqual(normalize({"mode": "skip", "confirm": "install-without-backup"}, False)["mode"], "skip")
+        for bad in ({"mode": "require_mounted", "uuid": "x"}, {"mode": "mount_fstab", "confirm": "x"}, {"mode": "mount_drive", "uuid": "a" * 65}, {"mode": "mount_drive", "uuid": 5}, {}, {"mode": None}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                normalize(bad, False)
+
+    def test_backup_lock_matches_the_shell_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "vesselstack.env"
+            for text, expected in (("", False), ("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true\n", False), ("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n", True),
+                                   ("export VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=\"false\"\n", True), ("# VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n", False)):
+                config.write_text(text)
+                self.assertIs(updates.backup_locked(config), expected, text)
+            self.assertIs(updates.backup_locked(Path(directory) / "missing.env"), False)
+
+    def test_start_detached_stores_the_choice_only_when_given(self):
+        for backup in (None, {"mode": "mount_fstab"}):
+            with self.subTest(backup=backup), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); snapshot = {"version": "0.6.0"}
+                kwargs = {"backup": backup} if backup else {}
+                with mock.patch.object(updates, "release_snapshot", return_value=snapshot), mock.patch.object(updates, "assert_snapshot_unchanged"), mock.patch.object(updates.subprocess, "run"):
+                    operation = updates.start_detached("update-release", root, {"boot_id": "old", "running_version": "0.5.3"}, 9, "lab", snapshot=snapshot, **kwargs)
+                request = json.loads(next((root / "var/lib/vesselstack").glob("browser-update-*/request.json")).read_text())
+                self.assertEqual(request.get("backup"), backup)
+                self.assertEqual(operation.get("backup_mode"), backup["mode"] if backup else None)
+                self.assertEqual("backup" in request, backup is not None)
 
 
 if __name__ == "__main__":

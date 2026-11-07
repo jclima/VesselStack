@@ -24,6 +24,7 @@ from typing import Any
 
 try:
     from browser_updates import installed_version, release_catalog, read_operation, public_operation, release_snapshot, running_identity, acquire_slot, release_slot, start_detached
+    from browser_updates import normalize_backup_choice, effective_backup_choice, backup_locked, ctl_supports
 except ImportError:
     import importlib.util
     _spec = importlib.util.spec_from_file_location("browser_updates", Path(__file__).with_name("browser_updates.py"))
@@ -35,6 +36,8 @@ except ImportError:
     acquire_slot = _updates.acquire_slot; release_slot = _updates.release_slot
     start_detached = _updates.start_detached
     release_snapshot = _updates.release_snapshot
+    normalize_backup_choice = _updates.normalize_backup_choice; effective_backup_choice = _updates.effective_backup_choice
+    backup_locked = _updates.backup_locked; ctl_supports = _updates.ctl_supports
 
 
 ROOT = Path(os.environ.get("VESSELSTACK_ROOT", "/opt/vesselstack"))
@@ -700,7 +703,7 @@ def verify_release_tree(release: Path) -> None:
             verify_release_path(path)
 
 
-def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
+def action_command(action: str, parameters: dict[str, Any], backup_choice: dict[str, str] | None = None) -> list[str]:
     if action in {"preflight", "apply", "install"}:
         if not INSTALLER.is_file():
             raise ValueError(f"Bundled installer not found at {INSTALLER}")
@@ -729,7 +732,12 @@ def action_command(action: str, parameters: dict[str, Any]) -> list[str]:
         for candidate in (reviewed_root, resolved):
             verify_release_path(candidate)
         verify_release_tree(resolved)
-        return [str(CTL), "update", str(resolved)]
+        command = [str(CTL), "update", str(resolved)]
+        # backup_choice only ever comes from request_backup_choice(), never straight from the request body.
+        if backup_choice and backup_choice.get("mode") in {"system_disk_once", "skip"}:
+            # The reviewed folder comes first (older controllers read only the first argument).
+            command.append("--backup-choice=" + backup_choice["mode"].replace("_", "-"))
+        return command
     raise ValueError("Unsupported action")
 
 
@@ -739,6 +747,15 @@ def command_output(command: list[str], timeout: int = 8) -> tuple[int, str]:
         return result.returncode, result.stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, str(exc)
+
+
+def command_stdout(command: list[str], timeout: int = 20) -> tuple[int, str]:
+    """Like command_output, but stderr is dropped so a warning cannot corrupt JSON."""
+    try:
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        return result.returncode, result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
 
 
 def describe_component(name: str, kind: str, enabled: bool, state: str) -> dict[str, Any]:
@@ -881,6 +898,92 @@ def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
     return result
 
 
+DRIVE_FIELDS = ("device", "label", "size", "fstype")
+
+
+def _drive_rows(value: Any, extra: tuple[str, ...]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        row = {key: str(item.get(key) or "")[:120] for key in (*DRIVE_FIELDS, *extra)}
+        if "uuid" in extra and not re.fullmatch(r"[A-Za-z0-9-]{1,64}", row["uuid"]):
+            continue
+        rows.append(row)
+    return rows[:20]
+
+
+def backup_is_locked() -> bool:
+    """Locked by vesselstack.env or by the panel's own process environment."""
+    return bool(backup_locked(VESSEL_ENV) or os.environ.get("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED") == "false")
+
+
+def backup_preflight() -> dict[str, Any]:
+    """What the owner may choose before a browser upgrade or folder update. Read-only.
+
+    default_ok means the normal path (a mounted backup folder) will work. The drive list comes from
+    the installed vesselstackctl (root side); the browser can only pick an entry by its UUID, and the
+    root side lists again before it mounts anything. Any problem there yields an empty drive list.
+    """
+    status = backup_status()
+    mount = status.get("mount", "unknown")
+    locked = backup_is_locked()
+    listing: dict[str, Any] = {}
+    if mount == "not_mounted":
+        code, text = command_stdout([str(CTL), "backup-drive", "list", "--json"])
+        if code == 0:
+            try:
+                parsed = json.loads(text)
+                listing = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                listing = {}
+    offered = (not locked) and mount in {"not_mounted", "system_disk"}
+    if locked:
+        reason = "Turned off: VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false is set in the configuration."
+    elif not offered:
+        reason = "The backup folder is on a mounted drive or could not be checked."
+    else:
+        reason = ""
+    return {
+        "path": status.get("path", ""),
+        "mount": mount,
+        "default_ok": mount == "mounted",
+        "fstab_mount": bool(listing.get("fstab_mount")) and mount == "not_mounted",
+        "drives": _drive_rows(listing.get("drives"), ("uuid",)),
+        "refused": _drive_rows(listing.get("refused"), ("reason",)),
+        "mounted_elsewhere": _drive_rows(listing.get("mounted_elsewhere"), ("mountpoint",)),
+        "system_disk_once": {"offered": offered, "reason": reason, "target": DEFAULT_BACKUP_DIR if mount == "not_mounted" else status.get("path", "")},
+        "skip": {"offered": not locked},
+    }
+
+
+def request_backup_choice(payload: dict[str, Any], folder: bool = False) -> dict[str, str] | None:
+    """The validated one-shot backup choice of this request (None means the normal mounted backup).
+
+    The release worker checks the installed controller itself; a folder update runs the installed
+    controller directly, so it is checked here.
+    """
+    choice = normalize_backup_choice(payload.get("backup"), backup_is_locked())
+    choice, _ = effective_backup_choice(choice, VESSEL_ENV)
+    if folder and choice is not None and not ctl_supports("backup-drive", str(CTL)):
+        raise ValueError("The installed vesselstackctl is older than this Control Panel and does not support that choice. Mount the drive by hand, or run the update from a terminal.")
+    return choice
+
+
+def folder_update_steps(choice: dict[str, str] | None) -> list[list[str]]:
+    """Commands that run before `vesselstackctl update DIR`: the mount, outside the panel's sandbox.
+
+    The panel runs with a private mount namespace, so a mount made here would not be visible to the
+    rest of the system. A transient unit is started by systemd instead and runs as plain root.
+    """
+    if not choice or choice["mode"] not in {"mount_fstab", "mount_drive"}:
+        return []
+    unit = ["systemd-run", "--wait", "--pipe", "--collect", "--quiet", "--property=RuntimeMaxSec=300",
+            f"--setenv=VESSELSTACK_ROOT={ROOT}", f"--setenv=VESSELSTACK_ENV={VESSEL_ENV}", "--setenv=VESSELSTACK_NONINTERACTIVE=true"]
+    mount = [str(CTL), "backup-drive", "mount"] + (["--fstab"] if choice["mode"] == "mount_fstab" else ["--uuid", choice["uuid"]])
+    return [unit + mount]
+
+
 ERROR_LINE = re.compile(r"^(?:\[[^\]]*\]\s*)?(?:ERROR|Error|error|FATAL|Refusing[^:]*|Backup[^:]*failed)[:\s]+(.*)$")
 
 
@@ -938,11 +1041,12 @@ class OperationStore:
         self.current: dict[str, Any] | None = None
         self.counter = 0
 
-    def start(self, label: str, command_or_factory: list[str] | Any) -> dict[str, Any]:
+    def start(self, label: str, command_or_factory: list[str] | Any, before: Any = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         slot_fd = take_lifecycle_slot()
         operation = None
         try:
             command = command_or_factory() if callable(command_or_factory) else command_or_factory
+            steps = (before() if callable(before) else before) or []
             with self.lock:
                 if self.current and self.current["state"] == "running":
                     raise ValueError("Another operation is already running")
@@ -952,9 +1056,10 @@ class OperationStore:
                     "command": command[0:1] + ["[arguments hidden]"],
                     "state": "running", "started_at": int(time.time()),
                     "finished_at": None, "exit_code": None, "output": deque(maxlen=400),
+                    **(extra or {}),
                 }
                 self.current = operation
-            threading.Thread(target=self._run, args=(operation, command, slot_fd), daemon=True).start()
+            threading.Thread(target=self._run, args=(operation, command, slot_fd, steps), daemon=True).start()
             return self.public()
         except Exception:
             if operation is not None:
@@ -966,19 +1071,24 @@ class OperationStore:
             release_lifecycle_slot(slot_fd)
             raise
 
-    def _run(self, operation: dict[str, Any], command: list[str], slot_fd) -> None:
+    def _run(self, operation: dict[str, Any], command: list[str], slot_fd, steps: list[list[str]] | None = None) -> None:
         environment = os.environ.copy()
         environment["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
         environment["VESSELSTACK_NONINTERACTIVE"] = "true"  # the panel cannot answer prompts; scripts print "To fix:" guidance instead
         exit_code = 1
         succeeded = False
         try:
-            process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
-            assert process.stdout is not None
-            for line in process.stdout:
-                with self.lock:
-                    operation["output"].append(line.rstrip())
-            exit_code = process.wait()
+            # Steps (for example mounting the backup drive) run first; the first failure stops everything.
+            exit_code = 0
+            for step in [*(steps or []), command]:
+                process = subprocess.Popen(step, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
+                assert process.stdout is not None
+                for line in process.stdout:
+                    with self.lock:
+                        operation["output"].append(line.rstrip())
+                exit_code = process.wait()
+                if exit_code != 0:
+                    break
             succeeded = exit_code == 0
             with self.lock:
                 if succeeded and operation["label"] in {"apply", "install", "update"} and restart_needed():
@@ -1108,6 +1218,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 operation = memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))
                 vessel = parse_env(VESSEL_ENV)
                 self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
+            elif path == "/api/backup-preflight":
+                self.send_json(200, backup_preflight())
             elif path == "/api/operation":
                 persisted = public_operation(ROOT)
                 memory = OPERATIONS.public()
@@ -1153,6 +1265,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/action":
                 action = str(payload.get("action", ""))
+                if payload.get("backup") is not None and action not in {"update", "update-release"}:
+                    raise ValueError("backup choices apply only to updates")
                 if action == "restart-panel":
                     slot = take_lifecycle_slot()
                     try:
@@ -1166,13 +1280,23 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                         raise ValueError("release_id and channel are required")
                     if OPERATIONS.public().get("state") == "running":
                         raise ValueError("Another operation is already running")
+                    choice = request_backup_choice(payload)
                     slot = take_lifecycle_slot()
                     try:
                         snapshot = release_snapshot(release_id, channel, ROOT)
-                        result = start_detached("update-release", ROOT, RUNNING_IDENTITY, release_id, channel, target_version=snapshot["version"], snapshot=snapshot)
+                        extra_args = {"backup": choice} if choice else {}
+                        result = start_detached("update-release", ROOT, RUNNING_IDENTITY, release_id, channel, target_version=snapshot["version"], snapshot=snapshot, **extra_args)
                     finally:
                         release_lifecycle_slot(slot)
                     self.send_json(202, result); return
+                if action == "update" and payload.get("backup") is not None:
+                    choice = request_backup_choice(payload, folder=True)
+                    if choice is not None:
+                        info: dict[str, Any] = {"backup_mode": choice["mode"]}
+                        if choice["mode"] == "skip":
+                            info["backup_skipped"] = True
+                        self.send_json(202, OPERATIONS.start(action, lambda: action_command(action, payload, choice), before=lambda: folder_update_steps(choice), extra=info))
+                        return
                 self.send_json(202, OPERATIONS.start(action, lambda: action_command(action, payload)))
                 return
             if path == "/api/restart-panel":
