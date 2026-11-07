@@ -411,8 +411,19 @@ dialog .keep{margin:.2rem 0 .5rem}
 .step.failed .mark{color:var(--on-red);background:var(--red);border-color:var(--red)}
 .step.todo{color:var(--muted)}
 .methods{border:1px solid var(--line);border-radius:.8rem;margin:0 0 .8rem;padding:.6rem .8rem}
-.choice{display:flex;gap:.5rem;align-items:flex-start;min-height:44px;padding:.3rem 0}.choice input{width:auto;min-height:auto;margin-top:.35rem}
+.methods .choice{display:flex;gap:.5rem;align-items:flex-start;min-height:44px;padding:.3rem 0;font-weight:400;border:0;border-radius:0}.methods .choice input{width:auto;min-height:auto;margin-top:.35rem}
 .methodrow{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:0 0 .5rem 1.6rem}.methodrow label{font-size:.9rem}.methodrow input,.methodrow select{flex:1 1 12rem;width:auto}
 .applynotes{margin:.4rem 0}
 #apply-dialog{width:min(36rem,calc(100% - 2rem))}
 @media (max-width:760px){.addbar{top:0}.methodrow{margin-left:0}}
+
+/* backup choice dialog */
+.choices{display:grid;gap:.4rem;margin:.6rem 0}
+.choice{display:flex;align-items:flex-start;gap:.6rem;min-height:44px;margin:0;padding:.6rem .75rem;font-weight:600;border:1px solid var(--strong);border-radius:8px;cursor:pointer}
+.choice input{width:auto;min-height:0;margin-top:.2rem;flex:none}
+.danger-choice{border-color:var(--red)}
+.ack{display:flex;align-items:flex-start;gap:.6rem;margin:.6rem 0;font-weight:600}
+.ack input{width:auto;min-height:0;margin-top:.2rem;flex:none}
+.notes{margin:.4rem 0;font-size:.85rem}
+.choice-error{margin:.4rem 0;color:var(--red)}
+#backup-choice-dialog{width:min(36rem,calc(100% - 2rem));max-height:calc(100% - 2rem);overflow:auto}

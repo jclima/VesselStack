@@ -191,6 +191,22 @@ sudo vesselstackctl restore &lt;backup-file&gt; --yes</code></div>
     <div class="foot"><button type="button" id="apply-cancel">Cancel</button><button type="button" id="apply-ok" class="primary">Start</button></div>
   </form></dialog>
 
+  <dialog id="backup-choice-dialog" aria-labelledby="backup-choice-title"><form method="dialog" id="backup-choice-form">
+    <h2 id="backup-choice-title"></h2>
+    <p id="backup-choice-intro"></p>
+    <ul id="backup-choice-items" hidden></ul>
+    <div id="backup-choice-options" class="choices" role="radiogroup" aria-label="How to handle the backup for this update"></div>
+    <p id="backup-choice-detail" class="keep" hidden></p>
+    <div id="backup-choice-folder" hidden>
+      <label for="backup-choice-path">New backup folder (a folder under /media or /mnt)</label>
+      <input id="backup-choice-path" type="text" autocomplete="off" spellcheck="false" placeholder="/media/backup-drive/vesselstack">
+    </div>
+    <label id="backup-choice-skip-ack" class="ack" hidden><input type="checkbox" id="backup-choice-ack"> <span id="backup-choice-ack-text"></span></label>
+    <ul id="backup-choice-notes" class="notes" hidden></ul>
+    <p id="backup-choice-error" role="alert" class="choice-error" hidden></p>
+    <div class="foot"><button type="button" id="backup-choice-cancel" autofocus>Cancel</button><button type="button" id="backup-choice-ok" class="primary"></button></div>
+  </form></dialog>
+
   <div id="toast" role="status" aria-live="polite"><span id="toast-text"></span><button id="toast-close" type="button" aria-label="Dismiss message" hidden>Dismiss</button></div>
   <script src="/app.js"></script>
 </body>

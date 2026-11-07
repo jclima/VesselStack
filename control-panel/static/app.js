@@ -166,6 +166,166 @@ function ask(spec) {
   });
 }
 
+// ---------------------------------------------------------------- backup choice (drive not mounted)
+
+const SKIP_ACK_TEXT = "I understand there is no backup to restore if this update fails";
+const mountFolder = (path) => {
+  const parts = String(path || "").split("/").filter(Boolean);
+  return ["media", "mnt"].includes(parts[0]) && parts[1] ? `/${parts[0]}/${parts[1]}` : String(path || "");
+};
+
+function backupOptions(pre) {
+  const folder = mountFolder(pre.path);
+  const options = [];
+  if (pre.fstab_mount) options.push({ id: "fstab", label: "Mount the backup drive now", detail: `It is listed in /etc/fstab for ${folder}.`, ok: "Mount and continue", backup: { mode: "mount_fstab" } });
+  (pre.drives || []).forEach((drive) => options.push({
+    id: `drive:${drive.uuid}`,
+    label: `Mount ${drive.label ? `"${drive.label}"` : "the drive with no name"} (${drive.size}, ${drive.fstype})`,
+    detail: `${drive.device} is mounted at ${folder} until the next restart. /etc/fstab is not changed.`,
+    ok: "Mount and continue",
+    backup: { mode: "mount_drive", uuid: drive.uuid },
+  }));
+  options.push({ id: "recheck", label: "I plugged the drive in; check again", ok: "Check again", action: "recheck" });
+  if (pre.system_disk_once?.offered) options.push({
+    id: "system", label: "Back up to the system disk this once (not recommended)",
+    detail: `Saved in ${pre.system_disk_once.target || "the system backup folder"} on this computer's own disk. It will not survive a failed disk. Nothing is remembered; the next update asks again.`,
+    ok: "Back up to the system disk and continue", backup: { mode: "system_disk_once", confirm: "system-disk-once" },
+  });
+  options.push({ id: "folder", label: "Use a different backup folder", detail: "Saves the new folder as your backup folder setting, then checks again.", ok: "Save folder and check again", action: "folder" });
+  if (pre.skip?.offered) options.push({
+    id: "skip", label: "Install without a backup", danger: true,
+    detail: "Nothing is saved first. If the update fails there is no archive to restore from.",
+    ok: "Install without a backup", backup: { mode: "skip", confirm: "install-without-backup" },
+  });
+  return options;
+}
+
+// Resolves to the chosen backup object, { mode: "require_mounted" } when the drive turned up while the dialog
+// was open (the normal backup then works), or null when cancelled. Nothing chosen here is saved anywhere.
+function askBackupChoice(spec, first) {
+  const dialog = $("#backup-choice-dialog");
+  if (dialog.open) return Promise.resolve(null);
+  const opener = document.activeElement;
+  let current = first;
+  let selected = "";
+  let working = false;
+  let outcome = null;
+  let options = [];
+  const chosen = () => options.find((option) => option.id === selected);
+  const refresh = () => {
+    const option = chosen();
+    $("#backup-choice-folder").hidden = option?.id !== "folder";
+    $("#backup-choice-skip-ack").hidden = option?.id !== "skip";
+    const ok = $("#backup-choice-ok");
+    ok.textContent = working ? "Working…" : option?.ok || "Continue";
+    ok.className = option?.danger ? "danger solid" : "primary";
+    ok.disabled = working || !option
+      || (option.id === "skip" && !$("#backup-choice-ack").checked)
+      || (option.id === "folder" && !$("#backup-choice-path").value.trim());
+    $("#backup-choice-detail").textContent = option?.detail || "";
+    $("#backup-choice-detail").hidden = !option?.detail;
+  };
+  const render = (error = "") => {
+    options = backupOptions(current);
+    if (!chosen()) selected = (options.find((option) => !option.danger) || options[0]).id;
+    const dirty = isConfigDirty();
+    $("#backup-choice-options").innerHTML = options.map((option) => {
+      const blocked = option.id === "folder" && dirty;
+      return `<label class="choice${option.danger ? " danger-choice" : ""}"><input type="radio" name="backup-choice" value="${escapeHtml(option.id)}"${option.id === selected ? " checked" : ""}${blocked ? " disabled" : ""}> <span>${escapeHtml(option.label)}${blocked ? " — save or discard your unsaved Settings edits first" : ""}</span></label>`;
+    }).join("");
+    const notes = [
+      ...(current.refused || []).map((item) => `${item.device} ${item.size} ${item.label ? `"${item.label}" ` : ""}${item.fstype}: ${item.reason}`),
+      ...(current.mounted_elsewhere || []).map((item) => `${item.device} ${item.size} ${item.label ? `"${item.label}" ` : ""}${item.fstype}: already mounted at ${item.mountpoint}. Unmount it first to use it here.`),
+      ...(current.system_disk_once && !current.system_disk_once.offered && current.system_disk_once.reason ? [`System disk: ${current.system_disk_once.reason}`] : []),
+    ];
+    $("#backup-choice-notes").innerHTML = notes.map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+    $("#backup-choice-notes").hidden = !notes.length;
+    $("#backup-choice-error").textContent = error;
+    $("#backup-choice-error").hidden = !error;
+    refresh();
+  };
+  const folder = mountFolder(current.path);
+  $("#backup-choice-title").textContent = spec.title;
+  $("#backup-choice-intro").textContent = current.mount === "not_mounted"
+    ? `The backup drive is not mounted (${folder}). ${spec.intro || ""} Choose how to handle the backup for this update only; nothing here is remembered.`.replace(/\s+/g, " ")
+    : `The backup folder ${current.path || ""} is not on an external drive, so the normal backup cannot be required. ${spec.intro || ""} Choose how to handle the backup for this update only.`.replace(/\s+/g, " ");
+  $("#backup-choice-items").innerHTML = (spec.items || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  $("#backup-choice-items").hidden = !(spec.items || []).length;
+  $("#backup-choice-ack-text").textContent = SKIP_ACK_TEXT;
+  $("#backup-choice-ack").checked = false;
+  $("#backup-choice-path").value = "";
+  $("#backup-choice-form").onsubmit = (event) => event.preventDefault();
+  $("#backup-choice-options").onchange = (event) => { selected = String(event.target?.value || ""); refresh(); };
+  $("#backup-choice-ack").onchange = refresh;
+  $("#backup-choice-path").oninput = refresh;
+  $("#backup-choice-cancel").onclick = () => dialog.close("cancel");
+  $("#backup-choice-ok").onclick = async () => {
+    const option = chosen();
+    if (!option || working) return;
+    if (option.id === "skip" && !$("#backup-choice-ack").checked) return;
+    if (option.backup) {
+      outcome = option.backup;
+      dialog.close("ok");
+      return;
+    }
+    const session = state.session;
+    working = true;
+    refresh();
+    try {
+      if (option.action === "folder") {
+        const saved = await api("/api/config", { method: "POST", body: JSON.stringify({ settings: { VESSELSTACK_BACKUP: $("#backup-choice-path").value.trim() } }) });
+        $("#backup-choice-path").value = "";
+        // This option is unavailable while Settings has unsaved edits, so showing the saved values loses nothing.
+        if (saved?.configuration && !isConfigDirty()) { state.config = saved.configuration; renderConfiguration(state.config); }
+      }
+      const next = await api("/api/backup-preflight");
+      if (session !== state.session || !state.token) return;
+      current = next;
+      working = false;
+      if (current.default_ok === true) {
+        outcome = { mode: "require_mounted" };
+        dialog.close("ok");
+        return;
+      }
+      selected = "";
+      render();
+    } catch (error) {
+      if (session !== state.session || !state.token) return;
+      if (error.status === 401) { dialog.close("cancel"); requireReauth("Your session ended."); return; }
+      working = false;
+      render(error.message);
+    }
+  };
+  return new Promise((resolve) => {
+    dialog.onclose = () => {
+      dialog.onclose = null;
+      if (opener && opener.isConnected !== false && typeof opener.focus === "function") opener.focus();
+      resolve(dialog.returnValue === "ok" ? outcome : null);
+    };
+    dialog.returnValue = "";
+    render();
+    dialog.showModal();
+  });
+}
+
+// Asks first. When the normal mounted backup will not work, the owner picks what to do for this one
+// request; otherwise the usual confirmation is shown unchanged. A failed lookup also falls back to the
+// usual confirmation: the server still refuses to install without the normal backup.
+async function confirmWithBackup(spec) {
+  const session = state.session;
+  let pre = null;
+  try {
+    pre = await api("/api/backup-preflight");
+  } catch (error) {
+    if (error.status === 401) { requireReauth("Your session ended."); return { proceed: false }; }
+  }
+  if (session !== state.session || !state.token || state.busy) return { proceed: false };
+  if (!pre || pre.default_ok !== false) return { proceed: await ask(spec) };
+  const choice = await askBackupChoice(spec, pre);
+  if (!choice) return { proceed: false };
+  return choice.mode === "require_mounted" ? { proceed: true } : { proceed: true, backup: choice };
+}
+
 // ---------------------------------------------------------------- session
 
 function lock(force = false) {
@@ -444,7 +604,11 @@ function describeOperation(operation) {
   }
   if (label === "update-release") {
     const target = operation.target_version || "the update";
+    if (operation.backup_skipped || operation.backup_mode === "skip") return { running: `Installing ${target} without a backup…`, done: `Installed ${target} (no backup was made)`, failed: `Installing ${target} failed`, next: "No backup was made for this update, so there is no archive to restore from. Check the details before trying again." };
     return { running: `Backing up, then installing ${target}…`, done: `Installed ${target}`, failed: `Installing ${target} failed`, next: "Your boat was backed up first if the backup step finished. Check the details before trying again." };
+  }
+  if (label === "update" && (operation.backup_skipped || operation.backup_mode === "skip")) {
+    return { running: "Updating from the folder without a backup…", done: "Update finished (no backup was made)", failed: "Update failed", next: "No backup was made for this update, so there is no archive to restore from. Check the details before trying again." };
   }
   const entry = OPERATION_TEXT[label];
   if (entry) return { running: entry[0], done: entry[1], failed: entry[2], next: entry[3] };
@@ -568,6 +732,12 @@ async function startOperation(payload, route = null) {
 
 async function runAction(action, extra = {}) {
   const spec = action === "update" ? updateConfirm(extra) : CONFIRMS[action];
+  if (action === "update") {
+    const decision = await confirmWithBackup(spec);
+    if (!decision.proceed) return;
+    startOperation({ action, ...extra, ...(decision.backup ? { backup: decision.backup } : {}) });
+    return;
+  }
   if (spec && !(await ask(spec))) return;
   startOperation({ action, ...extra });
 }
@@ -723,8 +893,9 @@ async function checkReleases() {
 async function installRelease(releaseId) {
   const release = state.releases.find((item) => item.id === Number(releaseId) && releaseEligible(item));
   if (!release || state.busy) return;
-  if (!(await ask(releaseConfirm(release)))) return;
-  startOperation({ action: "update-release", release_id: release.id, channel: state.releaseChannel });
+  const decision = await confirmWithBackup(releaseConfirm(release));
+  if (!decision.proceed) return;
+  startOperation({ action: "update-release", release_id: release.id, channel: state.releaseChannel, ...(decision.backup ? { backup: decision.backup } : {}) });
 }
 
 // ---------------------------------------------------------------- settings

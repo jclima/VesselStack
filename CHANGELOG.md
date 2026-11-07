@@ -5,6 +5,44 @@ Semantic Versioning.
 
 ## Unreleased
 
+Planned for 0.6.2 (`VERSION` is not bumped here).
+
+### Highlights
+
+- The Control Panel's **Back up & install** and **update from folder** no longer fail when the backup
+  drive is not mounted. A dialog lets you, for that one request, mount the drive from `/etc/fstab`,
+  mount a connected USB drive (ext4 recommended, exFAT allowed; chosen by UUID from a list built as
+  root), back up to the system disk once, use a different backup folder, or install without a backup
+  (needs an explicit acknowledgement). Nothing is remembered, and neither `/etc/fstab` nor
+  `vesselstack.env` is written; `backup_mode` / `backup_skipped` appear in the operation record for
+  display only. `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false` (in `vesselstack.env` or the process
+  environment, re-checked by the worker) turns off the system-disk and no-backup choices. A drive
+  mounted by UUID is verified after mounting; the `/etc/fstab` mount uses `nodev,nosuid,noexec`;
+  `--system-disk-once` is refused when the data size cannot be measured. `backup` is accepted only for
+  update actions. Without a choice the upgrade still requires a mounted backup.
+- New controller commands: `vesselstackctl backup --system-disk-once`, `vesselstackctl backup-drive list
+  --json` and `vesselstackctl backup-drive mount --fstab | --uuid UUID`; `vesselstackctl update DIR
+  --backup-choice=system-disk-once|skip` is accepted for the Control Panel and the pinned installer.
+- New read-only `GET /api/backup-preflight` for the dialog.
+
+### Fixes
+
+- `tests/test-lifecycle.sh` no longer fails intermittently on "Backup is missing the Prometheus data directory": the archive listing is read into a variable instead of `tar -t | grep -q` under `pipefail` (SIGPIPE when the match came early). Test-only; product behaviour is unchanged.
+- "Back up to the system disk this once" (terminal menu, pinned installer with a current controller)
+  now writes to `/var/backups/vesselstack` and leaves the unmounted `/media` or `/mnt` folder empty,
+  so the drive can still be mounted there later. An older installed controller still writes into that
+  folder.
+- Tests: the VesselTwin preload listing assertion no longer depends on filesystem directory order.
+
+### Upgrade notes
+
+This cannot help the upgrade that delivers it: the Control Panel worker uses the controller and panel
+that are already installed. For the upgrade to 0.6.2, mount the drive by hand or run the update from a
+terminal with `get-vesselstack.sh`. Rollback: unmount with `umount`; there is nothing to undo in
+`/etc/fstab` or `vesselstack.env`.
+
+### Displays
+
 - The Control Panel Displays tab can now edit and apply: pick a colour theme, edit page titles, layouts and items (add from the data list with the reasons shown when something does not fit, optional "Count in alarm banner"), **Save** (with a conflict check against changes made elsewhere), then **Apply to screen** over USB or Wi-Fi with a progress stepper and `To fix:` hints, and **History** with **Restore** and **Put previous firmware back on screen**. New Control Panel endpoints `POST /api/displays/save|deploy|restore|rollback` and `GET /api/displays/history` (token, Origin and JSON-only checks, payloads on stdin). Deploys and rollbacks hold the lifecycle slot, so backups, updates and settings changes wait. Wi-Fi (OTA) updates are not yet verified on hardware; the first flash must be USB. Downgrading: run `set-theme ID classic` first. Hardening: a Wi-Fi upload to an address other than the last successful one needs an explicit confirmation (the firmware holds the Wi-Fi password; `confirm_new_target` on `/api/displays/deploy` and `/rollback`, otherwise 400); **Put previous firmware back** is offered only when the previous image matches the current settings and credentials (restore the matching saved copy first); `--ota` and the panel reject `%` scope ids and the ESPHome names `ota` and `serial` (any case); redaction covers the `secrets.yaml` spelling of non-ASCII Wi-Fi names; `firmware.prev/` is never deleted without a `firmware/` to replace it and a failed `last-flash.json` write removes the stale record; a new notification never counts in the alarm banner unless chosen. Apply is not blocked by a missing builder image (a to-do, with a `To fix:` hint if the deploy fails offline).
 - New `vesselstackctl display deploy ID (--ota HOST | --serial DEVICE) [--progress]`: builds only when the stored firmware is out of date and uploads it, all under one build lock, so a retry after a failed upload does not recompile. `--progress` prints `STAGE: render|compile|upload|done`; known failures end with `To fix:` lines; Wi-Fi and MQTT/OTA/API secrets are replaced with `[redacted]` in everything the command prints. `flash` and `deploy` now record each successful upload in the root-only `build/displays/ID/last-flash.json` (when, how, target, image and version; no secret), `display show --json` reports it (`readiness.last_flash`, `readiness.firmware.rollback_possible`), and a deploy never moves a firmware that was never uploaded into `firmware.prev/`. Wi-Fi (OTA) updates are not yet verified on hardware. Rollback: `display restore-config STAMP`, then `display flash ID --previous`; an older VesselStack ignores `last-flash.json`.
 - The Control Panel has a **Displays** tab (read-only for now). For each display it shows the name, board, colour theme and whether the latest changes are on the screen (On screen, Changes not on screen, Never flashed, Not built, Unknown), a readiness checklist with the exact command for anything missing, its pages, and an approximate preview of every page in the display's theme with a Day/Night switch and a severity switch. A searchable list of the Signal K values a page can show is marked Live, No live data, Uncatalogued or Used on a display, with the live value when there is one. It reads `GET /api/displays`, `/api/displays/themes`, `/api/displays/catalog[?live=1]` (cached for 30 s) and `/api/displays/serial-ports`, each of which runs one fixed `vesselstackctl display ... --json` command with a 12 s limit, needs the Control Panel token and never returns a stored password, Wi-Fi detail or token. The tab changes nothing, so nothing needs rolling back; a newer panel can be undone by reinstalling the previous release. New `vesselstackctl display list --json` prints only each display's id, name, board and page count.

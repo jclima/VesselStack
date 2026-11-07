@@ -42,7 +42,8 @@ prereleases appear only after you turn on **Include early test releases** (0.5.x
 call the same switch "Include lab prereleases"). **Back up & install** downloads the
 archive, checks its size and SHA-256 checksum, runs the installer's `--dry-run` check,
 takes a backup with `--require-mounted` (so the update stops if the external backup drive
-under `/media` or `/mnt` is not mounted), installs, restarts the Control Panel and waits
+under `/media` or `/mnt` is not mounted, unless you choose in the dialog to mount it, back up to the
+system disk once or install without a backup), installs, restarts the Control Panel and waits
 for it to report the new version. The page reconnects by itself. See
 [Control Panel](CONTROL_PANEL.md#updates).
 
@@ -62,6 +63,13 @@ Panel they stop and print a `To fix:` line instead. A direct `sudo vesselstackct
 an installed 0.6.0 or earlier controller has no menu: use the pinned installer, mount the drive
 first, or run `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
 See [Backups](../README.md#backups).
+
+From 0.6.2 the Control Panel's **Back up & install** and **update from folder** show a dialog for an
+unmounted backup drive (mount from `/etc/fstab`, mount a listed USB drive, back up to the system disk
+once, use a different folder, or install without a backup). This cannot help the upgrade that delivers it: the Control Panel worker uses the controller and panel that are already installed, so for the upgrade to 0.6.2 itself mount the drive by hand or run the update from a terminal. Setting
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false` (in `vesselstack.env` or the environment) turns off the system-disk and no-backup choices; the choice is never saved. In the terminal
+menu, "back up to the system disk this once" also now writes to `/var/backups/vesselstack`, leaving the
+unmounted mount folder empty.
 
 ## From a source checkout
 
