@@ -143,7 +143,8 @@ TELEMETRY_INDEXER_ENABLE="true"
 EOF
 
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
-    "$REPO_ROOT/install.sh" --config "$CONFIG" --dry-run | grep -q 'Preflight passed'
+    "$REPO_ROOT/install.sh" --config "$CONFIG" --dry-run > "$TEST_ROOT/dry-run.out"
+grep -q 'Preflight passed' "$TEST_ROOT/dry-run.out"  # not a pipe: grep -q would SIGPIPE the installer under pipefail
 COLLISION_CONFIG="$TEST_ROOT/port-collision.env"
 cp "$CONFIG" "$COLLISION_CONFIG"
 printf '\nGRAFANA_PORT="8086"\nINFLUXDB_PORT="8086"\n' >> "$COLLISION_CONFIG"
@@ -737,7 +738,8 @@ cp "$XENV" "$GOODVAL"
 cat >> "$GOODVAL" <<'CFG'
 HOME_ASSISTANT_TOKEN="it's fine"
 CFG
-xinstall "$X_APP/installer/install.sh" --config "$GOODVAL" --dry-run | grep -q 'Preflight passed'
+xinstall "$X_APP/installer/install.sh" --config "$GOODVAL" --dry-run > "$TEST_ROOT/goodval.out"
+grep -q 'Preflight passed' "$TEST_ROOT/goodval.out"
 
 # 1b-bis. Legacy BOAT_UNITS=nautical (offered by older wizards, unchecked before 0.5.7) is read as
 # metric: the dry run prints one note and changes nothing; a real run persists metric. Any other
