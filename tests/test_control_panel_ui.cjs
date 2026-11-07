@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const appSource = fs.readFileSync('control-panel/static/app.js', 'utf8');
 const html = fs.readFileSync('control-panel/static/index.html', 'utf8');
 const css = fs.readFileSync('control-panel/static/styles.css', 'utf8');
-const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
+const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, newDraft, draftDirty, draftProblems, titleProblem, addCheck, addRowToDraft, removeItem, removePage, addPage, moveWithin, savePayload, draftShow, geometryFor, otaTargetProblem, serialProblem, uploadRequest, isNewOtaTarget, parseStages, applyBlock, defaultOtaTarget, defaultMethod, deployPanel, saveDraft, startEditing, stopEditing, applyToScreen, runDisplayAction, onDisplaysInput, openApplyDialog, renderHistory, loadHistory, restoreBackup, formatStamp, pageEditor, saveBar, rowAddControls, entryById, displaysDirty, layoutChoices, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
 
 const nodes = new Map();
 // A small element tree, enough to build and read back the Displays tab without a browser.
@@ -394,12 +394,15 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   const deq = (actual, expected) => assert.deepEqual(JSON.parse(JSON.stringify(actual)), JSON.parse(JSON.stringify(expected))); // the app runs in another realm
   const fixture = JSON.parse(fs.readFileSync('tests/fixtures/displays/panel_show.json', 'utf8'));
   const themesJson = JSON.parse(fs.readFileSync('displays/themes.json', 'utf8'));
-  const ready = (extra = {}) => ({ displays_enabled: true, secrets_readable: true, mqtt_password_stored: true, wifi_stored: true, data_bind_non_loopback: true, data_bind_hint: 'HINT-TEXT', docker_available: true, esphome_image_present: true, toolchain_cache_present: true, free_disk_bytes: 5e10, min_free_bytes_first_build: 3221225472, min_free_bytes_warm_build: 1073741824, firmware: { status: 'current', built_at_utc: 'T1', esphome_version: 'x', reasons: [], credentials_checked: true, has_previous: false }, last_flash: { at: 'T2', method: 'serial', ok: true, firmware_built_at: 'T1' }, ...extra });
+  const ready = (extra = {}) => ({ displays_enabled: true, secrets_readable: true, mqtt_password_stored: true, wifi_stored: true, data_bind_non_loopback: true, data_bind_hint: 'HINT-TEXT', docker_available: true, esphome_image_present: true, toolchain_cache_present: true, free_disk_bytes: 5e10, min_free_bytes_first_build: 3221225472, min_free_bytes_warm_build: 1073741824, firmware: { status: 'current', built_at_utc: 'T1', esphome_version: 'x', reasons: [], credentials_checked: true, has_previous: false }, last_flash: { at: 'T2', method: 'serial', ok: true, built_at_utc: 'T1', ota_target: null, credentials_changed: false }, ...extra });
   const chip = (extra) => ui.firmwareChip(ready(extra));
   deq([chip().state, chip().label], ['on-screen', 'On screen']);
   assert.equal(chip({ last_flash: null }).label, 'Never flashed');
-  assert.equal(chip({ last_flash: { ok: false, firmware_built_at: 'T1', error: 'x' } }).state, 'flash-failed');
-  assert.equal(chip({ last_flash: { ok: true, firmware_built_at: 'OLD' } }).label, 'Changes not on screen', 'a flash of an older build is not on screen');
+  assert.equal(chip({ last_flash: { ok: false, built_at_utc: 'T1' } }).state, 'flash-failed');
+  assert.equal(chip({ last_flash: { ok: true, built_at_utc: 'OLD' } }).label, 'Changes not on screen', 'a flash of an older build is not on screen');
+  assert.equal(chip({ last_flash: { ok: true, built_at_utc: 'OLD', matches_settings: true } }).label, 'On screen', 'what the screen runs matches the settings (e.g. after a rollback)');
+  assert.equal(chip({ firmware: { status: 'outdated', built_at_utc: 'NEW' }, last_flash: { ok: true, built_at_utc: 'OLD', matches_settings: true } }).label, 'On screen');
+  assert.equal(chip({ last_flash: { ok: true, built_at_utc: 'T1', matches_settings: false } }).label, 'Changes not on screen');
   assert.equal(chip({ firmware: { status: 'outdated', built_at_utc: 'T1' } }).label, 'Changes not on screen');
   assert.equal(chip({ firmware: { status: 'none', built_at_utc: null }, last_flash: null }).label, 'Not built');
   assert.equal(chip({ firmware: { status: 'unknown' } }).label, 'Unknown');
@@ -472,7 +475,7 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.ok(cardText.includes('<img src=x onerror=alert(1)>') && cardText.includes('<b>hint</b>') && cardText.includes('"><script>x</script>'), 'hostile text is shown literally');
   assert.equal(hostileCard.find((el) => ['img', 'script', 'b'].includes(el.tagName) || (el.tagName === 'i' && el.textContent === 't')).length, 0, 'and never becomes markup');
   assert.equal(hostileCard.find((el) => el.attrs && ('style' in el.attrs || 'onerror' in el.attrs)).length, 0);
-  assert.ok(hostileCard.find((el) => el.tagName === 'button' && el.attrs['data-theme-id']).every((el) => 'disabled' in el.attrs), 'theme swatches are read-only in this version');
+  assert.ok(hostileCard.find((el) => el.tagName === 'button' && el.attrs['data-theme-id']).every((el) => 'disabled' in el.attrs), 'theme swatches are read-only until Edit is pressed');
   const current = hostileCard.find((el) => el.attrs && el.attrs['data-theme-id'] === 'classic')[0];
   assert.match(current.attrs['aria-label'], /Classic theme, current/); assert.equal(current.attrs['aria-pressed'], 'true');
   deq(hostileCard.find((el) => el.tagName === 'button' && el.attrs['data-theme-id']).length, 4);
@@ -490,7 +493,7 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.equal(ui.state.displays.loaded, true); assert.equal(ui.state.displays.list.length, 2);
   const rootText = allText(node('#displays-root'));
   assert.match(rootText, /Helm/); assert.match(rootText, /Changes not on screen/); assert.match(rootText, /could not be read/); assert.match(rootText, /Approximate preview/);
-  assert.match(rootText, /sudo vesselstackctl display build helm/);
+  assert.match(rootText, /Edit theme and pages/); assert.match(rootText, /Apply to screen/);
   const browserText = allText(node('#catalog-root'));
   assert.match(browserText, /SOG/); assert.match(browserText, /6\.4 kn/); assert.match(browserText, /Used on Helm/); assert.match(browserText, /Uncatalogued/);
   assert.equal(calls.length, 3); await ui.loadDisplays(false); assert.equal(calls.length, 3, 'a fresh tab is not reloaded');
@@ -500,6 +503,370 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   clickOn({ previewMode: 'night' }); assert.equal(ui.state.displays.mode, 'night');
   clickOn({ previewSeverity: 'alarm' }); assert.equal(ui.state.displays.severity, 'alarm');
   clickOn({ previewPage: '2', display: 'helm' }); assert.equal(ui.state.displays.page.helm, 2);
+  // ---- Displays tab: editing, adding data, saving and applying ------------------------------------------------
+  {
+    const REV = 'a'.repeat(64);
+    const entry = () => JSON.parse(JSON.stringify({ ...fixture, readiness: ready(), revision: REV }));
+    const row = (extra) => ({ kind: 'instrument', row_id: 'stw', label: 'STW', path: 'navigation.speedThroughWater', group: 'Navigation', convert: 'm/s->kn', unit: 'kn', precision: 1, layouts: ['single', 'grid-2x2', 'status-grid'], roles: [], proposed_id: 'stw', id_stem: 'stw', configured_as: null, used_on: [], template: false,
+      definition: { path: 'navigation.speedThroughWater', label: 'STW', convert: 'm/s->kn', unit: 'kn', precision: 1, stale_after_s: 10 }, ...extra });
+    const note = (extra) => ({ kind: 'notification', row_id: 'smoke', label: 'Smoke', path: 'notifications.smoke', group: 'Safety', layouts: ['status-grid', 'electrical'], roles: [], proposed_id: 'smoke', id_stem: 'smoke', configured_as: null, used_on: [], template: false,
+      definition: { path: 'notifications.smoke', label: 'Smoke', alarm: false }, ...extra });
+
+    // Draft and dirty tracking.
+    const e1 = entry(); const draft = ui.newDraft(e1);
+    assert.equal(ui.draftDirty(e1, draft), false); assert.equal(ui.draftDirty(e1, null), false);
+    deq(draft.pages.map((p) => p.layout), ['grid-2x2', 'status-grid', 'tank-bars', 'gauge-arc', 'electrical']);
+    draft.theme = 'ocean'; assert.equal(ui.draftDirty(e1, draft), true); draft.theme = 'classic'; assert.equal(ui.draftDirty(e1, draft), false, 'putting it back is clean again');
+    draft.pages[0].title = 'Nav2'; assert.equal(ui.draftDirty(e1, draft), true); draft.pages[0].title = 'Nav'; assert.equal(ui.draftDirty(e1, draft), false);
+    draft.pages[0].items.reverse(); assert.equal(ui.draftDirty(e1, draft), true); draft.pages[0].items.reverse();
+    draft.pages[0].items.push('x'); ui.removeItem(draft, 0, 4); assert.equal(ui.draftDirty(e1, draft), false);
+    assert.equal(e1.display.pages[0].items.length, 4, 'editing the draft never touches the loaded display');
+
+    // The preview follows the draft: theme, and pages whose geometry is known.
+    const themed = ui.draftShow(e1, { ...draft, theme: 'ocean' });
+    assert.equal(ui.previewModel(themed, 0, themesJson, { theme: 'ocean' }).vars['--pv-tile'], themesJson.themes.ocean.day.tile);
+    assert.equal(ui.geometryFor(e1, { layout: 'grid-2x2', items: ['a'] }, 0).layout, 'grid-2x2', 'a grid keeps its cell boxes whatever the number of values');
+    assert.equal(ui.geometryFor(e1, { layout: 'status-grid', items: ['a', 'b'] }, 7), null, 'a layout with a new number of values has no geometry until it is saved');
+    deq(ui.layoutChoices(e1), ['single', 'grid-2x2', 'status-grid', 'tank-bars', 'gauge-arc', 'electrical']);
+    deq(ui.layoutChoices({ ...e1, board: { layouts: ['single', 'grid-2x2'] } }), ['single', 'grid-2x2'], 'only layouts of the board');
+
+    // Titles.
+    assert.match(ui.titleProblem(''), /name/); assert.match(ui.titleProblem('x'.repeat(17)), /16/); assert.match(ui.titleProblem('a\u0007b'), /ordinary/); assert.equal(ui.titleProblem('Nav 2'), '');
+
+    // Add-to-page compatibility rules, with a reason for every refusal.
+    const d1 = ui.newDraft(e1); d1.selected = 0;
+    assert.match(ui.addCheck(e1, d1, row()).reason, /full \(4 values\)/, 'capacity');
+    ui.removeItem(d1, 0, 3); assert.equal(ui.addCheck(e1, d1, row()).ok, true);
+    assert.match(ui.addCheck(e1, d1, row({ configured_as: 'sog' })).reason, /Already on this page/);
+    d1.selected = 2; assert.match(ui.addCheck(e1, d1, note()).reason, /Cannot be shown on a Tank bars page/);
+    assert.match(ui.addCheck(e1, d1, row()).reason, /minimum and maximum/, 'a value with no range cannot go on a bar');
+    ui.removeItem(d1, 2, 2); assert.equal(ui.addCheck(e1, d1, row({ layouts: ['tank-bars'], min: 0, max: 100 })).ok, true);
+    d1.selected = 4; assert.match(ui.addCheck(e1, d1, row({ layouts: ['electrical'], roles: ['voltage'] })).reason, /full/); assert.match(ui.addCheck(e1, d1, row()).reason, /Cannot be shown on a Electrical page/);
+    ui.removeItem(d1, 4, 4); ui.removeItem(d1, 4, 3);
+    assert.match(ui.addCheck(e1, d1, row({ layouts: ['electrical'], roles: ['voltage'] })).reason, /next slot is “shore”/, 'electrical slots keep their roles');
+    assert.equal(ui.addCheck(e1, d1, note()).ok, true, 'a notification fits the shore slot');
+    assert.equal(ui.addCheck(e1, d1, row({ layouts: ['electrical'], roles: ['shore'] })).ok, true);
+    assert.match(ui.addCheck({ ...e1, layouts: {} }, d1, row()).reason, /cannot show/);
+    assert.match(ui.addCheck(e1, { pages: [], selected: 0 }, row()).reason, /Choose a page/);
+
+    // Adding: ids, definitions, opt-in alarms and ranges.
+    const d2 = ui.newDraft(e1); d2.selected = 1; ui.removeItem(d2, 1, 8);
+    const plain = ui.addRowToDraft(e1, d2, row({ layouts: ['status-grid'], suggested_thresholds: { warn_above: 10 } }));
+    assert.equal(plain.ok, true); assert.equal(plain.id, 'stw'); assert.equal(d2.pages[1].items.length, 9, 'the status page had room for one more');
+    deq(Object.keys(d2.newInstruments), ['stw']); assert.equal(d2.newInstruments.stw.thresholds, undefined, 'suggested limits are OFF unless opted in');
+    ui.removeItem(d2, 1, d2.pages[1].items.length - 1);
+    assert.equal(Object.keys(d2.newInstruments).length, 0, 'removing the only use of a new item forgets its definition');
+    const withAlarm = ui.addRowToDraft(e1, d2, row({ layouts: ['status-grid'], suggested_thresholds: { warn_above: 10 } }), { alarm: true });
+    deq(d2.newInstruments[withAlarm.id].thresholds, { warn_above: 10 });
+    const dn = ui.newDraft(e1); dn.selected = 1; ui.removeItem(dn, 1, 8);
+    ui.addRowToDraft(e1, dn, note()); assert.equal(dn.newNotifications.smoke.alarm, false, 'a new notification does not count in the alarm banner by default');
+    const dn0 = ui.newDraft(e1); dn0.selected = 1; ui.removeItem(dn0, 1, 8);
+    const noAlarmKey = note(); delete noAlarmKey.definition.alarm; ui.addRowToDraft(e1, dn0, noAlarmKey);
+    assert.strictEqual(dn0.newNotifications.smoke.alarm, false, 'alarm is explicitly false when the definition has no alarm key and the opt-in is off');
+    const dn3 = ui.newDraft(e1); dn3.selected = 0; ui.removeItem(dn3, 0, 3);
+    const hot = ui.addRowToDraft(e1, dn3, row({ layouts: ['single', 'grid-2x2'], suggested_thresholds: { warn_above: 10 } }));
+    assert.equal(dn3.newInstruments[hot.id].thresholds, undefined, 'no thresholds are added when the opt-in is off');
+    const dn2 = ui.newDraft(e1); dn2.selected = 1; ui.removeItem(dn2, 1, 8);
+    ui.addRowToDraft(e1, dn2, note(), { alarm: true }); assert.equal(dn2.newNotifications.smoke.alarm, true, 'the opt-in maps to alarm:true');
+    // An id that is already taken gets a suffix; an item added twice is one item.
+    const d3 = ui.newDraft(e1); d3.selected = 0; ui.removeItem(d3, 0, 3); ui.removeItem(d3, 0, 2);
+    const clash = ui.addRowToDraft(e1, d3, row({ proposed_id: 'sog', layouts: ['grid-2x2'] }));
+    assert.equal(clash.id, 'sog_2', 'never reuses an existing id');
+    d3.selected = 3; const again = ui.addRowToDraft(e1, d3, row({ proposed_id: 'sog', layouts: ['gauge-arc'], min: 0, max: 30 }));
+    assert.equal(again.ok, false, 'gauge page is full'); d3.selected = 1; ui.removeItem(d3, 1, 8);
+    assert.equal(ui.addRowToDraft(e1, d3, row({ proposed_id: 'sog', layouts: ['grid-2x2', 'status-grid'] })).id, 'sog_2', 'the same row on a second page reuses the item');
+    assert.equal(Object.keys(d3.newInstruments).length, 1);
+    // Ranges for bars and arcs.
+    const d4 = ui.newDraft(e1); d4.selected = 2; ui.removeItem(d4, 2, 2);
+    const tank = row({ row_id: 'oil', label: 'Oil', layouts: ['tank-bars'], min: 0, max: 100, definition: { path: 'tanks.oil', label: 'Oil', min: 0, max: 100 }, proposed_id: 'oil' });
+    assert.match(ui.addRowToDraft(e1, d4, tank, { min: '10', max: '5' }).error, /minimum must be/);
+    assert.match(ui.addRowToDraft(e1, d4, tank, { min: 'x', max: '5' }).error, /minimum must be/);
+    const ranged = ui.addRowToDraft(e1, d4, tank, { min: '0', max: '250' });
+    assert.equal(d4.newInstruments[ranged.id].max, 250); assert.equal(d4.newInstruments[ranged.id].min, 0);
+    // Template rows: the user names the instance; the id and path follow.
+    const tpl = row({ row_id: 'eng', label: 'Engine temp', template: true, path: 'propulsion.*.temperature', path_template: 'propulsion.*.temperature', label_template: 'Engine * temp', id_stem: 'engine_temp', proposed_id: 'engine_temp', layouts: ['grid-2x2'], definition: { path: 'propulsion.*.temperature', label: 'Engine temp', convert: 'K->C', unit: '°C', precision: 0, stale_after_s: 30 } });
+    const d5 = ui.newDraft(e1); d5.selected = 0; ui.removeItem(d5, 0, 3);
+    assert.match(ui.addRowToDraft(e1, d5, tpl, {}).error, /Type which one/); assert.match(ui.addRowToDraft(e1, d5, tpl, { instance: 'a.b' }).error, /Type which one/); assert.match(ui.addRowToDraft(e1, d5, tpl, { instance: '../x' }).error, /Type which one/);
+    const port = ui.addRowToDraft(e1, d5, tpl, { instance: 'port' });
+    assert.equal(port.id, 'engine_temp_port'); assert.equal(d5.newInstruments.engine_temp_port.path, 'propulsion.port.temperature'); assert.equal(d5.newInstruments.engine_temp_port.label, 'Engine port temp');
+
+    // Page operations.
+    const d6 = ui.newDraft(e1);
+    while (d6.pages.length < 8) assert.equal(ui.addPage(e1, d6), true);
+    assert.equal(ui.addPage(e1, d6), false, 'at most 8 pages'); assert.equal(d6.pages[7].layout, 'grid-2x2'); assert.equal(d6.selected, 7);
+    assert.ok(ui.draftProblems(e1, d6).some((p) => /Page 6: add at least 1 value/.test(p.text)), 'an empty page blocks saving');
+    const d7 = ui.newDraft({ ...e1, display: { ...e1.display, pages: [e1.display.pages[0]] } });
+    assert.equal(ui.removePage(d7, 0), false, 'a display keeps at least one page');
+    const d8 = ui.newDraft(e1); assert.equal(ui.moveWithin(d8.pages[0].items, 0, -1), false); assert.equal(ui.moveWithin(d8.pages[0].items, 0, 1), true); assert.equal(d8.pages[0].items[0], 'depth');
+    const d9 = ui.newDraft(e1); d9.pages[0].layout = 'single'; d9.pages[1].title = 'x'.repeat(20);
+    const issues = ui.draftProblems(e1, d9).map((p) => p.text).join('|');
+    assert.match(issues, /holds 1, but it has 4/); assert.match(issues, /at most 16/);
+    d9.pages[2].layout = 'grid-2x2'; d9.pages[0].layout = 'grid-2x2'; d9.pages[1].title = 'S'; d9.pages[2].items = ['sog'];
+    d9.pages[3].layout = 'tank-bars'; d9.pages[3].items = ['sog'];
+    assert.match(ui.draftProblems(e1, d9).map((p) => p.text).join('|'), /“SOG” needs a minimum and maximum/);
+
+    // The save request: exact shape, nothing unrequested.
+    const d10 = ui.newDraft(e1);
+    deq(ui.savePayload(e1, d10), { id: 'helm', revision: REV, pages: e1.display.pages.map((p) => ({ title: p.title, layout: p.layout, items: p.items })) });
+    d10.theme = 'daylight'; d10.pages[0].title = ' Wind '; d10.selected = 0; ui.removeItem(d10, 0, 3);
+    ui.addRowToDraft(e1, d10, row({ layouts: ['grid-2x2'] }), { alarm: true });
+    const payload = ui.savePayload(e1, d10);
+    deq(Object.keys(payload).sort(), ['id', 'new_instruments', 'pages', 'revision', 'theme']);
+    assert.equal(payload.theme, 'daylight'); assert.equal(payload.pages[0].title, 'Wind'); deq(payload.new_instruments.stw, { path: 'navigation.speedThroughWater', label: 'STW', convert: 'm/s->kn', unit: 'kn', precision: 1, stale_after_s: 10 });
+    assert.equal(payload.new_notifications, undefined);
+
+    // Upload targets, client side.
+    ['192.0.2.50', 'vs-helm.local', 'boat-helm', '2001:db8::1', 'helm.boat.example.'].forEach((value) => assert.equal(ui.otaTargetProblem(value), '', value));
+    ['', '-x', '--force', 'a b', ' 192.0.2.50', 'http://192.0.2.50', '192.0.2.50:80', 'a/b', '..', 'x..y', 'a_b', '999.1.1.1', 'bootsel', 'COM3', '12345', 'a'.repeat(300), 'host\n'].forEach((value) => assert.notEqual(ui.otaTargetProblem(value), '', JSON.stringify(value)));
+    const ports = [{ path: '/dev/serial/by-id/usb-X-if00', device: '/dev/ttyACM0' }];
+    assert.equal(ui.serialProblem('/dev/serial/by-id/usb-X-if00', ports), ''); assert.notEqual(ui.serialProblem('/dev/ttyUSB1', ports), ''); assert.notEqual(ui.serialProblem('', ports), ''); assert.notEqual(ui.serialProblem('x', []), '');
+    deq(ui.uploadRequest(e1, 'ota', '192.0.2.50', ports), { body: { id: 'helm', method: 'ota', target: '192.0.2.50' } });
+    assert.ok(ui.uploadRequest(e1, 'ota', '-x', ports).error); assert.ok(ui.uploadRequest(e1, 'telnet', 'x', ports).error);
+    assert.equal(ui.defaultOtaTarget(e1), 'vs-helm.local'); assert.equal(ui.defaultOtaTarget({ ...e1, readiness: ready({ last_flash: { ok: true, method: 'ota', ota_target: '192.0.2.77' } }) }), '192.0.2.77');
+    assert.equal(ui.defaultMethod(e1), 'serial', 'the first flash is by USB'); assert.equal(ui.defaultMethod({ ...e1, readiness: ready({ last_flash: { ok: true, method: 'ota' } }) }), 'ota'); assert.equal(ui.defaultMethod({ ...e1, readiness: ready({ last_flash: null }) }), 'serial');
+    // Apply is blocked with a reason and the command to fix it.
+    assert.equal(ui.applyBlock(e1), null);
+    assert.equal(ui.applyBlock({ ...e1, readiness: ready({ wifi_stored: false }) }).command, 'sudo vesselstackctl display wifi');
+    assert.equal(ui.applyBlock({ ...e1, readiness: ready({ mqtt_password_stored: false }) }).command, 'sudo vesselstackctl display rotate helm');
+    assert.match(ui.applyBlock({ ...e1, readiness: ready({ docker_available: false }) }).reason, /Docker/);
+    assert.match(ui.applyBlock({ ...e1, readiness: ready({ free_disk_bytes: 1e8 }) }).reason, /free disk space/);
+    assert.equal(ui.applyBlock({ ...e1, readiness: ready({ esphome_image_present: false }) }), null, 'a missing builder image is downloaded by the build, not a blocker');
+
+    // Progress stepper from STAGE lines.
+    const stepStates = (lines, op, kind) => ui.parseStages(lines, op, kind).steps.map((s) => `${s.key}:${s.status}`).join(' ');
+    assert.equal(stepStates([], 'running'), 'render:active compile:todo upload:todo done:todo');
+    assert.equal(stepStates(['STAGE: render', 'x', 'STAGE: compile', 'log'], 'running'), 'render:done compile:active upload:todo done:todo');
+    assert.equal(stepStates(['STAGE: render', 'STAGE: compile', 'STAGE: upload'], 'failed'), 'render:done compile:done upload:failed done:todo');
+    assert.equal(stepStates(['STAGE: render', 'STAGE: compile', 'STAGE: upload', 'STAGE: done'], 'succeeded'), 'render:done compile:done upload:done done:done');
+    assert.equal(stepStates(['STAGE: render'], 'succeeded'), 'render:done compile:done upload:done done:done');
+    const skipped = ui.parseStages(['STAGE: render', 'STAGE: compile', 'note: the stored firmware already matches the current settings and credentials; skipping the compile', 'STAGE: upload'], 'running');
+    assert.equal(skipped.skippedCompile, true); assert.equal(skipped.steps[1].label, 'Firmware was already up to date');
+    assert.equal(stepStates(['STAGE: upload'], 'running', 'rollback'), 'upload:active done:todo');
+    assert.equal(stepStates(['STAGE:  upload  junk'], 'running'), 'render:active compile:todo upload:todo done:todo', 'only exact STAGE lines count');
+
+    // ---- the DOM: edit mode, save bar, data list controls ----
+    const posts2 = [];
+    const base = { ...entry(), id: 'helm' };
+    const st = ui.state.displays;
+    st.mode = 'day'; st.severity = 'plain'; st.list = [base]; st.themes = themesJson; st.loaded = true; st.editing = null; st.drafts = {}; st.page = {}; st.saveErrors = {}; st.conflict = {}; st.rowOpts = {}; st.rowErrors = {}; st.query = '';
+    st.catalog = { schema: 1, live: { requested: true, ok: true }, groups: ['Navigation'], rows: [row({ layouts: ['grid-2x2', 'status-grid', 'single'] }), note(), row({ row_id: 'tpl', label: 'Engine temp', template: true, path: 'propulsion.*.temperature', path_template: 'propulsion.*.temperature', label_template: 'Engine * temp', id_stem: 'engine_temp', proposed_id: 'engine_temp', layouts: ['grid-2x2'], suggested_thresholds: { warn_above: 90 } })] };
+    ui.state.operationRunning = false; ui.state.operation = null;
+    const readOnly = allText(ui.displayCard(base));
+    assert.match(readOnly, /Edit theme and pages/); assert.doesNotMatch(readOnly, /Discard/);
+    ui.renderDisplays(); ui.renderDataBrowser();
+    assert.doesNotMatch(allText(node('#catalog-root')), /Add to page/, 'no Add buttons until a display is being edited');
+    ui.runDisplayAction({ act: 'edit', display: 'helm' });
+    assert.equal(st.editing, 'helm'); assert.equal(ui.displaysDirty(), false);
+    let cardEl = node('#displays-root').children[0];
+    const buttons = (root, predicate) => root.find((el) => el.tagName === 'button' && predicate(el.attrs));
+    const bar = () => node('#displays-root').children[0].find((el) => el.attrs && el.attrs['data-savebar'] === 'helm')[0];
+    let save = buttons(bar(), (a) => a['data-act'] === 'save')[0]; let apply = buttons(bar(), (a) => a['data-act'] === 'apply')[0]; let discard = buttons(bar(), (a) => a['data-act'] === 'discard')[0];
+    assert.ok('disabled' in save.attrs && 'disabled' in discard.attrs, 'Save and Discard are off while nothing changed'); assert.ok(!('disabled' in apply.attrs), 'Apply to screen is available');
+    assert.ok(buttons(node('#displays-root').children[0], (a) => a['data-theme-id']).every((b) => !('disabled' in b.attrs)), 'swatches are selectable in edit mode');
+    assert.ok(buttons(node('#displays-root').children[0], (a) => /^Move .* up$/.test(a['aria-label'] || '')).length > 0, 'reorder buttons carry accessible names');
+    assert.ok(buttons(node('#displays-root').children[0], (a) => /^Remove SOG from page 1$/.test(a['aria-label'] || '')).length === 1);
+    // Choosing a theme and typing a name makes the draft dirty and the preview follows.
+    ui.runDisplayAction({ act: 'theme', display: 'helm', themeId: 'ocean' });
+    assert.equal(st.drafts.helm.theme, 'ocean'); assert.equal(ui.displaysDirty(), true);
+    assert.match(allText(node('#displays-root')), /Ocean theme/);
+    const frame = node('#displays-root').children[0].find((el) => el.attrs && el.attrs.class && el.attrs.class.startsWith('preview-frame'))[0];
+    assert.equal(frame.styleVars['--pv-tile'], themesJson.themes.ocean.day.tile, 'the preview shows the draft theme');
+    save = buttons(bar(), (a) => a['data-act'] === 'save')[0]; assert.ok(!('disabled' in save.attrs), 'Save is on once something changed');
+    ui.onDisplaysInput({ target: { dataset: { pageTitle: '0', display: 'helm' }, value: 'Wind', type: 'text' } });
+    assert.equal(st.drafts.helm.pages[0].title, 'Wind');
+    // Data rows: disabled with a reason when the page is full, enabled once there is room.
+    ui.renderDataBrowser();
+    const addButtons = () => node('#catalog-root').find((el) => el.tagName === 'button' && el.attrs['data-act'] === 'add-row');
+    assert.equal(addButtons().length, 3);
+    assert.ok(addButtons().every((b) => 'disabled' in b.attrs), 'page 1 is full'); assert.match(allText(node('#catalog-root')), /This page is full/);
+    assert.match(allText(node('#catalog-root')), /Adding to Helm/);
+    ui.runDisplayAction({ act: 'item-remove', display: 'helm', page: '0', item: '3' });
+    assert.ok(!('disabled' in addButtons()[0].attrs), 'room for the first row');
+    assert.match(node('#catalog-root').find((el) => el.tagName === 'button' && el.attrs['data-row-id'] === 'smoke')[0].attrs['aria-label'], /^Add Smoke to page 1$/);
+    assert.ok('disabled' in addButtons().find((b) => b.attrs['data-row-id'] === 'smoke').attrs && /Cannot be shown on a 2 × 2 grid page/.test(allText(node('#catalog-root'))), 'a notification cannot go on a grid');
+    assert.equal(node('#catalog-root').find((el) => el.tagName === 'input' && el.attrs['data-row-opt'] === 'instance').length, 1, 'a template row asks which one');
+    assert.equal(node('#catalog-root').find((el) => el.tagName === 'input' && el.attrs['data-row-opt'] === 'alarm').length, 2, 'the alarm opt-in is offered for a row with suggested limits and for a notification');
+    assert.match(allText(node('#catalog-root')), /Count in alarm banner \(uses the suggested limits\)/);
+    // Add a template row without naming it, then with.
+    ui.runDisplayAction({ act: 'add-row', rowId: 'tpl' });
+    assert.match(st.rowErrors.tpl, /Type which one/); assert.match(allText(node('#catalog-root')), /Type which one/);
+    ui.onDisplaysInput({ target: { dataset: { rowOpt: 'instance', rowId: 'tpl' }, value: 'port', type: 'text' } });
+    ui.onDisplaysInput({ target: { dataset: { rowOpt: 'alarm', rowId: 'tpl' }, checked: true, type: 'checkbox' } });
+    ui.runDisplayAction({ act: 'add-row', rowId: 'tpl' });
+    deq(st.drafts.helm.pages[0].items, ['sog', 'depth', 'house_v', 'engine_temp_port']);
+    deq(st.drafts.helm.newInstruments.engine_temp_port.thresholds, { warn_above: 90 });
+    assert.equal(st.rowOpts.tpl, undefined, 'the options are used up');
+    // Save: success path posts exactly the payload, leaves edit mode and reloads.
+    ui.state.token = 'tok-save';
+    const sent = [];
+    fetchImpl = async (path, options = {}) => {
+      if (options.method === 'POST') { sent.push([path, JSON.parse(options.body), options.headers['X-VesselStack-Token']]); return ok({ ok: true, changed: true }); }
+      return ok(routes[path]);
+    };
+    routes['/api/displays'] = { schema: 1, displays: [base] };
+    await ui.saveDraft(base);
+    assert.equal(sent.length, 1); assert.equal(sent[0][0], '/api/displays/save'); assert.equal(sent[0][2], 'tok-save');
+    deq(Object.keys(sent[0][1]).sort(), ['id', 'new_instruments', 'pages', 'revision', 'theme']); assert.equal(sent[0][1].pages[0].title, 'Wind'); assert.equal(sent[0][1].theme, 'ocean');
+    assert.equal(st.editing, null, 'a saved draft leaves edit mode'); assert.equal(st.saving, false);
+    // Save: a changed revision (409 code 3) keeps the edits and offers a reload; validation errors are listed.
+    ui.runDisplayAction({ act: 'edit', display: 'helm' }); ui.runDisplayAction({ act: 'theme', display: 'helm', themeId: 'daylight' });
+    fetchImpl = async (path, options = {}) => options.method === 'POST' ? ({ ok: false, status: 409, statusText: 'Conflict', json: async () => ({ error: 'changed', errors: ['changed'], code: 3 }) }) : ok(routes[path]);
+    await ui.saveDraft(base);
+    assert.equal(st.conflict.helm, true); assert.equal(st.editing, 'helm', 'the edits are kept'); assert.match(allText(node('#displays-root')), /changed somewhere else/); assert.match(allText(node('#displays-root')), /Reload the latest settings and drop my edits/);
+    fetchImpl = async (path, options = {}) => options.method === 'POST' ? ({ ok: false, status: 400, statusText: 'Bad', json: async () => ({ error: 'one', errors: ['pages[0].title: too long', 'second problem'], code: 2 }) }) : ok(routes[path]);
+    await ui.saveDraft(base);
+    assert.equal(st.conflict.helm, false); assert.match(allText(node('#displays-root')), /pages\[0\]\.title: too long/); assert.match(allText(node('#displays-root')), /second problem/);
+    fetchImpl = async (path, options = {}) => options.method === 'POST' ? ({ ok: false, status: 409, statusText: 'Conflict', json: async () => ({ error: 'Another operation is running' }) }) : ok(routes[path]);
+    await ui.saveDraft(base);
+    assert.equal(st.conflict.helm, false, 'a busy server is not a revision conflict'); assert.match(allText(node('#displays-root')), /Another operation is running/);
+    ui.runDisplayAction({ act: 'reload', display: 'helm' }); assert.equal(st.editing, null); assert.equal(st.drafts.helm, undefined);
+    // An invalid draft is never sent.
+    ui.runDisplayAction({ act: 'edit', display: 'helm' }); st.drafts.helm.pages[0].title = '';
+    sent.length = 0; fetchImpl = async (path, options = {}) => { sent.push(path); return ok({}); };
+    await ui.saveDraft(base); assert.equal(sent.length, 0); assert.match(allText(node('#displays-root')), /Give the page a name/);
+    ui.runDisplayAction({ act: 'discard', display: 'helm' }); assert.equal(st.editing, null);
+
+    // ---- Apply: dialog result, deploy request, operation tracking ----
+    nodes.set('#apply-body', new FakeEl('div'));
+    const applyDialog = node('#apply-dialog');
+    let dialogSeen = null;
+    applyDialog.showModal = function showModal() {
+      const dlg = ui.state.displays.applyDialog;
+      dialogSeen = { method: dlg.method, text: allText(node('#apply-body')), title: node('#apply-title').textContent };
+      dlg.host.value = dlgInput.host; dlg.port.value = dlgInput.port;
+      node('#apply-ok').onclick();
+      if (this.onclose) this.onclose();
+    };
+    applyDialog.close = function close(value) { this.returnValue = value; };
+    let dlgInput = { host: '192.0.2.50', port: '/dev/serial/by-id/usb-X-if00' };
+    const calls2 = [];
+    const opState = { id: 41, label: 'display deploy helm', state: 'running', output: [], started_at: 1, finished_at: null };
+    fetchImpl = async (path, options = {}) => {
+      calls2.push([path, options.method || 'GET', options.body ? JSON.parse(options.body) : null]);
+      if (path === '/api/displays/serial-ports') return ok({ schema: 1, ports });
+      if (options.method === 'POST') return ok(opState);
+      if (path === '/api/status') return ok({ components: [], operation: opState, installed_version: '0.6.0', running_version: '0.6.0', boot_id: 'b' });
+      return ok(routes[path]);
+    };
+    ui.state.token = 'tok-apply'; ui.state.busy = false; ui.state.pendingOperation = null;
+    // First flash: USB is the default, Wi-Fi shown as unverified, every note present.
+    await ui.applyToScreen('helm');
+    assert.equal(dialogSeen.method, 'serial'); assert.match(dialogSeen.text, /By USB cable/); assert.match(dialogSeen.text, /Over Wi-Fi/); assert.match(dialogSeen.text, /Wi-Fi updates are not yet verified on hardware/); assert.match(dialogSeen.text, /first time a new display is set up it must be sent by USB cable/);
+    assert.match(dialogSeen.text, /3 to 6 minutes/); assert.match(dialogSeen.text, /backups, updates and settings changes are paused/);
+    const post = calls2.find(([path, method]) => method === 'POST');
+    assert.equal(post[0], '/api/displays/deploy'); deq(post[2], { id: 'helm', method: 'serial', target: '/dev/serial/by-id/usb-X-if00' });
+    // Over Wi-Fi after a Wi-Fi flash: host prefilled from the last target; a bad host is refused inside the dialog.
+    base.readiness = ready({ toolchain_cache_present: false, last_flash: { ok: true, method: 'ota', ota_target: '192.0.2.77', built_at_utc: 'T1' } });
+    await tick(); await tick(); await tick();
+    dlgInput = { host: '-x', port: '' }; calls2.length = 0; ui.state.pendingOperation = null; ui.state.busy = false;
+    applyDialog.showModal = function showModal() {
+      const dlg = ui.state.displays.applyDialog;
+      assert.equal(dlg.method, 'ota'); assert.equal(dlg.host.attrs.value, '192.0.2.77', 'prefilled from the last Wi-Fi target');
+      assert.match(allText(node('#apply-body')), /10 to 15 minutes the first time/); assert.match(allText(node('#apply-body')), /needs about 3\.0 GB of free space; this computer has 47 GB/);
+      dlg.host.value = '-x'; node('#apply-ok').onclick();
+      assert.match(dlg.error.textContent, /IP address or host name/, 'a bad host is explained and the dialog stays open');
+      assert.equal(this.returnValue, '', 'it did not close');
+      dlg.host.value = '192.0.2.77'; node('#apply-ok').onclick();
+      if (this.onclose) this.onclose();
+    };
+    await ui.applyToScreen('helm');
+    const post2 = calls2.find(([path, method]) => method === 'POST');
+    deq(post2[2], { id: 'helm', method: 'ota', target: '192.0.2.77' });
+    // Blocked Apply: no dialog, a reason.
+    base.readiness = ready({ wifi_stored: false }); calls2.length = 0; dialogSeen = null; ui.state.busy = false;
+    await ui.applyToScreen('helm'); assert.equal(dialogSeen, null); assert.equal(calls2.length, 0);
+    assert.match(node('#toast-text').textContent, /Wi-Fi name and password/);
+    // Rollback uses its own endpoint.
+    await tick(); await tick(); await tick();
+    base.readiness = ready({ last_flash: { ok: true, method: 'ota', ota_target: '192.0.2.77', built_at_utc: 'T1' }, firmware: { status: 'current', built_at_utc: 'T1', has_previous: true, rollback_possible: true } }); calls2.length = 0; ui.state.pendingOperation = null; ui.state.busy = false;
+    applyDialog.showModal = function showModal() { const dlg = ui.state.displays.applyDialog; assert.equal(dlg.kind, 'rollback'); assert.match(node('#apply-title').textContent, /previous firmware/); dlg.host.value = '192.0.2.77'; dlg.port.value = ''; node('#apply-ok').onclick(); if (this.onclose) this.onclose(); };
+    await ui.runDisplayAction({ act: 'rollback', display: 'helm' }); await tick(); await tick();
+    assert.equal(calls2.find(([path, method]) => method === 'POST')[0], '/api/displays/rollback');
+    assert.match(allText(ui.displayCard(base)), /Put previous firmware back/);
+
+    // OTA target confirmation: the image holds the Wi-Fi password, so a new address needs an explicit tick.
+    assert.equal(ui.isNewOtaTarget(base, '192.0.2.77'), false); assert.equal(ui.isNewOtaTarget(base, ' 192.0.2.77 '), false); assert.equal(ui.isNewOtaTarget(base, '192.0.2.99'), true);
+    assert.equal(ui.isNewOtaTarget({ readiness: ready() }, '192.0.2.77'), true, 'no recorded target: every address is new');
+    deq(ui.uploadRequest(base, 'ota', '192.0.2.99', ports, true).body, { id: 'helm', method: 'ota', target: '192.0.2.99', confirm_new_target: true });
+    deq(ui.uploadRequest(base, 'ota', '192.0.2.77', ports, false).body, { id: 'helm', method: 'ota', target: '192.0.2.77' });
+    for (const kind of ['deploy', 'rollback']) {
+      if (kind === 'rollback') base.readiness = ready({ last_flash: { ok: true, method: 'ota', ota_target: '192.0.2.77', built_at_utc: 'T1' }, firmware: { status: 'current', built_at_utc: 'T1', has_previous: true, rollback_possible: true } });
+      else base.readiness = ready({ last_flash: { ok: true, method: 'ota', ota_target: '192.0.2.77', built_at_utc: 'T1' } });
+      await tick(); await tick(); await tick();
+      calls2.length = 0; ui.state.pendingOperation = null; ui.state.busy = false;
+      let seen = null;
+      applyDialog.showModal = function showModal() {
+        const dlg = ui.state.displays.applyDialog;
+        dlg.host.value = '192.0.2.99'; dlg.sync();
+        seen = { hidden: dlg.confirmRow.hidden, disabled: node('#apply-ok').disabled, text: allText(node('#apply-body')) };
+        node('#apply-ok').onclick();
+        seen.closedEarly = this.returnValue === 'ok'; seen.error = dlg.error.textContent;
+        dlg.confirmBox.checked = true; dlg.sync(); seen.enabled = node('#apply-ok').disabled === false;
+        node('#apply-ok').onclick();
+        if (this.onclose) this.onclose();
+      };
+      await (kind === 'rollback' ? ui.runDisplayAction({ act: 'rollback', display: 'helm' }) : ui.applyToScreen('helm')); await tick(); await tick();
+      assert.equal(seen.hidden, false, kind); assert.equal(seen.disabled, true, kind + ': Start stays disabled until ticked');
+      assert.match(seen.text, /Send firmware, which contains this boat's Wi-Fi password, to 192\.0\.2\.99/); assert.equal(seen.closedEarly, false); assert.match(seen.error, /Tick the box/); assert.equal(seen.enabled, true);
+      const sent = calls2.find(([path, method]) => method === 'POST');
+      deq(sent[2], { id: 'helm', method: 'ota', target: '192.0.2.99', confirm_new_target: true });
+    }
+
+    // The progress panel is built from the operation output: stepper, details, and the exact remedy on failure.
+    const hostileOutput = ['STAGE: render', 'STAGE: compile', '<img src=x onerror=alert(1)>', 'STAGE: upload'];
+    ui.state.operation = { id: 7, label: 'display deploy helm', state: 'running', output: hostileOutput, started_at: 1 };
+    let panel = ui.deployPanel(base);
+    assert.equal(panel.find((el) => el.tagName === 'li' && el.attrs.class === 'step active').length, 1); assert.match(allText(panel), /Sending it to the screen/); assert.match(allText(panel), /Backups, updates and settings changes are paused/);
+    assert.ok(allText(panel).includes('<img src=x onerror=alert(1)>')); assert.equal(panel.find((el) => el.tagName === 'img').length, 0, 'tool output is text only');
+    ui.state.operation = { id: 7, label: 'display deploy helm', state: 'failed', output: hostileOutput, started_at: 1, finished_at: Math.floor(Date.now() / 1000), summary: { reason: 'the upload failed (exit status 1).', fix: 'Check that the display is powered on.' } };
+    panel = ui.deployPanel(base); const failedText = allText(panel);
+    assert.match(failedText, /did not finish/); assert.match(failedText, /To fix: Check that the display is powered on\./); assert.equal(panel.find((el) => el.tagName === 'li' && el.attrs.class === 'step failed').length, 1);
+    ui.state.operation = { id: 8, label: 'display deploy helm', state: 'succeeded', output: ['STAGE: done'], started_at: 1, finished_at: Math.floor(Date.now() / 1000) };
+    assert.match(allText(ui.deployPanel(base)), /Sent\. The screen restarts/);
+    ui.state.operation = { id: 9, label: 'display deploy aux', state: 'running', output: [], started_at: 1 };
+    assert.equal(allText(ui.deployPanel(base)), '', 'another display\'s operation is not shown here');
+    ui.state.operation = { id: 10, label: 'backup', state: 'running', output: [], started_at: 1 };
+    assert.equal(allText(ui.deployPanel(base)), '');
+    assert.equal(ui.describeOperation({ label: 'display deploy helm' }).running, 'Putting the settings on Helm\'s screen…');
+    assert.match(ui.describeOperation({ label: 'display rollback helm' }).done, /previous firmware was put back on Helm/);
+    // While an operation runs, saving is off and says why.
+    ui.state.operationRunning = true; st.editing = null; ui.runDisplayAction({ act: 'edit', display: 'helm' }); ui.runDisplayAction({ act: 'theme', display: 'helm', themeId: 'daylight' });
+    const busyBar = node('#displays-root').children[0].find((el) => el.attrs && el.attrs['data-savebar'] === 'helm')[0];
+    assert.ok(buttons(busyBar, (a) => a['data-act'] === 'save').every((b) => 'disabled' in b.attrs)); assert.match(allText(busyBar), /Another operation is running/);
+    ui.state.operationRunning = false; ui.runDisplayAction({ act: 'discard', display: 'helm' });
+
+    // ---- History and restore ----
+    ui.formatStamp && assert.equal(ui.formatStamp('20260101T120000Z'), '2026-01-01 12:00 UTC');
+    const historyCalls = [];
+    fetchImpl = async (path, options = {}) => { historyCalls.push([path, options.method || 'GET', options.body ? JSON.parse(options.body) : null]); if (path === '/api/displays/history') return ok({ schema: 1, backups: [{ stamp: '20260101T120000Z', size: 900, revision: 'r' }, { stamp: '20251231T080000Z', size: 880, revision: 'q' }] }); if (options.method === 'POST') return ok({ ok: true, revision: 'new' }); return ok(routes[path]); };
+    ui.state.token = 'tok-hist'; routes['/api/displays'] = { schema: 1, displays: [{ ...base, readiness: ready({ firmware: { status: 'current', built_at_utc: 'T1', rollback_possible: true } }) }] };
+    nodes.set('#history-root', new FakeEl('div'));
+    await ui.loadHistory();
+    const histText = allText(node('#history-root')); assert.match(histText, /2026-01-01 12:00 UTC/); assert.match(histText, /2025-12-31 08:00 UTC/);
+    const restoreButtons = node('#history-root').find((el) => el.tagName === 'button' && el.attrs['data-act'] === 'restore'); assert.equal(restoreButtons.length, 2);
+    assert.match(restoreButtons[0].attrs['aria-label'], /Restore the settings from 2026-01-01 12:00 UTC/);
+    historyCalls.length = 0; dialogAnswer = 'cancel';
+    await ui.restoreBackup('20260101T120000Z'); assert.equal(historyCalls.filter(([, m]) => m === 'POST').length, 0, 'cancel restores nothing');
+    dialogAnswer = 'ok'; ui.state.displays.list = [{ ...base, revision: REV }];
+    await ui.restoreBackup('20260101T120000Z');
+    deq(historyCalls.find(([, m]) => m === 'POST'), ['/api/displays/restore', 'POST', { stamp: '20260101T120000Z', revision: REV }]);
+    assert.match(dialogTitles[dialogTitles.length - 1].title, /Restore these settings/);
+    assert.match(allText(node('#history-root')), /settings were restored/); assert.match(allText(node('#history-root')), /Put previous firmware back on Helm/, 'after a restore, rolling the firmware back is offered');
+    dialogAnswer = 'ok';
+    // Restore is off while there are unsaved edits.
+    ui.state.displays.list = [base]; ui.runDisplayAction({ act: 'edit', display: 'helm' }); ui.runDisplayAction({ act: 'theme', display: 'helm', themeId: 'daylight' });
+    ui.renderHistory(); assert.ok(node('#history-root').find((el) => el.tagName === 'button' && el.attrs['data-act'] === 'restore').every((b) => 'disabled' in b.attrs)); assert.match(allText(node('#history-root')), /Save or discard your edits first/);
+    ui.runDisplayAction({ act: 'discard', display: 'helm' });
+
+    // Nothing the editor builds uses inline styles or raw HTML.
+    ui.runDisplayAction({ act: 'edit', display: 'helm' });
+    assert.equal(node('#displays-root').find((el) => el.attrs && 'style' in el.attrs).length, 0);
+    assert.doesNotMatch(appSource, /innerHTML\s*=\s*[^;]*(draft|row\.|entry\.)/, 'editor data never goes through innerHTML');
+    ui.runDisplayAction({ act: 'discard', display: 'helm' });
+    ui.state.operation = null;
+  }
+
+  routes['/api/displays'] = { schema: 1, displays: [shown, { id: 'aux', name: 'Aux', board: 'b', error: 'could not be read' }] };
   // A failing catalog does not hide the displays; a failing list shows one plain message.
   fetchImpl = async (path) => path === '/api/displays/catalog?live=1' ? ({ ok: false, status: 504, statusText: 'x', json: async () => ({ error: 'too long' }) }) : ok(routes[path]);
   await ui.loadDisplays(true); assert.equal(ui.state.displays.list.length, 2); assert.match(ui.state.displays.error, /data list could not be loaded: too long/);

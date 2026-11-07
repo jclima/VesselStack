@@ -1088,7 +1088,8 @@ class EditorTests(unittest.TestCase):
         (base / "last-flash.json").write_text(json.dumps({"schema": 1, "current": entry, "previous": None}))
         flash = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"]
         self.assertEqual(flash, {"ok": True, "method": "ota", "at": "2026-01-02T00:00:00Z", "version": "1.2.3",
-                                 "ota_target": "192.0.2.77", "credentials_changed": True})
+                                 "ota_target": "192.0.2.77", "credentials_changed": True,
+                                 "matches_settings": False})
         self.assertNotIn("hunter2", json.dumps(flash))
         # a target that is not an IP or host name is never passed on; USB targets never are
         entry["target"] = "http://evil/x?token=1"

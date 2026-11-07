@@ -65,7 +65,7 @@ CONTAINER_FLAGS = ["--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
 SERIAL_REAL_RE = re.compile(r"^/dev/tty[A-Za-z0-9_.-]+$")
 SERIAL_BY_ID_PREFIX = "/dev/serial/by-id/"
 HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-RESERVED_TARGETS = {"bootsel", "mqtt", "mqttip"}
+RESERVED_TARGETS = {"bootsel", "mqtt", "mqttip", "ota", "serial"}
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_EXCLUDED = ("secrets.yaml", "README.txt")
 PULL_NOTICE = ("the ESPHome image is not present locally: pulling it now (about 250 MB to "
@@ -122,9 +122,11 @@ def validate_host(host: str) -> str:
     """An IP address or an RFC 1123 host name; never a URL, path or option."""
     if not isinstance(host, str) or not host or len(host) > 253:
         raise RenderError("--ota needs an IP address or host name", 2)
+    if "%" in host:
+        raise RenderError(f"--ota {host!r} must not contain a scope id (%): use the display's "
+                          "global or unique-local address", 2)
     try:
-        ipaddress.ip_address(host)
-        return host
+        return str(ipaddress.ip_address(host))
     except ValueError:
         pass
     labels = host.rstrip(".").split(".")
@@ -380,8 +382,8 @@ def _write_firmware_dir(dd: DisplayDir, files: dict, owner, rotate: bool = True)
         raise
     os.close(new_fd)
     if rotate:
-        render._remove_tree(parent, PREVIOUS_DIR)
-        if render._exists(parent, FIRMWARE_DIR):
+        if render._exists(parent, FIRMWARE_DIR):  # keep firmware.prev unless there is a firmware/ to replace it
+            render._remove_tree(parent, PREVIOUS_DIR)
             os.rename(FIRMWARE_DIR, PREVIOUS_DIR, src_dir_fd=parent, dst_dir_fd=parent)
     else:
         render._remove_tree(parent, FIRMWARE_DIR)
@@ -573,7 +575,8 @@ def staged_firmware(ctx, data: bytes, expected_sha256: str, rendered=None):
 
 def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = None,
           previous: bool = False, stream=default_stream_runner, lstat=os.lstat,
-          realpath=os.path.realpath, notify=None, force: bool = False) -> None:
+          realpath=os.path.realpath, notify=None, force: bool = False, progress: bool = False,
+          run_lines=None) -> None:
     """Upload the stored firmware; never compiles and never pulls an image.
 
     Holds the per-display build lock for the whole run, so a build cannot rotate the
@@ -584,11 +587,48 @@ def flash(ctx, display_id: str, *, serial: str | None = None, ota: str | None = 
         raise RenderError("choose exactly one of --serial DEVICE or --ota HOST", 2)
     device = validate_serial(serial, lstat, realpath) if serial else None
     host = validate_host(ota) if ota else None
-    with render.build_lock(ctx, display_id, notify=notify):
-        info = _flash_locked(ctx, display_id, device=device, host=host, previous=previous,
-                             stream=stream, serial=serial, force=force)
-        record_flash(ctx, display_id, info, "serial" if serial else "ota", device or host,
-                     warn=notify or (lambda text: print(text, file=sys.stderr)))
+    method = "serial" if serial else "ota"
+    on_secrets = None
+    tail: list = []
+    if progress:  # Control Panel mode: STAGE lines, secrets redacted from the tool output
+        run_lines = run_lines or default_line_runner
+        holder = {"redact": make_redactor([])}
+
+        def emit(line: str) -> None:
+            line = holder["redact"](line)
+            tail.append(line)
+            del tail[:-TAIL_LINES]
+            ctx.out(line)
+            _flush()
+
+        def stream(argv: list[str]) -> int:  # noqa: F811 - replaces the plain runner
+            return run_lines(argv, emit)
+
+        def on_secrets(values) -> None:
+            holder["redact"] = make_redactor(values)
+    try:
+        with render.build_lock(ctx, display_id, notify=notify):
+            if progress:
+                ctx.out("STAGE: upload")
+                _flush()
+            info = _flash_locked(ctx, display_id, device=device, host=host, previous=previous,
+                                 stream=stream, serial=serial, force=force, on_secrets=on_secrets)
+            record_flash(ctx, display_id, info, method, device or host,
+                         warn=notify or (lambda text: print(text, file=sys.stderr)))
+            if progress:
+                ctx.out("STAGE: done")
+                _flush()
+    except (RenderError, lifecycle.LifecycleError) as exc:
+        if progress:
+            exc.hints = fix_hints(str(exc), "\n".join(tail), method, display_id)
+        raise
+
+
+def _flush() -> None:
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def check_credentials(manifest: dict, display_id: str, previous: bool, current, reason=None) -> None:
@@ -633,7 +673,7 @@ def check_source(manifest: dict, display_id: str, previous: bool, current: str) 
 
 
 def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream, serial,
-                  force: bool = False) -> dict:
+                  force: bool = False, on_secrets=None) -> dict:
     image = render.pinned_image()
     directory = PREVIOUS_DIR if previous else FIRMWARE_DIR
     name = FACTORY_NAME if serial else OTA_NAME
@@ -652,6 +692,8 @@ def _flash_locked(ctx, display_id: str, *, device, host, previous: bool, stream,
         rendered = render.collect(ctx, display_id)  # may generate a missing OTA password
     except (RenderError, lifecycle.LifecycleError) as exc:
         reason = str(exc)
+    if rendered is not None and on_secrets:
+        on_secrets(rendered.secret_values)
     if not force:
         current = secrets_fingerprint(rendered.files, display_id) if rendered else None
         check_credentials(manifest, display_id, previous, current, reason)
@@ -763,6 +805,20 @@ def record_flash(ctx, display_id: str, info: dict, method: str, target: str, *, 
     except (RenderError, OSError, mqtt_auth.MqttAuthError) as exc:
         warn(f"warning: the upload worked but {LAST_FLASH_NAME} could not be written: "
              f"{getattr(exc, 'strerror', None) or exc}")
+        _discard_stale_last_flash(ctx, display_id)
+
+
+def _discard_stale_last_flash(ctx, display_id: str) -> None:
+    """After a failed record, drop the old file: it names an image the device no longer runs."""
+    try:
+        with DisplayDir(ctx.root, display_id, create=False) as dd:
+            for name in (LAST_FLASH_NAME, LAST_FLASH_NAME + ".tmp"):
+                try:
+                    os.unlink(name, dir_fd=dd.display_fd)
+                except FileNotFoundError:
+                    pass
+    except (RenderError, OSError):
+        pass
 
 
 # --- deploy (build if needed + upload, one lock) -------------------------------------
@@ -782,6 +838,10 @@ def make_redactor(values):
             continue
         spellings.add(value)
         spellings.add(json.dumps(value)[1:-1])
+        try:
+            spellings.add(render.yq(value)[1:-1])  # the spelling secrets.yaml uses
+        except Exception:  # noqa: BLE001 - redaction must never fail
+            pass
         spellings.add(urllib.parse.quote(value, safe=""))
         quoted = shlex.quote(value)
         if quoted.startswith("'") and quoted.endswith("'"):
@@ -850,7 +910,7 @@ def fix_hints(message: str, output: str, method: str, display_id: str) -> list[s
 
 
 def deploy(ctx, display_id: str, *, serial: str | None = None, ota: str | None = None,
-           progress: bool = False, run_lines=default_line_runner, statvfs=os.statvfs,
+           progress: bool = False, run_lines=None, statvfs=os.statvfs,
            monotonic=time.monotonic, now=_utc_now, lstat=os.lstat, realpath=os.path.realpath,
            notify=None) -> None:
     """Build when needed and upload, holding ONE build lock for the whole run.
@@ -863,6 +923,7 @@ def deploy(ctx, display_id: str, *, serial: str | None = None, ota: str | None =
     ESPHome tools print is redacted of secret values before it is shown.
     """
     lifecycle._require_root(ctx, "deploy")
+    run_lines = run_lines or default_line_runner
     if bool(serial) == bool(ota):
         raise RenderError("choose exactly one of --serial DEVICE or --ota HOST", 2)
     device = validate_serial(serial, lstat, realpath) if serial else None
@@ -916,8 +977,9 @@ def deploy(ctx, display_id: str, *, serial: str | None = None, ota: str | None =
             stage("done")
             say(f"Deployed to {device or host} ({'USB serial' if device else 'Wi-Fi'}).")
     except (RenderError, lifecycle.LifecycleError) as exc:
-        for hint in fix_hints(str(exc), "\n".join(tail), method, display_id):
-            say(f"To fix: {hint}")
+        # displayctl prints these as one "To fix:" line AFTER the error line (the Control Panel
+        # reads the remedy that follows the last error)
+        exc.hints = fix_hints(str(exc), "\n".join(tail), method, display_id)
         raise
 
 
@@ -946,9 +1008,8 @@ def _plan_build(ctx, display_id: str, source: str, fingerprint: str) -> tuple[bo
                             and manifest.get("secrets_sha256") == fingerprint)
                 except RenderError:
                     skip = False
-            rotate = True
-            if last is not None and hashes:
-                rotate = last["current"]["image_sha256"] in hashes
+            # rotate only an intact firmware/ that the device runs (or that predates last-flash.json)
+            rotate = bool(hashes) and (last is None or last["current"]["image_sha256"] in hashes)
     except RenderError:
         return False, True
     if skip and not _image_present(ctx, render.pinned_image()):

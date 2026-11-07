@@ -140,10 +140,11 @@ Nothing changes on the boat until you press **Save** and then **Apply**.
 
 ### Displays
 
-The Displays tab shows your ESP32 instrument displays and the data they can show. In this version it
-is read-only: it reads information and changes nothing, and it does not run builds or flashes. It
-opens when you pick the tab (it does not poll), and **Refresh** reads it again. The Settings tab's
-Displays section links to it.
+The Displays tab shows your ESP32 instrument displays and the data they can show, and lets you change
+a display's colour theme and pages and send the result to the screen. Looking is read-only; changes
+happen only when you press **Save** (settings) or **Apply to screen** (firmware). The tab opens when
+you pick it (it does not poll), and **Refresh** reads it again. The Settings tab's Displays section
+links to it.
 
 - **One card per display** with its name, id, board, colour theme and a firmware chip:
   **On screen** (the stored firmware matches your settings and the last flash from this computer
@@ -157,8 +158,30 @@ Displays section links to it.
   live numbers from Signal K when the data list has them, otherwise a dash. It is labelled
   **Approximate preview**; the display is the final word on spacing and fonts.
 - **Colour theme** swatches for `classic`, `high-contrast`, `daylight` and `ocean` with the current one
-  marked. They are not clickable yet; change the theme with
-  `sudo vesselstackctl display set-theme ID THEME`.
+  marked. Press **Edit pages and theme**, pick a swatch and the preview changes at once; nothing is
+  stored until **Save**. (Going back to an older VesselStack: run `set-theme ID classic` first.)
+- **Editing**: **Edit pages and theme** opens a private draft. Per page: title (16 characters), layout
+  (only those the board offers; the capacity and minimum number of items are shown), and the items
+  with accessible **Move up / Move down / Remove** buttons. Add or remove pages (at most 8). In the
+  data list **Add to page** puts a value on the page being edited; it is disabled with the reason when
+  the layout does not accept it, the page is full, or it needs a minimum/maximum (inline fields,
+  prefilled from the value's usual range, appear instead). Template values (tanks, batteries, ...) ask
+  for the instance name. **Count in alarm banner** is off by default; switching it on adds the suggested
+  thresholds or marks the notification as an alarm. The save bar offers **Discard**, **Save** and
+  **Apply to screen**. If `displays.json` changed somewhere else meanwhile (revision conflict) your edits
+  are kept and you are offered to reload the latest settings.
+- **Apply to screen** saves pending edits, then asks how to send the firmware: **By USB cable** (pick
+  the port, **Refresh** rescans) or **Over Wi-Fi** (host prefilled with the last Wi-Fi target, else
+  `vs-ID.local`; an IP address is more reliable). It notes that the first flash must be USB, that Wi-Fi
+  updates are not yet verified on hardware, how long it takes (3-6 minutes, 10-15 the first time with
+  about 3 GB free disk) and that backups, updates and settings changes are paused while it runs. The
+  progress panel shows a stepper from the `STAGE:` lines (Preparing, Building, Sending, Done), a
+  **Details** tail of the output and, on failure, a **To fix:** banner. Apply is disabled, with the
+  reason and the command to run, when readiness blocks it (no Wi-Fi stored, no data password, no
+  Docker, too little disk).
+- **History** lists the settings backups (`display history`) with **Restore**. When the previous
+  firmware is still what the stored `firmware.prev` is, **Put previous firmware back on screen** runs
+  `display flash ID --previous` (never `--force`) after you restore the matching settings.
 - **Pages** with their layout and the items on each (labels from your instruments, notifications and
   Home Assistant items). Clicking a page previews it.
 - **A readiness checklist** in plain language: displays switched on, a data password for the display,
@@ -169,6 +192,34 @@ Displays section links to it.
   **Live**, **No live data**, **Uncatalogued** and **Used on** a display, and the current value when it
   is live. Opening the tab asks your Signal K server once (at most every 30 s) which values have data;
   if it cannot be reached the list still shows, without live values.
+
+Endpoints (all POSTs need the unlock token and the panel's Origin, JSON only, at most 1 MiB; payloads
+go to the tool on stdin, never on a command line): `POST /api/displays/save` (`set-pages ID --if-revision
+REV --stdin`; 409 when an operation is running or the revision changed, 400 for invalid pages),
+`POST /api/displays/deploy` `{id, method: "ota"|"serial", target, confirm_new_target?}` (`display deploy ID --ota|--serial
+TARGET --progress`, an operation holding the lifecycle slot; the OTA target must be an IP address or a
+plain host name without a `%` scope id and not a name ESPHome reserves (`bootsel`, `mqtt`, `mqttip`, `ota`, `serial`, `COM*`), the USB target one of the listed `/dev/serial/by-id` ports), `GET /api/displays/history`,
+`POST /api/displays/restore` `{stamp, revision}` and `POST /api/displays/rollback` `{id, method, target, confirm_new_target?}`
+(`display flash ID --previous ...`; 409 while another operation runs).
+
+**What was last sent (`last-flash.json`).** After every successful upload the tool records, in the root-only
+`build/displays/ID/last-flash.json`, when and how (USB or Wi-Fi), the target, the image and VesselStack version
+(hashes only, no password). The panel uses it to prefill the Wi-Fi address and the method of the Apply dialog, to say
+**Credentials changed since this was sent** when the Wi-Fi or data password was rotated afterwards, and to decide whether
+the previous firmware can be put back.
+
+**Wi-Fi address confirmation.** The firmware image contains this boat's Wi-Fi password. The Apply and Put-previous-firmware
+dialogs prefill the address that worked last time; entering any other address (or any address when none worked yet) shows a
+checkbox, "Send firmware, which contains this boat's Wi-Fi password, to ADDRESS", and the button stays disabled until it is
+ticked. The server enforces the same rule: a Wi-Fi request whose target differs from the last successful one is refused with
+400 unless it carries `confirm_new_target: true`. USB uploads need no confirmation.
+
+**Putting the previous firmware back.** The button appears only when the previous image was built from exactly the current
+settings and credentials (otherwise the upload would be refused). The usual route is **History → Restore** of the saved copy
+that was current when that older firmware was built; once the settings match, **Put previous firmware back** appears on the card.
+
+**Builder image.** A missing ESPHome builder image does not block Apply: the checklist shows it as a to-do (about 250 MB, needs internet),
+and when the computer is offline the deploy fails with a `To fix:` hint. This is accepted behaviour.
 
 Adding a display (`sudo vesselstackctl display add ID --board BOARD --name NAME`) and entering Wi-Fi
 (`sudo vesselstackctl display wifi`) stay on the command line, so passwords never pass through this

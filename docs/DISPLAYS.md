@@ -180,8 +180,14 @@ files; keep archives private. It excludes `displays/.venv` and `__pycache__`
 
 ## Managing displays
 
-The Control Panel has a read-only **Displays** tab that shows each display, a preview of its pages, its
-firmware state and readiness, and the data list; see the [Control Panel guide](CONTROL_PANEL.md#displays).
+The Control Panel **Displays** tab shows each display, a preview of its pages, its firmware state and
+readiness and the data list, edits the theme and pages (`set-pages`), restores older settings
+(`restore-config`) and sends firmware to the screen (`display deploy`, rollback with `flash --previous`);
+see the [Control Panel guide](CONTROL_PANEL.md#displays). Editing is deterministic: restoring a backed-up
+`displays.json` renders the same source hash again, which is what makes `flash --previous` safe afterwards.
+**Downgrading** to a VesselStack without these themes or pages: run `set-theme ID classic` first and
+reflash. The panel runs `deploy` and rollback as an operation that holds the lifecycle slot, so backups,
+updates and settings changes wait until it ends.
 It runs `display list --json`, `show ID --json`, `themes --json`, `catalog [--live] --json` and
 `serial-ports --json`. Editing from the tab is not available yet; use the commands below.
 
@@ -531,12 +537,14 @@ lock from the render to the end of the upload and does `build` (only when needed
 image is present, so a retry after a failed upload does not rebuild. With `--progress` it prints `STAGE: render`, `STAGE: compile`
 (followed by a note when skipped), `STAGE: upload` and `STAGE: done`. Everything the ESPHome tools print passes through a
 redactor first: the Wi-Fi SSID and password and the MQTT, OTA and API secrets (also JSON-, URL- and shell-quoted) are replaced with
-`[redacted]` before a line leaves the command. Known failures end with `To fix:` lines: an unreachable host or a timeout (check
+`[redacted]` before a line leaves the command. Known failures end with a single `To fix:` line: an unreachable host or a timeout (check
 power and Wi-Fi, use the IP address instead of a `.local` name), an authentication failure (the credentials changed after the display
 was flashed: flash over USB, with the exact command), no space on the device, Docker missing, the image missing, a full disk, a
 busy lock. Exit status: `0` done, `1` failed, `2` invalid target. A build made by `deploy` replaces `firmware/` **without** moving it
 to `firmware.prev/` when `firmware/` was never uploaded (according to `last-flash.json`), so `firmware.prev/` stays the image the
-device last ran; without a `last-flash.json` it rotates as `build` does. `build` and `flash` themselves behave as before.
+device last ran; without a `last-flash.json` it rotates as `build` does. `firmware/` is only rotated into `firmware.prev/` when it is intact (a readable manifest), and an existing `firmware.prev/` is never deleted when there is no `firmware/` to replace it. If the upload worked but `last-flash.json` cannot be written, the old record is removed (a stale one would name the wrong image) and a warning is printed. `--ota` accepts an IP address (normalised; no `%` scope id) or a host name, and rejects the names ESPHome reserves (`bootsel`, `mqtt`, `mqttip`, `ota`, `serial`, `COM*`) in any letter case. Redaction also covers the spelling used in `secrets.yaml` (non-ASCII characters as `\u` escapes).
+
+**Control Panel notes.** Apply is not blocked by a missing ESPHome builder image: the readiness checklist shows it as a to-do and, when the computer is offline, the deploy fails with a `To fix:` hint (accepted behaviour). A Wi-Fi upload to an address other than the last successful one needs `confirm_new_target` (the image holds the Wi-Fi password); the dialog asks for an explicit tick. The rollback button is offered only when `firmware.prev/` was built from the current settings and credentials, i.e. after **History → Restore** of the matching saved copy. `build` and `flash` themselves behave as before.
 
 **`last-flash.json`** (`build/displays/ID/`, root `0600`, written atomically without following symlinks by `flash` and `deploy`,
 only after a successful upload; a failed upload records nothing): `{"schema": 1, "current": {...}, "previous": {...} | null}`

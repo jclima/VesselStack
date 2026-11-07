@@ -334,7 +334,10 @@ def run_render(args, action) -> int:
     try:
         action(ctx, args)
     except (render.RenderError, lifecycle.LifecycleError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        hints = getattr(exc, "hints", None)
+        if hints:
+            print("To fix: " + " ".join(hints), flush=True)
         return exc.code
     except (mqtt_auth.MqttAuthError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -357,7 +360,7 @@ def cmd_build_action(ctx, args) -> None:
 
 def cmd_flash_action(ctx, args) -> None:
     firmware.flash(ctx, args.id, serial=args.serial, ota=args.ota, previous=args.previous,
-                   force=args.force, notify=_warn)
+                   force=args.force, notify=_warn, progress=args.progress)
 
 
 def cmd_deploy_action(ctx, args) -> None:
@@ -485,6 +488,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="flash the previous build (firmware.prev) to roll back")
     flash.add_argument("--force", action="store_true",
                        help="flash even if the credentials changed since the firmware was built")
+    flash.add_argument("--progress", action="store_true",
+                       help="print 'STAGE: upload|done' and hide secrets in the tool output (used by the Control Panel)")
     deploy = firmware_parser("deploy", "build if needed and upload in one step, holding the build lock "
                              "throughout (root, optional)", cmd_deploy)
     deploy_target = deploy.add_mutually_exclusive_group(required=True)

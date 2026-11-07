@@ -377,3 +377,42 @@ dialog .keep{margin:.2rem 0 .5rem}
   .preview-frame{width:min(100%,300px)}
   .drow{align-items:flex-start}.dside{justify-content:flex-start}
 }
+
+/* Displays: editing, saving and applying */
+.swatch:not(:disabled){cursor:pointer}
+.swatch[aria-pressed="true"]:not(:disabled){border-color:var(--sea);background:var(--sea-soft)}
+.savebar{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:1rem 0;padding:.6rem;background:var(--panel-2);border:1px solid var(--line);border-radius:.8rem}
+.dcard.editing .savebar{position:sticky;bottom:.5rem;z-index:2;box-shadow:var(--shadow)}
+.savebar code{flex-basis:100%}
+.pedits{display:grid;gap:.75rem}
+.pedit{padding:.6rem;border:1px solid var(--line);border-radius:.8rem}
+.pedit.on{border-color:var(--sea);background:var(--sea-soft)}
+.phead{display:flex;flex-wrap:wrap;gap:.5rem;justify-content:space-between;align-items:center}
+.phead .pagebtn{width:auto;flex:1 1 12rem}
+.pbtns{display:flex;flex-wrap:wrap;gap:.3rem}
+.pbtns button{min-width:44px}
+.pfields{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:.6rem;margin:.6rem 0}
+.field{display:grid;gap:.2rem;font-size:.9rem}
+.field.inline{display:inline-grid;margin-right:.5rem}
+.field.inline input{width:8rem}
+.pitems{list-style:none;margin:.4rem 0;padding:0;display:grid;gap:.3rem}
+.pitem{display:flex;flex-wrap:wrap;gap:.4rem;justify-content:space-between;align-items:center;padding:.3rem 0;border-top:1px dashed var(--line)}
+.pname{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;min-width:0}.pname .mono{overflow-wrap:anywhere}
+.problems{margin:.4rem 0 0;padding-left:1.2rem;color:var(--red)}
+.addbar{position:sticky;top:3.5rem;z-index:1;padding:.5rem .75rem;margin:.5rem 0;background:var(--sea-soft);border:1px solid var(--sea);border-radius:.6rem}
+.addrow{flex-basis:100%;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
+.optcheck{display:inline-flex;gap:.3rem;align-items:center;min-height:44px}.optcheck input{width:auto;min-height:auto}
+.deploy:empty{display:none}
+.stepper{list-style:none;margin:.4rem 0;padding:0;display:grid;gap:.3rem}
+.step{display:flex;gap:.5rem;align-items:center}
+.step .mark{flex:none;display:inline-grid;place-items:center;width:1.5rem;height:1.5rem;border-radius:50%;font-weight:800;font-size:.85rem;background:var(--panel-2);border:1px solid var(--strong)}
+.step.done .mark{color:var(--on-sea);background:var(--success);border-color:var(--success)}
+.step.active .mark{color:var(--on-sea);background:var(--sea);border-color:var(--sea)}
+.step.failed .mark{color:var(--on-red);background:var(--red);border-color:var(--red)}
+.step.todo{color:var(--muted)}
+.methods{border:1px solid var(--line);border-radius:.8rem;margin:0 0 .8rem;padding:.6rem .8rem}
+.choice{display:flex;gap:.5rem;align-items:flex-start;min-height:44px;padding:.3rem 0}.choice input{width:auto;min-height:auto;margin-top:.35rem}
+.methodrow{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:0 0 .5rem 1.6rem}.methodrow label{font-size:.9rem}.methodrow input,.methodrow select{flex:1 1 12rem;width:auto}
+.applynotes{margin:.4rem 0}
+#apply-dialog{width:min(36rem,calc(100% - 2rem))}
+@media (max-width:760px){.addbar{top:0}.methodrow{margin-left:0}}

@@ -89,10 +89,17 @@
       </section>
 
       <section id="displays" class="tab-panel" role="tabpanel" aria-labelledby="tab-displays" hidden>
-        <div class="pagehead"><h1>Displays</h1><p>The instrument screens on your boat: what each one shows, how it will look, and whether the latest changes are on the screen. This page only shows information; nothing you do here changes a display yet.</p></div>
+        <div class="pagehead"><h1>Displays</h1><p>The instrument screens on your boat: choose a colour theme and what each page shows, see how it will look, then put it on the screen. Changes are saved on the boat computer when you press Save, and reach the screen only when you press Apply to screen.</p></div>
         <div class="toolbar dtoolbar"><button type="button" id="displays-refresh">Refresh</button><span id="displays-updated" class="small muted"></span></div>
         <div id="displays-status" role="status" aria-live="polite"></div>
         <div id="displays-root" class="displays"></div>
+        <section class="card flat" aria-labelledby="dh-h">
+          <details id="history-panel" class="dgroup">
+            <summary><strong id="dh-h">History and restore</strong></summary>
+            <p class="small">A copy of the display settings is kept before every save (the newest 20). Restoring brings those settings back; it does not change a screen until you apply it.</p>
+            <div id="history-root" aria-live="polite"></div>
+          </details>
+        </section>
         <section class="card flat" aria-labelledby="dd-h">
           <div class="sechead"><div><h2 id="dd-h">Available data</h2><p id="catalog-note" class="small"></p></div>
             <div class="toolbar"><div class="search"><label for="catalog-search">Search data</label><input id="catalog-search" type="search" placeholder="Name, group or Signal K path" autocomplete="off"></div></div></div>
@@ -176,6 +183,12 @@ sudo vesselstackctl restore &lt;backup-file&gt; --yes</code></div>
     <ul id="confirm-items"></ul>
     <p id="confirm-note" class="keep" hidden></p>
     <div class="foot"><button type="button" id="confirm-cancel" autofocus>Cancel</button><button type="button" id="confirm-ok" class="primary"></button></div>
+  </form></dialog>
+
+  <dialog id="apply-dialog" aria-labelledby="apply-title"><form method="dialog" id="apply-form">
+    <h2 id="apply-title">Apply to screen</h2>
+    <div id="apply-body"></div>
+    <div class="foot"><button type="button" id="apply-cancel">Cancel</button><button type="button" id="apply-ok" class="primary">Start</button></div>
   </form></dialog>
 
   <div id="toast" role="status" aria-live="polite"><span id="toast-text"></span><button id="toast-close" type="button" aria-label="Dismiss message" hidden>Dismiss</button></div>
