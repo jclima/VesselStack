@@ -1245,6 +1245,16 @@ ensure_service_account() {
 # library (trusted only after the archive was verified and its folder is root-controlled).
 # Sets BACKUP_ALLOW_ONCE=1 when the owner chose to back up to the system disk this once.
 BACKUP_ALLOW_ONCE=0
+# 1 when the installed vesselstackctl is this release or newer (it lists backup-drive and takes
+# --backup-choice). The help text is captured first so a closed pipe cannot flip the answer.
+CTL_TAKES_CHOICE=0
+detect_ctl_choice() {
+    local ctl help=''
+    CTL_TAKES_CHOICE=0
+    ctl=$(find_ctl) || return 0
+    help=$("$ctl" --help 2>/dev/null </dev/null) || help=
+    case $help in *backup-drive*) CTL_TAKES_CHOICE=1 ;; esac
+}
 settle_backup_destination() {
     local env_file=$INSTALL_ROOT/config/vesselstack.env dest allow mount_dir lib=$RELEASE_DIR/scripts/lib/remediate.sh
     local data_root app_root
@@ -1269,10 +1279,11 @@ settle_backup_destination() {
         return 0
     fi
     open_prompt || return 0
+    detect_ctl_choice
     # shellcheck source=scripts/lib/remediate.sh
     source "$lib"
     say ""
-    VS_CANCEL_MESSAGE="Cancelled. The update was not started; your installed VesselStack was not changed." \
+    VS_BACKUP_ONCE_REDIRECTS=$CTL_TAKES_CHOICE VS_CANCEL_MESSAGE="Cancelled. The update was not started; your installed VesselStack was not changed." \
         VS_PROMPT_FD=3 VS_BACKUP_ROOT=${app_root:-$INSTALL_ROOT} VS_BACKUP_DATA=${data_root:-/opt/vesselstack-data} \
         VS_BACKUP_ENV_FILE=$env_file VS_BACKUP_UPDATE_DIR=$RELEASE_DIR \
         vs_backup_destination_fix "$dest" bootstrap \
@@ -1350,14 +1361,26 @@ step_install() {
         # (read by old ctls' child install.sh and by the new ctl alike).
         settle_backup_destination
         # --yes, --defaults and scripted answers never pick a fix, so the ctl must not ask either.
-        if [ "$BACKUP_ALLOW_ONCE" -eq 1 ]; then ctl_env+=(VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true); fi
-        say "  Running: ${offline_env}vesselstackctl update $RELEASE_DIR"
+        # A controller of this release or newer takes the choice as an option and backs up to the system-disk
+        # folder, so the unmounted mount folder stays empty. An older one only reads the environment variable
+        # and writes the archive into the unmounted folder on the system disk.
+        local -a update_choice=()
+        if [ "$BACKUP_ALLOW_ONCE" -eq 1 ]; then
+            if [ "$CTL_TAKES_CHOICE" -eq 1 ]; then
+                update_choice=(--backup-choice=system-disk-once)
+            else
+                ctl_env+=(VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true)
+            fi
+        fi
+        local choice_note=''
+        [ "${#update_choice[@]}" -eq 0 ] || choice_note=" ${update_choice[*]}"
+        say "  Running: ${offline_env}vesselstackctl update $RELEASE_DIR$choice_note"
         if [ "$OFFLINE" -eq 1 ]; then
-            env "${ctl_env[@]}" VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$ctl" update "$RELEASE_DIR" </dev/null \
+            env "${ctl_env[@]}" VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$ctl" update "$RELEASE_DIR" ${update_choice[@]+"${update_choice[@]}"} </dev/null \
                 || die "The update failed (see above). Your data and the pre-update backup are untouched." \
                        "See the README sections on updating and restoring."
         else
-            env "${ctl_env[@]}" "$ctl" update "$RELEASE_DIR" </dev/null \
+            env "${ctl_env[@]}" "$ctl" update "$RELEASE_DIR" ${update_choice[@]+"${update_choice[@]}"} </dev/null \
                 || die "The update failed (see above). Your data and the pre-update backup are untouched." \
                        "See the README sections on updating and restoring."
         fi

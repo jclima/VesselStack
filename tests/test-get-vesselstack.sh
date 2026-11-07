@@ -166,9 +166,16 @@ echo "ctl $* WHEELHOUSE=${VESSELSTACK_WHEELHOUSE:-} OFFLINE=${VESSELSTACK_OFFLIN
 echo "ctlenv $1 NONINTERACTIVE=${VESSELSTACK_NONINTERACTIVE:-} ALLOW=${VESSELSTACK_BACKUP_ALLOW_UNMOUNTED:-}" >> "$LOG"
 # Behave like the released v0.2.0/v0.3.0 controllers: "update" reads ONLY $1, as the
 # release directory, and fails on anything else (for example a leading --offline).
+# FAKE_CTL_NEW=1 behaves like this release's controller: --help lists backup-drive and update takes
+# --backup-choice=system-disk-once after the directory.
+if [ "$1" = --help ] && [ -n "${FAKE_CTL_NEW:-}" ]; then
+    echo "  backup-drive list --json"
+    exit 0
+fi
 if [ "$1" = update ]; then
     [ -x "$2/install.sh" ] || { echo "Not a VesselStack release directory: $2" >&2; exit 1; }
-    [ "$#" -eq 2 ] || { echo "old ctl: unexpected extra arguments" >&2; exit 1; }
+    if [ -n "${FAKE_CTL_NEW:-}" ] && [ "$#" -eq 3 ] && [ "$3" = --backup-choice=system-disk-once ]; then :
+    else [ "$#" -eq 2 ] || { echo "old ctl: unexpected extra arguments" >&2; exit 1; }; fi
 fi
 case "$1" in urls) echo "Boat Chat  http://0.0.0.0:8765" ;; esac
 [ -z "${FAKE_CTL_FAIL:-}" ] || [ "$1" != "${FAKE_CTL_FAIL}" ]
@@ -1569,6 +1576,23 @@ expect_out "\\[4\\] Back up to the system disk this once"
 expect_out "WARNING: the backup will be written to the system disk"
 expect_log "^ctl update $RELEASE_BASE/$VER "
 expect_log "^ctlenv update NONINTERACTIVE=true ALLOW=true$"
+refuse_log "backup-choice"
+expect_out "This installed controller is older, so it writes the archive under $BACKUP_MNT on the system disk"
+refuse_out "stays empty"
+test ! -e "$BACKUP_MNT"
+
+# A controller of this release takes the choice as an option (the archive goes to the system-disk
+# folder and the unmounted folder stays empty); the environment variable is not set.
+backup_upgrade
+printf 'y\ny\n4\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" EXTRA_ENV2=FAKE_CTL_NEW=1 run
+EXTRA_ENV=
+EXTRA_ENV2=
+expect_rc 0 "backup drive: system disk once with a current controller"
+expect_out "It goes to /var/backups/vesselstack; $BACKUP_MNT stays empty."
+expect_log "^ctl update $RELEASE_BASE/$VER --backup-choice=system-disk-once "
+expect_out "Running: vesselstackctl update $RELEASE_BASE/$VER --backup-choice=system-disk-once"
+expect_log "^ctlenv update NONINTERACTIVE=true ALLOW=$"
 test ! -e "$BACKUP_MNT"
 
 backup_upgrade

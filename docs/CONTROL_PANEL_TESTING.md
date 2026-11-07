@@ -45,9 +45,28 @@ verification.
 
 Acceptance cases:
 
-- With the backup path unmounted, `--require-mounted` must refuse the update
+- With the backup path unmounted and no choice made, `--require-mounted` must refuse the update
   even if `ALLOW_UNMOUNTED=true`; no install may start. The failure keeps the
-  path and recovery help visible.
+  path and recovery help visible. From the browser the same press shows the backup dialog instead
+  of starting; verify each choice on a disposable Pi (an upgrade started from 0.6.2 or later; the
+  upgrade that delivers 0.6.2 uses the old worker and cannot show it):
+  - the dialog lists a spare ext4 USB drive by label, size and filesystem, lists a vfat drive and a
+    desktop-mounted drive as refused with the reason, and never shows a device path as a choice;
+  - mounting the listed drive makes `findmnt /media/<folder>` show `nodev,nosuid,noexec`, the
+    backup lands there, and `/etc/fstab` and `vesselstack.env` are byte-identical afterwards;
+  - **system disk this once** puts the archive in `/var/backups/vesselstack`, leaves the
+    `/media/<folder>` mount point empty, and the next upgrade asks again;
+  - **Install without a backup** stays disabled until the box is ticked, makes no archive, and the
+    banner says no backup was made;
+  - with `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false` in `vesselstack.env`, the system-disk and
+    no-backup choices are absent and a hand-made request for them is refused (HTTP 400);
+  - the same with the variable only in the panel's process environment, and with it added after the
+    request was accepted but before the worker reaches the backup step (the worker refuses);
+  - a hand-made `/api/action` request with a `backup` field for any action other than `update` or
+    `update-release` is refused (HTTP 400); `backup_mode` / `backup_skipped` appear in the operation
+    record for display only and `vesselstack.env` stays unchanged;
+  - mount propagation: after the mount, `findmnt` in a normal root shell (not the panel's
+    namespace) shows the drive for both **Back up & install** and **update from folder**.
 - Use a checksum-mismatch fixture and an unsafe-archive fixture; both must stop
   before preflight/install. Do not weaken the live release checksum check or
   hack the production endpoint.
@@ -87,7 +106,8 @@ target (or use a path that is not a mountpoint), then choose **Back up now** on
 Home and, separately, run an update from the Maintenance tab. Each stops with a
 red result banner that gives the reason, then a **To fix:** line naming the mount
 point (the update version also shows the one-off
-`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true` command in monospace). Confirm
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true` command in monospace; a Control Panel upgrade shows the
+backup dialog described above instead). Confirm
 nothing was stopped or changed, that no prompt waited in the Details log, mount
 the drive, and run the operation again to see it succeed. Setting an unsupported
 value such as `BOAT_UNITS=imperial` in the settings file and starting an update

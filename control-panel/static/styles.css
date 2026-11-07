@@ -310,3 +310,14 @@ dialog .keep{margin:.2rem 0 .5rem}
 .linklike{min-height:44px;padding:0;color:var(--sea);background:transparent;border:0;text-decoration:underline}
 .linklike:hover{background:transparent}
 .action .b button{white-space:nowrap}
+
+/* backup choice dialog */
+.choices{display:grid;gap:.4rem;margin:.6rem 0}
+.choice{display:flex;align-items:flex-start;gap:.6rem;min-height:44px;margin:0;padding:.6rem .75rem;font-weight:600;border:1px solid var(--strong);border-radius:8px;cursor:pointer}
+.choice input{width:auto;min-height:0;margin-top:.2rem;flex:none}
+.danger-choice{border-color:var(--red)}
+.ack{display:flex;align-items:flex-start;gap:.6rem;margin:.6rem 0;font-weight:600}
+.ack input{width:auto;min-height:0;margin-top:.2rem;flex:none}
+.notes{margin:.4rem 0;font-size:.85rem}
+.choice-error{margin:.4rem 0;color:var(--red)}
+#backup-choice-dialog{width:min(36rem,calc(100% - 2rem));max-height:calc(100% - 2rem);overflow:auto}

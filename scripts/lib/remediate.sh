@@ -30,10 +30,20 @@
 #                              installed env file; VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false there hides
 #                              the system-disk choice), VS_BACKUP_UPDATE_DIR (shown in the update hint).
 #                              The third argument offers only choices 1 to 3. fstab is never written.
+#                              Choice 4 sets VS_BACKUP_ONCE_TARGET to the folder on the system disk (default
+#                              VS_BACKUP_SYSTEM_DIR=/var/backups/vesselstack); the caller backs up THERE and
+#                              the unmounted mount folder stays empty. VS_BACKUP_ONCE_REDIRECTS=0 (the caller
+#                              knows the controller that will run is too old to redirect) changes only the wording.
+# vs_backup_list_drives MOUNT_DIR
+#                              Prints the drive rows (see VS_LSBLK_PY) for the connected USB drives. 1 (with
+#                              a message on stderr) when lsblk or python3 is missing or lsblk fails.
+# vs_backup_drives_json        Reads those rows on stdin and prints {"drives","refused","mounted_elsewhere"}.
 
 VS_PROMPT_FD=${VS_PROMPT_FD:-}
 VS_PROMPT_OWNED=${VS_PROMPT_OWNED:-0}
 VS_BACKUP_ALLOW_ONCE=${VS_BACKUP_ALLOW_ONCE:-0}
+VS_BACKUP_ONCE_TARGET=${VS_BACKUP_ONCE_TARGET:-}
+VS_BACKUP_SYSTEM_DIR=${VS_BACKUP_SYSTEM_DIR:-/var/backups/vesselstack}
 
 vs_prompt_cancel() {
     echo "${VS_CANCEL_MESSAGE:-Cancelled. Nothing was changed.}" >&2
@@ -237,8 +247,9 @@ vs_mib() {
 
 # Sets VS_BACKUP_OFFER_SYSTEM=1 when a backup to the system disk is allowed and fits, and prints why not.
 vs_backup_system_disk_check() {
-    local dest=$1 ancestor free_kib used_kib=0 size_kib du_status=0 du_out
+    local dest=$1 ancestor free_kib used_kib=0 size_kib du_status=0 du_out label=${VS_BACKUP_SPACE_LABEL:-system disk}
     VS_BACKUP_OFFER_SYSTEM=0
+    VS_BACKUP_SIZE_UNKNOWN=0
     if [ -n "${VS_BACKUP_ENV_FILE:-}" ] && [ -r "$VS_BACKUP_ENV_FILE" ] \
         && grep -Eq '^(export[[:space:]]+)?VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=["'"'"']?false' "$VS_BACKUP_ENV_FILE"; then
         return 0
@@ -251,6 +262,8 @@ vs_backup_system_disk_check() {
     if [ "$du_status" -eq 124 ]; then
         echo "  The size of the VesselStack data could not be measured in 60 seconds (size unknown)." >&2
         VS_BACKUP_OFFER_SYSTEM=1
+        # shellcheck disable=SC2034  # read by vesselstackctl after the call
+        VS_BACKUP_SIZE_UNKNOWN=1
         return 0
     fi
     while read -r size_kib _; do
@@ -258,8 +271,8 @@ vs_backup_system_disk_check() {
         used_kib=$((used_kib + size_kib))
     done <<<"$du_out"
     if [ "$free_kib" -lt "$used_kib" ]; then
-        echo "  The system disk has $(vs_mib "$free_kib") MiB free but the backup needs about $(vs_mib "$used_kib") MiB," >&2
-        echo "  so a backup to the system disk is not offered." >&2
+        echo "  The $label has $(vs_mib "$free_kib") MiB free but the backup needs about $(vs_mib "$used_kib") MiB," >&2
+        echo "  so a backup to the $label is not offered." >&2
         return 0
     fi
     VS_BACKUP_OFFER_SYSTEM=1
@@ -308,12 +321,11 @@ vs_backup_mount_device() {
     return 0
 }
 
-# vs_backup_pick_drive MOUNT_DIR: lists connected USB drives and mounts the chosen one.
-# 0 mounted, 1 nothing mounted (the caller shows the menu again).
-vs_backup_pick_drive() {
-    local mount_dir=$1 json='' sources='' target src listing kind path size label fs uuid reason shown label_text pick
-    local fstab_file=${VS_FSTAB_FILE:-/etc/fstab} fstab_src fstab_mp fstab_lines='' elsewhere=''
-    local -a paths=() fss=() uuids=()
+# vs_backup_list_drives MOUNT_DIR: the rows of VS_LSBLK_PY for the connected USB drives (stdout).
+# 0 when lsblk answered (the list may be empty), 1 with a message on stderr when it could not be asked.
+vs_backup_list_drives() {
+    local mount_dir=$1 json='' sources='' target src
+    local fstab_file=${VS_FSTAB_FILE:-/etc/fstab} fstab_src fstab_mp fstab_lines=''
     if ! command -v lsblk >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
         echo "Listing drives needs lsblk and python3." >&2
         return 1
@@ -337,7 +349,44 @@ vs_backup_pick_drive() {
             fstab_lines+="$fstab_src"$'\t'"$fstab_mp"$'\n'
         done <"$fstab_file"
     fi
-    listing=$(printf '%s' "$json" | python3 -I -c "$VS_LSBLK_PY" "$sources" "$fstab_lines") || listing=
+    local rows
+    if ! rows=$(printf '%s' "$json" | python3 -I -c "$VS_LSBLK_PY" "$sources" "$fstab_lines"); then
+        echo "Could not read the list of connected drives." >&2
+        return 1
+    fi
+    [ -z "$rows" ] || printf '%s\n' "$rows"
+}
+
+# Reads the rows of vs_backup_list_drives on stdin and prints one JSON object. Nothing here is
+# trusted by a later mount: the root side lists again and requires exactly one match.
+VS_ROWS_JSON_PY='
+import json, sys
+out = {"drives": [], "refused": [], "mounted_elsewhere": []}
+for line in sys.stdin.read().split("\n"):
+    parts = line.split("\x1f")
+    if len(parts) < 6:
+        continue
+    kind, device, size, label, fstype, last = parts[:6]
+    base = {"device": device, "size": size, "label": label, "fstype": fstype}
+    if kind == "OK":
+        out["drives"].append(dict(base, uuid=last))
+    elif kind == "NO":
+        out["refused"].append(dict(base, reason=last))
+    elif kind == "MOUNTED":
+        out["mounted_elsewhere"].append(dict(base, mountpoint=last))
+print(json.dumps(out, sort_keys=True))
+'
+
+vs_backup_drives_json() {
+    python3 -I -c "$VS_ROWS_JSON_PY"
+}
+
+# vs_backup_pick_drive MOUNT_DIR: lists connected USB drives and mounts the chosen one.
+# 0 mounted, 1 nothing mounted (the caller shows the menu again).
+vs_backup_pick_drive() {
+    local mount_dir=$1 listing kind path size label fs uuid reason shown label_text pick elsewhere=''
+    local -a paths=() fss=() uuids=()
+    listing=$(vs_backup_list_drives "$mount_dir") || return 1
     echo "Connected USB drives that are not mounted:" >&2
     shown=0
     while IFS=$'\x1f' read -r kind path size label fs uuid; do
@@ -383,7 +432,16 @@ vs_backup_menu() {
         has_fstab=1
     fi
     VS_BACKUP_OFFER_SYSTEM=0
-    [ -n "$strict" ] || vs_backup_system_disk_check "$dest"
+    # The archive of choice [4] goes to the system-disk folder, so that is where the space is checked.
+    # With the older controller (VS_BACKUP_ONCE_REDIRECTS=0) the archive lands under the unmounted folder.
+    # Choice [4] is not offered when the configuration locks the system disk, so nothing is measured then.
+    if [ -z "$strict" ] && [ "${VS_BACKUP_LOCKED:-0}" != 1 ]; then
+        if [ "${VS_BACKUP_ONCE_REDIRECTS:-1}" = 1 ]; then
+            vs_backup_system_disk_check "$VS_BACKUP_SYSTEM_DIR"
+        else
+            vs_backup_system_disk_check "$dest"
+        fi
+    fi
     while :; do
         {
             echo
@@ -425,7 +483,13 @@ vs_backup_menu() {
                 ;;
             4)
                 echo "WARNING: the backup will be written to the system disk (SD card) this once. It will not survive loss of that disk, and the next backup asks again." >&2
+                if [ "${VS_BACKUP_ONCE_REDIRECTS:-1}" = 1 ]; then
+                    echo "It goes to $(vs_printable "$VS_BACKUP_SYSTEM_DIR"); $(vs_printable "$mount_dir") stays empty." >&2
+                else
+                    echo "This installed controller is older, so it writes the archive under $(vs_printable "$mount_dir") on the system disk." >&2
+                fi
                 VS_BACKUP_ALLOW_ONCE=1
+                VS_BACKUP_ONCE_TARGET=$VS_BACKUP_SYSTEM_DIR
                 return 0
                 ;;
         esac
@@ -436,6 +500,7 @@ vs_backup_destination_fix() {
     local dest=$1 context=${2:-update} strict=${3:-} mount_dir rc=0 update_dir=${VS_BACKUP_UPDATE_DIR:-<DIR>}
     mount_dir=$(printf '%s' "$dest" | cut -d/ -f1-3)
     VS_BACKUP_ALLOW_ONCE=0
+    VS_BACKUP_ONCE_TARGET=
     if ! vs_prompt_open; then
         {
             echo "Refusing to back up: $(vs_printable "$mount_dir") is not mounted, so the archive would land on the system disk (SD card). Nothing was changed."

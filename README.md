@@ -454,6 +454,15 @@ than the fix); use `get-vesselstack.sh`, or mount the drive first, or run
 `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` to back up to
 the system disk once.
 
+**Backup drive not mounted, from the Control Panel (0.6.2).** The Control Panel can now resolve this
+itself, for that one request: **Back up & install** and **Back up & update from folder** check the
+backup folder first and, when the drive is not mounted, show a dialog to mount it from `/etc/fstab`,
+mount a listed USB drive, back up to the system disk once, use a different backup folder, or install
+without a backup. See [Backups](#backups). This cannot help the upgrade that delivers it: the
+worker uses the controller that is already installed, so for the upgrade to 0.6.2 mount the drive by
+hand or run the update from a terminal. Rollback: unmount with `umount`; nothing is written to
+`/etc/fstab` or `vesselstack.env`.
+
 Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
 needs no other manual step.
 
@@ -1160,7 +1169,10 @@ Nothing has been changed yet.
 - **[3]** checks the mount again after you plug the drive in.
 - **[4]** writes this one backup to the system disk after a warning. It is not offered when
   the free space is smaller than the data (`du -skx`, 60 s limit) or when `vesselstack.env` sets
-  `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false`. Nothing is saved: the next backup asks again.
+  `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false`. Since 0.6.2 the archive goes to
+  `/var/backups/vesselstack` on the system disk, not into the unmounted mount folder, which stays
+  empty (so the mount point is still free to mount later). Nothing is saved: the next backup asks
+  again.
 - **[c]**, end of input or no answer within 5 minutes cancels without changing anything (in
   the pinned installer it prints `Cancelled. The update was not started; your installed VesselStack
   was not changed.`; the packages and the release folder may already be in place). An answer must
@@ -1173,6 +1185,45 @@ still stops with `Refusing to back up: ... is not mounted ...` and a `To fix:` l
 menu; use `get-vesselstack.sh` (it asks before calling the controller) or
 `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>`.
 Rollback: unmount the drive with `umount`; remove the added `/etc/fstab` line if you do not want it.
+
+**Control Panel (0.6.2).** The panel cannot answer prompts, so before **Back up & install** and
+**Back up & update from folder** it asks `GET /api/backup-preflight`. If the backup folder is on a
+mounted drive the usual confirmation appears, unchanged. Otherwise a dialog offers, for this request
+only (nothing is saved and `vesselstack.env` is never edited):
+
+- mount the drive from `/etc/fstab`, when there is an entry for the backup folder;
+- mount one of the listed USB drives (chosen by its UUID from a list the root side produced; the
+  browser never sends a device path or a folder). The same rules as the terminal apply: ext4
+  (recommended) or exFAT, removable, not part of the system disk, `nodev,nosuid,noexec` (exFAT also
+  `uid=0,gid=0,umask=0077`), an empty mount folder, and the post-mount ownership and symbolic-link
+  check. `/etc/fstab` is never written; refused and already-mounted drives are listed with the reason;
+- back up to the system disk this once: `/var/backups/vesselstack` when the configured folder is on an
+  unmounted `/media` or `/mnt` mount point (otherwise the configured folder). It is refused when the
+  free space is smaller than the data;
+- use a different backup folder: saves `VESSELSTACK_BACKUP` through the normal settings call, then
+  checks again (not available while Settings has unsaved edits);
+- install without a backup: needs the box **I understand there is no backup to restore if this update
+  fails**. The result banner then says no backup was made.
+
+Setting `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false` in `vesselstack.env`, or in the environment of the
+panel or the controller, turns off the system-disk and no-backup choices (mounting remains available).
+The Update worker checks this again right before it skips or redirects the backup, and the controller
+refuses `--system-disk-once` while it is set. After a drive is mounted by UUID the controller checks
+that the filesystem now at the mount folder has that UUID, and unmounts it again if not; the
+`/etc/fstab` mount adds `nodev,nosuid,noexec`. The choice applies to `update` and `update-release`
+only (`/api/action` answers 400 for any other action that carries `backup`), and `--system-disk-once`
+is refused when the size of the data could not be measured. The choice is recorded in the operation
+record as `backup_mode` / `backup_skipped` for display only; it is never written to `vesselstack.env`
+or reused by a later request. The mount runs as root outside the panel's sandbox:
+in the update worker for **Back up & install** (after the installer's `--dry-run`, before anything is
+stopped), and in a transient `systemd-run --wait --pipe --collect --property=RuntimeMaxSec=300` unit for **update from folder**
+(before the update starts). The controller gained `vesselstackctl backup --system-disk-once`,
+`vesselstackctl backup-drive list --json` and `vesselstackctl backup-drive mount --fstab | --uuid UUID`;
+`vesselstackctl update DIR --backup-choice=system-disk-once|skip` is accepted for the Control Panel and
+the pinned installer and is not meant for terminal use (a terminal run shows the menu above). The
+panel refuses these choices clearly when the installed controller is older. This cannot help the upgrade that delivers it: the Control Panel worker uses the controller and panel that are already installed. For the upgrade to 0.6.2 itself, mount the drive by hand (or run the update from a terminal with `get-vesselstack.sh`) as before.
+Rollback: unmount with `umount`; to undo an update installed without a backup, restore an earlier
+backup, if you have one (`vesselstackctl restore`, see [Updating](#updating)).
 
 Besides the application and data trees the
 archive includes `/etc/systemd/system/vesselstack-*`,
@@ -1236,8 +1287,9 @@ live database files is insufficient.
 
 This is the one place in the README that describes updating and rolling back.
 Updates and backups started from the Control Panel never prompt; when one stops
-for something you can fix, the result banner shows a **To fix:** line with the
-exact step.
+for something you can fix, the result banner shows a **To fix:** line with the exact step.
+**Back up & install** and **update from folder** instead show a dialog when the backup drive is
+not mounted (see [Backups](#backups)).
 
 1. **Back up first** to a mounted external drive (see [Backups](#backups)):
 
@@ -1272,7 +1324,8 @@ exact step.
    **Check for updates**. **Back up & install** asks for confirmation in a dialog, verifies the downloaded SHA-256 manifest, safely extracts the
    release, runs preflight, then makes and verifies a backup on a mounted external drive
    (`/media` or `/mnt`; the browser cannot change the destination). A failed or unmounted
-   backup stops the update. A detached updater restarts the Control Panel and verifies its
+   backup stops the update unless you choose, in the dialog the panel shows, to mount the drive, back
+   up to the system disk once or install without a backup. A detached updater restarts the Control Panel and verifies its
    new version before the browser reconnects. The panel uses ordinary HTTP and serializes
    its own update, configuration and component operations; do not run CLI maintenance
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
@@ -1352,7 +1405,8 @@ The backup folder is under `/media` or `/mnt` and the drive is not mounted. From
 USB drive, check again, or back up to the system disk once (see [Backups](#backups)). Without
 a terminal, or from an installed 0.6.0 or earlier controller, mount the drive and run again, or
 use `sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` for one
-backup on the system disk. A FAT32 (vfat) drive is refused; use ext4 or exFAT.
+backup on the system disk. In the Control Panel (0.6.2 or later) **Back up & install** shows a dialog
+for this instead of failing. A FAT32 (vfat) drive is refused; use ext4 or exFAT.
 
 ### The installer stops on `BOAT_UNITS` or "cannot be written safely"
 
@@ -1447,6 +1501,10 @@ ownership: containers use different internal user IDs.
 Run `python3 -m unittest discover -s tests -p 'test_*.py'` and the shell suites under `tests/`
 (protected temporary roots, CI jobs, and the ESPHome config test) as described in
 [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
+
+Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
+Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order.
+To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
 
 ## Documentation policy
 

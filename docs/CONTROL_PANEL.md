@@ -154,14 +154,17 @@ notes on GitHub and a **Back up & install** button.
 for testing; leave it off on a boat in regular use. The 0.5.x panels called the
 same switch "Include lab prereleases"; an owner updating from 0.5.x uses that older name.
 
-**Back up & install** asks in a dialog, then runs the update in a detached
+**Back up & install** asks in a dialog (when the backup drive is not mounted, a longer one, see
+[When the backup drive is not mounted](#when-the-backup-drive-is-not-mounted)), then runs the update in a detached
 worker so it survives the panel restarting. It:
 
 1. downloads the release archive and its checksum file from GitHub and checks
    the size, the SHA-256 checksum and the digest GitHub reports;
 2. unpacks it and runs the installer's checks (`--dry-run`);
 3. takes a backup with `vesselstackctl backup --require-mounted`, so the update
-   stops here if the backup drive is not mounted;
+   stops here if the backup drive is not mounted (unless you chose another way in the dialog
+   described below, in which case it mounts the drive or backs up to the system disk first;
+   with **Install without a backup** it makes no backup at all);
 4. runs the new installer with `--config … --start`;
 5. restarts the Control Panel and waits for it to report the new version.
 
@@ -174,7 +177,34 @@ a separate step you can run yourself (see
 **Advanced: install a reviewed release folder** is for a release you already
 downloaded, checked and unpacked on the Pi under `/var/lib/vesselstack/releases`.
 **Back up & update from folder** runs `vesselstackctl update FOLDER`, which
-takes its own backup first.
+takes its own backup first. It shows the same dialog when the backup drive is not mounted.
+
+### When the backup drive is not mounted
+
+Before **Back up & install** or **Back up & update from folder** the panel checks the backup folder.
+If it is on a mounted drive, the usual confirmation appears. If the folder is under `/media` or
+`/mnt` and that drive is not mounted (or the folder is not on an external drive at all), a dialog
+lets you choose, for this one request only. Nothing you pick here is remembered, and
+`vesselstack.env` and `/etc/fstab` are not changed:
+
+| Choice | What happens |
+|---|---|
+| Mount the backup drive now | Only when `/etc/fstab` has an entry for the folder. |
+| Mount a listed drive | Connected USB drives (ext4 recommended, exFAT allowed) that are not part of the system disk; refused and already-mounted drives are listed with the reason. The panel only sends the drive's UUID; the root side lists again and mounts nothing else. Mounted with `nodev,nosuid,noexec`; the mount folder must be empty. |
+| I plugged the drive in; check again | Reads the list again. |
+| Back up to the system disk this once | Saves to `/var/backups/vesselstack` on the SD card, not into the unmounted folder. Refused when the data would not fit. Not recommended. |
+| Use a different backup folder | Saves the folder as the **Backup folder** setting, then checks again. Unavailable while Settings has unsaved edits. |
+| Install without a backup | Needs the box **I understand there is no backup to restore if this update fails**. No backup is made; the result banner says so. |
+
+The system-disk and no-backup choices are not offered, and the server refuses them, when
+`vesselstack.env` or the panel's own environment contains `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false`;
+the update worker checks again right before it skips or redirects the backup. The `backup` field is
+accepted only for the `update` and `update-release` actions (other actions get a 400). The choice is
+recorded in the operation record as `backup_mode` / `backup_skipped` for display only; it is never
+written to `vesselstack.env` or reused. A drive mounted by UUID is checked after the mount
+(its filesystem UUID must match) and unmounted again if not. The mount runs as root
+outside the panel's own sandbox (in the update worker, or a transient `systemd-run` unit limited to 300 seconds
+for the folder update). This cannot help the upgrade that delivers it: the Control Panel worker uses the controller and panel that are already installed, so for the upgrade to 0.6.2 itself mount the drive by hand or run the update from a terminal. Rollback: `sudo umount` the drive.
 
 ![Control Panel Updates tab with a newer release listed and a Back up and install button](images/control-panel-update-available.png)
 
@@ -240,7 +270,7 @@ what is affected and has a plain **Cancel**.
 | **Back up now** | It is the backup | No | No | Services pause during the copy |
 | **Apply** (Settings) | No | No | Renders and installs them; containers are not recreated | The displays bridge, if running, is restarted; other services keep running until restarted |
 | **Reinstall & start** | No | No | Yes | Every service restarts, about a minute |
-| **Back up & install** (Updates) | Yes, first, drive must be mounted | Yes, to the chosen release | Yes | Panel and services, a few minutes |
+| **Back up & install** (Updates) | Yes, first, drive must be mounted (or you choose otherwise in the dialog) | Yes, to the chosen release | Yes | Panel and services, a few minutes |
 
 **Apply** runs `install.sh --config …` against your saved settings without
 `--start`. That is the installer's render-only mode: it writes the rendered
@@ -310,7 +340,7 @@ require the node-exporter image only when `NODE_EXPORTER_ENABLE=true`.
 
 | Symptom | Likely cause and fix |
 |---|---|
-| Back up now fails with a mount message | The backup drive is not mounted. Mount it, then try again; the Home tab shows the drive state. |
+| Back up now fails with a mount message | The backup drive is not mounted. Mount it, then try again; the Home tab shows the drive state. (**Back up & install** offers to mount it for you; see [above](#when-the-backup-drive-is-not-mounted).) |
 | Home says backups are on the computer's own disk | The backup folder is not on an external drive. Set **Backup folder** under Settings → Advanced → Storage & history to a path under `/media` or `/mnt`. |
 | Save is rejected with field messages | Fix the marked fields (unknown timezone, number out of range) and save again. |
 | Check for updates fails | The Pi has no route to `github.com`. Check its internet connection; offline boats use [the offline path](UPDATING.md). |

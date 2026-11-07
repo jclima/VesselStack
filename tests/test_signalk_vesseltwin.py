@@ -191,7 +191,7 @@ class PreloadTests(unittest.TestCase):
             self.publish(raw, root)
             data = json.loads((root / "signalk/package.json").read_text())
             self.assertEqual(data["dependencies"], {"signalk-vesseltwin": "0.2.3"})
-            self.assertEqual(os.listdir(root / "signalk"), ["node_modules", "package.json"])
+            self.assertEqual(sorted(os.listdir(root / "signalk")), ["node_modules", "package.json"])
 
     def test_publish_preserves_package_json_keys_and_is_idempotent(self):
         raw = valid_archive()

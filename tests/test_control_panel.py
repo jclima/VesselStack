@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import tempfile
 import time
@@ -725,6 +726,153 @@ class StatusFieldTests(unittest.TestCase):
             self.assertTrue(panel.restart_needed())
         with mock.patch.object(panel, "installed_version", return_value="0.6.0"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
             self.assertFalse(panel.restart_needed())
+
+
+    # ---- backup preflight and one-shot backup choices
+
+    def _preflight(self, mount, listing=None, env_text="", code=0):
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vesselstack.env"
+            env.write_text(env_text)
+            status = {"path": "/media/backup-drive/backups", "mount": mount}
+            output = (listing if isinstance(listing, str) else json.dumps(listing)) if listing is not None else ""
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "backup_status", return_value=status), \
+                    mock.patch.object(panel, "command_stdout", return_value=(code, output)) as listed:
+                return panel.backup_preflight(), listed
+
+    def test_preflight_mounted_backup_is_the_default_and_lists_nothing(self) -> None:
+        result, listed = self._preflight("mounted")
+        self.assertTrue(result["default_ok"])
+        self.assertEqual((result["drives"], result["refused"], result["mounted_elsewhere"]), ([], [], []))
+        self.assertFalse(result["system_disk_once"]["offered"])
+        listed.assert_not_called()
+
+    def test_preflight_unmounted_backup_lists_root_side_drives(self) -> None:
+        listing = {"fstab_mount": True,
+                   "drives": [{"uuid": "AB12-CD34", "label": "BACKUP", "size": "58G", "fstype": "ext4", "device": "/dev/sda1"},
+                              {"uuid": "../bad", "label": "X", "size": "1G", "fstype": "ext4", "device": "/dev/sdz1"}],
+                   "refused": [{"device": "/dev/sdb1", "label": "CAMERA", "size": "29G", "fstype": "vfat", "reason": "vfat is not supported for backups"}],
+                   "mounted_elsewhere": [{"device": "/dev/sde1", "label": "", "size": "16G", "fstype": "ext4", "mountpoint": "/media/pi/USBSTICK"}]}
+        result, listed = self._preflight("not_mounted", listing)
+        self.assertEqual(listed.call_args.args[0][1:], ["backup-drive", "list", "--json"])
+        self.assertFalse(result["default_ok"])
+        self.assertTrue(result["fstab_mount"])
+        self.assertEqual([d["uuid"] for d in result["drives"]], ["AB12-CD34"])
+        self.assertEqual(set(result["drives"][0]), {"uuid", "device", "label", "size", "fstype"})
+        self.assertIn("not supported", result["refused"][0]["reason"])
+        self.assertEqual(result["mounted_elsewhere"][0]["mountpoint"], "/media/pi/USBSTICK")
+        self.assertEqual(result["system_disk_once"], {"offered": True, "reason": "", "target": panel.DEFAULT_BACKUP_DIR})
+        self.assertEqual(result["skip"], {"offered": True})
+        self.assertEqual(set(result), {"path", "mount", "default_ok", "fstab_mount", "drives", "refused", "mounted_elsewhere", "system_disk_once", "skip"})
+
+    def test_preflight_degrades_to_no_drives_when_listing_fails(self) -> None:
+        for kwargs in ({"code": 1, "listing": ""}, {"listing": "not json"}, {"listing": "[1, 2]"}):
+            with self.subTest(kwargs=kwargs):
+                result, _ = self._preflight("not_mounted", **kwargs)
+                self.assertEqual((result["drives"], result["refused"], result["fstab_mount"]), ([], [], False))
+                self.assertTrue(result["system_disk_once"]["offered"])
+
+    def test_preflight_lock_turns_off_system_disk_and_skip(self) -> None:
+        result, _ = self._preflight("not_mounted", {"drives": []}, env_text="VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n")
+        self.assertFalse(result["system_disk_once"]["offered"])
+        self.assertIn("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false", result["system_disk_once"]["reason"])
+        self.assertEqual(result["skip"], {"offered": False})
+
+    def test_command_stdout_drops_stderr(self) -> None:
+        with mock.patch.object(panel.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=" {} \n")) as run:
+            self.assertEqual(panel.command_stdout(["ctl"]), (0, "{}"))
+        self.assertEqual(run.call_args.kwargs["stderr"], panel.subprocess.DEVNULL)
+
+    def _folder_fixture(self, directory):
+        reviewed = Path(directory) / "releases"
+        release = reviewed / "vesselstack-0.9.0"
+        release.mkdir(parents=True)
+        (release / "install.sh").write_text("#!/bin/sh\n"); (release / "VERSION").write_text("0.9.0\n")
+        return reviewed, release
+
+    def test_update_from_folder_default_argv_is_unchanged_and_choices_append_after_the_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reviewed, release = self._folder_fixture(directory)
+            with mock.patch.object(panel, "REVIEWED_RELEASE_ROOT", reviewed), mock.patch.object(panel, "verify_release_path"), mock.patch.object(panel, "verify_release_tree"):
+                default = panel.action_command("update", {"source_directory": str(release)})
+                self.assertEqual(default, [str(panel.CTL), "update", str(release.resolve())])
+                for mode, flag in (("system_disk_once", "--backup-choice=system-disk-once"), ("skip", "--backup-choice=skip")):
+                    command = panel.action_command("update", {"source_directory": str(release)}, {"mode": mode})
+                    self.assertEqual(command, [str(panel.CTL), "update", str(release.resolve()), flag])
+                # Mount choices change nothing in the update command; the mount is a separate step.
+                self.assertEqual(panel.action_command("update", {"source_directory": str(release)}, {"mode": "mount_fstab"}), default)
+                # A browser-supplied field can never select a choice.
+                forged = panel.action_command("update", {"source_directory": str(release), "_backup_choice": {"mode": "skip"}, "backup_choice": {"mode": "skip"}})
+                self.assertEqual(forged, default)
+
+    def test_folder_update_mounts_in_a_transient_unit_outside_the_panel_sandbox(self) -> None:
+        self.assertEqual(panel.folder_update_steps(None), [])
+        self.assertEqual(panel.folder_update_steps({"mode": "skip", "confirm": "install-without-backup"}), [])
+        fstab = panel.folder_update_steps({"mode": "mount_fstab"})[0]
+        self.assertEqual(fstab[:5], ["systemd-run", "--wait", "--pipe", "--collect", "--quiet"])
+        self.assertIn("--property=RuntimeMaxSec=300", fstab)
+        self.assertEqual(fstab[-4:], [str(panel.CTL), "backup-drive", "mount", "--fstab"])
+        drive = panel.folder_update_steps({"mode": "mount_drive", "uuid": "AB12-CD34"})[0]
+        self.assertEqual(drive[-5:], [str(panel.CTL), "backup-drive", "mount", "--uuid", "AB12-CD34"])
+
+    def test_process_environment_lock_applies_to_choice_and_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vesselstack.env"
+            env.write_text("")
+            skip = {"backup": {"mode": "skip", "confirm": "install-without-backup"}}
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.dict(os.environ, {"VESSELSTACK_BACKUP_ALLOW_UNMOUNTED": "false"}):
+                with self.assertRaisesRegex(ValueError, "turned off"):
+                    panel.request_backup_choice(skip)
+                result, _ = self._preflight("not_mounted", {"drives": []})
+                self.assertFalse(result["skip"]["offered"])
+                self.assertFalse(result["system_disk_once"]["offered"])
+
+    def test_request_backup_choice_validates_locks_and_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / "vesselstack.env"
+            env.write_text("")
+            skip = {"backup": {"mode": "skip", "confirm": "install-without-backup"}}
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "effective_backup_choice", side_effect=lambda c, _: (c, "")):
+                self.assertIsNone(panel.request_backup_choice({}))
+                self.assertIsNone(panel.request_backup_choice({"backup": {"mode": "require_mounted"}}))
+                self.assertEqual(panel.request_backup_choice(skip)["mode"], "skip")
+                with self.assertRaises(ValueError):
+                    panel.request_backup_choice({"backup": {"mode": "skip"}})
+                with self.assertRaises(ValueError):
+                    panel.request_backup_choice({"backup": {"mode": "mount_drive", "uuid": "/dev/sda1"}})
+                env.write_text("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false\n")
+                with self.assertRaisesRegex(ValueError, "turned off"):
+                    panel.request_backup_choice(skip)
+                env.write_text("")
+                with mock.patch.object(panel, "ctl_supports", return_value=False):
+                    with self.assertRaisesRegex(ValueError, "older than this Control Panel"):
+                        panel.request_backup_choice({"backup": {"mode": "mount_fstab"}}, folder=True)
+                    self.assertEqual(panel.request_backup_choice(skip)["mode"], "skip")  # the release worker checks for itself
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel.os.path, "ismount", return_value=True):
+                env.write_text("VESSELSTACK_BACKUP=/media/backup-drive/backups\n")
+                self.assertIsNone(panel.request_backup_choice({"backup": {"mode": "mount_fstab"}}))
+
+    def test_operation_store_runs_steps_first_and_stops_on_failure(self) -> None:
+        ran: list = []
+
+        class FakeProcess:
+            def __init__(self, code):
+                self.stdout = iter(["line\n"]); self.code = code
+            def wait(self):
+                return self.code
+
+        def popen(command, **kwargs):
+            ran.append(command)
+            return FakeProcess(1 if command[0] == "mount-step" else 0)
+
+        for failing, expected in ((False, [["ok-step"], ["main"]]), (True, [["mount-step"]])):
+            ran.clear()
+            store = panel.OperationStore()
+            operation = {"label": "update", "state": "running", "output": panel.deque(maxlen=10), "exit_code": None, "finished_at": None}
+            with mock.patch.object(panel.subprocess, "Popen", side_effect=popen), mock.patch.object(panel, "release_lifecycle_slot"):
+                store._run(operation, ["main"], None, [["mount-step"] if failing else ["ok-step"]])
+            self.assertEqual(ran, expected)
+            self.assertEqual(operation["state"], "failed" if failing else "succeeded")
 
 
 if __name__ == "__main__":
