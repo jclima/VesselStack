@@ -315,6 +315,18 @@ def _board_block(board_id: str, board: dict, registry: dict) -> tuple:
     return block, layouts
 
 
+def list_displays(ctx: lifecycle.Context) -> dict:
+    """The configured displays, for the Control Panel (``list --json``): ids, names and boards only."""
+    registry = lifecycle.load_registry()
+    with lifecycle.ConfigDir(ctx) as cfg_dir:
+        if cfg_dir.read_text(lifecycle.DISPLAYS_NAME) is None:
+            return {"schema": 1, "displays": []}
+        _text, config = _read_current(cfg_dir, registry)
+    return {"schema": 1, "displays": [
+        {"id": display_id, "name": entry["name"], "board": entry["board"], "pages": len(entry["pages"])}
+        for display_id, entry in config["displays"].items()]}
+
+
 def show(ctx: lifecycle.Context, display_id: str) -> dict:
     """Everything the Displays tab needs to edit one display (``show ID --json``)."""
     registry = lifecycle.load_registry()
@@ -768,5 +780,5 @@ def format_text(kind: str, result: dict) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["EditError", "catalog", "show", "set_pages", "history", "restore_config", "serial_ports",
+__all__ = ["EditError", "catalog", "list_displays", "show", "set_pages", "history", "restore_config", "serial_ports",
            "parse_payload", "format_text", "revision_of", "write_backup"]

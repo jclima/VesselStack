@@ -5,9 +5,25 @@ const vm = require('node:vm');
 const appSource = fs.readFileSync('control-panel/static/app.js', 'utf8');
 const html = fs.readFileSync('control-panel/static/index.html', 'utf8');
 const css = fs.readFileSync('control-panel/static/styles.css', 'utf8');
-const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, setNotice, showFieldErrors, renderConfiguration, selectTab };';
+const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
 
 const nodes = new Map();
+// A small element tree, enough to build and read back the Displays tab without a browser.
+class FakeEl {
+  constructor(tag, ns) { this.tagName = tag; this.namespaceURI = ns || null; this.nodeType = 1; this.attrs = {}; this.children = []; this.styleVars = {}; this.listeners = {}; this._text = ''; }
+  get dataset() { const out = {}; Object.entries(this.attrs).forEach(([key, value]) => { if (key.startsWith('data-')) out[key.slice(5).replace(/-(\w)/g, (_m, ch) => ch.toUpperCase())] = value; }); return out; }
+  get style() { return { setProperty: (name, value) => { this.styleVars[name] = value; } }; }
+  get textContent() { return this._text + this.children.map((child) => child.textContent).join(''); }
+  set textContent(value) { this._text = String(value); this.children = []; }
+  setAttribute(name, value) { this.attrs[name] = String(value); }
+  getAttribute(name) { return name in this.attrs ? this.attrs[name] : null; }
+  append(...items) { items.forEach((item) => this.children.push(item)); }
+  replaceWith() {}
+  closest() { return null; }
+  find(predicate, out = []) { if (predicate(this)) out.push(this); this.children.forEach((child) => child.find && child.find(predicate, out)); return out; }
+}
+class FakeText { constructor(text) { this.nodeType = 3; this.data = String(text); } get textContent() { return this.data; } }
+const allText = (element) => element.textContent;
 const makeNode = () => ({
   value: '', checked: false, disabled: false, textContent: '', hidden: false, className: '', innerHTML: '', dataset: {}, open: false,
   classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
@@ -35,6 +51,7 @@ const context = {
   sessionStorage: { values: {}, getItem(key) { return this.values[key] || ''; }, setItem(key, value) { this.values[key] = value; }, removeItem(key) { delete this.values[key]; } },
   window: { addEventListener() {}, confirm: () => { throw new Error('window.confirm must not be used'); }, location: { reload() {} } },
   document: {
+    createElement: (tag) => new FakeEl(tag), createElementNS: (ns, tag) => new FakeEl(tag, ns), createTextNode: (text) => new FakeText(text),
     hidden: false, activeElement: { dataset: {} }, addEventListener() {},
     querySelector: (selector) => node(selector),
     querySelectorAll: (selector) => selector.includes('#config-form') ? formControls : selector.includes('data-clear-secret') ? clearBoxes : [],
@@ -56,14 +73,17 @@ assert.equal((html.match(/data-action="apply"/g) || []).length, 1, 'exactly one 
 assert.doesNotMatch(html, /Apply configuration|Apply now/, 'the duplicate Apply card and old label are gone');
 assert.doesNotMatch(html, /Install &amp; start|Run preflight|Create backup|Your boat computer,/, 'old hero is gone');
 assert.match(html, /Reinstall &amp; start/); assert.match(html, /Check setup/);
-['Home', 'Settings', 'Updates', 'Maintenance'].forEach((name) => assert.match(html, new RegExp(`role="tab"[^>]*>${name}`)));
-assert.equal((html.match(/role="tab"/g) || []).length, 4);
+['Home', 'Settings', 'Displays', 'Updates', 'Maintenance'].forEach((name) => assert.match(html, new RegExp(`role="tab"[^>]*>${name}`)));
+assert.equal((html.match(/role="tab"/g) || []).length, 5);
+assert.equal((html.match(/id="displays"/g) || []).length, 1, 'one Displays panel');
+assert.doesNotMatch(html, /\sstyle=/, 'no inline style attributes (CSP style-src self)');
 assert.match(html, /<dialog id="confirm-dialog"/);
 assert.match(html, /How do I reach this panel\?/); assert.match(html, /ssh -L 8780:127\.0\.0\.1:8780/); assert.match(html, /id="show-token"/);
 assert.match(html, /Contacts github\.com only when you press it/);
 assert.match(html, /id="banner" aria-live="polite"/);
 assert.doesNotMatch(html, /\bstyle="/, 'CSP forbids inline styles');
-assert.doesNotMatch(html + appSource, /https?:\/\/(?!127\.0\.0\.1|github\.com)/, 'no external requests');
+// The SVG namespace identifier (never fetched) is the one allowed non-local URL.
+assert.doesNotMatch(html + appSource, /https?:\/\/(?!127\.0\.0\.1|github\.com|www\.w3\.org\/2000\/svg")/, 'no external requests');
 assert.doesNotMatch(css, /@import|url\(\s*["']?https?:/, 'no external stylesheet or font requests');
 assert.match(css, /prefers-color-scheme: dark/); assert.match(css, /IBM Plex Mono/);
 assert.doesNotMatch(appSource, /style="/, 'generated markup has no inline styles');
@@ -368,5 +388,134 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.equal(context.sessionStorage.values.vesselstack_control_token, undefined, 'lock clears the session token');
   assert.equal(node('#app').hidden, true, 'lock hides the app and secrets');
   assert.equal(node('#connection-label').textContent, 'Locked');
+
+  {
+  // ---- Displays tab: pure helpers and DOM builders -------------------------------------
+  const deq = (actual, expected) => assert.deepEqual(JSON.parse(JSON.stringify(actual)), JSON.parse(JSON.stringify(expected))); // the app runs in another realm
+  const fixture = JSON.parse(fs.readFileSync('tests/fixtures/displays/panel_show.json', 'utf8'));
+  const themesJson = JSON.parse(fs.readFileSync('displays/themes.json', 'utf8'));
+  const ready = (extra = {}) => ({ displays_enabled: true, secrets_readable: true, mqtt_password_stored: true, wifi_stored: true, data_bind_non_loopback: true, data_bind_hint: 'HINT-TEXT', docker_available: true, esphome_image_present: true, toolchain_cache_present: true, free_disk_bytes: 5e10, min_free_bytes_first_build: 3221225472, min_free_bytes_warm_build: 1073741824, firmware: { status: 'current', built_at_utc: 'T1', esphome_version: 'x', reasons: [], credentials_checked: true, has_previous: false }, last_flash: { at: 'T2', method: 'serial', ok: true, firmware_built_at: 'T1' }, ...extra });
+  const chip = (extra) => ui.firmwareChip(ready(extra));
+  deq([chip().state, chip().label], ['on-screen', 'On screen']);
+  assert.equal(chip({ last_flash: null }).label, 'Never flashed');
+  assert.equal(chip({ last_flash: { ok: false, firmware_built_at: 'T1', error: 'x' } }).state, 'flash-failed');
+  assert.equal(chip({ last_flash: { ok: true, firmware_built_at: 'OLD' } }).label, 'Changes not on screen', 'a flash of an older build is not on screen');
+  assert.equal(chip({ firmware: { status: 'outdated', built_at_utc: 'T1' } }).label, 'Changes not on screen');
+  assert.equal(chip({ firmware: { status: 'none', built_at_utc: null }, last_flash: null }).label, 'Not built');
+  assert.equal(chip({ firmware: { status: 'unknown' } }).label, 'Unknown');
+  assert.equal(ui.firmwareChip(null).state, 'unknown');
+
+  const todo = (items) => items.filter((item) => item.state === 'todo').map((item) => item.key);
+  deq(todo(ui.readinessItems('helm', ready())), []);
+  const loop = ui.readinessItems('helm', ready({ data_bind_non_loopback: false })).find((item) => item.key === 'network');
+  assert.equal(loop.state, 'todo'); assert.equal(loop.hint, 'HINT-TEXT'); assert.equal(loop.command, 'sudo vesselstackctl lan all --yes');
+  const noWifi = ui.readinessItems('helm', ready({ wifi_stored: false })).find((item) => item.key === 'wifi');
+  assert.equal(noWifi.command, 'sudo vesselstackctl display wifi');
+  assert.equal(ui.readinessItems('helm', ready({ mqtt_password_stored: false })).find((item) => item.key === 'mqtt').command, 'sudo vesselstackctl display rotate helm');
+  deq(todo(ui.readinessItems('helm', ready({ displays_enabled: false }))), ['enabled']);
+  assert.ok(ui.readinessItems('helm', ready({ secrets_readable: false })).filter((item) => ['mqtt', 'wifi'].includes(item.key)).every((item) => item.state === 'unknown'));
+  assert.ok(todo(ui.readinessItems('helm', ready({ docker_available: false }))).includes('docker'));
+  assert.ok(todo(ui.readinessItems('helm', ready({ free_disk_bytes: 1e8 }))).includes('disk'));
+  assert.ok(!todo(ui.readinessItems('helm', ready({ free_disk_bytes: 2e9, toolchain_cache_present: true }))).includes('disk'), 'a warm build needs less space');
+  assert.ok(todo(ui.readinessItems('helm', ready({ free_disk_bytes: 2e9, toolchain_cache_present: false }))).includes('disk'));
+
+  // Preview model: the boxes come straight from `show --json`; colours come from the theme.
+  deq(fixture.preview.map((item) => item.layout), ['grid-2x2', 'status-grid', 'tank-bars', 'gauge-arc', 'electrical']);
+  const live = ui.liveRowsByPath({ rows: [{ path: fixture.instruments.sog.path, live_state: 'live', value: 6.44, convert: fixture.instruments.sog.convert }, { path: fixture.instruments.depth.path, live_state: 'live', value: 9, convert: 'other-conversion' }, { path: 'x.y', live_state: 'no_live_data' }] });
+  const grid = ui.previewModel(fixture, 0, themesJson, { mode: 'day', severity: 'plain' }, live);
+  assert.equal(grid.round, true); deq(grid.cells.map((cell) => cell.box), fixture.preview[0].cells);
+  deq(grid.header, fixture.preview[0].header); assert.equal(grid.footer.pages, 5);
+  assert.equal(grid.cells[0].label, 'SOG'); assert.equal(grid.cells[0].value, '6.4', 'live value uses the item precision');
+  assert.equal(grid.cells[1].value, '—', 'a value converted differently is not shown as this item');
+  assert.equal(grid.cells[2].value, '—', 'no live data gives a placeholder');
+  assert.equal(ui.previewModel(fixture, 0, themesJson, {}, null).cells[0].value, '—');
+  const status = ui.previewModel(fixture, 1, themesJson, {});
+  assert.equal(status.cells.length, 9); assert.equal(status.cells[0].cellKind, 'status'); assert.equal(status.cells[0].valueSize, 30, 'three-column status grid uses the small font');
+  assert.equal(ui.previewModel(fixture, 2, themesJson, {}).cells[0].cellKind, 'bar');
+  const gauge = ui.previewModel(fixture, 3, themesJson, {}); assert.equal(gauge.arc.sweep, 270); assert.equal(gauge.cells[0].cellKind, 'gauge');
+  const elec = ui.previewModel(fixture, 4, themesJson, {}); assert.equal(elec.cells.length, 0); assert.equal(elec.rows.length, 5); assert.equal(elec.rows[0].role, 'voltage'); deq(elec.textBox, fixture.preview[4].text_box);
+  assert.equal(ui.previewModel(fixture, 9, themesJson, {}), null, 'an unknown page has no preview');
+  assert.equal(ui.previewModel(fixture, 0, null, {}), null, 'no theme data, no preview');
+  const classic = themesJson.themes.classic;
+  const day = ui.themeVars(classic, 'day', 'plain'); const night = ui.themeVars(classic, 'night', 'plain');
+  assert.equal(day['--pv-page'], classic.day.page_bg); assert.equal(night['--pv-page'], classic.night.page_bg); assert.notEqual(ui.themeVars(themesJson.themes.daylight, 'day', 'plain')['--pv-page'], ui.themeVars(themesJson.themes.daylight, 'night', 'plain')['--pv-page'], 'night repaints a light theme');
+  assert.equal(ui.themeVars(classic, 'day', 'alarm')['--pv-tile'], classic.sev.day.alarm[0]);
+  assert.equal(ui.themeVars(classic, 'day', 'stale')['--pv-tile'], classic.sev.day.unknown[0], 'stale uses the unknown colours');
+  assert.equal(ui.themeVars(classic, 'day', 'warn')['--pv-gauge'], classic.gauge.day.warn);
+  assert.equal(ui.themeVars(themesJson.themes['high-contrast'], 'day', 'plain')['--pv-border'] !== 'transparent', true, 'a themed tile border shows');
+  assert.equal(ui.themeVars(classic, 'day', 'plain')['--pv-border'], 'transparent');
+  const ocean = ui.previewModel(fixture, 0, themesJson, { theme: 'ocean' });
+  assert.equal(ocean.vars['--pv-tile'], themesJson.themes.ocean.day.tile);
+  const svg = ui.previewSvg(grid);
+  assert.equal(svg.attrs.viewBox, '0 0 480 480'); assert.match(svg.attrs['aria-label'], /Approximate preview/);
+  assert.equal(svg.find((el) => el.tagName === 'text').length > 0, true);
+  assert.equal(svg.find((el) => el.tagName === 'clipPath').length, 1, 'a round screen is clipped to a circle');
+  assert.equal(svg.find((el) => el.attrs && 'style' in el.attrs).length, 0, 'no inline style attributes');
+  [3, 4, 2, 1].forEach((index) => assert.ok(ui.previewSvg(ui.previewModel(fixture, index, themesJson, { mode: 'night', severity: 'alarm' }, live)).find((el) => el.tagName === 'path' || el.tagName === 'rect').length > 0));
+
+  // Badges, value text, search and grouping.
+  const names = (id) => ({ helm: 'Helm' }[id] || id);
+  deq(ui.rowBadges({ live_state: 'live', group: 'Navigation', used_on: ['helm'] }, names).map((b) => b.text), ['Live', 'Used on Helm']);
+  deq(ui.rowBadges({ live_state: 'no_live_data', group: 'Navigation', used_on: [] }).map((b) => b.key), ['nolive']);
+  deq(ui.rowBadges({ live_state: 'unknown', group: 'Navigation', used_on: [] }), [], 'live data was not asked for: no live badge');
+  deq(ui.rowBadges({ live_state: 'live', group: 'Uncatalogued', row_id: 'unc:a.b', used_on: [] }).map((b) => b.key), ['live', 'uncatalogued']);
+  assert.equal(ui.rowValueText({ live_state: 'live', value: 6.4, unit: 'kn' }), '6.4 kn'); assert.equal(ui.rowValueText({ live_state: 'no_live_data', value: 6.4, unit: 'kn' }), '');
+  const rows = [{ label: 'SOG', group: 'Navigation', path: 'navigation.speedOverGround' }, { label: 'House', group: 'Electrical', path: 'electrical.batteries.house.voltage' }, { label: 'Depth', group: 'Navigation', path: 'environment.depth' }];
+  assert.equal(ui.filterCatalogRows(rows, 'sog').length, 1); assert.equal(ui.filterCatalogRows(rows, 'ELECTRICAL').length, 1); assert.equal(ui.filterCatalogRows(rows, 'depth')[0].label, 'Depth'); assert.equal(ui.filterCatalogRows(rows, '  ').length, 3);
+  deq(ui.groupCatalogRows(rows, ['Electrical', 'Navigation', 'Empty']).map((g) => [g.name, g.rows.length]), [['Electrical', 1], ['Navigation', 2]]);
+
+  // Text from the boat configuration is only ever text: a hostile label creates no elements.
+  const hostile = JSON.parse(JSON.stringify(fixture)); hostile.instruments.sog.label = '<img src=x onerror=alert(1)>'; hostile.display.name = '"><script>x</script>';
+  hostile.readiness = ready({ data_bind_non_loopback: false, data_bind_hint: '<b>hint</b>' }); hostile.display.pages[0].title = '<i>t</i>';
+  const hostileCard = ui.displayCard(hostile);
+  const cardText = allText(hostileCard);
+  assert.ok(cardText.includes('<img src=x onerror=alert(1)>') && cardText.includes('<b>hint</b>') && cardText.includes('"><script>x</script>'), 'hostile text is shown literally');
+  assert.equal(hostileCard.find((el) => ['img', 'script', 'b'].includes(el.tagName) || (el.tagName === 'i' && el.textContent === 't')).length, 0, 'and never becomes markup');
+  assert.equal(hostileCard.find((el) => el.attrs && ('style' in el.attrs || 'onerror' in el.attrs)).length, 0);
+  assert.ok(hostileCard.find((el) => el.tagName === 'button' && el.attrs['data-theme-id']).every((el) => 'disabled' in el.attrs), 'theme swatches are read-only in this version');
+  const current = hostileCard.find((el) => el.attrs && el.attrs['data-theme-id'] === 'classic')[0];
+  assert.match(current.attrs['aria-label'], /Classic theme, current/); assert.equal(current.attrs['aria-pressed'], 'true');
+  deq(hostileCard.find((el) => el.tagName === 'button' && el.attrs['data-theme-id']).length, 4);
+
+  // Loading: fixed endpoints, rendering from the responses, session and lock handling.
+  ['#displays-root', '#displays-status', '#catalog-root', '#catalog-note', '#displays-updated'].forEach((id) => nodes.set(id, new FakeEl('div')));
+  const calls = [];
+  const shown = { ...fixture, readiness: ready({ firmware: { status: 'outdated', built_at_utc: 'T1' } }), revision: 'r' };
+  const catalogPayload = { schema: 1, live: { requested: true, ok: true }, groups: ['Navigation', 'Uncatalogued'], rows: [{ label: 'SOG', group: 'Navigation', path: 'navigation.speedOverGround', live_state: 'live', value: 6.4, unit: 'kn', used_on: ['helm'], convert: 'm/s->kn', row_id: 'sog' }, { label: 'Odd', group: 'Uncatalogued', row_id: 'unc:odd', path: 'odd.path', live_state: 'live', used_on: [] }] };
+  const routes = { '/api/displays': { schema: 1, displays: [shown, { id: 'aux', name: 'Aux', board: 'b', error: 'could not be read' }] }, '/api/displays/themes': themesJson, '/api/displays/catalog?live=1': catalogPayload };
+  fetchImpl = async (path, options) => { calls.push([path, options.headers['X-VesselStack-Token']]); return ok(routes[path]); };
+  ui.state.token = 'tok'; ui.resetDisplays();
+  await ui.loadDisplays(true);
+  deq(calls, [['/api/displays', 'tok'], ['/api/displays/themes', 'tok'], ['/api/displays/catalog?live=1', 'tok']]);
+  assert.equal(ui.state.displays.loaded, true); assert.equal(ui.state.displays.list.length, 2);
+  const rootText = allText(node('#displays-root'));
+  assert.match(rootText, /Helm/); assert.match(rootText, /Changes not on screen/); assert.match(rootText, /could not be read/); assert.match(rootText, /Approximate preview/);
+  assert.match(rootText, /sudo vesselstackctl display build helm/);
+  const browserText = allText(node('#catalog-root'));
+  assert.match(browserText, /SOG/); assert.match(browserText, /6\.4 kn/); assert.match(browserText, /Used on Helm/); assert.match(browserText, /Uncatalogued/);
+  assert.equal(calls.length, 3); await ui.loadDisplays(false); assert.equal(calls.length, 3, 'a fresh tab is not reloaded');
+  ui.state.displays.query = 'zzz'; ui.renderDataBrowser(); assert.match(allText(node('#catalog-root')), /Nothing matches/);
+  // Preview toggles and page choice go through the delegated handler.
+  const clickOn = (attrs) => ui.onDisplaysClick({ target: { closest: () => ({ dataset: attrs, id: attrs.id || '' }) } });
+  clickOn({ previewMode: 'night' }); assert.equal(ui.state.displays.mode, 'night');
+  clickOn({ previewSeverity: 'alarm' }); assert.equal(ui.state.displays.severity, 'alarm');
+  clickOn({ previewPage: '2', display: 'helm' }); assert.equal(ui.state.displays.page.helm, 2);
+  // A failing catalog does not hide the displays; a failing list shows one plain message.
+  fetchImpl = async (path) => path === '/api/displays/catalog?live=1' ? ({ ok: false, status: 504, statusText: 'x', json: async () => ({ error: 'too long' }) }) : ok(routes[path]);
+  await ui.loadDisplays(true); assert.equal(ui.state.displays.list.length, 2); assert.match(ui.state.displays.error, /data list could not be loaded: too long/);
+  fetchImpl = async () => ({ ok: false, status: 502, statusText: 'Bad Gateway', json: async () => ({ error: 'The display tool is not available on this boat computer.' }) });
+  await ui.loadDisplays(true); assert.match(ui.state.displays.error, /Couldn't load the displays: The display tool is not available/);
+  assert.match(allText(node('#displays-status')), /not available/);
+  // A response that arrives after Lock is dropped, and Lock forgets everything.
+  const releases = []; fetchImpl = (path) => new Promise((resolve) => { releases.push(() => resolve(ok(routes[path]))); });
+  ui.state.token = 'tok2'; ui.resetDisplays();
+  const pending = ui.loadDisplays(true);
+  ui.lock(true); releases.forEach((release) => release()); await pending; await tick();
+  assert.equal(ui.state.displays.list.length, 0); assert.equal(ui.state.displays.loaded, false); assert.equal(allText(node('#displays-root')), '');
+  fetchImpl = async () => { throw new Error('no network for the tab test'); };
+  ui.state.token = 'tok3'; ui.selectTab('displays'); await tick();
+  assert.equal(ui.state.displays.loading, false);
+  ui.lock(true);
+  }
   console.log('control-panel UI regression checks passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -270,6 +270,8 @@ def cmd_restore_config(args) -> int:
 
 
 def cmd_list(args) -> int:
+    if getattr(args, "json", False):
+        return run_json(args, editor.list_displays)
     return run_lifecycle(args, lifecycle.list_displays)
 
 
@@ -419,7 +421,9 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.set_defaults(func=func)
         return parser_
 
-    lifecycle_parser("list", "list configured displays (never prints secrets)", cmd_list)
+    list_parser = lifecycle_parser("list", "list configured displays (never prints secrets)", cmd_list)
+    list_parser.add_argument("--json", action="store_true",
+                             help="print only id, name, board and page count as JSON (for the Control Panel)")
     add = lifecycle_parser("add", "add a display with a default page (root)", cmd_add, True)
     add.add_argument("--board", required=True, help="board id from the registry")
     add.add_argument("--name", help="display name (default: derived from the id)")

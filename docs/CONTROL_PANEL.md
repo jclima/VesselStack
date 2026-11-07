@@ -64,10 +64,10 @@ when the tab closes, and sent only in the `X-VesselStack-Token` request header.
 If you press **Lock** with unsaved Settings edits, the panel asks first, because
 locking discards them.
 
-## The four tabs
+## The five tabs
 
 The header shows the installed version and a connection state (Connected,
-Disconnected or Locked). The tabs are **Home**, **Settings**, **Updates** and
+Disconnected or Locked). The tabs are **Home**, **Settings**, **Displays**, **Updates** and
 **Maintenance**. The Updates tab shows a number when an update is known.
 
 On a phone the tabs and cards stack in one column, and the page follows the device's light or
@@ -137,6 +137,43 @@ Nothing changes on the boat until you press **Save** and then **Apply**.
   the worker. Disabled workers cannot be started from the component cards.
 - Changing the panel's own listener or port takes effect when the panel
   restarts: use **Maintenance → Restart Control Panel**.
+
+### Displays
+
+The Displays tab shows your ESP32 instrument displays and the data they can show. In this version it
+is read-only: it reads information and changes nothing, and it does not run builds or flashes. It
+opens when you pick the tab (it does not poll), and **Refresh** reads it again. The Settings tab's
+Displays section links to it.
+
+- **One card per display** with its name, id, board, colour theme and a firmware chip:
+  **On screen** (the stored firmware matches your settings and the last flash from this computer
+  succeeded with it), **Changes not on screen** (the settings changed after the firmware was built, or
+  a newer build exists than the one flashed), **Never flashed**, **Not built**, **Last flash failed** or
+  **Unknown**.
+- **A preview of every page**, drawn from the same geometry the firmware generator uses (the panel
+  does not repeat layout maths) with the display's theme colours: the round screen, the safe area, the
+  header and page dots, tiles, status cells, tank bars and gauges. **Day / Night** switches the
+  palette and **Normal / OK / Warning / Alarm / No data** shows how each severity looks. Values are
+  live numbers from Signal K when the data list has them, otherwise a dash. It is labelled
+  **Approximate preview**; the display is the final word on spacing and fonts.
+- **Colour theme** swatches for `classic`, `high-contrast`, `daylight` and `ocean` with the current one
+  marked. They are not clickable yet; change the theme with
+  `sudo vesselstackctl display set-theme ID THEME`.
+- **Pages** with their layout and the items on each (labels from your instruments, notifications and
+  Home Assistant items). Clicking a page previews it.
+- **A readiness checklist** in plain language: displays switched on, a data password for the display,
+  Wi-Fi stored, the display able to reach the boat data over the network (when MQTT only listens on this
+  computer it says so and shows `sudo vesselstackctl lan all --yes`), and Docker, the firmware builder
+  image and free disk space for building on this computer. Each problem shows the exact command to fix it.
+- **Available data**: a searchable, grouped list of the Signal K values a page can show, with badges
+  **Live**, **No live data**, **Uncatalogued** and **Used on** a display, and the current value when it
+  is live. Opening the tab asks your Signal K server once (at most every 30 s) which values have data;
+  if it cannot be reached the list still shows, without live values.
+
+Adding a display (`sudo vesselstackctl display add ID --board BOARD --name NAME`) and entering Wi-Fi
+(`sudo vesselstackctl display wifi`) stay on the command line, so passwords never pass through this
+page. Nothing from the secrets file reaches the browser: the panel shows only yes/no for stored
+passwords. Rollback: nothing is changed by this tab, so there is nothing to roll back.
 
 ### Updates
 

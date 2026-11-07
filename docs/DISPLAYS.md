@@ -180,6 +180,11 @@ files; keep archives private. It excludes `displays/.venv` and `__pycache__`
 
 ## Managing displays
 
+The Control Panel has a read-only **Displays** tab that shows each display, a preview of its pages, its
+firmware state and readiness, and the data list; see the [Control Panel guide](CONTROL_PANEL.md#displays).
+It runs `display list --json`, `show ID --json`, `themes --json`, `catalog [--live] --json` and
+`serial-ports --json`. Editing from the tab is not available yet; use the commands below.
+
 `vesselstackctl display COMMAND ...` (root, uses the installed configuration)
 and `python3 displays/displayctl.py COMMAND ...` (with `VESSELSTACK_ROOT` set;
 `MQTT_USERNAME`/`MQTT_PASSWORD` from `vesselstack.env` for commands that touch
@@ -197,7 +202,7 @@ sudo vesselstackctl display remove helm --yes
 
 | Command | What it changes |
 | --- | --- |
-| `list` | Nothing. Table of id, name, board, page count, MQTT username, whether generated credentials exist (`SECRETS`) and whether Wi-Fi credentials are stored (`WIFI`). Works without root if the files are readable; without root the secrets/Wi-Fi columns show `unknown`. Never prints secret values. |
+| `list [--json]` | Nothing. Table of id, name, board, page count, MQTT username, whether generated credentials exist (`SECRETS`) and whether Wi-Fi credentials are stored (`WIFI`). Works without root if the files are readable; without root the secrets/Wi-Fi columns show `unknown`. Never prints secret values. `--json` prints only `{"schema": 1, "displays": [{"id", "name", "board", "pages"}]}` (an empty list when `displays.json` does not exist yet), which is what the Control Panel Displays tab uses to find the displays. |
 | `add ID --board BOARD [--name NAME] [--home-assistant-api]` | Appends the display to `displays.json` with one default page: title `Main`, the board's largest layout, and the first N instruments in `displays.json` order (N = layout capacity, fewer if you have fewer instruments). It refuses an existing id, an unknown board or a configuration with no instruments, and validates the whole resulting file before writing. It then syncs MQTT like `sync-mqtt`: creates the display password in `displays.secrets.json`, rewrites the ACL/passwords and signals the broker. It prints the MQTT username (`vsdisp-ID`) and next steps, never the password. Edit the pages in `displays.json` afterwards and check with `validate`; then generate the firmware project with `render` or `export` (see [Firmware: generate, build and flash](#firmware-generate-build-and-flash)). |
 | `remove ID --yes` | Deletes the display from `displays.json` and its entry from `displays.secrets.json`, then syncs: the broker reload disconnects the connected device and refuses it afterwards. Without `--yes` it refuses. Adding the same id again generates new credentials. The Wi-Fi block and other displays are untouched. It also deletes the display's whole build tree (`build/displays/ID/`: rendered project with `secrets.yaml`, stored firmware with the compiled-in credentials, and old-layout `ID.new`/`ID.prev`; exactly those names, never another display's) and says so; it first waits for a running build or flash of that display (30 s, then fails without changing anything). |
 | `rotate ID` | Regenerates every generated secret of that display (the MQTT password, the OTA password and the Home Assistant API encryption key), then syncs. Other displays are untouched. The device is refused until it is **reflashed** (over USB) with the new credentials. |

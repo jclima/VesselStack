@@ -990,6 +990,27 @@ class EditorTests(unittest.TestCase):
         for value in values:
             self.assertNotIn(value, out)
 
+    def test_list_json_has_only_id_name_board_and_page_count(self):
+        self.add("aux")
+        code, out, err = self.run_cli("list", "--json", "--allow-non-root", DISPLAYS_SIGNALK_TOKEN=SK_TOKEN)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"schema": 1, "displays": [
+            {"id": "helm", "name": "Helm", "board": BOARD, "pages": 1},
+            {"id": "aux", "name": "Aux", "board": BOARD, "pages": 1}]})
+        for value in (ADMIN_PASSWORD, WIFI_PASSWORD, SK_TOKEN, "vsdisp-helm", "boat-net-ssid"):
+            self.assertNotIn(value, out)
+        self.assertNotIn(self.sec()["displays"]["helm"]["mqtt_password"], out)
+
+    def test_list_json_without_a_configuration_is_empty(self):
+        self.config.unlink()
+        self.assertEqual(editor.list_displays(self.ctx()), {"schema": 1, "displays": []})
+
+    def test_list_without_json_is_still_the_table(self):
+        code, out, err = self.run_cli("list", "--allow-non-root")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith("ID "))
+        self.assertNotIn("{", out)
+
     def test_show_readiness_flags(self):
         ready = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]
         self.assertIs(ready["displays_enabled"], True)

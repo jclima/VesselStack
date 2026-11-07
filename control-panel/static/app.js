@@ -198,6 +198,7 @@ function lock(force = false) {
   state.bannerHtml = "";
   $("#notice").innerHTML = "";
   $("#release-result").innerHTML = "";
+  resetDisplays();
   sessionStorage.removeItem("vesselstack_control_token");
   $("#app").hidden = true;
   $("#lock").hidden = true;
@@ -279,6 +280,7 @@ function selectTab(name) {
   });
   $$(".tab-panel").forEach((panel) => { panel.hidden = panel.id !== name; });
   if (name === "settings") updateScrollSpy();
+  if (name === "displays") loadDisplays(false);
 }
 
 // ---------------------------------------------------------------- components and the Home band
@@ -756,7 +758,8 @@ function renderConfiguration(config) {
   [...new Set(config.fields.map((item) => item.section))].forEach((name) => { if (!names.includes(name)) names.push(name); });
   const info = Object.fromEntries((config.sections || []).map((item) => [item.name, item]));
   const bySection = (name) => config.fields.filter((item) => item.section === name);
-  const body = (name) => `${info[name]?.advanced && info[name]?.lead && bySection(name).every((item) => item.read_only) ? `<p class="small read-only-note">${escapeHtml(info[name].lead)}</p>` : ""}<div class="fields">${bySection(name).map((spec) => fieldMarkup(spec, config.values[spec.key])).join("")}</div>`;
+  const displaysLink = (name) => name === "Displays" ? `<p class="small"><button type="button" class="linklike" data-tab-link="displays">Choose what each display shows on the Displays tab &rarr;</button></p>` : "";
+  const body = (name) => `${displaysLink(name)}${info[name]?.advanced && info[name]?.lead && bySection(name).every((item) => item.read_only) ? `<p class="small read-only-note">${escapeHtml(info[name].lead)}</p>` : ""}<div class="fields">${bySection(name).map((spec) => fieldMarkup(spec, config.values[spec.key])).join("")}</div>`;
   const common = names.filter((name) => !info[name]?.advanced && bySection(name).length);
   const advanced = names.filter((name) => info[name]?.advanced && bySection(name).length);
   const jump = `<nav class="jump" aria-label="Jump to a settings section">${common.map((name) => `<a href="#s-${slug(name)}" data-jump="${escapeHtml(name)}">${escapeHtml(name)}</a>`).join("")}${advanced.length ? `<span class="grp">Advanced</span>` : ""}${advanced.map((name) => `<a href="#s-${slug(name)}" data-jump="${escapeHtml(name)}">${escapeHtml(name)}</a>`).join("")}</nav>`;
@@ -929,6 +932,460 @@ function setBusy(busy) {
   updateConfigStatus();
 }
 
+// ---------------------------------------------------------------- Displays tab (read-only in this version)
+// Pure helpers first (unit-tested), then DOM builders. Every piece of data reaches the page through
+// textContent / createTextNode, never innerHTML; colours and sizes go through style.setProperty on
+// CSS custom properties, because the page's CSP forbids inline style attributes.
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const DISPLAYS_STALE_MS = 30000;
+const LAYOUT_NAMES = { single: "One big value", "grid-2x2": "2 × 2 grid", "status-grid": "Status grid", "tank-bars": "Tank bars", "gauge-arc": "Gauge", electrical: "Electrical" };
+const SEVERITIES = [["plain", "Normal"], ["ok", "OK"], ["warn", "Warning"], ["alarm", "Alarm"], ["stale", "No data"]];
+const SEVERITY_KEY = { plain: "ok", ok: "ok", warn: "warn", alarm: "alarm", stale: "unknown" };
+const PREVIEW_FONT = { grid: 56, single: 96, small: 20, status_lg: 48, status_sm: 30, row: 26 };
+const UNCATALOGUED_GROUP = "Uncatalogued";
+
+const freshDisplays = () => ({
+  loaded: false, loading: false, error: "", loadedAt: 0, epoch: 0,
+  list: [], themes: null, catalog: null, query: "",
+  mode: "day", severity: "plain", page: {}, editable: false,
+});
+state.displays = freshDisplays();
+
+function build(namespace, tag, props = {}, kids = []) {
+  const node = namespace ? document.createElementNS(namespace, tag) : document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === "text") node.textContent = String(value);
+    else if (key === "vars") Object.entries(value).forEach(([name, item]) => node.style.setProperty(name, String(item)));
+    else node.setAttribute(key, value === true ? "" : String(value));
+  }
+  [kids].flat(Infinity).forEach((kid) => { if (kid !== undefined && kid !== null && kid !== false) node.append(kid.nodeType ? kid : document.createTextNode(String(kid))); });
+  return node;
+}
+const h = (tag, props, ...kids) => build(null, tag, props, kids);
+const sv = (tag, props, ...kids) => build(SVG_NS, tag, props, kids);
+
+function displayName(entry) { return entry?.display?.name || entry?.name || entry?.id || ""; }
+function displayId(entry) { return entry?.display?.id || entry?.id || ""; }
+
+// Firmware chip: what is on the screen compared with what the settings say.
+function firmwareChip(readiness) {
+  const firmware = readiness?.firmware;
+  const flash = readiness?.last_flash || null;
+  const status = firmware?.status;
+  if (status === "none") return { state: "not-built", label: "Not built", tone: "warn", hint: "No firmware has been built for this display yet." };
+  if (status === "outdated") return { state: "outdated", label: "Changes not on screen", tone: "warn", hint: "The settings changed after the firmware was built. Rebuild and flash to show them." };
+  if (status === "current") {
+    if (!flash) return { state: "never-flashed", label: "Never flashed", tone: "warn", hint: "Firmware is built but has not been flashed to the display from this computer." };
+    if (flash.ok !== true) return { state: "flash-failed", label: "Last flash failed", tone: "bad", hint: "The last attempt to flash this display did not finish. Try again." };
+    if (flash.firmware_built_at !== firmware.built_at_utc) return { state: "outdated", label: "Changes not on screen", tone: "warn", hint: "A newer build exists than the one that was flashed. Flash again to show it." };
+    return { state: "on-screen", label: "On screen", tone: "good", hint: "The firmware that was last flashed matches your settings." };
+  }
+  return { state: "unknown", label: "Unknown", tone: "plain", hint: "The Control Panel could not tell whether the display is up to date." };
+}
+
+const formatBytes = (value) => {
+  const gb = Number(value) / 1073741824;
+  return gb >= 10 ? `${Math.round(gb)} GB` : `${gb.toFixed(1)} GB`;
+};
+
+// Checklist of what must be true before a display can be built, flashed and reach the boat data.
+// state: ok | todo (needs action) | unknown. `command` is shown as text to run on the boat computer.
+function readinessItems(id, readiness) {
+  const r = readiness || {};
+  const items = [];
+  const add = (key, state, label, hint = "", command = "") => items.push({ key, state, label, hint, command });
+  add("enabled", r.displays_enabled ? "ok" : "todo", r.displays_enabled ? "Displays are switched on" : "Displays are switched off",
+    r.displays_enabled ? "" : "Turn on “Enable instrument displays” in Settings, then Save and Apply.");
+  if (r.secrets_readable === false) add("secrets", "unknown", "Display passwords could not be checked", "The Control Panel cannot read the displays secrets file, so the password and Wi-Fi checks below are unknown.");
+  add("mqtt", r.secrets_readable === false ? "unknown" : r.mqtt_password_stored ? "ok" : "todo",
+    r.mqtt_password_stored ? "This display has its own data password" : "This display has no data password yet",
+    r.mqtt_password_stored ? "" : "Create one (the display must then be flashed with it).", r.mqtt_password_stored ? "" : `sudo vesselstackctl display rotate ${id}`);
+  add("wifi", r.secrets_readable === false ? "unknown" : r.wifi_stored ? "ok" : "todo",
+    r.wifi_stored ? "Wi-Fi details are stored" : "Wi-Fi details are not stored",
+    r.wifi_stored ? "" : "The display needs the boat Wi-Fi name and password. They are typed on the boat computer so they never pass through this page.", r.wifi_stored ? "" : "sudo vesselstackctl display wifi");
+  const reachable = r.data_bind_non_loopback === true;
+  add("network", reachable ? "ok" : "todo", reachable ? "The display can reach the boat data over the network" : "The display cannot reach the boat data yet",
+    reachable ? "" : (r.data_bind_hint || "The data service only listens on this computer, so a display on the network cannot connect."), reachable ? "" : "sudo vesselstackctl lan all --yes");
+  if (r.docker_available === false) add("docker", "todo", "Docker is not available", "Building firmware on this computer needs Docker. You can instead export the project and build it elsewhere.", `sudo vesselstackctl display export ${id} --output FILE`);
+  else if (r.docker_available === true) {
+    if (r.esphome_image_present === false) add("image", "todo", "The firmware builder is not downloaded yet", "The first build downloads it, which needs an internet connection and a few minutes.");
+    const need = r.toolchain_cache_present ? r.min_free_bytes_warm_build : r.min_free_bytes_first_build;
+    if (Number.isFinite(r.free_disk_bytes) && Number.isFinite(need) && r.free_disk_bytes < need) add("disk", "todo", "Not enough free disk space for a build", `${formatBytes(r.free_disk_bytes)} free, ${formatBytes(need)} needed.`);
+  }
+  return items;
+}
+
+// What each item on a page is called and where its value comes from.
+function itemInfo(show, id) {
+  const inst = show?.instruments?.[id];
+  if (inst) return { id, kind: "instrument", label: inst.label || id, unit: inst.unit || "", path: inst.path || "", precision: Number.isInteger(inst.precision) ? inst.precision : 0, convert: inst.convert || "" };
+  const note = show?.notifications?.[id];
+  if (note) return { id, kind: "notification", label: note.label || id, unit: "", path: note.path || "" };
+  const ha = show?.ha?.[id];
+  if (ha) return { id, kind: "ha", label: ha.label || id, unit: "", path: "" };
+  return { id, kind: "missing", label: id, unit: "", path: "" };
+}
+
+const liveRowsByPath = (catalog) => {
+  const map = new Map();
+  (catalog?.rows || []).forEach((row) => { if (row.live_state === "live" && row.path && !map.has(row.path)) map.set(row.path, row); });
+  return map;
+};
+
+// A live number is shown only when the catalog converted it the same way this item does.
+function liveValue(info, live) {
+  const row = info.kind === "instrument" && live ? live.get(info.path) : null;
+  if (!row || row.value === undefined || row.value === null || !Number.isFinite(Number(row.value)) || row.convert !== info.convert) return "—";
+  return Number(row.value).toFixed(info.precision);
+}
+
+function themeVars(theme, mode, severity) {
+  const palette = theme[mode] || theme.day;
+  const pair = (theme.sev?.[mode] || theme.sev?.day || {})[SEVERITY_KEY[severity] || "ok"] || [palette.tile, palette.value];
+  const gauge = (theme.gauge?.[mode] || theme.gauge?.day || {})[SEVERITY_KEY[severity] || "ok"] || palette.value;
+  const plain = severity === "plain";
+  const border = mode === "day" ? theme.shape?.tile_border : palette.page_lo;
+  const sevPair = plain ? ((theme.sev?.[mode] || theme.sev?.day || {}).ok || pair) : pair;
+  return {
+    "--pv-page": palette.page_bg, "--pv-tile": plain ? palette.tile : pair[0],
+    "--pv-tile-label": plain ? palette.label : pair[1], "--pv-tile-value": plain ? palette.value : pair[1],
+    "--pv-sev-bg": sevPair[0], "--pv-sev-fg": sevPair[1], "--pv-label": palette.label, "--pv-value": palette.value,
+    "--pv-clock": palette.clock, "--pv-title": palette.title, "--pv-dot-ok": palette.dot_ok, "--pv-dot-bad": palette.dot_bad, "--pv-dot-unknown": palette.dot_unknown,
+    "--pv-hi": palette.page_hi, "--pv-lo": palette.page_lo, "--pv-track": palette.track, "--pv-gauge": gauge,
+    "--pv-border": (theme.shape?.tile_border_width || 0) > 0 && border ? border : "transparent",
+  };
+}
+
+// Everything the preview draws, from `show --json` (geometry computed by the server) and the theme palettes.
+function previewModel(show, pageIndex, themes, options = {}, live = null) {
+  const page = show.display.pages[pageIndex];
+  const geometry = show.preview?.[pageIndex];
+  if (!page || !geometry) return null;
+  const themeId = options.theme || show.theme || "classic";
+  const theme = themes?.themes?.[themeId] || themes?.themes?.classic;
+  if (!theme) return null;
+  const mode = options.mode === "night" ? "night" : "day";
+  const severity = SEVERITIES.some(([key]) => key === options.severity) ? options.severity : "plain";
+  const infos = page.items.map((id) => itemInfo(show, id));
+  const values = infos.map((info) => ({ ...info, value: info.kind === "instrument" ? liveValue(info, live) : "" }));
+  const layout = geometry.layout;
+  const model = {
+    layout, pageIndex, title: page.title, themeId, mode, severity,
+    screen: geometry.screen, round: geometry.screen.shape === "round", content: geometry.content, header: geometry.header || null,
+    footer: show.board?.ring && show.display.pages.length > 1 ? { y: show.board.ring.footer_y, pages: show.display.pages.length } : null,
+    vars: themeVars(theme, mode, severity), borderWidth: theme.shape?.tile_border_width || 0, radius: theme.shape?.tile_radius || 0,
+    arc: geometry.arc || null, textBox: geometry.text_box || null, cells: [], rows: [], empty: infos.length === 0,
+  };
+  if (layout === "electrical") {
+    const slots = show.layouts?.electrical?.slots || [];
+    model.rows = values.map((item, index) => ({ ...item, role: slots[index]?.role || "" }));
+    return model;
+  }
+  const statusFont = geometry.status_font && /lg/.test(geometry.status_font) ? PREVIEW_FONT.status_lg : PREVIEW_FONT.status_sm;
+  model.cells = (geometry.cells || []).map((box, index) => {
+    const item = values[index] || { label: "", value: "", unit: "", kind: "missing" };
+    const kind = layout === "status-grid" ? "status" : layout === "tank-bars" ? "bar" : layout === "gauge-arc" ? "gauge" : "tile";
+    const size = kind === "status" ? statusFont : layout === "single" ? PREVIEW_FONT.single : PREVIEW_FONT.grid;
+    return { ...item, box, cellKind: kind, valueSize: size, labelSize: PREVIEW_FONT.small };
+  });
+  return model;
+}
+
+// Fit a label into a width using the average width of a condensed face (about half an em per letter).
+const fitFont = (text, size, width) => Math.max(10, Math.min(size, Math.floor(width / Math.max(1, String(text).length * 0.5))));
+
+function arcPath(box, width, start, sweep, fraction) {
+  const radius = (box.width - width) / 2;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const point = (degrees) => [cx + radius * Math.cos(degrees * Math.PI / 180), cy + radius * Math.sin(degrees * Math.PI / 180)];
+  const span = sweep * fraction;
+  const [x1, y1] = point(start);
+  const [x2, y2] = point(start + span);
+  return `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${radius} ${radius} 0 ${span > 180 ? 1 : 0} 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+}
+
+let previewSerial = 0;
+function previewSvg(model) {
+  const { screen } = model;
+  const clip = `pv-clip-${++previewSerial}`;
+  const text = (props, content) => sv("text", { "text-anchor": "middle", ...props }, content);
+  const body = [];
+  body.push(sv("rect", { class: "pv-page", x: 0, y: 0, width: screen.width, height: screen.height }));
+  const c = model.content;
+  body.push(sv("rect", { class: "pv-safe", x: c.x, y: c.y, width: c.width, height: c.height }));
+  if (model.header) {
+    const hd = model.header;
+    body.push(sv("circle", { class: "pv-dot ok", cx: screen.width / 2 - 62, cy: hd.y + hd.height / 2, r: 6 }));
+    body.push(text({ class: "pv-clock", x: screen.width / 2 + 6, y: hd.y + hd.height / 2 + 9, "font-size": 28 }, "12:00"));
+  }
+  const tile = (box, cls) => sv("rect", { class: cls, x: box.x, y: box.y, width: box.width, height: box.height, rx: model.radius, ry: model.radius, "stroke-width": model.borderWidth });
+  model.cells.forEach((cell) => {
+    const { box } = cell;
+    const cx = box.x + box.width / 2;
+    if (cell.cellKind === "status") {
+      body.push(tile(box, "pv-sev"));
+      const size = fitFont(cell.label, cell.valueSize, box.width - 8);
+      body.push(text({ class: "pv-sev-text", x: cx, y: box.y + box.height / 2 + size / 3, "font-size": size }, cell.label));
+    } else if (cell.cellKind === "bar") {
+      body.push(sv("rect", { class: "pv-track", x: box.x, y: box.y, width: box.width, height: box.height, rx: 8, ry: 8 }));
+      const fill = box.height * 0.6;
+      body.push(sv("rect", { class: "pv-gauge", x: box.x, y: box.y + box.height - fill, width: box.width, height: fill, rx: 8, ry: 8 }));
+      body.push(text({ class: "pv-label", x: cx, y: box.y - 10, "font-size": fitFont(cell.label, PREVIEW_FONT.small, box.width + 40) }, cell.label));
+      body.push(text({ class: "pv-value", x: cx, y: box.y + box.height + 30, "font-size": fitFont(cell.value, 28, box.width + 40) }, cell.value));
+    } else if (cell.cellKind === "gauge") {
+      body.push(text({ class: "pv-label", x: cx, y: box.y + box.height * 0.22, "font-size": cell.labelSize }, cell.label));
+      body.push(text({ class: "pv-value", x: cx, y: box.y + box.height * 0.62, "font-size": fitFont(cell.value, cell.valueSize, box.width) }, cell.value));
+      body.push(text({ class: "pv-label", x: cx, y: box.y + box.height * 0.86, "font-size": cell.labelSize }, cell.unit));
+    } else {
+      body.push(tile(box, "pv-tile"));
+      body.push(text({ class: "pv-tile-label", x: cx, y: box.y + box.height * 0.26, "font-size": fitFont(cell.label, cell.labelSize, box.width - 10) }, cell.label));
+      body.push(text({ class: "pv-tile-value", x: cx, y: box.y + box.height * 0.64, "font-size": fitFont(cell.value, cell.valueSize, box.width - 10) }, cell.value));
+      body.push(text({ class: "pv-tile-label", x: cx, y: box.y + box.height * 0.86, "font-size": cell.labelSize }, cell.unit));
+    }
+  });
+  if (model.arc) {
+    const arc = model.arc;
+    body.push(sv("path", { class: "pv-arc-track", d: arcPath(arc.box, arc.width, arc.start_angle, arc.sweep, 1), "stroke-width": arc.width }));
+    body.push(sv("path", { class: "pv-arc-fill", d: arcPath(arc.box, arc.width, arc.start_angle, arc.sweep, 0.65), "stroke-width": arc.width }));
+  }
+  if (model.layout === "electrical" && model.textBox) {
+    const box = model.textBox;
+    const step = Math.min(64, box.height / Math.max(1, model.rows.length));
+    const top = box.y + (box.height - step * model.rows.length) / 2;
+    model.rows.forEach((row, index) => {
+      const y = top + step * index + step * 0.66;
+      body.push(sv("text", { class: "pv-label", x: box.x + 6, y, "font-size": PREVIEW_FONT.small }, row.label));
+      body.push(sv("text", { class: "pv-value", x: box.x + box.width - 6, y, "text-anchor": "end", "font-size": PREVIEW_FONT.row }, row.kind === "instrument" ? `${row.value} ${row.unit}`.trim() : ""));
+    });
+  }
+  if (model.footer) {
+    const { pages, y } = model.footer;
+    for (let index = 0; index < pages; index += 1) body.push(sv("circle", { class: index === model.pageIndex ? "pv-pagedot hi" : "pv-pagedot", cx: screen.width / 2 + (index - (pages - 1) / 2) * 22, cy: y + 14, r: 5 }));
+  }
+  const defs = model.round ? [sv("clipPath", { id: clip }, sv("circle", { cx: screen.width / 2, cy: screen.height / 2, r: screen.width / 2 }))] : [];
+  const group = sv("g", model.round ? { "clip-path": `url(#${clip})` } : {}, body);
+  return sv("svg", { class: "pv-svg", viewBox: `0 0 ${screen.width} ${screen.height}`, role: "img", "aria-label": `Approximate preview of page ${model.pageIndex + 1}, ${model.title}, ${LAYOUT_NAMES[model.layout] || model.layout}` }, defs, group);
+}
+
+// ---- data list badges and search ------------------------------------------------------------
+
+function rowBadges(row, nameOf = (id) => id) {
+  const badges = [];
+  if (row.live_state === "live") badges.push({ key: "live", text: "Live", tone: "good" });
+  else if (row.live_state === "no_live_data") badges.push({ key: "nolive", text: "No live data", tone: "plain" });
+  if (row.group === UNCATALOGUED_GROUP || String(row.row_id || "").startsWith("unc:")) badges.push({ key: "uncatalogued", text: "Uncatalogued", tone: "warn" });
+  if (Array.isArray(row.used_on) && row.used_on.length) badges.push({ key: "used", text: `Used on ${row.used_on.map(nameOf).join(", ")}`, tone: "sea" });
+  return badges;
+}
+
+function rowValueText(row) {
+  if (row.live_state !== "live" || row.value === undefined || row.value === null) return "";
+  return `${row.value}${row.unit ? ` ${row.unit}` : ""}`;
+}
+
+function filterCatalogRows(rows, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return rows.slice();
+  return rows.filter((row) => [row.label, row.group, row.path, row.id_stem].some((value) => String(value || "").toLowerCase().includes(needle)));
+}
+
+function groupCatalogRows(rows, groups) {
+  const byGroup = new Map();
+  rows.forEach((row) => { if (!byGroup.has(row.group)) byGroup.set(row.group, []); byGroup.get(row.group).push(row); });
+  const order = [...(groups || []), ...byGroup.keys()].filter((name, index, all) => all.indexOf(name) === index && byGroup.has(name));
+  return order.map((name) => ({ name, rows: byGroup.get(name) }));
+}
+
+// ---- DOM: cards -------------------------------------------------------------------------------
+
+function themeSwatches(entry, themes) {
+  const current = entry.theme || "classic";
+  const ids = (entry.themes || []).map((item) => item.id);
+  return h("div", { class: "swatches", role: "group", "aria-label": `Colour theme for ${displayName(entry)}` }, ids.map((id) => {
+    const theme = themes?.themes?.[id];
+    const description = (entry.themes.find((item) => item.id === id) || {}).description || "";
+    const label = id === "high-contrast" ? "High contrast" : id.charAt(0).toUpperCase() + id.slice(1);
+    const isCurrent = id === current;
+    const day = theme?.day || {};
+    return h("button", {
+      type: "button", class: `swatch${isCurrent ? " current" : ""}`, "data-theme-id": id, "data-display": displayId(entry),
+      "aria-pressed": String(isCurrent), "aria-label": `${label} theme${isCurrent ? ", current" : ""}. ${description}`, disabled: !state.displays.editable, title: description,
+      vars: { "--sw-page": day.page_bg || "#000", "--sw-tile": day.tile || "#222", "--sw-value": day.value || "#fff", "--sw-label": day.label || "#aaa" },
+    }, h("span", { class: "sw-chip", "aria-hidden": "true" }, h("span", { class: "sw-tile" }, h("i", { class: "sw-v" }), h("i", { class: "sw-l" }))), h("span", { class: "sw-name", text: label }), isCurrent ? h("span", { class: "sw-now", text: "Current" }) : null);
+  }));
+}
+
+function checklist(entry) {
+  const id = displayId(entry);
+  const items = readinessItems(id, entry.readiness);
+  const mark = { ok: "✓", todo: "!", unknown: "?" };
+  return h("ul", { class: "checks" }, items.map((item) => h("li", { class: `check ${item.state}` },
+    h("span", { class: "mark", "aria-hidden": "true", text: mark[item.state] }),
+    h("div", {}, h("strong", { text: item.label }), h("span", { class: "sr", text: item.state === "ok" ? " (done)" : item.state === "todo" ? " (needs attention)" : " (unknown)" }),
+      item.hint ? h("p", { class: "small", text: item.hint }) : null,
+      item.command ? h("code", { text: item.command }) : null))));
+}
+
+function pageList(entry) {
+  const id = displayId(entry);
+  const selected = state.displays.page[id] || 0;
+  return h("ol", { class: "pages" }, entry.display.pages.map((page, index) => h("li", {},
+    h("button", { type: "button", class: `pagebtn${index === selected ? " on" : ""}`, "data-preview-page": String(index), "data-display": id, "aria-pressed": String(index === selected) },
+      h("strong", { text: page.title }), h("span", { class: "layout", text: LAYOUT_NAMES[page.layout] || page.layout }),
+      h("span", { class: "items", text: page.items.map((item) => itemInfo(entry, item).label).join(" · ") })))));
+}
+
+function previewBlock(entry) {
+  const id = displayId(entry);
+  const d = state.displays;
+  const index = Math.min(d.page[id] || 0, entry.display.pages.length - 1);
+  const model = previewModel(entry, index, d.themes, { mode: d.mode, severity: d.severity }, liveRowsByPath(d.catalog));
+  const wrap = h("div", { class: "preview-wrap", "data-preview": id });
+  if (!model) { wrap.append(h("p", { class: "small muted", text: "No preview is available for this page." })); return wrap; }
+  const frame = h("div", { class: `preview-frame${model.round ? " round" : ""}`, vars: model.vars }, previewSvg(model));
+  wrap.append(frame, h("p", { class: "small muted", text: "Approximate preview. The display itself is the final word on spacing and fonts." }));
+  return wrap;
+}
+
+function previewControls() {
+  const d = state.displays;
+  return h("div", { class: "pvctl" },
+    h("div", { class: "seg", role: "group", "aria-label": "Preview time of day" }, [["day", "Day"], ["night", "Night"]].map(([key, text]) => h("button", { type: "button", "data-preview-mode": key, "aria-pressed": String(d.mode === key), text }))),
+    h("div", { class: "seg", role: "group", "aria-label": "Preview colour for values" }, SEVERITIES.map(([key, text]) => h("button", { type: "button", "data-preview-severity": key, "aria-pressed": String(d.severity === key), text }))));
+}
+
+function displayCard(entry) {
+  const id = displayId(entry);
+  if (entry.error) {
+    return h("article", { class: "card dcard", "aria-labelledby": `dc-${id}` }, h("h3", { id: `dc-${id}`, text: displayName(entry) }), h("p", { class: "mono small", text: id }),
+      h("p", { class: "small warn-text", role: "alert", text: `This display could not be read: ${entry.error}` }));
+  }
+  const chip = firmwareChip(entry.readiness);
+  const themeName = entry.theme === "high-contrast" ? "High contrast" : (entry.theme || "classic").replace(/^./, (ch) => ch.toUpperCase());
+  const needsFlash = chip.state !== "on-screen";
+  return h("article", { class: "card dcard", "aria-labelledby": `dc-${id}` },
+    h("header", { class: "dhead" },
+      h("div", {}, h("h3", { id: `dc-${id}`, text: entry.display.name }), h("p", { class: "small muted" }, h("span", { class: "mono", text: id }), ` · ${entry.board?.name || entry.display.board} · ${themeName} theme`)),
+      h("span", { class: `chip ${chip.tone}`, "data-chip": chip.state, title: chip.hint, text: chip.label })),
+    h("div", { class: "dbody" },
+      h("div", { class: "dpreview" }, previewControls(), previewBlock(entry)),
+      h("div", { class: "dinfo" },
+        h("h4", { text: "Colour theme" }), themeSwatches(entry, state.displays.themes),
+        h("p", { class: "small muted", text: `Changing the theme is done on the boat computer for now: sudo vesselstackctl display set-theme ${id} THEME` }),
+        h("h4", { text: "Pages" }), pageList(entry),
+        h("h4", { text: "Ready to show on the screen?" }), checklist(entry),
+        needsFlash ? h("p", { class: "small" }, "After changing settings, build and flash the display:") : null,
+        needsFlash ? h("code", { text: `sudo vesselstackctl display build ${id}\nsudo vesselstackctl display flash ${id} --serial DEVICE` }) : null)));
+}
+
+function renderDisplays() {
+  const d = state.displays;
+  const root = $("#displays-root");
+  root.textContent = "";
+  if (d.error) {
+    $("#displays-status").textContent = "";
+    $("#displays-status").append(h("div", { class: "banner fail", role: "alert" }, h("span", { class: "icon", "aria-hidden": "true", text: "!" }), h("div", { class: "msg", text: d.error })));
+  } else {
+    $("#displays-status").textContent = d.loading ? "Loading displays…" : "";
+  }
+  if (d.loaded && !d.error && !d.list.length) {
+    root.append(h("div", { class: "card flat empty" }, h("h2", { text: "No displays yet" }), h("p", { text: "Add your first display from the boat computer, then come back here to see its pages and preview." }), h("code", { text: "sudo vesselstackctl display add helm --board BOARD --name Helm" })));
+  }
+  d.list.forEach((entry) => root.append(displayCard(entry)));
+  $("#displays-updated").textContent = d.loadedAt ? `Updated ${new Date(d.loadedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+}
+
+function rerenderPreviews() {
+  state.displays.list.forEach((entry) => {
+    if (entry.error) return;
+    const old = $$(`[data-preview="${displayId(entry)}"]`)[0];
+    if (old) old.replaceWith(previewBlock(entry));
+  });
+  $$("[data-preview-mode]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.previewMode === state.displays.mode)));
+  $$("[data-preview-severity]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.previewSeverity === state.displays.severity)));
+}
+
+function renderDataBrowser() {
+  const d = state.displays;
+  const root = $("#catalog-root");
+  root.textContent = "";
+  const catalog = d.catalog;
+  const note = $("#catalog-note");
+  if (!catalog) { note.textContent = d.loading ? "Loading…" : "The data list is not available yet."; return; }
+  const live = catalog.live || {};
+  note.textContent = live.requested && live.ok ? "Values marked Live are being received from Signal K right now." : live.requested ? `Live values are unavailable${live.error ? ` (${live.error})` : ""}. The list shows common values without live data.` : "Live values were not requested.";
+  const names = new Map(d.list.map((entry) => [displayId(entry), displayName(entry)]));
+  const nameOf = (id) => names.get(id) || id;
+  const rows = filterCatalogRows(catalog.rows || [], d.query);
+  if (!rows.length) { root.append(h("p", { class: "muted", text: d.query ? "Nothing matches that search." : "No data is listed." })); return; }
+  groupCatalogRows(rows, catalog.groups).forEach((group, index) => {
+    const details = h("details", { class: "dgroup", open: Boolean(d.query) || index === 0 }, h("summary", {}, h("strong", { text: group.name }), h("span", { class: "n", text: ` ${group.rows.length}` })));
+    details.append(h("ul", { class: "drows" }, group.rows.map((row) => {
+      const value = rowValueText(row);
+      return h("li", { class: "drow" },
+        h("div", { class: "dmain" }, h("strong", { text: row.label }), h("span", { class: "mono small muted", text: row.path })),
+        h("div", { class: "dside" }, value ? h("span", { class: "dvalue", text: value }) : null, rowBadges(row, nameOf).map((badge) => h("span", { class: `chip ${badge.tone}`, "data-badge": badge.key, text: badge.text }))));
+    })));
+    root.append(details);
+  });
+}
+
+async function loadDisplays(force = false) {
+  const d = state.displays;
+  if (!state.token || d.loading) return;
+  if (!force && d.loaded && Date.now() - d.loadedAt < DISPLAYS_STALE_MS) return;
+  const session = state.session;
+  const epoch = ++d.epoch;
+  d.loading = true;
+  renderDisplays();
+  try {
+    const [list, themes, catalog] = await Promise.all([api("/api/displays"), api("/api/displays/themes"), api("/api/displays/catalog?live=1").catch((error) => ({ error }))]);
+    if (session !== state.session || epoch !== d.epoch) return;
+    d.list = list.displays || [];
+    d.themes = themes;
+    d.catalog = catalog.error ? null : catalog;
+    d.error = "";
+    d.loaded = true;
+    d.loadedAt = Date.now();
+    if (catalog.error) d.error = `The data list could not be loaded: ${catalog.error.message}`;
+  } catch (error) {
+    if (session !== state.session || epoch !== d.epoch) return;
+    if (error.status === 401) { requireReauth("Your session ended."); return; }
+    d.error = `Couldn't load the displays: ${error.message}`;
+  } finally {
+    if (session === state.session && epoch === d.epoch) { d.loading = false; renderDisplays(); renderDataBrowser(); }
+  }
+}
+
+function resetDisplays() {
+  state.displays = freshDisplays();
+  $("#displays-root").textContent = "";
+  $("#displays-status").textContent = "";
+  $("#catalog-root").textContent = "";
+  $("#catalog-note").textContent = "";
+  $("#displays-updated").textContent = "";
+}
+
+function onDisplaysClick(event) {
+  const target = event.target.closest?.("[data-preview-mode], [data-preview-severity], [data-preview-page], #displays-refresh");
+  if (!target) return;
+  const d = state.displays;
+  if (target.dataset.previewMode) d.mode = target.dataset.previewMode;
+  else if (target.dataset.previewSeverity) d.severity = target.dataset.previewSeverity;
+  else if (target.dataset.previewPage !== undefined) {
+    d.page[target.dataset.display] = Number(target.dataset.previewPage) || 0;
+    renderDisplays();
+    $$("[data-preview-page]").find((item) => item.dataset.display === target.dataset.display && item.dataset.previewPage === target.dataset.previewPage)?.focus();
+    return;
+  }
+  else if (target.id === "displays-refresh") { loadDisplays(true); return; }
+  rerenderPreviews();
+}
+
+
 // ---------------------------------------------------------------- wiring
 
 $("#login-form").addEventListener("submit", (event) => {
@@ -1000,6 +1457,8 @@ $("#config-form").addEventListener("click", (event) => {
 });
 window.addEventListener("scroll", updateScrollSpy, { passive: true });
 
+$("#displays").addEventListener("click", onDisplaysClick);
+$("#catalog-search").addEventListener("input", (event) => { state.displays.query = event.target.value; renderDataBrowser(); });
 $("#toast-close").addEventListener("click", () => { $("#toast").className = ""; });
 $("#retry").addEventListener("click", () => { state.reconnectAttempts = 0; clearTimeout(state.reconnectTimer); refreshStatus(); });
 $("#sb-save").addEventListener("click", saveConfiguration);

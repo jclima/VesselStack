@@ -40,10 +40,11 @@ Commands:
                                projects and optionally build/flash firmware on this
                                host (display build ID; display flash ID --serial
                                DEVICE | --ota HOST [--previous]). The Control Panel
-                               Displays tab uses catalog [--live] --json, show ID
-                               --json, set-pages ID --if-revision SHA --stdin,
-                               history --json, restore-config STAMP and
-                               serial-ports --json; see "vesselstackctl display --help"
+                               Displays tab reads list --json, catalog [--live]
+                               --json, show ID --json, themes --json and
+                               serial-ports --json (and will use set-pages ID
+                               --if-revision SHA --stdin, history --json and
+                               restore-config STAMP); see "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack

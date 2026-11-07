@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +26,9 @@ SPEC.loader.exec_module(panel)
 # Keep the durable lifecycle lock inside the test fixture rather than the
 # privileged production default. Individual tests still patch their env files.
 panel.ROOT = Path(tempfile.mkdtemp(prefix="vesselstack-panel-test-"))
+
+
+sys.path[:0] = [str(ROOT / "displays"), str(ROOT / "tests"), str(ROOT / "tests" / "fixtures")]
 
 
 class EnvironmentFileTests(unittest.TestCase):
@@ -726,6 +736,223 @@ class StatusFieldTests(unittest.TestCase):
         with mock.patch.object(panel, "installed_version", return_value="0.6.0"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
             self.assertFalse(panel.restart_needed())
 
+
+class DisplaysApiTests(unittest.TestCase):
+    """GET /api/displays*: fixed argv, auth, cache, error mapping and no secrets (subprocess is mocked)."""
+
+    TOKEN = "panel-token-for-displays-tests"
+    CTL = "/usr/local/sbin/vesselstackctl"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        control = Path(self._tmp.name) / "control.env"
+        panel.write_env(control, {"CONTROL_PANEL_TOKEN": self.TOKEN}, [])
+        patches = [mock.patch.object(panel, "PANEL_ENV", control), mock.patch.object(panel, "CTL", Path(self.CTL)),
+                   mock.patch.dict(panel.os.environ, {}, clear=True)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        quiet = mock.patch.object(panel.ControlPanelHandler, "log_message", lambda *a, **k: None)
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        panel.invalidate_display_caches()
+        self.addCleanup(panel.invalidate_display_caches)
+        self.calls: list[list[str]] = []
+        self.responses: dict[tuple, subprocess.CompletedProcess] = {}
+        run = mock.patch.object(panel.subprocess, "run", side_effect=self.fake_run)
+        run.start()
+        self.addCleanup(run.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), panel.ControlPanelHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def fake_run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        self.assertEqual(kwargs.get("stderr"), subprocess.PIPE, "stderr must never be merged into the JSON")
+        self.assertIn("timeout", kwargs)
+        answer = self.responses.get(tuple(argv[1:]))
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer or subprocess.CompletedProcess(argv, 1, "", "unexpected call")
+
+    def answer(self, args, payload, code=0, stderr="") -> None:
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        self.responses[tuple(args)] = subprocess.CompletedProcess([], code, text, stderr)
+
+    def get(self, path, token="default"):
+        headers = {} if token is None else {"X-VesselStack-Token": self.TOKEN if token == "default" else token}
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}{path}", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    def test_every_endpoint_needs_the_token(self) -> None:
+        for path in ("/api/displays", "/api/displays?id=helm", "/api/displays/themes", "/api/displays/catalog",
+                     "/api/displays/catalog?live=1", "/api/displays/serial-ports"):
+            self.assertEqual(self.get(path, None)[0], 401, path)
+            self.assertEqual(self.get(path, "wrong")[0], 401, path)
+        self.assertEqual(self.calls, [], "nothing runs before authentication")
+
+    def test_display_id_regex_matches_the_cli(self) -> None:
+        import schema
+        self.assertEqual(panel.DISPLAY_ID_RE.pattern, schema.DISPLAY_ID.pattern)
+
+    def test_themes_and_serial_ports_argv(self) -> None:
+        self.answer(["display", "themes", "--json"], {"schema": 1, "themes": {"classic": {}}})
+        self.answer(["display", "serial-ports", "--json"], {"schema": 1, "ports": []})
+        self.assertEqual(self.get("/api/displays/themes")[0], 200)
+        self.assertEqual(self.get("/api/displays/serial-ports")[0], 200)
+        self.assertEqual(self.calls, [[self.CTL, "display", "themes", "--json"], [self.CTL, "display", "serial-ports", "--json"]])
+
+    def test_displays_lists_then_shows_each_display_with_fixed_argv(self) -> None:
+        self.answer(["display", "list", "--json"], {"schema": 1, "displays": [{"id": "helm", "name": "Helm", "board": "b", "pages": 1}, {"id": "aux", "name": "Aux", "board": "b", "pages": 1}]})
+        self.answer(["display", "show", "helm", "--json"], {"schema": 1, "display": {"id": "helm"}})
+        self.answer(["display", "show", "aux", "--json"], {"ok": False, "code": 2, "errors": ["boom in aux"]}, code=2)
+        status, body = self.get("/api/displays")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["displays"][0], {"schema": 1, "display": {"id": "helm"}})
+        self.assertEqual(data["displays"][1], {"id": "aux", "name": "Aux", "board": "b", "error": "boom in aux"}, "one failing display does not fail the rest")
+        self.assertEqual(sorted(self.calls), sorted([[self.CTL, "display", "list", "--json"], [self.CTL, "display", "show", "helm", "--json"], [self.CTL, "display", "show", "aux", "--json"]]))
+
+    def test_single_display_and_invalid_ids(self) -> None:
+        self.answer(["display", "list", "--json"], {"schema": 1, "displays": [{"id": "helm", "name": "Helm", "board": "b", "pages": 1}]})
+        self.answer(["display", "show", "helm", "--json"], {"schema": 1, "display": {"id": "helm"}})
+        self.assertEqual(len(json.loads(self.get("/api/displays?id=helm")[1])["displays"]), 1)
+        self.assertEqual(self.get("/api/displays?id=other")[0], 404)
+        self.calls.clear()
+        for bad in ("Helm", "-x", "a b", "a;rm", "../x", "x" * 40, "a%00b"):
+            self.assertEqual(self.get("/api/displays?id=" + urllib.request.quote(bad))[0], 400, bad)
+        self.assertEqual(self.calls, [], "an invalid id never reaches a command line")
+        for bad in ("Helm", "--live", "a b", None, 5):
+            with self.assertRaises(ValueError):
+                panel.valid_display_id(bad)
+        self.assertEqual(panel.valid_display_id("helm-2"), "helm-2")
+
+    def test_listed_ids_are_validated_too(self) -> None:
+        self.answer(["display", "list", "--json"], {"schema": 1, "displays": [{"id": "--evil", "name": "x", "board": "b"}, {"id": "ok", "name": "Ok", "board": "b"}]})
+        self.answer(["display", "show", "ok", "--json"], {"schema": 1, "display": {"id": "ok"}})
+        self.assertEqual(self.get("/api/displays")[0], 200)
+        self.assertNotIn([self.CTL, "display", "show", "--evil", "--json"], self.calls)
+
+    def test_catalog_argv_live_flag_and_validation(self) -> None:
+        self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": [], "live": {"requested": False}})
+        self.answer(["display", "catalog", "--live", "--json"], {"schema": 1, "rows": [], "live": {"requested": True}})
+        self.assertEqual(self.get("/api/displays/catalog")[0], 200)
+        self.assertEqual(self.get("/api/displays/catalog?live=0")[0], 200)
+        self.assertEqual(self.get("/api/displays/catalog?live=1")[0], 200)
+        self.assertEqual(self.calls, [[self.CTL, "display", "catalog", "--json"], [self.CTL, "display", "catalog", "--live", "--json"]])
+        self.calls.clear()
+        for bad in ("yes", "true", "1;x", "--json", "2"):
+            self.assertEqual(self.get("/api/displays/catalog?live=" + urllib.request.quote(bad))[0], 400, bad)
+        self.assertEqual(self.calls, [])
+
+    def test_catalog_cache_keyed_by_live_expires_and_skips_errors(self) -> None:
+        self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": []})
+        self.answer(["display", "catalog", "--live", "--json"], {"schema": 1, "rows": []})
+        clock = [1000.0]
+        with mock.patch.object(panel.time, "monotonic", side_effect=lambda: clock[0]):
+            self.get("/api/displays/catalog"); self.get("/api/displays/catalog")
+            self.assertEqual(len(self.calls), 1, "second call within 30 s is served from memory")
+            self.get("/api/displays/catalog?live=1")
+            self.assertEqual(len(self.calls), 2, "the live flag is part of the cache key")
+            clock[0] += 29
+            self.get("/api/displays/catalog"); self.assertEqual(len(self.calls), 2)
+            clock[0] += 2
+            self.get("/api/displays/catalog"); self.assertEqual(len(self.calls), 3, "expires after 30 s")
+            panel.invalidate_display_caches()
+            self.get("/api/displays/catalog"); self.assertEqual(len(self.calls), 4, "invalidate_display_caches forgets it")
+            # A failure is not cached.
+            panel.invalidate_display_caches(); self.calls.clear()
+            self.answer(["display", "catalog", "--json"], {"ok": False, "code": 1, "errors": ["x"]}, code=1)
+            self.assertEqual(self.get("/api/displays/catalog")[0], 502)
+            self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": []})
+            self.assertEqual(self.get("/api/displays/catalog")[0], 200)
+            self.assertEqual(len(self.calls), 2)
+
+    def test_catalog_uses_a_short_timeout(self) -> None:
+        self.answer(["display", "catalog", "--live", "--json"], {"schema": 1, "rows": []})
+        seen = {}
+        original = self.fake_run
+        def spy(argv, **kwargs):
+            seen.update(kwargs)
+            return original(argv, **kwargs)
+        with mock.patch.object(panel.subprocess, "run", side_effect=spy):
+            self.get("/api/displays/catalog?live=1")
+        self.assertEqual(seen["timeout"], 12)
+
+    def test_cli_failures_become_structured_errors_without_leaking(self) -> None:
+        trace = "Traceback (most recent call last):\n  File \"/opt/vesselstack/displays/x.py\", line 1\nSECRET-IN-STDERR"
+        cases = [
+            (subprocess.CompletedProcess([], 2, json.dumps({"ok": False, "code": 2, "errors": ["displays.json is invalid"]}), trace), 400, "displays.json is invalid"),
+            (subprocess.CompletedProcess([], 3, json.dumps({"ok": False, "code": 3, "errors": ["changed"]}), trace), 409, "changed"),
+            (subprocess.CompletedProcess([], 1, json.dumps({"ok": False, "code": 1, "errors": ["cannot read"]}), trace), 502, "cannot read"),
+            (subprocess.CompletedProcess([], 1, "", trace), 502, "The display tool failed"),
+            (subprocess.CompletedProcess([], 0, "not json", ""), 502, "could not read"),
+            (subprocess.CompletedProcess([], 0, "[1, 2]", ""), 502, "could not read"),
+            (subprocess.TimeoutExpired(["x"], 12), 504, "too long"),
+            (FileNotFoundError("/usr/local/sbin/vesselstackctl"), 502, "not available"),
+        ]
+        for answer, status, text in cases:
+            self.responses[("display", "serial-ports", "--json")] = answer
+            code, body = self.get("/api/displays/serial-ports")
+            self.assertEqual(code, status, body)
+            data = json.loads(body)
+            self.assertIn(text, data["error"])
+            self.assertNotIn("Traceback", body); self.assertNotIn("SECRET-IN-STDERR", body); self.assertNotIn("/usr/local/sbin", body)
+
+    def test_responses_from_real_cli_output_carry_no_secret(self) -> None:
+        import test_displays_cli as cli
+        from contextlib import redirect_stdout
+        import editor
+        case = type("Fixture", (cli.EditorTests,), {"runTest": lambda self: None})()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        ctx = case.ctx()
+        ctx.env["DISPLAYS_SIGNALK_TOKEN"] = cli.SK_TOKEN
+        case.write_config(case.cfg()["instruments"], case.cfg()["displays"])
+        secrets = [cli.ADMIN_PASSWORD, cli.WIFI_PASSWORD, cli.SK_TOKEN, "boat-net-ssid", case.sec()["displays"]["helm"]["mqtt_password"], case.sec()["bridge"]["mqtt_password"], self.TOKEN]
+        self.answer(["display", "list", "--json"], editor.list_displays(ctx))
+        self.answer(["display", "show", "helm", "--json"], editor.show(ctx, "helm"))
+        self.answer(["display", "catalog", "--json"], editor.catalog(ctx))
+        self.answer(["display", "serial-ports", "--json"], editor.serial_ports(ctx))
+        for path in ("/api/displays", "/api/displays/catalog", "/api/displays/serial-ports"):
+            status, body = self.get(path)
+            self.assertEqual(status, 200, body)
+            for value in secrets:
+                self.assertNotIn(value, body, path)
+        self.assertEqual(json.loads(self.get("/api/displays")[1])["displays"][0]["display"]["id"], "helm")
+
+
+
+class DisplaysPreviewFixtureTests(unittest.TestCase):
+    """tests/fixtures/displays/panel_show.json feeds the JS preview tests; it must be real `show` output."""
+
+    FIXTURE = ROOT / "tests" / "fixtures" / "displays" / "panel_show.json"
+    KEYS = ("display", "theme", "themes", "board", "layouts", "preview", "instruments", "notifications", "ha")
+
+    def current(self) -> dict:
+        import test_displays_cli as cli
+        import editor
+        case = type("Fixture", (cli.EditorTests,), {"runTest": lambda self: None})()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        config = json.loads((ROOT / "displays" / "displays.dashboard.example.json").read_text())
+        config["displays"]["helm"]["board"] = cli.BOARD
+        case.config.write_text(json.dumps(config))
+        shown = editor.show(case.ctx(), "helm")
+        return {key: shown[key] for key in self.KEYS}
+
+    def test_fixture_matches_the_renderer(self) -> None:
+        current = self.current()
+        if os.environ.get("UPDATE_PANEL_FIXTURE") == "1":
+            self.FIXTURE.write_text(json.dumps(current, indent=1, sort_keys=True) + "\n")
+        self.assertEqual(json.loads(self.FIXTURE.read_text()), json.loads(json.dumps(current, sort_keys=True)),
+                         "regenerate with UPDATE_PANEL_FIXTURE=1 python3 -B -m unittest tests/test_control_panel.py")
 
 if __name__ == "__main__":
     unittest.main()

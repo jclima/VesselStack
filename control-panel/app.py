@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hmac
 import ipaddress
 import json
@@ -741,6 +742,101 @@ def command_output(command: list[str], timeout: int = 8) -> tuple[int, str]:
         return 1, str(exc)
 
 
+# --- Displays tab (read-only): the fixed `vesselstackctl display ... --json` calls -------------------
+
+# Copy of displays/schema.py DISPLAY_ID (a test keeps them equal); only a validated id reaches argv.
+DISPLAY_ID_RE = re.compile(r"^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$")
+DISPLAY_TOOL_TIMEOUT_S = 12
+DISPLAY_CATALOG_TTL_S = 30
+DISPLAY_ERROR_STATUS = {2: 400, 3: 409, 4: 409}   # CLI exit codes: invalid input, revision changed, busy
+_DISPLAY_CACHE: dict[bool, tuple[float, dict[str, Any]]] = {}
+_DISPLAY_CACHE_LOCK = threading.Lock()
+
+
+class DisplayToolError(Exception):
+    """A display tool call failed; ``status`` and ``message`` are safe to show the browser."""
+
+    def __init__(self, status: int, message: str, errors: list[str] | None = None, code: int | None = None) -> None:
+        super().__init__(message)
+        self.status, self.message, self.errors, self.code = status, message, errors or [], code
+
+
+def display_argv(*args: str) -> list[str]:
+    return [str(CTL), "display", *args]
+
+
+def valid_display_id(value: Any) -> str:
+    if not isinstance(value, str) or not DISPLAY_ID_RE.fullmatch(value):
+        raise ValueError("Unknown display id")
+    return value
+
+
+def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S) -> dict[str, Any]:
+    """Run one display command and return its JSON object.
+
+    stdout is parsed and stderr is dropped, so nothing but the tool's own structured error message
+    (a few short lines about the configuration, never a stack trace or secret) can reach the browser.
+    """
+    try:
+        result = subprocess.run(display_argv(*args), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise DisplayToolError(504, "The display tool took too long to answer. Try again in a moment.") from exc
+    except OSError as exc:
+        raise DisplayToolError(502, "The display tool is not available on this boat computer.") from exc
+    try:
+        payload = json.loads(result.stdout or "")
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise DisplayToolError(502, "The display tool gave an answer the Control Panel could not read."
+                               if result.returncode == 0 else "The display tool failed. See the displays bridge log for details.",
+                               code=result.returncode or None)
+    if result.returncode != 0 or payload.get("ok") is False:
+        errors = [str(item)[:300] for item in payload.get("errors", []) if isinstance(item, str)][:5] if isinstance(payload.get("errors"), list) else []
+        code = payload.get("code") if isinstance(payload.get("code"), int) else result.returncode
+        raise DisplayToolError(DISPLAY_ERROR_STATUS.get(code, 502), errors[0] if errors else "The display tool failed.", errors, code)
+    return payload
+
+
+def invalidate_display_caches() -> None:
+    """Forget cached catalog answers (call after anything that changes displays.json)."""
+    with _DISPLAY_CACHE_LOCK:
+        _DISPLAY_CACHE.clear()
+
+
+def display_catalog(live: bool) -> dict[str, Any]:
+    now = time.monotonic()
+    with _DISPLAY_CACHE_LOCK:
+        cached = _DISPLAY_CACHE.get(live)
+        if cached and now - cached[0] < DISPLAY_CATALOG_TTL_S:
+            return cached[1]
+    payload = run_display_tool(["catalog", *(["--live"] if live else []), "--json"])
+    with _DISPLAY_CACHE_LOCK:
+        _DISPLAY_CACHE[live] = (time.monotonic(), payload)
+    return payload
+
+
+def display_details(only: str | None = None) -> dict[str, Any]:
+    """Every display with its ``show --json`` output; one that fails is listed with an error instead."""
+    listed = run_display_tool(["list", "--json"]).get("displays", [])
+    entries = [item for item in listed if isinstance(item, dict) and isinstance(item.get("id"), str) and DISPLAY_ID_RE.fullmatch(item["id"])]
+    if only is not None:
+        entries = [item for item in entries if item["id"] == only]
+        if not entries:
+            raise DisplayToolError(404, "Unknown display id")
+
+    def one(item: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return run_display_tool(["show", item["id"], "--json"])
+        except DisplayToolError as exc:
+            return {"id": item["id"], "name": str(item.get("name", ""))[:80], "board": str(item.get("board", ""))[:80], "error": exc.message}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        details = list(pool.map(one, entries))
+    return {"schema": 1, "displays": details}
+
+
 def describe_component(name: str, kind: str, enabled: bool, state: str) -> dict[str, Any]:
     """One component as the UI shows it: real name, plain status, no contradictions."""
     label, description, section = COMPONENT_INFO.get(name, (name.replace("-", " ").title(), "", ""))
@@ -1092,6 +1188,30 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_displays(self, path: str) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            if path == "/api/displays":
+                only = query.get("id", [None])[0]
+                self.send_json(200, display_details(valid_display_id(only) if only is not None else None))
+            elif path == "/api/displays/themes":
+                self.send_json(200, run_display_tool(["themes", "--json"]))
+            elif path == "/api/displays/catalog":
+                live = query.get("live", [""])[0]
+                if live not in {"", "0", "1"}:
+                    raise ValueError("live must be 0 or 1")
+                self.send_json(200, display_catalog(live == "1"))
+            elif path == "/api/displays/serial-ports":
+                self.send_json(200, run_display_tool(["serial-ports", "--json"]))
+            else:
+                self.send_json(404, {"error": "Not found"})
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except DisplayToolError as exc:
+            self.send_json(exc.status, {"error": exc.message, "errors": exc.errors, "code": exc.code})
+        except Exception:
+            self.send_json(500, {"error": "The display tool failed unexpectedly."})
+
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
@@ -1123,6 +1243,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                     self.send_json(502, {"error": "Release catalog unavailable; please retry."})
                     return
                 self.send_json(200, catalog)
+            elif path.startswith("/api/displays"):
+                self.send_displays(path)
             else:
                 self.send_json(404, {"error": "Not found"})
             return
