@@ -250,6 +250,108 @@ class CliTests(unittest.TestCase):
             lifecycle.remove(self.ctx(), "ghost", True)
         self.assertEqual(caught.exception.code, 2)
 
+    # --- themes ----------------------------------------------------------------
+
+    def test_themes_lists_the_four_themes(self):
+        code, out, _ = self.run_cli("themes")
+        self.assertEqual(code, 0)
+        listed = [line.split()[0] for line in out.splitlines()[:-1]]
+        self.assertEqual(listed, ["classic", "daylight", "high-contrast", "ocean"])
+        self.assertIn("set-theme", out)
+
+    def test_themes_json_has_the_full_palettes(self):
+        code, out, _ = self.run_cli("themes", "--json")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(list(data["themes"]), ["classic", "daylight", "high-contrast", "ocean"])
+        self.assertEqual(data["themes"]["ocean"]["day"]["tile"], "#12305A")
+        self.assertIn("night", data["themes"]["daylight"])
+        self.assertTrue(all(theme["description"] for theme in data["themes"].values()))
+
+    def test_set_theme_sets_validates_and_prints_next_steps(self):
+        self.add("helm")
+        lifecycle.set_theme(self.ctx(), "helm", "ocean")
+        self.assertEqual(self.cfg()["displays"]["helm"]["ui"], {"theme": "ocean"})
+        text = self.output()
+        self.assertIn("display build helm", text)
+        self.assertIn("display flash helm", text)
+        self.assertLess(text.index("display build helm"), text.index("display flash helm"))
+        self.assertEqual(oct(self.config.stat().st_mode & 0o777), "0o644")
+
+    def test_set_theme_keeps_other_ui_keys(self):
+        self.add("helm")
+        cfg = self.cfg()
+        cfg["displays"]["helm"]["ui"] = {"swipe": True}
+        self.config.write_text(json.dumps(cfg))
+        lifecycle.set_theme(self.ctx(), "helm", "daylight")
+        self.assertEqual(self.cfg()["displays"]["helm"]["ui"], {"swipe": True, "theme": "daylight"})
+        lifecycle.set_theme(self.ctx(), "helm", "classic")
+        self.assertEqual(self.cfg()["displays"]["helm"]["ui"], {"swipe": True})
+
+    def test_set_theme_classic_deletes_the_key_and_an_emptied_ui(self):
+        self.add("helm")
+        before = self.cfg()
+        lifecycle.set_theme(self.ctx(), "helm", "high-contrast")
+        lifecycle.set_theme(self.ctx(), "helm", "classic")
+        self.assertEqual(self.cfg(), before)   # readable by older versions again
+        self.assertNotIn("ui", self.cfg()["displays"]["helm"])
+
+    def test_set_theme_classic_removes_an_explicit_classic_key(self):
+        self.add("helm")
+        cfg = self.cfg()
+        cfg["displays"]["helm"]["ui"] = {"theme": "classic"}
+        self.config.write_text(json.dumps(cfg))
+        lifecycle.set_theme(self.ctx(), "helm", "classic")
+        self.assertNotIn("ui", self.cfg()["displays"]["helm"])
+        self.assertIn("removed", self.output())
+
+    def test_set_theme_classic_on_a_display_without_a_theme_changes_nothing(self):
+        self.add("helm")
+        before = self.config.read_text()
+        lifecycle.set_theme(self.ctx(), "helm", "classic")
+        self.assertEqual(self.config.read_text(), before)
+        self.assertIn("already", self.output())
+        self.assertNotIn("display build", self.output())
+
+    def test_set_theme_rejects_unknown_theme_and_display(self):
+        self.add("helm")
+        before = self.config.read_text()
+        with self.assertRaises(lifecycle.LifecycleError) as caught:
+            lifecycle.set_theme(self.ctx(), "helm", "neon")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("classic, daylight, high-contrast, ocean", str(caught.exception))
+        with self.assertRaises(lifecycle.LifecycleError) as caught:
+            lifecycle.set_theme(self.ctx(), "ghost", "ocean")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.config.read_text(), before)
+
+    def test_set_theme_waits_for_the_build_lock_then_gives_up_unchanged(self):
+        import render
+        self.add("helm")
+        before = self.config.read_text()
+        self.make_build_tree("helm")
+        with render.build_lock(self.ctx(), "helm"):
+            with self.assertRaises(lifecycle.LifecycleError) as caught:
+                lifecycle.set_theme(self.ctx(build_lock_timeout=0.2), "helm", "ocean")
+        self.assertIn("another build/flash", str(caught.exception))
+        self.assertEqual(self.config.read_text(), before)
+
+    def test_set_theme_cli(self):
+        self.add("helm")
+        code, out, err = self.run_cli("set-theme", "helm", "ocean", "--allow-non-root")
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertEqual(self.cfg()["displays"]["helm"]["ui"]["theme"], "ocean")
+        code, _, err = self.run_cli("set-theme", "helm", "neon", "--allow-non-root")
+        self.assertEqual(code, 2)
+        self.assertIn("ocean", err)
+
+    def test_set_theme_needs_root(self):
+        self.add("helm")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root")
+        with self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.set_theme(self.ctx(require_root=True), "helm", "ocean")
+
     # --- build tree cleanup --------------------------------------------------
 
     def make_build_tree(self, *ids):

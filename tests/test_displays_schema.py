@@ -38,6 +38,19 @@ class SchemaTests(unittest.TestCase):
         errors = errors_for(mutate)
         self.assertTrue(any(fragment in e for e in errors), f"{fragment!r} not in {errors}")
 
+    def test_ui_theme_accepts_every_known_theme(self):
+        for theme in schema.theme_ids():
+            cfg = copy.deepcopy(EXAMPLE)
+            cfg["displays"]["helm"].setdefault("ui", {})["theme"] = theme
+            self.assertEqual(schema.validate_config(cfg, REGISTRY), [], theme)
+
+    def test_ui_theme_unknown_lists_the_valid_ids(self):
+        for bad in ("neon", "Classic", "", None, 3, ["classic"]):
+            errors = errors_for(lambda c, b=bad: c["displays"]["helm"].setdefault("ui", {}).update(theme=b))
+            joined = " ".join(errors)
+            self.assertIn("$.displays.helm.ui.theme: must be one of the themes classic, daylight, "
+                          "high-contrast, ocean", joined, bad)
+
     def test_example_and_registry_are_valid(self) -> None:
         self.assertEqual(schema.validate_config(EXAMPLE, REGISTRY), [])
         self.assertEqual(schema.validate_registry(REGISTRY), [])

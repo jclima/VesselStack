@@ -304,6 +304,79 @@ class GoldenAndDeterminism(Base):
         self.set_config(icons_dashboard)
         self.check_golden("helm-icons.yaml", self.device(allow_missing_wifi=True))
 
+    def test_classic_theme_key_renders_the_same_golden(self):
+        """ui.theme "classic" is the same firmware as no theme key, for every golden configuration."""
+        def multipage_api(cfg):
+            multipage(cfg)
+            cfg["displays"]["helm"]["home_assistant_api"] = True
+            cfg["heartbeat_s"] = 7
+            for inst in cfg["instruments"].values():
+                inst["stale_after_s"] = 14
+
+        def electrical_header_night(cfg):
+            electrical_pages(cfg, header=True, night=True)
+
+        def gauges(cfg):
+            gauge_pages(cfg)
+
+        cases = [("helm.yaml", None, False), ("helm-multipage-api.yaml", multipage_api, True),
+                 ("helm-thresholds.yaml", with_thresholds, False), ("helm-status.yaml", status_page, False),
+                 ("helm-alarm.yaml", alarm_takeover, False), ("helm-ui.yaml", dashboard_ui, False),
+                 ("helm-gauges.yaml", gauges, False), ("helm-electrical.yaml", electrical_header_night, False),
+                 ("helm-ha.yaml", ha_dashboard, False), ("helm-icons.yaml", icons_dashboard, False)]
+        for name, mutate, strict_wifi in cases:
+            with self.subTest(golden=name):
+                def themed(cfg, mutate=mutate):
+                    if mutate:
+                        mutate(cfg)
+                    cfg["displays"]["helm"].setdefault("ui", {})["theme"] = "classic"
+                self.set_config(themed)
+                text = self.device(allow_missing_wifi=not strict_wifi)
+                self.assertEqual(text, (GOLDEN / name).read_text(encoding="utf-8"))
+
+    def test_other_themes_match_golden(self):
+        for theme in ("high-contrast", "daylight", "ocean"):
+            with self.subTest(theme=theme):
+                def themed(cfg, theme=theme):
+                    icons_dashboard(cfg)
+                    cfg["displays"]["helm"]["ui"]["theme"] = theme
+                self.set_config(themed)
+                self.check_golden(f"helm-theme-{theme}.yaml", self.device(allow_missing_wifi=True))
+
+    def test_emitted_colours_match_themes_json(self):
+        themes = schema.load_themes()["themes"]
+        for name, theme in themes.items():
+            with self.subTest(theme=name):
+                def themed(cfg, name=name):
+                    icons_dashboard(cfg)
+                    cfg["displays"]["helm"]["ui"]["theme"] = name
+                self.set_config(themed)
+                text = self.device(allow_missing_wifi=True)
+                hexes = lambda value: value[1:].upper()  # noqa: E731
+                day = theme["day"]
+                style = text.split("    - id: tile_style")[1].split("  pages:")[0]
+                self.assertIn(f"bg_color: 0x{hexes(day['tile'])}", style)
+                self.assertIn(f"border_width: {theme['shape']['tile_border_width']}", style)
+                self.assertEqual("border_color" in style, theme["shape"]["tile_border"] is not None)
+                self.assertIn(f"    - id: page_0\n      bg_color: 0x{hexes(day['page_bg'])}\n", text)
+                for role in ("label", "value", "clock", "title", "dot_ok", "dot_bad", "dot_unknown",
+                             "page_hi", "page_lo"):
+                    self.assertIn(hexes(day[role]), text, role)
+                for key, (bg, fg) in theme["sev"]["day"].items():
+                    self.assertIn(f"bg = 0x{hexes(bg)}", text, key)
+                    self.assertIn(f"fg = 0x{hexes(fg)}", text, key)
+                for key, colour in theme["gauge"]["day"].items():
+                    self.assertIn(f"= 0x{hexes(colour)};", text, key)
+                # Night keeps the red palette whatever the day theme is.
+                self.assertIn(f"n ? 0x{hexes(theme['night']['tile'])} : 0x{hexes(day['tile'])}", text)
+                self.assertIn(f"n ? 0x{hexes(theme['night']['value'])} : 0x{hexes(day['value'])}", text)
+                switches = day["page_bg"] != theme["night"]["page_bg"]
+                self.assertEqual("->obj, lv_color_hex(n ? 0x" in text, switches)
+                bordered = bool(theme["shape"]["tile_border_width"])
+                self.assertEqual("lv_obj_set_style_border_color(" in text, bordered)
+                if name == "classic":
+                    self.assertEqual(text, (GOLDEN / "helm-icons.yaml").read_text(encoding="utf-8"))
+
     def test_device_file_is_deterministic(self):
         self.assertEqual(self.device(), self.device())
 

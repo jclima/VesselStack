@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -212,6 +213,29 @@ def cmd_wifi(args) -> int:
     return run_lifecycle(args, lambda ctx: lifecycle.wifi(ctx, args.clear, args.open))
 
 
+def cmd_set_theme(args) -> int:
+    return run_lifecycle(args, lambda ctx: lifecycle.set_theme(ctx, args.id, args.theme))
+
+
+def cmd_themes(args) -> int:
+    """List the built-in display themes (reads the installed themes.json; needs no root)."""
+    try:
+        data = schema.load_themes()
+        ids = schema.theme_ids()
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot load the display themes: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"schema": data["schema"], "themes": {name: data["themes"][name] for name in ids}},
+                         indent=2))
+        return 0
+    width = max(len(name) for name in ids)
+    for name in ids:
+        print(f"{name.ljust(width)}  {data['themes'][name]['description']}")
+    print("Choose one with 'vesselstackctl display set-theme ID THEME', then rebuild and reflash the display.")
+    return 0
+
+
 def cmd_status(args) -> int:
     return run_lifecycle(args, lifecycle.status)
 
@@ -372,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="flash the previous build (firmware.prev) to roll back")
     flash.add_argument("--force", action="store_true",
                        help="flash even if the credentials changed since the firmware was built")
+    set_theme = lifecycle_parser("set-theme", "choose the colour theme of a display (root); rebuild and "
+                                 "reflash afterwards", cmd_set_theme, True)
+    set_theme.add_argument("theme", metavar="THEME", help="theme id (see 'themes'); classic removes the key")
+    themes = sub.add_parser("themes", help="list the available display themes")
+    themes.add_argument("--json", action="store_true", help="print the full palettes as JSON")
+    themes.set_defaults(func=cmd_themes)
     lifecycle_parser("status", "show bridge and display online state from retained MQTT topics",
                      cmd_status)
     return parser

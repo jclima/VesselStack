@@ -145,10 +145,18 @@ sudo vesselstackctl display list
 sudo vesselstackctl display status
 ```
 
-Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash`.
+Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash|themes|set-theme`.
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
 
-Display colours come from `displays/themes.json` (the built-in `classic` theme, output unchanged, nothing to do on an existing install; selectable themes are planned, see [Themes](docs/DISPLAYS.md#themes)).
+Display colours come from `displays/themes.json`, which offers four themes: `classic` (the default and the original look), `high-contrast` (black with white values and a light tile border, for sunlight), `daylight` (light tiles with dark text) and `ocean` (navy tiles). Pick one per display:
+
+```bash
+sudo vesselstackctl display themes                  # list the themes (--json for the full palettes)
+sudo vesselstackctl display set-theme helm daylight
+sudo vesselstackctl display build helm              # then: display flash helm --serial DEVICE (or --ota HOST)
+```
+
+`set-theme` writes `ui.theme` in `displays.json`; the change reaches the screen only after you rebuild and reflash that display. Night mode uses the same red palette on every theme and the alarm banner is never themed. `set-theme ID classic` removes the key and returns to the original colours. **Before downgrading VesselStack, run `set-theme ID classic` on every display that has a theme:** older versions reject the unknown `theme` key and the displays bridge then exits. A display left on `classic` generates exactly the firmware it did before, so nothing needs reflashing. Details and limits are in [Themes](docs/DISPLAYS.md#themes).
 
 ## Quick start: one command on the Raspberry Pi
 

@@ -35,7 +35,7 @@ Commands:
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
-  display list|add|remove|rotate|wifi|status|render|export|build|flash|validate|sync-mqtt [ARGUMENTS]
+  display list|add|remove|rotate|wifi|status|render|export|build|flash|themes|set-theme|validate|sync-mqtt [ARGUMENTS]
                                Manage instrument displays, generate their ESPHome
                                projects and optionally build/flash firmware on this
                                host (display build ID; display flash ID --serial

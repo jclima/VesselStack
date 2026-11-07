@@ -70,7 +70,7 @@ THRESHOLD_KEYS = {name for name, _ in THRESHOLD_BOUNDS} | {"hysteresis"}
 INSTRUMENT_REQUIRED = {"path", "label", "convert", "unit", "precision", "stale_after_s"}
 DISPLAY_KEYS = {"name", "board", "home_assistant_api", "pages", "ui"}
 UI_KEYS = {"alarm_takeover", "alarm_page", "swipe", "header", "night", "day_brightness",
-           "night_brightness", "dim_after_s"}
+           "night_brightness", "dim_after_s", "theme"}
 UI_BOOLEANS = ("alarm_takeover", "swipe", "header")
 NIGHT_MODES = ("off", "manual", "schedule")
 DEFAULT_DAY_BRIGHTNESS = 100
@@ -343,6 +343,8 @@ def validate_ui(ui, where: str, pages, instruments, notifications, errors: list,
     for key in ("day_brightness", "night_brightness"):
         if key in ui and not (is_int(ui[key]) and 5 <= ui[key] <= 100):
             errors.append(f"{where}.{key}: must be an integer 5..100 (percent)")
+    if "theme" in ui:
+        _validate_ui_theme(ui["theme"], f"{where}.theme", errors)
     if "dim_after_s" in ui and not (is_int(ui["dim_after_s"]) and 0 <= ui["dim_after_s"] <= 3600):
         errors.append(f"{where}.dim_after_s: must be an integer 0..3600 (0 = never dim)")
     day = ui.get("day_brightness", DEFAULT_DAY_BRIGHTNESS)
@@ -350,6 +352,16 @@ def validate_ui(ui, where: str, pages, instruments, notifications, errors: list,
     if (is_int(day) and is_int(dark) and 5 <= day <= 100 and 5 <= dark <= 100
             and "night_brightness" in ui and dark > day):
         errors.append(f"{where}.night_brightness: must not exceed day_brightness ({day})")
+
+
+def _validate_ui_theme(value, where: str, errors: list) -> None:
+    try:
+        ids = theme_ids()
+    except (OSError, ValueError) as exc:
+        errors.append(f"{where}: cannot check the theme, themes.json is unusable ({exc})")
+        return
+    if not (isinstance(value, str) and value in ids):
+        errors.append(f"{where}: must be one of the themes {', '.join(ids)}")
 
 
 def _layout_hint(layout, board: dict, specs: dict) -> str:
@@ -861,7 +873,7 @@ def load_registry(path=DEFAULT_REGISTRY):
 HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 THEME_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 THEME_TOP_KEYS = {"schema", "themes"}
-THEME_KEYS = {"day", "night", "sev", "gauge", "shape"}
+THEME_KEYS = {"description", "day", "night", "sev", "gauge", "shape"}
 THEME_ROLES = ("page_bg", "tile", "label", "value", "clock", "title", "dot_ok", "dot_bad",
                "dot_unknown", "page_hi", "page_lo", "track")
 SEV_NAMES = ("unknown", "ok", "warn", "alarm")
@@ -994,6 +1006,10 @@ def _validate_theme(name: str, theme, errors: list) -> None:
             errors.append(f"{where}.{key}: unknown key")
     for key in sorted(THEME_KEYS - set(theme)):
         errors.append(f"{where}.{key}: required")
+    description = theme.get("description")
+    if "description" in theme and not (isinstance(description, str) and 1 <= len(description) <= 100
+                                       and description.isprintable()):
+        errors.append(f"{where}.description: must be a printable text of 1 to 100 characters")
     modes = {m: _theme_block(theme[m], f"{where}.{m}", THEME_ROLES, errors) for m in THEME_MODES if m in theme}
     sev, gauge = {}, {}
     for kind, store in (("sev", sev), ("gauge", gauge)):
@@ -1115,3 +1131,9 @@ def load_themes(path=None):
     if problems:
         raise ValueError("invalid themes file:\n  " + "\n  ".join(problems))
     return data
+
+
+def theme_ids(path=None) -> list:
+    """The theme ids of themes.json (validated), the built-in classic first, the rest sorted."""
+    names = list(load_themes(path)["themes"])
+    return ["classic"] + sorted(name for name in names if name != "classic")

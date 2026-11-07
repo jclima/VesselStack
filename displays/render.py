@@ -81,8 +81,8 @@ HEADER_TITLE_WIDTH = 200
 PAGE_DOT_SIZE = 8
 PAGE_DOT_GAP = 8
 CLOCK_GLYPHS = "0123456789:-"
-# Palettes come from displays/themes.json (schema.load_themes); render_device_yaml uses "classic"
-# until themes become selectable. Night keeps to the red/amber end of the spectrum so night vision
+# Palettes come from displays/themes.json (schema.load_themes); render_device_yaml resolves the one
+# named by the display's ui.theme ("classic" when absent). Night keeps to the red/amber end of the spectrum so night vision
 # survives; only an alarm tile's text is deliberately bright. The alarm banner is never themed.
 THEMES_FILE = MODULE_DIR / "themes.json"
 SEV_NUMBERS = {0: "unknown", 1: "ok", 2: "warn", 3: "alarm"}          # severity number -> theme key
@@ -1873,6 +1873,9 @@ def _night_script(config: dict, display: dict, used: list, pal: Palette = CLASSI
         "            id(night_dirty) = true;",
     ]
     for pi, page in enumerate(display["pages"]):
+        if pal.day["page_bg"] != pal.night["page_bg"]:   # classic: black both ways, nothing emitted
+            lines.append(f"            lv_obj_set_style_bg_color(id(page_{pi})->obj, lv_color_hex("
+                         f"n ? 0x{pal.night['page_bg']:06X} : 0x{pal.day['page_bg']:06X}), LV_PART_MAIN);")
         if page["layout"] in GAUGE_LAYOUTS:
             lines += _gauge_night_lines(config, display, pi, page, pal=pal)
             continue
@@ -1891,6 +1894,9 @@ def _night_script(config: dict, display: dict, used: list, pal: Palette = CLASSI
                 f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_value), lv_color_hex("
                 f"n ? 0x{pal.night['value']:06X} : 0x{pal.day['value']:06X}), LV_PART_MAIN);",
             ]
+            if pal.tile_border_width and pal.tile_border is not None:   # a bright border would defeat night mode
+                lines.append(f"            lv_obj_set_style_border_color(id({tile}), lv_color_hex("
+                             f"n ? 0x{pal.night['name']:06X} : 0x{pal.tile_border:06X}), LV_PART_MAIN);")
             if not notification:
                 lines.append(f"            lv_obj_set_style_text_color(id(p{pi}_{iid}_unit), lv_color_hex("
                              f"n ? 0x{pal.night['name']:06X} : 0x{pal.day['name']:06X}), LV_PART_MAIN);")
@@ -1947,9 +1953,16 @@ def _dim_interval(display: dict) -> list:
     ]
 
 
-def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str, pal: Palette = CLASSIC) -> str:
+def display_theme(display: dict) -> str:
+    return _ui(display).get("theme", "classic")
+
+
+def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_package: str,
+                       pal: Palette | None = None) -> str:
     config = effective_config(config)
     display = config["displays"][display_id]
+    if pal is None:   # resolved once; every helper below takes it as a parameter
+        pal = CLASSIC if display_theme(display) == "classic" else load_palette(display_theme(display))
     board = registry["boards"][display["board"]]
     heartbeat = config.get("heartbeat_s", schema.DEFAULT_HEARTBEAT_S)
     name = firmware_name(display_id)

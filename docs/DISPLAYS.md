@@ -204,6 +204,8 @@ sudo vesselstackctl display remove helm --yes
 | `render ID`, `export ID` | Generate the ESPHome project for a display; see [Firmware: generate, build and flash](#firmware-generate-build-and-flash). Root. |
 | `build ID` | Optional. Renders, then compiles the firmware on this machine in a one-shot container of the pinned ESPHome image and stores it with a manifest; see [Building and flashing on the Pi](#building-and-flashing-on-the-pi). Root. |
 | `flash ID (--serial DEVICE \| --ota HOST) [--previous] [--force]` | Optional. Uploads the stored firmware (never compiles) over USB serial or Wi-Fi; `--previous` rolls back; refuses firmware built with credentials that are no longer current unless `--force`. Root. |
+| `themes [--json]` | Nothing. Lists the display themes with a one-line description; `--json` prints the full palettes. `displayctl.py themes` itself needs no root; through `vesselstackctl` run it with `sudo` like the other `display` commands. See [Themes](#themes). |
+| `set-theme ID THEME` | Root. Sets `displays.ID.ui.theme` in `displays.json` (validated and written atomically like the other changing commands); `classic` deletes the key instead (and the `ui` object when that leaves it empty), so the file stays readable by older versions. An unknown theme or display is refused with exit status 2 and the valid ids. It takes the per-display build lock first and the configuration lock inside it (see the lock table below), so it waits for a running build or flash of that display (30 s). It changes nothing on the device: it prints the next steps, `display build ID` then `display flash ID ...`. Setting the theme a display already has changes nothing. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it and also deletes `secrets.yaml` from every already rendered tree of every display id under `build/displays/` (`ID/project`, `ID/project.new`, `ID/project.prev`, an old-layout `ID/secrets.yaml`, and the old siblings `ID.new/` and `ID.prev/`), each under that display's build lock without following symlinks (a display whose build is running is skipped with a warning); it does this even when no Wi-Fi credentials were stored, so a rerun after a failed or partial clear still cleans up; a changed password prints a notice instead. In both cases projects rendered and firmware built earlier still contain the old Wi-Fi credentials until `render`/`build` runs again (the firmware cannot be scrubbed; `flash` refuses it without `--force`). Nothing is echoed. |
 | `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the Signal K link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
@@ -783,6 +785,7 @@ firmware it got before, byte for byte):
 | `day_brightness` | integer 5-100, default 100 | backlight in percent by day (and when `night` is `off`) |
 | `night_brightness` | integer 5-100, default 20, not above `day_brightness` | backlight in percent at night; also the idle-dim level when set |
 | `dim_after_s` | integer 0-3600, default 0 (never) | dim after this many seconds without a touch |
+| `theme` | `classic` (default), `high-contrast`, `daylight`, `ocean` | colour theme; see [Themes](#themes). Absent means `classic`. An unknown id is a validation error that lists the valid ids |
 
 `night: schedule` needs the top-level `night_schedule`, `{"start": "21:30",
 "end": "06:15"}`: 24-hour `HH:MM` on the boat's wall clock, `start` inclusive
@@ -1302,17 +1305,44 @@ point):
 ### Themes
 
 Display colours and tile shape come from `displays/themes.json`, which is installed with the rest
-of `displays/`. It holds one theme, `classic`, and generating firmware from it is byte-identical to
-before: there is no new setting and no change to a display you have already flashed. Selectable
-themes are planned; nothing in `displays.json` chooses a theme yet.
+of `displays/`. It holds four themes. Choose one per display with `ui.theme`
+(`sudo vesselstackctl display set-theme ID THEME`; list them with `sudo vesselstackctl display themes [--json]`):
 
-A theme has `day` and `night` blocks of roles (`page_bg`, `tile`, `label`, `value`, `clock`,
+| Theme | Look | Day contrast (value / label on tile) |
+| --- | --- | --- |
+| `classic` | The original: slate `#101820` tiles on a black page, pale grey labels. The default. | 17.9 / 7.2 |
+| `high-contrast` | For direct sunlight: black page and tiles, pure white values, light `#D0D8E0` labels, a 2 px light tile border, stronger severity colours. | 21.0 / 14.6 |
+| `daylight` | Light `#E4E8EC` page with white tiles and dark text; severity tiles use pastel green, amber and red with dark text. A 1 px grey tile border separates the tiles. | 17.9 / 9.8 |
+| `ocean` | Near-black navy page with navy `#12305A` tiles, blue-grey `#8FA8C4` labels and white values. | 13.2 / 5.4 |
+
+Night mode is the same on every theme in this version: the red night palette of `classic`, so night
+vision survives whatever the day theme. A themed display repaints to it when night starts, including
+the page background of the light themes and the tile border (which turns dark red at night, so a
+bright border never defeats night mode). The alarm banner is never themed.
+
+**Applying a theme.** `set-theme` only edits `displays.json`. The theme is compiled into the
+firmware: run `display build ID` and `display flash ID ...` for the display to change. Until then the
+device keeps its old colours (and `flash` refuses a stored firmware built from a different
+configuration, as for any other change). A display on `classic`, with or without `"theme": "classic"`,
+generates a byte-identical device file to the one it generated before themes existed
+(`tests/fixtures/displays/golden/` is checked for both), so such a display never needs reflashing for
+this feature.
+
+**Cost.** A theme only changes constants in the generated code. `classic` emits nothing new; a theme with a tile border adds one
+`lv_obj_set_style_border_color` call per tile to the night script, and a theme whose page background
+differs between day and night (`daylight`, `ocean`) adds one `lv_obj_set_style_bg_color` call per page.
+Measured with a full `esphome compile` (pinned image 2026.10.0, `displays.dashboard.example.json`,
+every layout, header and night schedule): static RAM is identical for all four themes (127,459 bytes,
+37.3 %), and flash grows by 616 bytes for `daylight`, 552 for `high-contrast` and 248 for `ocean`
+over `classic` (1,221,991 bytes, 15.0 % of the app partition). Not measured on a device.
+
+A theme has a `description`, `day` and `night` blocks of roles (`page_bg`, `tile`, `label`, `value`, `clock`,
 `title`, `dot_ok`, `dot_bad`, `dot_unknown`, `page_hi`, `page_lo`, `track`), `sev` and `gauge`
 palettes for each of day and night (`unknown`, `ok`, `warn`, `alarm`, plus `neutral` for gauges;
 `sev` entries are `[tile background, text]` pairs), and a `shape` block (`tile_radius`, `tile_pad`,
 `tile_border_width`, `tile_border`; no border colour is written while the width is 0). Colours are
 `"#RRGGBB"`. The alarm banner and its white text are deliberately not themed, and fonts are not part
-of a theme. `night.page_bg` is required but not used yet.
+of a theme.
 
 `displays/schema.py` (`load_themes`, `validate_themes`) rejects unknown keys, bad colour strings and
 missing roles, and enforces: stale/unknown colours are never green (hue 75-165 degrees unless nearly
@@ -1320,7 +1350,21 @@ grey); night colours are red to amber (hue 0-50 degrees, red the strongest chann
 day `ok`, `warn` and `alarm` are green, amber and red; and, for the day palette, value text on the
 tile is at least 4.5:1, label text at least 3:1 and each severity pair at least 4.5:1 (3:1 for the
 muted `unknown` pair; WCAG contrast ratio). The dim night palette is not held to the contrast floors.
-Rollback: restore the previous `displays/themes.json` and `displays/render.py`.
+Every built-in theme passes these rules; a custom `themes.json` is not supported (the file is part of
+the installed code and is replaced on update).
+
+**Limits.** Colours were checked by the validator and by generating and validating (`esphome config`)
+firmware for every theme, not by looking at a device; real-panel legibility, in particular of the
+light themes in sunlight and the pastel severity tiles, is not verified. The label colour is not
+changed by severity, so on severity tiles it keeps the theme's label colour (readable on the pastel
+`daylight` tiles, weaker on the saturated tiles of the dark themes, as in `classic`).
+
+**Upgrade and rollback.** Nothing changes until you run `set-theme` and reflash. To go back, run
+`set-theme ID classic` (it removes the key), then `display build ID` and `display flash ID ...`, or
+flash the previous firmware (`display flash ID --previous`). **Run `set-theme ID classic` on every
+display before downgrading VesselStack to a version without themes**: those versions reject the
+`theme` key as unknown, so the configuration is invalid and the displays bridge exits at start-up.
+Restoring only `displays/themes.json` and `displays/render.py` is not enough for the same reason.
 
 ### Board registry schema 2
 

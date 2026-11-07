@@ -5,7 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
-- Instrument display colours and tile shape now come from `displays/themes.json` (one built-in theme, `classic`). Generated firmware is byte-identical to before, so there is nothing to change or reflash; selectable themes are planned.
+- Instrument displays can use a colour theme per display: `classic` (the default, unchanged), `high-contrast`, `daylight` and `ocean`. List them with `vesselstackctl display themes [--json]` and choose one with `sudo vesselstackctl display set-theme ID THEME` (`ui.theme` in `displays.json`), then rebuild and reflash that display. Night mode keeps the red palette on every theme and the alarm banner is not themed. A display on `classic` (or without `ui.theme`) generates byte-identical firmware, so nothing needs reflashing. **Before downgrading VesselStack, run `set-theme ID classic` on every themed display:** older versions reject the `theme` key and the displays bridge exits.
+- Display colours and tile shape come from `displays/themes.json`.
 
 ## 0.6.1 - 2026-11-02
 
