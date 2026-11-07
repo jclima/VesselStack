@@ -41,11 +41,11 @@ installer. `-t` gives the session a terminal so the installer can ask questions:
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.1/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.2/get-vesselstack.sh | sudo bash
 ```
 
-The URL pins release `v0.6.1`, so it installs that release whatever GitHub marks as Latest
-(`--version 0.6.1` selects the same release). The form `.../releases/latest/download/get-vesselstack.sh`
+The URL pins release `v0.6.2`, so it installs that release whatever GitHub marks as Latest
+(`--version 0.6.2` selects the same release). The form `.../releases/latest/download/get-vesselstack.sh`
 points to whichever release GitHub marks Latest, which is not necessarily the newest one. For a
 lab Pi and an offline boat, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 

@@ -3,9 +3,7 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
-
-Planned for 0.6.2 (`VERSION` is not bumped here).
+## 0.6.2 - 2026-11-07
 
 ### Highlights
 
@@ -34,23 +32,39 @@ Planned for 0.6.2 (`VERSION` is not bumped here).
   folder.
 - Tests: the VesselTwin preload listing assertion no longer depends on filesystem directory order.
 
-### Upgrade notes
-
-This cannot help the upgrade that delivers it: the Control Panel worker uses the controller and panel
-that are already installed. For the upgrade to 0.6.2, mount the drive by hand or run the update from a
-terminal with `get-vesselstack.sh`. Rollback: unmount with `umount`; there is nothing to undo in
-`/etc/fstab` or `vesselstack.env`.
-
-### Displays
+### Displays (preview)
 
 - The Control Panel Displays tab can now edit and apply: pick a colour theme, edit page titles, layouts and items (add from the data list with the reasons shown when something does not fit, optional "Count in alarm banner"), **Save** (with a conflict check against changes made elsewhere), then **Apply to screen** over USB or Wi-Fi with a progress stepper and `To fix:` hints, and **History** with **Restore** and **Put previous firmware back on screen**. New Control Panel endpoints `POST /api/displays/save|deploy|restore|rollback` and `GET /api/displays/history` (token, Origin and JSON-only checks, payloads on stdin). Deploys and rollbacks hold the lifecycle slot, so backups, updates and settings changes wait. Wi-Fi (OTA) updates are not yet verified on hardware; the first flash must be USB. Downgrading: run `set-theme ID classic` first. Hardening: a Wi-Fi upload to an address other than the last successful one needs an explicit confirmation (the firmware holds the Wi-Fi password; `confirm_new_target` on `/api/displays/deploy` and `/rollback`, otherwise 400); **Put previous firmware back** is offered only when the previous image matches the current settings and credentials (restore the matching saved copy first); `--ota` and the panel reject `%` scope ids and the ESPHome names `ota` and `serial` (any case); redaction covers the `secrets.yaml` spelling of non-ASCII Wi-Fi names; `firmware.prev/` is never deleted without a `firmware/` to replace it and a failed `last-flash.json` write removes the stale record; a new notification never counts in the alarm banner unless chosen. Apply is not blocked by a missing builder image (a to-do, with a `To fix:` hint if the deploy fails offline).
 - New `vesselstackctl display deploy ID (--ota HOST | --serial DEVICE) [--progress]`: builds only when the stored firmware is out of date and uploads it, all under one build lock, so a retry after a failed upload does not recompile. `--progress` prints `STAGE: render|compile|upload|done`; known failures end with `To fix:` lines; Wi-Fi and MQTT/OTA/API secrets are replaced with `[redacted]` in everything the command prints. `flash` and `deploy` now record each successful upload in the root-only `build/displays/ID/last-flash.json` (when, how, target, image and version; no secret), `display show --json` reports it (`readiness.last_flash`, `readiness.firmware.rollback_possible`), and a deploy never moves a firmware that was never uploaded into `firmware.prev/`. Wi-Fi (OTA) updates are not yet verified on hardware. Rollback: `display restore-config STAMP`, then `display flash ID --previous`; an older VesselStack ignores `last-flash.json`.
 - The Control Panel has a **Displays** tab. For each display it shows the name, board, colour theme and whether the latest changes are on the screen (On screen, Changes not on screen, Never flashed, Not built, Unknown), a readiness checklist with the exact command for anything missing, its pages, and an approximate preview of every page in the display's theme with a Day/Night switch and a severity switch. A searchable list of the Signal K values a page can show is marked Live, No live data, Uncatalogued or Used on a display, with the live value when there is one. It reads `GET /api/displays`, `/api/displays/themes`, `/api/displays/catalog[?live=1]` (cached for 30 s) and `/api/displays/serial-ports`, each of which runs one fixed `vesselstackctl display ... --json` command with a 12 s limit, needs the Control Panel token and never returns a stored password, Wi-Fi detail or token. Editing and applying from the tab are described in the entry above; a newer panel can be undone by reinstalling the previous release. New `vesselstackctl display list --json` prints only each display's id, name, board and page count.
 
-- Display data catalog and page-editing commands used by the Control Panel Displays tab: `vesselstackctl display catalog [--live] --json` (about forty common Signal K values with the right units for `BOAT_UNITS`, merged with what is configured and, with `--live`, with what your Signal K server really publishes; positions, MMSI, names and destinations are never read or stored), `show ID --json`, `set-pages ID --if-revision SHA --stdin`, `history --json`, `restore-config STAMP` and `serial-ports --json`. Every change is validated, backed up to `config/displays-backups/` (newest 20, root-only) and restarts the displays bridge only when it reads something that changed. Suggested alarm limits are listed but never applied unless you choose them. Rollback: `display restore-config STAMP`, which refuses a backup whose set of displays differs from the current one (use `display add` / `display remove`, then restore again). `catalog --live` is now bounded to 10 s in total even against a server that answers very slowly. The `ocean` theme (unreleased) uses darker severity tiles with white text so its labels stay legible; rebuild and reflash an `ocean` display.
+- Display data catalog and page-editing commands used by the Control Panel Displays tab: `vesselstackctl display catalog [--live] --json` (about forty common Signal K values with the right units for `BOAT_UNITS`, merged with what is configured and, with `--live`, with what your Signal K server really publishes; positions, MMSI, names and destinations are never read or stored), `show ID --json`, `set-pages ID --if-revision SHA --stdin`, `history --json`, `restore-config STAMP` and `serial-ports --json`. Every change is validated, backed up to `config/displays-backups/` (newest 20, root-only) and restarts the displays bridge only when it reads something that changed. Suggested alarm limits are listed but never applied unless you choose them. Rollback: `display restore-config STAMP`, which refuses a backup whose set of displays differs from the current one (use `display add` / `display remove`, then restore again). `catalog --live` is now bounded to 10 s in total even against a server that answers very slowly. The `ocean` theme uses darker severity tiles with white text so its labels stay legible; rebuild and reflash an `ocean` display.
 - The `high-contrast` display theme's warning tile is now dark amber with white text, so its label is readable on it (it was unreadable on the old bright amber). Rebuild and reflash a display that uses `high-contrast` to get it. Theme validation now also requires every theme except `classic` to keep its label legible on severity tiles.
 - Instrument displays can use a colour theme per display: `classic` (the default, unchanged), `high-contrast`, `daylight` and `ocean`. List them with `vesselstackctl display themes [--json]` and choose one with `sudo vesselstackctl display set-theme ID THEME` (`ui.theme` in `displays.json`), then rebuild and reflash that display. Night mode keeps the red palette on every theme and the alarm banner is not themed. A display on `classic` (or without `ui.theme`) generates byte-identical firmware, so nothing needs reflashing. **Before downgrading VesselStack, run `set-theme ID classic` on every themed display:** older versions reject the `theme` key and the displays bridge exits.
 - Display colours and tile shape come from `displays/themes.json`.
+
+### Upgrade notes
+
+- **Backup choices cannot help the upgrade that delivers them.** The Control Panel worker uses the
+  controller and panel that are already installed. For the upgrade to 0.6.2, mount the drive by hand
+  or run the update from a terminal with `get-vesselstack.sh`. Rollback: unmount with `umount`; there
+  is nothing to undo in `/etc/fstab` or `vesselstack.env`.
+- **Displays are a preview and optional.** Installs that do not enable displays (`DISPLAYS_ENABLE`
+  unset or `false`) are unaffected. Wi-Fi (OTA) display updates are not yet verified on hardware; flash
+  each display over USB first and treat OTA as a lab test (see the Wi-Fi update rehearsal in
+  `docs/DEPLOYMENT.md`).
+- **Before downgrading below 0.6.2**, run `sudo vesselstackctl display set-theme ID classic` for every
+  themed display (a display on `classic` or without `ui.theme` needs nothing). Older versions reject the
+  `theme` key and the displays bridge exits with status 2. Downgrades are otherwise refused by the
+  installer; restore the verified pre-update backup. A newer panel's display editing is undone by
+  reinstalling the previous release; `display restore-config STAMP` and `display flash ID --previous`
+  roll back display settings and firmware.
+
+### Release status
+
+`v0.6.2` is an SSH-signed tag verified by the release workflow against `.github/allowed_signers`.
+It is published first as a pre-release and marked Latest after the maintainer's physical
+Raspberry Pi install passes.
 
 ## 0.6.1 - 2026-11-02
 
