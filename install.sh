@@ -1163,7 +1163,7 @@ tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -c
 # Shared stdlib-only modules (sign-in store and CLI helper). Root-owned and
 # not writable by anyone else: the panel and vesselstackctl load them as root.
 install -d -m 0755 "$VESSELSTACK_ROOT/common"
-install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$VESSELSTACK_ROOT/common/"
+install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$SOURCE_ROOT/common/qrcodegen.py" "$VESSELSTACK_ROOT/common/"
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
 # GNU tar run as root keeps the archive's modes, which are only as readable as the

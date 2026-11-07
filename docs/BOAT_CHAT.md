@@ -32,6 +32,19 @@ sudo vesselstackctl devices revoke ID chat   # or: devices revoke-all chat
 sudo vesselstackctl passphrase clear chat    # passphrase sign-in off; the access code still works
 ```
 
+To sign a phone in without typing, make a single-use pairing link and QR code (valid 10 minutes, then it is gone):
+
+```bash
+sudo vesselstackctl panel-link --for chat               # access rights
+sudo vesselstackctl panel-link --for chat --admin       # also the admin-code rights (settings changes)
+```
+
+or use **Pair a phone to Boat Chat** in the Control Panel (Settings, Sign-in). The phone opens the link (or
+types the `XXXXX-XXXXX` code under **Have a pairing code?** in Connect) and stays signed in for 30 days. An
+admin device passes the admin-code checks, so it can change settings and the passphrase without the code.
+Boat Chat only redeems pairings (`POST /api/auth/pair`); it never creates them. Treat the QR code as a
+password while it is valid: whoever scans it first gets the device.
+
 You can also set it in Boat Chat under **Settings, Sign-in** (after connecting with the access code).
 **Connect** then asks for the passphrase with **Remember this device (30 days)** (otherwise 12 hours);
 the access code sits under **Use the access code instead**. Settings, Sign-in lists signed-in devices

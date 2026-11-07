@@ -1396,6 +1396,68 @@ class SignInApiTests(DisplaysApiBase):
     def device(self, token):
         return {"X-VesselStack-Device": token, **self.origin}
 
+    # -- pairing links ------------------------------------------------------
+    def make_pairing(self, target="panel", admin=False, headers=None):
+        body = {"for": target, "admin": admin}
+        return self.call("POST", "/api/auth/pairing", body, headers or {**self.tokenh(), **self.origin})
+
+    def redeem(self, code, **extra):
+        return self.call("POST", "/api/auth/pair", {"code": code, **extra}, self.origin)
+
+    def test_pairing_matrix_requires_auth_and_origin(self) -> None:
+        self.assertEqual(self.call("POST", "/api/auth/pairing", {"for": "panel"}, self.origin)[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/pairing", {"for": "panel"}, self.tokenh())[0], 403, "Origin is mandatory")
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": "ABCDE-FGHJK"})[0], 403, "redeeming needs an Origin too")
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": "ABCDE-FGHJK"}, {"Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.make_pairing("nope")[0], 400)
+        self.assertEqual(self.make_pairing("panel", admin=True)[0], 400, "admin pairing is Boat Chat only")
+
+    def test_panel_pairing_round_trip_is_single_use(self) -> None:
+        status, link, _ = self.make_pairing()
+        self.assertEqual(status, 200, link)
+        self.assertRegex(link["code"], r"^[0-9A-Z]{5}-[0-9A-Z]{5}$")
+        self.assertTrue(link["tunnel"])
+        self.assertIn("#pair=" + link["code"].replace("-", ""), link["url"])
+        size = len(link["modules"])
+        self.assertTrue(all(len(row) == size for row in link["modules"]))
+        self.assertNotIn(link["code"].replace("-", ""), (self.root / "config" / "control-panel-auth.json").read_text())
+        status, paired, headers = self.redeem(link["code"].lower(), label="Pixel", remember=False)
+        self.assertEqual(status, 200, paired)
+        self.assertEqual(set(paired), {"device_token", "device_id", "expires_at", "remember"})
+        self.assertTrue(paired["remember"], "remember is ignored; pair links always remember")
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(paired["device_token"]))[0], 200)
+        self.assertEqual(self.redeem(link["code"])[0], 401, "single use")
+
+    def test_bad_pairing_codes_are_throttled(self) -> None:
+        results = [self.redeem("ZZZZZ-ZZZZZ")[0] for _ in range(8)]
+        self.assertEqual(results.count(401), panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(results.count(429), 8 - panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+
+    def test_chat_pairing_is_written_to_the_chat_store_with_role(self) -> None:
+        data = self.root / "data"
+        (data / "boat-chat").mkdir(parents=True)
+        env = self.root / "vesselstack.env"
+        env.write_text(f'VESSELSTACK_DATA="{data}"\n')
+        chat_env = self.root / "boat-chat.env"
+        chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\n')
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+            status, link, _ = self.make_pairing("chat", admin=True)
+        self.assertEqual(status, 200, link)
+        self.assertTrue(link["url"].startswith("http://198.51.100.9:8765/#pair="))
+        self.assertFalse(link["tunnel"])
+        stored = json.loads((data / "boat-chat" / "auth.json").read_text())
+        self.assertEqual([p["role"] for p in stored["pairings"]], ["admin"])
+        self.assertNotIn(link["code"].replace("-", ""), json.dumps(stored))
+        for _ in range(2):
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+                self.assertEqual(self.make_pairing("chat")[0], 200)
+            pass
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+            status, body, _ = self.make_pairing("chat")
+        self.assertEqual(status, 400, "at most three outstanding")
+        self.assertIn("already waiting", body["error"])
+
     def test_status_leaks_only_whether_a_passphrase_is_set(self) -> None:
         status, payload, _ = self.call("GET", "/api/auth/status")
         self.assertEqual((status, payload), (200, {"passphrase_set": False}))

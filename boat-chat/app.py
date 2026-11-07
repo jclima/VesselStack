@@ -5297,6 +5297,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             addr = ipaddress.ip_address(self.client_address[0])
         except ValueError:
             return False, "unrecognized client address"
+        if self.admin_device():
+            return True, ""
         token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
         if token:
             # A configured settings token is required from every address.
@@ -5355,10 +5357,15 @@ class BoatChatHandler(BaseHTTPRequestHandler):
     def needs_host_check(self, path: str) -> bool:
         return path.startswith("/api/auth/") or bool((self.headers.get("X-Boat-Chat-Device") or "").strip())
 
+    def admin_device(self) -> bool:
+        """A signed-in device paired with admin rights (role "admin") stands in for the admin code."""
+        device = self.device_context()
+        return bool(device and device.get("role") == "admin")
+
     def admin_code_supplied(self) -> bool:
         token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
-        return bool(token) and token_matches(provided, token)
+        return (bool(token) and token_matches(provided, token)) or self.admin_device()
 
     def access_allowed(self) -> bool:
         if not access_token_required():
@@ -5461,6 +5468,22 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 LOGIN_THROTTLE.success(matched)
                 token, device = store.create_device(payload.get("label"), remember, role="access")
                 self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": remember, "role": device["role"]}); return
+            if path == "/api/auth/pair":
+                payload = self.read_json_body()
+                code_text = payload.get("code")
+                if not isinstance(code_text, str) or not code_text:
+                    raise ValueError("code (text) is required")
+                allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)
+                if not allowed:
+                    self.too_many(wait)
+                    return
+                code = vsauth.normalize_pairing_code(code_text)
+                result = store.redeem_pairing(code, payload.get("label")) if code else None
+                if result is None:
+                    self.send_json(401, {"error": "That pairing code was not accepted or has expired."}); return
+                LOGIN_THROTTLE.success(attempt)
+                token, device = result
+                self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": True, "role": device["role"]}); return
             if path == "/api/auth/passphrase":
                 payload = self.read_json_body()
                 if store.passphrase_set() and not self.admin_code_supplied():
@@ -5638,7 +5661,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         if self.needs_host_check(path) and not self.host_allowed():
             return
         origin = self.headers.get("Origin")
-        if not origin and (path in {"/api/auth/login", "/api/auth/passphrase"} or (self.headers.get("X-Boat-Chat-Device") or "").strip()):
+        if not origin and (path in {"/api/auth/login", "/api/auth/passphrase", "/api/auth/pair"} or (self.headers.get("X-Boat-Chat-Device") or "").strip()):
             # Passphrase changes and device-authenticated writes must come from a page that names its origin.
             self.send_json(403, {"error": "request origin is not allowed"})
             return

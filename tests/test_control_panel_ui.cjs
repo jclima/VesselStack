@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const appSource = fs.readFileSync('control-panel/static/app.js', 'utf8');
 const html = fs.readFileSync('control-panel/static/index.html', 'utf8');
 const css = fs.readFileSync('control-panel/static/styles.css', 'utf8');
-const source = appSource + '\nthis.__ui = { passphraseLogin, deviceLabel, signedIn, renderSignIn, savePassphrase, revokeDevices, state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, askBackupChoice, confirmWithBackup, backupOptions, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, newDraft, draftDirty, draftProblems, titleProblem, addCheck, addRowToDraft, removeItem, removePage, addPage, moveWithin, savePayload, draftShow, geometryFor, otaTargetProblem, serialProblem, uploadRequest, isNewOtaTarget, parseStages, applyBlock, defaultOtaTarget, defaultMethod, deployPanel, saveDraft, startEditing, stopEditing, applyToScreen, runDisplayAction, onDisplaysInput, openApplyDialog, renderHistory, loadHistory, restoreBackup, formatStamp, pageEditor, saveBar, rowAddControls, entryById, displaysDirty, layoutChoices, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
+const source = appSource + '\nthis.__ui = { normalizePairingCode, takePairFragment, redeemPairing, renderPairing, passphraseLogin, deviceLabel, signedIn, renderSignIn, savePassphrase, revokeDevices, state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, askBackupChoice, confirmWithBackup, backupOptions, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, newDraft, draftDirty, draftProblems, titleProblem, addCheck, addRowToDraft, removeItem, removePage, addPage, moveWithin, savePayload, draftShow, geometryFor, otaTargetProblem, serialProblem, uploadRequest, isNewOtaTarget, parseStages, applyBlock, defaultOtaTarget, defaultMethod, deployPanel, saveDraft, startEditing, stopEditing, applyToScreen, runDisplayAction, onDisplaysInput, openApplyDialog, renderHistory, loadHistory, restoreBackup, formatStamp, pageEditor, saveBar, rowAddControls, entryById, displaysDirty, layoutChoices, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
 const nodes = new Map();
 // A small element tree, enough to build and read back the Displays tab without a browser.
 class FakeEl {
@@ -55,7 +55,8 @@ backupDialog.showModal = function showModal() {
 backupDialog.close = function close(value) { this.returnValue = value; this.open = false; if (this.onclose) this.onclose(); };
 let fetchImpl = async () => ({ ok: true, json: async () => ({ configuration: context.__ui.state.config }) });
 const context = {
-  console, setTimeout: () => 0, clearTimeout() {},
+  console, location: { hash: '', pathname: '/', search: '' }, history: { calls: [], replaceState(...args) { this.calls.push(args); context.location.hash = ''; } },
+  setTimeout: () => 0, clearTimeout() {},
   localStorage: { values: {}, getItem(key) { return this.values[key] || ''; }, setItem(key, value) { this.values[key] = value; }, removeItem(key) { delete this.values[key]; } },
   sessionStorage: { values: {}, getItem(key) { return this.values[key] || ''; }, setItem(key, value) { this.values[key] = value; }, removeItem(key) { delete this.values[key]; } },
   window: { addEventListener() {}, confirm: () => { throw new Error('window.confirm must not be used'); }, location: { reload() {} } },
@@ -1079,6 +1080,43 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
     ui.lock(true);
     assert.doesNotMatch(appSource, /document\.cookie/, 'device tokens never use cookies');
     assert.doesNotMatch(appSource, /innerHTML\s*=\s*[^;]*device/, 'device rows are built with textContent only');
+  }
+
+  // ---- pairing links --------------------------------------------------------
+  {
+    assert.equal(ui.normalizePairingCode('abcde-fghjk'), 'ABCDEFGHJK');
+    assert.equal(ui.normalizePairingCode(' oilo1 l0ilo '), '0110110110', 'O reads as 0, I and L as 1');
+    assert.equal(ui.normalizePairingCode('short'), '');
+    assert.equal(ui.normalizePairingCode('ABCDE-FGHJU'), '', 'U is not in the alphabet');
+    // The fragment leaves the address bar before anything is requested.
+    const requests = [];
+    fetchImpl = async (path, options = {}) => { requests.push({ path, options, hashAtRequest: context.location.hash }); return ok({ device_token: 'paired-token-0123456789abcdef', device_id: 'dev1' }); };
+    context.location.hash = '#pair=abcde-fghjk';
+    const taken = ui.takePairFragment();
+    assert.equal(taken, 'abcde-fghjk');
+    assert.equal(context.location.hash, '', 'fragment removed from the URL');
+    assert.equal(context.history.calls.length, 1);
+    assert.equal(requests.length, 0, 'nothing was requested before the fragment was stripped');
+    assert.equal(ui.takePairFragment(), '', 'no fragment, no code');
+    ui.state.token = ''; ui.state.device = '';
+    assert.equal(await ui.redeemPairing(taken), true); await tick();
+    const pair = requests.find((item) => item.path === '/api/auth/pair');
+    assert.equal(pair.hashAtRequest, '', 'the request was made after the fragment was gone');
+    assert.deepEqual(Object.keys(JSON.parse(pair.options.body)).sort(), ['code', 'label']);
+    assert.equal(JSON.parse(pair.options.body).code, 'ABCDEFGHJK');
+    assert.equal(context.localStorage.getItem('vesselstack_device_token'), 'paired-token-0123456789abcdef', 'pair links always remember the device');
+    assert.equal(ui.state.device, 'paired-token-0123456789abcdef');
+    requests.length = 0;
+    assert.equal(await ui.redeemPairing('nope'), false);
+    assert.equal(requests.length, 0, 'a malformed code is not sent');
+    // The QR renders as one SVG path built by DOM calls only.
+    const host = node('#pair-result');
+    ui.renderPairing({ url: 'http://boat.local:8780/#pair=ABCDEFGHJK', code: 'ABCDE-FGHJK', expires_at: Math.floor(Date.now() / 1000) + 600, modules: [[1, 0], [0, 1]], for: 'panel', admin: false, tunnel: false });
+    const svg = host.children.find((child) => child.tagName === 'svg');
+    assert.equal(svg.getAttribute('viewBox'), '-2 -2 6 6');
+    assert.equal(svg.children[1].getAttribute('d'), 'M0 0h1v1h-1zM1 1h1v1h-1z');
+    assert.equal(svg.find((el) => 'style' in el.attrs).length, 0, 'no inline style on the QR');
+    ui.lock(true);
   }
   console.log('control-panel UI regression checks passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -1157,6 +1157,23 @@ release; older versions ignore `control-panel-auth.json` and only the token work
 `sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
 [Control Panel guide](docs/CONTROL_PANEL.md).
 
+**Pairing links and QR codes (unreleased):** `sudo vesselstackctl panel-link [--for panel|chat] [--admin]
+[--label TEXT]` prints a single-use link (`http://HOST:PORT/#pair=CODE`, `$(hostname).local` plus each IPv4
+address; the SSH-tunnel form when the service is loopback-only), the code as `XXXXX-XXXXX`, its expiry and a
+terminal QR code. The Control Panel offers the same under Settings, Sign-in, **Pair a phone**
+(`POST /api/auth/pairing`, authenticated, `Origin` required, returns the link, code, expiry and QR module
+matrix; the panel writes the Boat Chat store through the privilege-dropping path). Redemption is
+`POST /api/auth/pair` on both services (same `Origin`/`Host` rules and throttle as login). Codes are 10
+Crockford base32 characters, only their SHA-256 is stored, they are single use, last 10 minutes, at most 3 may
+wait per store, and a redeemed link always remembers the device for 30 days. `--admin` (Boat Chat only) makes
+an admin device that passes the admin-code checks. **Security notes:** the QR code is a credential for 10
+minutes, so show it only to the person pairing; the code travels in the URL fragment (never sent to the
+server or logged) and the page removes it from the address bar before doing anything else; the link is plain
+HTTP on the boat network. Requires the vendored `common/qrcodegen.py` (Nayuki, MIT; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). **Rollback:** reinstall the previous release; older
+versions ignore the `pairings` list and the extra file. **Verify:** `sudo vesselstackctl panel-link`, then scan
+it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
+
 ![Control Panel Home tab](docs/images/control-panel-home.png)
 
 - **Home** is status only: services running or stopped, the last backup and backup drive (read-only;

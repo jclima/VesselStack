@@ -96,6 +96,12 @@
           <p>Your Boat Chat access code stays in this tab and is cleared when you disconnect.</p>
           <label>Access code <input id="connect-token" type="password" autocomplete="off" /></label>
         </details>
+        <details id="pair-block">
+          <summary>Have a pairing code?</summary>
+          <p>Type the code from <code>sudo vesselstackctl panel-link --for chat</code> or from the Control Panel.</p>
+          <label>Pairing code <input id="connect-pair-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDE-FGHJK" /></label>
+          <button id="connect-pair-submit" type="button">Pair this device</button>
+        </details>
         <p id="connect-message" role="status"></p>
         <footer class="dialog-footer"><button id="disconnect-device" type="button">Disconnect</button><button type="submit">Connect</button></footer>
       </form>
@@ -414,6 +420,6 @@
         <div id="insights-content" class="insights-content">Loading Boat Hub…</div>
       </section>
     </dialog>
-    <script src="/app.js?v=20261107-signin"></script>
+    <script src="/app.js?v=20261107-pairing"></script>
   </body>
 </html>

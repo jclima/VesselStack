@@ -171,13 +171,13 @@ class StoreTests(unittest.TestCase):
         other.revoke_all()
         self.assertIsNone(self.store.verify_device_token(token), "second writer's change is seen via mtime")
 
-    def test_unknown_keys_such_as_pairings_survive_writes(self) -> None:
+    def test_unknown_keys_survive_writes(self) -> None:
         self.store.set_passphrase(PASS)
         data = json.loads(self.path.read_text())
-        data["pairings"] = [{"id": "p"}]
+        data["future"] = [{"id": "p"}]
         self.path.write_text(json.dumps(data))
         self.store.create_device("a", False)
-        self.assertEqual(json.loads(self.path.read_text())["pairings"], [{"id": "p"}])
+        self.assertEqual(json.loads(self.path.read_text())["future"], [{"id": "p"}])
 
 
 class ThrottleTests(unittest.TestCase):
@@ -400,6 +400,96 @@ class StoreHardeningTests(unittest.TestCase):
         Store(self.path, inherit_owner=True).set_passphrase(PASS)
 
 
+class PairingStoreTests(unittest.TestCase):
+    def store(self, clock=None, **kwargs):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return auth.AuthStore(Path(tmp.name) / "auth.json", clock=clock or Clock(), **kwargs)
+
+    def test_code_format_and_normalisation(self) -> None:
+        codes = {auth.new_pairing_code() for _ in range(50)}
+        self.assertEqual(len(codes), 50)
+        for code in codes:
+            self.assertRegex(code, r"^[0-9A-HJKMNP-TV-Z]{10}$")
+        self.assertEqual(auth.format_pairing_code("ABCDEFGHJK"), "ABCDE-FGHJK")
+        self.assertEqual(auth.normalize_pairing_code("abcde-fghjk"), "ABCDEFGHJK")
+        self.assertEqual(auth.normalize_pairing_code(" abcde fghjk "), "ABCDEFGHJK")
+        self.assertEqual(auth.normalize_pairing_code("OILOI-LOILO"), "0110110110")
+        for bad in ("", "short", "ABCDEFGHJKM", "ABCDE-FGHJU", None, 7, "ABCDE-FGHJ!"):
+            self.assertIsNone(auth.normalize_pairing_code(bad))
+
+    def test_only_the_hash_is_stored_and_redeem_is_single_use(self) -> None:
+        store = self.store(expose_role=True)
+        code, expires = store.create_pairing("access", "Crew phone")
+        raw = store.path.read_text()
+        self.assertNotIn(code, raw)
+        self.assertIn(auth.token_digest(code), raw)
+        token, device = store.redeem_pairing(code, "Pixel")
+        self.assertEqual((device["role"], device["label"]), ("access", "Pixel"))
+        self.assertEqual(device["expires"] - device["created"], auth.REMEMBER_SECONDS, "pair links always remember 30 days")
+        self.assertEqual(store.verify_device_token(token)["id"], device["id"])
+        self.assertIsNone(store.redeem_pairing(code, "again"), "single use")
+        self.assertEqual(store.snapshot()["pairings"], [])
+
+    def test_expiry_and_max_outstanding_and_pruning(self) -> None:
+        clock = Clock()
+        store = self.store(clock, expose_role=True)
+        codes = [store.create_pairing()[0] for _ in range(auth.MAX_PAIRINGS)]
+        with self.assertRaises(auth.AuthError):
+            store.create_pairing()
+        clock.now += auth.PAIRING_TTL_SECONDS + 1
+        self.assertIsNone(store.redeem_pairing(codes[0], "late"), "expired")
+        fresh = store.create_pairing()[0]  # expired ones were pruned
+        self.assertEqual(store.pending_pairings(), 1)
+        self.assertIsNotNone(store.redeem_pairing(fresh, "x"))
+
+    def test_role_propagation_and_panel_cannot_issue_admin(self) -> None:
+        chat = self.store(expose_role=True)
+        code, _ = chat.create_pairing("admin")
+        _, device = chat.redeem_pairing(code, "Skipper")
+        self.assertEqual(device["role"], "admin")
+        with self.assertRaises(auth.AuthError):
+            self.store().create_pairing("admin")
+
+    def test_device_limit_does_not_burn_the_code(self) -> None:
+        store = self.store()
+        for _ in range(auth.MAX_DEVICES):
+            store.create_device("x", True)
+        code, _ = store.create_pairing()
+        with self.assertRaises(auth.DeviceLimitError):
+            store.redeem_pairing(code, "x")
+        self.assertEqual(store.pending_pairings(), 1)
+
+    def test_pairings_survive_other_writes_and_are_cleared_by_revoke_all(self) -> None:
+        store = self.store()
+        store.create_pairing()
+        store.set_passphrase(PASS)
+        self.assertEqual(store.pending_pairings(), 1)
+        store.revoke_all()
+        self.assertEqual(store.pending_pairings(), 0)
+
+    def test_links_and_terminal_qr(self) -> None:
+        loop = auth.pairing_urls("ABCDEFGHJK", "127.0.0.1", 8780)
+        self.assertEqual(loop, {"urls": ["http://127.0.0.1:8780/#pair=ABCDEFGHJK"], "tunnel": True})
+        lan = auth.pairing_urls("ABCDEFGHJK", "0.0.0.0", 8765, hostname="boat.local", addresses=["198.51.100.5", "198.51.100.7"])
+        self.assertEqual(lan["urls"], ["http://boat.local:8765/#pair=ABCDEFGHJK", "http://198.51.100.5:8765/#pair=ABCDEFGHJK", "http://198.51.100.7:8765/#pair=ABCDEFGHJK"])
+        self.assertEqual(auth.pairing_urls("ABCDEFGHJK", "198.51.100.5", 80)["urls"], ["http://198.51.100.5:80/#pair=ABCDEFGHJK"])
+        url = "http://boat.local:8780/#pair=ABCDEFGHJK"
+        matrix = auth.qr_matrix(url)
+        size = len(matrix)
+        self.assertEqual(size, 29, "version 3 for this URL at level L")
+        self.assertTrue(all(len(row) == size for row in matrix))
+        finder = [[1] * 7, [1, 0, 0, 0, 0, 0, 1], [1, 0, 1, 1, 1, 0, 1], [1, 0, 1, 1, 1, 0, 1], [1, 0, 1, 1, 1, 0, 1], [1, 0, 0, 0, 0, 0, 1], [1] * 7]
+        for ox, oy in ((0, 0), (size - 7, 0), (0, size - 7)):
+            self.assertEqual([row[ox:ox + 7] for row in matrix[oy:oy + 7]], finder)
+        text = auth.qr_terminal(url, color=False)
+        lines = text.splitlines()
+        self.assertEqual(len(lines), (size + 4 + 1) // 2)
+        self.assertTrue(all(len(line) == size + 4 for line in lines))
+        self.assertIn("\x1b[30;47m", auth.qr_terminal(url, color=True))
+        self.assertNotIn("ABCDEFGHJK", text)
+
+
 class ChatScopeTests(unittest.TestCase):
     def test_chat_store_minimum_roles_and_distinct_passphrases(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -489,6 +579,52 @@ class CliTests(unittest.TestCase):
     def test_pipe_without_stdin_flag_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             self.assertEqual(self.run_cli(root, ["passphrase", "set", "panel"], PASS + "\n")[0], 2)
+
+
+class PairLinkCliTests(unittest.TestCase):
+    def run_cli(self, args, env_extra=None):
+        cli = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        data = Path(self.tmp.name) / "data"
+        (data / "boat-chat").mkdir(parents=True)
+        out, err = io.StringIO(), io.StringIO()
+        env = {"VESSELSTACK_ROOT": self.tmp.name, "VESSELSTACK_DATA": str(data), **(env_extra or {})}
+        with mock.patch.dict(os.environ, env):
+            code = cli.main(args, io.StringIO(), out, err)
+        return code, out.getvalue(), err.getvalue(), data
+
+    def test_panel_link_on_loopback_prints_tunnel_form_code_and_qr(self) -> None:
+        code, out, err, _ = self.run_cli(["panel-link"], {"VS_PANEL_HOST": "127.0.0.1", "VS_PANEL_PORT": "8780"})
+        self.assertEqual((code, err), (0, ""))
+        import re
+        match = re.search(r"http://127\.0\.0\.1:8780/#pair=([0-9A-Z]{10})", out)
+        self.assertTrue(match, out)
+        self.assertIn(f"{match.group(1)[:5]}-{match.group(1)[5:]}", out)
+        self.assertIn("ssh -L 8780:127.0.0.1:8780", out)
+        self.assertIn("panel-access lan", out)
+        self.assertIn("\u2580", out + "\u2580")  # QR block characters are present
+        self.assertRegex(out, "[\u2580\u2584\u2588]")
+        self.assertNotIn("passphrase_hash", out)
+        self.assertNotIn("token_sha256", out)
+
+    def test_chat_admin_link_and_validation(self) -> None:
+        code, out, err, data = self.run_cli(["panel-link", "--for", "chat", "--admin", "--label", "Skipper"], {"VS_CHAT_HOST": "198.51.100.9", "VS_CHAT_PORT": "8765"})
+        self.assertEqual(code, 0, err)
+        self.assertIn("http://198.51.100.9:8765/#pair=", out)
+        self.assertIn("(admin)", out)
+        stored = json.loads((data / "boat-chat" / "auth.json").read_text())
+        self.assertEqual([p["role"] for p in stored["pairings"]], ["admin"])
+        self.assertEqual(self.run_cli(["panel-link", "--admin"])[0], 2)
+        self.assertEqual(self.run_cli(["panel-link", "--for", "nope"])[0], 2)
+        self.assertEqual(self.run_cli(["panel-link", "--bogus"])[0], 2)
+
+    def test_fourth_link_is_refused(self) -> None:
+        cli = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.dict(os.environ, {"VESSELSTACK_ROOT": root, "VESSELSTACK_DATA": root}):
+                codes = [cli.main(["panel-link"], None, io.StringIO(), io.StringIO()) for _ in range(4)]
+        self.assertEqual(codes, [0, 0, 0, 1])
 
 
 if __name__ == "__main__":

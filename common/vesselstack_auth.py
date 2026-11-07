@@ -122,8 +122,32 @@ def clean_label(label: Any) -> str:
     return text[:MAX_LABEL_LENGTH] or "Unnamed device"
 
 
+PAIRING_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O, U
+PAIRING_CODE_LENGTH = 10
+PAIRING_TTL_SECONDS = 600
+MAX_PAIRINGS = 3
+
+
+def new_pairing_code() -> str:
+    return "".join(secrets.choice(PAIRING_ALPHABET) for _ in range(PAIRING_CODE_LENGTH))
+
+
+def normalize_pairing_code(text: Any) -> str | None:
+    """Canonical code from what a person typed (case, dashes, spaces ignored; I/L -> 1, O -> 0), else None."""
+    if not isinstance(text, str) or len(text) > 64:
+        return None
+    cleaned = "".join(ch for ch in text.upper() if ch not in "- \t\r\n").translate(str.maketrans("ILO", "110"))
+    if len(cleaned) != PAIRING_CODE_LENGTH or any(ch not in PAIRING_ALPHABET for ch in cleaned):
+        return None
+    return cleaned
+
+
+def format_pairing_code(code: str) -> str:
+    return f"{code[:5]}-{code[5:]}"
+
+
 def _empty() -> dict[str, Any]:
-    return {"schema": SCHEMA, "passphrase_hash": None, "devices": []}
+    return {"schema": SCHEMA, "passphrase_hash": None, "devices": [], "pairings": []}
 
 
 def _normalize(data: Any) -> dict[str, Any]:
@@ -142,6 +166,13 @@ def _normalize(data: Any) -> dict[str, Any]:
                 "role": item.get("role") if item.get("role") in ROLES else "access",
             })
     result["devices"] = devices
+    pairings = []
+    for item in result.get("pairings") or []:
+        if isinstance(item, dict) and isinstance(item.get("code_sha256"), str) and isinstance(item.get("id"), str):
+            pairings.append({"id": item["id"], "code_sha256": item["code_sha256"], "label": clean_label(item.get("label")) if item.get("label") else "",
+                             "created": int(item.get("created") or 0), "expires": int(item.get("expires") or 0),
+                             "role": item.get("role") if item.get("role") in ROLES else "access"})
+    result["pairings"] = pairings
     return result
 
 
@@ -393,27 +424,72 @@ class AuthStore:
             count = len(data["devices"])
             data["passphrase_hash"] = None
             data["devices"] = []
+            data["pairings"] = []
             return count
         return self.transaction(mutate)
 
     # -- devices -----------------------------------------------------------
+    def _add_device(self, data: dict[str, Any], digest: str, label: Any, remember: bool, role: str, now: int) -> dict[str, Any]:
+        data["devices"] = [d for d in data["devices"] if d["expires"] > now]
+        if len(data["devices"]) >= MAX_DEVICES:
+            raise DeviceLimitError(f"This boat already has {MAX_DEVICES} signed-in devices. Revoke one in Settings, or on the boat computer with: sudo vesselstackctl devices list")
+        device = {"id": secrets.token_hex(6), "token_sha256": digest, "label": clean_label(label),
+                  "created": now, "last_seen": now, "expires": now + (REMEMBER_SECONDS if remember else SESSION_SECONDS),
+                  "role": role if role in ROLES else "access"}
+        data["devices"].append(device)
+        return device
+
     def create_device(self, label: Any, remember: bool, role: str = "access") -> tuple[str, dict[str, Any]]:
         token = secrets.token_urlsafe(32)
         digest = token_digest(token)
         now = int(self.clock())
-        lifetime = REMEMBER_SECONDS if remember else SESSION_SECONDS
+        device = self.transaction(lambda data: self._add_device(data, digest, label, remember, role, now))
+        return token, self.public_device(device)
 
-        def mutate(data: dict[str, Any]) -> dict[str, Any]:
-            data["devices"] = [d for d in data["devices"] if d["expires"] > now]
-            if len(data["devices"]) >= MAX_DEVICES:
-                raise DeviceLimitError(f"This boat already has {MAX_DEVICES} signed-in devices. Revoke one in Settings, or on the boat computer with: sudo vesselstackctl devices list")
-            device = {"id": secrets.token_hex(6), "token_sha256": digest, "label": clean_label(label),
-                      "created": now, "last_seen": now, "expires": now + lifetime,
-                      "role": role if role in ROLES else "access"}
-            data["devices"].append(device)
+    # -- pairing links -----------------------------------------------------
+    def create_pairing(self, role: str = "access", label: Any = "") -> tuple[str, int]:
+        """Record a single-use pairing code (only its SHA-256 is stored). Returns (code, expires_epoch)."""
+        if role not in ROLES or (role == "admin" and not self.expose_role):
+            raise AuthError("Admin pairing is only available for Boat Chat.")
+        code = new_pairing_code()
+        digest = token_digest(code)
+        now = int(self.clock())
+        expires = now + PAIRING_TTL_SECONDS
+        text = clean_label(label) if label else ""
+
+        def mutate(data: dict[str, Any]) -> int:
+            data["pairings"] = [p for p in data["pairings"] if p["expires"] > now]
+            if len(data["pairings"]) >= MAX_PAIRINGS:
+                raise AuthError(f"{MAX_PAIRINGS} pairing links are already waiting to be used. They expire after 10 minutes.")
+            data["pairings"].append({"id": secrets.token_hex(6), "code_sha256": digest, "label": text,
+                                     "created": now, "expires": expires, "role": role})
+            return expires
+        return code, self.transaction(mutate)
+
+    def redeem_pairing(self, code: str, label: Any) -> tuple[str, dict[str, Any]] | None:
+        """Exchange a valid code for a remembered device (single use). None when the code is unknown or expired."""
+        digest = token_digest(code)
+        token = secrets.token_urlsafe(32)
+        token_hash = token_digest(token)
+        now = int(self.clock())
+
+        def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+            data["pairings"] = [p for p in data["pairings"] if p["expires"] > now]
+            found = None
+            for record in data["pairings"]:  # compare every record so timing does not reveal a match
+                if hmac.compare_digest(record["code_sha256"], digest):
+                    found = record
+            if found is None:
+                return None
+            device = self._add_device(data, token_hash, label or found.get("label"), True, found["role"], now)
+            data["pairings"] = [p for p in data["pairings"] if p["id"] != found["id"]]
             return device
         device = self.transaction(mutate)
-        return token, self.public_device(device)
+        return None if device is None else (token, self.public_device(device, role=True))
+
+    def pending_pairings(self) -> int:
+        now = int(self.clock())
+        return sum(1 for p in self.snapshot()["pairings"] if p["expires"] > now)
 
     def verify_device_token(self, token: Any) -> dict[str, Any] | None:
         if not isinstance(token, str) or not (20 <= len(token) <= 128):
@@ -457,6 +533,7 @@ class AuthStore:
         def mutate(data: dict[str, Any]) -> int:
             before = len(data["devices"])
             data["devices"] = [d for d in data["devices"] if keep and d["id"] == keep]
+            data["pairings"] = []
             return before - len(data["devices"])
         return self.transaction(mutate)
 
@@ -731,3 +808,88 @@ def discover_local_names() -> set[str]:
 def _literal(address: str) -> str:
     address = address.split("%", 1)[0].lower()
     return f"[{address}]" if ":" in address else address
+
+
+# -- pairing links and QR codes ------------------------------------------------
+
+def local_ipv4_addresses() -> list[str]:
+    """Non-loopback IPv4 addresses this machine currently has (best effort, no packets are sent)."""
+    found: list[str] = []
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(item[4][0])
+    except OSError:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))
+            found.append(probe.getsockname()[0])
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    result: list[str] = []
+    for address in found:
+        if address and not address.startswith("127.") and not address.startswith("169.254.") and address not in result:
+            result.append(address)
+    return result
+
+
+def pairing_urls(code: str, bind_host: str, port: int, *, hostname: str | None = None,
+                 addresses: list[str] | None = None) -> dict[str, Any]:
+    """URLs that carry ``code`` in the fragment (never sent to the server or logged).
+
+    Loopback listener: only the SSH-tunnel form. Otherwise ``hostname.local`` first, then each IPv4 address
+    (just the bound address when the service listens on one specific interface)."""
+    bind = (bind_host or "").strip().lower()
+    if _is_loopback(bind):
+        return {"urls": [f"http://127.0.0.1:{port}/#pair={code}"], "tunnel": True}
+    try:
+        name = (hostname if hostname is not None else socket.gethostname()).split(".", 1)[0].strip()
+    except OSError:
+        name = ""
+    hosts: list[str] = []
+    if _is_wildcard(bind):
+        if name:
+            hosts.append(f"{name}.local")
+        hosts += addresses if addresses is not None else local_ipv4_addresses()
+    else:
+        hosts.append(bind)
+    if not hosts:
+        hosts.append("127.0.0.1")
+    return {"urls": [f"http://{host}:{port}/#pair={code}" for host in hosts], "tunnel": False}
+
+
+def load_qrcodegen() -> Any:
+    import importlib.util
+    path = Path(__file__).with_name("qrcodegen.py")
+    spec = importlib.util.spec_from_file_location("vesselstack_qrcodegen", path)
+    if not spec or not spec.loader or not path.is_file():
+        raise StoreError("the QR code module is missing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def qr_matrix(text: str) -> list[list[int]]:
+    """Module matrix (1 = dark) for ``text``, error correction level L (short URLs stay small and easy to scan)."""
+    qr = load_qrcodegen()
+    code = qr.QrCode.encode_text(text, qr.QrCode.Ecc.LOW)
+    size = code.get_size()
+    return [[1 if code.get_module(x, y) else 0 for x in range(size)] for y in range(size)]
+
+
+def qr_terminal(text: str, *, color: bool = True, border: int = 2) -> str:
+    """Half-block rendering: two module rows per text line. ``color`` forces black-on-white so dark terminals scan."""
+    matrix = qr_matrix(text)
+    size = len(matrix)
+
+    def dark(x: int, y: int) -> bool:
+        return 0 <= x < size and 0 <= y < size and bool(matrix[y][x])
+    glyphs = {(False, False): " ", (True, False): "\u2580", (False, True): "\u2584", (True, True): "\u2588"}
+    lines = []
+    for y in range(-border, size + border, 2):
+        row = "".join(glyphs[(dark(x, y), dark(x, y + 1))] for x in range(-border, size + border))
+        lines.append(f"\x1b[30;47m{row}\x1b[0m" if color else row)
+    return "\n".join(lines)

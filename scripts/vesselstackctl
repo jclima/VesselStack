@@ -43,6 +43,9 @@ Commands:
                                argument). Setting or clearing signs every device out.
   devices list|revoke ID|revoke-all [panel|chat]
                                Show or sign out devices remembered by the Control Panel or Boat Chat
+  panel-link [--for panel|chat] [--admin] [--label TEXT]
+                               Print a single-use, 10-minute pairing link, code and QR code that signs a
+                               phone in without typing (--admin: Boat Chat admin rights)
   display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports|validate|sync-mqtt [ARGUMENTS]
                                Manage instrument displays, generate their ESPHome
                                projects and optionally build/flash firmware on this
@@ -2222,7 +2225,15 @@ uninstall_stack() {
 auth_command() {
     local helper="$VESSELSTACK_ROOT/common/vesselstack_authctl.py"
     [ -r "$helper" ] || { echo "Missing sign-in tool: $helper" >&2; return 1; }
-    PYTHONDONTWRITEBYTECODE=1 VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" python3 "$helper" "$@"
+    local panel_host panel_port chat_host chat_port
+    panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
+    panel_port=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_PORT)
+    chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
+    chat_port=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_PORT)
+    PYTHONDONTWRITEBYTECODE=1 VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        VS_PANEL_HOST="${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}" VS_PANEL_PORT="${panel_port:-${CONTROL_PANEL_PORT:-8780}}" \
+        VS_CHAT_HOST="${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}" VS_CHAT_PORT="${chat_port:-${BOAT_CHAT_PORT:-8765}}" \
+        python3 "$helper" "$@"
 }
 
 [ $# -gt 0 ] || { usage; exit 2; }
@@ -2258,5 +2269,6 @@ case "$command" in
     uninstall) uninstall_stack "$@" ;;
     display) [ $# -ge 1 ] || { usage; exit 2; }; display_command "$@" ;;
     passphrase|devices) [ $# -ge 1 ] || { usage; exit 2; }; auth_command "$command" "$@" ;;
+    panel-link) auth_command panel-link "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
 esac

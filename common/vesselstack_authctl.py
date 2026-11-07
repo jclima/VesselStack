@@ -59,6 +59,7 @@ def usage() -> str:
         "  vesselstackctl devices list [panel|chat]\n"
         "  vesselstackctl devices revoke ID [panel|chat]\n"
         "  vesselstackctl devices revoke-all [panel|chat]\n"
+        "  vesselstackctl panel-link [--for panel|chat] [--admin] [--label TEXT]\n"
     )
 
 
@@ -70,6 +71,15 @@ def main(argv: list[str], stdin: TextIO | None = None, out: TextIO | None = None
     stdin, out, err = stdin or sys.stdin, out or sys.stdout, err or sys.stderr
     auth = load_auth()
     args = list(argv)
+    if args and args[0] == "panel-link":
+        try:
+            return panel_link_command(auth, stores_for(auth), args[1:], out, err)
+        except auth.AuthError as exc:
+            err.write(f"{exc}\n")
+            return 1
+        except (auth.StoreError, OSError) as exc:
+            err.write(f"Sign-in store problem: {exc}\n")
+            return 1
     if len(args) < 2:
         err.write(usage())
         return 2
@@ -100,6 +110,57 @@ def scope_ok(rest: list[str], err: TextIO, *, required: bool) -> bool:
 
 
 NAMES = {"panel": "Control Panel", "chat": "Boat Chat"}
+
+
+def listener(scope: str) -> tuple[str, int]:
+    """(bind host, port) of the service, as passed in by vesselstackctl (the env files are the source of truth)."""
+    prefix = "VS_PANEL" if scope == "panel" else "VS_CHAT"
+    host = os.environ.get(prefix + "_HOST") or ("127.0.0.1" if scope == "panel" else "0.0.0.0")
+    try:
+        port = int(os.environ.get(prefix + "_PORT") or (8780 if scope == "panel" else 8765))
+    except ValueError:
+        port = 8780 if scope == "panel" else 8765
+    return host, port
+
+
+def panel_link_command(auth: Any, stores: dict[str, Any], rest: list[str], out: TextIO, err: TextIO) -> int:
+    scope, admin, label, index = "panel", False, "", 0
+    while index < len(rest):
+        item = rest[index]
+        if item == "--for" and index + 1 < len(rest):
+            scope = rest[index + 1]
+            index += 2
+        elif item == "--admin":
+            admin = True
+            index += 1
+        elif item == "--label" and index + 1 < len(rest):
+            label = rest[index + 1]
+            index += 2
+        else:
+            err.write(usage())
+            return 2
+    if scope not in SCOPES:
+        err.write(usage())
+        return 2
+    if admin and scope != "chat":
+        err.write("--admin only applies to --for chat.\n")
+        return 2
+    code, expires = stores[scope].create_pairing("admin" if admin else "access", label)
+    host, port = listener(scope)
+    links = auth.pairing_urls(code, host, port)
+    role = "admin" if admin else "access"
+    out.write(f"{NAMES[scope]} pairing link ({role}). Valid once, until {stamp(expires)} (10 minutes).\n\n")
+    for url in links["urls"]:
+        out.write(f"  {url}\n")
+    if links["tunnel"]:
+        out.write(f"\n{NAMES[scope]} listens on this computer only. From the phone or laptop first open a tunnel:\n"
+                  f"  ssh -L {port}:127.0.0.1:{port} USER@BOAT-HOSTNAME\n"
+                  + ("or let the boat network reach it with: sudo vesselstackctl panel-access lan\n" if scope == "panel" else
+                     "or set BOAT_CHAT_HOST to the boat network address.\n"))
+    out.write(f"\nOr type this code on the sign-in screen: {auth.format_pairing_code(code)}\n\n")
+    out.write(auth.qr_terminal(links["urls"][0], color=bool(getattr(out, "isatty", lambda: False)())) + "\n\n")
+    out.write("Anyone who scans or opens this before it is used or expires gets a signed-in device. Keep it private.\n")
+    return 0
 
 
 def passphrase_command(auth: Any, stores: dict[str, Any], verb: str, rest: list[str], stdin: TextIO, out: TextIO, err: TextIO) -> int:

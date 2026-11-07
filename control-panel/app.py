@@ -74,6 +74,15 @@ def chat_passphrase_hash() -> str | None:
         return None
 
 
+def chat_auth_store() -> Any:
+    """Boat Chat's store, written only through the privilege-dropping path (the panel runs as root)."""
+    data_dir = parse_env(VESSEL_ENV).get("VESSELSTACK_DATA") or ""
+    if not data_dir:
+        raise vsauth.StoreError("VESSELSTACK_DATA is not configured")
+    return vsauth.AuthStore(Path(data_dir) / "boat-chat" / vsauth.CHAT_STORE_NAME, min_passphrase=vsauth.CHAT_MIN_PASSPHRASE_LENGTH,
+                            expose_role=True, inherit_owner=True)
+
+
 def auth_store() -> Any:
     path = ROOT / "config" / vsauth.STORE_NAME
     key = str(path)
@@ -1508,6 +1517,54 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         except (vsauth.StoreError, OSError):
             self.send_json(500, {"error": "The sign-in store could not be used."})
 
+    def post_auth_pair(self) -> None:
+        """Redeem a pairing code for a remembered device. Same throttle, Origin and Host rules as login."""
+        store = auth_store()
+        ip = self.client_ip()
+        try:
+            payload = self.read_payload()
+            code_text, label = payload.get("code"), payload.get("label")
+            if not isinstance(code_text, str) or not code_text:
+                raise ValueError("code (text) is required")
+            allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)
+            if not allowed:
+                self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                return
+            code = vsauth.normalize_pairing_code(code_text)
+            result = store.redeem_pairing(code, label) if code else None
+            if result is None:
+                self.send_json(401, {"error": "That pairing code was not accepted or has expired."})
+                return
+            LOGIN_THROTTLE.success(attempt)
+            token, device = result
+            self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": True})
+        except vsauth.DeviceLimitError as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
+
+    def post_auth_pairing(self, payload: dict[str, Any]) -> None:
+        """Create a pairing link for the panel or Boat Chat (authenticated)."""
+        target, admin = payload.get("for", "panel"), payload.get("admin", False)
+        if target not in {"panel", "chat"} or not isinstance(admin, bool) or (admin and target != "chat"):
+            raise ValueError('for ("panel" or "chat") and admin (true only with chat) are required')
+        label = payload.get("label")
+        if label is not None and not isinstance(label, str):
+            raise ValueError("label must be text")
+        if target == "panel":
+            store, bind, port = auth_store(), self.server.server_address[0], int(self.server.server_address[1])
+        else:
+            store = chat_auth_store()
+            chat = parse_env(CHAT_ENV)
+            bind = chat.get("BOAT_CHAT_HOST") or "0.0.0.0"
+            port = int(chat.get("BOAT_CHAT_PORT") or 8765)
+        code, expires = store.create_pairing("admin" if admin else "access", label or "")
+        links = vsauth.pairing_urls(code, str(bind), port)
+        self.send_json(200, {"url": links["urls"][0], "urls": links["urls"], "tunnel": links["tunnel"], "code": vsauth.format_pairing_code(code),
+                             "expires_at": expires, "modules": vsauth.qr_matrix(links["urls"][0]), "for": target, "admin": admin})
+
     def post_auth(self, path: str, payload: dict[str, Any]) -> None:
         store = auth_store()
         context = self.auth_context() or {}
@@ -1530,6 +1587,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                     self.send_json(200, {"ok": True, "revoked": 1, "revoked_current": target == current})
                 else:
                     raise ValueError('id (a device id or "all") is required')
+            elif path == "/api/auth/pairing":
+                self.post_auth_pairing(payload)
             elif path == "/api/auth/passphrase":
                 new = payload.get("new")
                 if store.passphrase_set() and context.get("kind") != "token":
@@ -1546,7 +1605,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "revoked_others": revoked})
             else:
                 self.send_json(404, {"error": "Not found"})
-        except vsauth.AuthError as exc:
+        except (vsauth.AuthError, ValueError) as exc:
             self.send_json(400, {"error": str(exc)})
         except (vsauth.StoreError, OSError):
             self.send_json(500, {"error": "The sign-in store could not be used."})
@@ -1695,7 +1754,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             return
         path = urllib.parse.urlparse(self.path).path
         origin = self.headers.get("Origin")
-        if path in {"/api/auth/login", "/api/auth/passphrase"} and not origin:
+        if path in {"/api/auth/login", "/api/auth/passphrase", "/api/auth/pair", "/api/auth/pairing"} and not origin:
             # Sign-in changes must come from a page that names its origin, whichever credential it carries.
             self.send_json(403, {"error": "request origin is not allowed"})
             return
@@ -1710,6 +1769,9 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 return
         if path == "/api/auth/login":
             self.post_auth_login()
+            return
+        if path == "/api/auth/pair":
+            self.post_auth_pair()
             return
         if not self.require_auth():
             return

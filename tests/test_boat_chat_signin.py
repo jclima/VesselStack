@@ -238,3 +238,54 @@ class MatrixAndHostTests(SignInCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PairingTests(SignInCase):
+    def pair_store(self):
+        return app.chat_auth_store()
+
+    def redeem(self, code, **extra):
+        return self.call("POST", "/api/auth/pair", {"code": code, **extra})
+
+    def test_pair_round_trip_roles_and_single_use(self):
+        store = self.pair_store()
+        code, _ = store.create_pairing("access")
+        status, body = self.redeem(auth_format(code), label="Crew phone", remember=False)
+        self.assertEqual((status, body["role"], body["remember"]), (200, "access", True))
+        status, devices = self.call("GET", "/api/auth/devices", headers=self.device(body["device_token"]))
+        self.assertEqual((status, devices["devices"][0]["label"]), (200, "Crew phone"))
+        self.assertEqual(self.redeem(code)[0], 401, "single use")
+
+    def test_matrix_origin_host_and_bad_codes(self):
+        code, _ = self.pair_store().create_pairing("access")
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": code}, origin=False)[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": code}, host="evil.example")[0], 421)
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": 5})[0], 400)
+        self.assertEqual(self.redeem("not a code")[0], 401)
+        self.assertEqual(self.redeem(code)[0], 200, "the real code still works after a typo")
+
+    def test_bad_codes_are_throttled(self):
+        results = [self.redeem("ZZZZZ-ZZZZZ")[0] for _ in range(8)]
+        self.assertEqual(results.count(401), app.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(results.count(429), 8 - app.vsauth.LoginThrottle.IP_FREE_FAILURES)
+
+    def test_admin_device_passes_admin_checks_and_access_device_does_not(self):
+        self.set_passphrase()
+        store = self.pair_store()
+        admin = self.redeem(store.create_pairing("admin")[0])[1]
+        access = self.redeem(store.create_pairing("access")[0])[1]
+        self.assertEqual(admin["role"], "admin")
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
+        status, body = self.call("POST", "/api/settings", {"settings": {}}, self.device(access["device_token"]))
+        self.assertEqual(status, 403, body)
+        status, body = self.call("POST", "/api/settings", {"settings": {}}, self.device(admin["device_token"]))
+        self.assertNotEqual(status, 403, body)
+        # an admin device may set the crew passphrase without the admin code or the current passphrase
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": "another crew pass"}, self.device(admin["device_token"]))
+        self.assertEqual(status, 200, body)
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": "third crew pass", "current": "wrong"}, self.device(access["device_token"]))
+        self.assertIn(status, (401, 403))
+
+
+def auth_format(code):
+    return code[:5].lower() + "-" + code[5:].lower()

@@ -41,6 +41,14 @@
         <p class="small muted">Or unlock with the long token below, then set one under Settings, Sign-in.</p>
       </div>
       <p id="login-error" class="field-err" role="alert"></p>
+      <details id="pair-disclosure" class="disc">
+        <summary>Have a pairing code?</summary>
+        <form id="pair-form" novalidate>
+          <label for="pair-code">Pairing code</label>
+          <div class="tokrow"><input id="pair-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDE-FGHJK"><button class="primary" type="submit">Pair this device</button></div>
+          <p class="small muted">Get one with <span class="mono">sudo vesselstackctl panel-link</span> on the boat computer, or from Settings, Sign-in on a device that is already signed in.</p>
+        </form>
+      </details>
       <details id="token-disclosure" class="disc">
         <summary>Use the long token instead</summary>
         <p>Paste the Control Panel token from your boat computer. It stays in this browser tab only.</p>
@@ -107,6 +115,12 @@
             <p id="signin-error" class="field-err" role="alert"></p>
             <button type="submit" class="primary" id="passphrase-save">Set passphrase</button>
           </form>
+          <h3>Pair a phone</h3>
+          <p class="small muted">Make a single-use link and QR code (valid 10 minutes) so a phone signs in without typing. Pairing the Control Panel from a phone needs <span class="mono">sudo vesselstackctl panel-access lan</span> on the boat computer when the panel only listens on this computer.</p>
+          <div class="pair-actions"><button type="button" id="pair-panel">Pair a device to the Control Panel</button><button type="button" id="pair-chat">Pair a phone to Boat Chat</button></div>
+          <label class="sw show-token"><input type="checkbox" id="pair-admin"><span class="track"></span><span class="txt"><strong>with admin rights (Boat Chat only)</strong></span></label>
+          <p id="pair-error" class="field-err" role="alert"></p>
+          <div id="pair-result" aria-live="polite"></div>
           <h3>Signed-in devices</h3>
           <p class="small muted">Devices that unlocked with the passphrase. Remembered devices stay signed in for 30 days from sign-in. Revoking one signs it out immediately.</p>
           <div id="signin-root" aria-live="polite"></div>

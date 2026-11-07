@@ -61,7 +61,7 @@ for required_asset in \
     }
 done
 for required_runtime in \
-    common/vesselstack_auth.py common/vesselstack_authctl.py \
+    common/vesselstack_auth.py common/vesselstack_authctl.py common/qrcodegen.py \
     boat-chat/display_units.py boat-chat/telemetry_indexer.py \
     systemd/vesselstack-telemetry-indexer.timer systemd/vesselstack-telemetry-sample.service.in \
     systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml; do

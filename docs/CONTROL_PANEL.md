@@ -83,8 +83,32 @@ it arrives, so a burst of simultaneous guesses cannot slip past the limit.
 > **Anyone on the network can pause passphrase sign-in.** Because the pause is
 > global (so a shared tunnel address cannot be used to guess slowly), anyone who
 > can reach the panel can trigger a 15-minute passphrase lockout by sending wrong
-> passphrases. The long token (and, later, pairing links) keeps working during
-> it. This is an accepted trade-off; keep the panel on the SSH tunnel.
+> passphrases. The long token keeps working during it. This is an accepted trade-off; keep the panel on the SSH tunnel.
+
+### Pair a phone (link or QR code)
+
+Skip typing entirely: make a **pairing link** and scan it.
+
+```bash
+sudo vesselstackctl panel-link                        # sign a device in to the Control Panel
+sudo vesselstackctl panel-link --for chat             # sign a phone in to Boat Chat
+sudo vesselstackctl panel-link --for chat --admin --label Skipper   # Boat Chat with admin rights
+```
+
+It prints the link (`http://boat.local:PORT/#pair=CODE` plus one line per boat-network IPv4 address), the
+code to type as `XXXXX-XXXXX`, the expiry time and a QR code you can scan with the phone camera. When the
+panel only listens on this computer (the default) it prints the tunnel form
+`http://127.0.0.1:8780/#pair=CODE` with an `ssh -L` hint; pairing a phone directly needs
+`sudo vesselstackctl panel-access lan` first. In an unlocked panel use **Settings, Sign-in, Pair a phone**:
+**Pair a device to the Control Panel** or **Pair a phone to Boat Chat** (optionally with admin rights) shows
+the QR code, link, code and a 10-minute countdown. On the unlock screen, **Have a pairing code?** accepts the
+typed code (case, dashes and spaces are ignored; I and L read as 1, O as 0).
+
+A pairing is single use, expires after 10 minutes, and at most three can be waiting at once. Opening the link
+signs that browser in as a remembered device (30 days) and removes the code from the address bar. Wrong codes
+count against the same throttle as passphrases. **Treat the QR code as a password for 10 minutes**: whoever
+scans it first gets in. The link is plain HTTP on your boat network; the code sits in the URL fragment, which
+browsers never send to the server, so it is not logged.
 
 **Host names.** The panel answers only requests whose `Host` names this
 machine (`127.0.0.1`, `localhost`, `[::1]`, and with `panel-access lan` also the

@@ -194,6 +194,7 @@ test ! -e "$APP_ROOT/config/displays.json"
 test ! -e "$APP_ROOT/displays/.venv"
 test -s "$APP_ROOT/control-panel/app.py"
 test -s "$APP_ROOT/common/vesselstack_auth.py"
+test -s "$APP_ROOT/common/qrcodegen.py"
 test -s "$APP_ROOT/installer/common/vesselstack_authctl.py"
 test "$(stat -c '%a' "$APP_ROOT/common/vesselstack_auth.py")" = 644
 test -s "$APP_ROOT/installer/install.sh"

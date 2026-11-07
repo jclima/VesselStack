@@ -440,3 +440,5 @@ dialog .keep{margin:.2rem 0 .5rem}
 .device-row{display:flex;gap:.75rem;align-items:center;justify-content:space-between;padding:.6rem 0;border-top:1px solid var(--line)}
 .device-row .d{display:flex;flex-direction:column;gap:.15rem;min-width:0}
 .device-row .chip{align-self:flex-start;font-size:.75rem;padding:.05rem .5rem;border:1px solid var(--line);border-radius:999px}
+.pair-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0}
+.qr{display:block;width:min(16rem,100%);height:auto;background:#fff;border-radius:.5rem}

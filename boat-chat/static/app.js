@@ -1,3 +1,12 @@
+// A pairing link carries its code in the fragment. Remove it from the address bar and history before anything is requested.
+const PAIR_FRAGMENT = (() => {
+  try {
+    const match = /(?:^|[#&])pair=([^&]*)/.exec(location.hash || "");
+    if (!match) return "";
+    history.replaceState(null, "", location.pathname + location.search);
+    return decodeURIComponent(match[1]);
+  } catch { return ""; }
+})();
 if (new URLSearchParams(window.location.search).get("embedded") === "ha") {
   document.documentElement.dataset.embedded = "ha";
 }
@@ -366,6 +375,33 @@ document.querySelector("#connect-form").addEventListener("submit",async(event)=>
     const data=await response.json(); sessionStorage.setItem("boatChatAccessToken",token); field.value=""; connectionState="connected";renderBoatStatus(data);message.textContent="";connectDialog.close();
   } catch(error) { message.textContent=error.message; }
 });
+
+// What a person typed (case, dashes and spaces ignored; I/L read as 1, O as 0) -> canonical code, or "".
+function normalizePairingCode(text) {
+  const cleaned = String(text || "").toUpperCase().replace(/[\s-]/g, "").replace(/[IL]/g, "1").replace(/O/g, "0");
+  return cleaned.length === 10 && [...cleaned].every((ch) => "0123456789ABCDEFGHJKMNPQRSTVWXYZ".includes(ch)) ? cleaned : "";
+}
+async function redeemPairing(raw, fromLink) {
+  const message = document.querySelector("#connect-message");
+  const code = normalizePairingCode(raw);
+  if (fromLink) { connectDialog.showModal(); }
+  if (!code) { message.textContent = "That pairing code doesn't look right. It has 10 letters and numbers, like ABCDE-FGHJK."; return false; }
+  message.textContent = "Pairing…";
+  try {
+    const response = await fetch("/api/auth/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, label: (navigator.userAgent || "").slice(0, 60) }), signal: AbortSignal.timeout(15000) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(response.status === 429 ? `Too many attempts. Try again in ${Math.ceil((data.retry_after || 60) / 60)} minute(s).` : response.status === 421 ? "This address is not recognised by the boat. Use the boat's usual address." : response.status === 401 ? "That pairing code was not accepted or has expired. Ask for a new one." : data.error || "Pairing failed.");
+    saveDeviceToken(data.device_token, true);
+    document.querySelector("#connect-pair-code").value = "";
+    const status = await fetch("/api/status", { signal: AbortSignal.timeout(10000) });
+    if (status.ok) { connectionState = "connected"; renderBoatStatus(await status.json()); }
+    message.textContent = ""; if (connectDialog.open) connectDialog.close();
+    return true;
+  } catch (error) { message.textContent = error.message; document.querySelector("#connect-pair-code").value = ""; return false; }
+}
+document.querySelector("#connect-pair-submit").addEventListener("click", () => redeemPairing(document.querySelector("#connect-pair-code").value, false));
+document.querySelector("#connect-pair-code").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); redeemPairing(event.target.value, false); } });
+if (PAIR_FRAGMENT) redeemPairing(PAIR_FRAGMENT, true);
 setInterval(()=>{if(!document.hidden) {ageText();loadBoatStatus();}},30000);
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)loadBoatStatus();});
 window.addEventListener("online",loadBoatStatus);

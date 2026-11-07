@@ -380,6 +380,8 @@ function lock(force = false) {
   $("#notice").innerHTML = "";
   $("#release-result").innerHTML = "";
   resetDisplays();
+  clearTimeout(pairing.timer);
+  $("#pair-result").replaceChildren();
   sessionStorage.removeItem("vesselstack_control_token");
   $("#app").hidden = true;
   $("#lock").hidden = true;
@@ -591,6 +593,89 @@ async function revokeDevices(target) {
     loadSignIn();
   } catch (failure) {
     if (failure.status === 401) requireReauth("Your session ended."); else toast(failure.message, true);
+  }
+}
+
+
+// ---------------------------------------------------------------- pairing links
+
+const PAIR_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+// What a person typed (case, dashes and spaces ignored; I/L read as 1, O as 0) -> canonical code, or "".
+function normalizePairingCode(text) {
+  const cleaned = String(text || "").toUpperCase().replace(/[\s-]/g, "").replace(/[IL]/g, "1").replace(/O/g, "0");
+  return cleaned.length === 10 && [...cleaned].every((ch) => PAIR_ALPHABET.includes(ch)) ? cleaned : "";
+}
+
+// Reads #pair=CODE and removes it from the address bar and history BEFORE anything is requested.
+function takePairFragment() {
+  if (typeof location === "undefined" || !location.hash) return "";
+  const match = /(?:^|[#&])pair=([^&]*)/.exec(location.hash);
+  if (!match) return "";
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (_error) { /* the fragment may stay visible */ }
+  try { return decodeURIComponent(match[1]); } catch (_error) { return ""; }
+}
+
+async function redeemPairing(raw) {
+  const code = normalizePairingCode(raw);
+  if (!code) { loginError("That pairing code doesn't look right. It has 10 letters and numbers, like ABCDE-FGHJK."); return false; }
+  loginError("");
+  try {
+    const result = await api("/api/auth/pair", { method: "POST", body: JSON.stringify({ code, label: deviceLabel() }) });
+    forgetDevice();
+    try { localStorage.setItem(DEVICE_KEY, result.device_token); } catch (_error) { /* kept in memory for this page only */ }
+    $("#pair-code").value = "";
+    state.token = "";
+    state.device = result.device_token;
+    state.deviceId = result.device_id;
+    unlock();
+    return true;
+  } catch (error) {
+    $("#pair-code").value = "";
+    if (error.status === 429) loginError(`Too many attempts. Try again in ${formatWait(error.retryAfter)}, or use the long token.`);
+    else if (error.status === 401) loginError("That pairing code was not accepted or has expired. Ask for a new one.");
+    else loginError(`Couldn't pair this device (${error.message}).`);
+    return false;
+  }
+}
+
+const pairing = { timer: null, expires: 0 };
+
+function renderPairing(result) {
+  const root = $("#pair-result");
+  clearTimeout(pairing.timer);
+  pairing.expires = result.expires_at;
+  const size = result.modules.length;
+  let path = "";
+  result.modules.forEach((row, y) => row.forEach((cell, x) => { if (cell) path += `M${x} ${y}h1v1h-1z`; }));
+  const tick = () => {
+    const left = Math.max(0, Math.round(pairing.expires - Date.now() / 1000));
+    const clock = $("#pair-countdown");
+    if (clock) clock.textContent = left > 0 ? `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}. Works once.` : "Expired.";
+    if (left > 0) pairing.timer = setTimeout(tick, 1000); else root.replaceChildren();
+  };
+  const target = result.for === "chat" ? "Boat Chat" : "the Control Panel";
+  root.replaceChildren(
+    h("p", { class: "small", text: `Scan with the phone camera to sign it in to ${target}${result.admin ? " with admin rights" : ""}.` }),
+    sv("svg", { class: "qr", viewBox: `-2 -2 ${size + 4} ${size + 4}`, role: "img", "aria-label": "Pairing QR code", "shape-rendering": "crispEdges" },
+      sv("rect", { x: -2, y: -2, width: size + 4, height: size + 4, fill: "#fff" }),
+      sv("path", { d: path, fill: "#000" })),
+    h("p", {}, h("a", { href: result.url, class: "mono", text: result.url })),
+    h("p", {}, "Or type this code on the sign-in screen: ", h("strong", { class: "mono", text: result.code })),
+    h("p", { id: "pair-countdown", class: "small muted" }),
+    result.tunnel ? h("p", { class: "small", text: "This service only listens on this computer. A phone cannot reach it directly: open an SSH tunnel, or run sudo vesselstackctl panel-access lan on the boat computer (Boat Chat: set BOAT_CHAT_HOST)." }) : null,
+    h("p", { class: "small muted", text: "Anyone who scans this before it expires gets a signed-in device. The link is plain HTTP on your boat network." }));
+  tick();
+}
+
+async function createPairing(target) {
+  const error = $("#pair-error");
+  error.textContent = "";
+  try {
+    const result = await api("/api/auth/pairing", { method: "POST", body: JSON.stringify({ for: target, admin: target === "chat" && Boolean($("#pair-admin").checked), label: "" }) });
+    renderPairing(result);
+  } catch (failure) {
+    if (failure.status === 401) requireReauth("Your session ended.");
+    else error.textContent = failure.message;
   }
 }
 
@@ -2532,6 +2617,9 @@ $("#passphrase").addEventListener("input", () => loginError(""));
 $("#passphrase-form").addEventListener("submit", (event) => { event.preventDefault(); passphraseLogin(); });
 $("#device-label").value = deviceLabel();
 $("#signin-form").addEventListener("submit", savePassphrase);
+$("#pair-form").addEventListener("submit", (event) => { event.preventDefault(); redeemPairing($("#pair-code").value); });
+$("#pair-panel").addEventListener("click", () => createPairing("panel"));
+$("#pair-chat").addEventListener("click", () => createPairing("chat"));
 $("#signin-root").addEventListener("click", (event) => {
   const one = event.target.closest && event.target.closest("[data-revoke-device]");
   if (one) { revokeDevices(one.dataset.revokeDevice); return; }
@@ -2630,7 +2718,11 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && si
 
 window.addEventListener("beforeunload", (event) => { if (isConfigDirty() || displaysDirty()) { event.preventDefault(); event.returnValue = ""; } });
 
-if (state.token) {
+const pairFragment = takePairFragment();
+if (pairFragment) {
+  // The code left the address bar above; redeem it before anything else is requested.
+  redeemPairing(pairFragment).then((paired) => { if (!paired) refreshAuthStatus(); });
+} else if (state.token) {
   $("#token").value = state.token;
   unlock();
 } else if (state.device) {
