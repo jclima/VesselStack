@@ -796,6 +796,7 @@ nano vesselstack.env
 | `TELEMETRY_INDEXER_ENABLE` | Enable five-minute current/power sampling and thirty-minute history refreshes |
 | `NODE_EXPORTER_ENABLE` | Optional private host metrics exporter; disabled by default; available in the wizard's advanced settings |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
+| `CONTROL_PANEL_ALLOWED_HOSTS` | Extra `Host` names the panel accepts (comma separated `name` or `name:port`); loopback and, in LAN mode, the machine's own names and addresses are always allowed |
 | `MQTT_USERNAME`, `MQTT_PASSWORD` | Mosquitto administrator account; the username may contain letters, numbers, `.`, `_` and `-` (1-64), and a custom password must not contain `:` or leading/trailing whitespace |
 | `DISPLAYS_ENABLE` | `false` by default; `true` adds the displays bridge and per-display MQTT accounts (see [MQTT access control](#mqtt-access-control)) |
 | `DISPLAYS_BRIDGE_MQTT_USERNAME` | Bridge account name, 1-64 letters, numbers, dot, underscore or hyphen; default `vesselstack-bridge`; must differ from `MQTT_USERNAME` (the Control Panel rejects a collision when displays are enabled, and the installer preflight rejects it) |
@@ -1124,6 +1125,13 @@ sessions, including while passphrase sign-in is paused by the brute-force limits
 address start a growing wait up to 15 minutes; over 20 failures in 15 minutes pause passphrase sign-in
 for 15 minutes). **Operational impact:** a new root-owned module `common/vesselstack_auth.py` is
 installed with the panel, nothing is migrated and passphrase sign-in stays off until you set one.
+Attempts are counted atomically when they arrive, and the panel now refuses any request whose `Host`
+header is not this machine (`127.0.0.1`, `localhost`, `[::1]`; with `panel-access lan` also the
+hostname, `hostname.local` and the current interface addresses, refreshed every 60 s), each with the
+panel port, answering `421`; add other names with `CONTROL_PANEL_ALLOWED_HOSTS` (comma separated,
+`name` or `name:port`) in `config/control-panel.env`. `/api/auth/login` and `/api/auth/passphrase`
+require an `Origin` matching `Host` whatever the credential. **Known trade-off:** the global pause means
+anyone on the network can trigger a 15-minute passphrase lockout; the token keeps working during it.
 **Limitation:** on plain HTTP (`panel-access lan`) the passphrase and device token cross the network
 unencrypted, so keep the SSH tunnel. **Lost passphrase or locked out:** unlock with the token or run
 `passphrase set panel` / `passphrase clear panel` on the boat. **Rollback:** reinstall the previous

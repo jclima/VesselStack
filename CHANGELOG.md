@@ -17,9 +17,17 @@ Semantic Versioning.
   no CORS) and device POSTs require a matching `Origin`; per-address backoff plus a global 15-minute pause
   after 20 failures (the token still works). New root-owned shared module `common/vesselstack_auth.py`
   and helper `common/vesselstack_authctl.py`.
+- Security review fixes: passphrase attempts are counted atomically (`LoginThrottle.begin`) so concurrent
+  guesses cannot outrun the limit; the Control Panel rejects requests whose `Host` is not this machine
+  (DNS-rebinding guard, `421`; extra names via `CONTROL_PANEL_ALLOWED_HOSTS`); `/api/auth/login` and
+  `/api/auth/passphrase` always require a matching `Origin`. Documented: the global pause lets anyone on
+  the network trigger a 15-minute passphrase lockout (the token still works).
 
 ### Upgrade notes
 
+- Reaching the panel through a name other than localhost or the boat's own names now needs
+  `CONTROL_PANEL_ALLOWED_HOSTS`. Scripts calling `/api/auth/login` or `/api/auth/passphrase` must send an
+  `Origin` header.
 - Nothing migrates and passphrase sign-in stays off until a passphrase is set. Rollback: reinstall the
   previous release; older versions ignore `control-panel-auth.json`.
 

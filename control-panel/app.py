@@ -71,6 +71,18 @@ def auth_store() -> Any:
     return _AUTH_STORES[key]
 
 
+_HOST_ALLOWLISTS: dict[tuple[str, int], Any] = {}
+
+
+def host_allowlist(address: Any) -> Any:
+    """Host-header allowlist for the listener this request arrived on (see vsauth.HostAllowlist)."""
+    host, port = str(address[0]), int(address[1])
+    key = (host, port)
+    if key not in _HOST_ALLOWLISTS:
+        _HOST_ALLOWLISTS[key] = vsauth.HostAllowlist(host, port, extra=lambda: panel_settings().get("CONTROL_PANEL_ALLOWED_HOSTS", ""))
+    return _HOST_ALLOWLISTS[key]
+
+
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 VESSEL_ENV = Path(os.environ.get("VESSELSTACK_ENV", str(ROOT / "config/vesselstack.env")))
 CHAT_ENV = ROOT / "config/boat-chat.env"
@@ -1434,6 +1446,21 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_json(401, {"error": "Sign in with the passphrase, or send a valid X-VesselStack-Token header"})
         return False
 
+    def host_allowed(self) -> bool:
+        """DNS-rebinding guard: refuse any Host header that does not name this machine (static files included)."""
+        if host_allowlist(self.server.server_address).allowed(self.headers.get("Host")):
+            return True
+        body = b"Misdirected request\n"
+        self.send_response(421)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+        return False
+
     def client_ip(self) -> str:
         return str(self.client_address[0])
 
@@ -1449,15 +1476,14 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             if not store.passphrase_set():
                 self.send_json(409, {"error": "Passphrase sign-in is off until a passphrase is set. Use the long token, then set one in Settings."})
                 return
-            wait = LOGIN_THROTTLE.retry_after(ip)
-            if wait:
-                self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
-                return
             passphrase, remember = payload.get("passphrase"), payload.get("remember", False)
             if not isinstance(passphrase, str) or not passphrase or not isinstance(remember, bool):
                 raise ValueError("passphrase (text) and remember (true or false) are required")
+            allowed, wait = LOGIN_THROTTLE.begin(ip)  # checks the limits and counts this attempt in one step
+            if not allowed:
+                self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                return
             if not store.check_passphrase(passphrase):
-                LOGIN_THROTTLE.failure(ip)
                 self.send_json(401, {"error": "That passphrase was not accepted."})
                 return
             LOGIN_THROTTLE.success(ip)
@@ -1496,12 +1522,11 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 new = payload.get("new")
                 if store.passphrase_set() and context.get("kind") != "token":
                     ip = self.client_ip()
-                    wait = LOGIN_THROTTLE.retry_after(ip)
-                    if wait:
+                    allowed, wait = LOGIN_THROTTLE.begin(ip)
+                    if not allowed:
                         self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
                         return
                     if not store.check_passphrase(payload.get("current")):
-                        LOGIN_THROTTLE.failure(ip)
                         self.send_json(401, {"error": "The current passphrase was not accepted."})
                         return
                     LOGIN_THROTTLE.success(ip)
@@ -1606,6 +1631,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "The display tool failed unexpectedly."})
 
     def do_GET(self) -> None:
+        if not self.host_allowed():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
             self.send_json(200, {"ok": True, "version": RUNNING_IDENTITY["running_version"], "boot_id": RUNNING_IDENTITY["boot_id"]})
@@ -1652,8 +1679,14 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_static(self.static_target(path))
 
     def do_POST(self) -> None:
+        if not self.host_allowed():
+            return
         path = urllib.parse.urlparse(self.path).path
         origin = self.headers.get("Origin")
+        if path in {"/api/auth/login", "/api/auth/passphrase"} and not origin:
+            # Sign-in changes must come from a page that names its origin, whichever credential it carries.
+            self.send_json(403, {"error": "request origin is not allowed"})
+            return
         if origin:
             try:
                 parsed = urllib.parse.urlsplit(origin)

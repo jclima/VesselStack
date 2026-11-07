@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import stat
 import tempfile
 import threading
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 SCHEMA = 1
+ROLES = ("access", "admin")
 MIN_PASSPHRASE_LENGTH = 12
 MAX_PASSPHRASE_LENGTH = 256
 MAX_DEVICES = 20
@@ -39,6 +41,8 @@ REMEMBER_SECONDS = 30 * 24 * 3600
 LAST_SEEN_INTERVAL = 3600
 MAX_LABEL_LENGTH = 60
 STORE_NAME = "control-panel-auth.json"
+CHAT_STORE_NAME = "auth.json"
+CHAT_MIN_PASSPHRASE_LENGTH = 8
 
 SCRYPT_LOG2_N = 15
 SCRYPT_R = 8
@@ -71,11 +75,11 @@ def _unb64(text: str) -> bytes:
     return base64.b64decode(text.encode("ascii"), validate=True)
 
 
-def check_new_passphrase(passphrase: Any) -> str:
+def check_new_passphrase(passphrase: Any, minimum: int = MIN_PASSPHRASE_LENGTH) -> str:
     if not isinstance(passphrase, str):
         raise AuthError("A passphrase is required.")
-    if len(passphrase) < MIN_PASSPHRASE_LENGTH:
-        raise AuthError(f"Use at least {MIN_PASSPHRASE_LENGTH} characters; a few random words work well.")
+    if len(passphrase) < minimum:
+        raise AuthError(f"Use at least {minimum} characters; a few random words work well.")
     if len(passphrase) > MAX_PASSPHRASE_LENGTH:
         raise AuthError(f"Use at most {MAX_PASSPHRASE_LENGTH} characters.")
     return passphrase
@@ -135,6 +139,7 @@ def _normalize(data: Any) -> dict[str, Any]:
                 "id": item["id"], "token_sha256": item["token_sha256"], "label": clean_label(item.get("label")),
                 "created": int(item.get("created") or 0), "last_seen": int(item.get("last_seen") or 0),
                 "expires": int(item.get("expires") or 0),
+                "role": item.get("role") if item.get("role") in ROLES else "access",
             })
     result["devices"] = devices
     return result
@@ -143,9 +148,19 @@ def _normalize(data: Any) -> dict[str, Any]:
 class AuthStore:
     """JSON store: flock-serialised read-modify-write, atomic replace, mtime-aware reads."""
 
-    def __init__(self, path: str | os.PathLike[str], *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, path: str | os.PathLike[str], *, clock: Callable[[], float] = time.time,
+                 min_passphrase: int = MIN_PASSPHRASE_LENGTH, expose_role: bool = False,
+                 inherit_owner: bool = False, differs_from: Callable[[], Any] | None = None,
+                 differs_message: str = "Choose a passphrase different from the other VesselStack passphrase.") -> None:
+        """``inherit_owner``: files created by root take the parent directory's owner (a service-user data dir).
+        ``differs_from``: returns a stored hash (or None) the new passphrase must not equal."""
         self.path = Path(path)
         self.clock = clock
+        self.min_passphrase = min_passphrase
+        self.expose_role = expose_role
+        self.inherit_owner = inherit_owner
+        self.differs_from = differs_from
+        self.differs_message = differs_message
         self._mutex = threading.RLock()
         self._cache: dict[str, Any] | None = None
         self._signature: tuple[int, int, int] | None = None
@@ -200,8 +215,10 @@ class AuthStore:
                 raise StoreError("the sign-in store is not a regular file")
             owner, mode = (existing.st_uid, existing.st_gid), stat.S_IMODE(existing.st_mode)
         except FileNotFoundError:
-            pass
-        fd, temp = tempfile.mkstemp(prefix=".control-panel-auth.", suffix=".tmp", dir=directory)
+            if self.inherit_owner:
+                parent = os.stat(directory)
+                owner = (parent.st_uid, parent.st_gid)
+        fd, temp = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=directory)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(json.dumps(data, indent=2, sort_keys=True).encode("utf-8") + b"\n")
@@ -233,6 +250,9 @@ class AuthStore:
             lock_path = self.path.with_name(self.path.name + ".lock")
             lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
             try:
+                if self.inherit_owner and hasattr(os, "fchown") and os.geteuid() == 0:
+                    parent = os.stat(self.path.parent)
+                    os.fchown(lock_fd, parent.st_uid, parent.st_gid)
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 data, _ = self._read_disk()
                 result = mutate(data)
@@ -252,7 +272,11 @@ class AuthStore:
 
     def set_passphrase(self, passphrase: str, *, keep_device: str | None = None) -> int:
         """Set/replace the passphrase and revoke every device except ``keep_device``. Returns revoked count."""
-        encoded = hash_passphrase(check_new_passphrase(passphrase))
+        checked = check_new_passphrase(passphrase, self.min_passphrase)
+        other = self.differs_from() if self.differs_from else None
+        if other and verify_passphrase(checked, other):
+            raise AuthError(self.differs_message)
+        encoded = hash_passphrase(checked)
 
         def mutate(data: dict[str, Any]) -> int:
             before = len(data["devices"])
@@ -270,7 +294,7 @@ class AuthStore:
         return self.transaction(mutate)
 
     # -- devices -----------------------------------------------------------
-    def create_device(self, label: Any, remember: bool) -> tuple[str, dict[str, Any]]:
+    def create_device(self, label: Any, remember: bool, role: str = "access") -> tuple[str, dict[str, Any]]:
         token = secrets.token_urlsafe(32)
         digest = token_digest(token)
         now = int(self.clock())
@@ -281,7 +305,8 @@ class AuthStore:
             if len(data["devices"]) >= MAX_DEVICES:
                 raise DeviceLimitError(f"This boat already has {MAX_DEVICES} signed-in devices. Revoke one in Settings, or on the boat computer with: sudo vesselstackctl devices list")
             device = {"id": secrets.token_hex(6), "token_sha256": digest, "label": clean_label(label),
-                      "created": now, "last_seen": now, "expires": now + lifetime}
+                      "created": now, "last_seen": now, "expires": now + lifetime,
+                      "role": role if role in ROLES else "access"}
             data["devices"].append(device)
             return device
         device = self.transaction(mutate)
@@ -301,7 +326,7 @@ class AuthStore:
             return None
         if now - found["last_seen"] >= LAST_SEEN_INTERVAL:
             self._touch(found["id"], now)
-        return self.public_device(found)
+        return self.public_device(found, role=True)
 
     def _touch(self, device_id: str, now: int) -> None:
         def mutate(data: dict[str, Any]) -> None:
@@ -315,7 +340,7 @@ class AuthStore:
 
     def list_devices(self, current_id: str | None = None) -> list[dict[str, Any]]:
         now = int(self.clock())
-        return [{**self.public_device(d), "current": d["id"] == current_id}
+        return [{**self.public_device(d, role=self.expose_role), "current": d["id"] == current_id}
                 for d in self.snapshot()["devices"] if d["expires"] > now]
 
     def revoke(self, device_id: str) -> bool:
@@ -332,13 +357,21 @@ class AuthStore:
             return before - len(data["devices"])
         return self.transaction(mutate)
 
-    @staticmethod
-    def public_device(device: dict[str, Any]) -> dict[str, Any]:
-        return {key: device[key] for key in ("id", "label", "created", "last_seen", "expires")}
+    def public_device(self, device: dict[str, Any], role: bool | None = None) -> dict[str, Any]:
+        keys = ["id", "label", "created", "last_seen", "expires"]
+        if self.expose_role if role is None else role:
+            keys.append("role")
+        return {key: device[key] for key in keys}
 
 
 class LoginThrottle:
-    """Per-address exponential backoff, plus a global lockout for shared (tunnel) addresses."""
+    """Per-address exponential backoff, plus a global lockout for shared (tunnel) addresses.
+
+    ``begin()`` is the atomic entry point: under one lock it checks both limits and, when the attempt
+    is allowed, records it as a failure up front ("pending"). Concurrent requests therefore cannot all
+    pass the check before any failure is counted. ``success()`` withdraws the pending record and clears
+    the address; ``failure()`` after a ``begin()`` just confirms it (no double count).
+    """
 
     IP_FREE_FAILURES = 5
     IP_BASE_DELAY = 30
@@ -354,38 +387,230 @@ class LoginThrottle:
         self._ips: dict[str, dict[str, float]] = {}
         self._global: deque[float] = deque()
         self._global_until = 0.0
+        self._pending: dict[str, list[float]] = {}
+
+    def _wait_locked(self, ip: str, now: float) -> float:
+        wait = max(self._global_until - now, 0.0)
+        entry = self._ips.get(ip)
+        if entry:
+            wait = max(wait, entry["blocked_until"] - now)
+        return wait
 
     def retry_after(self, ip: str) -> int:
-        """Seconds until a passphrase attempt is allowed again (0 means allowed now)."""
+        """Seconds until a passphrase attempt is allowed again (0 means allowed now). Read-only."""
         now = self.clock()
         with self._lock:
-            wait = max(self._global_until - now, 0.0)
-            entry = self._ips.get(ip)
-            if entry:
-                wait = max(wait, entry["blocked_until"] - now)
+            wait = self._wait_locked(ip, now)
         return int(wait) + 1 if wait > 0 else 0
 
-    def failure(self, ip: str) -> None:
+    def begin(self, ip: str) -> tuple[bool, int]:
+        """Atomically check the limits and count this attempt. Returns (allowed, retry_after_seconds)."""
         now = self.clock()
         with self._lock:
-            entry = self._ips.setdefault(ip, {"count": 0, "blocked_until": 0.0, "last": now})
-            if now - entry["last"] > 3600 and entry["blocked_until"] <= now:
-                entry["count"] = 0  # an hour of quiet forgives old failures
-            entry["count"] += 1
-            entry["last"] = now
-            over = entry["count"] - self.IP_FREE_FAILURES
-            if over >= 0:
-                entry["blocked_until"] = now + min(self.IP_BASE_DELAY * (2 ** over), self.MAX_DELAY)
-            if len(self._ips) > self.MAX_TRACKED:
-                for stale in sorted(self._ips, key=lambda key: self._ips[key]["last"])[: len(self._ips) - self.MAX_TRACKED]:
-                    del self._ips[stale]
-            self._global.append(now)
-            while self._global and now - self._global[0] > self.GLOBAL_WINDOW:
-                self._global.popleft()
-            if len(self._global) > self.GLOBAL_LIMIT:
-                self._global_until = now + self.GLOBAL_LOCKOUT
-                self._global.clear()
+            wait = self._wait_locked(ip, now)
+            if wait > 0:
+                return False, int(wait) + 1
+            self._record_locked(ip, now)
+            self._pending.setdefault(ip, []).append(now)
+            if len(self._pending) > self.MAX_TRACKED:
+                for stale in sorted(self._pending, key=lambda key: self._pending[key][-1])[: len(self._pending) - self.MAX_TRACKED]:
+                    del self._pending[stale]
+        return True, 0
+
+    def _record_locked(self, ip: str, now: float) -> None:
+        entry = self._ips.setdefault(ip, {"count": 0, "blocked_until": 0.0, "last": now})
+        if now - entry["last"] > 3600 and entry["blocked_until"] <= now:
+            entry["count"] = 0  # an hour of quiet forgives old failures
+        entry["count"] += 1
+        entry["last"] = now
+        over = entry["count"] - self.IP_FREE_FAILURES
+        if over >= 0:
+            entry["blocked_until"] = now + min(self.IP_BASE_DELAY * (2 ** over), self.MAX_DELAY)
+        if len(self._ips) > self.MAX_TRACKED:
+            for stale in sorted(self._ips, key=lambda key: self._ips[key]["last"])[: len(self._ips) - self.MAX_TRACKED]:
+                del self._ips[stale]
+        self._global.append(now)
+        while self._global and now - self._global[0] > self.GLOBAL_WINDOW:
+            self._global.popleft()
+        if len(self._global) > self.GLOBAL_LIMIT:
+            self._global_until = now + self.GLOBAL_LOCKOUT
+            self._global.clear()
+
+    def failure(self, ip: str) -> None:
+        """Confirm a failed attempt. A no-op when ``begin()`` already counted it; otherwise counts it now."""
+        now = self.clock()
+        with self._lock:
+            pending = self._pending.get(ip)
+            if pending:
+                pending.pop(0)
+                if not pending:
+                    del self._pending[ip]
+                return
+            self._record_locked(ip, now)
 
     def success(self, ip: str) -> None:
+        """A correct passphrase: clear this address and withdraw its pending attempts from the global count."""
         with self._lock:
             self._ips.pop(ip, None)
+            for stamp in self._pending.pop(ip, []):
+                try:
+                    self._global.remove(stamp)
+                except ValueError:
+                    pass
+
+
+def _is_wildcard(host: str) -> bool:
+    return host in {"", "0.0.0.0", "::", "[::]", "*"}
+
+
+def _is_loopback(host: str) -> bool:
+    return host == "localhost" or host.startswith("127.") or host in {"::1", "[::1]"}
+
+
+class HostAllowlist:
+    """Accepts only Host headers naming this machine (defence against DNS rebinding).
+
+    Always allowed: 127.0.0.1, localhost and [::1]. When the service listens beyond loopback (LAN mode)
+    the machine's hostname, ``hostname.local`` and its current interface addresses are added; the set is
+    recomputed at most every ``REFRESH_SECONDS`` so a DHCP change is picked up. Operators can add names
+    with ``extra`` (host or host:port entries). Every entry needs the configured port; a Host without a
+    port is accepted only when the port is 80.
+    """
+
+    REFRESH_SECONDS = 60
+
+    def __init__(self, bind_host: str, port: int, *, extra: Callable[[], Any] | None = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 discover: Callable[[], set[str]] | None = None) -> None:
+        self.bind_host = (bind_host or "").strip().lower()
+        self.port = int(port)
+        self._extra = extra
+        self._clock = clock
+        self._discover = discover or discover_local_names
+        self._lock = threading.Lock()
+        self._names: set[str] = set()
+        self._expires = float("-inf")
+
+    @property
+    def lan(self) -> bool:
+        return not _is_loopback(self.bind_host)
+
+    def _compute(self) -> set[str]:
+        names = {"127.0.0.1", "localhost", "[::1]"}
+        if self.bind_host and not _is_wildcard(self.bind_host):
+            names.add(self.bind_host if not (":" in self.bind_host and not self.bind_host.startswith("[")) else f"[{self.bind_host}]")
+        if self.lan:
+            names |= {name.lower() for name in self._discover()}
+        raw = self._extra() if self._extra else ""
+        if isinstance(raw, str):
+            raw = [part for part in raw.split(",")]
+        for item in raw or ():
+            host, port = self._split(str(item))
+            if host and port in (None, self.port):
+                names.add(host)
+        return names
+
+    @staticmethod
+    def _split(value: str) -> tuple[str, int | None] | tuple[None, None]:
+        """(host, port) from ``host``, ``host:port``, ``[v6]`` or ``[v6]:port``; (None, None) when malformed."""
+        value = value.strip().lower()
+        if not value or any(ch in value for ch in " /\\@?#\t\r\n"):
+            return None, None
+        if value.startswith("["):
+            end = value.find("]")
+            if end < 0:
+                return None, None
+            host, rest = value[: end + 1], value[end + 1:]
+        elif value.count(":") > 1:
+            return None, None  # unbracketed IPv6 is not a valid Host
+        else:
+            host, _, port_text = value.partition(":")
+            rest = ":" + port_text if ":" in value else ""
+        if not host or host in {"[]"}:
+            return None, None
+        if not rest:
+            return host, None
+        if not rest.startswith(":") or not rest[1:].isdigit() or not (0 < int(rest[1:]) < 65536):
+            return None, None
+        return host, int(rest[1:])
+
+    def allowed(self, host_header: Any) -> bool:
+        if not isinstance(host_header, str):
+            return False
+        host, port = self._split(host_header)
+        if host is None:
+            return False
+        if (port if port is not None else 80) != self.port:
+            # extra entries may carry their own port
+            return self._extra_with_port(host, port)
+        now = self._clock()
+        with self._lock:
+            if now >= self._expires:
+                try:
+                    self._names = self._compute()
+                except Exception:
+                    self._names = {"127.0.0.1", "localhost", "[::1]"}
+                self._expires = now + self.REFRESH_SECONDS
+            names = self._names
+        if host in names:
+            return True
+        return self.lan and _is_local_address(host)
+
+    def _extra_with_port(self, host: str, port: int | None) -> bool:
+        if port is None:
+            return False
+        raw = self._extra() if self._extra else ""
+        items = raw.split(",") if isinstance(raw, str) else list(raw or ())
+        return any(self._split(str(item)) == (host, port) for item in items if str(item).strip())
+
+
+def _is_local_address(host: str) -> bool:
+    """True when ``host`` is an IP literal currently assigned to this machine (bind probe; no DNS)."""
+    literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, literal)
+        except (OSError, ValueError):
+            continue
+        probe = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            probe.bind((literal, 0))
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+    return False
+
+
+def discover_local_names() -> set[str]:
+    """This machine's hostname, hostname.local and its current addresses (bracketed for IPv6)."""
+    names: set[str] = set()
+    try:
+        name = socket.gethostname().strip().lower()
+    except OSError:
+        name = ""
+    if name:
+        short = name.split(".", 1)[0]
+        names.update({name, short, f"{short}.local"})
+        try:
+            for item in socket.getaddrinfo(name, None):
+                names.add(_literal(item[4][0]))
+        except OSError:
+            pass
+    for family, target in ((socket.AF_INET, ("192.0.2.1", 9)), (socket.AF_INET6, ("2001:db8::1", 9))):
+        try:
+            probe = socket.socket(family, socket.SOCK_DGRAM)
+            try:
+                probe.connect(target)  # no packet is sent; the kernel just picks the outgoing address
+                names.add(_literal(probe.getsockname()[0]))
+            finally:
+                probe.close()
+        except OSError:
+            pass
+    return {n for n in names if n}
+
+
+def _literal(address: str) -> str:
+    address = address.split("%", 1)[0].lower()
+    return f"[{address}]" if ":" in address else address

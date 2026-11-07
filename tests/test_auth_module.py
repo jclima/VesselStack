@@ -181,6 +181,45 @@ class StoreTests(unittest.TestCase):
 
 
 class ThrottleTests(unittest.TestCase):
+    def test_begin_counts_attempts_atomically_across_threads(self) -> None:
+        import threading
+        throttle = auth.LoginThrottle()
+        allowed = []
+        start = threading.Barrier(30)
+
+        def attempt() -> None:
+            start.wait()
+            allowed.append(throttle.begin("192.0.2.9")[0])
+        threads = [threading.Thread(target=attempt) for _ in range(30)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(allowed.count(True), auth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertFalse(throttle.begin("192.0.2.9")[0])
+
+    def test_failure_after_begin_does_not_double_count_and_success_withdraws(self) -> None:
+        throttle = auth.LoginThrottle(Clock())
+        for _ in range(4):
+            self.assertTrue(throttle.begin("192.0.2.5")[0])
+            throttle.failure("192.0.2.5")
+        self.assertEqual(throttle.retry_after("192.0.2.5"), 0, "4 attempts, none double counted")
+        self.assertTrue(throttle.begin("192.0.2.5")[0])
+        throttle.success("192.0.2.5")
+        self.assertEqual(throttle.retry_after("192.0.2.5"), 0)
+        self.assertEqual(len(throttle._global), 4, "the successful attempt left the global window")
+        allowed, wait = throttle.begin("192.0.2.5")
+        self.assertTrue(allowed)
+        self.assertEqual(wait, 0)
+
+    def test_begin_global_lockout(self) -> None:
+        throttle = auth.LoginThrottle(Clock())
+        results = [throttle.begin(f"192.0.2.{index + 10}")[0] for index in range(25)]
+        self.assertEqual(results.count(True), auth.LoginThrottle.GLOBAL_LIMIT + 1)
+        allowed, wait = throttle.begin("198.51.100.1")
+        self.assertFalse(allowed)
+        self.assertGreater(wait, 800)
+
     def test_per_ip_backoff_is_exponential_and_capped(self) -> None:
         clock = Clock()
         throttle = auth.LoginThrottle(clock)

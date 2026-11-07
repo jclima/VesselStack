@@ -1365,7 +1365,10 @@ class SignInApiTests(DisplaysApiBase):
     def call(self, method, path, body=None, headers=None):
         data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
         all_headers = {"Content-Type": "application/json"} if data is not None else {}
+        if path in {"/api/auth/login", "/api/auth/passphrase"} and method == "POST":
+            all_headers.update(self.origin)  # these two endpoints require an Origin; pass {"Origin": None} to omit it
         all_headers.update(headers or {})
+        all_headers = {k: v for k, v in all_headers.items() if v is not None}
         request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}{path}", data=data, headers=all_headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -1445,6 +1448,33 @@ class SignInApiTests(DisplaysApiBase):
         self.assertEqual(headers["Retry-After"], str(payload["retry_after"]))
         self.assertEqual(self.call("GET", "/api/config", headers=self.tokenh())[0], 200)
 
+    def test_login_and_passphrase_require_an_origin_whatever_the_credential(self) -> None:
+        self.set_passphrase()
+        none = {"Origin": None}
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": self.PASSPHRASE, "remember": True}, none)[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": "another long passphrase"}, {**self.tokenh(), **none})[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": "another long passphrase"}, self.tokenh())[0], 200)
+
+    def test_concurrent_wrong_attempts_are_limited_before_any_is_evaluated(self) -> None:
+        self.set_passphrase()
+        evaluated = []
+        real = panel.vsauth.AuthStore.check_passphrase
+
+        def counting(store, passphrase):
+            evaluated.append(passphrase)
+            time.sleep(0.05)
+            return real(store, passphrase)
+        results = []
+        with mock.patch.object(panel.vsauth.AuthStore, "check_passphrase", counting):
+            threads = [threading.Thread(target=lambda: results.append(self.login(passphrase="wrong wrong wrong")[0])) for _ in range(12)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(sorted(results).count(401), panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(sorted(results).count(429), 12 - panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(len(evaluated), panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+
     def test_global_lockout_applies_to_other_addresses(self) -> None:
         self.set_passphrase()
         throttle = panel.LOGIN_THROTTLE
@@ -1516,3 +1546,84 @@ class SignInApiTests(DisplaysApiBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class HostAllowlistApiTests(SignInApiTests):
+    """DNS-rebinding guard: every request needs a Host naming this machine."""
+
+    def raw(self, method, path, host, headers=None, body=None):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.putrequest(method, path, skip_host=True)
+            if host is not None:
+                connection.putheader("Host", host)
+            for name, value in (headers or {}).items():
+                connection.putheader(name, value)
+            data = json.dumps(body).encode() if body is not None else None
+            if data is not None:
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Content-Length", str(len(data)))
+            connection.endheaders(data)
+            response = connection.getresponse()
+            return response.status, response.read().decode()
+        finally:
+            connection.close()
+
+    def test_wrong_host_is_refused_for_static_files_and_api(self) -> None:
+        port = self.server.server_address[1]
+        self.set_passphrase()
+        for host in ("evil.example", f"evil.example:{port}", f"127.0.0.1:{port + 1}", "127.0.0.1", "", None, f"127.0.0.1:{port}.evil.example"):
+            for method, path in (("GET", "/"), ("GET", "/health"), ("GET", "/api/auth/status"), ("GET", "/api/config")):
+                status, text = self.raw(method, path, host, self.tokenh())
+                self.assertIn(status, (400, 421), (host, path))
+                self.assertNotIn("passphrase", text.lower())
+            status, _ = self.raw("POST", "/api/auth/login", host, {"Origin": f"http://{host}"} if host else {}, {"passphrase": self.PASSPHRASE, "remember": True})
+            self.assertIn(status, (400, 421), host)
+        self.assertEqual(self.call("GET", "/api/auth/status")[1], {"passphrase_set": True}, "no attempt was counted")
+        self.assertEqual(panel.LOGIN_THROTTLE.retry_after("127.0.0.1"), 0)
+
+    def test_allowed_host_forms_are_accepted(self) -> None:
+        port = self.server.server_address[1]
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LocalHost:{port}", f"[::1]:{port}"):
+            self.assertEqual(self.raw("GET", "/api/config", host, self.tokenh())[0], 200, host)
+            self.assertEqual(self.raw("GET", "/", host)[0], 200, host)
+
+    def test_extra_hosts_come_from_the_environment(self) -> None:
+        port = self.server.server_address[1]
+        self.assertEqual(self.raw("GET", "/health", f"boat.example:{port}")[0], 421)
+        panel._HOST_ALLOWLISTS.clear()
+        with mock.patch.dict(panel.os.environ, {"CONTROL_PANEL_ALLOWED_HOSTS": "boat.example, other.example:9"}):
+            panel._HOST_ALLOWLISTS.clear()
+            allowlist = panel.host_allowlist(self.server.server_address)
+            allowlist._expires = float("-inf")
+            self.assertEqual(self.raw("GET", "/health", f"boat.example:{port}")[0], 200)
+            self.assertEqual(self.raw("GET", "/health", "boat.example")[0], 421, "port is required unless it is 80")
+            self.assertEqual(self.raw("GET", "/health", "other.example:9")[0], 200)
+        panel._HOST_ALLOWLISTS.clear()
+
+
+class HostAllowlistUnitTests(unittest.TestCase):
+    def test_lan_mode_adds_machine_names_and_refreshes(self) -> None:
+        clock = [0.0]
+        names = [{"boat", "boat.local", "203.0.113.20"}]
+        allow = panel.vsauth.HostAllowlist("0.0.0.0", 8780, clock=lambda: clock[0], discover=lambda: names[0])
+        self.assertTrue(allow.allowed("boat.local:8780"))
+        self.assertTrue(allow.allowed("203.0.113.20:8780"))
+        self.assertFalse(allow.allowed("203.0.113.20"), "port required")
+        self.assertFalse(allow.allowed("203.0.113.21:8780"))
+        names[0] = {"boat", "boat.local", "203.0.113.21"}
+        self.assertFalse(allow.allowed("203.0.113.21:8780"), "cached until the refresh interval")
+        clock[0] = 61
+        self.assertTrue(allow.allowed("203.0.113.21:8780"))
+        self.assertFalse(allow.allowed("203.0.113.20:8780"))
+        self.assertFalse(allow.allowed("attacker.example:8780"))
+
+    def test_loopback_mode_does_not_trust_machine_names(self) -> None:
+        allow = panel.vsauth.HostAllowlist("127.0.0.1", 8780, discover=lambda: {"boat.local"})
+        self.assertFalse(allow.allowed("boat.local:8780"))
+        self.assertTrue(allow.allowed("localhost:8780"))
+
+    def test_port_80_may_omit_the_port(self) -> None:
+        allow = panel.vsauth.HostAllowlist("127.0.0.1", 80)
+        self.assertTrue(allow.allowed("localhost"))
+        self.assertTrue(allow.allowed("localhost:80"))

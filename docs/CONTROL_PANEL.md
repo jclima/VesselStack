@@ -77,7 +77,23 @@ remember the device, in session storage otherwise) and sends it in the
 token or your passphrase. No cookies are used. After 5 wrong passphrases from one
 address, further tries wait longer each time (up to 15 minutes); more than 20
 failures in 15 minutes from anywhere pause passphrase sign-in for 15 minutes.
-The long token still works during a pause.
+The long token still works during a pause. Each attempt is counted the moment
+it arrives, so a burst of simultaneous guesses cannot slip past the limit.
+
+> **Anyone on the network can pause passphrase sign-in.** Because the pause is
+> global (so a shared tunnel address cannot be used to guess slowly), anyone who
+> can reach the panel can trigger a 15-minute passphrase lockout by sending wrong
+> passphrases. The long token (and, later, pairing links) keeps working during
+> it. This is an accepted trade-off; keep the panel on the SSH tunnel.
+
+**Host names.** The panel answers only requests whose `Host` names this
+machine (`127.0.0.1`, `localhost`, `[::1]`, and with `panel-access lan` also the
+boat's hostname, `hostname.local` and its current addresses, each with the panel
+port). Other names get `421 Misdirected request`; this blocks DNS-rebinding
+attacks from web pages. If you reach the panel through another name (a reverse
+proxy or a custom DNS name), add it to `CONTROL_PANEL_ALLOWED_HOSTS` in
+`config/control-panel.env` (comma separated, `name` or `name:port`; names
+without a port get the panel port), then restart the panel.
 
 > **Plain HTTP on the boat network.** If you opened the panel with
 > `panel-access lan`, the passphrase and device token cross the network
@@ -438,7 +454,12 @@ check still gate installer actions.
   with the long token. To start over from the boat computer run
   `sudo vesselstackctl passphrase set panel` (this signs every device out) or
   `sudo vesselstackctl passphrase clear panel` to turn passphrase sign-in off.
-  Forgot the passphrase? Use the token or the commands above.
+  Forgot the passphrase? Use the token or the commands above. The pause is
+  global, so anyone on the network can trigger it by guessing; the token still
+  works while it lasts.
+- **421 Misdirected request.** The address in the browser is not one the panel
+  recognises. Use `localhost` through the SSH tunnel, or add the name to
+  `CONTROL_PANEL_ALLOWED_HOSTS` (see Host names above).
 - **This device is no longer signed in.** The 12-hour or 30-day period ended, or
   the device was revoked. Enter the passphrase again.
 - **That token wasn't accepted.** Re-read the token on the Pi. A leftover space
