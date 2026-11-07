@@ -22,15 +22,13 @@ class FirewallRenderTests(unittest.TestCase):
         self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090 -j DROP", out)
         self.assertNotIn("ESTABLISHED", out)
 
-    def test_homepage_front_door_is_an_explicit_rule_on_its_published_port(self):
-        out = render().stdout
-        self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m conntrack --ctorigdstport 80 -j DROP", out)
-        custom = render(HOMEPAGE_PORT="8088").stdout
-        self.assertIn("--ctorigdstport 8088 -j DROP", custom)
-        self.assertNotIn("--ctorigdstport 80 ", custom)
-        # Strict mode already drops everything not allow-listed, so no extra rule there.
-        self.assertNotIn("--ctorigdstport 80 -j DROP", render(VESSELSTACK_FIREWALL_STRICT="true").stdout)
-        self.assertNotEqual(render(HOMEPAGE_PORT="x").returncode, 0)
+    def test_homepage_is_covered_by_the_container_port_rule_and_no_published_port_rule(self):
+        for port in ("80", "8088"):
+            out = render(HOMEPAGE_PORT=port).stdout
+            self.assertIn("--dports 1883,3000,8086,9090 -j DROP", out)
+            # Matching the published port would also drop replies to outbound HTTP on port 80.
+            self.assertNotIn("ctorigdstport", out)
+        self.assertEqual(render(HOMEPAGE_PORT="x").returncode, 0)
 
     def test_payload_is_atomic_restore_input(self):
         out = render().stdout

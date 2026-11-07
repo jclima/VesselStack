@@ -12,7 +12,21 @@ Semantic Versioning.
   firewall has an explicit rule for Homepage (trusted interfaces only). Port 443 is no longer published.
 - Heimdall is removed. Install/update and `vesselstackctl start` stop and remove an existing Heimdall
   container and image and print a notice; `$VESSELSTACK_DATA/heimdall` is left on disk untouched.
-  The `heimdall` component name is replaced by `homepage`.
+  The `heimdall` component name is replaced by `homepage`. A container named `vesselstack-heimdall` is
+  removed only when its Compose project label is `vesselstack`.
+- Homepage follow-ups: the `config/homepage*` folders are `0755` and files `0644` even under the
+  installer's `umask 077` (the container's service user could not read them before). A retired
+  `heimdall` entry in `VESSELSTACK_DISABLED_COMPONENTS` no longer aborts install, update or
+  `vesselstackctl` (it is dropped and the cleaned value saved; not converted to `homepage`).
+  `HEIMDALL_PORT` becomes `HOMEPAGE_PORT` when that is unset; `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT`
+  are not written back. The Signal K tile links an existing non-local `SIGNALK_URL`. The container
+  runs with `cap_drop: ALL` plus `CHOWN`, `SETUID`, `SETGID`. A new
+  `vesselstack-homepage-refresh.service` runs `vesselstackctl homepage refresh` at boot so
+  `HOMEPAGE_ALLOWED_HOSTS` follows new DHCP addresses (IPv4 only). Rollback: reinstall the previous release.
+- Firewall: the extra `-m conntrack --ctorigdstport PORT -j DROP` rule for Homepage is removed. On the
+  untrusted interface port 80 is now blocked exactly as before for inbound Homepage requests (the
+  container-port-3000 drop already covered it), but replies to the Pi's own outbound HTTP on port 80 are
+  no longer dropped. Strict mode is unchanged.
 
 ## 0.6.2 - 2026-11-07
 

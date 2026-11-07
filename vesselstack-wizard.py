@@ -26,7 +26,7 @@ DEFAULTS = {
 }
 
 def normalize_disabled_components(value):
-    items=[item.strip() for item in value.split(",") if item.strip()]
+    items=[item.strip() for item in value.split(",") if item.strip() and item.strip() != "heimdall"]  # Heimdall was retired
     if len(items) != len(set(items)) or any(item not in CORE_COMPONENTS for item in items):
         raise ValueError("VESSELSTACK_DISABLED_COMPONENTS must contain unique allowed core component IDs")
     return ",".join(items)

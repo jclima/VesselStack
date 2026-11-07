@@ -55,6 +55,13 @@ source "$CONFIG_FILE"
 : "${INFLUXDB_RAW_BUCKET:=vesselstack_raw}"
 : "${INFLUXDB_HISTORY_BUCKET:=vesselstack_1m}"
 : "${GRAFANA_PORT:=43000}"
+# Heimdall settings from before Homepage: its port becomes the home page port when none is
+# set; its keys are not written back (the installed env is rebuilt from known keys only).
+if [ -z "${HOMEPAGE_PORT:-}" ] && [ -n "${HEIMDALL_PORT:-}" ]; then
+    echo "Note: HEIMDALL_PORT is now HOMEPAGE_PORT; using $HEIMDALL_PORT." >&2
+    HOMEPAGE_PORT=$HEIMDALL_PORT
+fi
+unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${HOMEPAGE_PORT:=80}"
 : "${INFLUXDB_PORT:=8086}"
 : "${INFLUXDB_CONTAINER_NAME:=vesselstack-influxdb}"
@@ -125,6 +132,12 @@ component_disabled() { case ",${VESSELSTACK_DISABLED_COMPONENTS}," in *,"$1",*) 
 while [ -n "$disabled_input" ]; do
     case "$disabled_input" in *,*) disabled=${disabled_input%%,*}; disabled_input=${disabled_input#*,} ;; *) disabled=$disabled_input; disabled_input="" ;; esac
     disabled=${disabled//[[:space:]]/}; [ -z "$disabled" ] && continue
+    # Heimdall no longer exists; dropped (not translated to homepage). The cleaned list is
+    # written to the installed env with the rest of the settings.
+    if [ "$disabled" = heimdall ]; then
+        echo "Note: dropping the retired 'heimdall' entry from VESSELSTACK_DISABLED_COMPONENTS." >&2
+        continue
+    fi
     valid=0; for core in "${CORE_COMPONENTS[@]}"; do [ "$disabled" = "$core" ] && valid=1; done
     [ "$valid" -eq 1 ] || { echo "Unknown disabled component: $disabled" >&2; exit 1; }
     component_disabled "$disabled" && { echo "Duplicate disabled component: $disabled" >&2; exit 1; }
@@ -1307,6 +1320,10 @@ sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"
 chmod 0644 "$SYSTEMD_DIR/vesselstack-firewall.service"
+sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    "$SCRIPT_DIR/systemd/vesselstack-homepage-refresh.service.in" \
+    > "$SYSTEMD_DIR/vesselstack-homepage-refresh.service"
+chmod 0644 "$SYSTEMD_DIR/vesselstack-homepage-refresh.service"
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-signalk.service.in" \
     "$VESSELSTACK_ROOT/systemd/vesselstack-signalk.service.in"
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-socketcan.service.in" \
@@ -1502,6 +1519,8 @@ if [ "$START" -eq 1 ]; then
     else
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
+    # Re-render the home page's allowed hosts at every boot (DHCP addresses change).
+    systemctl enable vesselstack-homepage-refresh.service
     install -d -m 0750 "$VESSELSTACK_DATA/mosquitto"
     # Heimdall (the previous start page) held port 80; remove its container and image
     # before Homepage is started. Its data directory is never touched.

@@ -109,7 +109,13 @@ if [ "${1:-}" = compose ] && [[ " $* " == *" --script check_config "* ]]; then
 fi
 if [ "${1:-}" = container ] && [ "${2:-}" = inspect ]; then
     # Only a Heimdall container left by an older release can exist in these tests.
-    if [ -n "${FAKE_HEIMDALL_IMAGE:-}" ]; then echo "$FAKE_HEIMDALL_IMAGE"; exit 0; fi
+    if [ -n "${FAKE_HEIMDALL_IMAGE:-}" ]; then
+        case "$*" in
+            *compose.project*) echo "${FAKE_HEIMDALL_PROJECT-vesselstack}" ;;
+            *) echo "$FAKE_HEIMDALL_IMAGE" ;;
+        esac
+        exit 0
+    fi
     exit 1
 fi
 if [ "${1:-}" = run ]; then
@@ -1575,6 +1581,16 @@ up_line=$(grep -n 'docker compose.* up -d' "$FAKE_BIN/calls.log" | head -n 1 | c
 [ "$remove_line" -lt "$up_line" ] || { echo 'Heimdall was removed after compose up' >&2; exit 1; }
 grep -q 'heimdall is no longer used by VesselStack' "$TEST_ROOT/start-heimdall.out"
 grep -qx 'heimdall data sentinel' "$DATA_ROOT/heimdall/sentinel"
+# A container with that name from another Compose project (or none) is left alone.
+for project in other ''; do
+    : > "$FAKE_BIN/calls.log"
+    FAKE_HEIMDALL_IMAGE=sha256:foreign FAKE_HEIMDALL_PROJECT=$project run_ctl start >"$TEST_ROOT/start-foreign.out" 2>&1
+    if grep -q 'docker rm -f vesselstack-heimdall' "$FAKE_BIN/calls.log"; then
+        echo 'removed a Heimdall-named container outside the VesselStack project' >&2
+        exit 1
+    fi
+    grep -q 'does not belong to the VesselStack Compose project' "$TEST_ROOT/start-foreign.out"
+done
 # The home page is rendered at start and its allowed hosts persisted for compose.
 test -s "$APP_ROOT/config/homepage/services.yaml"
 test -s "$APP_ROOT/config/homepage/settings.yaml"
@@ -1586,6 +1602,16 @@ run_ctl homepage sync
 grep -q 'Marina' "$APP_ROOT/config/homepage/services.yaml"
 run_ctl homepage sync
 grep -q 'Marina' "$APP_ROOT/config/homepage-custom/services.yaml"
+# "refresh" (run at boot) re-renders and lets Compose recreate the container if the hosts changed.
+: > "$FAKE_BIN/calls.log"
+run_ctl homepage refresh
+grep -q 'docker compose.* up -d homepage' "$FAKE_BIN/calls.log"
+# A retired heimdall entry in the disabled list is dropped and persisted, not rejected.
+cp "$APP_ROOT/config/vesselstack.env" "$TEST_ROOT/env.before-heimdall"
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=heimdall,grafana/' "$APP_ROOT/config/vesselstack.env"
+run_ctl homepage sync 2>"$TEST_ROOT/legacy-disabled.err"
+grep -q "retired 'heimdall'" "$TEST_ROOT/legacy-disabled.err"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana$' "$APP_ROOT/config/vesselstack.env"
 if run_ctl homepage bogus >/dev/null 2>&1; then echo 'homepage accepted an unknown action' >&2; exit 1; fi
 # Removing the component removes only its container; the tiles file stays.
 : > "$FAKE_BIN/calls.log"

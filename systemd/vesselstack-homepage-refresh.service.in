@@ -1,0 +1,14 @@
+[Unit]
+Description=VesselStack home page refresh (host names and addresses)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=300
+RemainAfterExit=yes
+Environment=VESSELSTACK_ENV=@VESSELSTACK_ROOT@/config/vesselstack.env
+ExecStart=/usr/local/sbin/vesselstackctl homepage refresh
+
+[Install]
+WantedBy=multi-user.target

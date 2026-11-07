@@ -103,6 +103,16 @@ class TilesTests(unittest.TestCase):
         _, services = self.tiles(vs={"HOME_ASSISTANT_URL": "http://192.0.2.99:8123"})
         self.assertNotIn("Home Assistant", services)
 
+    def test_existing_signalk_on_another_host_is_linked_without_monitoring(self):
+        _, services = self.tiles(vs={"SIGNALK_MODE": "existing", "SIGNALK_URL": "http://192.0.2.50:3000/signalk"})
+        sk = services.split('- "Signal K":')[1].split("- \"")[0]
+        self.assertIn('href: "http://192.0.2.50:3000"', sk)
+        self.assertNotIn("siteMonitor", sk)
+        _, services = self.tiles(vs={"SIGNALK_MODE": "existing", "SIGNALK_URL": "http://127.0.0.1:3000"})
+        self.assertNotIn('"Signal K"', services)
+        _, services = self.tiles(vs={"SIGNALK_MODE": "existing", "SIGNALK_URL": "javascript:alert(1)"})
+        self.assertNotIn('"Signal K"', services)
+
     def test_ais_and_displays_tiles_only_when_enabled(self):
         _, services = self.tiles(vs={"AIS_ENABLE": "true", "AIS_WEB_PORT": "8101", "DISPLAYS_ENABLE": "true"})
         self.assertIn('href: "http://boat.local:8101"', services)
@@ -255,6 +265,27 @@ class CustomFileTests(unittest.TestCase):
 
 
 class AtomicWriteTests(unittest.TestCase):
+    def test_directories_and_files_are_readable_by_the_container_under_umask_077(self):
+        fixture = Fixture(self)
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        self.assertEqual(fixture.run().returncode, 0)
+        config = fixture.root / "config"
+        for name in ("homepage", "homepage-custom", "homepage-icons"):
+            self.assertEqual(stat.S_IMODE((config / name).stat().st_mode), 0o755, name)
+            for path in (config / name).iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644, str(path))
+        # An earlier run with a private mode is repaired.
+        os.chmod(config / "homepage", 0o700)
+        self.assertEqual(fixture.run().returncode, 0)
+        self.assertEqual(stat.S_IMODE((config / "homepage").stat().st_mode), 0o755)
+
+    def test_an_invalid_hostname_is_refused(self):
+        fixture = Fixture(self)
+        for bad in ("bo at", "a;b", "-x"):
+            result = fixture.run(hostname=bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+
     def test_files_are_replaced_atomically_with_world_readable_mode(self):
         fixture = Fixture(self)
         old = os.umask(0o077)
@@ -307,6 +338,15 @@ class AtomicWriteTests(unittest.TestCase):
         result = fixture.run()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(list(elsewhere.iterdir()), [])
+
+
+class ComposeHardeningTests(unittest.TestCase):
+    def test_homepage_drops_all_capabilities_but_the_three_its_entrypoint_needs(self):
+        compose = (REPO / "templates" / "compose.yml").read_text()
+        block = compose.split("\n  homepage:\n")[1]
+        block = re.split(r"\n  [a-z]", block)[0]
+        self.assertIn('cap_drop: ["ALL"]', block)
+        self.assertIn('cap_add: ["CHOWN", "SETUID", "SETGID"]', block)
 
 
 class AllowedHostsTests(unittest.TestCase):

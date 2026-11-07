@@ -33,7 +33,7 @@ Commands:
                                or all interfaces (never changes other listeners)
   ha-http sync|status          Re-apply or show the managed Home Assistant http bind block
                                (HOMEASSISTANT_BIND_ADDRESS); used by the installer and lan
-  homepage sync|remove-heimdall
+  homepage sync|refresh|remove-heimdall
                                Re-render the home page (Homepage) tiles and allowed hosts
                                from the installed settings; or remove the old Heimdall
                                container (its data folder is left on disk)
@@ -101,16 +101,24 @@ load_config() {
 }
 
 validate_disabled_components() {
-    local raw=${VESSELSTACK_DISABLED_COMPONENTS:-} item known seen=""
+    local raw=${VESSELSTACK_DISABLED_COMPONENTS:-} item known seen="" dropped_legacy=0
     while [ -n "$raw" ]; do
         case "$raw" in *,*) item=${raw%%,*}; raw=${raw#*,} ;; *) item=$raw; raw="" ;; esac
         item=${item//[[:space:]]/}; [ -z "$item" ] && continue
+        # Heimdall no longer exists: drop it (not translated to homepage) and persist below.
+        if [ "$item" = heimdall ]; then dropped_legacy=1; continue; fi
         known=0; for component in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && known=1; done
         [ "$known" -eq 1 ] || { echo "Unknown disabled component: $item" >&2; exit 2; }
         case ",$seen," in *,"$item",*) echo "Duplicate disabled component: $item" >&2; exit 2 ;; esac
         seen="${seen:+$seen,}$item"
     done
     VESSELSTACK_DISABLED_COMPONENTS=$seen
+    if [ "$dropped_legacy" -eq 1 ]; then
+        echo "Note: dropped the retired 'heimdall' entry from VESSELSTACK_DISABLED_COMPONENTS." >&2
+        if [ "$(id -u)" -eq 0 ]; then
+            set_env_key "$ENV_FILE" VESSELSTACK_DISABLED_COMPONENTS "$seen" || true
+        fi
+    fi
 }
 
 selected_services() {
@@ -185,11 +193,19 @@ homepage_sync() {
 # container and its image if nothing else uses it. The data directory is user data
 # and is never deleted.
 remove_heimdall() {
-    local image
+    local image project
     if image=$(docker container inspect --format '{{.Image}}' vesselstack-heimdall 2>/dev/null); then
-        docker rm -f vesselstack-heimdall >/dev/null || return 1
-        echo "Removed the old Heimdall container (replaced by Homepage)."
-        [ -z "$image" ] || docker image rm "$image" >/dev/null 2>&1 || true
+        # Only remove what this stack created: a container of that name from another
+        # Compose project (or none) is somebody else's.
+        project=$(docker container inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' \
+            vesselstack-heimdall 2>/dev/null || true)
+        if [ "$project" != vesselstack ]; then
+            echo "NOTICE: container vesselstack-heimdall does not belong to the VesselStack Compose project (label: '${project:-none}'); leaving it alone. Remove it yourself if it holds port ${HOMEPAGE_PORT:-80}." >&2
+        else
+            docker rm -f vesselstack-heimdall >/dev/null || return 1
+            echo "Removed the old Heimdall container (replaced by Homepage)."
+            [ -z "$image" ] || docker image rm "$image" >/dev/null 2>&1 || true
+        fi
     fi
     if [ -d "$VESSELSTACK_DATA/heimdall" ]; then
         echo "NOTICE: $VESSELSTACK_DATA/heimdall is no longer used by VesselStack and can be deleted when you no longer need it."
@@ -197,9 +213,19 @@ remove_heimdall() {
     return 0
 }
 
+# Run at boot (vesselstack-homepage-refresh.service): Docker restarts the container with the
+# allowed hosts it was created with, so after a new DHCP lease the page would refuse the new
+# address. Re-render, then let Compose recreate the container only if the value changed.
+homepage_refresh() {
+    homepage_sync || return 1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homepage,*) return 0 ;; esac
+    "${COMPOSE[@]}" up -d homepage
+}
+
 homepage_command() {
     case "${1:-}" in
         sync) [ $# -eq 1 ] || { usage >&2; exit 2; }; homepage_sync ;;
+        refresh) [ $# -eq 1 ] || { usage >&2; exit 2; }; homepage_refresh ;;
         remove-heimdall) [ $# -eq 1 ] || { usage >&2; exit 2; }; remove_heimdall ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -2240,6 +2266,7 @@ uninstall_stack() {
         "$SBIN_DIR/vesselstack-firewall" remove || true
     fi
     systemctl disable vesselstack-firewall.service || true
+    systemctl disable vesselstack-homepage-refresh.service || true
     rm -f -- "$SYSTEMD_DIR/vesselstack-chat.service" \
         "$SYSTEMD_DIR/vesselstack-chat-telegram.service" \
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.service" \
@@ -2250,7 +2277,7 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
-    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall" \
+    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SYSTEMD_DIR/vesselstack-homepage-refresh.service" "$SBIN_DIR/vesselstack-firewall" \
         "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload

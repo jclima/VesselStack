@@ -230,6 +230,19 @@ def build_tiles(env: dict[str, str], hostname: str) -> list[Tile]:
     if env.get("SIGNALK_MODE", "existing") in ("docker", "native"):
         _, sk_port = url_parts(env.get("SIGNALK_URL"), 3000)
         link("Signal K", "Boat", "Boat data server", sk_port, "0.0.0.0")
+    else:
+        # An existing Signal K server elsewhere on the network: link it (no monitoring).
+        # Only scheme, host and port are used, so credentials or paths in the URL never appear.
+        try:
+            sk = urlsplit(env.get("SIGNALK_URL", ""))
+            sk_host, sk_port = sk.hostname, sk.port
+        except ValueError:
+            sk, sk_host, sk_port = None, None, None
+        if sk and sk.scheme in ("http", "https") and sk_host and bind_kind(sk_host) != "loopback" \
+                and re.fullmatch(r"[A-Za-z0-9.-]+|[0-9A-Fa-f:]+", sk_host):
+            shown = f"[{sk_host}]" if ":" in sk_host else sk_host
+            tiles.append(Tile("Signal K", "Boat", "Boat data server (on another computer)",
+                              f"{sk.scheme}://{shown}" + (f":{sk_port}" if sk_port else "")))
 
     if env.get("AIS_ENABLE", "false") == "true":
         link("AIS", "Boat", "Nearby vessels", port_of(env.get("AIS_WEB_PORT"), 8100), "0.0.0.0")
@@ -366,7 +379,16 @@ def open_dir(path: Path, mode: int = 0o755) -> int:
     if path.is_symlink():
         raise OSError(f"refusing symlinked directory: {path}")
     path.mkdir(mode=mode, parents=True, exist_ok=True)
-    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    try:
+        # mkdir's mode is masked by the caller's umask (vesselstackctl runs with 077), which
+        # would leave the container's service user unable to read the config; also repairs
+        # directories created by an earlier run.
+        os.fchmod(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def atomic_write(dir_fd: int, name: str, data: bytes, mode: int = 0o644) -> None:
@@ -474,6 +496,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = Path(args.root)
     hostname = args.hostname or detect_hostname()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", hostname):
+        parser.error(f"invalid --hostname: {hostname!r}")
     if args.addresses is not None:
         addresses = [a for a in args.addresses.split(",") if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", a)]
     else:

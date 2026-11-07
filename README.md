@@ -1134,7 +1134,8 @@ Open `http://HOST` (port 80) or `http://BOATNAME.local`. [Homepage](https://geth
 tile per enabled service: Boat Chat, Grafana, Home Assistant, Signal K, AIS, and, when the databases
 are published beyond loopback, InfluxDB and Prometheus. The Control Panel tile links only when
 `panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. A Displays tile
-appears when `DISPLAYS_ENABLE=true`, and a VesselTwin tile when a VesselTwin URL is configured. Links use
+appears when `DISPLAYS_ENABLE=true`. With `SIGNALK_MODE=existing` and a `SIGNALK_URL` on another
+computer, the Signal K tile links to that server (scheme, host and port only; no status dot). Links use
 `$(hostname).local` and follow the address you opened the page with.
 
 Tiles update automatically: `vesselstackctl homepage sync` runs at every start, on component
@@ -1142,10 +1143,21 @@ add/remove, `lan` and `panel-access` changes, display enable and install/update.
 `config/homepage/` are overwritten each time and contain no passwords or tokens. Add your own tiles
 and bookmarks in `config/homepage-custom/services.yaml` and `bookmarks.yaml` (created once, never
 overwritten; an invalid file is skipped with a warning). The page accepts only the host names and
-addresses in `HOMEPAGE_ALLOWED_HOSTS` (managed; add more with `HOMEPAGE_ALLOWED_HOSTS_EXTRA`).
+addresses in `HOMEPAGE_ALLOWED_HOSTS` (managed; add more with `HOMEPAGE_ALLOWED_HOSTS_EXTRA`). The
+list is also refreshed at every boot by `vesselstack-homepage-refresh.service`
+(`sudo vesselstackctl homepage refresh`, which recreates the container only if the list changed), so
+IP access keeps working after a new DHCP lease; `BOATNAME.local` always works. IPv4 addresses only:
+IPv6 is not added.
 
-**Heimdall was removed.** Updating stops and removes an existing `vesselstack-heimdall` container and
-its image and prints a notice; `/opt/vesselstack-data/heimdall` is left untouched and can be deleted
+The `config/homepage*` folders are made world-readable (`0755`, files `0644`) so the container's
+service user can read them; they hold no secrets. The container runs with all capabilities dropped
+except `CHOWN`, `SETUID` and `SETGID`.
+
+**Heimdall was removed.** Updating stops and removes an existing `vesselstack-heimdall` container
+(only if it carries this stack's Compose project label) and its image and prints a notice. A leftover
+`heimdall` entry in `VESSELSTACK_DISABLED_COMPONENTS` is dropped (it is not turned into `homepage`),
+`HEIMDALL_PORT` becomes `HOMEPAGE_PORT` when that is unset, and `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT`
+are no longer kept; `/opt/vesselstack-data/heimdall` is left untouched and can be deleted
 by hand. Rollback: restore the previous release from a backup. Homepage uses no data directory.
 
 ## MQTT access control
