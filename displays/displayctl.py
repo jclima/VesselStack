@@ -360,7 +360,11 @@ def cmd_flash_action(ctx, args) -> None:
                    force=args.force, notify=_warn)
 
 
-STDOUT_ACTIONS = (cmd_render_action, cmd_build_action, cmd_flash_action)
+def cmd_deploy_action(ctx, args) -> None:
+    firmware.deploy(ctx, args.id, serial=args.serial, ota=args.ota, progress=args.progress, notify=_warn)
+
+
+STDOUT_ACTIONS = (cmd_render_action, cmd_build_action, cmd_flash_action, cmd_deploy_action)
 
 
 def cmd_build(args) -> int:
@@ -369,6 +373,10 @@ def cmd_build(args) -> int:
 
 def cmd_flash(args) -> int:
     return run_render(args, cmd_flash_action)
+
+
+def cmd_deploy(args) -> int:
+    return run_render(args, cmd_deploy_action)
 
 
 def cmd_render(args) -> int:
@@ -477,6 +485,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="flash the previous build (firmware.prev) to roll back")
     flash.add_argument("--force", action="store_true",
                        help="flash even if the credentials changed since the firmware was built")
+    deploy = firmware_parser("deploy", "build if needed and upload in one step, holding the build lock "
+                             "throughout (root, optional)", cmd_deploy)
+    deploy_target = deploy.add_mutually_exclusive_group(required=True)
+    deploy_target.add_argument("--serial", metavar="DEVICE",
+                               help="USB serial device, /dev/ttyACM0 or /dev/serial/by-id/...")
+    deploy_target.add_argument("--ota", metavar="HOST",
+                               help="IP address or host name of the display on the LAN")
+    deploy.add_argument("--progress", action="store_true",
+                        help="print 'STAGE: render|compile|upload|done' lines (used by the Control Panel)")
     set_theme = lifecycle_parser("set-theme", "choose the colour theme of a display (root); rebuild and "
                                  "reflash afterwards", cmd_set_theme, True)
     set_theme.add_argument("theme", metavar="THEME", help="theme id (see 'themes'); classic removes the key")

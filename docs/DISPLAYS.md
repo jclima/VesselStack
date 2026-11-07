@@ -344,9 +344,12 @@ was already rebuilt.
 
 `show` reads the stored firmware manifest and compares it with a read-only re-render (no secret is created or printed):
 `outdated` means the configuration (or, when Wi-Fi and credentials are complete, the credentials) changed since it was built.
-Without root the build folder is unreadable and the status is `unknown`. `last_flash` is read from
-`build/displays/ID/last-flash.json` when a future release writes one (only `at`, `method`, `ok`, `firmware_built_at` and `error`
-are passed on); its absence is normal.
+Without root the build folder is unreadable and the status is `unknown`. `readiness.last_flash` comes from
+`build/displays/ID/last-flash.json` (see "Deploy and rollback"); `null` when nothing was ever uploaded with this version. It has
+`ok`, `method` (`serial` or `ota`), `at`, `version`, `built_at_utc`, `ota_target` (the most recent Wi-Fi target when it is an IP
+address or host name; a USB device path, a URL or anything else is never passed on) and `credentials_changed` (the credentials
+differ from those compiled into the image that was flashed; `null` when unknown). `readiness.firmware.rollback_possible` is true
+when `firmware.prev/` holds the image that ran before the last upload.
 
 ## Firmware: generate, build and flash
 
@@ -514,6 +517,44 @@ verified without hardware.
 of the rendered project without `secrets.yaml` and `README.txt`, so it changes
 when the configuration changes but never depends on a secret), the sha256 and
 size of both images, `secrets_sha256` (see the credential check) and `built_at_utc`. It contains no secrets.
+
+### Deploy and rollback
+
+```bash
+sudo vesselstackctl display deploy helm --ota 192.0.2.50 [--progress]
+sudo vesselstackctl display deploy helm --serial /dev/serial/by-id/usb-...
+```
+
+`deploy ID (--ota HOST | --serial DEVICE) [--progress]` is what the Control Panel's **Apply to screen** runs. It holds **one** build
+lock from the render to the end of the upload and does `build` (only when needed) then `flash`. The compile is skipped when
+`firmware/` is intact, was built from today's source (`source_sha256`) and today's credentials (`secrets_sha256`) and the pinned
+image is present, so a retry after a failed upload does not rebuild. With `--progress` it prints `STAGE: render`, `STAGE: compile`
+(followed by a note when skipped), `STAGE: upload` and `STAGE: done`. Everything the ESPHome tools print passes through a
+redactor first: the Wi-Fi SSID and password and the MQTT, OTA and API secrets (also JSON-, URL- and shell-quoted) are replaced with
+`[redacted]` before a line leaves the command. Known failures end with `To fix:` lines: an unreachable host or a timeout (check
+power and Wi-Fi, use the IP address instead of a `.local` name), an authentication failure (the credentials changed after the display
+was flashed: flash over USB, with the exact command), no space on the device, Docker missing, the image missing, a full disk, a
+busy lock. Exit status: `0` done, `1` failed, `2` invalid target. A build made by `deploy` replaces `firmware/` **without** moving it
+to `firmware.prev/` when `firmware/` was never uploaded (according to `last-flash.json`), so `firmware.prev/` stays the image the
+device last ran; without a `last-flash.json` it rotates as `build` does. `build` and `flash` themselves behave as before.
+
+**`last-flash.json`** (`build/displays/ID/`, root `0600`, written atomically without following symlinks by `flash` and `deploy`,
+only after a successful upload; a failed upload records nothing): `{"schema": 1, "current": {...}, "previous": {...} | null}`
+where each entry has `method`, `target` (the IP, host name or USB device), `image_sha256` (the uploaded image), `source_sha256`,
+`secrets_sha256` (hashes only), `at`, `version` and `built_at_utc`. Uploading the same image again only updates `current`. It
+holds no secret and is never committed (`.gitignore`, `scripts/check-public-tree.py`).
+
+**Rollback** (put the previous firmware back on the screen):
+
+```bash
+sudo vesselstackctl display history                       # find the backup made before the edit
+sudo vesselstackctl display restore-config STAMP          # bring the old settings back
+sudo vesselstackctl display flash helm --previous --ota 192.0.2.50      # or --serial DEVICE
+```
+
+Rendering is deterministic, so after the restore the old firmware's `source_sha256` matches again and `flash --previous` passes its
+checks without `--force`. It is refused (and says why) if the credentials changed since that image was built. The
+Control Panel offers the same steps (Displays tab, History).
 
 Requirements and limits:
 

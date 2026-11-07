@@ -45,8 +45,6 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 STDIN_MAX_BYTES = 1024 * 1024
 BRIDGE_UNIT = "vesselstack-displays-bridge.service"
 SERIAL_BY_ID = Path(firmware.SERIAL_BY_ID_PREFIX)
-LAST_FLASH_NAME = "last-flash.json"    # written by the flash command (a later release); absent is normal
-LAST_FLASH_KEYS = ("at", "method", "ok", "firmware_built_at", "error")   # nothing else is ever passed on
 SET_PAGES_KEYS = {"pages", "theme", "new_instruments", "new_notifications", "instrument_edits"}
 EDITABLE_INSTRUMENT_KEYS = schema.INSTRUMENT_KEYS - {"path"}
 MAX_ERRORS = 50
@@ -195,11 +193,38 @@ def _credentials_fingerprint(config: dict, display_id: str, secret_data) -> str 
     return firmware.sha256_hex(render.secrets_yaml(config, display_id, wifi, entry).encode("utf-8"))
 
 
+def _last_flash_block(last_flash, fingerprint) -> dict | None:
+    """The ``readiness.last_flash`` block: when, how and what; no hash, path or credential.
+
+    ``ota_target`` is the most recent Wi-Fi target (an IP address or host name that passes
+    ``firmware.validate_host``), to prefill the Apply dialog. ``credentials_changed`` says the
+    credentials differ from those compiled into the image that was flashed (None: unknown).
+    """
+    if not last_flash:
+        return None
+    current = last_flash["current"]
+    ota_target = None
+    for entry in (current, last_flash["previous"]):
+        if entry and entry.get("method") == "ota" and entry.get("target"):
+            try:
+                ota_target = firmware.validate_host(entry["target"])
+            except render.RenderError:
+                continue
+            break
+    flashed = current.get("secrets_sha256")
+    block = {"ok": True, "method": current["method"], "at": current.get("at"),
+             "version": current.get("version"), "built_at_utc": current.get("built_at_utc"),
+             "ota_target": ota_target,
+             "credentials_changed": (flashed != fingerprint) if (flashed and fingerprint) else None}
+    return {key: value for key, value in block.items() if value is not None or key in
+            ("ota_target", "credentials_changed")}
+
+
 def _firmware_state(ctx: lifecycle.Context, display_id: str, config: dict, registry: dict, secret_data) -> tuple:
     """``(firmware, last_flash)`` blocks of ``show``. No credential, hash or path is reported."""
     state = _display_dir_state(ctx, display_id)
     base = {"status": "none", "built_at_utc": None, "esphome_version": None, "reasons": [],
-            "credentials_checked": False, "has_previous": False}
+            "credentials_checked": False, "has_previous": False, "rollback_possible": False}
     if state == "unreadable":
         return {**base, "status": "unknown", "reasons": ["the build folder is root-only: run as root"]}, None
     if state == "absent":
@@ -215,19 +240,14 @@ def _firmware_state(ctx: lifecycle.Context, display_id: str, config: dict, regis
             except (render.RenderError, ValueError):
                 manifest = None
             base["has_previous"] = render._exists(dd.display_fd, firmware.PREVIOUS_DIR)
-            try:
-                last_flash = json.loads(firmware._read_at(dd.display_fd, [LAST_FLASH_NAME], label))
-            except (render.RenderError, ValueError, OSError):
-                last_flash = None
+            last_flash = firmware.read_last_flash(dd)
+            if last_flash and last_flash["previous"]:
+                base["rollback_possible"] = (last_flash["previous"]["image_sha256"]
+                                             in firmware.firmware_image_hashes(dd, firmware.PREVIOUS_DIR))
     except (render.RenderError, OSError):
         return base, None
-    if isinstance(last_flash, dict):
-        last_flash = {key: last_flash[key] for key in LAST_FLASH_KEYS
-                      if isinstance(last_flash.get(key), (str, int, bool)) and len(str(last_flash[key])) <= 200}
-    else:
-        last_flash = None
     if not isinstance(manifest, dict):
-        return base, last_flash
+        return base, _last_flash_block(last_flash, None)
     base["built_at_utc"] = manifest.get("built_at_utc") if isinstance(manifest.get("built_at_utc"), str) else None
     base["esphome_version"] = manifest.get("esphome_version") if isinstance(
         manifest.get("esphome_version"), str) else None
@@ -245,7 +265,7 @@ def _firmware_state(ctx: lifecycle.Context, display_id: str, config: dict, regis
             reasons.append("the credentials changed since the firmware was built")
     base["status"] = "outdated" if reasons else "current"
     base["reasons"] = reasons
-    return base, last_flash
+    return base, _last_flash_block(last_flash, fingerprint)
 
 
 def _readiness(ctx: lifecycle.Context, display_id: str, config: dict, registry: dict, secret_data) -> dict:

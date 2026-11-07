@@ -2173,6 +2173,9 @@ class Rendered:
     display_id: str
     files: dict = field(default_factory=dict)  # relative path -> bytes, sorted on use
     warnings: list = field(default_factory=list)
+    # The secret values that went into secrets.yaml (Wi-Fi SSID/password, MQTT, OTA and API
+    # secrets). Only so that streamed tool output can be redacted; never written anywhere.
+    secret_values: list = field(default_factory=list, repr=False)
 
 
 def ensure_display_secrets(cfg_dir, secret_data: dict, display_id: str) -> dict:
@@ -2267,6 +2270,10 @@ def collect(ctx, display_id: str, allow_missing_wifi: bool = False) -> Rendered:
     files = result.files
     prefix = display_id
     files[f"{prefix}/secrets.yaml"] = secrets_yaml(config, display_id, wifi, entry).encode("utf-8")
+    result.secret_values = [value for value in (wifi.get("ssid"), wifi.get("password"),
+                                                entry.get("mqtt_password"), entry.get("ota_password"),
+                                                entry.get("api_encryption_key"))
+                            if isinstance(value, str) and value]
     files[f"{prefix}/README.txt"] = readme_text(display_id, display, bool(result.warnings)).encode("utf-8")
     return result
 
@@ -2451,7 +2458,7 @@ PROJECT_PREV = "project.prev"
 # Everything the per-display directory legitimately holds in the current layout.
 # firmware/, firmware.prev/ and firmware.new/ belong to firmware.py and are never touched here.
 DISPLAY_DIR_ENTRIES = (PROJECT_DIR, PROJECT_NEW, PROJECT_PREV, "firmware", "firmware.prev",
-                       "firmware.new")
+                       "firmware.new", "last-flash.json", "last-flash.json.tmp")
 
 
 def write_project(ctx, rendered: Rendered) -> Path:

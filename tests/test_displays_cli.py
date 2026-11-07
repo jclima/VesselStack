@@ -1078,14 +1078,28 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(state["status"], "outdated")
         self.assertIn("credentials", " ".join(state["reasons"]))
 
-    def test_show_last_flash_passes_only_known_keys(self):
+    def test_show_last_flash_passes_only_known_fields(self):
         files = render.collect(self.ctx(), "helm").files
         base = self.firmware_manifest(files)
-        (base / "last-flash.json").write_text(json.dumps(
-            {"at": "2026-01-02T00:00:00Z", "method": "serial", "ok": True, "device": "/dev/ttyACM0",
-             "host": "192.0.2.77", "password": "hunter2-secret"}))
+        sha = "a" * 64
+        entry = {"method": "ota", "target": "192.0.2.77", "image_sha256": sha,
+                 "source_sha256": "b" * 64, "secrets_sha256": "c" * 64, "at": "2026-01-02T00:00:00Z",
+                 "version": "1.2.3", "password": "hunter2-secret"}
+        (base / "last-flash.json").write_text(json.dumps({"schema": 1, "current": entry, "previous": None}))
         flash = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"]
-        self.assertEqual(flash, {"at": "2026-01-02T00:00:00Z", "method": "serial", "ok": True})
+        self.assertEqual(flash, {"ok": True, "method": "ota", "at": "2026-01-02T00:00:00Z", "version": "1.2.3",
+                                 "ota_target": "192.0.2.77", "credentials_changed": True})
+        self.assertNotIn("hunter2", json.dumps(flash))
+        # a target that is not an IP or host name is never passed on; USB targets never are
+        entry["target"] = "http://evil/x?token=1"
+        (base / "last-flash.json").write_text(json.dumps({"schema": 1, "current": entry, "previous": None}))
+        flash = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"]
+        self.assertIsNone(flash["ota_target"])
+        entry.update(method="serial", target="/dev/ttyACM0")
+        (base / "last-flash.json").write_text(json.dumps({"schema": 1, "current": entry, "previous": None}))
+        flash = editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"]
+        self.assertIsNone(flash["ota_target"])
+        self.assertNotIn("ttyACM0", json.dumps(flash))
         (base / "last-flash.json").write_text("not json")
         self.assertIsNone(editor.show(self.ctx(runner=self.runner), "helm")["readiness"]["last_flash"])
 

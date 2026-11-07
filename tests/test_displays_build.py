@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "displays"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import displayctl  # noqa: E402
+import editor  # noqa: E402
 import firmware  # noqa: E402
 import lifecycle  # noqa: E402
 import render  # noqa: E402
@@ -893,6 +894,320 @@ class FlashCommonTests(ServerFlashBase):
         (self.project() / "firmware" / "manifest.json").write_text('{"files": {}}')
         with self.assertRaises(render.RenderError):
             self.flash(ota="192.0.2.50")
+
+
+class DeployTests(FirmwareBase):
+    """display deploy: one lock, skip-compile retry, firmware.prev bookkeeping, last-flash.json."""
+
+    OTA = "192.0.2.50"
+
+    def setUp(self):
+        super().setUp()
+        self.lines: dict = {"compile": [], "upload": []}
+        self.lock_probes: list = []
+
+    def runner(self, argv, emit):
+        kind = "compile" if "compile" in argv else "upload"
+        # while the container runs, the same display's lock must be held by the deploy
+        try:
+            with render.build_lock(self.ctx(build_lock_timeout=0), "helm", notify=lambda t: None):
+                self.lock_probes.append((kind, "free"))
+        except render.BuildBusy:
+            self.lock_probes.append((kind, "held"))
+        for line in self.lines[kind]:
+            emit(line)
+        return self.docker.stream(argv)
+
+    def deploy(self, ota=OTA, serial=None, progress=True, **kw):
+        return firmware.deploy(self.ctx(), "helm", ota=ota if not serial else None, serial=serial,
+                               progress=progress, run_lines=self.runner, statvfs=vfs_free(50),
+                               monotonic=lambda: next(self.clock), now=lambda: NOW,
+                               notify=self.messages.append, **kw)
+
+    def fw(self, name):
+        return self.project() / name
+
+    def manifest(self, name="firmware"):
+        return json.loads((self.fw(name) / "manifest.json").read_text())
+
+    def last(self):
+        return json.loads((self.project() / "last-flash.json").read_text())
+
+    def retitle(self, theme):
+        """Change the rendered firmware source (a theme) the supported way; "Nav" restores classic."""
+        lifecycle.set_theme(self.ctx(), "helm", {"B": "ocean", "C": "daylight", "Again": "high-contrast"}.get(theme, "classic"))
+
+    def stages(self):
+        return [m for m in self.messages if m.startswith("STAGE: ")]
+
+    def test_deploy_holds_one_lock_for_build_and_upload(self):
+        from unittest import mock
+        real = render.build_lock
+        entered = []
+
+        def counting(*args, **kw):
+            entered.append(1)
+            return real(*args, **kw)
+        with mock.patch.object(render, "build_lock", counting):
+            self.deploy()
+        # one acquisition by deploy itself (plus our own probes, which are counted separately)
+        self.assertEqual(len(entered) - len(self.lock_probes), 1)
+        self.assertEqual(self.lock_probes, [("compile", "held"), ("upload", "held")])
+        self.assertEqual(self.stages(), ["STAGE: render", "STAGE: compile", "STAGE: upload", "STAGE: done"])
+        compile_argv, upload_argv = self.docker.streamed
+        self.assertIn("compile", compile_argv)
+        self.assertEqual(upload_argv[upload_argv.index("--device") + 1], self.OTA)
+        self.assertEqual(upload_argv[upload_argv.index("--network") + 1], "host")
+
+    def test_progress_lines_only_with_the_flag(self):
+        self.deploy(progress=False)
+        self.assertEqual(self.stages(), [])
+
+    def test_retry_after_failed_upload_does_not_recompile(self):
+        self.docker.upload_status = 1
+        self.lines["upload"] = ["ERROR Error communicating with device: Timed out connecting"]
+        with self.assertRaises(render.RenderError):
+            self.deploy()
+        self.assertFalse((self.project() / "last-flash.json").exists())  # nothing recorded on failure
+        self.assertEqual(sum("compile" in a for a in self.docker.streamed), 1)
+        self.assertTrue(any(m.startswith("To fix:") and "IP address" in m for m in self.messages))
+        self.messages.clear()
+        self.docker.upload_status = 0
+        self.deploy()
+        self.assertEqual(sum("compile" in a for a in self.docker.streamed), 1, "no second compile")
+        self.assertEqual(len(self.docker.streamed), 3)
+        self.assertIn("skipping the compile", " ".join(self.messages))
+        self.assertEqual(self.stages(), ["STAGE: render", "STAGE: compile", "STAGE: upload", "STAGE: done"])
+        self.assertEqual(self.last()["current"]["target"], self.OTA)
+
+    def test_changed_settings_or_credentials_rebuild(self):
+        self.deploy()
+        self.retitle("B")
+        self.deploy()
+        self.assertEqual(sum("compile" in a for a in self.docker.streamed), 2)
+        lifecycle.rotate(self.ctx(), "helm")
+        self.deploy()
+        self.assertEqual(sum("compile" in a for a in self.docker.streamed), 3)
+
+    def test_unflashed_firmware_is_replaced_without_rotating_the_previous_image(self):
+        self.deploy()                                   # A flashed
+        a_hash = self.manifest()["files"]["firmware.ota.bin"]["sha256"]
+        self.retitle("B")
+        self.docker.upload_status = 1
+        with self.assertRaises(render.RenderError):
+            self.deploy()                               # B built, upload failed: B was never flashed
+        self.assertEqual(self.manifest("firmware.prev")["files"]["firmware.ota.bin"]["sha256"], a_hash)
+        self.docker.upload_status = 0
+        self.docker.ota = b"OTA-IMAGE-C" * 100
+        self.retitle("C")
+        self.deploy()                                   # C replaces B; firmware.prev must still be A
+        self.assertEqual(self.manifest("firmware.prev")["files"]["firmware.ota.bin"]["sha256"], a_hash)
+        c_hash = self.manifest()["files"]["firmware.ota.bin"]["sha256"]
+        self.assertNotEqual(c_hash, a_hash)
+        self.assertEqual(self.last()["current"]["image_sha256"], c_hash)
+        self.assertEqual(self.last()["previous"]["image_sha256"], a_hash)
+
+    def test_flashed_firmware_rotates_into_previous(self):
+        self.docker.ota = b"OTA-A" * 100
+        self.deploy()
+        a_hash = self.manifest()["files"]["firmware.ota.bin"]["sha256"]
+        self.docker.ota = b"OTA-B" * 100
+        self.retitle("B")
+        self.deploy()
+        self.assertEqual(self.manifest("firmware.prev")["files"]["firmware.ota.bin"]["sha256"], a_hash)
+        self.assertEqual(self.last()["previous"]["image_sha256"], a_hash)
+
+    def test_missing_last_flash_keeps_the_conservative_rotation(self):
+        self.build()
+        self.build()                                    # firmware.prev exists, no last-flash.json
+        before = self.manifest("firmware.prev")
+        self.retitle("B")
+        self.deploy()
+        self.assertNotEqual(self.manifest("firmware.prev")["source_sha256"], self.manifest()["source_sha256"])
+        self.assertIsNotNone(before)
+
+    def test_last_flash_file_is_private_and_has_the_documented_shape(self):
+        self.deploy()
+        path = self.project() / "last-flash.json"
+        self.assertEqual(self.mode(path), 0o600)
+        self.assertFalse((self.project() / "last-flash.json.tmp").exists())
+        data = self.last()
+        self.assertEqual(data["schema"], 1)
+        self.assertIsNone(data["previous"])
+        cur = data["current"]
+        self.assertEqual(cur["method"], "ota")
+        self.assertEqual(cur["version"], (ROOT / "VERSION").read_text().strip())
+        self.assertEqual(cur["at"], "2026-10-24T12:30:05Z")
+        for key in ("image_sha256", "source_sha256", "secrets_sha256"):
+            self.assertRegex(cur[key], r"^[0-9a-f]{64}$")
+        text = path.read_text()
+        for secret in (MQTT_PW, "wifi-pass-123", "boat-wifi", self.stored()["displays"]["helm"]["ota_password"]):
+            self.assertNotIn(secret, text)
+
+    def test_last_flash_refuses_a_symlink(self):
+        self.build()
+        os.symlink("/nonexistent-target", self.project() / "last-flash.json.tmp")
+        self.deploy()                                   # the stale temp symlink is replaced, never followed
+        self.assertFalse(os.path.islink(self.project() / "last-flash.json"))
+        self.assertFalse(os.path.exists("/nonexistent-target"))
+
+    def test_plain_flash_records_last_flash_and_previous_flash_swaps_it(self):
+        self.build()
+        self.flash(ota=self.OTA)
+        a = self.last()["current"]["image_sha256"]
+        self.retitle("B")
+        self.docker.ota = b"OTA-B" * 100
+        self.build()
+        self.flash(ota=self.OTA)
+        data = self.last()
+        self.assertEqual(data["previous"]["image_sha256"], a)
+        self.retitle("Nav")                             # restore the settings the old image was built from
+        self.flash(ota=self.OTA, previous=True)
+        data = self.last()
+        self.assertEqual(data["current"]["image_sha256"], a)
+
+    def test_restore_config_then_flash_previous_rolls_back_without_force(self):
+        """Rollback = restore the settings, then flash --previous: the render is deterministic."""
+        cfg_path = self.root / "config" / "displays.json"
+        self.deploy()                                            # A, built from the original settings
+        a = self.last()["current"]["image_sha256"]
+        rev = editor.revision_of(cfg_path.read_text())
+        pages = json.loads(cfg_path.read_text())["displays"]["helm"]["pages"]
+        result = editor.set_pages(self.ctx(), "helm", rev, json.dumps({"pages": pages, "theme": "ocean"}))
+        self.docker.ota = b"OTA-B" * 100
+        self.deploy()                                            # B, built from the edited settings
+        with self.assertRaises(render.RenderError) as caught:    # settings differ now: refused
+            self.flash(ota=self.OTA, previous=True)
+        self.assertIn("configuration changed", str(caught.exception))
+        shown = editor.show(self.ctx(runner=self.docker.capture), "helm")["readiness"]
+        self.assertIs(shown["firmware"]["rollback_possible"], True)
+        editor.restore_config(self.ctx(), result["backup"], result["revision"])
+        self.flash(ota=self.OTA, previous=True)                  # no --force needed
+        self.assertEqual(self.docker.uploaded[-1], OTA_BYTES)
+        self.assertEqual(self.last()["current"]["image_sha256"], a)
+
+    def test_rollback_possible_follows_the_recorded_previous_image(self):
+        def possible():
+            return editor.show(self.ctx(runner=self.docker.capture), "helm")["readiness"]["firmware"]["rollback_possible"]
+        self.deploy()
+        self.assertFalse(possible())
+        self.docker.ota = b"OTA-B" * 100
+        self.retitle("B")
+        self.deploy()
+        self.assertTrue(possible())
+        lifecycle.set_theme(self.ctx(), "helm", "classic")
+        self.flash(ota=self.OTA, previous=True)                  # device now runs A again
+        self.assertFalse(possible())                             # firmware.prev IS the running image
+
+    def test_show_reports_the_last_ota_target_and_credential_changes(self):
+        self.deploy(ota="boat-helm.local")
+        flash = editor.show(self.ctx(runner=self.docker.capture), "helm")["readiness"]["last_flash"]
+        self.assertEqual(flash["ota_target"], "boat-helm.local")
+        self.assertIs(flash["credentials_changed"], False)
+        lifecycle.rotate(self.ctx(), "helm")
+        flash = editor.show(self.ctx(runner=self.docker.capture), "helm")["readiness"]["last_flash"]
+        self.assertIs(flash["credentials_changed"], True)
+
+    def test_failed_plain_flash_records_nothing(self):
+        self.build()
+        self.docker.upload_status = 1
+        with self.assertRaises(render.RenderError):
+            self.flash(ota=self.OTA)
+        self.assertFalse((self.project() / "last-flash.json").exists())
+
+    def test_same_image_again_keeps_previous(self):
+        self.deploy()
+        self.deploy()
+        self.assertIsNone(self.last()["previous"])
+
+    def test_output_is_redacted_of_every_secret(self):
+        ota_pw = self.stored()["displays"]["helm"].get("ota_password")
+        self.deploy()                                   # generates the OTA password
+        ota_pw = self.stored()["displays"]["helm"]["ota_password"]
+        self.retitle("Again")
+        secrets = ["boat-wifi", "wifi-pass-123", MQTT_PW, ota_pw]
+        self.lines["compile"] = [f"INFO using {v}" for v in secrets] + ["plain line", f'"{secrets[1]}"']
+        self.lines["upload"] = [f"OTA password {ota_pw} rejected"]
+        self.messages.clear()
+        self.deploy()
+        text = "\n".join(self.messages)
+        for secret in secrets:
+            self.assertNotIn(secret, text)
+        self.assertIn("INFO using [redacted]", text)
+        self.assertIn("plain line", text)
+
+    def test_redactor_covers_other_spellings(self):
+        redact = firmware.make_redactor(["pa ss\"w'ord", "", "x/y z"])
+        for text in ("pa ss\"w'ord", 'pa ss\\"w\'ord', "x%2Fy%20z", "x/y z"):
+            self.assertEqual(redact(f"a {text} b"), "a [redacted] b", text)
+
+    def test_known_failures_print_to_fix_lines(self):
+        self.docker.upload_status = 1
+        self.lines["upload"] = ["ERROR Authentication invalid. Is the password correct?"]
+        with self.assertRaises(render.RenderError):
+            self.deploy()
+        fixes = [m for m in self.messages if m.startswith("To fix:")]
+        self.assertEqual(len(fixes), 1)
+        self.assertIn("over USB", fixes[0])
+        self.assertIn("sudo vesselstackctl display deploy helm --serial /dev/serial/by-id/", fixes[0])
+
+    def test_hints_for_each_known_failure(self):
+        h = firmware.fix_hints
+        self.assertIn("disk", h("not enough free disk space on /var", "", "ota", "helm")[0])
+        self.assertIn("Docker", h("docker is not installed or not on PATH", "", "ota", "helm")[0])
+        self.assertIn("image", h("x is not present locally", "", "ota", "helm")[0])
+        self.assertIn("no room", h("the upload failed (exit status 2)", "Not enough space", "ota", "helm")[0])
+        self.assertIn(".local", h("the upload failed (exit status 2)", "timed out", "ota", "helm")[0])
+        self.assertIn("USB cable", h("the upload failed (exit status 2)", "", "serial", "helm")[0])
+        self.assertIn("Wi-Fi", h("no Wi-Fi credentials are stored", "", "ota", "helm")[0])
+        self.assertIn("running", h("another build/flash for helm is running", "", "ota", "helm")[0])
+        self.assertEqual(h("some unrelated failure", "", "ota", "helm"), [])
+        # generic advice in the exception text must not be mistaken for an authentication failure
+        generic = ("the upload failed (exit status 1). Check that the display is online. After 'display rotate' "
+                   "the project carries a new OTA password that the device does not know yet")
+        self.assertNotIn("credentials differ", " ".join(h(generic, "Timed out", "ota", "helm")))
+
+    def test_missing_image_does_not_skip_the_compile(self):
+        self.deploy()
+        self.docker.image_present = False
+        self.docker.upload_status = 1  # the compile (which pulls) runs; the fake upload then fails
+        with self.assertRaises(render.RenderError):
+            self.deploy()
+        self.assertEqual(sum("compile" in a for a in self.docker.streamed), 2)
+
+    def test_validation_and_options(self):
+        with self.assertRaises(render.RenderError) as caught:
+            self.deploy(ota="http://x")
+        self.assertEqual(caught.exception.code, 2)
+        with self.assertRaises(render.RenderError):
+            firmware.deploy(self.ctx(), "helm", run_lines=self.runner)
+        self.assertEqual(self.docker.streamed, [])
+
+    def test_serial_deploy_flashes_the_factory_image_over_usb(self):
+        nodes, links = self.fake_serial()
+        seam = self.seam(nodes, links)
+        self.deploy(serial="/dev/ttyACM0", **seam)
+        upload = self.docker.streamed[-1]
+        self.assertIn("--device", upload)
+        self.assertEqual(self.docker.uploaded[-1], FACTORY_BYTES)
+        self.assertEqual(self.last()["current"]["method"], "serial")
+
+    def test_default_line_runner_splits_lines_and_merges_stderr(self):
+        got: list = []
+        code = firmware.default_line_runner(
+            [sys.executable, "-c", "import sys; print('a\\rb'); print('err', file=sys.stderr); sys.exit(3)"],
+            got.append)
+        self.assertEqual(code, 3)
+        self.assertEqual(sorted(got), ["a", "b", "err"])
+
+    def test_command_line(self):
+        parser = displayctl.build_parser()
+        args = parser.parse_args(["deploy", "helm", "--ota", "192.0.2.2", "--progress"])
+        self.assertEqual((args.ota, args.serial, args.progress), ("192.0.2.2", None, True))
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["deploy", "helm"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["deploy", "helm", "--ota", "h", "--serial", "/dev/ttyACM0"])
 
 
 class CommandLineTests(FirmwareBase):
