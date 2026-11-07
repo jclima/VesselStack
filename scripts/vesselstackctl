@@ -6,7 +6,7 @@ umask 077
 
 ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
-CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
@@ -33,6 +33,10 @@ Commands:
                                or all interfaces (never changes other listeners)
   ha-http sync|status          Re-apply or show the managed Home Assistant http bind block
                                (HOMEASSISTANT_BIND_ADDRESS); used by the installer and lan
+  homepage sync|refresh|remove-heimdall
+                               Re-render the home page (Homepage) tiles and allowed hosts
+                               from the installed settings; or remove the old Heimdall
+                               container (its data folder is left on disk)
   reindex                      Rebuild Boat Chat's memory index as the service user
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|displays|containers|all]
@@ -97,16 +101,24 @@ load_config() {
 }
 
 validate_disabled_components() {
-    local raw=${VESSELSTACK_DISABLED_COMPONENTS:-} item known seen=""
+    local raw=${VESSELSTACK_DISABLED_COMPONENTS:-} item known seen="" dropped_legacy=0
     while [ -n "$raw" ]; do
         case "$raw" in *,*) item=${raw%%,*}; raw=${raw#*,} ;; *) item=$raw; raw="" ;; esac
         item=${item//[[:space:]]/}; [ -z "$item" ] && continue
+        # Heimdall no longer exists: drop it (not translated to homepage) and persist below.
+        if [ "$item" = heimdall ]; then dropped_legacy=1; continue; fi
         known=0; for component in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && known=1; done
         [ "$known" -eq 1 ] || { echo "Unknown disabled component: $item" >&2; exit 2; }
         case ",$seen," in *,"$item",*) echo "Duplicate disabled component: $item" >&2; exit 2 ;; esac
         seen="${seen:+$seen,}$item"
     done
     VESSELSTACK_DISABLED_COMPONENTS=$seen
+    if [ "$dropped_legacy" -eq 1 ]; then
+        echo "Note: dropped the retired 'heimdall' entry from VESSELSTACK_DISABLED_COMPONENTS." >&2
+        if [ "$(id -u)" -eq 0 ]; then
+            set_env_key "$ENV_FILE" VESSELSTACK_DISABLED_COMPONENTS "$seen" || true
+        fi
+    fi
 }
 
 selected_services() {
@@ -158,6 +170,67 @@ persist_disabled_components() {
     VESSELSTACK_DISABLED_COMPONENTS=$value
 }
 
+# Render the Homepage configuration (tiles follow the enabled components and the
+# configured addresses) and refresh HOMEPAGE_ALLOWED_HOSTS, which changes with DHCP
+# addresses. Reads only host, port, bind and enable settings (see
+# scripts/render-homepage.py). A changed allowed-hosts value recreates the container
+# at the next "compose up"; the rendered files are picked up without a restart.
+homepage_sync() {
+    local renderer=${VESSELSTACK_HOMEPAGE_RENDERER:-$VESSELSTACK_ROOT/installer/scripts/render-homepage.py} hosts
+    local -a render_args=()
+    [ -r "$renderer" ] || { echo "Missing home page renderer: $renderer (rerun the installer)" >&2; return 1; }
+    [ -z "${VESSELSTACK_HOMEPAGE_HOSTNAME:-}" ] || render_args+=(--hostname "$VESSELSTACK_HOMEPAGE_HOSTNAME")
+    [ -z "${VESSELSTACK_HOMEPAGE_ADDRESSES+x}" ] || render_args+=(--addresses "$VESSELSTACK_HOMEPAGE_ADDRESSES")
+    python3 -I "$renderer" render --root "$VESSELSTACK_ROOT" "${render_args[@]}" || return 1
+    hosts=$(python3 -I "$renderer" allowed-hosts --root "$VESSELSTACK_ROOT" "${render_args[@]}") || return 1
+    if [ "$hosts" != "$(env_file_value "$ENV_FILE" HOMEPAGE_ALLOWED_HOSTS)" ]; then
+        set_env_key "$ENV_FILE" HOMEPAGE_ALLOWED_HOSTS "$hosts" || return 1
+    fi
+    export HOMEPAGE_ALLOWED_HOSTS=$hosts
+}
+
+# Heimdall (the previous start page) is no longer part of the stack: remove its
+# container and its image if nothing else uses it. The data directory is user data
+# and is never deleted.
+remove_heimdall() {
+    local image project
+    if image=$(docker container inspect --format '{{.Image}}' vesselstack-heimdall 2>/dev/null); then
+        # Only remove what this stack created: a container of that name from another
+        # Compose project (or none) is somebody else's.
+        project=$(docker container inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' \
+            vesselstack-heimdall 2>/dev/null || true)
+        if [ "$project" != vesselstack ]; then
+            echo "NOTICE: container vesselstack-heimdall does not belong to the VesselStack Compose project (label: '${project:-none}'); leaving it alone. Remove it yourself if it holds port ${HOMEPAGE_PORT:-80}." >&2
+        else
+            docker rm -f vesselstack-heimdall >/dev/null || return 1
+            echo "Removed the old Heimdall container (replaced by Homepage)."
+            [ -z "$image" ] || docker image rm "$image" >/dev/null 2>&1 || true
+        fi
+    fi
+    if [ -d "$VESSELSTACK_DATA/heimdall" ]; then
+        echo "NOTICE: $VESSELSTACK_DATA/heimdall is no longer used by VesselStack and can be deleted when you no longer need it."
+    fi
+    return 0
+}
+
+# Run at boot (vesselstack-homepage-refresh.service): Docker restarts the container with the
+# allowed hosts it was created with, so after a new DHCP lease the page would refuse the new
+# address. Re-render, then let Compose recreate the container only if the value changed.
+homepage_refresh() {
+    homepage_sync || return 1
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homepage,*) return 0 ;; esac
+    "${COMPOSE[@]}" up -d homepage
+}
+
+homepage_command() {
+    case "${1:-}" in
+        sync) [ $# -eq 1 ] || { usage >&2; exit 2; }; homepage_sync ;;
+        refresh) [ $# -eq 1 ] || { usage >&2; exit 2; }; homepage_refresh ;;
+        remove-heimdall) [ $# -eq 1 ] || { usage >&2; exit 2; }; remove_heimdall ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
 component_change() {
     local action=$1 component=$2 item found=0 value=""
     for item in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && found=1; done
@@ -169,9 +242,11 @@ component_change() {
     done
     if [ "$action" = remove ]; then
         value="${value:+$value,}$component"; persist_disabled_components "$value"
+        homepage_sync || echo "WARN: could not update the home page tiles; run: sudo vesselstackctl homepage sync" >&2
         "${COMPOSE[@]}" rm --stop --force "$component"
     else
         persist_disabled_components "$value"
+        homepage_sync || echo "WARN: could not update the home page tiles; run: sudo vesselstackctl homepage sync" >&2
         if [ "$component" = mosquitto ]; then sync_mqtt_access; fi
         if [ "$component" = influxdb ]; then
             [ -x "$VESSELSTACK_ROOT/installer/scripts/bootstrap-influx.sh" ] || {
@@ -254,6 +329,10 @@ start_stack() {
            fi ;;
     esac
     local -a services=()
+    # Heimdall held port 80 before Homepage; remove it first, then re-render the
+    # home page (the machine's addresses may have changed since the last start).
+    remove_heimdall || return 1
+    homepage_sync || echo "WARN: could not render the home page; run: sudo vesselstackctl homepage sync" >&2
     sync_prometheus_config || return 1
     while IFS= read -r service; do services+=("$service"); done < <(selected_services)
     if [ "${#services[@]}" -gt 0 ]; then
@@ -383,7 +462,7 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
 
 status_stack() {
     local failed=0 service running_services
-    local services=(homeassistant influxdb grafana prometheus mosquitto heimdall)
+    local services=(homeassistant influxdb grafana prometheus mosquitto homepage)
     local -a selected=()
     for service in "${services[@]}"; do
         case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,"$service",*) ;; *) selected+=("$service") ;; esac
@@ -590,6 +669,10 @@ show_urls() {
         printf 'Note: listening sockets could not be inspected (ss unavailable); bind state is taken from the configuration.\n'
     fi
     printf '\n'
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in
+        *,homepage,*) printf '%-20s %s\n' 'Home page' 'removed (sudo vesselstackctl component add homepage)' ;;
+        *) show_service 'Home page' "${HOMEPAGE_PORT:-80}" http "$web_bind" no 'start here: links to every boat page' 'to change: sudo vesselstackctl lan dashboards' ;;
+    esac
     show_service 'Boat Chat' "${BOAT_CHAT_PORT:-8765}" http "$chat_host" no 'access token required' \
         'to change: sudo vesselstackctl lan dashboards'
     local panel_note='root-level editor'
@@ -609,7 +692,6 @@ show_urls() {
         *) printf '%-20s %s\n' 'Home Assistant' "external server, not managed here: $HOME_ASSISTANT_URL" ;;
     esac
     show_service Grafana "${GRAFANA_PORT:-43000}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
-    show_service Heimdall "${HEIMDALL_PORT:-80}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
     show_service InfluxDB "${INFLUXDB_PORT:-8086}" http "$data_bind" no 'API token required' 'to change: sudo vesselstackctl lan all'
     show_service Prometheus "${PROMETHEUS_PORT:-9090}" http "$data_bind" no 'NO login' 'to change: sudo vesselstackctl lan all'
     show_service MQTT "${MQTT_PORT:-1883}" mqtt "$data_bind" no 'password required' 'to change: sudo vesselstackctl lan all'
@@ -646,7 +728,7 @@ show_logs() {
 
 # --- LAN access presets -------------------------------------------------------------
 # local:      everything this machine publishes listens on loopback only
-# dashboards: Grafana, Heimdall and Boat Chat on every interface; databases on loopback
+# dashboards: Grafana, Homepage and Boat Chat on every interface; databases on loopback
 # all:        also InfluxDB, Prometheus and MQTT on every interface
 # The control panel (a root-level editor) is in no preset. Home Assistant (host-networked)
 # follows HOMEASSISTANT_BIND_ADDRESS through a managed http block in its configuration.yaml
@@ -1068,7 +1150,7 @@ lan_firewall_report() {
     if [ "$strict" = true ]; then
         what="everything except the allow-listed TCP ports (${VESSELSTACK_FIREWALL_ALLOW_TCP:-22})"
     else
-        what="Grafana ${GRAFANA_PORT:-43000}, InfluxDB ${INFLUXDB_PORT:-8086}, Prometheus ${PROMETHEUS_PORT:-9090} and MQTT ${MQTT_PORT:-1883}"
+        what="the home page ${HOMEPAGE_PORT:-80}, Grafana ${GRAFANA_PORT:-43000}, InfluxDB ${INFLUXDB_PORT:-8086}, Prometheus ${PROMETHEUS_PORT:-9090} and MQTT ${MQTT_PORT:-1883}"
     fi
     printf 'FIREWALL: the VesselStack firewall is enabled and treats %s as untrusted.\n' "$iface" >&2
     printf '          Devices that reach this machine over %s (usually Wi-Fi) are blocked from %s,\n' "$iface" "$what" >&2
@@ -1100,13 +1182,13 @@ lan_stack() {
     panel_host=${panel_host:-127.0.0.1}
     if [ -z "$preset" ]; then
         printf 'Current LAN access: %s\n' "$(lan_current_preset)"
-        printf '  Grafana, Heimdall listen on     %s\n  InfluxDB, Prometheus, MQTT on   %s\n  Boat Chat listens on            %s\n  Home Assistant listens on       %s\n' \
+        printf '  Grafana, Home page listen on   %s\n  InfluxDB, Prometheus, MQTT on   %s\n  Boat Chat listens on            %s\n  Home Assistant listens on       %s\n' \
             "$cur_web" "$cur_data" "$cur_chat" "$cur_ha"
         printf '  Control panel                   %s (never changed by this command)\n\n' "$panel_host"
         cat <<'EOF'
 Presets (sudo vesselstackctl lan PRESET [--dry-run]):
   local       everything this machine publishes is limited to this device (use an SSH tunnel)
-  dashboards  Grafana, Heimdall and Boat Chat on the network; InfluxDB, Prometheus and MQTT
+  dashboards  Grafana, Home page and Boat Chat on the network; InfluxDB, Prometheus and MQTT
               stay on this device (recommended)
   all         also InfluxDB, Prometheus (NO login) and MQTT on the network; needs --yes
 Home Assistant (8123) follows the preset (managed http block in its configuration.yaml).
@@ -1186,6 +1268,8 @@ EOF
     fi
     rm -rf -- "$backup"
     echo "Configuration updated."
+    # The home page tiles follow the bind addresses; re-render before re-applying.
+    homepage_sync || echo "WARN: could not update the home page tiles; run: sudo vesselstackctl homepage sync" >&2
     # Re-apply: compose recreates only the containers whose published ports changed.
     if "${COMPOSE[@]}" ps --status running --quiet 2>/dev/null | grep -q .; then
         local -a lan_services=()
@@ -1307,6 +1391,8 @@ panel_access() {
         return 1
     fi
     rm -rf -- "$backup"
+    # The Control Panel tile on the home page links or explains the tunnel by this mode.
+    homepage_sync || echo "WARN: could not update the home page tiles; run: sudo vesselstackctl homepage sync" >&2
     case "$new_host" in
         127.*|::1|localhost) panel_url=$(url_for http 127.0.0.1 "$panel_port") ;;
         0.0.0.0)
@@ -2180,6 +2266,7 @@ uninstall_stack() {
         "$SBIN_DIR/vesselstack-firewall" remove || true
     fi
     systemctl disable vesselstack-firewall.service || true
+    systemctl disable vesselstack-homepage-refresh.service || true
     rm -f -- "$SYSTEMD_DIR/vesselstack-chat.service" \
         "$SYSTEMD_DIR/vesselstack-chat-telegram.service" \
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.service" \
@@ -2190,7 +2277,7 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
-    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SBIN_DIR/vesselstack-firewall" \
+    rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SYSTEMD_DIR/vesselstack-homepage-refresh.service" "$SBIN_DIR/vesselstack-firewall" \
         "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload
@@ -2231,6 +2318,7 @@ case "$command" in
     lan) lan_stack "$@" ;;
     panel-access) panel_access "$@" ;;
     ha-http) ha_http_command "$@" ;;
+    homepage) homepage_command "$@" ;;
     reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;

@@ -99,7 +99,7 @@ systemctl is-active docker
 id boat                             # service account (VESSELSTACK_USER); create per INSTALLATION.md if absent
 df -h / /opt /var/backups           # >= 1 GiB free for data is the doctor FAIL threshold; plan far more
 findmnt -no SOURCE,FSTYPE /opt      # SD card (mmcblk) vs SSD (sda/nvme)
-ss -ltn | grep -E ':(80|443|1883|3000|8086|8123|8765|8780|9090|43000)\b' || echo "ports free"
+ss -ltn | grep -E ':(80|1883|3000|8086|8123|8765|8780|9090|43000)\b' || echo "ports free"
 cat /opt/vesselstack/config/installed-version 2>/dev/null || echo "not installed"
 ```
 

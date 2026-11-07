@@ -1452,7 +1452,7 @@ final_report() {
 
 # Plain-text information for a headless Pi: nothing here has to be opened now.
 print_access_info() {
-    local host ip where user web_bind web_port heimdall chat chat_host panel_host panel_port panel_url_host app_root cfg=$ENV_FILE panel_cfg
+    local host ip where user web_bind web_port homepage chat chat_host panel_host panel_port panel_url_host app_root cfg=$ENV_FILE panel_cfg
     # After an upgrade the settings live in the installed configuration, not in the staged one.
     if [ "$UPGRADE" -eq 1 ]; then cfg=$INSTALL_ROOT/config/vesselstack.env; fi
     host=$(hostname 2>/dev/null || true)
@@ -1463,13 +1463,13 @@ print_access_info() {
     if [ -z "$user" ] || [ "$user" = root ]; then user=YOUR_USER; fi
     web_bind=$(env_get "$cfg" VESSELSTACK_WEB_BIND_ADDRESS 2>/dev/null || true)
     web_port=$(env_get "$cfg" GRAFANA_PORT 2>/dev/null || true)
-    heimdall=$(env_get "$cfg" HEIMDALL_PORT 2>/dev/null || true)
+    homepage=$(env_get "$cfg" HOMEPAGE_PORT 2>/dev/null || true)
     chat=$(env_get "$cfg" BOAT_CHAT_PORT 2>/dev/null || true)
     chat_host=$(env_get "$cfg" BOAT_CHAT_HOST 2>/dev/null || true)
     panel_port=$(env_get "$cfg" CONTROL_PANEL_PORT 2>/dev/null || true)
     panel_host=$(env_get "$cfg" CONTROL_PANEL_HOST 2>/dev/null || true)
     app_root=$(env_get "$cfg" VESSELSTACK_ROOT 2>/dev/null || true)
-    web_bind=${web_bind:-0.0.0.0}; web_port=${web_port:-43000}; heimdall=${heimdall:-80}
+    web_bind=${web_bind:-0.0.0.0}; web_port=${web_port:-43000}; homepage=${homepage:-80}
     chat=${chat:-8765}; chat_host=${chat_host:-0.0.0.0}; panel_port=${panel_port:-8780}
     app_root=${app_root:-$INSTALL_ROOT}
     # The installed service environment is authoritative after install. Only
@@ -1489,8 +1489,8 @@ print_access_info() {
     if [ "$web_bind" = 127.0.0.1 ]; then
         info "Dashboards are limited to this Pi (VESSELSTACK_WEB_BIND_ADDRESS=127.0.0.1); reach them through an SSH tunnel."
     else
+        if [ "$homepage" = 80 ]; then info "Home page (start here)         http://$where"; else info "Home page (start here)         http://$where:$homepage"; fi
         info "Grafana (history dashboards)   http://$where:$web_port"
-        if [ "$heimdall" = 80 ]; then info "Heimdall (start page)          http://$where"; else info "Heimdall (start page)          http://$where:$heimdall"; fi
     fi
     info "Home Assistant                 http://$where:8123"
     if [ "$chat_host" = 127.0.0.1 ]; then

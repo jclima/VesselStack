@@ -7,14 +7,16 @@
 #   print   render the rules that apply would load, without root or changes
 #
 # Default policy: drop the administrative TCP ports (MQTT, InfluxDB, Prometheus,
-# Grafana) arriving on the untrusted interface.
+# Grafana) arriving on the untrusted interface. Homepage listens on container port 3000,
+# which the DOCKER-USER drop of port 3000 covers whatever HOMEPAGE_PORT is; no rule
+# matches the published port, so replies to this host's own outbound HTTP are untouched.
 #
 # Strict policy (VESSELSTACK_FIREWALL_STRICT=true): drop EVERYTHING arriving on the
 # untrusted interface except replies to connections this host started, ICMP, DHCP
 # client traffic and an explicit allow-list (VESSELSTACK_FIREWALL_ALLOW_TCP, default
 # 22; VESSELSTACK_FIREWALL_ALLOW_UDP, default empty). This covers host-networked
 # services (SignalK 3000, AIS) and Boat Chat 8765 through INPUT, and published
-# container ports (Heimdall 80/443, Grafana, ...) through DOCKER-USER.
+# container ports (Homepage 80, Grafana, ...) through DOCKER-USER.
 #
 # Chain contents are replaced atomically with iptables-restore --noflush, so there
 # is never a moment where an existing chain is empty. DOCKER-USER only exists once

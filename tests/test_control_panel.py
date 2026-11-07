@@ -624,7 +624,7 @@ class StatusFieldTests(unittest.TestCase):
     def test_components_use_real_names_and_one_plain_status(self) -> None:
         expected = {"signalk": "Signal K", "ais-catcher": "AIS-catcher", "socketcan": "SocketCAN", "node-exporter": "Node Exporter",
                     "homeassistant": "Home Assistant", "influxdb": "InfluxDB", "mosquitto": "Mosquitto", "boat-chat": "Boat Chat",
-                    "telegram": "Telegram alerts", "prometheus": "Prometheus", "heimdall": "Heimdall", "displays-bridge": "Displays bridge"}
+                    "telegram": "Telegram alerts", "prometheus": "Prometheus", "homepage": "Home page", "displays-bridge": "Displays bridge"}
         for name, label in expected.items():
             self.assertEqual(panel.describe_component(name, "container", True, "running")["label"], label)
         self.assertEqual(panel.describe_component("grafana", "container", True, "running")["status"], "running")

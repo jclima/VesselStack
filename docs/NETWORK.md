@@ -11,7 +11,7 @@ question in the "Who can reach what" section; `--set LAN_ACCESS=local|dashboards
 for unattended installs) and `sudo vesselstackctl lan` changes it later. The answer is
 a preset that sets the real bind settings; `LAN_ACCESS` itself is never written to a file.
 
-| Preset | Grafana, Heimdall (`VESSELSTACK_WEB_BIND_ADDRESS`) | Boat Chat (`BOAT_CHAT_HOST`) | InfluxDB, Prometheus, MQTT (`VESSELSTACK_DATA_BIND_ADDRESS`) | Home Assistant (`HOMEASSISTANT_BIND_ADDRESS`) |
+| Preset | Grafana, Homepage (`VESSELSTACK_WEB_BIND_ADDRESS`) | Boat Chat (`BOAT_CHAT_HOST`) | InfluxDB, Prometheus, MQTT (`VESSELSTACK_DATA_BIND_ADDRESS`) | Home Assistant (`HOMEASSISTANT_BIND_ADDRESS`) |
 | --- | --- | --- | --- | --- |
 | `local` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` | `127.0.0.1` |
 | `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` | `0.0.0.0` |
@@ -108,17 +108,30 @@ curl -sS -o /dev/null -w 'grafana %{http_code}\n' http://PI:43000/login   # 200 
 curl -sS -m 5 -o /dev/null -w 'influx %{http_code}\n' http://PI:8086/health || echo 'influx: not reachable (expected unless preset all)'
 ```
 
+## Home page host names
+
+Homepage answers only to the host names and addresses in `HOMEPAGE_ALLOWED_HOSTS`
+(managed; the Pi's `.local` name, host name, current IPv4 addresses and loopback, plus
+`HOMEPAGE_ALLOWED_HOSTS_EXTRA`). The list is refreshed at every start and, because Docker
+restarts the container with the value it was created with, again at every boot by
+`vesselstack-homepage-refresh.service` (`vesselstackctl homepage refresh`), which
+recreates the container only when the list changed (for example after a new DHCP lease).
+IPv6 addresses are not added: use the `.local` name, an IPv4 address or
+`HOMEPAGE_ALLOWED_HOSTS_EXTRA`. A request with any other Host header gets `400`.
+
 ## Network security
 
 Compose publishes InfluxDB `8086`, Prometheus `9090`, and MQTT `1883` on
 `127.0.0.1` by default (`VESSELSTACK_DATA_BIND_ADDRESS`). Grafana `43000` and
-Heimdall `80/443` remain reachable on every interface by default
+Homepage `80` are published on every interface by default
 (`VESSELSTACK_WEB_BIND_ADDRESS=0.0.0.0`) because the documented dashboards are
-used over the boat LAN; set it to `127.0.0.1` to keep them local. Grafana still
+used over the boat LAN; set it to `127.0.0.1` to keep them local. With the
+firewall enabled (see below), Grafana and Homepage are dropped on the untrusted
+interface only; every other interface still reaches them. Grafana still
 reaches InfluxDB and Prometheus by service name, and host-networked Home
 Assistant reaches MQTT on loopback. AIS ports are unchanged. At minimum:
 
-- restrict Grafana `43000` and Heimdall to trusted management networks, and set
+- restrict Grafana `43000` and Homepage to trusted management networks, and set
   `VESSELSTACK_DATA_BIND_ADDRESS` to a trusted LAN/VPN IPv4 address only if
   external devices must publish to MQTT or InfluxDB;
 - keep Home Assistant, Signal K, and Boat Chat off the public internet unless
@@ -164,8 +177,10 @@ VESSELSTACK_FIREWALL_ALLOW_UDP=""
 On the untrusted interface strict mode drops everything except replies to
 connections the boat started, ICMP/ICMPv6, DHCP client replies and the
 allow-lists. That covers host-networked Signal K `3000`, AIS, Boat Chat `8765`
-(INPUT) and published container ports such as Heimdall `80/443` and Grafana
-(`DOCKER-USER`, matched on the published port). The allow-list therefore opens
+(INPUT) and published container ports such as Homepage `80` and Grafana
+(`DOCKER-USER`; Homepage is matched by its container port `3000`, whatever
+`HOMEPAGE_PORT` is, so replies to the Pi's own outbound HTTP on port 80 are never
+dropped). The allow-list therefore opens
 ports on both paths; the default `22` only lets SSH in. Keep Ethernet, a VPN or
 console access before enabling it: a wrong interface name or allow-list can lock
 you out of Wi-Fi access, and remote `ssh` on that interface needs `22` listed.

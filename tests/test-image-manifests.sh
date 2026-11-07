@@ -16,6 +16,13 @@ esphome_image=$(tr -d '[:space:]' < "$ROOT/displays/esphome/IMAGE")
     exit 1
 }
 images+=("$esphome_image")
+# The Homepage front door is pinned by tag AND multi-arch index digest, like ESPHome;
+# the loop below then checks that this index has a Linux ARM64 manifest.
+homepage_image=$(printf '%s\n' "${images[@]}" | grep '^ghcr\.io/gethomepage/homepage:' || true)
+[[ "$homepage_image" =~ ^ghcr\.io/gethomepage/homepage:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$ ]] || {
+    echo "compose.yml must pin Homepage as ghcr.io/gethomepage/homepage:vX.Y.Z@sha256:<index digest>: ${homepage_image:-missing}" >&2
+    exit 1
+}
 manifest=""
 trap 'rm -f -- "$manifest"' EXIT
 

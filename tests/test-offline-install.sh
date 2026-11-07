@@ -314,7 +314,7 @@ test ! -s "$TEST_ROOT/pip.log" 2>/dev/null || fail "pip ran although preflight f
 
 # --- Offline install with every image present --------------------------------
 for image in homeassistant/home-assistant:2026.6.4 influxdb:2.9.1 grafana/grafana:13.0.1 \
-    prom/prometheus:v2.55.0 eclipse-mosquitto:2.1.2-alpine lscr.io/linuxserver/heimdall:v2.8.1-ls357; do
+    prom/prometheus:v2.55.0 eclipse-mosquitto:2.1.2-alpine ghcr.io/gethomepage/homepage:v2.7.0@sha256:19c5c09184458a41b7b5915e71463a39f36cd33540f41bdbed008791b8182d5f; do
     echo "$image" >> "$IMAGES_PRESENT"
 done
 : > "$TEST_ROOT/docker.log"

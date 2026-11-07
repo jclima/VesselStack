@@ -22,6 +22,14 @@ class FirewallRenderTests(unittest.TestCase):
         self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090 -j DROP", out)
         self.assertNotIn("ESTABLISHED", out)
 
+    def test_homepage_is_covered_by_the_container_port_rule_and_no_published_port_rule(self):
+        for port in ("80", "8088"):
+            out = render(HOMEPAGE_PORT=port).stdout
+            self.assertIn("--dports 1883,3000,8086,9090 -j DROP", out)
+            # Matching the published port would also drop replies to outbound HTTP on port 80.
+            self.assertNotIn("ctorigdstport", out)
+        self.assertEqual(render(HOMEPAGE_PORT="x").returncode, 0)
+
     def test_payload_is_atomic_restore_input(self):
         out = render().stdout
         self.assertIn("*filter\n:VESSELSTACK-INPUT - [0:0]\n-F VESSELSTACK-INPUT\n", out)

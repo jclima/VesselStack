@@ -1,5 +1,12 @@
 # Development and safe updates
 
+## Homepage front door
+
+`scripts/render-homepage.py` (stdlib, run as `python3 -I`) renders `config/homepage/*` from an
+allow-list of non-secret settings; tests are in `tests/test_homepage_render.py`. The image in
+`templates/compose.yml` is pinned by tag and multi-arch digest and checked by
+`tests/test-image-manifests.sh`. Never mount `docker.sock` into it.
+
 ## Use a separate source checkout
 
 Clone `https://github.com/jclima/VesselStack.git` on each development machine.
@@ -637,7 +644,7 @@ See [development/update details](DEVELOPMENT.md).
 
 The installed `VESSELSTACK_DISABLED_COMPONENTS` setting is a comma-separated
 list of core services to exclude: `homeassistant`, `influxdb`, `grafana`,
-`prometheus`, `mosquitto`, and `heimdall`. Empty (the default) starts all six;
+`prometheus`, `mosquitto`, and `homepage`. Empty (the default) starts all six;
 unknown or duplicate IDs are rejected. `install.sh --start` and
 `vesselstackctl start` pass only selected services to Compose, preserve offline
 `--pull never`, and skip InfluxDB provisioning and Mosquitto force-recreation
