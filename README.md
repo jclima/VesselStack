@@ -1503,6 +1503,8 @@ Run `python3 -m unittest discover -s tests -p 'test_*.py'` and the shell suites 
 [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 
 Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
+Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order.
+To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
 
 ## Documentation policy
 

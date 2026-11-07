@@ -360,7 +360,10 @@ mv "$TEST_ROOT/control-panel.env.saved" "$APP_ROOT/config/control-panel.env"
 install -d -m 0750 -o 65534 -g 65534 "$DATA_ROOT/prometheus"
 printf 'tsdb\n' > "$DATA_ROOT/prometheus/lifecycle-marker"
 archive=$(run_ctl backup "$BACKUP_ROOT" | tail -n 1)
-tar -tzf "$archive" | grep -q '/prometheus/lifecycle-marker$' || {
+# The listing goes to a variable first: `tar -t | grep -q` under pipefail fails with SIGPIPE whenever grep
+# matches early in a listing longer than one pipe write (which entry comes first depends on the filesystem).
+prometheus_listing=$(tar -tzf "$archive")
+grep -q '/prometheus/lifecycle-marker$' <<<"$prometheus_listing" || {
     echo 'Backup is missing the Prometheus data directory' >&2
     exit 1
 }
@@ -412,13 +415,13 @@ if ! grep -q '/displays/bridge.py' <<<"$archive_listing"; then
     echo 'Displays sources are missing from the backup' >&2
     exit 1
 fi
-if tar -tzf "$archive" | grep -q '/boat-chat/.venv'; then
+if grep -q '/boat-chat/.venv' <<<"$archive_listing"; then
     echo 'Rebuildable virtual environment was included in backup' >&2
     exit 1
 fi
 for extra in etc/systemd/system/vesselstack-chat.service usr/local/sbin/vesselstackctl \
     usr/local/sbin/vesselstack-firewall etc/vesselstack/update.env; do
-    tar -tzf "$archive" | grep -q "${SYSTEM_ROOT#/}/$extra\$" || {
+    grep -q "${SYSTEM_ROOT#/}/$extra\$" <<<"$archive_listing" || {
         echo "Backup is missing $extra" >&2
         exit 1
     }

@@ -27,6 +27,7 @@ Planned for 0.6.2 (`VERSION` is not bumped here).
 
 ### Fixes
 
+- `tests/test-lifecycle.sh` no longer fails intermittently on "Backup is missing the Prometheus data directory": the archive listing is read into a variable instead of `tar -t | grep -q` under `pipefail` (SIGPIPE when the match came early). Test-only; product behaviour is unchanged.
 - "Back up to the system disk this once" (terminal menu, pinned installer with a current controller)
   now writes to `/var/backups/vesselstack` and leaves the unmounted `/media` or `/mnt` folder empty,
   so the drive can still be mounted there later. An older installed controller still writes into that
