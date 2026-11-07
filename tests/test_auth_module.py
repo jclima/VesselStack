@@ -255,6 +255,58 @@ class ThrottleTests(unittest.TestCase):
         self.assertEqual(throttle.retry_after("192.0.2.200"), 0)
 
 
+class ChatScopeTests(unittest.TestCase):
+    def test_chat_store_minimum_roles_and_distinct_passphrases(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            panel = auth.AuthStore(Path(root) / "panel.json")
+            panel.set_passphrase(PASS)
+            chat = auth.AuthStore(Path(root) / "chat" / "auth.json", min_passphrase=auth.CHAT_MIN_PASSPHRASE_LENGTH,
+                                  expose_role=True, inherit_owner=True,
+                                  differs_from=lambda: panel.snapshot()["passphrase_hash"])
+            with self.assertRaises(auth.AuthError):
+                chat.set_passphrase("short")
+            with self.assertRaises(auth.AuthError):
+                chat.set_passphrase(PASS)
+            chat.set_passphrase("crew pass")
+            token, device = chat.create_device("Phone", True)
+            self.assertEqual(device["role"], "access")
+            self.assertEqual(chat.list_devices()[0]["role"], "access")
+            self.assertEqual(chat.verify_device_token(token)["role"], "access")
+            self.assertEqual(stat.S_IMODE(os.stat(chat.path).st_mode), 0o600)
+            self.assertNotIn("role", panel.create_device("x", False)[1], "panel devices do not expose a role")
+            self.assertEqual(chat.create_device("Admin", False, role="admin")[1]["role"], "admin")
+            self.assertEqual(chat.create_device("Bogus", False, role="root")[1]["role"], "access")
+
+    def test_panel_refuses_the_chat_passphrase_and_cli_covers_both(self) -> None:
+        cli = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as data:
+            (Path(data) / "boat-chat").mkdir()
+
+            def run(args, stdin=""):
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.dict(os.environ, {"VESSELSTACK_ROOT": root, "VESSELSTACK_DATA": data}):
+                    code = cli.main(args, io.StringIO(stdin), out, err)
+                return code, out.getvalue(), err.getvalue()
+            self.assertEqual(run(["passphrase", "set", "chat", "--stdin"], "short\n")[0], 1)
+            self.assertEqual(run(["passphrase", "set", "chat", "--stdin"], "crew pass\n")[0], 0)
+            code, _, err = run(["passphrase", "set", "panel", "--stdin"], "crew pass and more\n")
+            self.assertEqual(code, 0)
+            code, _, err = run(["passphrase", "set", "chat", "--stdin"], "crew pass and more\n")
+            self.assertEqual(code, 1)
+            self.assertIn("different from the Control Panel", err)
+            code, _, err = run(["passphrase", "set", "panel", "--stdin"], "crew pass\n")
+            self.assertEqual(code, 1)
+            self.assertEqual(run(["passphrase", "status", "chat"])[1].splitlines()[0], "chat passphrase: set")
+            chat_store = auth.AuthStore(Path(data) / "boat-chat" / "auth.json", expose_role=True)
+            chat_store.create_device("Tablet", True)
+            self.assertIn("access", run(["devices", "list", "chat"])[1])
+            self.assertEqual(run(["devices", "list", "panel"])[1], "No signed-in devices.\n")
+            self.assertIn("Revoked 1", run(["devices", "revoke-all", "chat"])[1])
+            self.assertEqual(run(["passphrase", "clear", "chat"])[0], 0)
+            self.assertFalse(chat_store.passphrase_set())
+            self.assertTrue(auth.AuthStore(Path(root) / "config" / "control-panel-auth.json").passphrase_set())
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, root: str, args: list[str], stdin: str = ""):
         cli = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")

@@ -49,6 +49,47 @@ KNOWLEDGE_ROOT = ROOT / "knowledge"
 BOAT_NAME = os.environ.get("BOAT_NAME", "VesselStack")
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
+
+
+def _load_shared_auth() -> Any:
+    """Load common/vesselstack_auth.py by path (installed root-owned 0644 next to boat-chat/; same layout in a checkout).
+
+    Missing or broken module: passphrase sign-in is off and the Access/admin codes keep working.
+    """
+    import importlib.util
+    candidate = REPO_ROOT / "common" / "vesselstack_auth.py"
+    try:
+        spec = importlib.util.spec_from_file_location("vesselstack_auth", candidate)
+        if spec is None or spec.loader is None or not candidate.is_file():
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:  # noqa: BLE001 - never stop the chat service over optional sign-in
+        sys.stderr.write(f"passphrase sign-in unavailable: {exc}\n")
+        return None
+
+
+vsauth = _load_shared_auth()
+LOGIN_THROTTLE = vsauth.LoginThrottle() if vsauth else None
+_AUTH_STORES: dict[str, Any] = {}
+_HOST_ALLOWLISTS: dict[tuple[str, int], Any] = {}
+
+
+def chat_auth_store() -> Any:
+    """The service user's sign-in store: $BOAT_CHAT_STATE_DIR/auth.json (0600)."""
+    path = env_config.state_dir() / vsauth.CHAT_STORE_NAME
+    key = str(path)
+    if key not in _AUTH_STORES:
+        _AUTH_STORES[key] = vsauth.AuthStore(path, min_passphrase=vsauth.CHAT_MIN_PASSPHRASE_LENGTH, expose_role=True)
+    return _AUTH_STORES[key]
+
+
+def chat_host_allowlist(address: Any) -> Any:
+    host, port = str(address[0]), int(address[1])
+    if (host, port) not in _HOST_ALLOWLISTS:
+        _HOST_ALLOWLISTS[(host, port)] = vsauth.HostAllowlist(host, port, extra=lambda: setting_value("BOAT_CHAT_ALLOWED_HOSTS", "") or "")
+    return _HOST_ALLOWLISTS[(host, port)]
 MAX_REQUEST_BODY = 1024 * 1024
 DEFAULT_OPENAI_MODEL = "gpt-5.5"
 DEFAULT_GOOGLE_MODEL = "gemini-2.5-flash"
@@ -5284,8 +5325,45 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         # Browsers always send Host; only a bare HTTP/1.0 client omits it.
         return hostname == "" or hostname in allowed or hostname.endswith(".localhost")
 
+    def device_context(self) -> dict[str, Any] | None:
+        """The signed-in device named by X-Boat-Chat-Device (role "access"), or None."""
+        if vsauth is None:
+            return None
+        token = (self.headers.get("X-Boat-Chat-Device") or "").strip()
+        if not token:
+            return None
+        try:
+            return chat_auth_store().verify_device_token(token)
+        except (OSError, vsauth.StoreError):
+            return None
+
+    def host_allowed(self) -> bool:
+        """DNS-rebinding guard for passphrase sign-in: Host must name this machine (or BOAT_CHAT_ALLOWED_HOSTS)."""
+        if vsauth is None or chat_host_allowlist(self.server.server_address).allowed(self.headers.get("Host")):
+            return True
+        body = b"Misdirected request\n"
+        self.send_response(421)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+        return False
+
+    def needs_host_check(self, path: str) -> bool:
+        return path.startswith("/api/auth/") or bool((self.headers.get("X-Boat-Chat-Device") or "").strip())
+
+    def admin_code_supplied(self) -> bool:
+        token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
+        provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
+        return bool(token) and token_matches(provided, token)
+
     def access_allowed(self) -> bool:
         if not access_token_required():
+            return True
+        if self.device_context() is not None:
             return True
         token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
         if not token:
@@ -5308,9 +5386,121 @@ class BoatChatHandler(BaseHTTPRequestHandler):
     def sensitive_access_allowed(self) -> bool:
         if not access_token_required():
             return True
+        if self.device_context() is not None:
+            return True
         token = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
         provided = (self.headers.get("X-Boat-Chat-Token") or "").strip()
         return bool(token) and token_matches(provided, token)
+
+    # -- passphrase sign-in -------------------------------------------------
+    def client_ip(self) -> str:
+        return str(self.client_address[0])
+
+    def too_many(self, wait: int) -> None:
+        self.send_json_headers(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+
+    def send_json_headers(self, status: int, payload: dict[str, Any], headers: dict[str, str]) -> None:
+        body = json.dumps(payload, default=json_default).encode("utf-8")
+        try:
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.log_message("client disconnected before response was written")
+
+    def get_auth(self, path: str) -> None:
+        if vsauth is None:
+            self.send_json(404, {"error": "Passphrase sign-in is not available"}); return
+        store = chat_auth_store()
+        try:
+            if path == "/api/auth/status":
+                self.send_json(200, {"passphrase_set": store.passphrase_set()}); return
+            if path == "/api/auth/devices":
+                if not self.access_allowed():
+                    self.send_json(401, {"error": "Sign in first"}); return
+                device = self.device_context()
+                self.send_json(200, {"devices": store.list_devices(device["id"] if device else None), "max_devices": vsauth.MAX_DEVICES,
+                                     "passphrase_set": store.passphrase_set(), "via": "device" if device else "code"}); return
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."}); return
+        self.send_json(404, {"error": "Not found"})
+
+    def check_passphrase_throttled(self, store: Any, candidate: Any) -> tuple[bool, bool]:
+        """(proceed, matched). Counts the attempt atomically before the slow hash check; answers 429 itself when blocked."""
+        allowed, wait = LOGIN_THROTTLE.begin(self.client_ip())
+        if not allowed:
+            self.too_many(wait)
+            return False, False
+        return True, store.check_passphrase(candidate)
+
+    def post_auth(self, path: str) -> None:
+        if vsauth is None:
+            self.send_json(404, {"error": "Passphrase sign-in is not available"}); return
+        store = chat_auth_store()
+        ip = self.client_ip()
+        try:
+            if path == "/api/auth/login":
+                payload = self.read_json_body()
+                passphrase, remember = payload.get("passphrase"), payload.get("remember", False)
+                if not store.passphrase_set():
+                    self.send_json(409, {"error": "Passphrase sign-in is off until a passphrase is set. Use the access code, then set one under Sign-in."}); return
+                if not isinstance(passphrase, str) or not passphrase or not isinstance(remember, bool):
+                    raise ValueError("passphrase (text) and remember (true or false) are required")
+                proceed, matched = self.check_passphrase_throttled(store, passphrase)
+                if not proceed:
+                    return
+                if not matched:
+                    self.send_json(401, {"error": "That passphrase was not accepted."}); return
+                LOGIN_THROTTLE.success(ip)
+                token, device = store.create_device(payload.get("label"), remember, role="access")
+                self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": remember, "role": device["role"]}); return
+            if path == "/api/auth/passphrase":
+                payload = self.read_json_body()
+                if store.passphrase_set() and not self.admin_code_supplied():
+                    proceed, matched = self.check_passphrase_throttled(store, payload.get("current"))
+                    if not proceed:
+                        return
+                    if not matched:
+                        self.send_json(401, {"error": "The current passphrase was not accepted."}); return
+                    LOGIN_THROTTLE.success(ip)
+                elif not store.passphrase_set() and not (self.admin_code_supplied() or self.access_allowed()):
+                    self.send_json(401, {"error": "Sign in with the access code first"}); return
+                device = self.device_context()
+                revoked = store.set_passphrase(vsauth.check_new_passphrase(payload.get("new"), vsauth.CHAT_MIN_PASSPHRASE_LENGTH), keep_device=device["id"] if device else None)
+                self.send_json(200, {"ok": True, "revoked_others": revoked}); return
+            if not self.access_allowed():
+                self.send_json(401, {"error": "Sign in first"}); return
+            device = self.device_context()
+            current = device["id"] if device else None
+            if path == "/api/auth/logout":
+                if current:
+                    store.revoke(current)
+                self.send_json(200, {"ok": True, "revoked": bool(current)}); return
+            if path == "/api/auth/devices/revoke":
+                payload = self.read_json_body()
+                target = payload.get("id")
+                if target == "all":
+                    self.send_json(200, {"ok": True, "revoked": store.revoke_all(), "revoked_current": current is not None}); return
+                if isinstance(target, str) and target:
+                    if not store.revoke(target):
+                        self.send_json(404, {"error": "No such signed-in device"}); return
+                    self.send_json(200, {"ok": True, "revoked": 1, "revoked_current": target == current}); return
+                raise ValueError('id (a device id or "all") is required')
+            self.send_json(404, {"error": "Not found"})
+        except vsauth.DeviceLimitError as exc:
+            self.send_json(409, {"error": str(exc)})
+        except vsauth.AuthError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
 
     def rate_limit_allowed(self) -> bool:
         now = time.monotonic()
@@ -5389,6 +5579,11 @@ class BoatChatHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if self.needs_host_check(path) and not self.host_allowed():
+            return
+        if path.startswith("/api/auth/"):
+            self.get_auth(path)
+            return
         if path == "/health":
             readiness = readiness_status()
             self.send_json(
@@ -5439,7 +5634,13 @@ class BoatChatHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if self.needs_host_check(path) and not self.host_allowed():
+            return
         origin = self.headers.get("Origin")
+        if not origin and (path in {"/api/auth/login", "/api/auth/passphrase"} or (self.headers.get("X-Boat-Chat-Device") or "").strip()):
+            # Passphrase changes and device-authenticated writes must come from a page that names its origin.
+            self.send_json(403, {"error": "request origin is not allowed"})
+            return
         if origin:
             try:
                 parsed = urllib.parse.urlsplit(origin)
@@ -5452,6 +5653,9 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeError):
                 self.send_json(403, {"error": "request origin is not allowed"})
                 return
+        if path.startswith("/api/auth/"):
+            self.post_auth(path)
+            return
         if path == "/api/settings":
             try:
                 # Same access check as GET /api/settings, then the admin (write) check.

@@ -19,6 +19,51 @@ Boat Chat retains the access code and admin code only for the current browser ta
 closing the tab clears them. The web app labels them **Access code** and **Admin code**;
 the environment variable names (`BOAT_CHAT_ACCESS_TOKEN`, `BOAT_CHAT_SETTINGS_TOKEN`) are unchanged.
 
+### Sign in with a crew passphrase
+
+Instead of typing the access code on every phone, the skipper can choose a **crew passphrase**
+(at least 8 characters; separate from the Control Panel passphrase, and the two may not be equal):
+
+```bash
+sudo vesselstackctl passphrase set chat      # hidden prompt; --stdin reads one line for scripts
+sudo vesselstackctl passphrase status chat
+sudo vesselstackctl devices list chat
+sudo vesselstackctl devices revoke ID chat   # or: devices revoke-all chat
+sudo vesselstackctl passphrase clear chat    # passphrase sign-in off; the access code still works
+```
+
+You can also set it in Boat Chat under **Settings, Sign-in** (after connecting with the access code).
+**Connect** then asks for the passphrase with **Remember this device (30 days)** (otherwise 12 hours);
+the access code sits under **Use the access code instead**. Settings, Sign-in lists signed-in devices
+with **Sign out**, **Sign out all devices** and a change-passphrase form: changing it needs the current
+passphrase, or the admin code, and signs out every other device.
+
+- The passphrase grants **access only** (what the access code grants). Settings changes still need the
+  admin code exactly as before; the access code and admin code keep working unchanged.
+- The browser keeps a random device token (local storage when remembered, session storage otherwise; no
+  cookies) and sends it as `X-Boat-Chat-Device`. The boat stores only a scrypt hash of the passphrase and
+  the SHA-256 of each token in `auth.json` inside Boat Chat's state directory (owned by the service
+  user, 0600, written atomically). Each device carries a `role` (`access`).
+- Wrong passphrases are limited like the Control Panel's: growing waits after 5 failures from one address
+  and a 15-minute pause after 20 failures anywhere (**anyone on the network can trigger this pause**; the
+  access code keeps working during it). Attempts are counted atomically when they arrive.
+- Passphrase sign-in, and any request carrying a device token, is refused (`421`) unless the `Host` names
+  this machine (`localhost`, `127.0.0.1`, `[::1]`, the hostname, `hostname.local`, current interface
+  addresses, each with the Boat Chat port). If you use another name (for example a VPN or Tailscale name)
+  add it to `BOAT_CHAT_ALLOWED_HOSTS` (comma separated) in `config/boat-chat.env`. Access-code requests
+  are not affected. Login, passphrase changes and device-authenticated POSTs need a matching `Origin`.
+- The Control Panel cannot be checked from Boat Chat's own Settings, so only `vesselstackctl` and the
+  Control Panel enforce "different from the other passphrase"; choose different ones.
+- Plain HTTP on the boat network: the passphrase and device token cross it unencrypted, like the access code.
+
+| Request | What it needs |
+|---|---|
+| `GET /api/auth/status` | Nothing (reports whether a passphrase is set) |
+| `POST /api/auth/login` | Passphrase in the JSON body, plus `Origin` |
+| `POST /api/auth/logout`, `GET /api/auth/devices`, `POST /api/auth/devices/revoke` | Access code or device token |
+| `POST /api/auth/passphrase` | Current passphrase, or the admin code; the very first passphrase only needs access. Needs `Origin` |
+| Chat, status, insights, maintenance, `GET /api/settings` | Access code **or** `X-Boat-Chat-Device` |
+
 ## A tour of the interface
 
 ![Boat Chat Overview: boat condition, observations, needs attention and suggested actions](images/boat-chat-overview.png)

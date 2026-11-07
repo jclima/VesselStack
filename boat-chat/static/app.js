@@ -103,6 +103,26 @@ function announce(text) {
   window.setTimeout(() => { announcer.textContent = text; }, 60);
 }
 function accessCode() { try { return sessionStorage.getItem("boatChatAccessToken") || ""; } catch { return ""; } }
+// Passphrase sign-in: a random device token, kept in localStorage when remembered and sessionStorage otherwise.
+const DEVICE_KEY = "boatChatDevice";
+function deviceToken() { try { return localStorage.getItem(DEVICE_KEY) || sessionStorage.getItem(DEVICE_KEY) || ""; } catch { return ""; } }
+function clearDeviceToken() { try { localStorage.removeItem(DEVICE_KEY); sessionStorage.removeItem(DEVICE_KEY); } catch { /* storage may be blocked */ } }
+function saveDeviceToken(token, remember) { clearDeviceToken(); try { (remember ? localStorage : sessionStorage).setItem(DEVICE_KEY, token); } catch { /* storage may be blocked */ } }
+function hasAccess() { return Boolean(accessCode() || deviceToken()); }
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const url = typeof input === "string" ? input : (input && input.url) || "";
+  const token = url.startsWith("/api/") ? deviceToken() : "";
+  if (token) {
+    const headers = new Headers((init && init.headers) || {});
+    if (!headers.has("X-Boat-Chat-Device")) headers.set("X-Boat-Chat-Device", token);
+    init = { ...(init || {}), headers };
+  }
+  const response = await nativeFetch(input, init);
+  // A rejected device token (revoked or expired) is forgotten so the sign-in screen can ask again.
+  if (token && response.status === 401 && !url.startsWith("/api/auth/")) clearDeviceToken();
+  return response;
+};
 function describeHttpError(status, data) {
   if (status === 401) return "Access code needed or not accepted. Choose Connect.";
   if (status === 429) return "Too many requests. Wait a minute, then try again.";
@@ -184,7 +204,7 @@ function setStatus(text, state = "ready") {
 let healthState = "unknown";
 function refreshConnectionStatus() {
   if (activeController) return;
-  if (accessTokenRequired && !accessCode()) setStatus("Not connected", "error");
+  if (accessTokenRequired && !hasAccess()) setStatus("Not connected", "error");
   else if (connectionState === "offline" || healthState === "offline") setStatus("Offline", "error");
   else if (healthState === "limited") setStatus("Limited data", "error");
   else if (connectionState === "connected" && lastBoatStatus) {
@@ -295,11 +315,11 @@ function clearDeviceStatus(message) {
 async function loadBoatStatus() {
   if(statusBusy) return;
   const token=accessCode();
-  if(accessTokenRequired && !token) { connectionState="disconnected"; clearDeviceStatus("Connect this device to view boat observations."); return; }
+  if(accessTokenRequired && !hasAccess()) { connectionState="disconnected"; clearDeviceStatus("Connect this device to view boat observations."); return; }
   statusBusy=true;
   try {
     const response=await fetch("/api/status",{headers:{"X-Boat-Chat-Token":token},signal:AbortSignal.timeout(10000)});
-    if(response.status===401) { accessTokenRequired=true; updateAccessControls(); connectionState="disconnected"; clearDeviceStatus("Access code not accepted. Choose Connect to sign in again."); return; }
+    if(response.status===401) { accessTokenRequired=true; updateAccessControls(); connectionState="disconnected"; clearDeviceStatus("Sign-in not accepted. Choose Connect to sign in again."); return; }
     if(!response.ok) throw new Error(`HTTP ${response.status}`);
     connectionState="connected"; renderBoatStatus(await response.json());
   } catch(error) {
@@ -311,12 +331,36 @@ async function loadBoatStatus() {
 document.querySelector("#overview-open").addEventListener("click",()=>{showView("overview");loadBoatStatus();});
 document.querySelector("#chat-open").addEventListener("click",()=>{showView("chat");input.focus();});
 document.querySelector("#refresh-status").addEventListener("click",loadBoatStatus);
-function openConnect() { connectDialog.showModal(); document.querySelector("#connect-token").focus(); }
+async function prepareConnectDialog() {
+  const block = document.querySelector("#passphrase-block"), code = document.querySelector("#code-block");
+  let enabled = false;
+  try { const response = await fetch("/api/auth/status"); enabled = response.ok && (await response.json()).passphrase_set === true; } catch { enabled = false; }
+  block.hidden = !enabled;
+  code.open = !enabled;
+  document.querySelector("#connect-message").textContent = enabled ? "" : "No passphrase is set yet. Use the access code, then set a passphrase under Settings, Sign-in.";
+  (enabled ? document.querySelector("#connect-passphrase") : document.querySelector("#connect-token")).focus();
+}
+function openConnect() { connectDialog.showModal(); prepareConnectDialog(); }
 document.querySelector("#connect-open").addEventListener("click",openConnect);
 document.querySelector("#connect-close").addEventListener("click",()=>connectDialog.close());
-document.querySelector("#disconnect-device").addEventListener("click",()=>{sessionStorage.removeItem("boatChatAccessToken");connectionState="disconnected";clearDeviceStatus("Device disconnected.");connectDialog.close();});
+document.querySelector("#disconnect-device").addEventListener("click",async()=>{
+  if(deviceToken()) { try { await fetch("/api/auth/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); } catch { /* the token is forgotten here regardless */ } }
+  clearDeviceToken(); sessionStorage.removeItem("boatChatAccessToken");connectionState="disconnected";clearDeviceStatus("Device disconnected.");connectDialog.close();});
 document.querySelector("#connect-form").addEventListener("submit",async(event)=>{
   event.preventDefault(); const field=document.querySelector("#connect-token"); const token=field.value.trim(); const message=document.querySelector("#connect-message"); message.textContent="Checking access…";
+  const passField=document.querySelector("#connect-passphrase"); const passphrase=passField.value;
+  if(!token && !document.querySelector("#passphrase-block").hidden) {
+    if(!passphrase) { message.textContent="Enter the passphrase, or use the access code."; return; }
+    try {
+      const response=await fetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passphrase,remember:document.querySelector("#connect-remember").checked,label:(navigator.userAgent||"").slice(0,60)}),signal:AbortSignal.timeout(15000)});
+      const data=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(response.status===429 ? `Too many attempts. Try again in ${Math.ceil((data.retry_after||60)/60)} minute(s), or use the access code.` : response.status===421 ? "This address is not recognised by the boat. Use the boat's usual address." : data.error||"Sign-in failed.");
+      saveDeviceToken(data.device_token,document.querySelector("#connect-remember").checked); passField.value="";
+      const status=await fetch("/api/status",{signal:AbortSignal.timeout(10000)}); if(status.ok){connectionState="connected";renderBoatStatus(await status.json());}
+      message.textContent=""; connectDialog.close();
+    } catch(error) { message.textContent=error.message; }
+    return;
+  }
   try { const response=await fetch("/api/status",{headers:{"X-Boat-Chat-Token":token},signal:AbortSignal.timeout(10000)});
     if(!response.ok) throw new Error(response.status===401 ? "Access code not accepted. Check the Boat Chat access code and try again." : "Boat status is unavailable. Try again.");
     const data=await response.json(); sessionStorage.setItem("boatChatAccessToken",token); field.value=""; connectionState="connected";renderBoatStatus(data);message.textContent="";connectDialog.close();
@@ -382,7 +426,7 @@ function dueLabel(status) { return status === "overdue" ? "Overdue" : status ===
 async function loadInsights() {
   const token=accessCode();
   insightsContent.textContent="Loading Boat Hub…";
-  if (accessTokenRequired && !token) { insightsContent.textContent="Choose Connect to sign in to this device and view your trips and maintenance."; return; }
+  if (accessTokenRequired && !hasAccess()) { insightsContent.textContent="Choose Connect to sign in to this device and view your trips and maintenance."; return; }
   try {
     const data=await fetchJson("/api/insights",{headers:{"X-Boat-Chat-Token":token}}); insightsContent.replaceChildren();
     const alerts=hubCard(`Boat · ${data.status.condition}`); const alertList=document.createElement("ul"); alertList.className="alert-list";
@@ -1003,3 +1047,45 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && narrowHeader.matches && moreMenu.open) { moreMenu.open = false; moreMenu.querySelector("summary").focus(); }
 });
 showView(document.body.dataset.view || "overview");
+
+// Settings > Sign-in: signed-in devices and the shared passphrase.
+const signinMessage = document.querySelector("#signin-message");
+function adminHeaders() { const headers = { "Content-Type": "application/json" }; const admin = settingsToken(); if (admin) headers["X-Boat-Chat-Token"] = admin; else if (accessCode()) headers["X-Boat-Chat-Token"] = accessCode(); return headers; }
+async function loadSignin() {
+  const list = document.querySelector("#signin-devices"), state = document.querySelector("#signin-state");
+  list.replaceChildren(); signinMessage.textContent = "";
+  try {
+    const response = await fetch("/api/auth/devices", { headers: accessCode() ? { "X-Boat-Chat-Token": accessCode() } : {} });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) { state.textContent = "Connect this device to manage sign-in."; return; }
+    state.textContent = data.passphrase_set ? `Passphrase sign-in is on. ${data.devices.length} of ${data.max_devices} devices signed in.` : "No passphrase is set yet. Set one below so crew can sign in without the access code.";
+    data.devices.forEach((device) => {
+      const row = document.createElement("li"); const info = document.createElement("span");
+      info.textContent = device.label + (device.current ? " (this device)" : "");
+      const detail = document.createElement("small"); detail.textContent = `Signed in until ${new Date(device.expires * 1000).toLocaleString()}`; info.appendChild(detail);
+      const revoke = document.createElement("button"); revoke.type = "button"; revoke.textContent = "Sign out";
+      revoke.addEventListener("click", async () => {
+        const result = await fetch("/api/auth/devices/revoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: device.id }) });
+        if (result.ok && device.current) clearDeviceToken();
+        loadSignin();
+      });
+      row.append(info, revoke); list.appendChild(row);
+    });
+  } catch { state.textContent = "Could not read the sign-in list."; }
+}
+document.querySelector("#signin-revoke-all").addEventListener("click", async () => {
+  const result = await fetch("/api/auth/devices/revoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: "all" }) });
+  if (result.ok) clearDeviceToken(); loadSignin();
+});
+document.querySelector("#signin-change").addEventListener("click", async () => {
+  const current = document.querySelector("#signin-current"), fresh = document.querySelector("#signin-new");
+  signinMessage.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/auth/passphrase", { method: "POST", headers: adminHeaders(), body: JSON.stringify({ current: current.value, new: fresh.value }) });
+    const data = await response.json().catch(() => ({}));
+    signinMessage.textContent = response.ok ? `Passphrase saved. ${data.revoked_others || 0} other device(s) signed out.` : response.status === 429 ? "Too many attempts. Try again later." : data.error || "The passphrase was not saved.";
+    if (response.ok) { current.value = ""; fresh.value = ""; loadSignin(); }
+  } catch { signinMessage.textContent = "Could not reach the boat."; }
+});
+document.querySelectorAll("#signin-section input").forEach((field) => field.addEventListener("keydown", (event) => { if (event.key === "Enter") event.preventDefault(); }));
+document.querySelector("#settings-open")?.addEventListener("click", () => setTimeout(loadSignin, 0));

@@ -1111,6 +1111,20 @@ lan|local` changes only that bind. Sign in with the token from
 `sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
 `CONTROL_PANEL_TOKEN=...` line works too.
 
+**Boat Chat sign-in (unreleased):** Boat Chat accepts a separate crew passphrase (at least 8 characters) with
+remembered devices: `sudo vesselstackctl passphrase set chat` (or Boat Chat, Settings, Sign-in), `passphrase
+status|clear chat`, `devices list|revoke ID|revoke-all chat`. It stores `auth.json` (service user, 0600) in
+Boat Chat's state directory and loads the root-owned `common/vesselstack_auth.py` by path (readable by the
+service user; if it is missing, passphrase sign-in is simply off). The device token travels in
+`X-Boat-Chat-Device`; the passphrase grants access only, so settings still need the admin code, and the
+Access code and admin code are unchanged. Passphrase sign-in and device requests require a `Host` naming
+this machine (extra names via `BOAT_CHAT_ALLOWED_HOSTS`) and, for login, passphrase changes and device
+POSTs, a matching `Origin`. Panel and chat passphrases may not be equal (checked by the CLI and the panel).
+Same brute-force limits as the panel, including the global pause anyone on the network can trigger (the
+access code still works). **Rollback:** reinstall the previous release; older versions ignore `auth.json`.
+**Verify:** `sudo vesselstackctl passphrase status chat` and a sign-in from a phone. See the
+[Boat Chat guide](docs/BOAT_CHAT.md).
+
 **Easier sign-in (unreleased):** choose a passphrase once with `sudo vesselstackctl passphrase set panel`
 (hidden prompt, at least 12 characters; `--stdin` reads one line for scripts and never takes it as an
 argument), or set it in the panel under Settings, Sign-in after unlocking with the token. The unlock

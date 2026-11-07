@@ -17,6 +17,11 @@ Semantic Versioning.
   no CORS) and device POSTs require a matching `Origin`; per-address backoff plus a global 15-minute pause
   after 20 failures (the token still works). New root-owned shared module `common/vesselstack_auth.py`
   and helper `common/vesselstack_authctl.py`.
+- Boat Chat adopts the same sign-in: a separate crew passphrase (8+ characters) with remembered devices
+  (`vesselstackctl passphrase set|clear|status chat`, `devices list|revoke|revoke-all chat`, Settings,
+  Sign-in). Passphrase sign-in grants access only; the Access code and admin code work unchanged. Device
+  tokens use `X-Boat-Chat-Device`; sign-in and device requests need a `Host` naming the machine
+  (`BOAT_CHAT_ALLOWED_HOSTS` adds names) and login/passphrase/device POSTs need an `Origin`.
 - Security review fixes: passphrase attempts are counted atomically (`LoginThrottle.begin`) so concurrent
   guesses cannot outrun the limit; the Control Panel rejects requests whose `Host` is not this machine
   (DNS-rebinding guard, `421`; extra names via `CONTROL_PANEL_ALLOWED_HOSTS`); `/api/auth/login` and

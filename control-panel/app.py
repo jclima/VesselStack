@@ -63,11 +63,23 @@ LOGIN_THROTTLE = vsauth.LoginThrottle()
 _AUTH_STORES: dict[str, Any] = {}
 
 
+def chat_passphrase_hash() -> str | None:
+    """Boat Chat's passphrase hash (root can read the service user's file); None when unset or unreadable."""
+    try:
+        data_dir = parse_env(VESSEL_ENV).get("VESSELSTACK_DATA") or ""
+        if not data_dir:
+            return None
+        return vsauth.AuthStore(Path(data_dir) / "boat-chat" / vsauth.CHAT_STORE_NAME).snapshot()["passphrase_hash"]
+    except (OSError, vsauth.StoreError):
+        return None
+
+
 def auth_store() -> Any:
     path = ROOT / "config" / vsauth.STORE_NAME
     key = str(path)
     if key not in _AUTH_STORES:
-        _AUTH_STORES[key] = vsauth.AuthStore(path)
+        _AUTH_STORES[key] = vsauth.AuthStore(path, differs_from=chat_passphrase_hash,
+                                             differs_message="Choose a passphrase different from the Boat Chat one.")
     return _AUTH_STORES[key]
 
 

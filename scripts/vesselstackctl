@@ -37,12 +37,12 @@ Commands:
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
-  passphrase set panel [--stdin] | clear panel | status [panel]
-                               Set or remove the Control Panel passphrase (read from a hidden
+  passphrase set panel|chat [--stdin] | clear panel|chat | status [panel|chat]
+                               Set or remove the Control Panel or Boat Chat passphrase (read from a hidden
                                prompt, or one line of standard input with --stdin; never an
                                argument). Setting or clearing signs every device out.
-  devices list|revoke ID|revoke-all [panel]
-                               Show or sign out devices remembered by the Control Panel
+  devices list|revoke ID|revoke-all [panel|chat]
+                               Show or sign out devices remembered by the Control Panel or Boat Chat
   display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports|validate|sync-mqtt [ARGUMENTS]
                                Manage instrument displays, generate their ESPHome
                                projects and optionally build/flash firmware on this
@@ -2222,7 +2222,7 @@ uninstall_stack() {
 auth_command() {
     local helper="$VESSELSTACK_ROOT/common/vesselstack_authctl.py"
     [ -r "$helper" ] || { echo "Missing sign-in tool: $helper" >&2; return 1; }
-    PYTHONDONTWRITEBYTECODE=1 VESSELSTACK_ROOT="$VESSELSTACK_ROOT" python3 "$helper" "$@"
+    PYTHONDONTWRITEBYTECODE=1 VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" python3 "$helper" "$@"
 }
 
 [ $# -gt 0 ] || { usage; exit 2; }

@@ -9,7 +9,7 @@ from pathlib import Path
 BLOCKED_PARTS = {'.git-local', '.local', '.venv', 'memory', 'data', 'backups',
                  'pre-change-backups', 'displays-backups', 'reviews', '.claude', '.codex', '.agents', '.tools', '.esphome'}
 BLOCKED_NAMES = {'.mcp.json', 'boat_facts.json', 'boat-chat.env', 'boatstack.env', 'token.pass',
-                 'secrets.yaml', 'control-panel-auth.json', 'displays.json', 'displays.secrets.json', 'displays-backups', 'last-flash.json'}
+                 'secrets.yaml', 'control-panel-auth.json', 'auth.json', 'displays.json', 'displays.secrets.json', 'displays-backups', 'last-flash.json'}
 BLOCKED_PREFIXES = (('displays', 'build'), ('build', 'displays'))
 BLOCKED_SUFFIXES = {'.sqlite', '.sqlite3', '.db', '.jsonl', '.log', '.secret', '.tar', '.gz', '.zip',
                     '.bin', '.elf', '.uf2'}

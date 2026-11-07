@@ -71,7 +71,7 @@ for required_runtime in \
     }
 done
 # Defence in depth: tracked-only does not excuse a tracked private artifact.
-for private in boat-chat/boat_facts.json boat-chat/boat-chat.env config/control-panel-auth.json control-panel-auth.json vesselstack.env .mcp.json boat-chat/.venv boat-chat/memory boat-chat/data; do
+for private in boat-chat/boat_facts.json boat-chat/boat-chat.env boat-chat/auth.json config/control-panel-auth.json control-panel-auth.json vesselstack.env .mcp.json boat-chat/.venv boat-chat/memory boat-chat/data; do
     if [ -e "$STAGE/$PACKAGE_NAME/$private" ]; then
         echo "Refusing to package tracked private artifact: $private" >&2
         exit 1
