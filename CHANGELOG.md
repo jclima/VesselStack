@@ -27,6 +27,12 @@ Semantic Versioning.
   (DNS-rebinding guard, `421`; extra names via `CONTROL_PANEL_ALLOWED_HOSTS`); `/api/auth/login` and
   `/api/auth/passphrase` always require a matching `Origin`. Documented: the global pause lets anyone on
   the network trigger a 15-minute passphrase lockout (the token still works).
+- Sign-in store hardening: a correct login now withdraws only its own attempt from the throttle's global
+  window (`LoginThrottle.begin` returns an attempt handle), so interleaved correct logins cannot erase
+  other recorded failures; root no longer chowns files in the Boat Chat data directory. When root edits
+  that service-user-owned store (`passphrase ... chat`, `devices ... chat`) it forks a child that drops to
+  the directory owner first, and all store files are opened relative to a no-follow directory descriptor,
+  refused unless regular with one link, with exclusive temp files.
 
 ### Upgrade notes
 

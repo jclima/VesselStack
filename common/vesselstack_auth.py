@@ -152,7 +152,8 @@ class AuthStore:
                  min_passphrase: int = MIN_PASSPHRASE_LENGTH, expose_role: bool = False,
                  inherit_owner: bool = False, differs_from: Callable[[], Any] | None = None,
                  differs_message: str = "Choose a passphrase different from the other VesselStack passphrase.") -> None:
-        """``inherit_owner``: files created by root take the parent directory's owner (a service-user data dir).
+        """``inherit_owner``: the store lives in a service user's directory; when root uses it, transactions run in a
+        child that has dropped to that directory's owner (root never opens or chowns files there).
         ``differs_from``: returns a stored hash (or None) the new passphrase must not equal."""
         self.path = Path(path)
         self.clock = clock
@@ -166,17 +167,54 @@ class AuthStore:
         self._signature: tuple[int, int, int] | None = None
 
     # -- file access -------------------------------------------------------
+    # Every file operation is relative to a directory descriptor opened with O_NOFOLLOW, and every file
+    # opened is checked (regular, single link) before use. Nothing here ever chowns: when root must touch a
+    # directory owned by a service user, the whole transaction runs in a child that has dropped privileges.
+    _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+    def _euid(self) -> int:
+        return os.geteuid()
+
+    def _parent_owner(self) -> tuple[int, int]:
+        info = os.stat(self.path.parent)
+        return info.st_uid, info.st_gid
+
+    def _open_dir(self) -> int:
+        try:
+            return os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | self._CLOEXEC)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise StoreError(f"cannot open the sign-in store directory: {exc.strerror}") from exc
+
+    @staticmethod
+    def _require_plain_file(fd: int, what: str) -> os.stat_result:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise StoreError(f"the sign-in {what} is not a regular file")
+        if info.st_nlink != 1:
+            raise StoreError(f"the sign-in {what} has more than one hard link")
+        return info
+
     def _read_disk(self) -> tuple[dict[str, Any], tuple[int, int, int] | None]:
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+            dir_fd = self._open_dir()
+        except FileNotFoundError:
+            return _empty(), None
+        try:
+            return self._read_at(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _read_at(self, dir_fd: int) -> tuple[dict[str, Any], tuple[int, int, int] | None]:
+        try:
+            fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | self._CLOEXEC, dir_fd=dir_fd)
         except FileNotFoundError:
             return _empty(), None
         except OSError as exc:
             raise StoreError(f"cannot open the sign-in store: {exc.strerror}") from exc
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                raise StoreError("the sign-in store is not a regular file")
+            info = self._require_plain_file(fd, "store")
             with os.fdopen(fd, "rb", closefd=False) as handle:
                 raw = handle.read(1024 * 1024)
         finally:
@@ -205,62 +243,127 @@ class AuthStore:
                     self._cache, self._signature = _empty(), signature
             return self._cache
 
-    def _write(self, data: dict[str, Any]) -> None:
-        directory = self.path.parent
-        directory.mkdir(parents=True, exist_ok=True)
-        owner = mode = None
+    def _write_at(self, dir_fd: int, data: dict[str, Any]) -> None:
+        name = self.path.name
+        mode = 0o600
         try:
-            existing = os.lstat(self.path)
-            if not stat.S_ISREG(existing.st_mode):
-                raise StoreError("the sign-in store is not a regular file")
-            owner, mode = (existing.st_uid, existing.st_gid), stat.S_IMODE(existing.st_mode)
+            existing = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | self._CLOEXEC, dir_fd=dir_fd)
         except FileNotFoundError:
-            if self.inherit_owner:
-                parent = os.stat(directory)
-                owner = (parent.st_uid, parent.st_gid)
-        fd, temp = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=directory)
+            pass
+        except OSError as exc:
+            raise StoreError(f"cannot open the sign-in store: {exc.strerror}") from exc
+        else:
+            try:
+                mode = stat.S_IMODE(self._require_plain_file(existing, "store").st_mode)
+            finally:
+                os.close(existing)
+        temp = f".{name}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | self._CLOEXEC, 0o600, dir_fd=dir_fd)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(json.dumps(data, indent=2, sort_keys=True).encode("utf-8") + b"\n")
                 handle.flush()
-                os.fchmod(handle.fileno(), mode if mode is not None else 0o600)
-                if owner is not None and hasattr(os, "fchown"):
-                    try:
-                        os.fchown(handle.fileno(), *owner)
-                    except PermissionError:
-                        pass
+                os.fchmod(handle.fileno(), mode)
                 os.fsync(handle.fileno())
-            os.replace(temp, self.path)
+            os.rename(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except BaseException:
             try:
-                os.unlink(temp)
+                os.unlink(temp, dir_fd=dir_fd)
             except OSError:
                 pass
             raise
-        dir_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        os.fsync(dir_fd)
 
-    def transaction(self, mutate: Callable[[dict[str, Any]], Any]) -> Any:
-        """Run ``mutate(data)`` under an exclusive lock on fresh data, then persist."""
-        with self._mutex:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            lock_path = self.path.with_name(self.path.name + ".lock")
-            lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+    def _transaction_local(self, mutate: Callable[[dict[str, Any]], Any]) -> Any:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        dir_fd = self._open_dir()
+        try:
+            lock_fd = os.open(self.path.name + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | self._CLOEXEC,
+                              0o600, dir_fd=dir_fd)
             try:
-                if self.inherit_owner and hasattr(os, "fchown") and os.geteuid() == 0:
-                    parent = os.stat(self.path.parent)
-                    os.fchown(lock_fd, parent.st_uid, parent.st_gid)
+                self._require_plain_file(lock_fd, "lock file")
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                data, _ = self._read_disk()
+                data, _ = self._read_at(dir_fd)
                 result = mutate(data)
-                self._write(data)
-                self._cache, self._signature = None, None
+                self._write_at(dir_fd, data)
                 return result
             finally:
                 os.close(lock_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _drop_privileges(self, uid: int, gid: int) -> None:
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
+        if os.getuid() != uid or os.geteuid() != uid or os.getgid() != gid:
+            raise StoreError("could not drop privileges")
+
+    def _foreign_owner(self) -> tuple[int, int] | None:
+        """(uid, gid) of the directory owner when root would otherwise be working in another user's directory."""
+        if not self.inherit_owner or self._euid() != 0:
+            return None
+        try:
+            uid, gid = self._parent_owner()
+        except FileNotFoundError:
+            return None
+        return (uid, gid) if uid != 0 else None
+
+    def _transaction_as(self, owner: tuple[int, int], mutate: Callable[[dict[str, Any]], Any]) -> Any:
+        """Run the transaction in a forked child that has become the directory owner; root never opens a file there."""
+        reader, writer = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child: never returns into the caller's stack
+            code = 1
+            try:
+                os.close(reader)
+                try:
+                    self._drop_privileges(*owner)
+                    reply: dict[str, Any] = {"ok": True, "result": self._transaction_local(mutate)}
+                except DeviceLimitError as exc:
+                    reply = {"ok": False, "kind": "limit", "message": str(exc)}
+                except AuthError as exc:
+                    reply = {"ok": False, "kind": "auth", "message": str(exc)}
+                except StoreError as exc:
+                    reply = {"ok": False, "kind": "store", "message": str(exc)}
+                except OSError as exc:
+                    reply = {"ok": False, "kind": "store", "message": exc.strerror or "I/O error"}
+                except BaseException:  # noqa: BLE001 - report generically, never leak details
+                    reply = {"ok": False, "kind": "store", "message": "sign-in store transaction failed"}
+                payload = json.dumps(reply).encode("utf-8")
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(writer, view):]
+                code = 0
+            finally:
+                os._exit(code)
+        os.close(writer)
+        try:
+            with os.fdopen(reader, "rb") as handle:
+                raw = handle.read(1024 * 1024)
+        finally:
+            _, status = os.waitpid(pid, 0)
+        try:
+            reply = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise StoreError("the sign-in store helper failed") from exc
+        if not reply.get("ok"):
+            kind = {"limit": DeviceLimitError, "auth": AuthError}.get(reply.get("kind"), StoreError)
+            raise kind(str(reply.get("message") or "sign-in store problem"))
+        return reply.get("result")
+
+    def transaction(self, mutate: Callable[[dict[str, Any]], Any]) -> Any:
+        """Run ``mutate(data)`` under an exclusive lock on fresh data, then persist.
+
+        ``mutate`` must return JSON-serialisable data (it may run in a privilege-dropped child process)."""
+        with self._mutex:
+            try:
+                owner = self._foreign_owner()
+                if owner is not None:
+                    return self._transaction_as(owner, mutate)
+                return self._transaction_local(mutate)
+            finally:
+                self._cache, self._signature = None, None
 
     # -- passphrase --------------------------------------------------------
     def passphrase_set(self) -> bool:
@@ -364,13 +467,25 @@ class AuthStore:
         return {key: device[key] for key in keys}
 
 
+class Attempt:
+    """Handle for one attempt admitted by ``LoginThrottle.begin()``."""
+
+    __slots__ = ("ip", "stamp_id")
+
+    def __init__(self, ip: str, stamp_id: int) -> None:
+        self.ip = ip
+        self.stamp_id = stamp_id
+
+
 class LoginThrottle:
     """Per-address exponential backoff, plus a global lockout for shared (tunnel) addresses.
 
     ``begin()`` is the atomic entry point: under one lock it checks both limits and, when the attempt
-    is allowed, records it as a failure up front ("pending"). Concurrent requests therefore cannot all
-    pass the check before any failure is counted. ``success()`` withdraws the pending record and clears
-    the address; ``failure()`` after a ``begin()`` just confirms it (no double count).
+    is allowed, records it as a failure up front ("pending") and returns an ``Attempt`` handle.
+    Concurrent requests therefore cannot all pass the check before any failure is counted.
+    ``success(handle)`` withdraws only that one attempt from the global window and clears the address's
+    backoff; every other recorded failure (the caller's or anyone else's) stays counted.
+    ``failure(handle)`` just confirms the attempt (no double count).
     """
 
     IP_FREE_FAILURES = 5
@@ -385,9 +500,10 @@ class LoginThrottle:
         self.clock = clock
         self._lock = threading.Lock()
         self._ips: dict[str, dict[str, float]] = {}
-        self._global: deque[float] = deque()
+        self._global: deque[tuple[int, float]] = deque()
         self._global_until = 0.0
-        self._pending: dict[str, list[float]] = {}
+        self._pending: set[int] = set()
+        self._next_id = 0
 
     def _wait_locked(self, ip: str, now: float) -> float:
         wait = max(self._global_until - now, 0.0)
@@ -403,21 +519,21 @@ class LoginThrottle:
             wait = self._wait_locked(ip, now)
         return int(wait) + 1 if wait > 0 else 0
 
-    def begin(self, ip: str) -> tuple[bool, int]:
-        """Atomically check the limits and count this attempt. Returns (allowed, retry_after_seconds)."""
+    def begin(self, ip: str) -> tuple[bool, int, Attempt | None]:
+        """Atomically check the limits and count this attempt. Returns (allowed, retry_after_seconds, handle)."""
         now = self.clock()
         with self._lock:
             wait = self._wait_locked(ip, now)
             if wait > 0:
-                return False, int(wait) + 1
-            self._record_locked(ip, now)
-            self._pending.setdefault(ip, []).append(now)
-            if len(self._pending) > self.MAX_TRACKED:
-                for stale in sorted(self._pending, key=lambda key: self._pending[key][-1])[: len(self._pending) - self.MAX_TRACKED]:
-                    del self._pending[stale]
-        return True, 0
+                return False, int(wait) + 1, None
+            stamp_id = self._record_locked(ip, now)
+            self._pending.add(stamp_id)
+            if len(self._pending) > 4 * self.MAX_TRACKED:
+                live = {entry[0] for entry in self._global}
+                self._pending &= live
+        return True, 0, Attempt(ip, stamp_id)
 
-    def _record_locked(self, ip: str, now: float) -> None:
+    def _record_locked(self, ip: str, now: float) -> int:
         entry = self._ips.setdefault(ip, {"count": 0, "blocked_until": 0.0, "last": now})
         if now - entry["last"] > 3600 and entry["blocked_until"] <= now:
             entry["count"] = 0  # an hour of quiet forgives old failures
@@ -429,34 +545,35 @@ class LoginThrottle:
         if len(self._ips) > self.MAX_TRACKED:
             for stale in sorted(self._ips, key=lambda key: self._ips[key]["last"])[: len(self._ips) - self.MAX_TRACKED]:
                 del self._ips[stale]
-        self._global.append(now)
-        while self._global and now - self._global[0] > self.GLOBAL_WINDOW:
+        self._next_id += 1
+        stamp_id = self._next_id
+        self._global.append((stamp_id, now))
+        while self._global and now - self._global[0][1] > self.GLOBAL_WINDOW:
             self._global.popleft()
         if len(self._global) > self.GLOBAL_LIMIT:
             self._global_until = now + self.GLOBAL_LOCKOUT
             self._global.clear()
+        return stamp_id
 
-    def failure(self, ip: str) -> None:
-        """Confirm a failed attempt. A no-op when ``begin()`` already counted it; otherwise counts it now."""
-        now = self.clock()
+    def failure(self, attempt: "Attempt | str") -> None:
+        """Confirm a failed attempt. A handle from ``begin()`` is already counted; a bare address is counted now."""
         with self._lock:
-            pending = self._pending.get(ip)
-            if pending:
-                pending.pop(0)
-                if not pending:
-                    del self._pending[ip]
+            if isinstance(attempt, Attempt):
+                self._pending.discard(attempt.stamp_id)
                 return
-            self._record_locked(ip, now)
+            self._record_locked(str(attempt), self.clock())
 
-    def success(self, ip: str) -> None:
-        """A correct passphrase: clear this address and withdraw its pending attempts from the global count."""
+    def success(self, attempt: Attempt) -> None:
+        """A correct credential: withdraw only this attempt from the global window and clear the address backoff."""
+        if not isinstance(attempt, Attempt):
+            raise TypeError("success() needs the handle returned by begin()")
         with self._lock:
-            self._ips.pop(ip, None)
-            for stamp in self._pending.pop(ip, []):
-                try:
-                    self._global.remove(stamp)
-                except ValueError:
-                    pass
+            self._ips.pop(attempt.ip, None)
+            self._pending.discard(attempt.stamp_id)
+            for index, (stamp_id, _) in enumerate(self._global):
+                if stamp_id == attempt.stamp_id:
+                    del self._global[index]
+                    break
 
 
 def _is_wildcard(host: str) -> bool:

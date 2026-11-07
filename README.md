@@ -1120,6 +1120,10 @@ service user; if it is missing, passphrase sign-in is simply off). The device to
 Access code and admin code are unchanged. Passphrase sign-in and device requests require a `Host` naming
 this machine (extra names via `BOAT_CHAT_ALLOWED_HOSTS`) and, for login, passphrase changes and device
 POSTs, a matching `Origin`. Panel and chat passphrases may not be equal (checked by the CLI and the panel).
+When root edits the chat store (CLI or Control Panel), the work runs in a child process that has dropped to the
+directory owner's uid/gid, so root never opens or chowns files in the service user's directory; store files
+must be regular, single-link files (symlinks and hard links are refused). Rollback: reinstalling the previous
+release restores the old behaviour; the store format is unchanged.
 Same brute-force limits as the panel, including the global pause anyone on the network can trigger (the
 access code still works). **Rollback:** reinstall the previous release; older versions ignore `auth.json`.
 **Verify:** `sudo vesselstackctl passphrase status chat` and a sign-in from a phone. See the

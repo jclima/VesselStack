@@ -1491,14 +1491,14 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             passphrase, remember = payload.get("passphrase"), payload.get("remember", False)
             if not isinstance(passphrase, str) or not passphrase or not isinstance(remember, bool):
                 raise ValueError("passphrase (text) and remember (true or false) are required")
-            allowed, wait = LOGIN_THROTTLE.begin(ip)  # checks the limits and counts this attempt in one step
+            allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)  # checks the limits and counts this attempt in one step
             if not allowed:
                 self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
                 return
             if not store.check_passphrase(passphrase):
                 self.send_json(401, {"error": "That passphrase was not accepted."})
                 return
-            LOGIN_THROTTLE.success(ip)
+            LOGIN_THROTTLE.success(attempt)
             token, device = store.create_device(payload.get("label"), remember)
             self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": remember})
         except vsauth.DeviceLimitError as exc:
@@ -1534,14 +1534,14 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 new = payload.get("new")
                 if store.passphrase_set() and context.get("kind") != "token":
                     ip = self.client_ip()
-                    allowed, wait = LOGIN_THROTTLE.begin(ip)
+                    allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)
                     if not allowed:
                         self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
                         return
                     if not store.check_passphrase(payload.get("current")):
                         self.send_json(401, {"error": "The current passphrase was not accepted."})
                         return
-                    LOGIN_THROTTLE.success(ip)
+                    LOGIN_THROTTLE.success(attempt)
                 revoked = store.set_passphrase(vsauth.check_new_passphrase(new), keep_device=current)
                 self.send_json(200, {"ok": True, "revoked_others": revoked})
             else:

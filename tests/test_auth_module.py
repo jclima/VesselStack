@@ -201,14 +201,16 @@ class ThrottleTests(unittest.TestCase):
     def test_failure_after_begin_does_not_double_count_and_success_withdraws(self) -> None:
         throttle = auth.LoginThrottle(Clock())
         for _ in range(4):
-            self.assertTrue(throttle.begin("192.0.2.5")[0])
-            throttle.failure("192.0.2.5")
+            ok, _, handle = throttle.begin("192.0.2.5")
+            self.assertTrue(ok)
+            throttle.failure(handle)
         self.assertEqual(throttle.retry_after("192.0.2.5"), 0, "4 attempts, none double counted")
-        self.assertTrue(throttle.begin("192.0.2.5")[0])
-        throttle.success("192.0.2.5")
+        ok, _, handle = throttle.begin("192.0.2.5")
+        self.assertTrue(ok)
+        throttle.success(handle)
         self.assertEqual(throttle.retry_after("192.0.2.5"), 0)
         self.assertEqual(len(throttle._global), 4, "the successful attempt left the global window")
-        allowed, wait = throttle.begin("192.0.2.5")
+        allowed, wait, _ = throttle.begin("192.0.2.5")
         self.assertTrue(allowed)
         self.assertEqual(wait, 0)
 
@@ -216,7 +218,7 @@ class ThrottleTests(unittest.TestCase):
         throttle = auth.LoginThrottle(Clock())
         results = [throttle.begin(f"192.0.2.{index + 10}")[0] for index in range(25)]
         self.assertEqual(results.count(True), auth.LoginThrottle.GLOBAL_LIMIT + 1)
-        allowed, wait = throttle.begin("198.51.100.1")
+        allowed, wait, _ = throttle.begin("198.51.100.1")
         self.assertFalse(allowed)
         self.assertGreater(wait, 800)
 
@@ -242,8 +244,46 @@ class ThrottleTests(unittest.TestCase):
         throttle = auth.LoginThrottle(Clock())
         for _ in range(5):
             throttle.failure("192.0.2.5")
-        throttle.success("192.0.2.5")
-        self.assertEqual(throttle.retry_after("192.0.2.5"), 0)
+        self.assertGreater(throttle.retry_after("192.0.2.5"), 0)
+        _, _, handle = throttle.begin("192.0.2.6")
+        throttle.failure("192.0.2.6")  # unrelated address
+        ok, _, mine = throttle.begin("192.0.2.7")
+        throttle.success(mine)
+        self.assertEqual(throttle.retry_after("192.0.2.7"), 0)
+        self.assertGreater(throttle.retry_after("192.0.2.5"), 0, "success clears only its own address")
+        with self.assertRaises(TypeError):
+            throttle.success("192.0.2.5")
+
+    def test_interleaved_success_never_erases_other_failures(self) -> None:
+        throttle = auth.LoginThrottle(Clock())
+        ip = "192.0.2.50"
+        ok1, _, a = throttle.begin(ip); throttle.failure(a)
+        ok2, _, b = throttle.begin(ip); throttle.failure(b)
+        ok3, _, c = throttle.begin(ip); throttle.success(c)
+        ok4, _, d = throttle.begin(ip); throttle.failure(d)
+        self.assertTrue(all((ok1, ok2, ok3, ok4)))
+        self.assertEqual([stamp for stamp, _ in throttle._global], [a.stamp_id, b.stamp_id, d.stamp_id])
+
+    def test_concurrent_pending_attempts_keep_their_stamps_when_one_succeeds(self) -> None:
+        throttle = auth.LoginThrottle(Clock())
+        handles = [throttle.begin("192.0.2.60")[2] for _ in range(3)]
+        winner = handles[1]
+        throttle.success(winner)
+        remaining = [stamp for stamp, _ in throttle._global]
+        self.assertEqual(remaining, [handles[0].stamp_id, handles[2].stamp_id])
+        other = throttle.begin("198.51.100.4")[2]
+        throttle.success(other)
+        self.assertEqual(len(throttle._global), 2)
+        # many failing addresses plus one logging in repeatedly still reach the global lockout
+        for index in range(15):
+            throttle.failure(f"203.0.113.{index}")
+            h = throttle.begin("198.51.100.9")[2]
+            if h:
+                throttle.success(h)
+        self.assertEqual(len(throttle._global), 17)
+        for index in range(10):
+            throttle.failure(f"203.0.114.{index}")
+        self.assertGreater(throttle.retry_after("192.0.2.200"), 800)
 
     def test_global_lockout_after_twenty_failures_from_any_addresses(self) -> None:
         clock = Clock()
@@ -253,6 +293,111 @@ class ThrottleTests(unittest.TestCase):
         self.assertGreater(throttle.retry_after("192.0.2.200"), 800)
         clock.now += 15 * 60 + 2
         self.assertEqual(throttle.retry_after("192.0.2.200"), 0)
+
+
+class StoreHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name) / "chat"
+        self.dir.mkdir()
+        self.path = self.dir / "auth.json"
+
+    def test_hardlinked_lock_file_is_refused(self) -> None:
+        victim = Path(self._tmp.name) / "root-owned"
+        victim.write_text("secret")
+        os.link(victim, self.dir / "auth.json.lock")
+        store = auth.AuthStore(self.path)
+        with self.assertRaises(auth.StoreError):
+            store.set_passphrase(PASS)
+        self.assertEqual(victim.read_text(), "secret")
+
+    def test_symlinked_store_or_lock_is_refused(self) -> None:
+        victim = Path(self._tmp.name) / "target.json"
+        victim.write_text("{}")
+        os.symlink(victim, self.path)
+        store = auth.AuthStore(self.path)
+        self.assertFalse(store.passphrase_set())
+        with self.assertRaises((auth.StoreError, OSError)):
+            store.set_passphrase(PASS)
+        self.assertEqual(victim.read_text(), "{}")
+        self.path.unlink()
+        (self.dir / "auth.json.lock").unlink(missing_ok=True)
+        os.symlink(victim, self.dir / "auth.json.lock")
+        with self.assertRaises(OSError):
+            auth.AuthStore(self.path).set_passphrase(PASS)
+
+    def test_hardlinked_or_non_regular_store_is_refused(self) -> None:
+        victim = Path(self._tmp.name) / "other.json"
+        victim.write_text(json.dumps({"schema": 1, "passphrase_hash": None, "devices": []}))
+        os.link(victim, self.path)
+        store = auth.AuthStore(self.path)
+        with self.assertRaises(auth.StoreError):
+            store._read_disk()
+        with self.assertRaises(auth.StoreError):
+            store.set_passphrase(PASS)
+        self.path.unlink()
+        os.mkfifo(self.path)
+        with self.assertRaises(auth.StoreError):
+            auth.AuthStore(self.path)._read_disk()
+        with self.assertRaises(auth.StoreError):
+            auth.AuthStore(self.path).set_passphrase(PASS)
+
+    def test_symlinked_directory_is_refused(self) -> None:
+        link = Path(self._tmp.name) / "link"
+        os.symlink(self.dir, link)
+        with self.assertRaises((auth.StoreError, OSError)):
+            auth.AuthStore(link / "auth.json").set_passphrase(PASS)
+
+    def test_precreated_temp_names_do_not_matter_and_no_leftovers(self) -> None:
+        store = auth.AuthStore(self.path)
+        store.set_passphrase(PASS)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["auth.json", "auth.json.lock"])
+
+    def test_root_over_foreign_directory_drops_privileges_and_never_chowns(self) -> None:
+        marker = self.dir.parent / "dropped"
+        calls = []
+
+        class Store(auth.AuthStore):
+            def _euid(self) -> int:
+                return 0
+
+            def _parent_owner(self) -> tuple[int, int]:
+                return 4242, 4343
+
+            def _drop_privileges(self, uid: int, gid: int) -> None:
+                marker.write_text(f"{uid}:{gid}")  # runs in the forked child
+
+        store = Store(self.path, inherit_owner=True, expose_role=True)
+        with mock.patch("os.fchown", side_effect=lambda *a: calls.append(a)), mock.patch("os.chown", side_effect=lambda *a, **k: calls.append(a)):
+            store.set_passphrase(PASS)
+            token, device = store.create_device("Phone", True, role="admin")
+            self.assertEqual(device["role"], "admin")
+            self.assertEqual(store.verify_device_token(token)["role"], "admin")
+            with self.assertRaises(auth.DeviceLimitError):
+                for _ in range(auth.MAX_DEVICES + 1):
+                    store.create_device("x", True)
+        self.assertEqual(marker.read_text(), "4242:4343")
+        self.assertEqual(calls, [])
+        self.assertTrue(store.check_passphrase(PASS))
+
+    def test_root_over_root_owned_directory_stays_in_process(self) -> None:
+        class Store(auth.AuthStore):
+            def _euid(self) -> int:
+                return 0
+
+            def _parent_owner(self) -> tuple[int, int]:
+                return 0, 0
+
+            def _transaction_as(self, owner, mutate):
+                raise AssertionError("must not fork for a root-owned directory")
+        Store(self.path, inherit_owner=True).set_passphrase(PASS)
+
+    def test_non_root_never_forks(self) -> None:
+        class Store(auth.AuthStore):
+            def _transaction_as(self, owner, mutate):
+                raise AssertionError("must not fork when not root")
+        Store(self.path, inherit_owner=True).set_passphrase(PASS)
 
 
 class ChatScopeTests(unittest.TestCase):

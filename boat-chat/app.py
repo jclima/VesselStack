@@ -5431,13 +5431,14 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "The sign-in store could not be used."}); return
         self.send_json(404, {"error": "Not found"})
 
-    def check_passphrase_throttled(self, store: Any, candidate: Any) -> tuple[bool, bool]:
-        """(proceed, matched). Counts the attempt atomically before the slow hash check; answers 429 itself when blocked."""
-        allowed, wait = LOGIN_THROTTLE.begin(self.client_ip())
+    def check_passphrase_throttled(self, store: Any, candidate: Any) -> tuple[bool, Any]:
+        """(proceed, attempt). ``attempt`` is the throttle handle when the passphrase matched, else None.
+        Counts the attempt atomically before the slow hash check; answers 429 itself when blocked."""
+        allowed, wait, attempt = LOGIN_THROTTLE.begin(self.client_ip())
         if not allowed:
             self.too_many(wait)
-            return False, False
-        return True, store.check_passphrase(candidate)
+            return False, None
+        return True, (attempt if store.check_passphrase(candidate) else None)
 
     def post_auth(self, path: str) -> None:
         if vsauth is None:
@@ -5457,7 +5458,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                     return
                 if not matched:
                     self.send_json(401, {"error": "That passphrase was not accepted."}); return
-                LOGIN_THROTTLE.success(ip)
+                LOGIN_THROTTLE.success(matched)
                 token, device = store.create_device(payload.get("label"), remember, role="access")
                 self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": remember, "role": device["role"]}); return
             if path == "/api/auth/passphrase":
@@ -5468,7 +5469,7 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                         return
                     if not matched:
                         self.send_json(401, {"error": "The current passphrase was not accepted."}); return
-                    LOGIN_THROTTLE.success(ip)
+                    LOGIN_THROTTLE.success(matched)
                 elif not store.passphrase_set() and not (self.admin_code_supplied() or self.access_allowed()):
                     self.send_json(401, {"error": "Sign in with the access code first"}); return
                 device = self.device_context()
