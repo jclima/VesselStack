@@ -10,6 +10,8 @@ __pycache__/
 *.env
 !*.example.env
 *.secret
+control-panel-auth.json
+control-panel-auth.json.lock
 *.env.before-fix-*
 *.sqlite
 *.sqlite3

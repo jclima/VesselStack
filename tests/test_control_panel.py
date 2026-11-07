@@ -1350,5 +1350,169 @@ class DisplaysPreviewFixtureTests(unittest.TestCase):
         self.assertEqual(json.loads(self.FIXTURE.read_text()), json.loads(json.dumps(current, sort_keys=True)),
                          "regenerate with UPDATE_PANEL_FIXTURE=1 python3 -B -m unittest tests/test_control_panel.py")
 
+class SignInApiTests(DisplaysApiBase):
+    PASSPHRASE = "correct horse battery"
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = tempfile.mkdtemp(prefix="vesselstack-signin-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        for patch in (mock.patch.object(panel, "ROOT", Path(root)), mock.patch.object(panel, "LOGIN_THROTTLE", panel.vsauth.LoginThrottle())):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.root = Path(root)
+
+    def call(self, method, path, body=None, headers=None):
+        data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
+        all_headers = {"Content-Type": "application/json"} if data is not None else {}
+        all_headers.update(headers or {})
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}{path}", data=data, headers=all_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read().decode() or "{}"), dict(response.headers)
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read().decode() or "{}"), dict(exc.headers)
+            finally:
+                exc.close()
+
+    @property
+    def origin(self):
+        return {"Origin": f"http://127.0.0.1:{self.server.server_address[1]}"}
+
+    def tokenh(self):
+        return {"X-VesselStack-Token": self.TOKEN}
+
+    def set_passphrase(self):
+        status, payload, _ = self.call("POST", "/api/auth/passphrase", {"new": self.PASSPHRASE}, self.tokenh())
+        self.assertEqual(status, 200, payload)
+
+    def login(self, remember=True, passphrase=None, label="Safari on Mac"):
+        return self.call("POST", "/api/auth/login", {"passphrase": passphrase or self.PASSPHRASE, "remember": remember, "label": label})
+
+    def device(self, token):
+        return {"X-VesselStack-Device": token, **self.origin}
+
+    def test_status_leaks_only_whether_a_passphrase_is_set(self) -> None:
+        status, payload, _ = self.call("GET", "/api/auth/status")
+        self.assertEqual((status, payload), (200, {"passphrase_set": False}))
+        self.set_passphrase()
+        self.assertEqual(self.call("GET", "/api/auth/status")[1], {"passphrase_set": True})
+
+    def test_login_is_off_until_a_passphrase_is_set(self) -> None:
+        status, payload, _ = self.login()
+        self.assertEqual(status, 409)
+        self.assertIn("off until a passphrase is set", payload["error"])
+
+    def test_login_returns_a_device_token_that_works_for_existing_apis(self) -> None:
+        self.set_passphrase()
+        status, payload, headers = self.login(remember=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(set(payload), {"device_token", "device_id", "expires_at", "remember"})
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        token = payload["device_token"]
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(token))[0], 200)
+        self.assertEqual(self.call("GET", "/api/config")[0], 401)
+        self.assertEqual(self.call("GET", "/api/config", headers={"X-VesselStack-Device": "nope" * 10})[0], 401)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.tokenh())[0], 200, "long token unchanged")
+        raw = (self.root / "config/control-panel-auth.json").read_text()
+        self.assertNotIn(token, raw)
+
+    def test_non_remembered_login_lasts_twelve_hours(self) -> None:
+        self.set_passphrase()
+        _, short, _ = self.login(remember=False)
+        _, long, _ = self.login(remember=True)
+        now = time.time()
+        self.assertAlmostEqual(short["expires_at"] - now, 12 * 3600, delta=60)
+        self.assertAlmostEqual(long["expires_at"] - now, 30 * 86400, delta=60)
+
+    def test_wrong_passphrase_is_a_generic_401_and_bad_payloads_are_400(self) -> None:
+        self.set_passphrase()
+        status, payload, _ = self.login(passphrase="not the passphrase")
+        self.assertEqual(status, 401)
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": "x"})[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": 5, "remember": True})[0], 400)
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": self.PASSPHRASE, "remember": "yes"})[0], 400)
+
+    def test_lockout_returns_429_but_the_token_still_works(self) -> None:
+        self.set_passphrase()
+        for _ in range(5):
+            self.assertEqual(self.login(passphrase="wrong wrong wrong")[0], 401)
+        status, payload, headers = self.login()
+        self.assertEqual(status, 429)
+        self.assertGreater(payload["retry_after"], 0)
+        self.assertEqual(headers["Retry-After"], str(payload["retry_after"]))
+        self.assertEqual(self.call("GET", "/api/config", headers=self.tokenh())[0], 200)
+
+    def test_global_lockout_applies_to_other_addresses(self) -> None:
+        self.set_passphrase()
+        throttle = panel.LOGIN_THROTTLE
+        for index in range(21):
+            throttle.failure(f"192.0.2.{index + 10}")
+        self.assertEqual(self.login()[0], 429)
+
+    def test_device_posts_need_a_matching_origin_but_token_posts_do_not(self) -> None:
+        self.set_passphrase()
+        token = self.login()[1]["device_token"]
+        body = {"id": "all"}
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", body, {"X-VesselStack-Device": token})[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", body, {"X-VesselStack-Device": token, "Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", body, self.tokenh())[0], 200)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(token))[0], 401, "revoked")
+
+    def test_devices_list_marks_current_and_hides_hashes(self) -> None:
+        self.set_passphrase()
+        first = self.login(label="Phone")[1]
+        second = self.login(label="Laptop")[1]
+        status, payload, _ = self.call("GET", "/api/auth/devices", headers=self.device(first["device_token"]))
+        self.assertEqual(status, 200)
+        self.assertEqual({d["label"]: d["current"] for d in payload["devices"]}, {"Phone": True, "Laptop": False})
+        for entry in payload["devices"]:
+            self.assertEqual(set(entry), {"id", "label", "created", "last_seen", "expires", "current"})
+        self.assertEqual(self.call("GET", "/api/auth/devices")[0], 401)
+        self.assertNotIn("token_sha256", json.dumps(payload))
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": second["device_id"]}, self.device(first["device_token"]))[0], 200)
+        self.assertEqual(len(self.call("GET", "/api/auth/devices", headers=self.tokenh())[1]["devices"]), 1)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "missing"}, self.tokenh())[0], 404)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {}, self.tokenh())[0], 400)
+
+    def test_logout_revokes_only_the_current_device(self) -> None:
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        other = self.login()[1]["device_token"]
+        self.assertEqual(self.call("POST", "/api/auth/logout", {}, self.device(mine))[0], 200)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(mine))[0], 401)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(other))[0], 200)
+        self.assertEqual(self.call("POST", "/api/auth/logout", {}, self.tokenh())[1]["revoked"], False)
+        self.assertEqual(self.call("POST", "/api/auth/logout", {})[0], 401)
+
+    def test_changing_the_passphrase(self) -> None:
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        other = self.login()[1]["device_token"]
+        new = "a different long phrase"
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": new}, self.device(mine))[0], 401, "needs current")
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"current": "wrong wrong wrong", "new": new}, self.device(mine))[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"current": self.PASSPHRASE, "new": "short"}, self.device(mine))[0], 400)
+        status, payload, _ = self.call("POST", "/api/auth/passphrase", {"current": self.PASSPHRASE, "new": new}, self.device(mine))
+        self.assertEqual((status, payload["revoked_others"]), (200, 1))
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(mine))[0], 200)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(other))[0], 401)
+        self.assertEqual(self.login(passphrase=self.PASSPHRASE)[0], 401)
+        self.assertEqual(self.login(passphrase=new)[0], 200)
+
+    def test_long_token_may_change_the_passphrase_without_the_current_one(self) -> None:
+        self.set_passphrase()
+        device = self.login()[1]["device_token"]
+        status, payload, _ = self.call("POST", "/api/auth/passphrase", {"new": "brand new long phrase"}, self.tokenh())
+        self.assertEqual((status, payload["revoked_others"]), (200, 1))
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(device))[0], 401)
+
+    def test_password_endpoints_require_authentication(self) -> None:
+        for path in ("/api/auth/logout", "/api/auth/devices/revoke", "/api/auth/passphrase"):
+            self.assertEqual(self.call("POST", path, {"new": self.PASSPHRASE})[0], 401, path)
+
+
 if __name__ == "__main__":
     unittest.main()

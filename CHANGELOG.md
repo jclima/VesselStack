@@ -3,6 +3,26 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Highlights
+
+- Control Panel sign-in is easier: choose a passphrase (`sudo vesselstackctl passphrase set panel`, or
+  Settings, Sign-in) and unlock with it, optionally with **Remember this device (30 days)**. Settings lists
+  signed-in devices with Revoke and Revoke all; `vesselstackctl devices list|revoke|revoke-all` and
+  `passphrase status|clear` manage them from the boat computer. The long `CONTROL_PANEL_TOKEN`
+  (`X-VesselStack-Token`) works unchanged for scripts and existing sessions.
+- Security: scrypt passphrase hash and SHA-256-only device tokens in root-only
+  `config/control-panel-auth.json`; device tokens travel in an `X-VesselStack-Device` header (no cookies,
+  no CORS) and device POSTs require a matching `Origin`; per-address backoff plus a global 15-minute pause
+  after 20 failures (the token still works). New root-owned shared module `common/vesselstack_auth.py`
+  and helper `common/vesselstack_authctl.py`.
+
+### Upgrade notes
+
+- Nothing migrates and passphrase sign-in stays off until a passphrase is set. Rollback: reinstall the
+  previous release; older versions ignore `control-panel-auth.json`.
+
 ## 0.6.2 - 2026-11-07
 
 ### Highlights

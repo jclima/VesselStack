@@ -1108,7 +1108,27 @@ The Control Panel is the browser page for looking after VesselStack. It listens 
 default (`http://127.0.0.1:8780` through an SSH tunnel); `sudo vesselstackctl panel-access
 lan|local` changes only that bind. Sign in with the token from
 `sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
-`CONTROL_PANEL_TOKEN=...` line works too. The full tour is in the
+`CONTROL_PANEL_TOKEN=...` line works too.
+
+**Easier sign-in (unreleased):** choose a passphrase once with `sudo vesselstackctl passphrase set panel`
+(hidden prompt, at least 12 characters; `--stdin` reads one line for scripts and never takes it as an
+argument), or set it in the panel under Settings, Sign-in after unlocking with the token. The unlock
+screen then takes the passphrase, with **Remember this device (30 days)** (otherwise 12 hours). Settings
+lists signed-in devices with Revoke and Revoke all; `sudo vesselstackctl devices list|revoke ID|revoke-all`
+does the same on the boat, `passphrase status` shows the state and `passphrase clear panel` turns it
+off. Details: the browser holds a random 256-bit device token (local storage when remembered, session
+storage otherwise; no cookies) sent as `X-VesselStack-Device`; the boat keeps only its SHA-256 and a
+scrypt hash of the passphrase in `config/control-panel-auth.json` (root, 0600, written atomically; never
+commit it). The `X-VesselStack-Token` header keeps working unchanged for scripts and existing
+sessions, including while passphrase sign-in is paused by the brute-force limits (5 failures per
+address start a growing wait up to 15 minutes; over 20 failures in 15 minutes pause passphrase sign-in
+for 15 minutes). **Operational impact:** a new root-owned module `common/vesselstack_auth.py` is
+installed with the panel, nothing is migrated and passphrase sign-in stays off until you set one.
+**Limitation:** on plain HTTP (`panel-access lan`) the passphrase and device token cross the network
+unencrypted, so keep the SSH tunnel. **Lost passphrase or locked out:** unlock with the token or run
+`passphrase set panel` / `passphrase clear panel` on the boat. **Rollback:** reinstall the previous
+release; older versions ignore `control-panel-auth.json` and only the token works. **Verify:**
+`sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
 [Control Panel guide](docs/CONTROL_PANEL.md).
 
 ![Control Panel Home tab](docs/images/control-panel-home.png)

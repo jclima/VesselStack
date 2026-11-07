@@ -37,6 +37,12 @@ Commands:
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
+  passphrase set panel [--stdin] | clear panel | status [panel]
+                               Set or remove the Control Panel passphrase (read from a hidden
+                               prompt, or one line of standard input with --stdin; never an
+                               argument). Setting or clearing signs every device out.
+  devices list|revoke ID|revoke-all [panel]
+                               Show or sign out devices remembered by the Control Panel
   display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports|validate|sync-mqtt [ARGUMENTS]
                                Manage instrument displays, generate their ESPHome
                                projects and optionally build/flash firmware on this
@@ -2211,6 +2217,14 @@ uninstall_stack() {
     fi
 }
 
+# Sign-in management for the Control Panel (passphrase and signed-in devices). The
+# passphrase comes from standard input or a hidden prompt, never from arguments.
+auth_command() {
+    local helper="$VESSELSTACK_ROOT/common/vesselstack_authctl.py"
+    [ -r "$helper" ] || { echo "Missing sign-in tool: $helper" >&2; return 1; }
+    PYTHONDONTWRITEBYTECODE=1 VESSELSTACK_ROOT="$VESSELSTACK_ROOT" python3 "$helper" "$@"
+}
+
 [ $# -gt 0 ] || { usage; exit 2; }
 command=$1
 shift
@@ -2243,5 +2257,6 @@ case "$command" in
     update) [ $# -ge 1 ] || { usage; exit 2; }; update_stack "$@" ;;
     uninstall) uninstall_stack "$@" ;;
     display) [ $# -ge 1 ] || { usage; exit 2; }; display_command "$@" ;;
+    passphrase|devices) [ $# -ge 1 ] || { usage; exit 2; }; auth_command "$command" "$@" ;;
     *) echo "Unknown command: $command" >&2; usage; exit 2 ;;
 esac

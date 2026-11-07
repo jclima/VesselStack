@@ -27,16 +27,32 @@
     <section id="login" class="login card">
       <p class="eyebrow">Local administration</p>
       <h1>Unlock the Control Panel</h1>
-      <p>Paste the Control Panel token from your boat computer. It stays in this browser only.</p>
-      <form id="login-form" novalidate>
-        <label for="token">Control Panel token</label>
-        <div class="tokrow"><input id="token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-help login-error" placeholder="Paste the token or the whole line"><button class="primary" type="submit">Unlock</button></div>
-        <p id="login-error" class="field-err" role="alert"></p>
-        <label class="sw show-token"><input type="checkbox" id="show-token"><span class="track"></span><span class="txt"><strong>Show token</strong></span></label>
-        <p class="small muted" id="token-help">Either form works: <span class="mono">CONTROL_PANEL_TOKEN=abc123…</span> or just <span class="mono">abc123…</span>.</p>
+      <form id="passphrase-form" novalidate>
+        <p>Enter your passphrase.</p>
+        <label for="passphrase">Passphrase</label>
+        <div class="tokrow"><input id="passphrase" type="password" autocomplete="current-password" spellcheck="false" aria-describedby="login-error"><button class="primary" type="submit">Unlock</button></div>
+        <label class="sw show-token"><input type="checkbox" id="remember-device"><span class="track"></span><span class="txt"><strong>Remember this device (30 days)</strong></span></label>
+        <label for="device-label" class="small">Name for this device</label>
+        <input id="device-label" type="text" maxlength="60" autocomplete="off">
       </form>
-      <p class="label login-label">Don't have it? Run this on the boat computer:</p>
-      <code>sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env</code>
+      <div id="passphrase-hint" hidden>
+        <p>Passphrase sign-in is off until you set a passphrase. On the boat computer, run:</p>
+        <code>sudo vesselstackctl passphrase set panel</code>
+        <p class="small muted">Or unlock with the long token below, then set one under Settings, Sign-in.</p>
+      </div>
+      <p id="login-error" class="field-err" role="alert"></p>
+      <details id="token-disclosure" class="disc">
+        <summary>Use the long token instead</summary>
+        <p>Paste the Control Panel token from your boat computer. It stays in this browser tab only.</p>
+        <form id="login-form" novalidate>
+          <label for="token">Control Panel token</label>
+          <div class="tokrow"><input id="token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-help login-error" placeholder="Paste the token or the whole line"><button class="primary" type="submit">Unlock with token</button></div>
+          <label class="sw show-token"><input type="checkbox" id="show-token"><span class="track"></span><span class="txt"><strong>Show token</strong></span></label>
+          <p class="small muted" id="token-help">Either form works: <span class="mono">CONTROL_PANEL_TOKEN=abc123…</span> or just <span class="mono">abc123…</span>.</p>
+        </form>
+        <p class="label login-label">Don't have it? Run this on the boat computer:</p>
+        <code>sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env</code>
+      </details>
       <details class="disc">
         <summary>How do I reach this panel?</summary>
         <p>By default the panel only answers on the boat computer itself, so nobody else on the dock network can open it. From your laptop, create a secure tunnel (SSH), then browse to the address below:</p>
@@ -81,6 +97,20 @@
       <section id="settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
         <div class="pagehead"><h1>Settings</h1><p>Edit as much as you like. Nothing changes on the boat until you <strong>Save</strong> and then <strong>Apply</strong>. Secrets are write-only: leave a secret blank to keep its current value.</p><p id="rollback-note" class="small mono"></p></div>
         <form id="config-form" class="settings" novalidate></form>
+        <section id="signin-card" class="card flat" aria-labelledby="signin-h" hidden>
+          <h2 id="signin-h">Sign-in</h2>
+          <p id="signin-state" class="small"></p>
+          <form id="signin-form" novalidate>
+            <div id="signin-current-row" hidden><label for="current-passphrase">Current passphrase</label><input id="current-passphrase" type="password" autocomplete="current-password"></div>
+            <label for="new-passphrase">New passphrase (at least 12 characters)</label><input id="new-passphrase" type="password" autocomplete="new-password">
+            <label for="confirm-passphrase">Repeat the new passphrase</label><input id="confirm-passphrase" type="password" autocomplete="new-password">
+            <p id="signin-error" class="field-err" role="alert"></p>
+            <button type="submit" class="primary" id="passphrase-save">Set passphrase</button>
+          </form>
+          <h3>Signed-in devices</h3>
+          <p class="small muted">Devices that unlocked with the passphrase. Remembered devices stay signed in for 30 days from sign-in. Revoking one signs it out immediately.</p>
+          <div id="signin-root" aria-live="polite"></div>
+        </section>
         <div class="savebar" id="savebar" role="region" aria-label="Unsaved changes">
           <span class="state" id="sb-state" aria-live="polite">No changes</span>
           <span class="note" id="sb-note"></span>

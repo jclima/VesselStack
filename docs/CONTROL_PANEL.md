@@ -49,20 +49,58 @@ panel-access local` restores the loopback-only default.
 
 *The unlock screen. It explains how to read the token and how to reach the panel.*
 
-Read the generated token on the Pi:
+You can unlock with a **passphrase you choose** or with the long **token**.
+
+### Passphrase (easiest)
+
+Set one once, on the boat computer, or after unlocking with the token (see
+**Settings, Sign-in** below):
+
+```bash
+sudo vesselstackctl passphrase set panel
+```
+
+It asks twice with hidden input and needs at least 12 characters; a few random
+words work well. Then on the unlock screen type the passphrase and press
+**Unlock**.
+
+- **Remember this device (30 days)** keeps you signed in on this browser for
+  30 days from sign-in (fixed, not extended by use). Without it you stay signed
+  in for 12 hours or until the tab closes, whichever comes first.
+- **Name for this device** defaults to something like "Safari on Mac" and is
+  what you will see in the device list.
+- **Lock** signs this device out on the boat and forgets it in the browser.
+
+The browser keeps a random 256-bit device token (in local storage when you
+remember the device, in session storage otherwise) and sends it in the
+`X-VesselStack-Device` header. The boat stores only a SHA-256 of it, never the
+token or your passphrase. No cookies are used. After 5 wrong passphrases from one
+address, further tries wait longer each time (up to 15 minutes); more than 20
+failures in 15 minutes from anywhere pause passphrase sign-in for 15 minutes.
+The long token still works during a pause.
+
+> **Plain HTTP on the boat network.** If you opened the panel with
+> `panel-access lan`, the passphrase and device token cross the network
+> unencrypted, exactly as the token does. Prefer the SSH tunnel (the default).
+
+### Token
+
+Open **Use the long token instead**. Read the generated token on the Pi:
 
 ```bash
 sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env
 ```
 
-Paste the result into **Control Panel token** and press **Unlock**. Either form
-works: the whole `CONTROL_PANEL_TOKEN=…` line or just the value after the equals
-sign. **Show token** reveals what you pasted.
+Paste the result into **Control Panel token** and press **Unlock with token**.
+Either form works: the whole `CONTROL_PANEL_TOKEN=…` line or just the value after
+the equals sign. **Show token** reveals what you pasted. The token is kept in
+this browser tab's session storage, cleared by **Lock** or when the tab closes,
+and sent only in the `X-VesselStack-Token` request header. Scripts keep using it
+exactly as before.
 
-The token is kept in this browser tab's session storage, cleared by **Lock** or
-when the tab closes, and sent only in the `X-VesselStack-Token` request header.
-If you press **Lock** with unsaved Settings edits, the panel asks first, because
-locking discards them.
+If no passphrase is set yet, the unlock screen says so and shows the command
+above. If you press **Lock** with unsaved Settings edits, the panel asks first,
+because locking discards them.
 
 ## The five tabs
 
@@ -137,6 +175,18 @@ Nothing changes on the boat until you press **Save** and then **Apply**.
   the worker. Disabled workers cannot be started from the component cards.
 - Changing the panel's own listener or port takes effect when the panel
   restarts: use **Maintenance → Restart Control Panel**.
+
+### Sign-in
+
+At the bottom of Settings: set or change the passphrase (the current one is
+asked for unless you unlocked with the token), and see **Signed-in devices** with
+name, when it signed in, last seen, when it expires and **this device**.
+**Revoke** signs one device out immediately; **Revoke all devices** signs out
+every device including this one. Changing the passphrase signs out every other
+device. These are not part of Save and Apply and take effect at once.
+
+On the boat computer: `sudo vesselstackctl devices list`, `devices revoke ID`,
+`devices revoke-all`, `passphrase status` and `passphrase clear panel`.
 
 ### Displays
 
@@ -383,6 +433,14 @@ check still gate installer actions.
 - **Your session ended.** After a restart or a token change the panel returns
   to the unlock screen and says so. Paste the token again; unsaved edits are
   kept.
+- **Locked out of passphrase sign-in.** "Too many attempts" means several wrong
+  passphrases were entered; wait the time shown (at most 15 minutes) or unlock
+  with the long token. To start over from the boat computer run
+  `sudo vesselstackctl passphrase set panel` (this signs every device out) or
+  `sudo vesselstackctl passphrase clear panel` to turn passphrase sign-in off.
+  Forgot the passphrase? Use the token or the commands above.
+- **This device is no longer signed in.** The 12-hour or 30-day period ended, or
+  the device was revoked. Enter the passphrase again.
 - **That token wasn't accepted.** Re-read the token on the Pi. A leftover space
   or an old token from before a reinstall is the usual cause.
 - **Couldn't reach the Control Panel.** At the unlock screen this means the

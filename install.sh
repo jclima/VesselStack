@@ -956,7 +956,7 @@ safe_data_path() {
 }
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
-    "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
+    "$VESSELSTACK_ROOT/common" "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 [ ! -L "$VESSELSTACK_DATA" ] || fail_data_path "$VESSELSTACK_DATA is a symlink"
@@ -1160,6 +1160,10 @@ chown -hR root:root "$VESSELSTACK_ROOT/boat-chat"
 chmod -R go-w,go+rX "$VESSELSTACK_ROOT/boat-chat"
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
+# Shared stdlib-only modules (sign-in store and CLI helper). Root-owned and
+# not writable by anyone else: the panel and vesselstackctl load them as root.
+install -d -m 0755 "$VESSELSTACK_ROOT/common"
+install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$VESSELSTACK_ROOT/common/"
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
 # GNU tar run as root keeps the archive's modes, which are only as readable as the
@@ -1170,7 +1174,7 @@ chmod -R u=rwX,go=rX "$VESSELSTACK_ROOT/displays"
 # apply operations without depending on a source checkout that may be removed.
 if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
     tar -C "$SOURCE_ROOT" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' \
-        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel displays \
+        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel common displays \
         | tar --no-same-owner -C "$VESSELSTACK_ROOT/installer" -xf -
 fi
 # The source application keeps legacy defaults for compatibility. Installed

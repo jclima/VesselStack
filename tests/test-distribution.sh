@@ -19,6 +19,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/lib/remediate.sh"
 python3 -m py_compile "$ROOT/scripts/pin-displays-requirements.py"
 python3 -m py_compile "$ROOT/control-panel/app.py"
+python3 -m py_compile "$ROOT/common/vesselstack_auth.py" "$ROOT/common/vesselstack_authctl.py"
 python3 -m py_compile "$ROOT/vesselstack-wizard.py"
 for f in "$ROOT"/displays/*.py "$ROOT"/tests/fixtures/*.py; do python3 -m py_compile "$f"; done
 python3 -m json.tool "$ROOT/displays/boards/registry.json" >/dev/null

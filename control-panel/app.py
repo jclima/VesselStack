@@ -42,6 +42,35 @@ except ImportError:
 
 
 ROOT = Path(os.environ.get("VESSELSTACK_ROOT", "/opt/vesselstack"))
+
+
+def _load_shared_auth() -> Any:
+    """Load common/vesselstack_auth.py from the install root, else from the repository checkout."""
+    import importlib.util
+    candidates = [ROOT / "common" / "vesselstack_auth.py", Path(__file__).resolve().parent.parent / "common" / "vesselstack_auth.py"]
+    for candidate in candidates:
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location("vesselstack_auth", candidate)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise SystemExit("Missing shared sign-in module: " + str(candidates[0]))
+
+
+vsauth = _load_shared_auth()
+LOGIN_THROTTLE = vsauth.LoginThrottle()
+_AUTH_STORES: dict[str, Any] = {}
+
+
+def auth_store() -> Any:
+    path = ROOT / "config" / vsauth.STORE_NAME
+    key = str(path)
+    if key not in _AUTH_STORES:
+        _AUTH_STORES[key] = vsauth.AuthStore(path)
+    return _AUTH_STORES[key]
+
+
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 VESSEL_ENV = Path(os.environ.get("VESSELSTACK_ENV", str(ROOT / "config/vesselstack.env")))
 CHAT_ENV = ROOT / "config/boat-chat.env"
@@ -1367,9 +1396,11 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print("[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), fmt % args), flush=True)
 
-    def send_json(self, status: int, payload: Any) -> None:
+    def send_json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
@@ -1379,16 +1410,109 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def authenticated(self) -> bool:
+    def auth_context(self) -> dict[str, Any] | None:
+        """{"kind": "token"} or {"kind": "device", "device": {...}}; None when unauthenticated."""
+        context: dict[str, Any] | None = None
         expected = panel_settings().get("CONTROL_PANEL_TOKEN", "").strip()
         supplied = normalize_token(self.headers.get("X-VesselStack-Token") or "")
-        return bool(expected) and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+        if expected and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8")):
+            context = {"kind": "token"}
+        else:
+            device_token = (self.headers.get("X-VesselStack-Device") or "").strip()
+            if device_token:
+                device = auth_store().verify_device_token(device_token)
+                if device:
+                    context = {"kind": "device", "device": device}
+        return context
+
+    def authenticated(self) -> bool:
+        return self.auth_context() is not None
 
     def require_auth(self) -> bool:
         if self.authenticated():
             return True
-        self.send_json(401, {"error": "A valid X-VesselStack-Token header is required"})
+        self.send_json(401, {"error": "Sign in with the passphrase, or send a valid X-VesselStack-Token header"})
         return False
+
+    def client_ip(self) -> str:
+        return str(self.client_address[0])
+
+    def current_device_id(self) -> str | None:
+        context = self.auth_context()
+        return context["device"]["id"] if context and context["kind"] == "device" else None
+
+    def post_auth_login(self) -> None:
+        store = auth_store()
+        ip = self.client_ip()
+        try:
+            payload = self.read_payload()
+            if not store.passphrase_set():
+                self.send_json(409, {"error": "Passphrase sign-in is off until a passphrase is set. Use the long token, then set one in Settings."})
+                return
+            wait = LOGIN_THROTTLE.retry_after(ip)
+            if wait:
+                self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                return
+            passphrase, remember = payload.get("passphrase"), payload.get("remember", False)
+            if not isinstance(passphrase, str) or not passphrase or not isinstance(remember, bool):
+                raise ValueError("passphrase (text) and remember (true or false) are required")
+            if not store.check_passphrase(passphrase):
+                LOGIN_THROTTLE.failure(ip)
+                self.send_json(401, {"error": "That passphrase was not accepted."})
+                return
+            LOGIN_THROTTLE.success(ip)
+            token, device = store.create_device(payload.get("label"), remember)
+            self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": remember})
+        except vsauth.DeviceLimitError as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
+
+    def post_auth(self, path: str, payload: dict[str, Any]) -> None:
+        store = auth_store()
+        context = self.auth_context() or {}
+        current = self.current_device_id()
+        try:
+            if path == "/api/auth/logout":
+                if current:
+                    store.revoke(current)
+                self.send_json(200, {"ok": True, "revoked": bool(current)})
+            elif path == "/api/auth/devices/revoke":
+                target = payload.get("id")
+                if target == "all":
+                    count = store.revoke_all()
+                    self.send_json(200, {"ok": True, "revoked": count, "revoked_current": current is not None})
+                elif isinstance(target, str) and target:
+                    found = store.revoke(target)
+                    if not found:
+                        self.send_json(404, {"error": "No such signed-in device"})
+                        return
+                    self.send_json(200, {"ok": True, "revoked": 1, "revoked_current": target == current})
+                else:
+                    raise ValueError('id (a device id or "all") is required')
+            elif path == "/api/auth/passphrase":
+                new = payload.get("new")
+                if store.passphrase_set() and context.get("kind") != "token":
+                    ip = self.client_ip()
+                    wait = LOGIN_THROTTLE.retry_after(ip)
+                    if wait:
+                        self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                        return
+                    if not store.check_passphrase(payload.get("current")):
+                        LOGIN_THROTTLE.failure(ip)
+                        self.send_json(401, {"error": "The current passphrase was not accepted."})
+                        return
+                    LOGIN_THROTTLE.success(ip)
+                revoked = store.set_passphrase(vsauth.check_new_passphrase(new), keep_device=current)
+                self.send_json(200, {"ok": True, "revoked_others": revoked})
+            else:
+                self.send_json(404, {"error": "Not found"})
+        except vsauth.AuthError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
 
     def read_payload(self) -> dict[str, Any]:
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1486,10 +1610,16 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json(200, {"ok": True, "version": RUNNING_IDENTITY["running_version"], "boot_id": RUNNING_IDENTITY["boot_id"]})
             return
+        if path == "/api/auth/status":
+            self.send_json(200, {"passphrase_set": auth_store().passphrase_set()})
+            return
         if path.startswith("/api/"):
             if not self.require_auth():
                 return
-            if path == "/api/config":
+            if path == "/api/auth/devices":
+                store = auth_store()
+                self.send_json(200, {"devices": store.list_devices(self.current_device_id()), "max_devices": vsauth.MAX_DEVICES, "passphrase_set": store.passphrase_set(), "via": self.auth_context()["kind"]})
+            elif path == "/api/config":
                 self.send_json(200, public_configuration())
             elif path == "/api/status":
                 persisted = public_operation(ROOT)
@@ -1533,10 +1663,20 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeError):
                 self.send_json(403, {"error": "request origin is not allowed"})
                 return
+        if path == "/api/auth/login":
+            self.post_auth_login()
+            return
         if not self.require_auth():
+            return
+        if self.auth_context()["kind"] == "device" and not origin:
+            # Device tokens ride in a header a page could be tricked into sending; insist the browser names its origin.
+            self.send_json(403, {"error": "request origin is not allowed"})
             return
         try:
             payload = self.read_payload()
+            if path.startswith("/api/auth/"):
+                self.post_auth(path, payload)
+                return
             if path.startswith("/api/displays/"):
                 self.post_displays(path, payload)
                 return
