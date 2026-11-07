@@ -725,10 +725,10 @@ class InstallerImportTests(unittest.TestCase):
         (self.root / "config").mkdir()
         (self.root / "data" / "boat-chat").mkdir(parents=True)
 
-    def run_ctl(self, scope: str, text: str):
+    def run_ctl(self, scope: str, text: str, *flags: str):
         import subprocess, sys
         env = {"PATH": os.environ.get("PATH", ""), "VESSELSTACK_ROOT": str(self.root), "VESSELSTACK_DATA": str(self.root / "data")}
-        return subprocess.run([sys.executable, "-I", str(ROOT / "common" / "vesselstack_authctl.py"), "passphrase", "set-hash", scope],
+        return subprocess.run([sys.executable, "-I", str(ROOT / "common" / "vesselstack_authctl.py"), "passphrase", "set-hash", scope, *flags],
                               input=text + "\n", capture_output=True, text=True, env=env)
 
     def test_valid_hash_is_imported_into_each_store(self) -> None:
@@ -738,6 +738,67 @@ class InstallerImportTests(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(auth.AuthStore(self.root / relative).check_passphrase("imported passphrase"))
             self.assertNotIn("imported passphrase", done.stdout + done.stderr)
+
+    def test_if_unset_stores_only_when_no_passphrase_exists(self) -> None:
+        for scope, relative in (("panel", "config/control-panel-auth.json"), ("chat", "data/boat-chat/auth.json")):
+            store = auth.AuthStore(self.root / relative)
+            first, later = auth.hash_passphrase("first passphrase"), auth.hash_passphrase("later passphrase")
+            done = self.run_ctl(scope, first, "--if-unset")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue(store.check_passphrase("first passphrase"))
+            done = self.run_ctl(scope, later, "--if-unset")
+            self.assertEqual(done.returncode, 3, done.stderr)
+            self.assertIn("already set", done.stderr)
+            self.assertTrue(store.check_passphrase("first passphrase"))
+            self.assertFalse(store.check_passphrase("later passphrase"))
+            # Without the flag the explicit command still replaces it.
+            self.assertEqual(self.run_ctl(scope, later).returncode, 0)
+            self.assertTrue(store.check_passphrase("later passphrase"))
+
+    def test_if_unset_still_refuses_a_malformed_hash(self) -> None:
+        self.assertNotIn(self.run_ctl("panel", "scrypt:bad", "--if-unset").returncode, (0, 3))
+        self.assertFalse((self.root / "config" / "control-panel-auth.json").exists())
+
+    def test_scrub_is_per_key_and_follows_each_import(self) -> None:
+        """Run the installer's own functions with a stub authctl: a failed import keeps only its own key."""
+        import subprocess
+        text = (ROOT / "install.sh").read_text()
+        start, end = text.index("scrub_signin_hash() {"), text.index("import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH")
+        functions = text[start:end]
+        common = self.root / "app" / "common"
+        common.mkdir(parents=True)
+        # Stub: exit status comes from STUB_<SCOPE>; records that --if-unset was passed.
+        (common / "vesselstack_authctl.py").write_text(
+            "import os, sys\nassert sys.argv[1:3] == ['passphrase', 'set-hash'] and '--if-unset' in sys.argv, sys.argv\n"
+            "sys.exit(int(os.environ['STUB_' + sys.argv[3].upper()]))\n")
+        config, installed = self.root / "vesselstack.env", self.root / "app" / "config" / "vesselstack.env"
+        installed.parent.mkdir(parents=True)
+
+        def run(panel: int, chat: int) -> tuple[str, str, str]:
+            for path in (config, installed):
+                path.write_text("KEEP=1\nCONTROL_PANEL_PASSPHRASE_HASH=scrypt:p\nBOAT_CHAT_PASSPHRASE_HASH=scrypt:c\nOTHER=2\n")
+            script = (f"CONFIG_FILE={config}; VESSELSTACK_ROOT={self.root / 'app'}; VESSELSTACK_DATA={self.root}\n"
+                      f"CONTROL_PANEL_PASSPHRASE_HASH=scrypt:p; BOAT_CHAT_PASSPHRASE_HASH=scrypt:c\n{functions}\n"
+                      'import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH panel "Control Panel" || true\n'
+                      'import_signin_hash BOAT_CHAT_PASSPHRASE_HASH chat "Boat Chat" || true\n')
+            done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                  env={"PATH": os.environ.get("PATH", ""), "STUB_PANEL": str(panel), "STUB_CHAT": str(chat)})
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(config.read_text(), installed.read_text())
+            return config.read_text(), done.stdout, done.stderr
+
+        left, out, _ = run(0, 0)
+        self.assertEqual(left, "KEEP=1\nOTHER=2\n")
+        left, out, err = run(1, 0)
+        self.assertEqual(left, "KEEP=1\nCONTROL_PANEL_PASSPHRASE_HASH=scrypt:p\nOTHER=2\n")
+        self.assertIn("sudo vesselstackctl passphrase set panel", err)
+        left, out, _ = run(0, 1)
+        self.assertEqual(left, "KEEP=1\nBOAT_CHAT_PASSPHRASE_HASH=scrypt:c\nOTHER=2\n")
+        left, out, _ = run(3, 3)
+        self.assertEqual(left, "KEEP=1\nOTHER=2\n")
+        self.assertIn("a Control Panel passphrase is already set; the one from the installer settings was ignored", out)
+        self.assertIn("sudo vesselstackctl passphrase set panel", out)
+        self.assertIn("a Boat Chat passphrase is already set", out)
 
     def test_malformed_hash_is_refused_and_nothing_is_written(self) -> None:
         for bad in ("imported passphrase", "scrypt:15:8:1:AAAA:BBBB", "", "scrypt:99:8:1:" + "A" * 22 + "==:" + "A" * 43 + "="):
@@ -755,5 +816,6 @@ class InstallerImportTests(unittest.TestCase):
             self.assertIn(key, extra)
             self.assertIn(key, secret)
             self.assertNotIn(key, written, "never written to vesselstack.env")
-        self.assertIn("scrub_signin_hashes", text)
+        self.assertIn("scrub_signin_hash", text)
         self.assertIn("passphrase set-hash", text)
+        self.assertIn("--if-unset", text)

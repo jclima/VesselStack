@@ -99,7 +99,9 @@ prints `vesselstackctl panel-link --for chat` with its QR code. Passphrases go t
 standard input only; they are never in arguments, environment variables or logs. The terminal wizard and
 the browser wizard also offer both passphrases as optional fields; they hash them with the same scrypt
 code and write only `CONTROL_PANEL_PASSPHRASE_HASH` / `BOAT_CHAT_PASSPHRASE_HASH`, which `install.sh`
-imports into the sign-in stores and then removes from the env file (never kept in `vesselstack.env`).
+imports into the sign-in stores and then removes from the env file (never kept in `vesselstack.env`). Each
+is imported only when no passphrase is stored yet, so a re-install never overwrites one you changed later; a
+note says so and points to `sudo vesselstackctl passphrase set panel|chat`.
 Skipped or scripted installs can do it later: `sudo vesselstackctl passphrase set panel`,
 `sudo vesselstackctl passphrase set chat`, `sudo vesselstackctl panel-link [--for chat]`.
 

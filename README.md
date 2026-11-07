@@ -1171,7 +1171,9 @@ The terminal wizard and browser wizard have optional passphrase fields; they has
 the hash format before changing anything (refusing otherwise), imports each into its sign-in store (panel store as
 root; Boat Chat store through the privilege-dropping helper), then deletes the key from the env file; the hashes are
 never kept in `vesselstack.env` and are never printed. `vesselstackctl passphrase set-hash panel|chat` (hash on
-standard input) is the underlying command. Rollback: `sudo vesselstackctl passphrase clear panel|chat`.
+standard input) is the underlying command. The installer uses `set-hash ... --if-unset` and removes each key as soon as
+its own import is settled: it never overwrites a passphrase that is already stored (exit status 3, an "already set"
+notice, the key is scrubbed), and a failed import keeps only its own key for the next run. Rollback: `sudo vesselstackctl passphrase clear panel|chat`.
 
 **Pairing links and QR codes (unreleased):** `sudo vesselstackctl panel-link [--for panel|chat] [--admin]
 [--label TEXT]` prints a single-use link (`http://HOST:PORT/#pair=CODE`, `$(hostname).local` plus each IPv4

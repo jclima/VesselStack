@@ -1397,30 +1397,32 @@ new_env_temp control-panel.env; control_panel_temp=$NEW_ENV_TEMP
 } >> "$control_panel_temp"
 mv -f -- "$control_panel_temp" "$VESSELSTACK_ROOT/config/control-panel.env"
 
-# Import sign-in passphrase hashes chosen in the wizard, then drop the keys from the env files: they live only
-# in the sign-in stores (the Control Panel one is root-only; Boat Chat's is written by the helper process that
-# runs as the service user, never by root in that directory). A failure only means setting it later by hand.
-import_signin_hash() {
-    local key=$1 scope=$2 label=$3 hash=${!1:-}
-    [ -n "$hash" ] || return 0
-    if env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
-        python3 -I "$VESSELSTACK_ROOT/common/vesselstack_authctl.py" passphrase set-hash "$scope" <<<"$hash" >/dev/null; then
-        echo "$label passphrase from the wizard stored (hash only)."
-        return 0
-    fi
-    echo "WARNING: could not store the $label passphrase from the wizard. Set it with: sudo vesselstackctl passphrase set $scope" >&2
-    return 1
-}
-scrub_signin_hashes() {
-    local file
+# Import sign-in passphrase hashes chosen in the wizard, then drop each key from the env files as soon as ITS
+# import is settled: the hash lives only in the sign-in stores (the Control Panel one is root-only; Boat Chat's is
+# written by the helper process that runs as the service user, never by root in that directory). The import is
+# "only if no passphrase is stored yet" (set-hash --if-unset), so a re-install can never overwrite a passphrase
+# changed since. A failed import keeps only its own key, so a later install can retry it.
+scrub_signin_hash() {
+    local key=$1 file
     for file in "$CONFIG_FILE" "$VESSELSTACK_ROOT/config/vesselstack.env"; do
-        if [ -f "$file" ] && [ ! -L "$file" ]; then sed -i -e '/^CONTROL_PANEL_PASSPHRASE_HASH=/d' -e '/^BOAT_CHAT_PASSPHRASE_HASH=/d' "$file"; fi
+        if [ -f "$file" ] && [ ! -L "$file" ]; then sed -i -e "/^${key}=/d" "$file"; fi
     done
 }
-signin_import_failed=0
-import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH panel "Control Panel" || signin_import_failed=1
-import_signin_hash BOAT_CHAT_PASSPHRASE_HASH chat "Boat Chat" || signin_import_failed=1
-if [ "$signin_import_failed" -eq 0 ]; then scrub_signin_hashes; fi
+import_signin_hash() {
+    local key=$1 scope=$2 label=$3 hash=${!1:-} status=0
+    [ -n "$hash" ] || return 0
+    env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        python3 -I "$VESSELSTACK_ROOT/common/vesselstack_authctl.py" passphrase set-hash "$scope" --if-unset <<<"$hash" >/dev/null 2>&1 || status=$?
+    case $status in
+        0) echo "$label passphrase from the wizard stored (hash only)."; scrub_signin_hash "$key" ;;
+        3) echo "Notice: a $label passphrase is already set; the one from the installer settings was ignored - use \`sudo vesselstackctl passphrase set $scope\` to change it."
+           scrub_signin_hash "$key" ;;
+        *) echo "WARNING: could not store the $label passphrase from the wizard. Set it with: sudo vesselstackctl passphrase set $scope" >&2
+           return 1 ;;
+    esac
+}
+import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH panel "Control Panel" || true
+import_signin_hash BOAT_CHAT_PASSPHRASE_HASH chat "Boat Chat" || true
 CONTROL_PANEL_PASSPHRASE_HASH=; BOAT_CHAT_PASSPHRASE_HASH=
 
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)

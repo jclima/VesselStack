@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 SCOPES = ("panel", "chat")
+EXIT_ALREADY_SET = 3  # set-hash --if-unset found a passphrase already stored
 
 
 def load_auth() -> Any:
@@ -56,7 +57,8 @@ def usage() -> str:
         "Usage:\n"
         "  vesselstackctl passphrase set panel|chat [--stdin]\n"
         "  vesselstackctl passphrase clear panel|chat\n"
-        "  vesselstackctl passphrase set-hash panel|chat   (reads a scrypt hash line on stdin; used by the installer)\n"
+        "  vesselstackctl passphrase set-hash panel|chat [--if-unset]   (scrypt hash line on stdin; used by the installer;\n"
+        "                                       --if-unset stores it only when no passphrase exists, else exits 3)\n"
         "  vesselstackctl passphrase status [panel|chat]\n"
         "  vesselstackctl devices list [panel|chat]\n"
         "  vesselstackctl devices revoke ID [panel|chat]\n"
@@ -267,10 +269,20 @@ def passphrase_command(auth: Any, stores: dict[str, Any], verb: str, rest: list[
         out.write(f"{NAMES[scope]} passphrase set; {revoked} previously signed-in device(s) revoked.\n")
         return 0
     if verb == "set-hash":
-        if len(rest) != 1 or rest[0] not in SCOPES:
+        flags = [item for item in rest if item.startswith("--")]
+        positional = [item for item in rest if not item.startswith("--")]
+        if len(positional) != 1 or positional[0] not in SCOPES or any(flag != "--if-unset" for flag in flags):
             err.write(usage())
             return 2
-        revoked = stores[rest[0]].set_passphrase_hash(stdin.readline().strip())
+        scope, hash_line = positional[0], stdin.readline().strip()
+        if flags:
+            try:
+                revoked = stores[scope].set_passphrase_hash(hash_line, expect_hash=None)
+            except auth.PassphraseChanged:
+                err.write(f"A {NAMES[scope]} passphrase is already set; left unchanged.\n")
+                return EXIT_ALREADY_SET
+        else:
+            revoked = stores[scope].set_passphrase_hash(hash_line)
         out.write(f"{NAMES[rest[0]]} passphrase set from a prepared hash; {revoked} previously signed-in device(s) revoked.\n")
         return 0
     err.write(usage())

@@ -7,6 +7,10 @@ Semantic Versioning.
 
 ### Highlights
 
+- Security: the installer imports each wizard passphrase hash only when no passphrase is stored yet
+  (`vesselstackctl passphrase set-hash --if-unset`, exit status 3 when one exists) and removes each key
+  as soon as its own import is settled, so a failed import of one no longer leaves both keys behind and a
+  re-install can never overwrite a passphrase changed since.
 - Security: setting or changing a sign-in passphrase now also cancels waiting pairing links, and Boat Chat admin devices are bound to the admin code they were paired under (they lose admin rights when `BOAT_CHAT_SETTINGS_TOKEN` is changed or removed; `--admin` pairing needs a configured admin code).
 - Control Panel sign-in is easier: choose a passphrase (`sudo vesselstackctl passphrase set panel`, or
   Settings, Sign-in) and unlock with it, optionally with **Remember this device (30 days)**. Settings lists
