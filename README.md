@@ -1162,7 +1162,7 @@ release; older versions ignore `control-panel-auth.json` and only the token work
 address; the SSH-tunnel form when the service is loopback-only), the code as `XXXXX-XXXXX`, its expiry and a
 terminal QR code. The Control Panel offers the same under Settings, Sign-in, **Pair a phone**
 (`POST /api/auth/pairing`, authenticated, `Origin` required, returns the link, code, expiry and QR module
-matrix; the panel writes the Boat Chat store through the privilege-dropping path). Redemption is
+matrix; the root panel changes the Boat Chat store only by running `common/vesselstack_authctl.py` as a fresh process with the Boat Chat service user's uid/gid and no supplementary groups, never by forking itself or writing in that directory; `/api/auth/passphrase` on both services is a compare-and-set and answers 409 "passphrase changed, try again" if the passphrase changed between the check and the write). Redemption is
 `POST /api/auth/pair` on both services (same `Origin`/`Host` rules and throttle as login). Codes are 10
 Crockford base32 characters, only their SHA-256 is stored, they are single use, last 10 minutes, at most 3 may
 wait per store, and a redeemed link always remembers the device for 30 days. `--admin` (Boat Chat only) makes

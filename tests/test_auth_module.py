@@ -354,50 +354,113 @@ class StoreHardeningTests(unittest.TestCase):
         store.set_passphrase(PASS)
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["auth.json", "auth.json.lock"])
 
-    def test_root_over_foreign_directory_drops_privileges_and_never_chowns(self) -> None:
-        marker = self.dir.parent / "dropped"
+    def _root_store(self, owner=(4242, 4343), runner=None):
+        class Store(auth.AuthStore):
+            def _euid(self) -> int:
+                return 0
+
+            def _parent_owner(self) -> tuple[int, int]:
+                return owner
+        return Store(self.path, inherit_owner=True, expose_role=True, runner=runner, helper_path="/opt/vesselstack/common/vesselstack_authctl.py")
+
+    def test_root_over_foreign_directory_uses_helper_process_with_dropped_identity(self) -> None:
         calls = []
 
-        class Store(auth.AuthStore):
-            def _euid(self) -> int:
-                return 0
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            reply = {"passphrase": {"set-hash": {"ok": True, "revoked": 2}, "clear": {"ok": True, "revoked": 3}},
+                     "pairing": {"create": {"ok": True, "code": "ABCDE12345", "expires": 1800000600}},
+                     "devices": {"revoke": {"ok": True, "found": True}, "revoke-all": {"ok": True, "revoked": 4}}}[command[3]][command[4]]
+            return mock.Mock(stdout=json.dumps(reply).encode(), returncode=0)
+        store = self._root_store(runner=runner)
+        with mock.patch("os.fchown") as fchown, mock.patch("os.chown") as chown:
+            self.assertEqual(store.set_passphrase(PASS, keep_device="abc"), 2)
+            self.assertEqual(store.clear_passphrase(), 3)
+            self.assertEqual(store.create_pairing("admin", "Phone"), ("ABCDE12345", 1800000600))
+            self.assertTrue(store.revoke("dev1"))
+            self.assertEqual(store.revoke_all(keep="k"), 4)
+        fchown.assert_not_called()
+        chown.assert_not_called()
+        self.assertFalse(self.path.exists(), "root wrote nothing itself")
+        import sys
+        for command, kwargs in calls:
+            self.assertEqual(command[:3], [sys.executable, "-I", "/opt/vesselstack/common/vesselstack_authctl.py"])
+            self.assertEqual(command[-1], "--json")
+            self.assertEqual((kwargs["user"], kwargs["group"], kwargs["extra_groups"]), (4242, 4343, []))
+            self.assertEqual((kwargs["capture_output"], kwargs["timeout"]), (True, 30))
+            self.assertEqual(set(kwargs["env"]), {"PATH", "LANG", "VESSELSTACK_DATA", "VESSELSTACK_ROOT"})
+        self.assertEqual([c[0][3:-1] for c in calls], [["passphrase", "set-hash", "chat"], ["passphrase", "clear", "chat"], ["pairing", "create", "chat"],
+                                                      ["devices", "revoke", "chat"], ["devices", "revoke-all", "chat"]])
+        sent = json.loads(calls[0][1]["input"])
+        self.assertTrue(auth.valid_hash(sent["hash"]))
+        self.assertNotIn(PASS, calls[0][1]["input"].decode(), "the helper gets a hash, never the passphrase")
+        self.assertEqual(sent["keep_device"], "abc")
+        self.assertEqual(json.loads(calls[2][1]["input"]), {"role": "admin", "label": "Phone"})
+        self.assertEqual(json.loads(calls[3][1]["input"]), {"id": "dev1"})
+        self.assertEqual(json.loads(calls[4][1]["input"]), {"keep": "k"})
 
-            def _parent_owner(self) -> tuple[int, int]:
-                return 4242, 4343
+    def test_helper_errors_map_back_to_exceptions(self) -> None:
+        for kind, exc in (("limit", auth.DeviceLimitError), ("auth", auth.AuthError), ("changed", auth.PassphraseChanged), ("store", auth.StoreError)):
+            store = self._root_store(runner=lambda *a, _k=kind, **k: mock.Mock(stdout=json.dumps({"ok": False, "kind": _k, "message": "m"}).encode()))
+            with self.assertRaises(exc):
+                store.clear_passphrase()
+        store = self._root_store(runner=lambda *a, **k: mock.Mock(stdout=b"not json"))
+        with self.assertRaises(auth.StoreError):
+            store.clear_passphrase()
 
-            def _drop_privileges(self, uid: int, gid: int) -> None:
-                marker.write_text(f"{uid}:{gid}")  # runs in the forked child
+    def test_transaction_refuses_foreign_directory_as_root(self) -> None:
+        store = self._root_store(runner=lambda *a, **k: self.fail("no helper expected"))
+        with self.assertRaises(auth.StoreError):
+            store.transaction(lambda data: None)
+        with self.assertRaises(auth.StoreError):
+            store.create_device("x", True)
 
-        store = Store(self.path, inherit_owner=True, expose_role=True)
-        with mock.patch("os.fchown", side_effect=lambda *a: calls.append(a)), mock.patch("os.chown", side_effect=lambda *a, **k: calls.append(a)):
-            store.set_passphrase(PASS)
-            token, device = store.create_device("Phone", True, role="admin")
-            self.assertEqual(device["role"], "admin")
-            self.assertEqual(store.verify_device_token(token)["role"], "admin")
-            with self.assertRaises(auth.DeviceLimitError):
-                for _ in range(auth.MAX_DEVICES + 1):
-                    store.create_device("x", True)
-        self.assertEqual(marker.read_text(), "4242:4343")
-        self.assertEqual(calls, [])
-        self.assertTrue(store.check_passphrase(PASS))
+    def test_helper_json_commands_round_trip_as_owner(self) -> None:
+        ctl = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")
+        module = ctl.load_auth()
+        stores = {"chat": module.AuthStore(self.path, expose_role=True, inherit_owner=True)}
+        stores["panel"] = stores["chat"]
 
-    def test_root_over_root_owned_directory_stays_in_process(self) -> None:
-        class Store(auth.AuthStore):
-            def _euid(self) -> int:
-                return 0
+        def run(args, payload):
+            out = io.StringIO()
+            code = ctl.json_command(module, stores, args, io.StringIO(json.dumps(payload)), out)
+            return code, json.loads(out.getvalue())
+        encoded = module.hash_passphrase(PASS)
+        self.assertEqual(run(["passphrase", "set-hash", "chat"], {"hash": encoded}), (0, {"ok": True, "revoked": 0}))
+        self.assertTrue(stores["chat"].check_passphrase(PASS))
+        code, reply = run(["passphrase", "set-hash", "chat"], {"hash": "scrypt:bad"})
+        self.assertEqual((code, reply["ok"], reply["kind"]), (1, False, "auth"))
+        code, reply = run(["passphrase", "set-hash", "chat"], {"hash": encoded, "expect_hash": None})
+        self.assertEqual((code, reply["kind"]), (1, "changed"))
+        code, reply = run(["pairing", "create", "chat"], {"role": "admin", "label": "Tablet"})
+        self.assertEqual((code, reply["ok"], len(reply["code"])), (0, True, 10))
+        self.assertEqual(run(["devices", "revoke", "chat"], {"id": "nope"}), (0, {"ok": True, "found": False}))
+        self.assertEqual(run(["devices", "revoke-all", "chat"], {}), (0, {"ok": True, "revoked": 0}))
+        self.assertEqual(run(["passphrase", "clear", "chat"], {}), (0, {"ok": True, "revoked": 0}))
+        self.assertEqual(run(["bogus", "x", "chat"], {})[0], 2)
 
-            def _parent_owner(self) -> tuple[int, int]:
-                return 0, 0
+    def test_compare_and_set_refuses_changed_passphrase(self) -> None:
+        store = auth.AuthStore(self.path)
+        store.set_passphrase(PASS)
+        before = store.current_hash()
+        store.set_passphrase("somebody else wins")
+        with self.assertRaises(auth.PassphraseChanged):
+            store.set_passphrase("late writer wins!", expect_hash=before)
+        self.assertTrue(store.check_passphrase("somebody else wins"))
+        store.set_passphrase("fine now yes", expect_hash=store.current_hash())
 
-            def _transaction_as(self, owner, mutate):
-                raise AssertionError("must not fork for a root-owned directory")
-        Store(self.path, inherit_owner=True).set_passphrase(PASS)
+    def test_compare_and_set_first_set_loses_to_concurrent_first_set(self) -> None:
+        store = auth.AuthStore(self.path)
+        self.assertIsNone(store.current_hash())
+        store.set_passphrase(PASS)
+        with self.assertRaises(auth.PassphraseChanged):
+            store.set_passphrase("second first-setter", expect_hash=None)
 
-    def test_non_root_never_forks(self) -> None:
-        class Store(auth.AuthStore):
-            def _transaction_as(self, owner, mutate):
-                raise AssertionError("must not fork when not root")
-        Store(self.path, inherit_owner=True).set_passphrase(PASS)
+    def test_no_fork_left_in_auth_module(self) -> None:
+        text = (ROOT / "common" / "vesselstack_auth.py").read_text()
+        self.assertNotIn("os.fork", text)
+        self.assertNotIn("os.setuid", text)
+        self.assertNotIn("setgroups", text)
 
 
 class PairingStoreTests(unittest.TestCase):

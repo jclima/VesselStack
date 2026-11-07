@@ -8,6 +8,7 @@ input or a hidden prompt, never from argv.
 from __future__ import annotations
 
 import getpass
+import json
 import importlib.util
 import os
 import sys
@@ -55,6 +56,7 @@ def usage() -> str:
         "Usage:\n"
         "  vesselstackctl passphrase set panel|chat [--stdin]\n"
         "  vesselstackctl passphrase clear panel|chat\n"
+        "  vesselstackctl passphrase set-hash panel|chat   (reads a scrypt hash line on stdin; used by the installer)\n"
         "  vesselstackctl passphrase status [panel|chat]\n"
         "  vesselstackctl devices list [panel|chat]\n"
         "  vesselstackctl devices revoke ID [panel|chat]\n"
@@ -71,6 +73,8 @@ def main(argv: list[str], stdin: TextIO | None = None, out: TextIO | None = None
     stdin, out, err = stdin or sys.stdin, out or sys.stdout, err or sys.stderr
     auth = load_auth()
     args = list(argv)
+    if "--json" in args:
+        return json_command(auth, stores_for(auth), [a for a in args if a != "--json"], stdin, out)
     if args and args[0] == "panel-link":
         try:
             return panel_link_command(auth, stores_for(auth), args[1:], out, err)
@@ -163,6 +167,50 @@ def panel_link_command(auth: Any, stores: dict[str, Any], rest: list[str], out: 
     return 0
 
 
+def json_command(auth: Any, stores: dict[str, Any], args: list[str], stdin: TextIO, out: TextIO) -> int:
+    """Machine interface used when root must change a store owned by a service user: JSON on stdin and stdout.
+
+    Run by root as a separate process that has dropped to the directory owner's uid/gid (see AuthStore._helper_call)."""
+    def reply(body: dict[str, Any], code: int = 0) -> int:
+        out.write(json.dumps(body) + "\n")
+        return code
+    try:
+        raw = stdin.read(65536).strip()
+        payload = json.loads(raw) if raw else {}
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object required")
+        group, verb, scope = (args + ["", "", ""])[:3]
+        if scope not in SCOPES:
+            return reply({"ok": False, "kind": "store", "message": "unknown store"}, 2)
+        store = stores[scope]
+        if (group, verb) == ("pairing", "create"):
+            code, expires = store.create_pairing(str(payload.get("role") or "access"), payload.get("label") or "")
+            return reply({"ok": True, "code": code, "expires": expires})
+        if (group, verb) == ("passphrase", "set-hash"):
+            extra = {"expect_hash": payload["expect_hash"]} if "expect_hash" in payload else {}
+            keep = payload.get("keep_device")
+            revoked = store.set_passphrase_hash(payload.get("hash"), keep_device=keep if isinstance(keep, str) else None, **extra)
+            return reply({"ok": True, "revoked": revoked})
+        if (group, verb) == ("passphrase", "clear"):
+            return reply({"ok": True, "revoked": store.clear_passphrase()})
+        if (group, verb) == ("devices", "revoke") and isinstance(payload.get("id"), str):
+            return reply({"ok": True, "found": store.revoke(payload["id"])})
+        if (group, verb) == ("devices", "revoke-all"):
+            keep = payload.get("keep")
+            return reply({"ok": True, "revoked": store.revoke_all(keep=keep if isinstance(keep, str) else None)})
+        return reply({"ok": False, "kind": "store", "message": "unknown helper command"}, 2)
+    except auth.PassphraseChanged as exc:
+        return reply({"ok": False, "kind": "changed", "message": str(exc)}, 1)
+    except auth.DeviceLimitError as exc:
+        return reply({"ok": False, "kind": "limit", "message": str(exc)}, 1)
+    except auth.AuthError as exc:
+        return reply({"ok": False, "kind": "auth", "message": str(exc)}, 1)
+    except (auth.StoreError, OSError) as exc:
+        return reply({"ok": False, "kind": "store", "message": getattr(exc, "strerror", None) or str(exc)}, 1)
+    except ValueError as exc:
+        return reply({"ok": False, "kind": "store", "message": str(exc)}, 2)
+
+
 def passphrase_command(auth: Any, stores: dict[str, Any], verb: str, rest: list[str], stdin: TextIO, out: TextIO, err: TextIO) -> int:
     if verb == "status":
         if not scope_ok(rest[:1], err, required=False) or len(rest) > 1:
@@ -198,6 +246,13 @@ def passphrase_command(auth: Any, stores: dict[str, Any], verb: str, rest: list[
                 return 1
         revoked = stores[scope].set_passphrase(first)
         out.write(f"{NAMES[scope]} passphrase set; {revoked} previously signed-in device(s) revoked.\n")
+        return 0
+    if verb == "set-hash":
+        if len(rest) != 1 or rest[0] not in SCOPES:
+            err.write(usage())
+            return 2
+        revoked = stores[rest[0]].set_passphrase_hash(stdin.readline().strip())
+        out.write(f"{NAMES[rest[0]]} passphrase set from a prepared hash; {revoked} previously signed-in device(s) revoked.\n")
         return 0
     err.write(usage())
     return 2

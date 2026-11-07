@@ -5486,17 +5486,24 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": True, "role": device["role"]}); return
             if path == "/api/auth/passphrase":
                 payload = self.read_json_body()
-                if store.passphrase_set() and not self.admin_code_supplied():
+                # Authorization is decided from one read of the stored hash, and the write is a compare-and-set on
+                # that same hash, so a concurrent change between the check and the write is refused (409).
+                before = store.current_hash()
+                if before is not None and not self.admin_code_supplied():
                     proceed, matched = self.check_passphrase_throttled(store, payload.get("current"))
                     if not proceed:
                         return
                     if not matched:
                         self.send_json(401, {"error": "The current passphrase was not accepted."}); return
                     LOGIN_THROTTLE.success(matched)
-                elif not store.passphrase_set() and not (self.admin_code_supplied() or self.access_allowed()):
+                elif before is None and not (self.admin_code_supplied() or self.access_allowed()):
                     self.send_json(401, {"error": "Sign in with the access code first"}); return
                 device = self.device_context()
-                revoked = store.set_passphrase(vsauth.check_new_passphrase(payload.get("new"), vsauth.CHAT_MIN_PASSPHRASE_LENGTH), keep_device=device["id"] if device else None)
+                try:
+                    revoked = store.set_passphrase(vsauth.check_new_passphrase(payload.get("new"), vsauth.CHAT_MIN_PASSPHRASE_LENGTH),
+                                                   keep_device=device["id"] if device else None, expect_hash=before)
+                except vsauth.PassphraseChanged:
+                    self.send_json(409, {"error": "passphrase changed, try again"}); return
                 self.send_json(200, {"ok": True, "revoked_others": revoked}); return
             if not self.access_allowed():
                 self.send_json(401, {"error": "Sign in first"}); return

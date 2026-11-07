@@ -1591,7 +1591,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 self.post_auth_pairing(payload)
             elif path == "/api/auth/passphrase":
                 new = payload.get("new")
-                if store.passphrase_set() and context.get("kind") != "token":
+                before = store.current_hash()  # authorization and the write both hinge on this one read (compare-and-set)
+                if before is not None and context.get("kind") != "token":
                     ip = self.client_ip()
                     allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)
                     if not allowed:
@@ -1601,7 +1602,11 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                         self.send_json(401, {"error": "The current passphrase was not accepted."})
                         return
                     LOGIN_THROTTLE.success(attempt)
-                revoked = store.set_passphrase(vsauth.check_new_passphrase(new), keep_device=current)
+                try:
+                    revoked = store.set_passphrase(vsauth.check_new_passphrase(new), keep_device=current, expect_hash=before)
+                except vsauth.PassphraseChanged:
+                    self.send_json(409, {"error": "passphrase changed, try again"})
+                    return
                 self.send_json(200, {"ok": True, "revoked_others": revoked})
             else:
                 self.send_json(404, {"error": "Not found"})

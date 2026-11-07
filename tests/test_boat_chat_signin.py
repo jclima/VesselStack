@@ -163,6 +163,35 @@ class EndpointTests(SignInCase):
         self.assertEqual(self.call("GET", "/api/settings", headers=self.device(third["device_token"]))[0], 401)
         self.assertEqual(self.call("GET", "/api/auth/devices")[0], 401)
 
+    def _race(self, rival, method="current_hash"):
+        """Make ``rival`` write the store right after the handler's read (or current-passphrase check)."""
+        real = getattr(app.vsauth.AuthStore, method)
+
+        def racing(store, *args):
+            value = real(store, *args)
+            racing.fired or rival()
+            racing.fired = True
+            return value
+        racing.fired = False
+        return mock.patch.object(app.vsauth.AuthStore, method, racing)
+
+    def test_first_set_loses_to_a_concurrent_first_set_with_409(self):
+        rival = lambda: app.vsauth.AuthStore(Path(self.tmp.name) / "auth.json", min_passphrase=8).set_passphrase("rival passphrase")
+        with self._race(rival):
+            status, body = self.call("POST", "/api/auth/passphrase", {"new": CREW}, self.code())
+        self.assertEqual((status, body), (409, {"error": "passphrase changed, try again"}))
+        self.assertEqual(self.login(passphrase="rival passphrase")[0], 200)
+        self.assertEqual(self.login(passphrase=CREW)[0], 401)
+
+    def test_change_loses_to_a_concurrent_change_with_409(self):
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        rival = lambda: app.vsauth.AuthStore(Path(self.tmp.name) / "auth.json", min_passphrase=8).set_passphrase("rival passphrase")
+        with self._race(rival, "check_passphrase"):
+            status, body = self.call("POST", "/api/auth/passphrase", {"current": CREW, "new": "another pass"}, self.device(mine))
+        self.assertEqual((status, body["error"]), (409, "passphrase changed, try again"))
+        self.assertEqual(self.login(passphrase="rival passphrase")[0], 200)
+
     def test_change_needs_current_passphrase_or_admin_code(self):
         os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
         self.set_passphrase()

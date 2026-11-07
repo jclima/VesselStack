@@ -1594,6 +1594,23 @@ class SignInApiTests(DisplaysApiBase):
         self.assertEqual(self.login(passphrase=self.PASSPHRASE)[0], 401)
         self.assertEqual(self.login(passphrase=new)[0], 200)
 
+    def test_passphrase_change_loses_to_a_concurrent_change_with_409(self) -> None:
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        real = panel.vsauth.AuthStore.check_passphrase
+        fired = []
+
+        def racing(store, *args):
+            value = real(store, *args)
+            if not fired:
+                fired.append(1)
+                panel.vsauth.AuthStore(self.root / "config" / panel.vsauth.STORE_NAME).set_passphrase("rival long passphrase")
+            return value
+        with mock.patch.object(panel.vsauth.AuthStore, "check_passphrase", racing):
+            status, payload, _ = self.call("POST", "/api/auth/passphrase", {"current": self.PASSPHRASE, "new": "a different long phrase"}, self.device(mine))
+        self.assertEqual((status, payload["error"]), (409, "passphrase changed, try again"))
+        self.assertEqual(self.login(passphrase="rival long passphrase")[0], 200)
+
     def test_long_token_may_change_the_passphrase_without_the_current_one(self) -> None:
         self.set_passphrase()
         device = self.login()[1]["device_token"]

@@ -21,9 +21,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -63,6 +66,10 @@ class DeviceLimitError(AuthError):
     pass
 
 
+class PassphraseChanged(AuthError):
+    """The passphrase changed between the caller's check and the write."""
+
+
 class StoreError(Exception):
     """The store could not be read or written safely."""
 
@@ -83,6 +90,15 @@ def check_new_passphrase(passphrase: Any, minimum: int = MIN_PASSPHRASE_LENGTH) 
     if len(passphrase) > MAX_PASSPHRASE_LENGTH:
         raise AuthError(f"Use at most {MAX_PASSPHRASE_LENGTH} characters.")
     return passphrase
+
+
+_ANY = object()
+_HASH_PATTERN = re.compile(r"^scrypt:(1[0-9]|20):([1-9]|1[0-6]):[1-4]:[A-Za-z0-9+/]{22}==:[A-Za-z0-9+/]{43}=$")
+
+
+def valid_hash(value: Any) -> bool:
+    """Strict shape check for a stored/imported hash (what ``hash_passphrase`` produces, within verify's bounds)."""
+    return isinstance(value, str) and len(value) <= 200 and bool(_HASH_PATTERN.match(value))
 
 
 def hash_passphrase(passphrase: str) -> str:
@@ -182,9 +198,11 @@ class AuthStore:
     def __init__(self, path: str | os.PathLike[str], *, clock: Callable[[], float] = time.time,
                  min_passphrase: int = MIN_PASSPHRASE_LENGTH, expose_role: bool = False,
                  inherit_owner: bool = False, differs_from: Callable[[], Any] | None = None,
-                 differs_message: str = "Choose a passphrase different from the other VesselStack passphrase.") -> None:
-        """``inherit_owner``: the store lives in a service user's directory; when root uses it, transactions run in a
-        child that has dropped to that directory's owner (root never opens or chowns files there).
+                 differs_message: str = "Choose a passphrase different from the other VesselStack passphrase.",
+                 runner: Callable[..., Any] | None = None, helper_path: str | os.PathLike[str] | None = None) -> None:
+        """``inherit_owner``: the store lives in a service user's directory; when root uses it, mutations run in the
+        helper process (vesselstack_authctl.py) started with that directory owner's identity (root never opens or
+        chowns files there). ``runner`` replaces ``subprocess.run`` (tests).
         ``differs_from``: returns a stored hash (or None) the new passphrase must not equal."""
         self.path = Path(path)
         self.clock = clock
@@ -193,6 +211,8 @@ class AuthStore:
         self.inherit_owner = inherit_owner
         self.differs_from = differs_from
         self.differs_message = differs_message
+        self.runner = runner
+        self.helper_path = Path(helper_path) if helper_path else Path(__file__).with_name("vesselstack_authctl.py")
         self._mutex = threading.RLock()
         self._cache: dict[str, Any] | None = None
         self._signature: tuple[int, int, int] | None = None
@@ -200,7 +220,7 @@ class AuthStore:
     # -- file access -------------------------------------------------------
     # Every file operation is relative to a directory descriptor opened with O_NOFOLLOW, and every file
     # opened is checked (regular, single link) before use. Nothing here ever chowns: when root must touch a
-    # directory owned by a service user, the whole transaction runs in a child that has dropped privileges.
+    # directory owned by a service user, mutations run in a helper process that has dropped privileges.
     _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 
     def _euid(self) -> int:
@@ -323,13 +343,6 @@ class AuthStore:
         finally:
             os.close(dir_fd)
 
-    def _drop_privileges(self, uid: int, gid: int) -> None:
-        os.setgroups([])
-        os.setgid(gid)
-        os.setuid(uid)
-        if os.getuid() != uid or os.geteuid() != uid or os.getgid() != gid:
-            raise StoreError("could not drop privileges")
-
     def _foreign_owner(self) -> tuple[int, int] | None:
         """(uid, gid) of the directory owner when root would otherwise be working in another user's directory."""
         if not self.inherit_owner or self._euid() != 0:
@@ -340,59 +353,52 @@ class AuthStore:
             return None
         return (uid, gid) if uid != 0 else None
 
-    def _transaction_as(self, owner: tuple[int, int], mutate: Callable[[dict[str, Any]], Any]) -> Any:
-        """Run the transaction in a forked child that has become the directory owner; root never opens a file there."""
-        reader, writer = os.pipe()
-        pid = os.fork()
-        if pid == 0:  # child: never returns into the caller's stack
-            code = 1
-            try:
-                os.close(reader)
-                try:
-                    self._drop_privileges(*owner)
-                    reply: dict[str, Any] = {"ok": True, "result": self._transaction_local(mutate)}
-                except DeviceLimitError as exc:
-                    reply = {"ok": False, "kind": "limit", "message": str(exc)}
-                except AuthError as exc:
-                    reply = {"ok": False, "kind": "auth", "message": str(exc)}
-                except StoreError as exc:
-                    reply = {"ok": False, "kind": "store", "message": str(exc)}
-                except OSError as exc:
-                    reply = {"ok": False, "kind": "store", "message": exc.strerror or "I/O error"}
-                except BaseException:  # noqa: BLE001 - report generically, never leak details
-                    reply = {"ok": False, "kind": "store", "message": "sign-in store transaction failed"}
-                payload = json.dumps(reply).encode("utf-8")
-                view = memoryview(payload)
-                while view:
-                    view = view[os.write(writer, view):]
-                code = 0
-            finally:
-                os._exit(code)
-        os.close(writer)
+    def _helper_call(self, owner: tuple[int, int], args: list[str], payload: dict[str, Any]) -> dict[str, Any]:
+        """Run the sign-in helper as a fresh process with the directory owner's identity (never a fork of this process).
+
+        Root cannot hand a closure to another process, so the few mutations root needs (set/clear passphrase, pairing
+        links, revoke) are helper subcommands with JSON on standard input and output."""
+        uid, gid = owner
+        command = [sys.executable, "-I", str(self.helper_path), *args, "--json"]
+        env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "VESSELSTACK_DATA": str(self.path.parent.parent),
+               "VESSELSTACK_ROOT": str(Path(self.helper_path).parent.parent)}
+        runner = self.runner or subprocess.run
         try:
-            with os.fdopen(reader, "rb") as handle:
-                raw = handle.read(1024 * 1024)
-        finally:
-            _, status = os.waitpid(pid, 0)
+            done = runner(command, user=uid, group=gid, extra_groups=[], input=json.dumps(payload).encode("utf-8"),
+                          capture_output=True, timeout=30, env=env, cwd="/")
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise StoreError("the sign-in store helper could not run") from exc
         try:
-            reply = json.loads(raw.decode("utf-8"))
+            reply = json.loads((done.stdout or b"").decode("utf-8"))
+            if not isinstance(reply, dict):
+                raise ValueError
         except (ValueError, UnicodeError) as exc:
             raise StoreError("the sign-in store helper failed") from exc
         if not reply.get("ok"):
-            kind = {"limit": DeviceLimitError, "auth": AuthError}.get(reply.get("kind"), StoreError)
+            kind = {"limit": DeviceLimitError, "auth": AuthError, "changed": PassphraseChanged}.get(reply.get("kind"), StoreError)
             raise kind(str(reply.get("message") or "sign-in store problem"))
-        return reply.get("result")
+        return reply
 
     def transaction(self, mutate: Callable[[dict[str, Any]], Any]) -> Any:
         """Run ``mutate(data)`` under an exclusive lock on fresh data, then persist.
 
-        ``mutate`` must return JSON-serialisable data (it may run in a privilege-dropped child process)."""
+        Root never mutates a store in a directory owned by another user in this process."""
         with self._mutex:
             try:
-                owner = self._foreign_owner()
-                if owner is not None:
-                    return self._transaction_as(owner, mutate)
+                if self._foreign_owner() is not None:
+                    raise StoreError("root must change this sign-in store through the helper process, not in-process")
                 return self._transaction_local(mutate)
+            finally:
+                self._cache, self._signature = None, None
+
+    def _mutating(self, args: list[str], payload: dict[str, Any], key: str, local: Callable[[], Any]) -> Any:
+        """Run ``local()`` in-process, or the helper subcommand ``args`` when root faces a foreign-owned directory."""
+        with self._mutex:
+            owner = self._foreign_owner()
+            if owner is None:
+                return local()
+            try:
+                return self._helper_call(owner, args, payload)[key]
             finally:
                 self._cache, self._signature = None, None
 
@@ -404,20 +410,37 @@ class AuthStore:
         stored = self.snapshot()["passphrase_hash"]
         return stored is not None and verify_passphrase(passphrase, stored)
 
-    def set_passphrase(self, passphrase: str, *, keep_device: str | None = None) -> int:
-        """Set/replace the passphrase and revoke every device except ``keep_device``. Returns revoked count."""
+    def current_hash(self) -> str | None:
+        """The stored passphrase hash, read fresh (use as ``expect_hash`` for a compare-and-set)."""
+        return self.snapshot()["passphrase_hash"]
+
+    def set_passphrase(self, passphrase: str, *, keep_device: str | None = None, expect_hash: Any = _ANY) -> int:
+        """Set/replace the passphrase and revoke every device except ``keep_device``. Returns revoked count.
+
+        ``expect_hash``: compare-and-set. The write happens only if the stored hash (None = unset) still equals it
+        when read under the store lock; otherwise ``PassphraseChanged``."""
         checked = check_new_passphrase(passphrase, self.min_passphrase)
         other = self.differs_from() if self.differs_from else None
         if other and verify_passphrase(checked, other):
             raise AuthError(self.differs_message)
-        encoded = hash_passphrase(checked)
+        return self.set_passphrase_hash(hash_passphrase(checked), keep_device=keep_device, expect_hash=expect_hash)
+
+    def set_passphrase_hash(self, encoded: str, *, keep_device: str | None = None, expect_hash: Any = _ANY) -> int:
+        """Store an already computed hash (strictly validated); see ``set_passphrase``."""
+        if not valid_hash(encoded):
+            raise AuthError("That is not a valid passphrase hash.")
 
         def mutate(data: dict[str, Any]) -> int:
+            if expect_hash is not _ANY and data["passphrase_hash"] != expect_hash:
+                raise PassphraseChanged("The passphrase changed while you were doing this. Try again.")
             before = len(data["devices"])
             data["passphrase_hash"] = encoded
             data["devices"] = [d for d in data["devices"] if keep_device and d["id"] == keep_device]
             return before - len(data["devices"])
-        return self.transaction(mutate)
+        payload: dict[str, Any] = {"hash": encoded, "keep_device": keep_device}
+        if expect_hash is not _ANY:
+            payload["expect_hash"] = expect_hash
+        return self._mutating(["passphrase", "set-hash", "chat"], payload, "revoked", lambda: self.transaction(mutate))
 
     def clear_passphrase(self) -> int:
         def mutate(data: dict[str, Any]) -> int:
@@ -426,7 +449,7 @@ class AuthStore:
             data["devices"] = []
             data["pairings"] = []
             return count
-        return self.transaction(mutate)
+        return self._mutating(["passphrase", "clear", "chat"], {}, "revoked", lambda: self.transaction(mutate))
 
     # -- devices -----------------------------------------------------------
     def _add_device(self, data: dict[str, Any], digest: str, label: Any, remember: bool, role: str, now: int) -> dict[str, Any]:
@@ -464,6 +487,9 @@ class AuthStore:
             data["pairings"].append({"id": secrets.token_hex(6), "code_sha256": digest, "label": text,
                                      "created": now, "expires": expires, "role": role})
             return expires
+        if self._foreign_owner() is not None:
+            reply = self._helper_call(self._foreign_owner(), ["pairing", "create", "chat"], {"role": role, "label": text})  # type: ignore[arg-type]
+            return str(reply["code"]), int(reply["expires"])
         return code, self.transaction(mutate)
 
     def redeem_pairing(self, code: str, label: Any) -> tuple[str, dict[str, Any]] | None:
@@ -527,7 +553,7 @@ class AuthStore:
             before = len(data["devices"])
             data["devices"] = [d for d in data["devices"] if d["id"] != device_id]
             return len(data["devices"]) != before
-        return self.transaction(mutate)
+        return self._mutating(["devices", "revoke", "chat"], {"id": device_id}, "found", lambda: self.transaction(mutate))
 
     def revoke_all(self, *, keep: str | None = None) -> int:
         def mutate(data: dict[str, Any]) -> int:
@@ -535,7 +561,7 @@ class AuthStore:
             data["devices"] = [d for d in data["devices"] if keep and d["id"] == keep]
             data["pairings"] = []
             return before - len(data["devices"])
-        return self.transaction(mutate)
+        return self._mutating(["devices", "revoke-all", "chat"], {"keep": keep}, "revoked", lambda: self.transaction(mutate))
 
     def public_device(self, device: dict[str, Any], role: bool | None = None) -> dict[str, Any]:
         keys = ["id", "label", "created", "last_seen", "expires"]

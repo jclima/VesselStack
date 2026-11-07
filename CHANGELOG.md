@@ -39,6 +39,12 @@ Semantic Versioning.
   the directory owner first, and all store files are opened relative to a no-follow directory descriptor,
   refused unless regular with one link, with exclusive temp files.
 
+- Sign-in hardening: root no longer forks the multithreaded Control Panel to change Boat Chat's store; it
+  runs `vesselstack_authctl.py` (JSON on stdin and stdout) as a separate process with the service user's
+  uid/gid. `AuthStore.transaction()` as root on a foreign-owned directory now raises. Setting the
+  Control Panel or Boat Chat passphrase is an atomic compare-and-set: a concurrent change returns 409
+  "passphrase changed, try again" instead of overwriting.
+
 ### Upgrade notes
 
 - Reaching the panel through a name other than localhost or the boat's own names now needs
