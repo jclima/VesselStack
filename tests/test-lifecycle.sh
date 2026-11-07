@@ -27,7 +27,7 @@ HOME_ASSISTANT_URL=http://127.0.0.1:8123
 INFLUXDB_URL=http://127.0.0.1:8086
 BOAT_CHAT_PORT=9876
 GRAFANA_PORT=9877
-HEIMDALL_PORT=9878
+HOMEPAGE_PORT=9878
 MQTT_USERNAME=test-user
 MQTT_PASSWORD=test-password
 CONTROL_PANEL_HOST=127.0.0.1
@@ -58,6 +58,9 @@ install -d "$APP_ROOT/boat-chat/knowledge" "$DATA_ROOT/boat-chat"
 cp "$REPO_ROOT/boat-chat/memory_index.py" "$APP_ROOT/boat-chat/"
 cp "$REPO_ROOT"/boat-chat/knowledge/*.md "$APP_ROOT/boat-chat/knowledge/"
 cp "$REPO_ROOT/scripts/memory-index.sh" "$APP_ROOT/installer/scripts/memory-index.sh"
+cp "$REPO_ROOT/scripts/render-homepage.py" "$APP_ROOT/installer/scripts/render-homepage.py"
+install -d "$APP_ROOT/installer/brand"
+cp "$REPO_ROOT/brand/icon.png" "$APP_ROOT/installer/brand/icon.png"
 printf '0.3.0\n' > "$APP_ROOT/config/installed-version"
 # The real credential helper runs against the fake docker below.
 for helper in configure-hardware.sh bootstrap-influx.sh; do
@@ -95,7 +98,7 @@ if [ "$(basename "$0")" = curl ]; then
     fi
 fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --services "* ]]; then
-    printf '%s\n' homeassistant influxdb grafana prometheus mosquitto heimdall
+    printf '%s\n' homeassistant influxdb grafana prometheus mosquitto homepage
 fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --quiet "* ]]; then
     echo fake-container-id
@@ -103,6 +106,17 @@ fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --script check_config "* ]]; then
     [ -z "${FAKE_HA_CHECK_HOOK:-}" ] || eval "$FAKE_HA_CHECK_HOOK"
     [ -z "${FAKE_HA_CHECK_FAIL:-}" ] || exit 1
+fi
+if [ "${1:-}" = container ] && [ "${2:-}" = inspect ]; then
+    # Only a Heimdall container left by an older release can exist in these tests.
+    if [ -n "${FAKE_HEIMDALL_IMAGE:-}" ]; then
+        case "$*" in
+            *compose.project*) echo "${FAKE_HEIMDALL_PROJECT-vesselstack}" ;;
+            *) echo "$FAKE_HEIMDALL_IMAGE" ;;
+        esac
+        exit 0
+    fi
+    exit 1
 fi
 if [ "${1:-}" = run ]; then
     for argument in "$@"; do
@@ -1031,7 +1045,7 @@ for hidden in 198.51.100 http://0.0.0.0; do
     fi
 done
 grep -q 'Grafana .*ALL interfaces' <<<"$urls_output"
-grep -q 'Heimdall .*ALL interfaces' <<<"$urls_output"
+grep -q 'Home page .*ALL interfaces' <<<"$urls_output"
 grep -q 'Prometheus .*this device only; NO login' <<<"$urls_output"
 grep -Fq 'to change: sudo vesselstackctl lan all' <<<"$urls_output"
 grep -q 'MQTT .*this device only' <<<"$urls_output"
@@ -1375,7 +1389,7 @@ run_lan local >/dev/null 2>&1
 before=$(lan_files_digest)
 if FAKE_DEFAULT_ROUTE_IF=wlan0 run_lan dashboards >/dev/null 2>"$TEST_ROOT/lan.stderr"; then echo 'lan opened the LAN against the firewall' >&2; exit 1; fi
 grep -q 'treats wlan0 as untrusted' "$TEST_ROOT/lan.stderr"
-grep -q 'blocked from Grafana 9877, InfluxDB 8086, Prometheus 9090 and MQTT 1883' "$TEST_ROOT/lan.stderr"
+grep -q 'blocked from the home page 9878, Grafana 9877, InfluxDB 8086, Prometheus 9090 and MQTT 1883' "$TEST_ROOT/lan.stderr"
 grep -q 'This machine reaches your network over wlan0 itself' "$TEST_ROOT/lan.stderr"
 grep -q 'Refusing to change LAN access while the firewall would block it' "$TEST_ROOT/lan.stderr"
 [ "$(lan_files_digest)" = "$before" ]
@@ -1548,6 +1562,67 @@ if grep -Eq 'compose .* up -d .*grafana|compose .* up -d grafana' "$FAKE_BIN/cal
     exit 1
 fi
 
+# Homepage replaced Heimdall: start removes a leftover Heimdall container (before
+# anything is started on its port) and its image, and never deletes its data.
+install -d "$DATA_ROOT/heimdall"
+printf 'heimdall data sentinel\n' > "$DATA_ROOT/heimdall/sentinel"
+: > "$FAKE_BIN/calls.log"
+run_ctl start >"$TEST_ROOT/start-no-heimdall.out"
+if grep -q 'docker rm -f vesselstack-heimdall' "$FAKE_BIN/calls.log"; then
+    echo 'start removed a Heimdall container that does not exist' >&2
+    exit 1
+fi
+: > "$FAKE_BIN/calls.log"
+FAKE_HEIMDALL_IMAGE=sha256:oldheimdall run_ctl start >"$TEST_ROOT/start-heimdall.out"
+grep -q '^docker rm -f vesselstack-heimdall$' "$FAKE_BIN/calls.log"
+grep -q '^docker image rm sha256:oldheimdall$' "$FAKE_BIN/calls.log"
+remove_line=$(grep -n '^docker rm -f vesselstack-heimdall$' "$FAKE_BIN/calls.log" | head -n 1 | cut -d: -f1)
+up_line=$(grep -n 'docker compose.* up -d' "$FAKE_BIN/calls.log" | head -n 1 | cut -d: -f1)
+[ "$remove_line" -lt "$up_line" ] || { echo 'Heimdall was removed after compose up' >&2; exit 1; }
+grep -q 'heimdall is no longer used by VesselStack' "$TEST_ROOT/start-heimdall.out"
+grep -qx 'heimdall data sentinel' "$DATA_ROOT/heimdall/sentinel"
+# A container with that name from another Compose project (or none) is left alone.
+for project in other ''; do
+    : > "$FAKE_BIN/calls.log"
+    FAKE_HEIMDALL_IMAGE=sha256:foreign FAKE_HEIMDALL_PROJECT=$project run_ctl start >"$TEST_ROOT/start-foreign.out" 2>&1
+    if grep -q 'docker rm -f vesselstack-heimdall' "$FAKE_BIN/calls.log"; then
+        echo 'removed a Heimdall-named container outside the VesselStack project' >&2
+        exit 1
+    fi
+    grep -q 'does not belong to the VesselStack Compose project' "$TEST_ROOT/start-foreign.out"
+done
+# The home page is rendered at start and its allowed hosts persisted for compose.
+test -s "$APP_ROOT/config/homepage/services.yaml"
+test -s "$APP_ROOT/config/homepage/settings.yaml"
+test -s "$APP_ROOT/config/homepage-icons/vesselstack.png"
+grep -q '^HOMEPAGE_ALLOWED_HOSTS=.*localhost' "$APP_ROOT/config/vesselstack.env"
+# A user-edited tiles file survives a re-render.
+printf -- '- Mine:\n    - Marina:\n        href: http://192.0.2.50/\n' > "$APP_ROOT/config/homepage-custom/services.yaml"
+run_ctl homepage sync
+grep -q 'Marina' "$APP_ROOT/config/homepage/services.yaml"
+run_ctl homepage sync
+grep -q 'Marina' "$APP_ROOT/config/homepage-custom/services.yaml"
+# "refresh" (run at boot) re-renders and lets Compose recreate the container if the hosts changed.
+: > "$FAKE_BIN/calls.log"
+run_ctl homepage refresh
+grep -q 'docker compose.* up -d homepage' "$FAKE_BIN/calls.log"
+# A retired heimdall entry in the disabled list is dropped and persisted, not rejected.
+cp "$APP_ROOT/config/vesselstack.env" "$TEST_ROOT/env.before-heimdall"
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=heimdall,grafana/' "$APP_ROOT/config/vesselstack.env"
+run_ctl homepage sync 2>"$TEST_ROOT/legacy-disabled.err"
+grep -q "retired 'heimdall'" "$TEST_ROOT/legacy-disabled.err"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana$' "$APP_ROOT/config/vesselstack.env"
+if run_ctl homepage bogus >/dev/null 2>&1; then echo 'homepage accepted an unknown action' >&2; exit 1; fi
+# Removing the component removes only its container; the tiles file stays.
+: > "$FAKE_BIN/calls.log"
+run_ctl component remove homepage >/dev/null
+grep -q 'docker compose.*rm --stop --force homepage' "$FAKE_BIN/calls.log"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana,homepage$' "$APP_ROOT/config/vesselstack.env"
+run_ctl component add homepage >/dev/null
+grep -q 'docker compose.*up -d homepage' "$FAKE_BIN/calls.log"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana$' "$APP_ROOT/config/vesselstack.env"
+grep -q 'Marina' "$APP_ROOT/config/homepage-custom/services.yaml"
+
 # LAN changes re-apply only selected services, and re-adding the component starts
 # it without disturbing the retained data directory.
 printf 'VESSELSTACK_DISABLED_COMPONENTS=grafana\n' >> "$LAN_ROOT/config/vesselstack.env"
@@ -1591,7 +1666,7 @@ if run_ctl start >/dev/null 2>&1; then echo 'unknown component was accepted' >&2
 
 # With all six core services disabled, optional Docker SignalK/AIS remain
 # selectable and no bare Compose up is emitted.
-sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=homeassistant,influxdb,grafana,prometheus,mosquitto,heimdall/' "$APP_ROOT/config/vesselstack.env"
+sed -i 's/^VESSELSTACK_DISABLED_COMPONENTS=.*/VESSELSTACK_DISABLED_COMPONENTS=homeassistant,influxdb,grafana,prometheus,mosquitto,homepage/' "$APP_ROOT/config/vesselstack.env"
 printf 'SIGNALK_MODE=docker\nAIS_ENABLE=true\n' >> "$APP_ROOT/config/vesselstack.env"
 : > "$FAKE_BIN/calls.log"
 run_ctl start >/dev/null

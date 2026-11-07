@@ -112,7 +112,7 @@ is another separately enabled local feature.
 ### Component lifecycle
 
 The Control Panel and `vesselstackctl` manage six core components—Home
-Assistant, InfluxDB, Grafana, Prometheus, Mosquitto, and Heimdall—as a
+Assistant, InfluxDB, Grafana, Prometheus, Mosquitto, and Homepage—as a
 persistent catalog. Add or remove components without deleting retained data;
 membership survives restarts, upgrades, and reinstalls. Review and apply
 changes in the component view at `http://127.0.0.1:8780` through an SSH tunnel,
@@ -626,7 +626,7 @@ The restore keeps the previous trees as `*.pre-restore-STAMP` until you delete t
 | Grafana 13 | Historical dashboards | `http://HOST:43000` |
 | Prometheus | Infrastructure metrics | `http://HOST:9090` |
 | Mosquitto | Authenticated MQTT broker | `HOST:1883` |
-| Heimdall | Local service launcher | `http://HOST` |
+| Homepage | Boat front door: tiles for every enabled service | `http://HOST` |
 | Boat Chat | Telemetry-backed diagnostic assistant | `http://HOST:8765` |
 | Control Panel | Component installation, configuration, and lifecycle | `http://127.0.0.1:8780` |
 | Displays bridge (opt-in, `DISPLAYS_ENABLE=true`) | Publishes configured Signal K instruments to MQTT for instrument displays | systemd service `vesselstack-displays-bridge`; no listener |
@@ -759,9 +759,9 @@ nano vesselstack.env
 | `BOAT_NAME` | Name displayed by Boat Chat |
 | `BOAT_TYPE` | Vessel make/model or general type |
 | `BOAT_MMSI`, `BOAT_CALLSIGN` | Optional identity fields |
-| `*_PORT` | Host ports for Grafana, Heimdall HTTP/HTTPS, InfluxDB, Prometheus, MQTT, and AIS |
+| `*_PORT` | Host ports for Grafana, the Homepage front door (`HOMEPAGE_PORT`, default 80), InfluxDB, Prometheus, MQTT, and AIS |
 | `VESSELSTACK_DATA_BIND_ADDRESS` | IPv4 address InfluxDB, Prometheus and MQTT publish on; default `127.0.0.1` (this device only) |
-| `VESSELSTACK_WEB_BIND_ADDRESS` | IPv4 address Grafana and Heimdall publish on; default `0.0.0.0` (LAN dashboards), `127.0.0.1` to restrict |
+| `VESSELSTACK_WEB_BIND_ADDRESS` | IPv4 address Grafana and Homepage publish on; default `0.0.0.0` (LAN dashboards), `127.0.0.1` to restrict |
 | `HOMEASSISTANT_BIND_ADDRESS` | IPv4 address Home Assistant (host-networked, `8123`) listens on; default `0.0.0.0`. Any other value makes the installer manage one delimited `http:` block in `${VESSELSTACK_DATA}/homeassistant/configuration.yaml` (see "Reaching VesselStack from other devices"). Signal K has no equivalent setting |
 | `BOAT_CHAT_ACCESS_TOKEN` | `GENERATE` (default) creates a random token, preserved on re-install; required for chat, status and data APIs |
 | `INFLUXDB_CONTAINER_NAME` | Advanced override for existing/custom Compose deployments |
@@ -1209,10 +1209,39 @@ Stopping or interrupting actions ask first in an in-page dialog. If the connecti
 header shows Disconnected with **Retry now**. Rollback: restore the previous release from a
 backup as described under [Updating](#updating); stored settings keys are unchanged.
 
-### Heimdall
+### Homepage (the front door)
 
-Open `http://HOST` and add trusted-network links to Home Assistant, Grafana,
-Signal K, Boat Chat, InfluxDB, and Prometheus.
+Open `http://HOST` (port 80) or `http://BOATNAME.local`. [Homepage](https://gethomepage.dev) shows one
+tile per enabled service: Boat Chat, Grafana, Home Assistant, Signal K, AIS, and, when the databases
+are published beyond loopback, InfluxDB and Prometheus. The Control Panel tile links only when
+`panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. A Displays tile
+appears when `DISPLAYS_ENABLE=true`. With `SIGNALK_MODE=existing` and a `SIGNALK_URL` on another
+computer, the Signal K tile links to that server (scheme, host and port only; no status dot). Links use
+`$(hostname).local` and follow the address you opened the page with. The Boat Chat and Control Panel tiles
+are plain links: each opens its own sign-in screen (passphrase or pairing link, see the sign-in sections
+below); the home page itself holds no sign-in and no secrets.
+
+Tiles update automatically: `vesselstackctl homepage sync` runs at every start, on component
+add/remove, `lan` and `panel-access` changes, display enable and install/update. The rendered files in
+`config/homepage/` are overwritten each time and contain no passwords or tokens. Add your own tiles
+and bookmarks in `config/homepage-custom/services.yaml` and `bookmarks.yaml` (created once, never
+overwritten; an invalid file is skipped with a warning). The page accepts only the host names and
+addresses in `HOMEPAGE_ALLOWED_HOSTS` (managed; add more with `HOMEPAGE_ALLOWED_HOSTS_EXTRA`). The
+list is also refreshed at every boot by `vesselstack-homepage-refresh.service`
+(`sudo vesselstackctl homepage refresh`, which recreates the container only if the list changed), so
+IP access keeps working after a new DHCP lease; `BOATNAME.local` always works. IPv4 addresses only:
+IPv6 is not added.
+
+The `config/homepage*` folders are made world-readable (`0755`, files `0644`) so the container's
+service user can read them; they hold no secrets. The container runs with all capabilities dropped
+except `CHOWN`, `SETUID` and `SETGID`.
+
+**Heimdall was removed.** Updating stops and removes an existing `vesselstack-heimdall` container
+(only if it carries this stack's Compose project label) and its image and prints a notice. A leftover
+`heimdall` entry in `VESSELSTACK_DISABLED_COMPONENTS` is dropped (it is not turned into `homepage`),
+`HEIMDALL_PORT` becomes `HOMEPAGE_PORT` when that is unset, and `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT`
+are no longer kept; `/opt/vesselstack-data/heimdall` is left untouched and can be deleted
+by hand. Rollback: restore the previous release from a backup. Homepage uses no data directory.
 
 ## MQTT access control
 
@@ -1229,7 +1258,7 @@ limits for host-networked containers are in [Network access and security](docs/N
 
 ## Network security
 
-InfluxDB, Prometheus and MQTT bind to `127.0.0.1` by default; Grafana and Heimdall are LAN-reachable.
+InfluxDB, Prometheus and MQTT bind to `127.0.0.1` by default; Grafana and Homepage are LAN-reachable.
 Keep Home Assistant, Signal K and Boat Chat off the public internet. The minimum checklist is in
 [Network access and security](docs/NETWORK.md#network-security).
 
@@ -1394,7 +1423,6 @@ Back up at least:
 /opt/vesselstack-data/influxdb/
 /opt/vesselstack-data/grafana/
 /opt/vesselstack-data/mosquitto/
-/opt/vesselstack-data/heimdall/
 ```
 
 Keep an encrypted copy off the boat and test restoration. InfluxDB needs an

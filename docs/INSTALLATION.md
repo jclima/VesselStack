@@ -352,7 +352,7 @@ sudo vesselstackctl verify-backup /path/to/archive.tar.gz
 ## Reaching VesselStack from other devices
 
 The wizard asks "Who should be able to reach the dashboards?": `local` (only this Pi; use an
-SSH tunnel), `dashboards` (recommended: Grafana, Heimdall and Boat Chat on your boat network;
+SSH tunnel), `dashboards` (recommended: Grafana, the Homepage front door and Boat Chat on your boat network;
 InfluxDB, Prometheus and MQTT stay on the Pi) or `all` (also MQTT, InfluxDB and Prometheus,
 which has no login). Unattended: `--set LAN_ACCESS=dashboards`. Change it later with
 `sudo vesselstackctl lan [local|dashboards|all] [--dry-run]` (`all` needs `--yes`). The

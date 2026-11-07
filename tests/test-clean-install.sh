@@ -1219,4 +1219,25 @@ if grep -Eq 'force-recreate mosquitto|compose .* up -d .*mosquitto' "$FAKE_BIN/d
 fi
 test ! -e "$APP_ROOT/config/.mosquitto-conf.sha256"
 
+# Settings from the Heimdall era: a retired "heimdall" entry in the disabled list is dropped (not
+# translated to homepage) instead of aborting, HEIMDALL_PORT becomes HOMEPAGE_PORT and no
+# HEIMDALL_* key is written back.
+LEGACY_CONFIG="$TEST_ROOT/legacy-heimdall.env"
+cp "$CONFIG" "$LEGACY_CONFIG"
+printf '\nVESSELSTACK_DISABLED_COMPONENTS="heimdall, grafana"\nHEIMDALL_PORT="8081"\nHEIMDALL_HTTPS_PORT="8443"\n' >> "$LEGACY_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$LEGACY_CONFIG" >/dev/null 2>"$TEST_ROOT/legacy.stderr"
+grep -q "retired 'heimdall'" "$TEST_ROOT/legacy.stderr"
+grep -q '^VESSELSTACK_DISABLED_COMPONENTS=grafana$' "$APP_ROOT/config/vesselstack.env"
+grep -q '^HOMEPAGE_PORT=8081$' "$APP_ROOT/config/vesselstack.env"
+if grep -qi 'heimdall' "$APP_ROOT/config/vesselstack.env"; then
+    echo "Installed settings still mention Heimdall" >&2
+    exit 1
+fi
+# An explicit HOMEPAGE_PORT wins over a leftover HEIMDALL_PORT.
+printf 'HOMEPAGE_PORT="8090"\n' >> "$LEGACY_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$LEGACY_CONFIG" >/dev/null 2>&1
+grep -q '^HOMEPAGE_PORT=8090$' "$APP_ROOT/config/vesselstack.env"
+
 echo "clean installation checks passed"

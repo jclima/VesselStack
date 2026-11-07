@@ -305,7 +305,7 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   // ---- components: names, statuses, menu, configure -----------------------
   const comps = [
     { id: 'grafana', label: 'Grafana', description: 'Charts', section: 'Services & ports', manageable: true, enabled: true, state: 'running', status: 'running' },
-    { id: 'heimdall', label: 'Heimdall', description: 'Start page', section: 'Services & ports', manageable: true, enabled: true, state: 'exited', status: 'stopped' },
+    { id: 'homepage', label: 'Home page', description: 'Start page', section: 'Services & ports', manageable: true, enabled: true, state: 'exited', status: 'stopped' },
     { id: 'telegram', label: 'Telegram alerts', description: 'Alerts', section: 'Boat Chat', manageable: false, enabled: false, state: 'active', status: 'disabled', still_running: true },
     { id: 'socketcan', label: 'SocketCAN', description: 'CAN', section: 'Signal K & NMEA 2000', manageable: false, enabled: false, state: 'inactive', status: 'disabled' },
     { id: 'ais-catcher', label: 'AIS-catcher', description: 'AIS', section: 'AIS receiver', manageable: false, enabled: true, state: 'unknown', status: 'unknown' },

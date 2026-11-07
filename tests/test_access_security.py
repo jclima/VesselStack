@@ -368,13 +368,13 @@ class ComposeBindTests(unittest.TestCase):
 
     def test_web_services_have_configurable_bind(self):
         services = self.ports()
-        for name in ("grafana", "heimdall"):
+        for name in ("grafana", "homepage"):
             for mapping in services[name]:
                 self.assertTrue(mapping.startswith("${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}:"), mapping)
 
     def test_no_unbound_sensitive_publish(self):
         services = self.ports()
-        for name in ("influxdb", "prometheus", "mosquitto", "grafana", "heimdall"):
+        for name in ("influxdb", "prometheus", "mosquitto", "grafana", "homepage"):
             for mapping in services[name]:
                 self.assertRegex(mapping, r"^\$\{VESSELSTACK_(DATA|WEB)_BIND_ADDRESS:-")
 

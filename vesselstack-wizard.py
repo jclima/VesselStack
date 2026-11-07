@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent
 WIZARD = ROOT / "wizard"
 OUTPUT = ROOT / "vesselstack.env"
 ALLOWED = re.compile(r"^[A-Za-z0-9 _.,:/@+()-]*$")
-CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "heimdall")
+CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "homepage")
 
 DEFAULTS = {
  "SIGNALK_VESSELTWIN_PRELOAD":"true",
@@ -20,9 +20,9 @@ DEFAULTS = {
  "HOME_ASSISTANT_URL":"http://127.0.0.1:8123","HOME_ASSISTANT_TOKEN":"","INFLUXDB_URL":"http://127.0.0.1:8086","INFLUXDB_PORT":"8086","INFLUXDB_CONTAINER_NAME":"vesselstack-influxdb","INFLUXDB_ORG":"vesselstack","INFLUXDB_USERNAME":"boatadmin",
  "INFLUXDB_RAW_BUCKET":"signalk","INFLUXDB_HISTORY_BUCKET":"signalk_1m","INFLUXDB_HOME_ASSISTANT_BUCKET":"homeassistant","INFLUXDB_AIS_BUCKET":"ais","INFLUXDB_RAW_RETENTION":"","INFLUXDB_PASSWORD":"GENERATE","INFLUXDB_TOKEN":"GENERATE","GRAFANA_ADMIN_PASSWORD":"GENERATE",
  "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true","NODE_EXPORTER_ENABLE":"false",
- "GRAFANA_PORT":"43000","HEIMDALL_PORT":"80","HEIMDALL_HTTPS_PORT":"443","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780",
+ "GRAFANA_PORT":"43000","HOMEPAGE_PORT":"80","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780",
  "DISPLAYS_ENABLE":"false","DISPLAYS_BRIDGE_MQTT_USERNAME":"vesselstack-bridge","DISPLAYS_SIGNALK_TOKEN":"","DISPLAYS_HA_TOKEN":"",
- "VESSELSTACK_DISABLED_COMPONENTS":"",
+ "VESSELSTACK_DISABLED_COMPONENTS":"","HOMEPAGE_ALLOWED_HOSTS":"","HOMEPAGE_ALLOWED_HOSTS_EXTRA":"",
  "CONTROL_PANEL_PASSPHRASE_HASH":"","BOAT_CHAT_PASSPHRASE_HASH":"",
 }
 # Sign-in passphrases are hashed here (scrypt, the shared module) and only the hash is ever written; install.sh
@@ -58,7 +58,7 @@ def expand_signin(values):
     return values
 
 def normalize_disabled_components(value):
-    items=[item.strip() for item in value.split(",") if item.strip()]
+    items=[item.strip() for item in value.split(",") if item.strip() and item.strip() != "heimdall"]  # Heimdall was retired
     if len(items) != len(set(items)) or any(item not in CORE_COMPONENTS for item in items):
         raise ValueError("VESSELSTACK_DISABLED_COMPONENTS must contain unique allowed core component IDs")
     return ",".join(items)
@@ -221,6 +221,9 @@ def _ipv4(value):
     try: ipaddress.IPv4Address(value)
     except ValueError: return "Enter an IPv4 address such as 127.0.0.1 (this device only) or 0.0.0.0 (all networks)."
 
+def _host_list(value):
+    if not re.fullmatch(r"[A-Za-z0-9_.:,-]*", value): return "Use host names (or HOST:PORT) separated by commas."
+
 def _any_ip(value):
     try: ipaddress.ip_address(value)
     except ValueError: return "Enter an IP address such as 127.0.0.1."
@@ -307,7 +310,7 @@ def lan_notes(values):
     return notes
 
 def _lan_hint(s):
-    lines=["Grafana, Heimdall, Boat Chat (needs its access token), Home Assistant and SignalK; the control panel has its own access choice below."]
+    lines=["Grafana, Home page, Boat Chat (needs its access token), Home Assistant and SignalK; the control panel has its own access choice below."]
     note=firewall_note(s.values)
     if note: lines.append("WARNING: "+note)
     return "\n    ".join(lines)
@@ -380,16 +383,17 @@ SECTIONS=[
  {"title":"Data retention","intro":"How long InfluxDB keeps the full-detail (raw) readings. One-minute averages are kept much longer.","fields":[
   F("INFLUXDB_RAW_RETENTION","Keep raw data for","Enter a duration such as 30d, 8w or 720h, 0 to keep it forever, or press Enter for the installer default: 30d on a new install and no change to an existing database. Raw data is large: 30 days suits a small SSD.",optional=True)]},
  {"title":"Who can reach what","intro":"Which devices on your network can open the dashboards. The default shares the dashboards and keeps the databases private to this Pi. You can change this later with: sudo vesselstackctl lan","fields":[
-  F("LAN_ACCESS","Who should be able to reach the dashboards?","local: only this Pi (reach everything through an SSH tunnel). dashboards (recommended): Grafana, Heimdall, Boat Chat, Home Assistant and SignalK on your boat network, while InfluxDB, Prometheus and MQTT stay on this Pi. all: also InfluxDB, Prometheus (it has no login) and MQTT on the network; turn the firewall on if you choose this. The control panel has a separate access choice.","choice",
+  F("LAN_ACCESS","Who should be able to reach the dashboards?","local: only this Pi (reach everything through an SSH tunnel). dashboards (recommended): Grafana, Home page, Boat Chat, Home Assistant and SignalK on your boat network, while InfluxDB, Prometheus and MQTT stay on this Pi. all: also InfluxDB, Prometheus (it has no login) and MQTT on the network; turn the firewall on if you choose this. The control panel has a separate access choice.","choice",
     choices=[("local","only this Pi (SSH tunnel for everything)"),("dashboards","dashboards on the boat network (recommended)"),("all","dashboards plus MQTT, InfluxDB, Prometheus on the network")],hint=_lan_hint),
-  F("VESSELSTACK_WEB_BIND_ADDRESS","Dashboards (Grafana, Heimdall) listen on","0.0.0.0 shares them with every device on the boat network (default). 127.0.0.1 keeps them on this Pi only. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
+  F("VESSELSTACK_WEB_BIND_ADDRESS","Dashboards (Grafana, Home page) listen on","0.0.0.0 shares them with every device on the boat network (default). 127.0.0.1 keeps them on this Pi only. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
   F("VESSELSTACK_DATA_BIND_ADDRESS","Databases (InfluxDB, Prometheus, MQTT) listen on","127.0.0.1 keeps them private to this Pi (default and recommended). Change it only to a trusted LAN or VPN address. (Set by the question above.)",advanced=True,required=True,check=_ipv4),
   F("HOMEASSISTANT_BIND_ADDRESS","Home Assistant listens on","0.0.0.0 shares it with every device on the boat network (default). 127.0.0.1 keeps it on this Pi only; the installer then manages a delimited http block in Home Assistant's configuration.yaml (see README). (Set by the question above. SignalK has no such setting.)",advanced=True,required=True,check=_ipv4),
   F("CONTROL_PANEL_HOST","Control panel listens on","127.0.0.1 keeps administration on this Pi (use an SSH tunnel). 0.0.0.0 shares the HTTP panel on every interface and requires its access token; keep the firewall rules you have chosen. A specific IP is also accepted for an existing trusted interface.","choice",choices=[("127.0.0.1","this Pi only (SSH tunnel)"),("0.0.0.0","trusted network (token required)")],required=True,check=_any_ip),
   F("CONTROL_PANEL_PORT","Control panel port","TCP port of the control panel.",advanced=True,required=True,check=PORT),
   F("GRAFANA_PORT","Grafana port","TCP port of Grafana.",advanced=True,required=True,check=PORT),
-  F("HEIMDALL_PORT","Heimdall web port","TCP port of the Heimdall start page (HTTP).",advanced=True,required=True,check=PORT),
-  F("HEIMDALL_HTTPS_PORT","Heimdall HTTPS port","TCP port of the Heimdall start page (HTTPS).",advanced=True,required=True,check=PORT),
+  F("HOMEPAGE_PORT","Home page port","TCP port of the home page (Homepage, HTTP).",advanced=True,required=True,check=PORT),
+  F("HOMEPAGE_ALLOWED_HOSTS_EXTRA","Extra home page host names","Optional comma-separated host names (HOST or HOST:PORT) the home page should also answer to, for example a reverse proxy name. This Pi's names and addresses are added automatically.",advanced=True,check=_host_list),
+  F("HOMEPAGE_ALLOWED_HOSTS","Home page allowed hosts","Generated at every start; not edited by hand.",advanced=True,when=lambda s:False),
   F("PROMETHEUS_PORT","Prometheus port","TCP port of Prometheus.",advanced=True,required=True,check=PORT),
   F("PROMETHEUS_RETENTION","Prometheus retention","How long Prometheus keeps metrics, for example 30d, 8w or 720h.",advanced=True,required=True),
   F("MQTT_PORT","MQTT port","TCP port of the MQTT broker.",advanced=True,required=True,check=PORT),
