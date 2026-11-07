@@ -37,16 +37,17 @@ Commands:
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
-  display list|add|remove|rotate|wifi|status|render|export|build|flash|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports|validate|sync-mqtt [ARGUMENTS]
+  display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports|validate|sync-mqtt [ARGUMENTS]
                                Manage instrument displays, generate their ESPHome
                                projects and optionally build/flash firmware on this
                                host (display build ID; display flash ID --serial
                                DEVICE | --ota HOST [--previous]). The Control Panel
-                               Displays tab reads list --json, catalog [--live]
-                               --json, show ID --json, themes --json and
-                               serial-ports --json (and will use set-pages ID
-                               --if-revision SHA --stdin, history --json and
-                               restore-config STAMP); see "vesselstackctl display --help"
+                               Displays tab runs list --json, catalog [--live]
+                               --json, show ID --json, themes --json,
+                               serial-ports --json, set-pages ID --if-revision
+                               SHA --stdin, history --json, restore-config STAMP
+                               and deploy (display deploy ID --ota HOST |
+                               --serial DEVICE); see "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack

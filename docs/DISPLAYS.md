@@ -189,7 +189,7 @@ see the [Control Panel guide](CONTROL_PANEL.md#displays). Editing is determinist
 reflash. The panel runs `deploy` and rollback as an operation that holds the lifecycle slot, so backups,
 updates and settings changes wait until it ends.
 It runs `display list --json`, `show ID --json`, `themes --json`, `catalog [--live] --json` and
-`serial-ports --json`. Editing from the tab is not available yet; use the commands below.
+`serial-ports --json`. Editing, saving, applying and restoring from the tab run `set-pages`, `deploy`, `restore-config` and `flash --previous`; only `display add` and `display wifi` stay on the command line. The commands below are the same ones you can run yourself.
 
 `vesselstackctl display COMMAND ...` (root, uses the installed configuration)
 and `python3 displays/displayctl.py COMMAND ...` (with `VESSELSTACK_ROOT` set;

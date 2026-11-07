@@ -1991,7 +1991,7 @@ async function openApplyDialog(entry, kind = "deploy") {
   const error = h("p", { id: "apply-error", class: "small warn-text", role: "alert" });
   const confirmBox = h("input", { id: "apply-confirm-target", type: "checkbox", "data-apply-confirm": "1" });
   const confirmText = h("span", { id: "apply-confirm-text" });
-  const confirmRow = h("label", { class: "choice", id: "apply-confirm-row" }, confirmBox, confirmText);
+  const confirmRow = h("label", { class: "apply-ack", id: "apply-confirm-row" }, confirmBox, confirmText);
   const minutes = r.toolchain_cache_present ? "about 3 to 6 minutes" : "10 to 15 minutes the first time (the build tools are downloaded once)";
   const notes = [
     rollback ? "This sends the firmware that ran before the last update. It is offered only when the settings match the ones it was built from (restore that older saved copy from History first)."
