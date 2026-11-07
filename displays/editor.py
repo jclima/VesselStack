@@ -466,6 +466,18 @@ def _bridge_view(config: dict) -> dict:
     return view
 
 
+def acl_inputs(config) -> list:
+    """Everything in displays.json that the broker ACL and password files derive from.
+
+    ``mqtt_auth.sync`` reads the configuration only through ``load_display_ids`` (mqtt_auth.py:133-146),
+    which returns the sorted display ids; roles, usernames and topics come from the environment and
+    constants. ``None`` (an unreadable file) never equals a list, so it counts as a difference.
+    """
+    if not isinstance(config, dict) or not isinstance(config.get("displays"), dict):
+        return None
+    return sorted(config["displays"])
+
+
 def _source_hashes(config: dict, registry: dict) -> dict:
     out = {}
     for did in config["displays"]:
@@ -666,7 +678,18 @@ def restore_config(ctx: lifecycle.Context, stamp: str, if_revision: str | None =
         if text == backup_text:
             return {"ok": True, "changed": False, "revision": current, "previous_revision": current,
                     "backup": None, "bridge_restart": "not_needed", "rebuild_needed": [],
-                    "new_alarm_sources": []}
+                    "new_alarm_sources": [], "mqtt_sync": "not_needed"}
+        if isinstance(config, dict) and not schema.validate_config(config, registry):
+            now_ids, then_ids = set(config["displays"]), set(restored["displays"])
+            if now_ids != then_ids:
+                parts = []
+                if then_ids - now_ids:
+                    parts.append("the backup adds display(s) " + ", ".join(sorted(then_ids - now_ids)))
+                if now_ids - then_ids:
+                    parts.append("the backup removes display(s) " + ", ".join(sorted(now_ids - then_ids)))
+                raise EditError([f"backup {stamp} has a different set of displays ({'; '.join(parts)}). "
+                                 "Restore never changes MQTT accounts or the ACL: use 'vesselstackctl display add' "
+                                 "or 'display remove' to match, then restore again"], EXIT_INVALID)
         before_sources = _source_hashes(config, registry) if config and not schema.validate_config(config, registry) else {}
         stamp_made = write_backup(cfg_dir, text)
         cfg_dir.write_text(lifecycle.DISPLAYS_NAME, backup_text, lifecycle.DISPLAYS_MODE)
@@ -674,9 +697,17 @@ def restore_config(ctx: lifecycle.Context, stamp: str, if_revision: str | None =
         bridge_changed = not isinstance(config, dict) or _bridge_view(config) != _bridge_view(restored)
         new_sources = sorted(alarm_sources(restored) - (alarm_sources(config) if isinstance(config, dict) else set()))
         rebuild = [did for did in restored["displays"] if after_sources[did] != before_sources.get(did)]
+        mqtt_sync = "not_needed"
+        if acl_inputs(config) != acl_inputs(restored):   # same display set is enforced above, so only a damaged file lands here
+            try:
+                lifecycle._check_sync_env(ctx)
+                lifecycle._sync(ctx)
+                mqtt_sync = "synced"
+            except lifecycle.LifecycleError as exc:
+                mqtt_sync = f"failed: {exc}"
     return {"ok": True, "changed": True, "revision": revision_of(backup_text), "previous_revision": current,
             "backup": stamp_made, "bridge_restart": _restart_bridge(ctx, bridge_changed),
-            "rebuild_needed": rebuild, "new_alarm_sources": new_sources}
+            "rebuild_needed": rebuild, "new_alarm_sources": new_sources, "mqtt_sync": mqtt_sync}
 
 
 # --- serial ports ----------------------------------------------------------------------------------

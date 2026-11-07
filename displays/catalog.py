@@ -13,11 +13,14 @@ anywhere and nothing is cached on disk. Suggested thresholds are never applied u
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
+import http.client
 import json
 import math
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -377,11 +380,61 @@ def live_error(message: str) -> dict:
     return {"ok": False, "error": message, "leaves": [], "notifications": [], "truncated": False}
 
 
+def _socket_of(response):
+    """The socket under an ``http.client.HTTPResponse`` (``fp`` is a BufferedReader over a SocketIO), or None."""
+    return getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+
+
+def _download(request, opener, deadline: float):
+    """GET ``request`` and return ``(body, error)``; every wait is bounded by ``deadline`` (a monotonic time).
+
+    Connect uses ``min(LIVE_TIMEOUT_S, remaining)``; before each body read the socket timeout is set to the
+    remaining budget and ``read1`` (at most one recv) is used, so a server that drips bytes cannot stretch the
+    total. A header-phase drip is bounded by the caller's thread join.
+    """
+    try:
+        with opener.open(request, timeout=max(0.05, min(LIVE_TIMEOUT_S, deadline - time.monotonic()))) as response:
+            length = response.headers.get("Content-Length")
+            if length and length.isdigit() and int(length) > LIVE_MAX_BYTES:
+                return None, "the Signal K response is larger than 4 MiB; refusing it"
+            sock = _socket_of(response)
+            chunks, size = [], 0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, "the Signal K server answered too slowly"
+                if sock is not None:
+                    with contextlib.suppress(OSError):   # already closed after the last byte: read1 then returns b""
+                        sock.settimeout(remaining)
+                chunk = response.read1(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > LIVE_MAX_BYTES:
+                    return None, "the Signal K response is larger than 4 MiB; refusing it"
+                chunks.append(chunk)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if 300 <= exc.code < 400:
+            return None, "the Signal K server redirected the request; redirects are refused"
+        if exc.code in (401, 403):
+            return None, f"the Signal K server refused access (HTTP {exc.code}); check DISPLAYS_SIGNALK_TOKEN"
+        return None, f"the Signal K server answered HTTP {exc.code}"
+    except TimeoutError:
+        return None, "the Signal K server answered too slowly"
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            return None, "the Signal K server answered too slowly"
+        return None, f"cannot reach the Signal K server ({type(exc).__name__})"
+    return b"".join(chunks), None
+
+
 def fetch_live(signalk_url: str, token: str = "", now: datetime.datetime | None = None) -> dict:
     """GET the configured server's ``vessels/self`` once and keep only the safe numeric leaves.
 
     Never raises for an unreachable server: the result is ``{"ok": False, "error": ...}``. Redirects are
-    refused, the bearer token is sent only when set, the body is capped at 4 MiB and nothing is stored.
+    refused, the bearer token is sent only when set, the body is capped at 4 MiB, nothing is stored and the
+    whole request (connect, headers, body) is bounded by ``LIVE_TOTAL_S``.
     """
     try:
         url = _rest_url(signalk_url)
@@ -393,34 +446,17 @@ def fetch_live(signalk_url: str, token: str = "", now: datetime.datetime | None 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     request = urllib.request.Request(url, headers=headers, method="GET")
     deadline = time.monotonic() + LIVE_TOTAL_S
+    box: list = []
+    worker = threading.Thread(target=lambda: box.append(_download(request, opener, deadline)), daemon=True)
+    worker.start()
+    worker.join(LIVE_TOTAL_S)
+    if not box:   # still connecting or reading headers: abandon the daemon thread (its socket times out on its own)
+        return live_error("the Signal K server answered too slowly")
+    body, error = box[0]
+    if error:
+        return live_error(error)
     try:
-        with opener.open(request, timeout=LIVE_TIMEOUT_S) as response:
-            length = response.headers.get("Content-Length")
-            if length and length.isdigit() and int(length) > LIVE_MAX_BYTES:
-                return live_error("the Signal K response is larger than 4 MiB; refusing it")
-            chunks, size = [], 0
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > LIVE_MAX_BYTES:
-                    return live_error("the Signal K response is larger than 4 MiB; refusing it")
-                if time.monotonic() > deadline:
-                    return live_error("the Signal K server answered too slowly")
-                chunks.append(chunk)
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        if 300 <= exc.code < 400:
-            return live_error("the Signal K server redirected the request; redirects are refused")
-        if exc.code in (401, 403):
-            return live_error(f"the Signal K server refused access (HTTP {exc.code}); "
-                              "check DISPLAYS_SIGNALK_TOKEN")
-        return live_error(f"the Signal K server answered HTTP {exc.code}")
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        return live_error(f"cannot reach the Signal K server ({type(exc).__name__})")
-    try:
-        tree = json.loads(b"".join(chunks))
+        tree = json.loads(body)
     except ValueError:
         return live_error("the Signal K server did not return JSON")
     if not isinstance(tree, dict):

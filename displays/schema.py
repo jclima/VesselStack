@@ -894,10 +894,9 @@ CONTRAST_SEV = 4.5
 CONTRAST_SEV_UNKNOWN = 3.0          # the stale/unknown pair is deliberately muted
 CONTRAST_LABEL_ON_SEV = 3.0         # the theme label colour is drawn on the severity tile too
 # `classic` keeps its severity tiles (changing them would change every existing display's firmware) and
-# fails the label-on-severity floor: label/ok 2.13, label/warn 1.25, label/alarm 2.25. `ocean` reuses
-# the classic severity tiles (2.18, 1.22, 2.29; unknown 2.98 with its own label). Both are exempt until
-# their tiles are revisited; every other theme must pass.
-LABEL_ON_SEV_EXEMPT = frozenset({"classic", "ocean"})
+# fails the label-on-severity floor: label/ok 2.13, label/warn 1.25, label/alarm 2.25. It is the only
+# exemption; every other theme must pass.
+LABEL_ON_SEV_EXEMPT = frozenset({"classic"})
 
 
 def theme_rgb(text: str) -> int:

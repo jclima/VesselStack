@@ -1370,6 +1370,88 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(result["bridge_restart"], "restarted")
         self.assertEqual(len(self.restarts()), 1)
 
+    def _two_display_texts(self):
+        one = self.config.read_text()
+        data = json.loads(one)
+        data["displays"]["deck"] = json.loads(json.dumps(data["displays"]["helm"]))
+        return one, json.dumps(data, indent=2) + "\n"
+
+    def test_restore_refuses_a_backup_with_an_extra_display(self):
+        one, two = self._two_display_texts()
+        self.backups.mkdir(exist_ok=True)
+        (self.backups / "displays-20260101T000000Z.json").write_text(two)
+        before, stamps = self.config.read_text(), self.stamps()
+        self.runner.calls.clear()
+        with mock.patch.object(lifecycle, "_sync") as sync:
+            with self.assertRaises(editor.EditError) as caught:
+                editor.restore_config(self.ctx(), "20260101T000000Z")
+            code, out, _ = self.run_cli("restore-config", "20260101T000000Z", "--allow-non-root")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("adds display(s) deck", caught.exception.errors[0])
+        self.assertIn("display add", caught.exception.errors[0])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out)["ok"], False)
+        self.assertEqual(self.config.read_text(), before)
+        self.assertEqual(self.stamps(), stamps)
+        sync.assert_not_called()
+        self.assertEqual(self.restarts(), [])
+
+    def test_restore_refuses_a_backup_with_a_missing_display(self):
+        one, two = self._two_display_texts()
+        self.config.write_text(two)
+        self.backups.mkdir(exist_ok=True)
+        (self.backups / "displays-20260101T000000Z.json").write_text(one)
+        stamps = self.stamps()
+        with self.assertRaises(editor.EditError) as caught:
+            editor.restore_config(self.ctx(), "20260101T000000Z")
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("removes display(s) deck", caught.exception.errors[0])
+        self.assertIn("display remove", caught.exception.errors[0])
+        self.assertEqual(self.config.read_text(), two)
+        self.assertEqual(self.stamps(), stamps)
+
+    def test_restore_of_the_same_display_set_needs_no_mqtt_sync(self):
+        first = self.set_pages({"pages": self.pages("One")})
+        self.set_pages({"pages": self.pages("Two", ("awa",))})
+        with mock.patch.object(lifecycle, "_sync") as sync:
+            result = editor.restore_config(self.ctx(), first["backup"])
+        self.assertEqual(result["mqtt_sync"], "not_needed")
+        sync.assert_not_called()
+
+    def test_restore_syncs_mqtt_when_an_acl_input_differs(self):
+        first = self.set_pages({"pages": self.pages("One")})
+        self.set_pages({"pages": self.pages("Two", ("awa",))})
+        with mock.patch.object(editor, "acl_inputs", side_effect=[["helm"], ["helm", "x"]]), \
+                mock.patch.object(lifecycle, "_sync") as sync:
+            result = editor.restore_config(self.ctx(), first["backup"])
+        sync.assert_called_once()
+        self.assertEqual(result["mqtt_sync"], "synced")
+        newest = result["backup"]   # the "Two" file the first restore replaced
+        with mock.patch.object(editor, "acl_inputs", side_effect=[None, ["helm"]]), \
+                mock.patch.object(lifecycle, "_sync", side_effect=lifecycle.LifecycleError("boom")):
+            result = editor.restore_config(self.ctx(), newest)
+        self.assertEqual(result["mqtt_sync"], "failed: boom")
+
+    def test_the_acl_depends_only_on_the_display_ids_and_set_pages_cannot_change_them(self):
+        config = self.cfg()
+        self.assertEqual(editor.acl_inputs(config), ["helm"])
+        other = json.loads(json.dumps(config))
+        other["displays"]["helm"]["pages"] = self.pages("Else")
+        other["displays"]["helm"]["name"] = "Renamed"
+        other["instruments"]["x"] = {"path": "a.b", "label": "X", "convert": "none", "unit": "m"}
+        other["ha"] = {"anything": 1}
+        self.assertEqual(editor.acl_inputs(other), ["helm"])
+        new = {"keel": {"path": "environment.depth.belowKeel", "label": "Keel", "convert": "none", "unit": "m",
+                        "precision": 1, "stale_after_s": 10}}
+        with mock.patch.object(lifecycle, "_sync") as sync:
+            self.set_pages({"pages": self.pages("Two", ("keel",)), "new_instruments": new, "theme": "ocean"})
+            with self.assertRaises(editor.EditError):
+                self.set_pages({"pages": self.pages("Two"), "displays": {"deck": {}}})
+            with self.assertRaises(lifecycle.LifecycleError):
+                self.set_pages({"pages": self.pages("Two")}, display="deck")
+        self.assertEqual(editor.acl_inputs(self.cfg()), ["helm"])
+        sync.assert_not_called()
+
     # --- serial ports ---
 
     def test_serial_ports_lists_only_devices_flash_would_accept(self):

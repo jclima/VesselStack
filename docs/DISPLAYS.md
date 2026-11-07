@@ -272,7 +272,7 @@ ratio `%`, `rpm`, charge `Ah`, distance `nmi`, engine hours `h`; volts, amperes 
 are. Only conversions that exist in `displays/conversions.py` are used.
 
 **Live data.** `catalog --live` makes one `GET {SIGNALK_URL}/signalk/v1/api/vessels/self` (Bearer token only when
-`DISPLAYS_SIGNALK_TOKEN` is set, redirects refused, 5 s timeout, 4 MiB cap, no proxy) and keeps only
+`DISPLAYS_SIGNALK_TOKEN` is set, redirects refused, 4 MiB cap, no proxy; the whole request - connect, headers and body - is bounded by a 10 s total, so a server that answers one byte at a time or never answers ends as "the Signal K server answered too slowly" after 10 s) and keeps only
 `{path, si_units, age_s, value}` of numeric leaves, plus the names (never the text) of active
 notifications. Positions (`*.position*`), destinations, `navigation.anchor.position`, and anything named
 `mmsi`, `uuid`, `name` or `callsign` are never kept, and the raw document is neither stored nor cached.
@@ -328,7 +328,12 @@ are kept. The backups hold the same content as `displays.json` and no secrets, a
 with the rest of `config/`, and are never committed (`displays-backups` is in `.gitignore` and `scripts/check-public-tree.py`).
 `history` lists them (stamp, size, revision); `restore-config STAMP` accepts only a strictly formed stamp of an existing backup,
 validates it against the current version (a backup that is no longer valid is refused with status 2), backs the current file up
-and writes the backup byte for byte. **Rollback** of any edit: `sudo vesselstackctl display history`, then
+and writes the backup byte for byte. `restore-config` **refuses (status 2) a backup whose set of displays differs from the current
+`displays.json`**, naming the added or removed ids, because it never touches MQTT accounts, the ACL, secrets or build trees: a removed
+display would keep its broker credentials and a resurrected one would have no account. Run `sudo vesselstackctl display add ID ...`
+or `display remove ID` to make the sets match, then restore again. The ACL and password files derive from the display ids only
+(`mqtt_auth.load_display_ids`); `set-pages` cannot change them (it edits one existing display and the shared definitions), and the
+result of `restore-config` carries `"mqtt_sync": "not_needed"` (or `synced` / `failed: ...` if the file was unreadable and the sync ran). **Rollback** of any edit: `sudo vesselstackctl display history`, then
 `sudo vesselstackctl display restore-config STAMP`; rebuild and reflash the displays named in `rebuild_needed` if the firmware
 was already rebuilt.
 
@@ -1404,7 +1409,7 @@ of `displays/`. It holds four themes. Choose one per display with `ui.theme`
 | `classic` | The original: slate `#101820` tiles on a black page, pale grey labels. The default. | 17.9 / 7.2 |
 | `high-contrast` | For direct sunlight: black page and tiles, pure white values, light `#D0D8E0` labels, a 2 px light tile border, stronger severity colours. | 21.0 / 14.6 |
 | `daylight` | Light `#E4E8EC` page with white tiles and dark text; severity tiles use pastel green, amber and red with dark text. A 1 px grey tile border separates the tiles. | 17.9 / 9.8 |
-| `ocean` | Near-black navy page with navy `#12305A` tiles, blue-grey `#8FA8C4` labels and white values. | 13.2 / 5.4 |
+| `ocean` | Near-black navy page with navy `#12305A` tiles, blue-grey `#8FA8C4` labels and white values. | 13.2 / 5.4 (severity tiles are darker than in `classic`, with white text) |
 
 Night mode is the same on every theme in this version: the red night palette of `classic`, so night
 vision survives whatever the day theme. A themed display repaints to it when night starts, including
@@ -1441,9 +1446,10 @@ grey); night colours are red to amber (hue 0-50 degrees, red the strongest chann
 day `ok`, `warn` and `alarm` are green, amber and red; and, for the day palette, value text on the
 tile is at least 4.5:1, label text at least 3:1 and each severity pair at least 4.5:1 (3:1 for the
 muted `unknown` pair; WCAG contrast ratio). The theme's label colour is also drawn on severity tiles,
-so every theme except `classic` and `ocean` needs the day label to reach 3:1 on each day severity
-tile background (`classic` is 2.13 / 1.25 / 2.25 on ok / warn / alarm and `ocean` 2.18 / 1.22 / 2.29,
-because it reuses the classic tiles; both are exempt and unchanged). The dim night palette is not held to the contrast floors.
+so every theme except `classic` needs the day label to reach 3:1 on each day severity
+tile background (`classic` is 2.13 / 1.25 / 2.25 on ok / warn / alarm and is the only exemption, unchanged; `ocean` uses
+deep tiles with white text: ok `#145A27` 3.40 (white 8.33), warn `#6E4900` 3.27 (8.03), alarm `#9E1B1B` 3.26 (8.00),
+unknown `#3A5272` 3.26 (text `#E6EEF7` 6.82), label contrast first, text contrast in brackets). The dim night palette is not held to the contrast floors.
 Every built-in theme passes these rules; a custom `themes.json` is not supported (the file is part of
 the installed code and is replaced on update).
 
@@ -1452,7 +1458,7 @@ firmware for every theme, not by looking at a device; real-panel legibility, in 
 light themes in sunlight and the pastel severity tiles, is not verified. The label colour is not
 changed by severity, so on severity tiles it keeps the theme's label colour: readable on the
 `daylight` and `high-contrast` tiles, but weak on the saturated green, amber and red tiles of
-`classic` and `ocean` (the amber one is about 1.2:1; the large value text stays black or white and
+`classic` (the amber one is about 1.2:1; the large value text stays black or white and
 readable). The `high-contrast` warn tile was a bright amber that made its label unreadable; it is now
 dark amber `#8A5A00` with white text.
 

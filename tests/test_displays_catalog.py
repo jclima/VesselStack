@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import copy
 import json
+import socket
 import sys
+import threading
+import time
 import unittest
+from unittest import mock
 import urllib.request
 from pathlib import Path
 
@@ -345,6 +349,84 @@ class FetchLiveTests(ServerCase):
         _server, url = self.serve(tree={"x": 1})
         self.assertTrue(catalog.fetch_live(url)["ok"])
         self.assertEqual(catalog.extract_leaves([1, 2])["leaves"], [])
+
+    def _raw_server(self, handler):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        stop = threading.Event()
+        conns = []
+
+        def run():
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    continue
+                conns.append(conn)
+                threading.Thread(target=handler, args=(conn, stop), daemon=True).start()
+
+        threading.Thread(target=run, daemon=True).start()
+
+        def close():
+            stop.set()
+            listener.close()
+            for conn in conns:
+                conn.close()
+        self.addCleanup(close)
+        return f"http://127.0.0.1:{listener.getsockname()[1]}"
+
+    def _within_budget(self, url, budget=1.5):
+        started = time.monotonic()
+        with mock.patch.object(catalog, "LIVE_TOTAL_S", budget):
+            result = catalog.fetch_live(url)
+        elapsed = time.monotonic() - started
+        self.assertFalse(result["ok"])
+        self.assertIn("answered too slowly", result["error"])
+        self.assertLess(elapsed, budget + 0.8)
+
+    def test_a_body_that_drips_one_byte_at_a_time_hits_the_total_deadline(self):
+        def drip(conn, stop):
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{")
+                while not stop.is_set():
+                    time.sleep(0.3)
+                    conn.sendall(b" ")
+            except OSError:
+                pass
+        self._within_budget(self._raw_server(drip))
+
+    def test_a_chunked_body_that_drips_hits_the_total_deadline(self):
+        def drip(conn, stop):
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                while not stop.is_set():
+                    time.sleep(0.3)
+                    conn.sendall(b"1\r\n \r\n")
+            except OSError:
+                pass
+        self._within_budget(self._raw_server(drip))
+
+    def test_a_server_that_never_sends_headers_hits_the_total_deadline(self):
+        def silent(conn, stop):
+            conn.recv(4096)
+            stop.wait(10)
+        self._within_budget(self._raw_server(silent))
+
+    def test_headers_that_drip_hit_the_total_deadline(self):
+        def drip(conn, stop):
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 200 OK\r\n")
+                while not stop.is_set():
+                    time.sleep(0.3)
+                    conn.sendall(b"X-A: b\r\n")
+            except OSError:
+                pass
+        self._within_budget(self._raw_server(drip))
 
     def test_no_proxy_and_no_redirect_handler_in_use(self):
         # The opener must not honour proxy variables: the token goes only to SIGNALK_URL.

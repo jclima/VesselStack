@@ -234,10 +234,10 @@
       },
       "sev": {
         "day": {
-          "unknown": ["#3E5878", "#E6EEF7"],
-          "ok": ["#1E7B34", "#FFFFFF"],
-          "warn": ["#F2A900", "#000000"],
-          "alarm": ["#C62828", "#FFFFFF"]
+          "unknown": ["#3A5272", "#E6EEF7"],
+          "ok": ["#145A27", "#FFFFFF"],
+          "warn": ["#6E4900", "#FFFFFF"],
+          "alarm": ["#9E1B1B", "#FFFFFF"]
         },
         "night": {
           "unknown": ["#000000", "#5A1200"],
