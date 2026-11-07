@@ -1442,6 +1442,10 @@ class SignInApiTests(DisplaysApiBase):
         chat_env = self.root / "boat-chat.env"
         chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\n')
         with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+            self.assertEqual(self.make_pairing("chat", admin=True)[0], 400, "admin pairing needs BOAT_CHAT_SETTINGS_TOKEN")
+        self.assertFalse((data / "boat-chat" / "auth.json").exists())
+        chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\nBOAT_CHAT_SETTINGS_TOKEN="admin-code"\n')
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
             status, link, _ = self.make_pairing("chat", admin=True)
         self.assertEqual(status, 200, link)
         self.assertTrue(link["url"].startswith("http://198.51.100.9:8765/#pair="))

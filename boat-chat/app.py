@@ -608,6 +608,11 @@ def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
             else:
                 current[key] = text
         _write_env_config_unlocked(current)
+    if vsauth is not None and "BOAT_CHAT_SETTINGS_TOKEN" in updates:
+        try:  # admin devices paired under the old admin code lose their rights (the binding check already refuses them)
+            chat_auth_store().prune_admin_devices(vsauth.admin_binding(current.get("BOAT_CHAT_SETTINGS_TOKEN") or os.environ.get("BOAT_CHAT_SETTINGS_TOKEN", "")))
+        except (OSError, vsauth.StoreError):
+            pass
     return public_settings()
 
 
@@ -5360,7 +5365,12 @@ class BoatChatHandler(BaseHTTPRequestHandler):
     def admin_device(self) -> bool:
         """A signed-in device paired with admin rights (role "admin") stands in for the admin code."""
         device = self.device_context()
-        return bool(device and device.get("role") == "admin")
+        if not device or device.get("role") != "admin":
+            return False
+        # Bound to the admin code it was paired under: rotating or removing BOAT_CHAT_SETTINGS_TOKEN ends the privilege,
+        # and with no token configured only loopback may write settings (a device never overrides that).
+        token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
+        return bool(token) and vsauth is not None and hmac.compare_digest(str(device.get("binding") or ""), vsauth.admin_binding(token))
 
     def admin_code_supplied(self) -> bool:
         token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()

@@ -7,6 +7,7 @@ Semantic Versioning.
 
 ### Highlights
 
+- Security: setting or changing a sign-in passphrase now also cancels waiting pairing links, and Boat Chat admin devices are bound to the admin code they were paired under (they lose admin rights when `BOAT_CHAT_SETTINGS_TOKEN` is changed or removed; `--admin` pairing needs a configured admin code).
 - Control Panel sign-in is easier: choose a passphrase (`sudo vesselstackctl passphrase set panel`, or
   Settings, Sign-in) and unlock with it, optionally with **Remember this device (30 days)**. Settings lists
   signed-in devices with Revoke and Revoke all; `vesselstackctl devices list|revoke|revoke-all` and

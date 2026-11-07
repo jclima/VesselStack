@@ -1560,7 +1560,10 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             chat = parse_env(CHAT_ENV)
             bind = chat.get("BOAT_CHAT_HOST") or "0.0.0.0"
             port = int(chat.get("BOAT_CHAT_PORT") or 8765)
-        code, expires = store.create_pairing("admin" if admin else "access", label or "")
+        if admin and not (chat.get("BOAT_CHAT_SETTINGS_TOKEN") or "").strip():
+            raise ValueError("Admin pairing needs an admin code: set BOAT_CHAT_SETTINGS_TOKEN in the Boat Chat settings first.")
+        binding = vsauth.admin_binding(chat.get("BOAT_CHAT_SETTINGS_TOKEN")) if admin else ""
+        code, expires = store.create_pairing("admin" if admin else "access", label or "", binding)
         links = vsauth.pairing_urls(code, str(bind), port)
         self.send_json(200, {"url": links["urls"][0], "urls": links["urls"], "tunnel": links["tunnel"], "code": vsauth.format_pairing_code(code),
                              "expires_at": expires, "modules": vsauth.qr_matrix(links["urls"][0]), "for": target, "admin": admin})

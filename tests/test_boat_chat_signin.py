@@ -301,10 +301,10 @@ class PairingTests(SignInCase):
     def test_admin_device_passes_admin_checks_and_access_device_does_not(self):
         self.set_passphrase()
         store = self.pair_store()
-        admin = self.redeem(store.create_pairing("admin")[0])[1]
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
+        admin = self.redeem(store.create_pairing("admin", "", app.vsauth.admin_binding(ADMIN))[0])[1]
         access = self.redeem(store.create_pairing("access")[0])[1]
         self.assertEqual(admin["role"], "admin")
-        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
         status, body = self.call("POST", "/api/settings", {"settings": {}}, self.device(access["device_token"]))
         self.assertEqual(status, 403, body)
         status, body = self.call("POST", "/api/settings", {"settings": {}}, self.device(admin["device_token"]))
@@ -314,6 +314,21 @@ class PairingTests(SignInCase):
         self.assertEqual(status, 200, body)
         status, body = self.call("POST", "/api/auth/passphrase", {"new": "third crew pass", "current": "wrong"}, self.device(access["device_token"]))
         self.assertIn(status, (401, 403))
+
+    def test_admin_device_is_bound_to_the_admin_code(self):
+        self.set_passphrase()
+        store = self.pair_store()
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
+        admin = self.redeem(store.create_pairing("admin", "", app.vsauth.admin_binding(ADMIN))[0])[1]
+        headers = self.device(admin["device_token"])
+        self.assertNotEqual(self.call("POST", "/api/settings", {"settings": {}}, headers)[0], 403)
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "rotated-admin-code"          # rotate: the old device loses admin
+        self.assertEqual(self.call("POST", "/api/settings", {"settings": {}}, headers)[0], 403)
+        os.environ.pop("BOAT_CHAT_SETTINGS_TOKEN")                            # no token: a device is never an admin
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": "another crew pass"}, headers)
+        self.assertIn(status, (401, 403), body)
+        with self.assertRaises(app.vsauth.AuthError):
+            store.create_pairing("admin", "", app.vsauth.admin_binding(""))
 
 
 def auth_format(code):

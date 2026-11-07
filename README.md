@@ -1157,6 +1157,8 @@ release; older versions ignore `control-panel-auth.json` and only the token work
 `sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
 [Control Panel guide](docs/CONTROL_PANEL.md).
 
+**Sign-in hardening (unreleased):** setting or changing a passphrase (panel or Boat Chat) also clears waiting pairing links. A Boat Chat admin device (`panel-link --for chat --admin`, or the panel pairing option) records a SHA-256 marker of the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) at pairing time and counts as admin only while that marker matches the current code; rotating or removing the code ends its admin rights (stale admin devices are pruned when the code is changed in Boat Chat settings), and without an admin code a device never overrides the loopback-only settings rule. Admin pairing is refused with a clear error while no admin code is set. Rollback: `sudo vesselstackctl devices revoke-all` and pair again.
+
 **Passphrases at install time (unreleased):** `get-vesselstack.sh` asks, after a successful install or update
 and only on a real terminal without `--yes`/`--defaults`, "Set a Control Panel passphrase now? (recommended)",
 the same for a Boat Chat crew passphrase (hidden, typed twice, up to 3 tries, policy errors shown, Enter skips) and

@@ -133,6 +133,12 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def admin_binding(token: Any) -> str:
+    """Generation marker for admin devices: SHA-256 of the admin code (BOAT_CHAT_SETTINGS_TOKEN) they were paired under, or "none"."""
+    text = token.strip() if isinstance(token, str) else ""
+    return token_digest(text) if text else "none"
+
+
 def clean_label(label: Any) -> str:
     text = "".join(ch for ch in str(label or "") if ch.isprintable()).strip()
     return text[:MAX_LABEL_LENGTH] or "Unnamed device"
@@ -180,6 +186,7 @@ def _normalize(data: Any) -> dict[str, Any]:
                 "created": int(item.get("created") or 0), "last_seen": int(item.get("last_seen") or 0),
                 "expires": int(item.get("expires") or 0),
                 "role": item.get("role") if item.get("role") in ROLES else "access",
+                "binding": item["binding"] if isinstance(item.get("binding"), str) and len(item["binding"]) <= 64 else "",
             })
     result["devices"] = devices
     pairings = []
@@ -187,7 +194,8 @@ def _normalize(data: Any) -> dict[str, Any]:
         if isinstance(item, dict) and isinstance(item.get("code_sha256"), str) and isinstance(item.get("id"), str):
             pairings.append({"id": item["id"], "code_sha256": item["code_sha256"], "label": clean_label(item.get("label")) if item.get("label") else "",
                              "created": int(item.get("created") or 0), "expires": int(item.get("expires") or 0),
-                             "role": item.get("role") if item.get("role") in ROLES else "access"})
+                             "role": item.get("role") if item.get("role") in ROLES else "access",
+                             "binding": item["binding"] if isinstance(item.get("binding"), str) and len(item["binding"]) <= 64 else ""})
     result["pairings"] = pairings
     return result
 
@@ -436,6 +444,7 @@ class AuthStore:
             before = len(data["devices"])
             data["passphrase_hash"] = encoded
             data["devices"] = [d for d in data["devices"] if keep_device and d["id"] == keep_device]
+            data["pairings"] = []
             return before - len(data["devices"])
         payload: dict[str, Any] = {"hash": encoded, "keep_device": keep_device}
         if expect_hash is not _ANY:
@@ -452,13 +461,13 @@ class AuthStore:
         return self._mutating(["passphrase", "clear", "chat"], {}, "revoked", lambda: self.transaction(mutate))
 
     # -- devices -----------------------------------------------------------
-    def _add_device(self, data: dict[str, Any], digest: str, label: Any, remember: bool, role: str, now: int) -> dict[str, Any]:
+    def _add_device(self, data: dict[str, Any], digest: str, label: Any, remember: bool, role: str, now: int, binding: str = "") -> dict[str, Any]:
         data["devices"] = [d for d in data["devices"] if d["expires"] > now]
         if len(data["devices"]) >= MAX_DEVICES:
             raise DeviceLimitError(f"This boat already has {MAX_DEVICES} signed-in devices. Revoke one in Settings, or on the boat computer with: sudo vesselstackctl devices list")
         device = {"id": secrets.token_hex(6), "token_sha256": digest, "label": clean_label(label),
                   "created": now, "last_seen": now, "expires": now + (REMEMBER_SECONDS if remember else SESSION_SECONDS),
-                  "role": role if role in ROLES else "access"}
+                  "role": role if role in ROLES else "access", "binding": binding}
         data["devices"].append(device)
         return device
 
@@ -470,10 +479,16 @@ class AuthStore:
         return token, self.public_device(device)
 
     # -- pairing links -----------------------------------------------------
-    def create_pairing(self, role: str = "access", label: Any = "") -> tuple[str, int]:
-        """Record a single-use pairing code (only its SHA-256 is stored). Returns (code, expires_epoch)."""
+    def create_pairing(self, role: str = "access", label: Any = "", binding: str = "") -> tuple[str, int]:
+        """Record a single-use pairing code (only its SHA-256 is stored). Returns (code, expires_epoch).
+
+        An admin pairing needs ``binding`` (see ``admin_binding``): the device stops being admin when the admin code changes."""
         if role not in ROLES or (role == "admin" and not self.expose_role):
             raise AuthError("Admin pairing is only available for Boat Chat.")
+        if role == "admin" and (not isinstance(binding, str) or binding in {"", "none"} or len(binding) > 64):
+            raise AuthError("Admin pairing needs an admin code: set BOAT_CHAT_SETTINGS_TOKEN first.")
+        if role != "admin":
+            binding = ""
         code = new_pairing_code()
         digest = token_digest(code)
         now = int(self.clock())
@@ -485,10 +500,10 @@ class AuthStore:
             if len(data["pairings"]) >= MAX_PAIRINGS:
                 raise AuthError(f"{MAX_PAIRINGS} pairing links are already waiting to be used. They expire after 10 minutes.")
             data["pairings"].append({"id": secrets.token_hex(6), "code_sha256": digest, "label": text,
-                                     "created": now, "expires": expires, "role": role})
+                                     "created": now, "expires": expires, "role": role, "binding": binding})
             return expires
         if self._foreign_owner() is not None:
-            reply = self._helper_call(self._foreign_owner(), ["pairing", "create", "chat"], {"role": role, "label": text})  # type: ignore[arg-type]
+            reply = self._helper_call(self._foreign_owner(), ["pairing", "create", "chat"], {"role": role, "label": text, "binding": binding})  # type: ignore[arg-type]
             return str(reply["code"]), int(reply["expires"])
         return code, self.transaction(mutate)
 
@@ -507,7 +522,7 @@ class AuthStore:
                     found = record
             if found is None:
                 return None
-            device = self._add_device(data, token_hash, label or found.get("label"), True, found["role"], now)
+            device = self._add_device(data, token_hash, label or found.get("label"), True, found["role"], now, found.get("binding", ""))
             data["pairings"] = [p for p in data["pairings"] if p["id"] != found["id"]]
             return device
         device = self.transaction(mutate)
@@ -531,7 +546,16 @@ class AuthStore:
             return None
         if now - found["last_seen"] >= LAST_SEEN_INTERVAL:
             self._touch(found["id"], now)
-        return self.public_device(found, role=True)
+        return {**self.public_device(found, role=True), "binding": found.get("binding", "")}
+
+    def prune_admin_devices(self, current_binding: str) -> int:
+        """Drop admin devices (and waiting admin links) paired under a different admin code. Runs as the store's owner."""
+        def mutate(data: dict[str, Any]) -> int:
+            before = len(data["devices"])
+            data["devices"] = [d for d in data["devices"] if d["role"] != "admin" or d.get("binding") == current_binding]
+            data["pairings"] = [p for p in data["pairings"] if p["role"] != "admin" or p.get("binding") == current_binding]
+            return before - len(data["devices"])
+        return self.transaction(mutate)
 
     def _touch(self, device_id: str, now: int) -> None:
         def mutate(data: dict[str, Any]) -> None:

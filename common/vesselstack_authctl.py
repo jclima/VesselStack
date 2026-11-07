@@ -127,6 +127,23 @@ def listener(scope: str) -> tuple[str, int]:
     return host, port
 
 
+def chat_settings_token() -> str:
+    """BOAT_CHAT_SETTINGS_TOKEN from the root-only Boat Chat env file (the admin code), or "" when none is configured."""
+    base = Path(os.environ.get("VESSELSTACK_ROOT", "/opt/vesselstack"))
+    try:
+        lines = (base / "config" / "boat-chat.env").read_text().splitlines()
+    except OSError:
+        return ""
+    value = ""
+    for line in lines:
+        key, sep, rest = line.partition("=")
+        if sep and key.strip() == "BOAT_CHAT_SETTINGS_TOKEN":
+            value = rest.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+    return value.strip()
+
+
 def panel_link_command(auth: Any, stores: dict[str, Any], rest: list[str], out: TextIO, err: TextIO) -> int:
     scope, admin, label, index = "panel", False, "", 0
     while index < len(rest):
@@ -149,7 +166,8 @@ def panel_link_command(auth: Any, stores: dict[str, Any], rest: list[str], out: 
     if admin and scope != "chat":
         err.write("--admin only applies to --for chat.\n")
         return 2
-    code, expires = stores[scope].create_pairing("admin" if admin else "access", label)
+    binding = auth.admin_binding(chat_settings_token()) if admin else ""
+    code, expires = stores[scope].create_pairing("admin" if admin else "access", label, binding)
     host, port = listener(scope)
     links = auth.pairing_urls(code, host, port)
     role = "admin" if admin else "access"
@@ -184,7 +202,8 @@ def json_command(auth: Any, stores: dict[str, Any], args: list[str], stdin: Text
             return reply({"ok": False, "kind": "store", "message": "unknown store"}, 2)
         store = stores[scope]
         if (group, verb) == ("pairing", "create"):
-            code, expires = store.create_pairing(str(payload.get("role") or "access"), payload.get("label") or "")
+            code, expires = store.create_pairing(str(payload.get("role") or "access"), payload.get("label") or "",
+                                                 str(payload.get("binding") or ""))
             return reply({"ok": True, "code": code, "expires": expires})
         if (group, verb) == ("passphrase", "set-hash"):
             extra = {"expect_hash": payload["expect_hash"]} if "expect_hash" in payload else {}

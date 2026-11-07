@@ -376,7 +376,7 @@ class StoreHardeningTests(unittest.TestCase):
         with mock.patch("os.fchown") as fchown, mock.patch("os.chown") as chown:
             self.assertEqual(store.set_passphrase(PASS, keep_device="abc"), 2)
             self.assertEqual(store.clear_passphrase(), 3)
-            self.assertEqual(store.create_pairing("admin", "Phone"), ("ABCDE12345", 1800000600))
+            self.assertEqual(store.create_pairing("admin", "Phone", auth.admin_binding("admin-code")), ("ABCDE12345", 1800000600))
             self.assertTrue(store.revoke("dev1"))
             self.assertEqual(store.revoke_all(keep="k"), 4)
         fchown.assert_not_called()
@@ -395,7 +395,7 @@ class StoreHardeningTests(unittest.TestCase):
         self.assertTrue(auth.valid_hash(sent["hash"]))
         self.assertNotIn(PASS, calls[0][1]["input"].decode(), "the helper gets a hash, never the passphrase")
         self.assertEqual(sent["keep_device"], "abc")
-        self.assertEqual(json.loads(calls[2][1]["input"]), {"role": "admin", "label": "Phone"})
+        self.assertEqual(json.loads(calls[2][1]["input"]), {"role": "admin", "label": "Phone", "binding": auth.admin_binding("admin-code")})
         self.assertEqual(json.loads(calls[3][1]["input"]), {"id": "dev1"})
         self.assertEqual(json.loads(calls[4][1]["input"]), {"keep": "k"})
 
@@ -432,7 +432,7 @@ class StoreHardeningTests(unittest.TestCase):
         self.assertEqual((code, reply["ok"], reply["kind"]), (1, False, "auth"))
         code, reply = run(["passphrase", "set-hash", "chat"], {"hash": encoded, "expect_hash": None})
         self.assertEqual((code, reply["kind"]), (1, "changed"))
-        code, reply = run(["pairing", "create", "chat"], {"role": "admin", "label": "Tablet"})
+        code, reply = run(["pairing", "create", "chat"], {"role": "admin", "label": "Tablet", "binding": auth.admin_binding("admin-code")})
         self.assertEqual((code, reply["ok"], len(reply["code"])), (0, True, 10))
         self.assertEqual(run(["devices", "revoke", "chat"], {"id": "nope"}), (0, {"ok": True, "found": False}))
         self.assertEqual(run(["devices", "revoke-all", "chat"], {}), (0, {"ok": True, "revoked": 0}))
@@ -508,9 +508,16 @@ class PairingStoreTests(unittest.TestCase):
 
     def test_role_propagation_and_panel_cannot_issue_admin(self) -> None:
         chat = self.store(expose_role=True)
-        code, _ = chat.create_pairing("admin")
-        _, device = chat.redeem_pairing(code, "Skipper")
+        with self.assertRaises(auth.AuthError):
+            chat.create_pairing("admin")
+        with self.assertRaises(auth.AuthError):
+            chat.create_pairing("admin", "", auth.admin_binding(""))
+        code, _ = chat.create_pairing("admin", "", auth.admin_binding("admin-code"))
+        token, device = chat.redeem_pairing(code, "Skipper")
         self.assertEqual(device["role"], "admin")
+        self.assertEqual(chat.verify_device_token(token)["binding"], auth.admin_binding("admin-code"))
+        self.assertEqual(chat.prune_admin_devices(auth.admin_binding("rotated")), 1)
+        self.assertEqual(chat.list_devices(), [])
         with self.assertRaises(auth.AuthError):
             self.store().create_pairing("admin")
 
@@ -526,7 +533,13 @@ class PairingStoreTests(unittest.TestCase):
     def test_pairings_survive_other_writes_and_are_cleared_by_revoke_all(self) -> None:
         store = self.store()
         store.create_pairing()
+        self.assertEqual(store.pending_pairings(), 1)
         store.set_passphrase(PASS)
+        self.assertEqual(store.pending_pairings(), 0, "setting or changing the passphrase clears waiting pairing links")
+        store.create_pairing()
+        store.set_passphrase("another passphrase here")
+        self.assertEqual(store.pending_pairings(), 0)
+        store.create_pairing()
         self.assertEqual(store.pending_pairings(), 1)
         store.revoke_all()
         self.assertEqual(store.pending_pairings(), 0)
@@ -645,12 +658,15 @@ class CliTests(unittest.TestCase):
 
 
 class PairLinkCliTests(unittest.TestCase):
-    def run_cli(self, args, env_extra=None):
+    def run_cli(self, args, env_extra=None, settings_token=None):
         cli = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         data = Path(self.tmp.name) / "data"
         (data / "boat-chat").mkdir(parents=True)
+        if settings_token:
+            (Path(self.tmp.name) / "config").mkdir()
+            (Path(self.tmp.name) / "config" / "boat-chat.env").write_text(f"BOAT_CHAT_PORT='8765'\nBOAT_CHAT_SETTINGS_TOKEN='{settings_token}'\n")
         out, err = io.StringIO(), io.StringIO()
         env = {"VESSELSTACK_ROOT": self.tmp.name, "VESSELSTACK_DATA": str(data), **(env_extra or {})}
         with mock.patch.dict(os.environ, env):
@@ -672,12 +688,17 @@ class PairLinkCliTests(unittest.TestCase):
         self.assertNotIn("token_sha256", out)
 
     def test_chat_admin_link_and_validation(self) -> None:
-        code, out, err, data = self.run_cli(["panel-link", "--for", "chat", "--admin", "--label", "Skipper"], {"VS_CHAT_HOST": "198.51.100.9", "VS_CHAT_PORT": "8765"})
+        code, out, err, data = self.run_cli(["panel-link", "--for", "chat", "--admin"], {"VS_CHAT_HOST": "198.51.100.9", "VS_CHAT_PORT": "8765"})
+        self.assertEqual(code, 1, "no BOAT_CHAT_SETTINGS_TOKEN: admin pairing is refused")
+        self.assertIn("BOAT_CHAT_SETTINGS_TOKEN", err)
+        self.assertFalse((data / "boat-chat" / "auth.json").exists())
+        code, out, err, data = self.run_cli(["panel-link", "--for", "chat", "--admin", "--label", "Skipper"], {"VS_CHAT_HOST": "198.51.100.9", "VS_CHAT_PORT": "8765"}, settings_token="admin-code")
         self.assertEqual(code, 0, err)
         self.assertIn("http://198.51.100.9:8765/#pair=", out)
         self.assertIn("(admin)", out)
         stored = json.loads((data / "boat-chat" / "auth.json").read_text())
         self.assertEqual([p["role"] for p in stored["pairings"]], ["admin"])
+        self.assertEqual(stored["pairings"][0]["binding"], auth.admin_binding("admin-code"))
         self.assertEqual(self.run_cli(["panel-link", "--admin"])[0], 2)
         self.assertEqual(self.run_cli(["panel-link", "--for", "nope"])[0], 2)
         self.assertEqual(self.run_cli(["panel-link", "--bogus"])[0], 2)

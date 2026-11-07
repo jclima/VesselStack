@@ -41,7 +41,7 @@ sudo vesselstackctl panel-link --for chat --admin       # also the admin-code ri
 
 or use **Pair a phone to Boat Chat** in the Control Panel (Settings, Sign-in). The phone opens the link (or
 types the `XXXXX-XXXXX` code under **Have a pairing code?** in Connect) and stays signed in for 30 days. An
-admin device passes the admin-code checks, so it can change settings and the passphrase without the code.
+admin device passes the admin-code checks, so it can change settings and the passphrase without the code. An admin device is bound to the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) it was paired under: it stops being an admin as soon as that code is changed or removed, and `--admin` pairing is refused while no admin code is set.
 Boat Chat only redeems pairings (`POST /api/auth/pair`); it never creates them. Treat the QR code as a
 password while it is valid: whoever scans it first gets the device.
 
