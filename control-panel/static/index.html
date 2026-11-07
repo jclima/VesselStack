@@ -50,6 +50,7 @@
       <nav class="tabs" role="tablist" aria-label="Control Panel sections">
         <button id="tab-home" class="active" role="tab" aria-selected="true" aria-controls="home" data-tab="home" type="button">Home</button>
         <button id="tab-settings" role="tab" aria-selected="false" aria-controls="settings" data-tab="settings" type="button" tabindex="-1">Settings</button>
+        <button id="tab-displays" role="tab" aria-selected="false" aria-controls="displays" data-tab="displays" type="button" tabindex="-1">Displays</button>
         <button id="tab-updates" role="tab" aria-selected="false" aria-controls="updates" data-tab="updates" type="button" tabindex="-1">Updates<span id="update-badge" class="badge" hidden></span></button>
         <button id="tab-maintenance" role="tab" aria-selected="false" aria-controls="maintenance" data-tab="maintenance" type="button" tabindex="-1">Maintenance</button>
       </nav>
@@ -85,6 +86,32 @@
           <span class="note" id="sb-note"></span>
           <span class="btns"><button type="button" id="sb-discard">Discard</button><button type="button" class="primary" id="sb-save">Save</button><button type="button" class="primary" id="sb-apply" data-action="apply" aria-describedby="sb-note">Apply</button></span>
         </div>
+      </section>
+
+      <section id="displays" class="tab-panel" role="tabpanel" aria-labelledby="tab-displays" hidden>
+        <div class="pagehead"><h1>Displays</h1><p>The instrument screens on your boat: choose a colour theme and what each page shows, see how it will look, then put it on the screen. Changes are saved on the boat computer when you press Save, and reach the screen only when you press Apply to screen.</p></div>
+        <div class="toolbar dtoolbar"><button type="button" id="displays-refresh">Refresh</button><span id="displays-updated" class="small muted"></span></div>
+        <div id="displays-status" role="status" aria-live="polite"></div>
+        <div id="displays-root" class="displays"></div>
+        <section class="card flat" aria-labelledby="dh-h">
+          <details id="history-panel" class="dgroup">
+            <summary><strong id="dh-h">History and restore</strong></summary>
+            <p class="small">A copy of the display settings is kept before every save (the newest 20). Restoring brings those settings back; it does not change a screen until you apply it.</p>
+            <div id="history-root" aria-live="polite"></div>
+          </details>
+        </section>
+        <section class="card flat" aria-labelledby="dd-h">
+          <div class="sechead"><div><h2 id="dd-h">Available data</h2><p id="catalog-note" class="small"></p></div>
+            <div class="toolbar"><div class="search"><label for="catalog-search">Search data</label><input id="catalog-search" type="search" placeholder="Name, group or Signal K path" autocomplete="off"></div></div></div>
+          <div id="catalog-root"></div>
+        </section>
+        <section class="card flat" aria-labelledby="dc-h">
+          <h2 id="dc-h">Still done on the boat computer</h2>
+          <p>Adding a display and entering Wi-Fi details stay on the command line for now, so that passwords never pass through this page.</p>
+          <code>sudo vesselstackctl display add ID --board BOARD --name "Display name"
+sudo vesselstackctl display wifi</code>
+          <p class="small">Use <span class="mono">sudo vesselstackctl display add --help</span> to see the available boards.</p>
+        </section>
       </section>
 
       <section id="updates" class="tab-panel" role="tabpanel" aria-labelledby="tab-updates" hidden>
@@ -156,6 +183,12 @@ sudo vesselstackctl restore &lt;backup-file&gt; --yes</code></div>
     <ul id="confirm-items"></ul>
     <p id="confirm-note" class="keep" hidden></p>
     <div class="foot"><button type="button" id="confirm-cancel" autofocus>Cancel</button><button type="button" id="confirm-ok" class="primary"></button></div>
+  </form></dialog>
+
+  <dialog id="apply-dialog" aria-labelledby="apply-title"><form method="dialog" id="apply-form">
+    <h2 id="apply-title">Apply to screen</h2>
+    <div id="apply-body"></div>
+    <div class="foot"><button type="button" id="apply-cancel">Cancel</button><button type="button" id="apply-ok" class="primary">Start</button></div>
   </form></dialog>
 
   <dialog id="backup-choice-dialog" aria-labelledby="backup-choice-title"><form method="dialog" id="backup-choice-form">

@@ -53,7 +53,7 @@ import copy, json, sys
 from pathlib import Path
 repo, work = Path(sys.argv[1]), Path(sys.argv[2])
 sys.path.insert(0, str(repo / "displays"))
-import lifecycle, render
+import lifecycle, render, schema
 
 example = json.loads((repo / "displays" / "displays.example.json").read_text())
 HOSTILE = '$x ${y} ${1+1} <% 1+1 %> "q" \\ #: \'s'
@@ -237,8 +237,17 @@ def dashboard_icons(cfg):
     cfg.update(json.loads((repo / "displays" / "displays.dashboard.example.json").read_text()))
     assert any("icon" in item for item in cfg["instruments"].values())
 
+def themed(theme):
+    # The dashboard example (every layout, header, night schedule, alarm takeover) in one theme.
+    def mutate(cfg):
+        dashboard_icons(cfg)
+        cfg["displays"]["helm"]["ui"]["theme"] = theme
+    return mutate
+
 variant("example")
 variant("icons", dashboard_icons)
+for theme in schema.theme_ids():   # every built-in theme must produce a valid ESPHome configuration
+    variant("theme-" + theme, themed(theme))
 variant("ha", ha_items)
 variant("electrical", electrical)
 variant("electricalui", electrical_ui)
@@ -312,6 +321,16 @@ check electricalui helm
 check electricalmin helm
 check ha helm
 check icons helm
+for theme in $(python3 -I -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/displays")
+import schema
+print(*schema.theme_ids())
+' "$REPO_ROOT"); do
+    check "theme-$theme" helm
+    grep -qF "lv_obj_set_style_bg_color(id(page_0)->obj" "$WORK/theme-$theme-helm.log" \
+        && [ "$theme" = classic ] && { echo "classic must not switch the page background at night" >&2; fail=1; }
+done
 # Icons: the Material Symbols subset font at the two sizes, glyphs as private-use characters, static labels
 # repainted by the night palette; configurations without icons carry none of it.
 log="$WORK/icons-helm.log"

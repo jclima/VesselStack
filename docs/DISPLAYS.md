@@ -180,6 +180,17 @@ files; keep archives private. It excludes `displays/.venv` and `__pycache__`
 
 ## Managing displays
 
+The Control Panel **Displays** tab shows each display, a preview of its pages, its firmware state and
+readiness and the data list, edits the theme and pages (`set-pages`), restores older settings
+(`restore-config`) and sends firmware to the screen (`display deploy`, rollback with `flash --previous`);
+see the [Control Panel guide](CONTROL_PANEL.md#displays). Editing is deterministic: restoring a backed-up
+`displays.json` renders the same source hash again, which is what makes `flash --previous` safe afterwards.
+**Downgrading** to a VesselStack without these themes or pages: run `set-theme ID classic` first and
+reflash. The panel runs `deploy` and rollback as an operation that holds the lifecycle slot, so backups,
+updates and settings changes wait until it ends.
+It runs `display list --json`, `show ID --json`, `themes --json`, `catalog [--live] --json` and
+`serial-ports --json`. Editing, saving, applying and restoring from the tab run `set-pages`, `deploy`, `restore-config` and `flash --previous`; only `display add` and `display wifi` stay on the command line. The commands below are the same ones you can run yourself.
+
 `vesselstackctl display COMMAND ...` (root, uses the installed configuration)
 and `python3 displays/displayctl.py COMMAND ...` (with `VESSELSTACK_ROOT` set;
 `MQTT_USERNAME`/`MQTT_PASSWORD` from `vesselstack.env` for commands that touch
@@ -197,13 +208,21 @@ sudo vesselstackctl display remove helm --yes
 
 | Command | What it changes |
 | --- | --- |
-| `list` | Nothing. Table of id, name, board, page count, MQTT username, whether generated credentials exist (`SECRETS`) and whether Wi-Fi credentials are stored (`WIFI`). Works without root if the files are readable; without root the secrets/Wi-Fi columns show `unknown`. Never prints secret values. |
+| `list [--json]` | Nothing. Table of id, name, board, page count, MQTT username, whether generated credentials exist (`SECRETS`) and whether Wi-Fi credentials are stored (`WIFI`). Works without root if the files are readable; without root the secrets/Wi-Fi columns show `unknown`. Never prints secret values. `--json` prints only `{"schema": 1, "displays": [{"id", "name", "board", "pages"}]}` (an empty list when `displays.json` does not exist yet), which is what the Control Panel Displays tab uses to find the displays. |
 | `add ID --board BOARD [--name NAME] [--home-assistant-api]` | Appends the display to `displays.json` with one default page: title `Main`, the board's largest layout, and the first N instruments in `displays.json` order (N = layout capacity, fewer if you have fewer instruments). It refuses an existing id, an unknown board or a configuration with no instruments, and validates the whole resulting file before writing. It then syncs MQTT like `sync-mqtt`: creates the display password in `displays.secrets.json`, rewrites the ACL/passwords and signals the broker. It prints the MQTT username (`vsdisp-ID`) and next steps, never the password. Edit the pages in `displays.json` afterwards and check with `validate`; then generate the firmware project with `render` or `export` (see [Firmware: generate, build and flash](#firmware-generate-build-and-flash)). |
 | `remove ID --yes` | Deletes the display from `displays.json` and its entry from `displays.secrets.json`, then syncs: the broker reload disconnects the connected device and refuses it afterwards. Without `--yes` it refuses. Adding the same id again generates new credentials. The Wi-Fi block and other displays are untouched. It also deletes the display's whole build tree (`build/displays/ID/`: rendered project with `secrets.yaml`, stored firmware with the compiled-in credentials, and old-layout `ID.new`/`ID.prev`; exactly those names, never another display's) and says so; it first waits for a running build or flash of that display (30 s, then fails without changing anything). |
 | `rotate ID` | Regenerates every generated secret of that display (the MQTT password, the OTA password and the Home Assistant API encryption key), then syncs. Other displays are untouched. The device is refused until it is **reflashed** (over USB) with the new credentials. |
 | `render ID`, `export ID` | Generate the ESPHome project for a display; see [Firmware: generate, build and flash](#firmware-generate-build-and-flash). Root. |
 | `build ID` | Optional. Renders, then compiles the firmware on this machine in a one-shot container of the pinned ESPHome image and stores it with a manifest; see [Building and flashing on the Pi](#building-and-flashing-on-the-pi). Root. |
 | `flash ID (--serial DEVICE \| --ota HOST) [--previous] [--force]` | Optional. Uploads the stored firmware (never compiles) over USB serial or Wi-Fi; `--previous` rolls back; refuses firmware built with credentials that are no longer current unless `--force`. Root. |
+| `themes [--json]` | Nothing. Lists the display themes with a one-line description; `--json` prints the full palettes. `displayctl.py themes` itself needs no root; through `vesselstackctl` run it with `sudo` like the other `display` commands. See [Themes](#themes). |
+| `set-theme ID THEME` | Root. Sets `displays.ID.ui.theme` in `displays.json` (validated and written atomically like the other changing commands); `classic` deletes the key instead (and the `ui` object when that leaves it empty), so the file stays readable by older versions. An unknown theme or display is refused with exit status 2 and the valid ids. It takes the per-display build lock first and the configuration lock inside it (see the lock table below), so it waits for a running build or flash of that display (30 s). It changes nothing on the device: it prints the next steps, `display build ID` then `display flash ID ...`. Setting the theme a display already has changes nothing. |
+| `catalog [--live] [--json]` | Nothing. The data list a page can pick from: about forty common Signal K values (see [Data catalog](#data-catalog)), each with the right unit for `BOAT_UNITS`, merged with what is already in `displays.json`. `--live` also asks the configured `SIGNALK_URL` once which values really have data. `--json` is what the Control Panel reads. Needs no root if `displays.json` is readable. |
+| `show ID [--json]` | Nothing. Everything needed to edit one display: its pages, `ui` and theme, the board geometry, the layouts the board offers (capacity, minimum items, accepted item types, electrical slot roles), a preview box for every item computed by `render.py` (the Control Panel never repeats layout maths), the configuration `revision` (sha256 of `displays.json`) and a `readiness` block (displays enabled, MQTT password and Wi-Fi stored as yes/no, MQTT reachable from the network, Docker, ESPHome image and toolchain cache present, free disk bytes, stored firmware `none`/`current`/`outdated`, last flash). Never prints a secret value. |
+| `set-pages ID --if-revision SHA --stdin` | Root. Replaces the pages of a display from a JSON request on standard input (`{"pages": [...], "theme"?, "new_instruments"?, "new_notifications"?, "instrument_edits"?}`) and prints a JSON result. See [Editing pages](#editing-pages-backups-and-restore). |
+| `history [--json]` | Root. Lists the `displays.json` backups, newest first. |
+| `restore-config STAMP [--if-revision SHA]` | Root. Puts the backup `STAMP` back as `displays.json` (validated; the file it replaces is backed up first) and prints a JSON result. |
+| `serial-ports [--json]` | Nothing. The USB serial devices under `/dev/serial/by-id` that `flash --serial` would accept. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it and also deletes `secrets.yaml` from every already rendered tree of every display id under `build/displays/` (`ID/project`, `ID/project.new`, `ID/project.prev`, an old-layout `ID/secrets.yaml`, and the old siblings `ID.new/` and `ID.prev/`), each under that display's build lock without following symlinks (a display whose build is running is skipped with a warning); it does this even when no Wi-Fi credentials were stored, so a rerun after a failed or partial clear still cleans up; a changed password prints a notice instead. In both cases projects rendered and firmware built earlier still contain the old Wi-Fi credentials until `render`/`build` runs again (the firmware cannot be scrubbed; `flash` refuses it without `--force`). Nothing is echoed. |
 | `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the Signal K link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
@@ -244,6 +263,99 @@ is removed when it ends.
 Rollback: `remove` and `rotate` are not reversible (the old password is gone);
 restore `config/displays.json` and `config/displays.secrets.json` from a
 `vesselstackctl backup` archive and run `vesselstackctl display sync-mqtt`.
+
+## Data catalog
+
+`displays/catalog.json` (schema 1, read by `displays/catalog.py`, standard library only) lists the common
+Signal K values a page can show, so the Control Panel Displays tab can offer a list instead of asking
+you to type paths. Each entry has a `key`, a `path` (a `*` segment stands for an instance: `electrical.batteries.*.voltage`),
+a `group` (Navigation, Wind, Depth & water, Electrical, Tanks, Engine, Environment, Notifications), a `label`
+(`{0}` is the matched instance), an `icon` from [Icons](#icons), a `quantity`, `precision`, `stale_after_s`,
+optional `min_interval_ms`, a `range` per unit system (used as the instrument `min`/`max`, so the entry can
+sit on a bar or an arc) and `suggested_thresholds` per unit system. The catalog has 38 instruments and 4
+notifications (anchor, man overboard, fire, flooding).
+
+The quantity decides the conversion and unit from `BOAT_UNITS` (`metric` or `us_customary`; the legacy
+`nautical` value is read as `metric`, like the rest of VesselStack; unset or anything else is
+`us_customary`): depth `m` or `ft`, temperature `K->C` or `K->F`, fluid pressure `bar` or `psi`, barometric
+pressure `hPa`, volume `L` or `gal`, flow `L/h` or `gal/h`, speed `kn`, heading `deg_360`, angle `deg_signed`,
+ratio `%`, `rpm`, charge `Ah`, distance `nmi`, engine hours `h`; volts, amperes and watts are shown as they
+are. Only conversions that exist in `displays/conversions.py` are used.
+
+**Live data.** `catalog --live` makes one `GET {SIGNALK_URL}/signalk/v1/api/vessels/self` (Bearer token only when
+`DISPLAYS_SIGNALK_TOKEN` is set, redirects refused, 4 MiB cap, no proxy; the whole request - connect, headers and body - is bounded by a 10 s total, so a server that answers one byte at a time or never answers ends as "the Signal K server answered too slowly" after 10 s) and keeps only
+`{path, si_units, age_s, value}` of numeric leaves, plus the names (never the text) of active
+notifications. Positions (`*.position*`), destinations, `navigation.anchor.position`, and anything named
+`mmsi`, `uuid`, `name` or `callsign` are never kept, and the raw document is neither stored nor cached.
+Only the configured `SIGNALK_URL` is contacted. If the server cannot be reached the command still succeeds and
+says why (`live.ok` is false). Concrete entries are marked `live` or `no_live_data`; a wildcard entry
+expands to one row per live match (`electrical.batteries.house.voltage`, `...start.voltage`), or appears once
+as a template with a default instance you can edit (`house`, `main`, `0`); live numeric values the catalog
+does not know come under **Uncatalogued** with defaults taken from `meta.units`: no limits, no icon, the last path
+segment as the label (16 characters, glyphs the display font lacks removed), unit `none` and no unit text when
+the units are unknown. A row already in `displays.json` (same path and conversion) is shown as configured and
+lists the displays that use it, never added twice.
+
+**Suggested limits are never applied by default.** An instrument with `thresholds` counts in the boat-wide alarm
+summary and can raise the alarm banner and take over the screen, so `suggested_thresholds` are shown as
+suggestions only; a row's `definition` has none, and `materialise(..., apply_thresholds=True)` is the only way
+to get them. New notifications are written with `"alarm": false` for the same reason. Oil pressure has no
+suggestion because it reads 0 with the engine stopped.
+
+## Editing pages, backups and restore
+
+The Control Panel Displays tab calls only fixed `vesselstackctl display ...` commands. The write commands
+(`set-pages`, `restore-config`) print JSON; a failure prints `{"ok": false, "code": N, "errors": [...]}` on
+standard output and the first error on standard error.
+
+| Exit status | Meaning |
+| --- | --- |
+| `0` | Done. |
+| `1` | Operational error (not root, configuration lock timeout, unreadable files). |
+| `2` | Invalid request or configuration: the `errors` list holds every problem; nothing was written. |
+| `3` | `--if-revision` no longer matches `displays.json` (someone changed it); `current_revision` is in the reply. |
+| `4` | A build or flash for the display is running; try again when it has finished. |
+
+`set-pages` takes the per-display build lock **without waiting** (a running build or flash makes it refuse with
+status 4, unlike `set-theme`, which waits 30 s), then the configuration lock, checks the revision, applies
+the request to a copy, validates the whole result (`schema.validate_config` and the font glyph check) and writes it
+atomically with `lifecycle.write_config`. The request is `pages` (required, replaces the display's pages),
+`theme` (a theme id; `classic` removes the key), `new_instruments` and `new_notifications` (id to definition; an existing id with
+a different definition is refused), and `instrument_edits` (id to `{field: value}`, `null` removes a field;
+`path` cannot be edited). The result has `changed`, the new `revision`, the `backup` stamp, `added_instruments`,
+`added_notifications`, `new_alarm_sources` (items that now count in the alarm summary), `rebuild_needed` (displays
+whose firmware would change: rebuild and reflash them) and `bridge_restart`.
+
+The displays bridge reads `displays.json` only when it starts (`bridge.main` loads it once). So when anything the
+bridge reads changed (instruments, notifications, Home Assistant items, heartbeat, night schedule, or whether any display wants the
+clock through `ui.header` or `ui.night`; not pages or themes), and `DISPLAYS_ENABLE=true`, the command runs `systemctl try-restart vesselstack-displays-bridge.service`.
+`bridge_restart` is `not_needed`, `skipped_displays_disabled`, `restarted` or `failed: ...` (the file is written either way; restart
+the bridge by hand if it failed). A change to pages or the theme alone never restarts it.
+
+**Backups.** Before every change `set-pages` and `restore-config` copy the current `displays.json` to
+`$VESSELSTACK_ROOT/config/displays-backups/displays-STAMP.json` (`STAMP` is UTC `YYYYMMDDTHHMMSSZ`, with `-2`,
+`-3` for changes within one second). The directory is `root` `0700`, the files `0600`, symlinks are refused, and the newest 20
+are kept. The backups hold the same content as `displays.json` and no secrets, are included in `vesselstackctl backup`
+with the rest of `config/`, and are never committed (`displays-backups` is in `.gitignore` and `scripts/check-public-tree.py`).
+`history` lists them (stamp, size, revision); `restore-config STAMP` accepts only a strictly formed stamp of an existing backup,
+validates it against the current version (a backup that is no longer valid is refused with status 2), backs the current file up
+and writes the backup byte for byte. `restore-config` **refuses (status 2) a backup whose set of displays differs from the current
+`displays.json`**, naming the added or removed ids, because it never touches MQTT accounts, the ACL, secrets or build trees: a removed
+display would keep its broker credentials and a resurrected one would have no account. Run `sudo vesselstackctl display add ID ...`
+or `display remove ID` to make the sets match, then restore again. The ACL and password files derive from the display ids only
+(`mqtt_auth.load_display_ids`); `set-pages` cannot change them (it edits one existing display and the shared definitions), and the
+result of `restore-config` carries `"mqtt_sync": "not_needed"` (or `synced` / `failed: ...` if the file was unreadable and the sync ran). **Rollback** of any edit: `sudo vesselstackctl display history`, then
+`sudo vesselstackctl display restore-config STAMP`; rebuild and reflash the displays named in `rebuild_needed` if the firmware
+was already rebuilt.
+
+`show` reads the stored firmware manifest and compares it with a read-only re-render (no secret is created or printed):
+`outdated` means the configuration (or, when Wi-Fi and credentials are complete, the credentials) changed since it was built.
+Without root the build folder is unreadable and the status is `unknown`. `readiness.last_flash` comes from
+`build/displays/ID/last-flash.json` (see "Deploy and rollback"); `null` when nothing was ever uploaded with this version. It has
+`ok`, `method` (`serial` or `ota`), `at`, `version`, `built_at_utc`, `ota_target` (the most recent Wi-Fi target when it is an IP
+address or host name; a USB device path, a URL or anything else is never passed on) and `credentials_changed` (the credentials
+differ from those compiled into the image that was flashed; `null` when unknown). `readiness.firmware.rollback_possible` is true
+when `firmware.prev/` holds the image that ran before the last upload.
 
 ## Firmware: generate, build and flash
 
@@ -291,7 +403,7 @@ Where files live:
 | Path | Owner | Mode | Notes |
 | --- | --- | --- | --- |
 | `$VESSELSTACK_ROOT/build/` and `build/displays/` | `root:root` | `0700` | Deliberately **not** under `$VESSELSTACK_DATA` (service-user owned: root writing there is a symlink hazard). Created and swapped with directory-relative, no-follow operations; a symlink anywhere in the path is refused. Files the build container produced are read only after a regular-file check and with `O_NONBLOCK|O_NOFOLLOW`, so a FIFO planted at an artifact path is refused instead of hanging the build. |
-| `build/displays/.ID.lock` | `root:root` | `0600` | Per-display build lock (no-follow `flock`). `render`, `export`, `build`, `flash` (and `remove`) of the same display hold it for their whole run, so two of them can never delete, rename or half-read each other's tree, or let a build rotate `firmware/` while `flash` is uploading it. A second command waits, says so, and fails after 30 s with "another build/flash for ID is running" (builds are long; try again when the first has finished). Different displays do not block each other. It is separate from the 10 s `config/.displays.lock`; the build lock is always taken first and the configuration lock only briefly inside it, so the two cannot deadlock. The empty lock file stays in place; it holds no data. |
+| `build/displays/.ID.lock` | `root:root` | `0600` | Per-display build lock (no-follow `flock`). `render`, `export`, `build`, `flash` (and `remove`) of the same display hold it for their whole run, so two of them can never delete, rename or half-read each other's tree, or let a build rotate `firmware/` while `flash` is uploading it. A second command waits, says so, and fails after 30 s with "another build/flash for ID is running" (builds are long; try again when the first has finished). Different displays do not block each other. `set-pages` and `restore-config` take it without waiting and refuse with exit status 4 instead. It is separate from the 10 s `config/.displays.lock`; the build lock is always taken first and the configuration lock only briefly inside it, so the two cannot deadlock. The empty lock file stays in place; it holds no data. |
 | `build/displays/ID/project/` | `root:root` | dirs `0700`, files `0600` | The self-contained ESPHome project, including `secrets.yaml`, and the **only** directory the compile container mounts (as `/config`, writable, so never trusted afterwards: `flash` re-renders into a private staging directory instead). Rendering again keeps the previous project as `project.prev/` (one generation). |
 | `build/displays/ID/firmware/` and `firmware.prev/` | `root:root` | dirs `0700`, files `0600` | Only after `display build`: `firmware.factory.bin`, `firmware.ota.bin` and `manifest.json` of the newest and the previous build. They sit **beside** `project/`, never inside it and never mounted into a container, so a compromised build (the toolchain and components are downloaded into a persistent cache) cannot rewrite the stored images or their manifests, nor poison the `--previous` rollback. `render` replaces only `project/` and never touches these directories. |
 
@@ -411,6 +523,46 @@ verified without hardware.
 of the rendered project without `secrets.yaml` and `README.txt`, so it changes
 when the configuration changes but never depends on a secret), the sha256 and
 size of both images, `secrets_sha256` (see the credential check) and `built_at_utc`. It contains no secrets.
+
+### Deploy and rollback
+
+```bash
+sudo vesselstackctl display deploy helm --ota 192.0.2.50 [--progress]
+sudo vesselstackctl display deploy helm --serial /dev/serial/by-id/usb-...
+```
+
+`deploy ID (--ota HOST | --serial DEVICE) [--progress]` is what the Control Panel's **Apply to screen** runs. It holds **one** build
+lock from the render to the end of the upload and does `build` (only when needed) then `flash`. The compile is skipped when
+`firmware/` is intact, was built from today's source (`source_sha256`) and today's credentials (`secrets_sha256`) and the pinned
+image is present, so a retry after a failed upload does not rebuild. With `--progress` it prints `STAGE: render`, `STAGE: compile`
+(followed by a note when skipped), `STAGE: upload` and `STAGE: done`. Everything the ESPHome tools print passes through a
+redactor first: the Wi-Fi SSID and password and the MQTT, OTA and API secrets (also JSON-, URL- and shell-quoted) are replaced with
+`[redacted]` before a line leaves the command. Known failures end with a single `To fix:` line: an unreachable host or a timeout (check
+power and Wi-Fi, use the IP address instead of a `.local` name), an authentication failure (the credentials changed after the display
+was flashed: flash over USB, with the exact command), no space on the device, Docker missing, the image missing, a full disk, a
+busy lock. Exit status: `0` done, `1` failed, `2` invalid target. A build made by `deploy` replaces `firmware/` **without** moving it
+to `firmware.prev/` when `firmware/` was never uploaded (according to `last-flash.json`), so `firmware.prev/` stays the image the
+device last ran; without a `last-flash.json` it rotates as `build` does. `firmware/` is only rotated into `firmware.prev/` when it is intact (a readable manifest), and an existing `firmware.prev/` is never deleted when there is no `firmware/` to replace it. If the upload worked but `last-flash.json` cannot be written, the old record is removed (a stale one would name the wrong image) and a warning is printed. `--ota` accepts an IP address (normalised; no `%` scope id) or a host name, and rejects the names ESPHome reserves (`bootsel`, `mqtt`, `mqttip`, `ota`, `serial`, `COM*`) in any letter case. Redaction also covers the spelling used in `secrets.yaml` (non-ASCII characters as `\u` escapes).
+
+**Control Panel notes.** Apply is not blocked by a missing ESPHome builder image: the readiness checklist shows it as a to-do and, when the computer is offline, the deploy fails with a `To fix:` hint (accepted behaviour). A Wi-Fi upload to an address other than the last successful one needs `confirm_new_target` (the image holds the Wi-Fi password); the dialog asks for an explicit tick. The rollback button is offered only when `firmware.prev/` was built from the current settings and credentials, i.e. after **History → Restore** of the matching saved copy. `build` and `flash` themselves behave as before.
+
+**`last-flash.json`** (`build/displays/ID/`, root `0600`, written atomically without following symlinks by `flash` and `deploy`,
+only after a successful upload; a failed upload records nothing): `{"schema": 1, "current": {...}, "previous": {...} | null}`
+where each entry has `method`, `target` (the IP, host name or USB device), `image_sha256` (the uploaded image), `source_sha256`,
+`secrets_sha256` (hashes only), `at`, `version` and `built_at_utc`. Uploading the same image again only updates `current`. It
+holds no secret and is never committed (`.gitignore`, `scripts/check-public-tree.py`).
+
+**Rollback** (put the previous firmware back on the screen):
+
+```bash
+sudo vesselstackctl display history                       # find the backup made before the edit
+sudo vesselstackctl display restore-config STAMP          # bring the old settings back
+sudo vesselstackctl display flash helm --previous --ota 192.0.2.50      # or --serial DEVICE
+```
+
+Rendering is deterministic, so after the restore the old firmware's `source_sha256` matches again and `flash --previous` passes its
+checks without `--force`. It is refused (and says why) if the credentials changed since that image was built. The
+Control Panel offers the same steps (Displays tab, History).
 
 Requirements and limits:
 
@@ -783,6 +935,7 @@ firmware it got before, byte for byte):
 | `day_brightness` | integer 5-100, default 100 | backlight in percent by day (and when `night` is `off`) |
 | `night_brightness` | integer 5-100, default 20, not above `day_brightness` | backlight in percent at night; also the idle-dim level when set |
 | `dim_after_s` | integer 0-3600, default 0 (never) | dim after this many seconds without a touch |
+| `theme` | `classic` (default), `high-contrast`, `daylight`, `ocean` | colour theme; see [Themes](#themes). Absent means `classic`. An unknown id is a validation error that lists the valid ids |
 
 `night: schedule` needs the top-level `night_schedule`, `{"start": "21:30",
 "end": "06:15"}`: 24-hour `HH:MM` on the boat's wall clock, `start` inclusive
@@ -1298,6 +1451,79 @@ point):
   alignment in the round corners) is not verified on a device. Firmware must be
   rebuilt and reflashed to show icons. Rollback: remove the `icon` keys, rebuild
   and reflash, or flash the previous firmware.
+
+### Themes
+
+Display colours and tile shape come from `displays/themes.json`, which is installed with the rest
+of `displays/`. It holds four themes. Choose one per display with `ui.theme`
+(`sudo vesselstackctl display set-theme ID THEME`; list them with `sudo vesselstackctl display themes [--json]`):
+
+| Theme | Look | Day contrast (value / label on tile) |
+| --- | --- | --- |
+| `classic` | The original: slate `#101820` tiles on a black page, pale grey labels. The default. | 17.9 / 7.2 |
+| `high-contrast` | For direct sunlight: black page and tiles, pure white values, light `#D0D8E0` labels, a 2 px light tile border, stronger severity colours. | 21.0 / 14.6 |
+| `daylight` | Light `#E4E8EC` page with white tiles and dark text; severity tiles use pastel green, amber and red with dark text. A 1 px grey tile border separates the tiles. | 17.9 / 9.8 |
+| `ocean` | Near-black navy page with navy `#12305A` tiles, blue-grey `#8FA8C4` labels and white values. | 13.2 / 5.4 (severity tiles are darker than in `classic`, with white text) |
+
+Night mode is the same on every theme in this version: the red night palette of `classic`, so night
+vision survives whatever the day theme. A themed display repaints to it when night starts, including
+the page background of the light themes and the tile border (which turns dark red at night, so a
+bright border never defeats night mode). The alarm banner is never themed.
+
+**Applying a theme.** `set-theme` only edits `displays.json`. The theme is compiled into the
+firmware: run `display build ID` and `display flash ID ...` for the display to change. Until then the
+device keeps its old colours (and `flash` refuses a stored firmware built from a different
+configuration, as for any other change). A display on `classic`, with or without `"theme": "classic"`,
+generates a byte-identical device file to the one it generated before themes existed
+(`tests/fixtures/displays/golden/` is checked for both), so such a display never needs reflashing for
+this feature.
+
+**Cost.** A theme only changes constants in the generated code. `classic` emits nothing new; a theme with a tile border adds one
+`lv_obj_set_style_border_color` call per tile to the night script, and a theme whose page background
+differs between day and night (`daylight`, `ocean`) adds one `lv_obj_set_style_bg_color` call per page.
+Measured with a full `esphome compile` (pinned image 2026.10.0, `displays.dashboard.example.json`,
+every layout, header and night schedule): static RAM is identical for all four themes (127,459 bytes,
+37.3 %), and flash grows by 616 bytes for `daylight`, 552 for `high-contrast` and 248 for `ocean`
+over `classic` (1,221,991 bytes, 15.0 % of the app partition). Not measured on a device.
+
+A theme has a `description`, `day` and `night` blocks of roles (`page_bg`, `tile`, `label`, `value`, `clock`,
+`title`, `dot_ok`, `dot_bad`, `dot_unknown`, `page_hi`, `page_lo`, `track`), `sev` and `gauge`
+palettes for each of day and night (`unknown`, `ok`, `warn`, `alarm`, plus `neutral` for gauges;
+`sev` entries are `[tile background, text]` pairs), and a `shape` block (`tile_radius`, `tile_pad`,
+`tile_border_width`, `tile_border`; no border colour is written while the width is 0). Colours are
+`"#RRGGBB"`. The alarm banner and its white text are deliberately not themed, and fonts are not part
+of a theme.
+
+`displays/schema.py` (`load_themes`, `validate_themes`) rejects unknown keys, bad colour strings and
+missing roles, and enforces: stale/unknown colours are never green (hue 75-165 degrees unless nearly
+grey); night colours are red to amber (hue 0-50 degrees, red the strongest channel) or near-black;
+day `ok`, `warn` and `alarm` are green, amber and red; and, for the day palette, value text on the
+tile is at least 4.5:1, label text at least 3:1 and each severity pair at least 4.5:1 (3:1 for the
+muted `unknown` pair; WCAG contrast ratio). The theme's label colour is also drawn on severity tiles,
+so every theme except `classic` needs the day label to reach 3:1 on each day severity
+tile background (`classic` is 2.13 / 1.25 / 2.25 on ok / warn / alarm and is the only exemption, unchanged; `ocean` uses
+deep tiles with white text: ok `#145A27` 3.40 (white 8.33), warn `#6E4900` 3.27 (8.03), alarm `#9E1B1B` 3.26 (8.00),
+unknown `#3A5272` 3.26 (text `#E6EEF7` 6.82), label contrast first, text contrast in brackets). The dim night palette is not held to the contrast floors.
+Every built-in theme passes these rules; a custom `themes.json` is not supported (the file is part of
+the installed code and is replaced on update).
+
+**Limits.** Colours were checked by the validator and by generating and validating (`esphome config`)
+firmware for every theme, not by looking at a device; real-panel legibility, in particular of the
+light themes in sunlight and the pastel severity tiles, is not verified. The label colour is not
+changed by severity, so on severity tiles it keeps the theme's label colour: readable on the
+`daylight` and `high-contrast` tiles, but weak on the saturated green, amber and red tiles of
+`classic` (the amber one is about 1.2:1; the large value text stays black or white and
+readable). The `high-contrast` warn tile was a bright amber that made its label unreadable; it is now
+dark amber `#8A5A00` with white text.
+
+**Upgrade and rollback.** Nothing changes until you run `set-theme` and reflash. To go back, run
+`set-theme ID classic` (it removes the key), then `display build ID` and `display flash ID ...`, or
+flash the previous firmware (`display flash ID --previous`). **Run `set-theme ID classic` on every
+display before downgrading VesselStack to a version without themes**: those versions reject the
+`theme` key as unknown (checked against 0.6.1: `$.displays.helm.ui.theme: unknown key`), so the configuration
+is invalid and the displays bridge exits at start-up with status 2, which its systemd unit does not restart
+(`RestartPreventExitStatus=2 3`). A backup from `displays-backups` taken before the theme was set is another way back.
+Restoring only `displays/themes.json` and `displays/render.py` is not enough for the same reason.
 
 ### Board registry schema 2
 

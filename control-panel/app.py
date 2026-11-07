@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hmac
 import ipaddress
 import json
@@ -749,6 +750,238 @@ def command_output(command: list[str], timeout: int = 8) -> tuple[int, str]:
         return 1, str(exc)
 
 
+# --- Displays tab (read-only): the fixed `vesselstackctl display ... --json` calls -------------------
+
+# Copy of displays/schema.py DISPLAY_ID (a test keeps them equal); only a validated id reaches argv.
+DISPLAY_ID_RE = re.compile(r"^[a-z]([a-z0-9-]{0,22}[a-z0-9])?$")
+DISPLAY_TOOL_TIMEOUT_S = 12
+DISPLAY_CATALOG_TTL_S = 30
+DISPLAY_ERROR_STATUS = {2: 400, 3: 409, 4: 409}   # CLI exit codes: invalid input, revision changed, busy
+_DISPLAY_CACHE: dict[bool, tuple[float, dict[str, Any]]] = {}
+_DISPLAY_CACHE_LOCK = threading.Lock()
+
+
+class DisplayToolError(Exception):
+    """A display tool call failed; ``status`` and ``message`` are safe to show the browser."""
+
+    def __init__(self, status: int, message: str, errors: list[str] | None = None, code: int | None = None) -> None:
+        super().__init__(message)
+        self.status, self.message, self.errors, self.code = status, message, errors or [], code
+
+
+def display_argv(*args: str) -> list[str]:
+    return [str(CTL), "display", *args]
+
+
+def valid_display_id(value: Any) -> str:
+    if not isinstance(value, str) or not DISPLAY_ID_RE.fullmatch(value):
+        raise ValueError("Unknown display id")
+    return value
+
+
+def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S, input_text: str | None = None) -> dict[str, Any]:
+    """Run one display command and return its JSON object.
+
+    stdout is parsed and stderr is dropped, so nothing but the tool's own structured error message
+    (a few short lines about the configuration, never a stack trace or secret) can reach the browser.
+    """
+    # A request body goes to the tool's standard input, never to its argument list.
+    stdin = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        result = subprocess.run(display_argv(*args), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False, **stdin)
+    except subprocess.TimeoutExpired as exc:
+        raise DisplayToolError(504, "The display tool took too long to answer. Try again in a moment.") from exc
+    except OSError as exc:
+        raise DisplayToolError(502, "The display tool is not available on this boat computer.") from exc
+    try:
+        payload = json.loads(result.stdout or "")
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise DisplayToolError(502, "The display tool gave an answer the Control Panel could not read."
+                               if result.returncode == 0 else "The display tool failed. See the displays bridge log for details.",
+                               code=result.returncode or None)
+    if result.returncode != 0 or payload.get("ok") is False:
+        errors = [str(item)[:300] for item in payload.get("errors", []) if isinstance(item, str)][:5] if isinstance(payload.get("errors"), list) else []
+        code = payload.get("code") if isinstance(payload.get("code"), int) else result.returncode
+        raise DisplayToolError(DISPLAY_ERROR_STATUS.get(code, 502), errors[0] if errors else "The display tool failed.", errors, code)
+    return payload
+
+
+def invalidate_display_caches() -> None:
+    """Forget cached catalog answers (call after anything that changes displays.json)."""
+    with _DISPLAY_CACHE_LOCK:
+        _DISPLAY_CACHE.clear()
+
+
+def display_catalog(live: bool) -> dict[str, Any]:
+    now = time.monotonic()
+    with _DISPLAY_CACHE_LOCK:
+        cached = _DISPLAY_CACHE.get(live)
+        if cached and now - cached[0] < DISPLAY_CATALOG_TTL_S:
+            return cached[1]
+    payload = run_display_tool(["catalog", *(["--live"] if live else []), "--json"])
+    with _DISPLAY_CACHE_LOCK:
+        _DISPLAY_CACHE[live] = (time.monotonic(), payload)
+    return payload
+
+
+def display_details(only: str | None = None) -> dict[str, Any]:
+    """Every display with its ``show --json`` output; one that fails is listed with an error instead."""
+    listed = run_display_tool(["list", "--json"]).get("displays", [])
+    entries = [item for item in listed if isinstance(item, dict) and isinstance(item.get("id"), str) and DISPLAY_ID_RE.fullmatch(item["id"])]
+    if only is not None:
+        entries = [item for item in entries if item["id"] == only]
+        if not entries:
+            raise DisplayToolError(404, "Unknown display id")
+
+    def one(item: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return run_display_tool(["show", item["id"], "--json"])
+        except DisplayToolError as exc:
+            return {"id": item["id"], "name": str(item.get("name", ""))[:80], "board": str(item.get("board", ""))[:80], "error": exc.message}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        details = list(pool.map(one, entries))
+    return {"schema": 1, "displays": details}
+
+
+# --- Displays tab: edit, save, apply (deploy), history, restore, rollback ------------------------------
+
+DISPLAY_SAVE_TIMEOUT_S = 40
+DISPLAY_SAVE_KEYS = {"pages", "theme", "new_instruments", "new_notifications", "instrument_edits"}
+DISPLAY_REVISION_RE = re.compile(r"^[0-9a-f]{64}$")
+DISPLAY_STAMP_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z(-[0-9]{1,3})?$")
+DISPLAY_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+DISPLAY_RESERVED_HOSTS = {"bootsel", "mqtt", "mqttip", "ota", "serial"}
+DISPLAY_BUSY_MESSAGE = ("Another operation (a backup, an update or a screen upload) is running. "
+                        "Wait for it to finish, then try again.")
+
+
+def valid_ota_host(value: Any) -> str:
+    """An IP address or an RFC 1123 host name; never an option, URL, path or scope id.
+
+    Mirrors ``firmware.validate_host`` (a test keeps them in step) and is a little stricter: no ``%``
+    scope ids. The command validates again before anything is uploaded.
+    """
+    message = "Enter the display's IP address or host name (letters, digits, hyphens and dots)"
+    if not isinstance(value, str) or not value or len(value) > 253 or value != value.strip() or "%" in value:
+        raise ValueError(message)
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    labels = value.rstrip(".").split(".")
+    if not all(DISPLAY_HOST_LABEL_RE.fullmatch(label) for label in labels) or labels[-1].isdigit():
+        raise ValueError(message)
+    if value.casefold() in DISPLAY_RESERVED_HOSTS or value.startswith("COM"):
+        raise ValueError("That name is reserved by ESPHome; use the display's IP address")
+    return value
+
+
+def valid_serial_target(value: Any) -> str:
+    """A path from the current ``serial-ports --json`` answer (either spelling it lists), nothing else."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("Choose a USB port")
+    ports = run_display_tool(["serial-ports", "--json"]).get("ports")
+    allowed = set()
+    for port in ports if isinstance(ports, list) else []:
+        if isinstance(port, dict):
+            allowed.update(item for item in (port.get("path"), port.get("device")) if isinstance(item, str))
+    if value not in allowed:
+        raise ValueError("That USB port is not connected any more. Plug the display in and refresh the list")
+    return value
+
+
+def display_busy_guard():
+    """Hold the global operation slot for a short synchronous write, or answer 409."""
+    try:
+        return take_lifecycle_slot()
+    except ValueError as exc:
+        raise DisplayToolError(409, DISPLAY_BUSY_MESSAGE) from exc
+
+
+def display_save(payload: dict[str, Any]) -> dict[str, Any]:
+    display_id = valid_display_id(payload.get("id"))
+    revision = payload.get("revision")
+    if not isinstance(revision, str) or not DISPLAY_REVISION_RE.fullmatch(revision):
+        raise ValueError("revision is required (reload the display)")
+    extra = set(payload) - DISPLAY_SAVE_KEYS - {"id", "revision"}
+    if extra:
+        raise ValueError("Unsupported field: " + sorted(extra)[0][:40])
+    if not isinstance(payload.get("pages"), list):
+        raise ValueError("pages must be a list")
+    body = {key: payload[key] for key in DISPLAY_SAVE_KEYS if key in payload}
+    text = json.dumps(body)
+    if len(text.encode("utf-8")) > 1024 * 1024:
+        raise ValueError("Request is too large")
+    slot = display_busy_guard()
+    try:
+        result = run_display_tool(["set-pages", display_id, "--if-revision", revision, "--stdin"],
+                                  timeout=DISPLAY_SAVE_TIMEOUT_S, input_text=text)
+    finally:
+        release_lifecycle_slot(slot)
+        invalidate_display_caches()
+    return result
+
+
+def display_restore(payload: dict[str, Any]) -> dict[str, Any]:
+    stamp, revision = payload.get("stamp"), payload.get("revision")
+    if not isinstance(stamp, str) or not DISPLAY_STAMP_RE.fullmatch(stamp):
+        raise ValueError("Choose a backup from the list")
+    if not isinstance(revision, str) or not DISPLAY_REVISION_RE.fullmatch(revision):
+        raise ValueError("revision is required (reload the displays)")
+    slot = display_busy_guard()
+    try:
+        result = run_display_tool(["restore-config", stamp, "--if-revision", revision], timeout=DISPLAY_SAVE_TIMEOUT_S)
+    finally:
+        release_lifecycle_slot(slot)
+        invalidate_display_caches()
+    return result
+
+
+def confirm_new_ota_target(display_id: str, target: str, confirmed: Any) -> None:
+    """The firmware image contains the boat's Wi-Fi password: a Wi-Fi target other than the one that
+    last worked (or any target when none is recorded) needs ``confirm_new_target: true``."""
+    if confirmed is not None and not isinstance(confirmed, bool):
+        raise ValueError("confirm_new_target must be true or false")
+    if confirmed:
+        return
+    detail = run_display_tool(["show", display_id, "--json"])
+    last = ((detail.get("readiness") or {}).get("last_flash") or {}).get("ota_target")
+    if not isinstance(last, str) or last.casefold() != target.casefold():
+        raise ValueError("This address is not the one used for the last successful upload. The firmware "
+                         "contains this boat's Wi-Fi password: confirm that you want to send it to "
+                         f"{target} (confirm_new_target)")
+
+
+def display_upload_command(kind: str, payload: dict[str, Any]) -> tuple[str, list[str]]:
+    """The label and argv of a screen upload: ``deploy`` (build if needed + upload) or ``rollback``."""
+    display_id = valid_display_id(payload.get("id"))
+    method = payload.get("method")
+    if method == "ota":
+        flag, target = "--ota", valid_ota_host(payload.get("target"))
+        confirm_new_ota_target(display_id, target, payload.get("confirm_new_target"))
+    elif method == "serial":
+        flag, target = "--serial", valid_serial_target(payload.get("target"))
+    else:
+        raise ValueError("method must be ota or serial")
+    if kind == "deploy":
+        return f"display deploy {display_id}", display_argv("deploy", display_id, flag, target, "--progress")
+    return f"display rollback {display_id}", display_argv("flash", display_id, "--previous", flag, target, "--progress")
+
+
+def start_display_upload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    label, argv = display_upload_command(kind, payload)
+    try:
+        started = OPERATIONS.start(label, argv)
+    except ValueError as exc:
+        raise DisplayToolError(409, DISPLAY_BUSY_MESSAGE) from exc
+    invalidate_display_caches()
+    return started
+
+
 def command_stdout(command: list[str], timeout: int = 20) -> tuple[int, str]:
     """Like command_output, but stderr is dropped so a warning cannot corrupt JSON."""
     try:
@@ -1202,6 +1435,52 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_displays(self, path: str) -> None:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            if path == "/api/displays":
+                only = query.get("id", [None])[0]
+                self.send_json(200, display_details(valid_display_id(only) if only is not None else None))
+            elif path == "/api/displays/themes":
+                self.send_json(200, run_display_tool(["themes", "--json"]))
+            elif path == "/api/displays/catalog":
+                live = query.get("live", [""])[0]
+                if live not in {"", "0", "1"}:
+                    raise ValueError("live must be 0 or 1")
+                self.send_json(200, display_catalog(live == "1"))
+            elif path == "/api/displays/serial-ports":
+                self.send_json(200, run_display_tool(["serial-ports", "--json"]))
+            elif path == "/api/displays/history":
+                self.send_json(200, run_display_tool(["history", "--json"]))
+            else:
+                self.send_json(404, {"error": "Not found"})
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except DisplayToolError as exc:
+            self.send_json(exc.status, {"error": exc.message, "errors": exc.errors, "code": exc.code})
+        except Exception:
+            self.send_json(500, {"error": "The display tool failed unexpectedly."})
+
+    def post_displays(self, path: str, payload: dict[str, Any]) -> None:
+        """POST /api/displays/{save,deploy,restore,rollback}: fixed argv, validated input, nothing secret."""
+        try:
+            if path == "/api/displays/save":
+                self.send_json(200, display_save(payload))
+            elif path == "/api/displays/restore":
+                self.send_json(200, display_restore(payload))
+            elif path == "/api/displays/deploy":
+                self.send_json(202, start_display_upload("deploy", payload))
+            elif path == "/api/displays/rollback":
+                self.send_json(202, start_display_upload("rollback", payload))
+            else:
+                self.send_json(404, {"error": "Not found"})
+        except ValueError as exc:
+            self.send_json(400, {"error": str(exc)})
+        except DisplayToolError as exc:
+            self.send_json(exc.status, {"error": exc.message, "errors": exc.errors, "code": exc.code})
+        except Exception:
+            self.send_json(500, {"error": "The display tool failed unexpectedly."})
+
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
@@ -1235,6 +1514,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                     self.send_json(502, {"error": "Release catalog unavailable; please retry."})
                     return
                 self.send_json(200, catalog)
+            elif path.startswith("/api/displays"):
+                self.send_displays(path)
             else:
                 self.send_json(404, {"error": "Not found"})
             return
@@ -1256,6 +1537,9 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self.read_payload()
+            if path.startswith("/api/displays/"):
+                self.post_displays(path, payload)
+                return
             if path == "/api/config":
                 updates = payload.get("settings", payload)
                 if not isinstance(updates, dict):

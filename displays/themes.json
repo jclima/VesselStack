@@ -1,0 +1,273 @@
+{
+  "schema": 1,
+  "themes": {
+    "classic": {
+      "description": "Dark slate tiles on black; the original look",
+      "day": {
+        "page_bg": "#000000",
+        "tile": "#101820",
+        "label": "#9AA5B1",
+        "value": "#FFFFFF",
+        "clock": "#FFFFFF",
+        "title": "#9AA5B1",
+        "dot_ok": "#1E7B34",
+        "dot_bad": "#C62828",
+        "dot_unknown": "#37474F",
+        "page_hi": "#FFFFFF",
+        "page_lo": "#37474F",
+        "track": "#263238"
+      },
+      "night": {
+        "page_bg": "#000000",
+        "tile": "#000000",
+        "label": "#6A1600",
+        "value": "#B02400",
+        "clock": "#A02000",
+        "title": "#6A1600",
+        "dot_ok": "#6B3000",
+        "dot_bad": "#B00000",
+        "dot_unknown": "#2A0A00",
+        "page_hi": "#A02000",
+        "page_lo": "#2A0A00",
+        "track": "#1A0800"
+      },
+      "sev": {
+        "day": {
+          "unknown": ["#37474F", "#9AA5B1"],
+          "ok": ["#1E7B34", "#FFFFFF"],
+          "warn": ["#F2A900", "#000000"],
+          "alarm": ["#C62828", "#FFFFFF"]
+        },
+        "night": {
+          "unknown": ["#000000", "#5A1200"],
+          "ok": ["#2A0800", "#C02800"],
+          "warn": ["#7A3E00", "#F0B060"],
+          "alarm": ["#B00000", "#FFB090"]
+        }
+      },
+      "gauge": {
+        "day": {
+          "unknown": "#37474F",
+          "ok": "#1E7B34",
+          "warn": "#F2A900",
+          "alarm": "#C62828",
+          "neutral": "#2E86C1"
+        },
+        "night": {
+          "unknown": "#2A0A00",
+          "ok": "#6B3000",
+          "warn": "#B06A00",
+          "alarm": "#C00000",
+          "neutral": "#8A4A00"
+        }
+      },
+      "shape": {
+        "tile_radius": 14,
+        "tile_pad": 4,
+        "tile_border_width": 0,
+        "tile_border": null
+      }
+    },
+    "high-contrast": {
+      "description": "Black tiles, pure white values and a light tile border, for direct sunlight",
+      "day": {
+        "page_bg": "#000000",
+        "tile": "#000000",
+        "label": "#D0D8E0",
+        "value": "#FFFFFF",
+        "clock": "#FFFFFF",
+        "title": "#D0D8E0",
+        "dot_ok": "#2EAF4A",
+        "dot_bad": "#E53935",
+        "dot_unknown": "#5C6B73",
+        "page_hi": "#FFFFFF",
+        "page_lo": "#5C6B73",
+        "track": "#37474F"
+      },
+      "night": {
+        "page_bg": "#000000",
+        "tile": "#000000",
+        "label": "#6A1600",
+        "value": "#B02400",
+        "clock": "#A02000",
+        "title": "#6A1600",
+        "dot_ok": "#6B3000",
+        "dot_bad": "#B00000",
+        "dot_unknown": "#2A0A00",
+        "page_hi": "#A02000",
+        "page_lo": "#2A0A00",
+        "track": "#1A0800"
+      },
+      "sev": {
+        "day": {
+          "unknown": ["#37474F", "#E0E6EB"],
+          "ok": ["#0B6B25", "#FFFFFF"],
+          "warn": ["#8A5A00", "#FFFFFF"],
+          "alarm": ["#B71C1C", "#FFFFFF"]
+        },
+        "night": {
+          "unknown": ["#000000", "#5A1200"],
+          "ok": ["#2A0800", "#C02800"],
+          "warn": ["#7A3E00", "#F0B060"],
+          "alarm": ["#B00000", "#FFB090"]
+        }
+      },
+      "gauge": {
+        "day": {
+          "unknown": "#5C6B73",
+          "ok": "#2EAF4A",
+          "warn": "#FFC107",
+          "alarm": "#E53935",
+          "neutral": "#4FA3E0"
+        },
+        "night": {
+          "unknown": "#2A0A00",
+          "ok": "#6B3000",
+          "warn": "#B06A00",
+          "alarm": "#C00000",
+          "neutral": "#8A4A00"
+        }
+      },
+      "shape": {
+        "tile_radius": 14,
+        "tile_pad": 4,
+        "tile_border_width": 2,
+        "tile_border": "#D0D8E0"
+      }
+    },
+    "daylight": {
+      "description": "Light page and tiles with dark text; pastel severity colours",
+      "day": {
+        "page_bg": "#E4E8EC",
+        "tile": "#FFFFFF",
+        "label": "#3A4550",
+        "value": "#101820",
+        "clock": "#101820",
+        "title": "#3A4550",
+        "dot_ok": "#1E7B34",
+        "dot_bad": "#C62828",
+        "dot_unknown": "#90A4AE",
+        "page_hi": "#101820",
+        "page_lo": "#B0BEC5",
+        "track": "#CFD8DC"
+      },
+      "night": {
+        "page_bg": "#000000",
+        "tile": "#000000",
+        "label": "#6A1600",
+        "value": "#B02400",
+        "clock": "#A02000",
+        "title": "#6A1600",
+        "dot_ok": "#6B3000",
+        "dot_bad": "#B00000",
+        "dot_unknown": "#2A0A00",
+        "page_hi": "#A02000",
+        "page_lo": "#2A0A00",
+        "track": "#1A0800"
+      },
+      "sev": {
+        "day": {
+          "unknown": ["#CFD8DC", "#37474F"],
+          "ok": ["#8FD6A0", "#0B3D17"],
+          "warn": ["#FFD166", "#000000"],
+          "alarm": ["#F4A09A", "#4A0A0A"]
+        },
+        "night": {
+          "unknown": ["#000000", "#5A1200"],
+          "ok": ["#2A0800", "#C02800"],
+          "warn": ["#7A3E00", "#F0B060"],
+          "alarm": ["#B00000", "#FFB090"]
+        }
+      },
+      "gauge": {
+        "day": {
+          "unknown": "#B0BEC5",
+          "ok": "#1E7B34",
+          "warn": "#F2A900",
+          "alarm": "#C62828",
+          "neutral": "#2E86C1"
+        },
+        "night": {
+          "unknown": "#2A0A00",
+          "ok": "#6B3000",
+          "warn": "#B06A00",
+          "alarm": "#C00000",
+          "neutral": "#8A4A00"
+        }
+      },
+      "shape": {
+        "tile_radius": 14,
+        "tile_pad": 4,
+        "tile_border_width": 1,
+        "tile_border": "#B0BEC5"
+      }
+    },
+    "ocean": {
+      "description": "Deep navy page and tiles with blue-grey labels and white values",
+      "day": {
+        "page_bg": "#060E1C",
+        "tile": "#12305A",
+        "label": "#8FA8C4",
+        "value": "#FFFFFF",
+        "clock": "#FFFFFF",
+        "title": "#8FA8C4",
+        "dot_ok": "#1E7B34",
+        "dot_bad": "#C62828",
+        "dot_unknown": "#3E5878",
+        "page_hi": "#FFFFFF",
+        "page_lo": "#3E5878",
+        "track": "#1F3A5F"
+      },
+      "night": {
+        "page_bg": "#000000",
+        "tile": "#000000",
+        "label": "#6A1600",
+        "value": "#B02400",
+        "clock": "#A02000",
+        "title": "#6A1600",
+        "dot_ok": "#6B3000",
+        "dot_bad": "#B00000",
+        "dot_unknown": "#2A0A00",
+        "page_hi": "#A02000",
+        "page_lo": "#2A0A00",
+        "track": "#1A0800"
+      },
+      "sev": {
+        "day": {
+          "unknown": ["#3A5272", "#E6EEF7"],
+          "ok": ["#145A27", "#FFFFFF"],
+          "warn": ["#6E4900", "#FFFFFF"],
+          "alarm": ["#9E1B1B", "#FFFFFF"]
+        },
+        "night": {
+          "unknown": ["#000000", "#5A1200"],
+          "ok": ["#2A0800", "#C02800"],
+          "warn": ["#7A3E00", "#F0B060"],
+          "alarm": ["#B00000", "#FFB090"]
+        }
+      },
+      "gauge": {
+        "day": {
+          "unknown": "#3E5878",
+          "ok": "#1E7B34",
+          "warn": "#F2A900",
+          "alarm": "#C62828",
+          "neutral": "#4FA3E0"
+        },
+        "night": {
+          "unknown": "#2A0A00",
+          "ok": "#6B3000",
+          "warn": "#B06A00",
+          "alarm": "#C00000",
+          "neutral": "#8A4A00"
+        }
+      },
+      "shape": {
+        "tile_radius": 14,
+        "tile_pad": 4,
+        "tile_border_width": 0,
+        "tile_border": null
+      }
+    }
+  }
+}

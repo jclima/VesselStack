@@ -32,6 +32,8 @@ displays.secrets.json
 secrets.yaml
 .esphome/
 displays/build/
+displays-backups/
+last-flash.json
 /build/
 *.bin
 *.elf

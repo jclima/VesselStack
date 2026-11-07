@@ -5,9 +5,15 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +26,9 @@ SPEC.loader.exec_module(panel)
 # Keep the durable lifecycle lock inside the test fixture rather than the
 # privileged production default. Individual tests still patch their env files.
 panel.ROOT = Path(tempfile.mkdtemp(prefix="vesselstack-panel-test-"))
+
+
+sys.path[:0] = [str(ROOT / "displays"), str(ROOT / "tests"), str(ROOT / "tests" / "fixtures")]
 
 
 class EnvironmentFileTests(unittest.TestCase):
@@ -727,7 +736,6 @@ class StatusFieldTests(unittest.TestCase):
         with mock.patch.object(panel, "installed_version", return_value="0.6.0"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
             self.assertFalse(panel.restart_needed())
 
-
     # ---- backup preflight and one-shot backup choices
 
     def _preflight(self, mount, listing=None, env_text="", code=0):
@@ -874,6 +882,473 @@ class StatusFieldTests(unittest.TestCase):
             self.assertEqual(ran, expected)
             self.assertEqual(operation["state"], "failed" if failing else "succeeded")
 
+
+class DisplaysApiBase(unittest.TestCase):
+    """Shared server and subprocess fakes for the Displays API tests (subprocess is mocked)."""
+
+    TOKEN = "panel-token-for-displays-tests"
+    CTL = "/usr/local/sbin/vesselstackctl"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        control = Path(self._tmp.name) / "control.env"
+        panel.write_env(control, {"CONTROL_PANEL_TOKEN": self.TOKEN}, [])
+        patches = [mock.patch.object(panel, "PANEL_ENV", control), mock.patch.object(panel, "CTL", Path(self.CTL)),
+                   mock.patch.dict(panel.os.environ, {}, clear=True)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        quiet = mock.patch.object(panel.ControlPanelHandler, "log_message", lambda *a, **k: None)
+        quiet.start()
+        self.addCleanup(quiet.stop)
+        panel.invalidate_display_caches()
+        self.addCleanup(panel.invalidate_display_caches)
+        self.calls: list[list[str]] = []
+        self.kwargs: list[dict] = []
+        self.responses: dict[tuple, subprocess.CompletedProcess] = {}
+        run = mock.patch.object(panel.subprocess, "run", side_effect=self.fake_run)
+        run.start()
+        self.addCleanup(run.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), panel.ControlPanelHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def fake_run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        self.kwargs.append(kwargs)
+        self.assertEqual(kwargs.get("stderr"), subprocess.PIPE, "stderr must never be merged into the JSON")
+        self.assertIn("timeout", kwargs)
+        answer = self.responses.get(tuple(argv[1:]))
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer or subprocess.CompletedProcess(argv, 1, "", "unexpected call")
+
+    def answer(self, args, payload, code=0, stderr="") -> None:
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        self.responses[tuple(args)] = subprocess.CompletedProcess([], code, text, stderr)
+
+    def get(self, path, token="default"):
+        headers = {} if token is None else {"X-VesselStack-Token": self.TOKEN if token == "default" else token}
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}{path}", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    def post(self, path, body=None, token="default", headers=None, raw=None, content_type="application/json"):
+        data = raw if raw is not None else json.dumps(body if body is not None else {}).encode()
+        all_headers = {"Content-Type": content_type} if content_type else {}
+        if token is not None:
+            all_headers["X-VesselStack-Token"] = self.TOKEN if token == "default" else token
+        all_headers.update(headers or {})
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}{path}", data=data, headers=all_headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+
+class DisplaysApiTests(DisplaysApiBase):
+    """GET /api/displays*: fixed argv, auth, cache, error mapping and no secrets (subprocess is mocked)."""
+
+    def test_every_endpoint_needs_the_token(self) -> None:
+        for path in ("/api/displays", "/api/displays?id=helm", "/api/displays/themes", "/api/displays/catalog",
+                     "/api/displays/catalog?live=1", "/api/displays/serial-ports", "/api/displays/history"):
+            self.assertEqual(self.get(path, None)[0], 401, path)
+            self.assertEqual(self.get(path, "wrong")[0], 401, path)
+        self.assertEqual(self.calls, [], "nothing runs before authentication")
+
+    def test_display_id_regex_matches_the_cli(self) -> None:
+        import schema
+        self.assertEqual(panel.DISPLAY_ID_RE.pattern, schema.DISPLAY_ID.pattern)
+
+    def test_themes_and_serial_ports_argv(self) -> None:
+        self.answer(["display", "themes", "--json"], {"schema": 1, "themes": {"classic": {}}})
+        self.answer(["display", "serial-ports", "--json"], {"schema": 1, "ports": []})
+        self.assertEqual(self.get("/api/displays/themes")[0], 200)
+        self.assertEqual(self.get("/api/displays/serial-ports")[0], 200)
+        self.assertEqual(self.calls, [[self.CTL, "display", "themes", "--json"], [self.CTL, "display", "serial-ports", "--json"]])
+
+    def test_displays_lists_then_shows_each_display_with_fixed_argv(self) -> None:
+        self.answer(["display", "list", "--json"], {"schema": 1, "displays": [{"id": "helm", "name": "Helm", "board": "b", "pages": 1}, {"id": "aux", "name": "Aux", "board": "b", "pages": 1}]})
+        self.answer(["display", "show", "helm", "--json"], {"schema": 1, "display": {"id": "helm"}})
+        self.answer(["display", "show", "aux", "--json"], {"ok": False, "code": 2, "errors": ["boom in aux"]}, code=2)
+        status, body = self.get("/api/displays")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["displays"][0], {"schema": 1, "display": {"id": "helm"}})
+        self.assertEqual(data["displays"][1], {"id": "aux", "name": "Aux", "board": "b", "error": "boom in aux"}, "one failing display does not fail the rest")
+        self.assertEqual(sorted(self.calls), sorted([[self.CTL, "display", "list", "--json"], [self.CTL, "display", "show", "helm", "--json"], [self.CTL, "display", "show", "aux", "--json"]]))
+
+    def test_single_display_and_invalid_ids(self) -> None:
+        self.answer(["display", "list", "--json"], {"schema": 1, "displays": [{"id": "helm", "name": "Helm", "board": "b", "pages": 1}]})
+        self.answer(["display", "show", "helm", "--json"], {"schema": 1, "display": {"id": "helm"}})
+        self.assertEqual(len(json.loads(self.get("/api/displays?id=helm")[1])["displays"]), 1)
+        self.assertEqual(self.get("/api/displays?id=other")[0], 404)
+        self.calls.clear()
+        for bad in ("Helm", "-x", "a b", "a;rm", "../x", "x" * 40, "a%00b"):
+            self.assertEqual(self.get("/api/displays?id=" + urllib.request.quote(bad))[0], 400, bad)
+        self.assertEqual(self.calls, [], "an invalid id never reaches a command line")
+        for bad in ("Helm", "--live", "a b", None, 5):
+            with self.assertRaises(ValueError):
+                panel.valid_display_id(bad)
+        self.assertEqual(panel.valid_display_id("helm-2"), "helm-2")
+
+    def test_listed_ids_are_validated_too(self) -> None:
+        self.answer(["display", "list", "--json"], {"schema": 1, "displays": [{"id": "--evil", "name": "x", "board": "b"}, {"id": "ok", "name": "Ok", "board": "b"}]})
+        self.answer(["display", "show", "ok", "--json"], {"schema": 1, "display": {"id": "ok"}})
+        self.assertEqual(self.get("/api/displays")[0], 200)
+        self.assertNotIn([self.CTL, "display", "show", "--evil", "--json"], self.calls)
+
+    def test_catalog_argv_live_flag_and_validation(self) -> None:
+        self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": [], "live": {"requested": False}})
+        self.answer(["display", "catalog", "--live", "--json"], {"schema": 1, "rows": [], "live": {"requested": True}})
+        self.assertEqual(self.get("/api/displays/catalog")[0], 200)
+        self.assertEqual(self.get("/api/displays/catalog?live=0")[0], 200)
+        self.assertEqual(self.get("/api/displays/catalog?live=1")[0], 200)
+        self.assertEqual(self.calls, [[self.CTL, "display", "catalog", "--json"], [self.CTL, "display", "catalog", "--live", "--json"]])
+        self.calls.clear()
+        for bad in ("yes", "true", "1;x", "--json", "2"):
+            self.assertEqual(self.get("/api/displays/catalog?live=" + urllib.request.quote(bad))[0], 400, bad)
+        self.assertEqual(self.calls, [])
+
+    def test_catalog_cache_keyed_by_live_expires_and_skips_errors(self) -> None:
+        self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": []})
+        self.answer(["display", "catalog", "--live", "--json"], {"schema": 1, "rows": []})
+        clock = [1000.0]
+        with mock.patch.object(panel.time, "monotonic", side_effect=lambda: clock[0]):
+            self.get("/api/displays/catalog"); self.get("/api/displays/catalog")
+            self.assertEqual(len(self.calls), 1, "second call within 30 s is served from memory")
+            self.get("/api/displays/catalog?live=1")
+            self.assertEqual(len(self.calls), 2, "the live flag is part of the cache key")
+            clock[0] += 29
+            self.get("/api/displays/catalog"); self.assertEqual(len(self.calls), 2)
+            clock[0] += 2
+            self.get("/api/displays/catalog"); self.assertEqual(len(self.calls), 3, "expires after 30 s")
+            panel.invalidate_display_caches()
+            self.get("/api/displays/catalog"); self.assertEqual(len(self.calls), 4, "invalidate_display_caches forgets it")
+            # A failure is not cached.
+            panel.invalidate_display_caches(); self.calls.clear()
+            self.answer(["display", "catalog", "--json"], {"ok": False, "code": 1, "errors": ["x"]}, code=1)
+            self.assertEqual(self.get("/api/displays/catalog")[0], 502)
+            self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": []})
+            self.assertEqual(self.get("/api/displays/catalog")[0], 200)
+            self.assertEqual(len(self.calls), 2)
+
+    def test_catalog_uses_a_short_timeout(self) -> None:
+        self.answer(["display", "catalog", "--live", "--json"], {"schema": 1, "rows": []})
+        seen = {}
+        original = self.fake_run
+        def spy(argv, **kwargs):
+            seen.update(kwargs)
+            return original(argv, **kwargs)
+        with mock.patch.object(panel.subprocess, "run", side_effect=spy):
+            self.get("/api/displays/catalog?live=1")
+        self.assertEqual(seen["timeout"], 12)
+
+    def test_cli_failures_become_structured_errors_without_leaking(self) -> None:
+        trace = "Traceback (most recent call last):\n  File \"/opt/vesselstack/displays/x.py\", line 1\nSECRET-IN-STDERR"
+        cases = [
+            (subprocess.CompletedProcess([], 2, json.dumps({"ok": False, "code": 2, "errors": ["displays.json is invalid"]}), trace), 400, "displays.json is invalid"),
+            (subprocess.CompletedProcess([], 3, json.dumps({"ok": False, "code": 3, "errors": ["changed"]}), trace), 409, "changed"),
+            (subprocess.CompletedProcess([], 1, json.dumps({"ok": False, "code": 1, "errors": ["cannot read"]}), trace), 502, "cannot read"),
+            (subprocess.CompletedProcess([], 1, "", trace), 502, "The display tool failed"),
+            (subprocess.CompletedProcess([], 0, "not json", ""), 502, "could not read"),
+            (subprocess.CompletedProcess([], 0, "[1, 2]", ""), 502, "could not read"),
+            (subprocess.TimeoutExpired(["x"], 12), 504, "too long"),
+            (FileNotFoundError("/usr/local/sbin/vesselstackctl"), 502, "not available"),
+        ]
+        for answer, status, text in cases:
+            self.responses[("display", "serial-ports", "--json")] = answer
+            code, body = self.get("/api/displays/serial-ports")
+            self.assertEqual(code, status, body)
+            data = json.loads(body)
+            self.assertIn(text, data["error"])
+            self.assertNotIn("Traceback", body); self.assertNotIn("SECRET-IN-STDERR", body); self.assertNotIn("/usr/local/sbin", body)
+
+    def test_responses_from_real_cli_output_carry_no_secret(self) -> None:
+        import test_displays_cli as cli
+        from contextlib import redirect_stdout
+        import editor
+        case = type("Fixture", (cli.EditorTests,), {"runTest": lambda self: None})()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        ctx = case.ctx()
+        ctx.env["DISPLAYS_SIGNALK_TOKEN"] = cli.SK_TOKEN
+        case.write_config(case.cfg()["instruments"], case.cfg()["displays"])
+        secrets = [cli.ADMIN_PASSWORD, cli.WIFI_PASSWORD, cli.SK_TOKEN, "boat-net-ssid", case.sec()["displays"]["helm"]["mqtt_password"], case.sec()["bridge"]["mqtt_password"], self.TOKEN]
+        self.answer(["display", "list", "--json"], editor.list_displays(ctx))
+        self.answer(["display", "show", "helm", "--json"], editor.show(ctx, "helm"))
+        self.answer(["display", "catalog", "--json"], editor.catalog(ctx))
+        self.answer(["display", "serial-ports", "--json"], editor.serial_ports(ctx))
+        for path in ("/api/displays", "/api/displays/catalog", "/api/displays/serial-ports"):
+            status, body = self.get(path)
+            self.assertEqual(status, 200, body)
+            for value in secrets:
+                self.assertNotIn(value, body, path)
+        self.assertEqual(json.loads(self.get("/api/displays")[1])["displays"][0]["display"]["id"], "helm")
+
+
+
+REV = "a" * 64
+
+
+class DisplaysWriteApiTests(DisplaysApiBase):
+    """POST /api/displays/{save,restore,deploy,rollback} and GET history: auth, origin, validation, exact argv."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.slot_calls: list[str] = []
+        self.busy = False
+
+        def take():
+            if self.busy:
+                raise ValueError("Another operation is already running")
+            self.slot_calls.append("take")
+            return 99
+
+        def release(fd):
+            self.slot_calls.append("release")
+        for patch in (mock.patch.object(panel, "take_lifecycle_slot", side_effect=take),
+                      mock.patch.object(panel, "release_lifecycle_slot", side_effect=release)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.operations = mock.Mock()
+        self.operations.start.return_value = {"state": "running", "id": 7}
+        patch = mock.patch.object(panel, "OPERATIONS", self.operations)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    SAVE = {"id": "helm", "revision": REV, "pages": [{"title": "Nav", "layout": "grid-2x2", "items": ["sog"]}], "theme": "ocean"}
+    ENDPOINTS = {"/api/displays/save": SAVE, "/api/displays/restore": {"stamp": "20260101T120000Z", "revision": REV},
+                 "/api/displays/deploy": {"id": "helm", "method": "ota", "target": "192.0.2.50"},
+                 "/api/displays/rollback": {"id": "helm", "method": "ota", "target": "192.0.2.50"}}
+
+    def test_history_is_a_fixed_get(self) -> None:
+        self.answer(["display", "history", "--json"], {"schema": 1, "backups": []})
+        self.assertEqual(self.get("/api/displays/history")[0], 200)
+        self.assertEqual(self.calls, [[self.CTL, "display", "history", "--json"]])
+
+    def test_every_post_needs_the_token_and_a_matching_origin(self) -> None:
+        for path, body in self.ENDPOINTS.items():
+            self.assertEqual(self.post(path, body, token=None)[0], 401, path)
+            self.assertEqual(self.post(path, body, token="wrong")[0], 401, path)
+            self.assertEqual(self.post(path, body, headers={"Origin": "http://evil.example"})[0], 403, path)
+            self.assertEqual(self.post(path, body, headers={"Origin": "http://127.0.0.1:1"})[0], 403, path)
+        self.assertEqual(self.calls, [])
+        self.operations.start.assert_not_called()
+
+    def test_content_type_size_and_shape(self) -> None:
+        for path in self.ENDPOINTS:
+            self.assertEqual(self.post(path, raw=b"{}", content_type="text/plain")[0], 400, path)
+            self.assertEqual(self.post(path, raw=b"{}", content_type=None)[0], 400, path)
+            self.assertEqual(self.post(path, raw=b"[1]")[0], 400, path)
+            self.assertEqual(self.post(path, raw=b"not json")[0], 400, path)
+            import http.client
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+            connection.putrequest("POST", path)  # declare a body over 1 MiB; the server refuses before reading it
+            for name, value in (("Content-Type", "application/json"), ("X-VesselStack-Token", self.TOKEN), ("Content-Length", str(1024 * 1024 + 1))):
+                connection.putheader(name, value)
+            connection.endheaders()
+            self.assertEqual(connection.getresponse().status, 400, path)
+            connection.close()
+        self.assertEqual(self.post("/api/displays/unknown", {})[0], 404)
+        self.assertEqual(self.calls, [])
+
+    def test_save_runs_set_pages_with_the_body_on_stdin_only(self) -> None:
+        reply = {"ok": True, "changed": True, "revision": "b" * 64, "rebuild_needed": ["helm"]}
+        self.answer(["display", "set-pages", "helm", "--if-revision", REV, "--stdin"], reply)
+        status, body = self.post("/api/displays/save", {**self.SAVE, "new_instruments": {"x": {"path": "a.b"}}})
+        self.assertEqual((status, json.loads(body)), (200, reply))
+        self.assertEqual(self.calls, [[self.CTL, "display", "set-pages", "helm", "--if-revision", REV, "--stdin"]])
+        sent = json.loads(self.kwargs[0]["input"])
+        self.assertEqual(set(sent), {"pages", "theme", "new_instruments"}, "id and revision are not part of the request body")
+        self.assertEqual(sent["pages"], self.SAVE["pages"])
+        self.assertEqual(self.kwargs[0]["timeout"], 40)
+        self.assertNotIn("sog", " ".join(self.calls[0]), "page content never reaches the argument list")
+        self.assertEqual(self.slot_calls, ["take", "release"], "the global operation slot is held while saving")
+
+    def test_save_rejects_bad_input_before_running_anything(self) -> None:
+        bad = [{**self.SAVE, "id": "--evil"}, {**self.SAVE, "id": "A"}, {**self.SAVE, "id": 7}, {k: v for k, v in self.SAVE.items() if k != "id"},
+               {**self.SAVE, "revision": "abc"}, {k: v for k, v in self.SAVE.items() if k != "revision"}, {**self.SAVE, "revision": REV + "0"},
+               {**self.SAVE, "pages": "x"}, {k: v for k, v in self.SAVE.items() if k != "pages"}, {**self.SAVE, "argv": ["--force"]}]
+        for body in bad:
+            self.assertEqual(self.post("/api/displays/save", body)[0], 400, body)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.slot_calls, [])
+
+    def test_save_is_409_while_an_operation_runs(self) -> None:
+        self.busy = True
+        status, body = self.post("/api/displays/save", self.SAVE)
+        self.assertEqual(status, 409)
+        self.assertIn("running", json.loads(body)["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_save_error_mapping_and_cache_invalidation(self) -> None:
+        args = ["display", "set-pages", "helm", "--if-revision", REV, "--stdin"]
+        self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": []})
+        self.get("/api/displays/catalog")
+        self.get("/api/displays/catalog")
+        self.assertEqual(len(self.calls), 1)
+        cases = [(2, 400, ["page 1: too many items", "second problem"]), (3, 409, ["the configuration changed since it was read"]),
+                 (4, 409, ["a build or flash for helm is running"]), (1, 502, ["cannot read"])]
+        for code, status, errors in cases:
+            self.answer(args, {"ok": False, "code": code, "errors": errors}, code=code)
+            got, body = self.post("/api/displays/save", self.SAVE)
+            self.assertEqual(got, status, code)
+            data = json.loads(body)
+            self.assertEqual(data["errors"], errors)
+            self.assertEqual(data["error"], errors[0])
+        self.assertEqual(self.slot_calls, ["take", "release"] * 4, "the slot is released after a failure too")
+        self.calls.clear()
+        self.get("/api/displays/catalog")
+        self.assertEqual(len(self.calls), 1, "a save forgets the cached catalog")
+
+    def test_restore_argv_and_validation(self) -> None:
+        self.answer(["display", "restore-config", "20260101T120000Z", "--if-revision", REV], {"ok": True, "revision": "c" * 64})
+        status, body = self.post("/api/displays/restore", {"stamp": "20260101T120000Z", "revision": REV})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.calls, [[self.CTL, "display", "restore-config", "20260101T120000Z", "--if-revision", REV]])
+        self.calls.clear()
+        self.answer(["display", "catalog", "--json"], {"schema": 1, "rows": []})
+        self.get("/api/displays/catalog")
+        self.get("/api/displays/catalog")
+        self.assertEqual(len(self.calls), 1)
+        self.post("/api/displays/restore", {"stamp": "20260101T120000Z", "revision": REV})
+        self.calls.clear()
+        self.get("/api/displays/catalog")
+        self.assertEqual(len(self.calls), 1, "a restore forgets the cached catalog")
+        self.calls.clear()
+        for body in ({"stamp": "--help", "revision": REV}, {"stamp": "20260101T120000Z"}, {"stamp": "../x", "revision": REV},
+                     {"stamp": "20260101T120000Z", "revision": "nope"}, {"stamp": 5, "revision": REV}):
+            self.assertEqual(self.post("/api/displays/restore", body)[0], 400, body)
+        self.assertEqual(self.calls, [])
+        self.busy = True
+        self.assertEqual(self.post("/api/displays/restore", {"stamp": "20260101T120000Z", "revision": REV})[0], 409)
+
+    def test_deploy_ota_and_serial_argv(self) -> None:
+        status, body = self.post("/api/displays/deploy", {"id": "helm", "method": "ota", "target": "192.0.2.50", "confirm_new_target": True})
+        self.assertEqual((status, json.loads(body)["state"]), (202, "running"))
+        self.operations.start.assert_called_with("display deploy helm", [self.CTL, "display", "deploy", "helm", "--ota", "192.0.2.50", "--progress"])
+        self.assertEqual(self.calls, [], "no serial-ports lookup for Wi-Fi")
+        self.answer(["display", "serial-ports", "--json"], {"schema": 1, "ports": [{"path": "/dev/serial/by-id/usb-X-if00", "device": "/dev/ttyACM0"}]})
+        for target in ("/dev/serial/by-id/usb-X-if00", "/dev/ttyACM0"):
+            self.assertEqual(self.post("/api/displays/deploy", {"id": "helm", "method": "serial", "target": target})[0], 202, target)
+            self.operations.start.assert_called_with("display deploy helm", [self.CTL, "display", "deploy", "helm", "--serial", target, "--progress"])
+
+    def test_deploy_target_validation(self) -> None:
+        self.answer(["display", "serial-ports", "--json"], {"schema": 1, "ports": [{"path": "/dev/serial/by-id/usb-X-if00", "device": "/dev/ttyACM0"}]})
+        for target in ("-x", "--force", "a b", " 192.0.2.50", "192.0.2.50 ", "http://192.0.2.50", "192.0.2.50:80", "a/b", "../x", "..", "x..y", "a_b",
+                       "fe80::1%eth0", "", None, 5, ["a"], "bootsel", "MQTT", "OTA", "Serial", "fe80::1%a\nb", "fe80::1%$(id)", "COM3", "a" * 300, "host\nname", "-host.local", "12345"):
+            self.assertEqual(self.post("/api/displays/deploy", {"id": "helm", "method": "ota", "target": target, "confirm_new_target": True})[0], 400, repr(target))
+        for target in ("/dev/ttyUSB0", "/dev/serial/by-id/../../sda", "/dev/serial/by-id/usb-X-if00/", "-x", "", None, "/dev/ttyACM0 --force"):
+            self.assertEqual(self.post("/api/displays/deploy", {"id": "helm", "method": "serial", "target": target})[0], 400, repr(target))
+        for body in ({"id": "--evil", "method": "ota", "target": "192.0.2.50", "confirm_new_target": True}, {"id": "helm", "method": "telnet", "target": "x"},
+                     {"id": "helm", "target": "192.0.2.50"}, {"method": "ota", "target": "192.0.2.50", "confirm_new_target": True}):
+            self.assertEqual(self.post("/api/displays/deploy", body)[0], 400, body)
+        self.operations.start.assert_not_called()
+        for target in ("192.0.2.50", "2001:db8::1", "helm.local", "boat-helm", "helm.boat.example."):
+            self.assertEqual(self.post("/api/displays/deploy", {"id": "helm", "method": "ota", "target": target, "confirm_new_target": True})[0], 202, target)
+
+    def test_host_rules_match_the_command_line_tool(self) -> None:
+        import firmware
+        import render
+        for text in ("192.0.2.50", "helm.local", "-x", "a b", "http://x", "..", "x..y", "bootsel", "ota", "SERIAL", "fe80::1%eth0", "COM3", "12345", "a_b", "2001:db8::1",
+                     "", "a" * 300, "host-", "-host", "ok-host.example.com", "1.2.3.4.5", "[::1]", "a.b.9"):
+            try:
+                firmware.validate_host(text)
+                cli = True
+            except render.RenderError:
+                cli = False
+            try:
+                panel.valid_ota_host(text)
+                web = True
+            except ValueError:
+                web = False
+            self.assertLessEqual(web, cli, f"the panel must never accept what the tool refuses: {text!r}")
+            if cli:
+                self.assertTrue(web, text)
+
+    def test_deploy_is_409_while_an_operation_runs(self) -> None:
+        self.operations.start.side_effect = ValueError("Another operation is already running")
+        status, body = self.post("/api/displays/deploy", {"id": "helm", "method": "ota", "target": "192.0.2.50", "confirm_new_target": True})
+        self.assertEqual(status, 409)
+        self.assertIn("running", json.loads(body)["error"])
+
+    def test_rollback_runs_flash_previous_without_force(self) -> None:
+        status, _ = self.post("/api/displays/rollback", {"id": "helm", "method": "ota", "target": "helm.local", "confirm_new_target": True})
+        self.assertEqual(status, 202)
+        label, argv = self.operations.start.call_args[0]
+        self.assertEqual(label, "display rollback helm")
+        self.assertEqual(argv, [self.CTL, "display", "flash", "helm", "--previous", "--ota", "helm.local", "--progress"])
+        self.assertNotIn("--force", argv)
+        self.assertEqual(self.post("/api/displays/rollback", {"id": "helm", "method": "ota", "target": "-x", "confirm_new_target": True})[0], 400)
+
+    def test_ota_target_needs_confirmation_unless_it_is_the_last_successful_one(self) -> None:
+        show = ["display", "show", "helm", "--json"]
+        for route in ("deploy", "rollback"):
+            path = f"/api/displays/{route}"
+            self.operations.start.reset_mock()
+            self.answer(show, {"readiness": {"last_flash": {"ota_target": "192.0.2.50"}}})
+            self.assertEqual(self.post(path, {"id": "helm", "method": "ota", "target": "192.0.2.50"})[0], 202, route)
+            self.assertEqual(self.post(path, {"id": "helm", "method": "ota", "target": "192.0.2.77"})[0], 400, route)
+            self.assertIn("confirm", json.loads(self.post(path, {"id": "helm", "method": "ota", "target": "192.0.2.77"})[1])["error"])
+            self.assertEqual(self.post(path, {"id": "helm", "method": "ota", "target": "192.0.2.77", "confirm_new_target": "yes"})[0], 400)
+            self.assertEqual(self.operations.start.call_count, 1, "only the matching target started")
+            self.assertEqual(self.post(path, {"id": "helm", "method": "ota", "target": "192.0.2.77", "confirm_new_target": True})[0], 202, route)
+            self.answer(show, {"readiness": {"last_flash": None}})  # nothing recorded: every Wi-Fi target is new
+            self.assertEqual(self.post(path, {"id": "helm", "method": "ota", "target": "192.0.2.50"})[0], 400, route)
+
+    def test_rollback_is_409_while_an_operation_runs(self) -> None:
+        self.operations.start.side_effect = ValueError("Another operation is already running")
+        status, body = self.post("/api/displays/rollback", {"id": "helm", "method": "ota", "target": "192.0.2.50", "confirm_new_target": True})
+        self.assertEqual(status, 409)
+        self.assertIn("running", json.loads(body)["error"])
+
+    def test_operation_output_cannot_leak_the_command_arguments(self) -> None:
+        store = panel.OperationStore()
+        with mock.patch.object(panel, "take_lifecycle_slot", return_value=1), mock.patch.object(panel, "release_lifecycle_slot"), \
+                mock.patch.object(panel.threading, "Thread"):
+            started = store.start("display deploy helm", [self.CTL, "display", "deploy", "helm", "--ota", "192.0.2.50"])
+        self.assertEqual(started["command"], [self.CTL, "[arguments hidden]"])
+
+    def test_deploy_failure_summary_extracts_the_remedy(self) -> None:
+        operation = {"state": "failed", "label": "display deploy helm", "output": [
+            "STAGE: render", "STAGE: upload", "ERROR Timed out", "error: the upload failed (exit status 1).",
+            "To fix: Check that the display is powered on."]}
+        summary = panel.summarize_operation(operation)
+        self.assertIn("upload failed", summary["reason"])
+        self.assertEqual(summary["fix"], "Check that the display is powered on.")
+
+
+class DisplaysPreviewFixtureTests(unittest.TestCase):
+    """tests/fixtures/displays/panel_show.json feeds the JS preview tests; it must be real `show` output."""
+
+    FIXTURE = ROOT / "tests" / "fixtures" / "displays" / "panel_show.json"
+    KEYS = ("display", "theme", "themes", "board", "layouts", "preview", "instruments", "notifications", "ha")
+
+    def current(self) -> dict:
+        import test_displays_cli as cli
+        import editor
+        case = type("Fixture", (cli.EditorTests,), {"runTest": lambda self: None})()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        config = json.loads((ROOT / "displays" / "displays.dashboard.example.json").read_text())
+        config["displays"]["helm"]["board"] = cli.BOARD
+        case.config.write_text(json.dumps(config))
+        shown = editor.show(case.ctx(), "helm")
+        return {key: shown[key] for key in self.KEYS}
+
+    def test_fixture_matches_the_renderer(self) -> None:
+        current = self.current()
+        if os.environ.get("UPDATE_PANEL_FIXTURE") == "1":
+            self.FIXTURE.write_text(json.dumps(current, indent=1, sort_keys=True) + "\n")
+        self.assertEqual(json.loads(self.FIXTURE.read_text()), json.loads(json.dumps(current, sort_keys=True)),
+                         "regenerate with UPDATE_PANEL_FIXTURE=1 python3 -B -m unittest tests/test_control_panel.py")
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,712 @@
+{
+ "board": {
+  "content_height": 340,
+  "content_width": 340,
+  "height": 480,
+  "id": "waveshare-esp32-s3-touch-lcd-2.8c",
+  "layouts": [
+   "single",
+   "grid-2x2",
+   "status-grid",
+   "tank-bars",
+   "gauge-arc",
+   "electrical"
+  ],
+  "name": "Waveshare ESP32-S3-Touch-LCD-2.8C",
+  "ring": {
+   "footer_y": 414,
+   "header_h": 52,
+   "header_y": 14
+  },
+  "safe_inset": 70,
+  "shape": "round",
+  "width": 480
+ },
+ "display": {
+  "board": "waveshare-esp32-s3-touch-lcd-2.8c",
+  "home_assistant_api": false,
+  "id": "helm",
+  "name": "Helm",
+  "pages": [
+   {
+    "items": [
+     "sog",
+     "depth",
+     "house_v",
+     "start_v"
+    ],
+    "layout": "grid-2x2",
+    "title": "Nav"
+   },
+   {
+    "items": [
+     "anchor",
+     "low_battery",
+     "bilge",
+     "high_water",
+     "engine",
+     "shore",
+     "watch",
+     "weather",
+     "health"
+    ],
+    "layout": "status-grid",
+    "title": "Status"
+   },
+   {
+    "items": [
+     "fuel",
+     "water",
+     "waste"
+    ],
+    "layout": "tank-bars",
+    "title": "Tanks"
+   },
+   {
+    "items": [
+     "fuel"
+    ],
+    "layout": "gauge-arc",
+    "title": "Fuel"
+   },
+   {
+    "items": [
+     "house_v",
+     "batt_soc",
+     "batt_a",
+     "shore",
+     "solar_a"
+    ],
+    "layout": "electrical",
+    "title": "Electrical"
+   }
+  ],
+  "ui": {
+   "alarm_page": 1,
+   "alarm_takeover": true,
+   "day_brightness": 100,
+   "dim_after_s": 120,
+   "header": true,
+   "night": "schedule",
+   "night_brightness": 15,
+   "swipe": true
+  }
+ },
+ "ha": {
+  "bilge": {
+   "kind": "binary",
+   "label": "Bilge",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "engine": {
+   "kind": "state",
+   "label": "Engine",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "health": {
+   "kind": "state",
+   "label": "Health",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "high_water": {
+   "kind": "binary",
+   "label": "High water",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "shore": {
+   "kind": "binary",
+   "label": "Shore",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "watch": {
+   "kind": "state",
+   "label": "Watch",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "weather": {
+   "kind": "state",
+   "label": "Weather",
+   "used_on": [
+    "helm"
+   ]
+  }
+ },
+ "instruments": {
+  "batt_a": {
+   "convert": "none",
+   "icon": "electrical_services",
+   "label": "Current",
+   "path": "electrical.batteries.house.current",
+   "precision": 1,
+   "stale_after_s": 30,
+   "unit": "A",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "batt_soc": {
+   "convert": "ratio->%",
+   "icon": "battery_charging_full",
+   "label": "SoC",
+   "max": 100,
+   "min": 0,
+   "path": "electrical.batteries.house.capacity.stateOfCharge",
+   "precision": 0,
+   "stale_after_s": 60,
+   "thresholds": {
+    "alarm_below": 20,
+    "hysteresis": 2,
+    "warn_below": 30
+   },
+   "unit": "%",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "depth": {
+   "convert": "m->ft",
+   "icon": "water",
+   "label": "Depth",
+   "path": "environment.depth.belowTransducer",
+   "precision": 1,
+   "stale_after_s": 10,
+   "thresholds": {
+    "alarm_below": 4,
+    "hysteresis": 0.5,
+    "warn_below": 8
+   },
+   "unit": "ft",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "fuel": {
+   "convert": "ratio->%",
+   "icon": "local_gas_station",
+   "label": "Fuel",
+   "max": 100,
+   "min": 0,
+   "path": "tanks.fuel.0.currentLevel",
+   "precision": 0,
+   "stale_after_s": 60,
+   "thresholds": {
+    "alarm_below": 10,
+    "hysteresis": 2,
+    "warn_below": 25
+   },
+   "unit": "%",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "house_v": {
+   "convert": "none",
+   "icon": "battery_full",
+   "label": "House",
+   "max": 16,
+   "min": 10,
+   "path": "electrical.batteries.house.voltage",
+   "precision": 2,
+   "stale_after_s": 30,
+   "thresholds": {
+    "alarm_above": 15.2,
+    "alarm_below": 11.8,
+    "hysteresis": 0.1,
+    "warn_above": 14.8,
+    "warn_below": 12.2
+   },
+   "unit": "V",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "sog": {
+   "convert": "m/s->kn",
+   "icon": "speed",
+   "label": "SOG",
+   "min_interval_ms": 500,
+   "path": "navigation.speedOverGround",
+   "precision": 1,
+   "stale_after_s": 10,
+   "unit": "kn",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "solar_a": {
+   "convert": "none",
+   "icon": "solar_power",
+   "label": "Solar",
+   "path": "electrical.solar.main.current",
+   "precision": 1,
+   "stale_after_s": 30,
+   "unit": "A",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "start_v": {
+   "convert": "none",
+   "icon": "bolt",
+   "label": "Start",
+   "path": "electrical.batteries.start.voltage",
+   "precision": 2,
+   "stale_after_s": 30,
+   "thresholds": {
+    "alarm_below": 11.5,
+    "hysteresis": 0.1,
+    "warn_below": 12.0
+   },
+   "unit": "V",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "waste": {
+   "convert": "ratio->%",
+   "icon": "oil_barrel",
+   "label": "Waste",
+   "max": 100,
+   "min": 0,
+   "path": "tanks.blackWater.0.currentLevel",
+   "precision": 0,
+   "stale_after_s": 60,
+   "thresholds": {
+    "alarm_above": 90,
+    "hysteresis": 2,
+    "warn_above": 75
+   },
+   "unit": "%",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "water": {
+   "convert": "ratio->%",
+   "icon": "water_drop",
+   "label": "Water",
+   "max": 100,
+   "min": 0,
+   "path": "tanks.freshWater.0.currentLevel",
+   "precision": 0,
+   "stale_after_s": 60,
+   "thresholds": {
+    "hysteresis": 2,
+    "warn_below": 20
+   },
+   "unit": "%",
+   "used_on": [
+    "helm"
+   ]
+  }
+ },
+ "layouts": {
+  "electrical": {
+   "capacity": 5,
+   "min_items": 3,
+   "needs_range": false,
+   "slots": [
+    {
+     "needs": [
+      "numeric"
+     ],
+     "role": "voltage",
+     "types": [
+      "instrument"
+     ]
+    },
+    {
+     "needs": [
+      "numeric",
+      "min_max"
+     ],
+     "role": "soc",
+     "types": [
+      "instrument"
+     ]
+    },
+    {
+     "needs": [
+      "numeric"
+     ],
+     "role": "current",
+     "types": [
+      "instrument"
+     ]
+    },
+    {
+     "optional": true,
+     "role": "shore",
+     "types": [
+      "instrument",
+      "notification",
+      "ha"
+     ]
+    },
+    {
+     "needs": [
+      "numeric"
+     ],
+     "optional": true,
+     "role": "solar",
+     "types": [
+      "instrument"
+     ]
+    }
+   ],
+   "types": [
+    "instrument",
+    "notification",
+    "ha"
+   ]
+  },
+  "gauge-arc": {
+   "capacity": 1,
+   "min_items": 1,
+   "needs_range": true,
+   "types": [
+    "instrument",
+    "ha"
+   ]
+  },
+  "grid-2x2": {
+   "capacity": 4,
+   "min_items": 1,
+   "needs_range": false,
+   "types": [
+    "instrument",
+    "ha"
+   ]
+  },
+  "single": {
+   "capacity": 1,
+   "min_items": 1,
+   "needs_range": false,
+   "types": [
+    "instrument",
+    "ha"
+   ]
+  },
+  "status-grid": {
+   "capacity": 9,
+   "min_items": 1,
+   "needs_range": false,
+   "types": [
+    "instrument",
+    "notification",
+    "ha"
+   ]
+  },
+  "tank-bars": {
+   "capacity": 4,
+   "min_items": 1,
+   "needs_range": true,
+   "types": [
+    "instrument",
+    "ha"
+   ]
+  }
+ },
+ "notifications": {
+  "anchor": {
+   "icon": "anchor",
+   "label": "Anchor",
+   "path": "notifications.navigation.anchor",
+   "used_on": [
+    "helm"
+   ]
+  },
+  "low_battery": {
+   "absent": "ok",
+   "icon": "battery_alert",
+   "label": "Low battery",
+   "path": "notifications.electrical.batteries.house.voltage",
+   "used_on": [
+    "helm"
+   ]
+  }
+ },
+ "preview": [
+  {
+   "cells": [
+    {
+     "height": 167,
+     "width": 167,
+     "x": 70,
+     "y": 70
+    },
+    {
+     "height": 167,
+     "width": 167,
+     "x": 243,
+     "y": 70
+    },
+    {
+     "height": 167,
+     "width": 167,
+     "x": 70,
+     "y": 243
+    },
+    {
+     "height": 167,
+     "width": 167,
+     "x": 243,
+     "y": 243
+    }
+   ],
+   "content": {
+    "height": 340,
+    "width": 340,
+    "x": 70,
+    "y": 70
+   },
+   "header": {
+    "height": 52,
+    "width": 480,
+    "x": 0,
+    "y": 14
+   },
+   "layout": "grid-2x2",
+   "screen": {
+    "height": 480,
+    "shape": "round",
+    "width": 480
+   }
+  },
+  {
+   "cells": [
+    {
+     "height": 109,
+     "width": 109,
+     "x": 70,
+     "y": 70
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 185,
+     "y": 70
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 300,
+     "y": 70
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 70,
+     "y": 185
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 185,
+     "y": 185
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 300,
+     "y": 185
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 70,
+     "y": 300
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 185,
+     "y": 300
+    },
+    {
+     "height": 109,
+     "width": 109,
+     "x": 300,
+     "y": 300
+    }
+   ],
+   "content": {
+    "height": 340,
+    "width": 340,
+    "x": 70,
+    "y": 70
+   },
+   "header": {
+    "height": 52,
+    "width": 480,
+    "x": 0,
+    "y": 14
+   },
+   "layout": "status-grid",
+   "screen": {
+    "height": 480,
+    "shape": "round",
+    "width": 480
+   },
+   "status_font": "font_status_sm"
+  },
+  {
+   "cells": [
+    {
+     "height": 210,
+     "width": 60,
+     "x": 97,
+     "y": 135
+    },
+    {
+     "height": 210,
+     "width": 60,
+     "x": 210,
+     "y": 135
+    },
+    {
+     "height": 210,
+     "width": 60,
+     "x": 323,
+     "y": 135
+    }
+   ],
+   "content": {
+    "height": 340,
+    "width": 340,
+    "x": 70,
+    "y": 70
+   },
+   "header": {
+    "height": 52,
+    "width": 480,
+    "x": 0,
+    "y": 14
+   },
+   "layout": "tank-bars",
+   "screen": {
+    "height": 480,
+    "shape": "round",
+    "width": 480
+   }
+  },
+  {
+   "arc": {
+    "box": {
+     "height": 440,
+     "width": 440,
+     "x": 20,
+     "y": 20
+    },
+    "diameter": 440,
+    "end_angle": 225,
+    "start_angle": 315,
+    "sweep": 270,
+    "width": 24
+   },
+   "cells": [
+    {
+     "height": 211,
+     "width": 264,
+     "x": 108,
+     "y": 134
+    }
+   ],
+   "content": {
+    "height": 340,
+    "width": 340,
+    "x": 70,
+    "y": 70
+   },
+   "header": {
+    "height": 52,
+    "width": 480,
+    "x": 0,
+    "y": 14
+   },
+   "layout": "gauge-arc",
+   "screen": {
+    "height": 480,
+    "shape": "round",
+    "width": 480
+   },
+   "text_box": {
+    "height": 211,
+    "width": 264,
+    "x": 108,
+    "y": 134
+   }
+  },
+  {
+   "arc": {
+    "box": {
+     "height": 440,
+     "width": 440,
+     "x": 20,
+     "y": 20
+    },
+    "diameter": 440,
+    "end_angle": 225,
+    "start_angle": 315,
+    "sweep": 270,
+    "width": 24
+   },
+   "cells": [],
+   "content": {
+    "height": 340,
+    "width": 340,
+    "x": 70,
+    "y": 70
+   },
+   "header": {
+    "height": 52,
+    "width": 480,
+    "x": 0,
+    "y": 14
+   },
+   "layout": "electrical",
+   "screen": {
+    "height": 480,
+    "shape": "round",
+    "width": 480
+   },
+   "text_box": {
+    "height": 340,
+    "width": 300,
+    "x": 90,
+    "y": 70
+   }
+  }
+ ],
+ "theme": "classic",
+ "themes": [
+  {
+   "description": "Dark slate tiles on black; the original look",
+   "id": "classic"
+  },
+  {
+   "description": "Light page and tiles with dark text; pastel severity colours",
+   "id": "daylight"
+  },
+  {
+   "description": "Black tiles, pure white values and a light tile border, for direct sunlight",
+   "id": "high-contrast"
+  },
+  {
+   "description": "Deep navy page and tiles with blue-grey labels and white values",
+   "id": "ocean"
+  }
+ ]
+}

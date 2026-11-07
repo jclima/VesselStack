@@ -175,3 +175,35 @@ The six core catalog entries are Home Assistant, InfluxDB, Grafana, Prometheus,
 Mosquitto, and Heimdall. Hardware and systemd services remain
 configuration-driven. A passing lab result does not claim physical Pi,
 hardware, or production evidence.
+
+## Exercise display editing and Apply (lab, with hardware)
+
+Needs a display added with `display add`, Wi-Fi stored (`display wifi`), Docker and about 3 GB free
+disk. Wi-Fi (OTA) updates are not yet verified on hardware: record what actually happens.
+
+1. Displays tab: **Edit pages and theme**, pick the `daylight` swatch, add a value with **Add to page**
+   (try a full page and an incompatible layout to see the disabled reasons), move and remove an item.
+   **Save**; check `sudo vesselstackctl display history` lists a new backup and `displays.json` has the edit.
+   Edit `displays.json` in a shell while the draft is open and **Save**: expect the conflict offer.
+2. **Apply to screen → By USB cable** with the display plugged in: the stepper walks Preparing, Building,
+   Sending, Done; during the run Maintenance buttons and Save are refused (409); the display restarts
+   with the new theme and page. `build/displays/ID/last-flash.json` exists with mode 0600.
+3. Repeat Apply with no change: Building is skipped ("already up to date").
+4. **Apply to screen → Over Wi-Fi** with the display's IP (for example `192.0.2.50`). Also try a wrong
+   address and a powered-off display: the **To fix:** banner appears. Record whether OTA works.
+5. History → **Restore** the older backup (the settings that were current before the last Apply). Only now
+   does **Put previous firmware back on screen** appear on the card (before the restore it is hidden and
+   a hint explains why). Press it; confirm the display shows the old pages and no Wi-Fi password appears
+   in the Details output (`[redacted]`).
+6. `display deploy` on the command line, USB first, then Wi-Fi:
+   `sudo vesselstackctl display deploy helm --serial /dev/serial/by-id/usb-... --progress`, then change the
+   theme and run `sudo vesselstackctl display deploy helm --ota 192.0.2.50 --progress`. Check
+   `last-flash.json` (mode 0600) after each and that a failed upload (unplug the display) leaves it unchanged.
+7. Wi-Fi address confirmation: in Apply → Over Wi-Fi the last address is prefilled and Start is enabled; type a
+   different address (for example `192.0.2.51`): a checkbox "Send firmware, which contains this boat's Wi-Fi
+   password, to 192.0.2.51" appears and Start stays disabled until ticked. A direct `POST /api/displays/deploy`
+   with a new address and no `confirm_new_target` returns 400.
+8. Lifecycle slot: while an Apply runs, start a backup or an update from Maintenance and Updates and expect
+   them to be refused as busy; try Save and Restore too (409).
+9. Downgrade note: before installing an older VesselStack run `sudo vesselstackctl display set-theme helm classic`
+   for every themed display (older versions reject the `theme` key and the bridge exits).

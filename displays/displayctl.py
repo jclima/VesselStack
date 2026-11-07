@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import editor  # noqa: E402
 import firmware  # noqa: E402
 import lifecycle  # noqa: E402
 import mqtt_auth  # noqa: E402
@@ -164,8 +166,11 @@ def cmd_bridge_env(args) -> int:
     return 0
 
 
+# SIGNALK_URL, DISPLAYS_SIGNALK_TOKEN and BOAT_UNITS feed 'catalog'; the token is only ever sent to
+# SIGNALK_URL and never printed. VESSELSTACK_DATA_BIND_ADDRESS feeds the 'show' readiness block.
 LIFECYCLE_ENV_KEYS = ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
-                      "DISPLAYS_BRIDGE_MQTT_USERNAME")
+                      "DISPLAYS_BRIDGE_MQTT_USERNAME", "SIGNALK_URL", "DISPLAYS_SIGNALK_TOKEN", "BOAT_UNITS",
+                      "VESSELSTACK_DATA_BIND_ADDRESS")
 
 
 def run_lifecycle(args, action) -> int:
@@ -191,7 +196,82 @@ def run_lifecycle(args, action) -> int:
     return result if isinstance(result, int) else 0
 
 
+def run_json(args, action, text_kind=None) -> int:
+    """Run an editor action that returns a dict; print it as JSON (or text without --json).
+
+    A failure prints ``{"ok": false, "code": N, "errors": [...]}`` on stdout and the first error on
+    stderr. Exit codes: 0 done, 1 failed (I/O, lock, environment), 2 invalid input or configuration,
+    3 the revision no longer matches, 4 a build or flash for the display is running.
+    """
+    root_text = args.root or os.environ.get("VESSELSTACK_ROOT", "")
+    if not root_text:
+        print("error: VESSELSTACK_ROOT (or --root) is required", file=sys.stderr)
+        return 2
+    ctx = lifecycle.Context(
+        root=Path(root_text),
+        env={key: os.environ[key] for key in LIFECYCLE_ENV_KEYS if key in os.environ},
+        require_root=not getattr(args, "allow_non_root", False),
+        container=getattr(args, "container", None) or mqtt_auth.CONTAINER,
+        image=getattr(args, "image", None), out=lambda *_a, **_k: None)
+    try:
+        result = action(ctx)
+    except editor.EditError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "errors": exc.errors, **exc.extra}))
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.code
+    except lifecycle.LifecycleError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "errors": [str(exc)]}))
+        print(f"error: {exc}", file=sys.stderr)
+        return exc.code
+    except (mqtt_auth.MqttAuthError, OSError) as exc:
+        message = getattr(exc, "strerror", None) or str(exc)
+        print(json.dumps({"ok": False, "code": 1, "errors": [message]}))
+        print(f"error: {message}", file=sys.stderr)
+        return 1
+    if text_kind and not getattr(args, "json", True):
+        print(editor.format_text(text_kind, result))
+    else:
+        print(json.dumps(result))
+    return 0
+
+
+def read_stdin_limited() -> str:
+    data = sys.stdin.buffer.read(editor.STDIN_MAX_BYTES + 1)
+    if len(data) > editor.STDIN_MAX_BYTES:
+        raise editor.EditError(["the request is larger than 1 MiB"], 2)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise editor.EditError(["the request is not valid UTF-8"], 2) from exc
+
+
+def cmd_catalog(args) -> int:
+    return run_json(args, lambda ctx: editor.catalog(ctx, live=args.live), "catalog")
+
+
+def cmd_show(args) -> int:
+    return run_json(args, lambda ctx: editor.show(ctx, args.id), "show")
+
+
+def cmd_history(args) -> int:
+    return run_json(args, editor.history, "history")
+
+
+def cmd_serial_ports(args) -> int:
+    return run_json(args, editor.serial_ports, "serial-ports")
+
+
+def cmd_set_pages(args) -> int:
+    return run_json(args, lambda ctx: editor.set_pages(ctx, args.id, args.if_revision, read_stdin_limited()))
+
+
+def cmd_restore_config(args) -> int:
+    return run_json(args, lambda ctx: editor.restore_config(ctx, args.stamp, args.if_revision))
+
+
 def cmd_list(args) -> int:
+    if getattr(args, "json", False):
+        return run_json(args, editor.list_displays)
     return run_lifecycle(args, lifecycle.list_displays)
 
 
@@ -210,6 +290,29 @@ def cmd_rotate(args) -> int:
 
 def cmd_wifi(args) -> int:
     return run_lifecycle(args, lambda ctx: lifecycle.wifi(ctx, args.clear, args.open))
+
+
+def cmd_set_theme(args) -> int:
+    return run_lifecycle(args, lambda ctx: lifecycle.set_theme(ctx, args.id, args.theme))
+
+
+def cmd_themes(args) -> int:
+    """List the built-in display themes (reads the installed themes.json; needs no root)."""
+    try:
+        data = schema.load_themes()
+        ids = schema.theme_ids()
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot load the display themes: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"schema": data["schema"], "themes": {name: data["themes"][name] for name in ids}},
+                         indent=2))
+        return 0
+    width = max(len(name) for name in ids)
+    for name in ids:
+        print(f"{name.ljust(width)}  {data['themes'][name]['description']}")
+    print("Choose one with 'vesselstackctl display set-theme ID THEME', then rebuild and reflash the display.")
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -231,7 +334,10 @@ def run_render(args, action) -> int:
     try:
         action(ctx, args)
     except (render.RenderError, lifecycle.LifecycleError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        hints = getattr(exc, "hints", None)
+        if hints:
+            print("To fix: " + " ".join(hints), flush=True)
         return exc.code
     except (mqtt_auth.MqttAuthError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -254,10 +360,14 @@ def cmd_build_action(ctx, args) -> None:
 
 def cmd_flash_action(ctx, args) -> None:
     firmware.flash(ctx, args.id, serial=args.serial, ota=args.ota, previous=args.previous,
-                   force=args.force, notify=_warn)
+                   force=args.force, notify=_warn, progress=args.progress)
 
 
-STDOUT_ACTIONS = (cmd_render_action, cmd_build_action, cmd_flash_action)
+def cmd_deploy_action(ctx, args) -> None:
+    firmware.deploy(ctx, args.id, serial=args.serial, ota=args.ota, progress=args.progress, notify=_warn)
+
+
+STDOUT_ACTIONS = (cmd_render_action, cmd_build_action, cmd_flash_action, cmd_deploy_action)
 
 
 def cmd_build(args) -> int:
@@ -266,6 +376,10 @@ def cmd_build(args) -> int:
 
 def cmd_flash(args) -> int:
     return run_render(args, cmd_flash_action)
+
+
+def cmd_deploy(args) -> int:
+    return run_render(args, cmd_deploy_action)
 
 
 def cmd_render(args) -> int:
@@ -318,7 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
         parser_.set_defaults(func=func)
         return parser_
 
-    lifecycle_parser("list", "list configured displays (never prints secrets)", cmd_list)
+    list_parser = lifecycle_parser("list", "list configured displays (never prints secrets)", cmd_list)
+    list_parser.add_argument("--json", action="store_true",
+                             help="print only id, name, board and page count as JSON (for the Control Panel)")
     add = lifecycle_parser("add", "add a display with a default page (root)", cmd_add, True)
     add.add_argument("--board", required=True, help="board id from the registry")
     add.add_argument("--name", help="display name (default: derived from the id)")
@@ -372,6 +488,46 @@ def build_parser() -> argparse.ArgumentParser:
                        help="flash the previous build (firmware.prev) to roll back")
     flash.add_argument("--force", action="store_true",
                        help="flash even if the credentials changed since the firmware was built")
+    flash.add_argument("--progress", action="store_true",
+                       help="print 'STAGE: upload|done' and hide secrets in the tool output (used by the Control Panel)")
+    deploy = firmware_parser("deploy", "build if needed and upload in one step, holding the build lock "
+                             "throughout (root, optional)", cmd_deploy)
+    deploy_target = deploy.add_mutually_exclusive_group(required=True)
+    deploy_target.add_argument("--serial", metavar="DEVICE",
+                               help="USB serial device, /dev/ttyACM0 or /dev/serial/by-id/...")
+    deploy_target.add_argument("--ota", metavar="HOST",
+                               help="IP address or host name of the display on the LAN")
+    deploy.add_argument("--progress", action="store_true",
+                        help="print 'STAGE: render|compile|upload|done' lines (used by the Control Panel)")
+    set_theme = lifecycle_parser("set-theme", "choose the colour theme of a display (root); rebuild and "
+                                 "reflash afterwards", cmd_set_theme, True)
+    set_theme.add_argument("theme", metavar="THEME", help="theme id (see 'themes'); classic removes the key")
+    themes = sub.add_parser("themes", help="list the available display themes")
+    themes.add_argument("--json", action="store_true", help="print the full palettes as JSON")
+    themes.set_defaults(func=cmd_themes)
+    catalog = lifecycle_parser("catalog", "list the data a page can show (JSON for the Control Panel)", cmd_catalog)
+    catalog.add_argument("--live", action="store_true",
+                         help="also ask the configured Signal K server which values have data")
+    catalog.add_argument("--json", action="store_true", help="print JSON")
+    show = lifecycle_parser("show", "everything needed to edit one display (JSON for the Control Panel)",
+                            cmd_show, True)
+    show.add_argument("--json", action="store_true", help="print JSON")
+    set_pages = lifecycle_parser("set-pages", "replace a display's pages from JSON on stdin (root); "
+                                 "prints JSON", cmd_set_pages, True)
+    set_pages.add_argument("--if-revision", required=True, metavar="SHA256",
+                           help="the revision from 'show'; refuse (exit 3) if displays.json changed since")
+    set_pages.add_argument("--stdin", action="store_true", required=True,
+                           help="read the request {pages, theme?, new_instruments?, new_notifications?, "
+                                "instrument_edits?} from standard input")
+    history = lifecycle_parser("history", "list the displays.json backups (root)", cmd_history)
+    history.add_argument("--json", action="store_true", help="print JSON")
+    restore = lifecycle_parser("restore-config", "restore a displays.json backup by STAMP (root); prints JSON",
+                               cmd_restore_config)
+    restore.add_argument("stamp", metavar="STAMP", help="a stamp from 'history', such as 20260101T120000Z")
+    restore.add_argument("--if-revision", metavar="SHA256", help="refuse (exit 3) if displays.json changed")
+    ports = lifecycle_parser("serial-ports", "list USB serial devices that flash --serial accepts",
+                             cmd_serial_ports)
+    ports.add_argument("--json", action="store_true", help="print JSON")
     lifecycle_parser("status", "show bridge and display online state from retained MQTT topics",
                      cmd_status)
     return parser

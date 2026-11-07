@@ -37,12 +37,17 @@ Commands:
                                (fixes "memory ... not ready" and a failing doctor check)
   logs [chat|telegram|indexer|control|displays|containers|all]
                                Show recent diagnostic logs (default: all)
-  display list|add|remove|rotate|wifi|status|render|export|build|flash|validate|sync-mqtt [ARGUMENTS]
+  display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports|validate|sync-mqtt [ARGUMENTS]
                                Manage instrument displays, generate their ESPHome
                                projects and optionally build/flash firmware on this
                                host (display build ID; display flash ID --serial
-                               DEVICE | --ota HOST [--previous]); see
-                               "vesselstackctl display --help"
+                               DEVICE | --ota HOST [--previous]). The Control Panel
+                               Displays tab runs list --json, catalog [--live]
+                               --json, show ID --json, themes --json,
+                               serial-ports --json, set-pages ID --if-revision
+                               SHA --stdin, history --json, restore-config STAMP
+                               and deploy (display deploy ID --ota HOST |
+                               --serial DEVICE); see "vesselstackctl display --help"
   start                        Start the stack
   stop                         Stop the stack
   restart                      Restart the stack
@@ -208,6 +213,9 @@ display_command() {
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
         DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
+        SIGNALK_URL="${SIGNALK_URL:-}" DISPLAYS_SIGNALK_TOKEN="${DISPLAYS_SIGNALK_TOKEN:-}" \
+        BOAT_UNITS="${BOAT_UNITS:-}" \
+        VESSELSTACK_DATA_BIND_ADDRESS="${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}" \
         python3 "$displayctl" "$@"
 }
 

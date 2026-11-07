@@ -145,8 +145,37 @@ sudo vesselstackctl display list
 sudo vesselstackctl display status
 ```
 
-Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash`.
+Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports`.
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
+
+Display colours come from `displays/themes.json`, which offers four themes: `classic` (the default and the original look), `high-contrast` (black with white values and a light tile border, for sunlight), `daylight` (light tiles with dark text) and `ocean` (navy tiles). Pick one per display:
+
+```bash
+sudo vesselstackctl display themes                  # list the themes (--json for the full palettes)
+sudo vesselstackctl display set-theme helm daylight
+sudo vesselstackctl display deploy helm --ota 192.0.2.50   # build if needed and upload in one step (or --serial DEVICE)
+```
+
+`display deploy ID (--ota HOST | --serial DEVICE)` builds only when the stored firmware is out of date and uploads it under one lock; it prints `STAGE:` lines with `--progress` and `To fix:` lines for known failures, and hides Wi-Fi and MQTT/OTA/API secrets in everything it prints. After every successful upload `build/displays/ID/last-flash.json` (root-only, never committed) records when, how and which image went to the screen. **Operational impact:** a deploy can take 3-6 minutes (10-15 minutes the first time, about 3 GB free disk). **Wi-Fi (OTA) updates have not been verified on hardware yet**; the first flash of a new display must be over USB, and USB is an equal option. To put the previous firmware back: `display restore-config STAMP` (see `display history`), then `display flash ID --previous --ota HOST` (or `--serial DEVICE`); see [Deploy and rollback](docs/DISPLAYS.md#deploy-and-rollback).
+
+In the Control Panel, **Displays → Edit pages and theme** changes the theme and pages, **Save** stores them (a backup is kept) and **Apply to screen** runs `display deploy` over USB or Wi-Fi with progress and `To fix:` hints; **History → Restore** and **Put previous firmware back on screen** do the rollback (`display restore-config STAMP`, then `display flash ID --previous`). **Operational impact:** while a deploy runs the Control Panel lifecycle slot is busy, so backups, updates and settings changes are refused until it finishes; Wi-Fi (OTA) updates are not yet verified on hardware. To go back to an older VesselStack, run `set-theme ID classic` first. A Wi-Fi upload to an address other than the last successful one needs an explicit tick (the firmware contains the Wi-Fi password; the API needs `confirm_new_target: true`), and **Put previous firmware back** appears only after **History → Restore** of the saved copy that matches the previous firmware (same settings and credentials). A missing builder image does not block Apply: it is a to-do and the deploy shows a `To fix:` hint if it fails offline. **Rollback of this feature:** reinstall the previous release; `last-flash.json` is ignored by older versions. **Verify:** the screen restarts with the new pages and `show ID --json` reports `readiness.last_flash`. See [docs/CONTROL_PANEL.md](docs/CONTROL_PANEL.md#displays).
+
+`set-theme` writes `ui.theme` in `displays.json`; the change reaches the screen only after you rebuild and reflash that display. Night mode uses the same red palette on every theme and the alarm banner is never themed. `set-theme ID classic` removes the key and returns to the original colours. **Before downgrading VesselStack, run `set-theme ID classic` on every display that has a theme:** older versions reject the unknown `theme` key and the displays bridge then exits. A display left on `classic` generates exactly the firmware it did before, so nothing needs reflashing. The `high-contrast` warning tile is dark amber with white text (the old bright amber made its label unreadable); rebuild and reflash a display on that theme to get it. Details and limits are in [Themes](docs/DISPLAYS.md#themes).
+
+**Choosing what a page shows.** The Control Panel's **Displays** tab lists your displays, shows whether the latest changes are on each screen (On screen, Changes not on screen, Never flashed, Not built, Unknown), a readiness checklist with the exact fix command for anything missing, each page's layout and items, an approximate preview of every page in the display's theme (Day/Night and severity switches, live values when Signal K has them), and a searchable list of the data a page can show. The tab also edits the theme and pages, saves, applies to the screen and restores older settings (see above); it runs the commands below (all JSON output, root for the ones that change anything), which you can also run yourself. Only `display add` and `display wifi` stay on the command line.
+
+```bash
+sudo vesselstackctl display list --json              # id, name, board and page count of every display
+sudo vesselstackctl display catalog --live --json    # ~40 common values for your BOAT_UNITS, marked live or no_live_data
+sudo vesselstackctl display show helm --json         # pages, layouts, preview boxes, revision, readiness (no secrets)
+echo '{"pages":[{"title":"Nav","layout":"grid-2x2","items":["sog","depth"]}]}' | \
+  sudo vesselstackctl display set-pages helm --if-revision "$(sudo sha256sum /opt/vesselstack/config/displays.json | cut -d' ' -f1)" --stdin
+sudo vesselstackctl display history                  # backups of displays.json (newest 20)
+sudo vesselstackctl display restore-config 20260101T120000Z
+sudo vesselstackctl display serial-ports             # USB serial devices that `flash --serial` accepts
+```
+
+The data list (`displays/catalog.json`) offers 38 common Signal K values and 4 notifications with the right unit for `BOAT_UNITS` (`metric` or `us_customary`; the legacy `nautical` reads as metric). With `--live`, `catalog` makes one read-only request to your configured `SIGNALK_URL` (Bearer token only if `DISPLAYS_SIGNALK_TOKEN` is set, no redirects, 10 s in total, 4 MiB) to mark which values have data and to list other numeric values under "Uncatalogued"; it keeps only path, units, age and value of numeric leaves and never reads positions, destinations, MMSI, names, UUIDs or call signs, and it stores nothing. **Suggested alarm limits are shown but never applied by default**: an instrument with limits counts in the boat-wide alarm summary and can raise the alarm banner. `set-pages` refuses (exit 3) if `displays.json` changed since you read it (`--if-revision` is the sha256 of the file), refuses (exit 4) while a build or flash of that display runs, validates everything before writing, copies the previous file to `config/displays-backups/` (root-only, newest 20 kept, included in `vesselstackctl backup`) and restarts the displays bridge only when it reads something that changed. **Rollback:** `display history`, then `display restore-config STAMP` (refused with exit 2 if the backup has a different set of displays than the current `displays.json`: match them with `display add` / `display remove` first, then restore again, because restore does not touch MQTT accounts); rebuild and reflash the displays the command lists in `rebuild_needed`. Exit codes, JSON shapes and limits are in [Data catalog](docs/DISPLAYS.md#data-catalog) and [Editing pages, backups and restore](docs/DISPLAYS.md#editing-pages-backups-and-restore).
 
 ## Quick start: one command on the Raspberry Pi
 

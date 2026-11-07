@@ -194,13 +194,17 @@ def read_secrets(cfg_dir: ConfigDir) -> dict:
     return data
 
 
+def config_text(config: dict) -> str:
+    """The exact text ``write_config`` stores (and whose sha256 is the configuration revision)."""
+    return json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+
+
 def write_config(cfg_dir: ConfigDir, config: dict, registry: dict) -> None:
     errors = schema.validate_config(config, registry)
     if errors:
         raise LifecycleError(
             f"the resulting {DISPLAYS_NAME} would be invalid ({errors[0]}); nothing written", 2)
-    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
-    cfg_dir.write_text(DISPLAYS_NAME, text, DISPLAYS_MODE)
+    cfg_dir.write_text(DISPLAYS_NAME, config_text(config), DISPLAYS_MODE)
 
 
 def write_secrets(cfg_dir: ConfigDir, data: dict) -> None:
@@ -405,6 +409,44 @@ def rotate(ctx: Context, display_id: str) -> None:
         _sync(ctx)
     ctx.out("WARNING: the device still holds the old credentials and is refused by the broker; "
             "it must be reflashed with the new ones.")
+
+
+def set_theme(ctx: Context, display_id: str, theme: str) -> None:
+    """Choose ``ui.theme`` of a display; ``classic`` removes the key so older versions still read the file."""
+    try:
+        known = schema.theme_ids()
+    except (OSError, ValueError) as exc:
+        raise LifecycleError(f"cannot load the display themes: {exc}") from exc
+    if theme not in known:
+        raise LifecycleError(f"unknown theme {theme!r}; available: {', '.join(known)}", 2)
+    _require_root(ctx, "set-theme")
+    registry = load_registry()
+    # The same order as every other user of both locks: the per-display build lock, then the
+    # configuration lock (a running build or flash finishes first and keeps its old configuration).
+    with _display_build_lock(ctx, display_id), ConfigDir(ctx) as cfg_dir:
+        cfg_dir.lock()
+        config = _loaded_config(cfg_dir, registry)
+        display = _display_or_error(config, display_id)
+        ui = display.get("ui") if isinstance(display.get("ui"), dict) else {}
+        had_key = "theme" in ui
+        if theme == "classic":
+            if not had_key:
+                ctx.out(f"Display {display_id!r} already uses the 'classic' theme; nothing changed.")
+                return
+            del ui["theme"]
+            if not ui:   # this command emptied it: older versions never saw a ui object
+                del display["ui"]
+        else:
+            if ui.get("theme") == theme:
+                ctx.out(f"Display {display_id!r} already uses the {theme!r} theme; nothing changed.")
+                return
+            display.setdefault("ui", {})["theme"] = theme
+        write_config(cfg_dir, config, registry)
+        ctx.out(f"Display {display_id!r} now uses the {theme!r} theme"
+                + (" (the ui.theme key was removed)." if theme == "classic" else "."))
+    ctx.out("The firmware on the device is unchanged until you rebuild and reflash:")
+    ctx.out(f"  vesselstackctl display build {display_id}")
+    ctx.out(f"  vesselstackctl display flash {display_id} --serial DEVICE   (or --ota HOST)")
 
 
 def validate_wifi(ssid: str, password: str, allow_open: bool) -> None:
