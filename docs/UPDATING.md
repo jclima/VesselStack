@@ -21,7 +21,7 @@ Re-run the pinned release installer over `ssh -t`. It finds the installed system
 installs and starts the release:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.2/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.3/get-vesselstack.sh | sudo bash
 ```
 
 The command itself needs the unpacked release directory, so plain `vesselstackctl update`
@@ -29,7 +29,7 @@ with no argument fails. To run it by hand once a release is unpacked (the instal
 `/opt/vesselstack-release/<version>`):
 
 ```bash
-sudo vesselstackctl update /opt/vesselstack-release/0.6.2
+sudo vesselstackctl update /opt/vesselstack-release/0.6.3
 ```
 
 From a terminal (`ssh -t`) the installer now offers to fix an unsupported `BOAT_UNITS` value or
@@ -136,7 +136,7 @@ sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.2.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.3.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -224,7 +224,7 @@ and `ssh-keygen` (part of OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.6.2
+scripts/verify-release-tag.sh v0.6.3
 ```
 
 The script takes `TAG [ALLOWED_SIGNERS_FILE [EXPECTED_COMMIT]]`. It checks that the tag is
