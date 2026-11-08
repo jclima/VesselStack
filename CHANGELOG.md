@@ -3,7 +3,7 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
+## 0.6.3 - 2026-11-08
 
 ### Highlights
 
@@ -89,13 +89,45 @@ Semantic Versioning.
   `BOAT_CHAT_PASSPHRASE_HASH`) that `install.sh` imports and then removes from the env file. New
   `vesselstackctl passphrase set-hash`. The first-sign-in docs now lead with the passphrase or pairing link.
 
+### Security
+
+- Sign-in secrets are stored as scrypt passphrase hashes and SHA-256-only device tokens in root-only
+  `config/control-panel-auth.json`; the store fails closed when corrupt and is never overwritten.
+  Rotating `CONTROL_PANEL_TOKEN`, `BOAT_CHAT_ACCESS_TOKEN` or `BOAT_CHAT_SETTINGS_TOKEN` signs out the
+  devices issued under the old value. Passphrase attempts are throttled per address with a global pause
+  (anyone on the network can trigger a 15-minute passphrase lockout; the long token still works). The
+  Control Panel rejects requests whose `Host` is not this machine (`421`), and sign-in POSTs need a
+  matching `Origin`.
+- Homepage runs with `cap_drop: ALL` plus `CHOWN`, `SETUID`, `SETGID`; its image is pinned by digest.
+
 ### Upgrade notes
 
-- Reaching the panel through a name other than localhost or the boat's own names now needs
-  `CONTROL_PANEL_ALLOWED_HOSTS`. Scripts calling `/api/auth/login` or `/api/auth/passphrase` must send an
-  `Origin` header.
-- Nothing migrates and passphrase sign-in stays off until a passphrase is set. Rollback: reinstall the
-  previous release; older versions ignore `control-panel-auth.json`.
+- **Heimdall is removed.** Install and update stop and remove an existing `vesselstack-heimdall`
+  container and image (only when its Compose project label is `vesselstack`) and print a notice.
+  `$VESSELSTACK_DATA/heimdall` is left on disk untouched; delete it yourself when you no longer need it.
+  `HEIMDALL_PORT` migrates to `HOMEPAGE_PORT` when that is unset. The `heimdall` component is now
+  `homepage`. Port 443 is no longer published; the firewall has an explicit rule for port 80 on trusted
+  interfaces only, so review a hand-managed firewall.
+- **Existing sign-in keeps working.** Long tokens (`CONTROL_PANEL_TOKEN`, `BOAT_CHAT_ACCESS_TOKEN`) and
+  the access and admin codes work unchanged. Passphrase sign-in stays off until a passphrase is set
+  (`sudo vesselstackctl passphrase set panel|chat`, Settings, or the installer questions). Reaching the
+  panel through a name other than localhost or the boat's own names needs `CONTROL_PANEL_ALLOWED_HOSTS`;
+  scripts calling `/api/auth/login` or `/api/auth/passphrase` must send an `Origin` header. Boat Chat
+  admin devices from earlier builds must be paired again.
+- **Plain HTTP on the LAN.** The panel, Boat Chat and Homepage use unencrypted HTTP. Passphrases, pairing
+  links and device tokens can be read by anyone able to watch that network. Use a trusted LAN only.
+- **Rollback.** Downgrades are refused by the installer. Reinstall 0.6.2 with its pinned installer
+  (`.../releases/download/v0.6.2/get-vesselstack.sh`); Homepage is replaced by Heimdall again only by that
+  reinstall of 0.6.2. Older versions ignore the sign-in store files (`control-panel-auth.json` and Boat
+  Chat's store). The display downgrade note still applies: run
+  `sudo vesselstackctl display set-theme ID classic` for every themed display before going below 0.6.2.
+
+### Release status
+
+`v0.6.3` is an SSH-signed tag verified by the release workflow against `.github/allowed_signers`.
+It is published first as a pre-release and marked Latest after the maintainer's physical Raspberry Pi
+install passes. (`v0.6.2` was marked Latest directly rather than staying a pre-release first; that is
+the process 0.6.3 returns to.)
 
 ## 0.6.2 - 2026-11-07
 
