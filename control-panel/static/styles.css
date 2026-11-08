@@ -429,3 +429,16 @@ dialog .keep{margin:.2rem 0 .5rem}
 .notes{margin:.4rem 0;font-size:.85rem}
 .choice-error{margin:.4rem 0;color:var(--red)}
 #backup-choice-dialog{width:min(36rem,calc(100% - 2rem));max-height:calc(100% - 2rem);overflow:auto}
+
+/* Sign-in: unlock screen and Settings section */
+.login #passphrase-form,.login #passphrase-hint{margin-top:.75rem}
+.login #device-label{width:100%;margin-top:.25rem}
+.login #login-error{margin:.75rem 0 0}
+#signin-card{margin:1.25rem 0}
+#signin-card input{display:block;width:100%;max-width:24rem;margin:.25rem 0 .75rem}
+.device-list{list-style:none;margin:.5rem 0;padding:0}
+.device-row{display:flex;gap:.75rem;align-items:center;justify-content:space-between;padding:.6rem 0;border-top:1px solid var(--line)}
+.device-row .d{display:flex;flex-direction:column;gap:.15rem;min-width:0}
+.device-row .chip{align-self:flex-start;font-size:.75rem;padding:.05rem .5rem;border:1px solid var(--line);border-radius:999px}
+.pair-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0}
+.qr{display:block;width:min(16rem,100%);height:auto;background:#fff;border-radius:.5rem}

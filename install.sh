@@ -86,6 +86,8 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${VESSELSTACK_FIREWALL_STRICT:=false}"
 : "${VESSELSTACK_FIREWALL_ALLOW_TCP=22}"
 : "${VESSELSTACK_FIREWALL_ALLOW_UDP=}"
+: "${CONTROL_PANEL_PASSPHRASE_HASH:=}"
+: "${BOAT_CHAT_PASSPHRASE_HASH:=}"
 : "${CONTROL_PANEL_HOST:=127.0.0.1}"
 : "${CONTROL_PANEL_PORT:=8780}"
 # Whether the INPUT configuration really sets BOAT_CHAT_HOST: the installed vesselstack.env
@@ -516,7 +518,8 @@ EOF
 # Keys written to boat-chat.env and control-panel.env beyond the list above.
 extra_env_keys() {
     printf '%s\n' BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT \
-        BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN CONTROL_PANEL_TOKEN
+        BOAT_CHAT_SETTINGS_TOKEN BOAT_CHAT_ACCESS_TOKEN CONTROL_PANEL_TOKEN \
+        CONTROL_PANEL_PASSPHRASE_HASH BOAT_CHAT_PASSPHRASE_HASH
 }
 # env_value_problem VALUE: prints the reason and returns 0 when VALUE cannot be
 # written. Compose cannot parse the '\'' idiom, so a value with a single quote is
@@ -561,7 +564,8 @@ env_line() {
 config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
-        BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN) return 0 ;;
+        BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN|\
+        CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH) return 0 ;;
     esac
     return 1
 }
@@ -846,6 +850,20 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 # check covers the values that will actually be written; read-only, so it is
 # also safe ahead of the dry run.
 env_values_preflight
+# Sign-in passphrases chosen in the wizard arrive as scrypt hashes (never as text). Anything else is refused
+# before a single change is made; only the key name is reported.
+for hash_key in CONTROL_PANEL_PASSPHRASE_HASH BOAT_CHAT_PASSPHRASE_HASH; do
+    if [ -n "${!hash_key}" ] && ! python3 -I -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("vesselstack_auth", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.exit(0 if module.valid_hash(sys.stdin.readline().rstrip("\n")) else 1)
+' "$SCRIPT_DIR/common/vesselstack_auth.py" <<<"${!hash_key}"; then
+        echo "Refusing to continue: $hash_key is not a valid passphrase hash (it must come from the VesselStack wizard). Nothing was changed." >&2
+        exit 1
+    fi
+done
 vs_prompt_close
 
 PLUGIN_STAGE=
@@ -972,7 +990,7 @@ safe_data_path() {
 }
 install -d -m 0755 "$VESSELSTACK_ROOT" "$VESSELSTACK_ROOT/config" \
     "$VESSELSTACK_ROOT/boat-chat" "$VESSELSTACK_ROOT/control-panel" \
-    "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
+    "$VESSELSTACK_ROOT/common" "$VESSELSTACK_ROOT/displays" "$VESSELSTACK_ROOT/installer"
 install -d -m 0755 "$RELEASES_DIR"
 install -d -m 0755 "$VESSELSTACK_ROOT/systemd"
 [ ! -L "$VESSELSTACK_DATA" ] || fail_data_path "$VESSELSTACK_DATA is a symlink"
@@ -1176,6 +1194,10 @@ chown -hR root:root "$VESSELSTACK_ROOT/boat-chat"
 chmod -R go-w,go+rX "$VESSELSTACK_ROOT/boat-chat"
 tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/control-panel" -xf -
+# Shared stdlib-only modules (sign-in store and CLI helper). Root-owned and
+# not writable by anyone else: the panel and vesselstackctl load them as root.
+install -d -m 0755 "$VESSELSTACK_ROOT/common"
+install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$SOURCE_ROOT/common/qrcodegen.py" "$VESSELSTACK_ROOT/common/"
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
 # GNU tar run as root keeps the archive's modes, which are only as readable as the
@@ -1186,7 +1208,7 @@ chmod -R u=rwX,go=rX "$VESSELSTACK_ROOT/displays"
 # apply operations without depending on a source checkout that may be removed.
 if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
     tar -C "$SOURCE_ROOT" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' \
-        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel displays \
+        -cf - install.sh VERSION scripts systemd templates boat-chat control-panel common displays \
         | tar --no-same-owner -C "$VESSELSTACK_ROOT/installer" -xf -
 fi
 # The source application keeps legacy defaults for compatibility. Installed
@@ -1335,6 +1357,18 @@ while IFS= read -r key; do
 done < <(vesselstack_env_keys)
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
 
+# Tokens as installed before this run, to notice a rotation afterwards (plain text compare, never evaluated;
+# the app env files are writable by the service user).
+previous_env_value() {
+    local value
+    value=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1) || value=
+    value=${value#[\'\"]}; value=${value%[\'\"]}
+    printf '%s' "$value"
+}
+PREVIOUS_CONTROL_PANEL_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/control-panel.env" CONTROL_PANEL_TOKEN)
+PREVIOUS_BOAT_CHAT_ACCESS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_ACCESS_TOKEN)
+PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_SETTINGS_TOKEN)
+
 # Retain provider credentials and optional Boat Chat settings across installer
 # re-renders while replacing the integration values owned by VesselStack.
 new_env_temp boat-chat.env; boat_chat_temp=$NEW_ENV_TEMP
@@ -1394,6 +1428,53 @@ new_env_temp control-panel.env; control_panel_temp=$NEW_ENV_TEMP
     env_line CONTROL_PANEL_TOKEN "$CONTROL_PANEL_TOKEN"
 } >> "$control_panel_temp"
 mv -f -- "$control_panel_temp" "$VESSELSTACK_ROOT/config/control-panel.env"
+
+# Import sign-in passphrase hashes chosen in the wizard, then drop each key from the env files as soon as ITS
+# import is settled: the hash lives only in the sign-in stores (the Control Panel one is root-only; Boat Chat's is
+# written by the helper process that runs as the service user, never by root in that directory). The import is
+# "only if no passphrase is stored yet" (set-hash --if-unset), so a re-install can never overwrite a passphrase
+# changed since. A failed import keeps only its own key, so a later install can retry it.
+scrub_signin_hash() {
+    local key=$1 file
+    for file in "$CONFIG_FILE" "$VESSELSTACK_ROOT/config/vesselstack.env"; do
+        if [ -f "$file" ] && [ ! -L "$file" ]; then sed -i -e "/^${key}=/d" "$file"; fi
+    done
+}
+import_signin_hash() {
+    local key=$1 scope=$2 label=$3 hash=${!1:-} status=0
+    [ -n "$hash" ] || return 0
+    env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        python3 -I "$VESSELSTACK_ROOT/common/vesselstack_authctl.py" passphrase set-hash "$scope" --if-unset <<<"$hash" >/dev/null 2>&1 || status=$?
+    case $status in
+        0) echo "$label passphrase from the wizard stored (hash only)."; scrub_signin_hash "$key" ;;
+        3) echo "Notice: a $label passphrase is already set; the one from the installer settings was ignored - use \`sudo vesselstackctl passphrase set $scope\` to change it."
+           scrub_signin_hash "$key" ;;
+        *) echo "WARNING: could not store the $label passphrase from the wizard. Set it with: sudo vesselstackctl passphrase set $scope" >&2
+           return 1 ;;
+    esac
+}
+import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH panel "Control Panel" || true
+import_signin_hash BOAT_CHAT_PASSPHRASE_HASH chat "Boat Chat" || true
+CONTROL_PANEL_PASSPHRASE_HASH=; BOAT_CHAT_PASSPHRASE_HASH=
+
+# A rotated token signs out every device of that service (a device must not outlive the credential it was
+# issued under). Only when an earlier, different token existed; a first install has no devices.
+revoke_after_rotation() {
+    local scope=$1 label=$2 previous=$3 current=$4
+    [ -n "$previous" ] && [ "$previous" != "$current" ] || return 0
+    if env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        python3 -B -I "$VESSELSTACK_ROOT/common/vesselstack_authctl.py" devices revoke-all "$scope" >/dev/null 2>&1; then
+        echo "A $label token changed: every signed-in $label device was signed out."
+    else
+        echo "WARNING: a $label token changed but its signed-in devices could not be signed out. Run: sudo vesselstackctl devices revoke-all $scope" >&2
+    fi
+}
+revoke_after_rotation panel "Control Panel" "$PREVIOUS_CONTROL_PANEL_TOKEN" "$CONTROL_PANEL_TOKEN"
+if [ -n "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN" ] && [ "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN" != "$BOAT_CHAT_ACCESS_TOKEN" ]; then
+    revoke_after_rotation chat "Boat Chat" "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN" "$BOAT_CHAT_ACCESS_TOKEN"
+elif [ -n "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN" ] && [ "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN" != "$BOAT_CHAT_SETTINGS_TOKEN" ]; then
+    revoke_after_rotation chat "Boat Chat" "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN" "$BOAT_CHAT_SETTINGS_TOKEN"
+fi
 
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)
 # application directory and renamed into place; the service user can only read it.

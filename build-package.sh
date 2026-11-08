@@ -61,6 +61,7 @@ for required_asset in \
     }
 done
 for required_runtime in \
+    common/vesselstack_auth.py common/vesselstack_authctl.py common/qrcodegen.py \
     boat-chat/display_units.py boat-chat/telemetry_indexer.py \
     systemd/vesselstack-telemetry-indexer.timer systemd/vesselstack-telemetry-sample.service.in \
     systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml scripts/render-homepage.py \
@@ -71,7 +72,7 @@ for required_runtime in \
     }
 done
 # Defence in depth: tracked-only does not excuse a tracked private artifact.
-for private in boat-chat/boat_facts.json boat-chat/boat-chat.env vesselstack.env .mcp.json boat-chat/.venv boat-chat/memory boat-chat/data; do
+for private in boat-chat/boat_facts.json boat-chat/boat-chat.env boat-chat/auth.json config/control-panel-auth.json control-panel-auth.json vesselstack.env .mcp.json boat-chat/.venv boat-chat/memory boat-chat/data; do
     if [ -e "$STAGE/$PACKAGE_NAME/$private" ]; then
         echo "Refusing to package tracked private artifact: $private" >&2
         exit 1

@@ -103,28 +103,32 @@ The terminal wizard asks the same things; its wording and values may differ slig
 
 At the end, the installer prints the LAN addresses for Grafana, Home Assistant,
 and Boat Chat. Open those addresses from a computer on the same trusted boat
-network. It also prints a command to read the Boat Chat access token locally;
-keep that token private and never commit `config/*.env`.
+network. Near the end it asks whether to set a Control Panel passphrase and a Boat Chat
+crew passphrase (typed twice, hidden; just Enter skips) and whether to pair this phone or
+laptop with a link and QR code. With `--yes` or `--defaults` it asks nothing and prints the commands
+to do it later. The long access tokens still exist for scripts; keep them private and never
+commit `config/*.env`.
 
 ## First sign-in to the Control Panel
 
-The Control Panel is administration-only and binds to loopback by default. On
-the Pi, retrieve its token locally:
-
-```bash
-sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env
-```
-
-Keep the token private; paste it only into the unlock screen reached through an
+The Control Panel is administration-only and binds to loopback by default. Reach it through an
 SSH tunnel from your own computer:
 
 ```bash
 ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI
 ```
 
-Then open `http://127.0.0.1:8780`, paste the token (or the whole `CONTROL_PANEL_TOKEN=…`
-line) into **Control Panel token** and press **Unlock**. If you changed the panel port in
-Settings, use that number. Do not expose port 8780 directly to the internet.
+Then open `http://127.0.0.1:8780` and sign in with the passphrase you chose during installation
+(tick **Remember this device** to skip it for 30 days). If you skipped it:
+
+```bash
+sudo vesselstackctl passphrase set panel   # choose a passphrase
+sudo vesselstackctl panel-link             # or print a one-time link and QR code for a phone or laptop
+```
+
+The long token still works for scripts and as a fallback: `sudo grep '^CONTROL_PANEL_TOKEN='
+/opt/vesselstack/config/control-panel.env` (paste it into the token box). If you changed the panel
+port in Settings, use that number. Do not expose port 8780 directly to the internet.
 
 ![Control Panel unlock screen](images/control-panel-login.png)
 

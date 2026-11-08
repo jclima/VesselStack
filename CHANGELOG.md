@@ -5,6 +5,19 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Highlights
+
+- Sign-in review fixes: rotating `CONTROL_PANEL_TOKEN`, `BOAT_CHAT_ACCESS_TOKEN` or
+  `BOAT_CHAT_SETTINGS_TOKEN` (installer, Boat Chat Settings, panel Settings) now signs out the devices
+  issued under the old value (`sudo vesselstackctl devices revoke-all [chat]` for a manual sweep). A sign-in
+  store with wrong types is treated as corrupt (fail closed, never overwritten, no 500). In Boat Chat, crew
+  can sign out only their own device; others, "all", and the first passphrase need the admin code or an admin
+  device. The Control Panel authenticates once per request. Admin bindings are HMAC-SHA256 under a random key
+  in the store and are computed from the admin code Boat Chat actually uses (Settings override, then env);
+  admin devices from earlier builds must be paired again. A correct sign-in no longer clears an address's
+  backoff (global lockout trade-off documented). `vesselstackctl` runs the helper with `python3 -B -I`;
+  Boat Chat sends `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+
 - Homepage (gethomepage.dev, `ghcr.io/gethomepage/homepage:v2.7.0` pinned by multi-arch digest) replaces
   Heimdall as the front door on port 80 (`HOMEPAGE_PORT`). Tiles follow the enabled components and are
   rendered by `vesselstackctl homepage sync` without secrets; custom tiles live in
@@ -27,6 +40,62 @@ Semantic Versioning.
   untrusted interface port 80 is now blocked exactly as before for inbound Homepage requests (the
   container-port-3000 drop already covered it), but replies to the Pi's own outbound HTTP on port 80 are
   no longer dropped. Strict mode is unchanged.
+- Security: the installer imports each wizard passphrase hash only when no passphrase is stored yet
+  (`vesselstackctl passphrase set-hash --if-unset`, exit status 3 when one exists) and removes each key
+  as soon as its own import is settled, so a failed import of one no longer leaves both keys behind and a
+  re-install can never overwrite a passphrase changed since.
+- Security: setting or changing a sign-in passphrase now also cancels waiting pairing links, and Boat Chat admin devices are bound to the admin code they were paired under (they lose admin rights when `BOAT_CHAT_SETTINGS_TOKEN` is changed or removed; `--admin` pairing needs a configured admin code).
+- Control Panel sign-in is easier: choose a passphrase (`sudo vesselstackctl passphrase set panel`, or
+  Settings, Sign-in) and unlock with it, optionally with **Remember this device (30 days)**. Settings lists
+  signed-in devices with Revoke and Revoke all; `vesselstackctl devices list|revoke|revoke-all` and
+  `passphrase status|clear` manage them from the boat computer. The long `CONTROL_PANEL_TOKEN`
+  (`X-VesselStack-Token`) works unchanged for scripts and existing sessions.
+- Security: scrypt passphrase hash and SHA-256-only device tokens in root-only
+  `config/control-panel-auth.json`; device tokens travel in an `X-VesselStack-Device` header (no cookies,
+  no CORS) and device POSTs require a matching `Origin`; per-address backoff plus a global 15-minute pause
+  after 20 failures (the token still works). New root-owned shared module `common/vesselstack_auth.py`
+  and helper `common/vesselstack_authctl.py`.
+- Boat Chat adopts the same sign-in: a separate crew passphrase (8+ characters) with remembered devices
+  (`vesselstackctl passphrase set|clear|status chat`, `devices list|revoke|revoke-all chat`, Settings,
+  Sign-in). Passphrase sign-in grants access only; the Access code and admin code work unchanged. Device
+  tokens use `X-Boat-Chat-Device`; sign-in and device requests need a `Host` naming the machine
+  (`BOAT_CHAT_ALLOWED_HOSTS` adds names) and login/passphrase/device POSTs need an `Origin`.
+- Security review fixes: passphrase attempts are counted atomically (`LoginThrottle.begin`) so concurrent
+  guesses cannot outrun the limit; the Control Panel rejects requests whose `Host` is not this machine
+  (DNS-rebinding guard, `421`; extra names via `CONTROL_PANEL_ALLOWED_HOSTS`); `/api/auth/login` and
+  `/api/auth/passphrase` always require a matching `Origin`. Documented: the global pause lets anyone on
+  the network trigger a 15-minute passphrase lockout (the token still works).
+- Pairing links and QR codes: `sudo vesselstackctl panel-link [--for panel|chat] [--admin] [--label TEXT]`
+  and Control Panel Settings, Sign-in, **Pair a phone** make a single-use, 10-minute link, typed code
+  (`XXXXX-XXXXX`) and QR code that sign a phone in as a remembered device (`POST /api/auth/pairing`,
+  `POST /api/auth/pair`). Only the code's SHA-256 is stored; at most three can wait; `--admin` pairs a Boat
+  Chat device with admin-code rights. Vendors Nayuki's MIT-licensed `common/qrcodegen.py`.
+- Sign-in store hardening: a correct login now withdraws only its own attempt from the throttle's global
+  window (`LoginThrottle.begin` returns an attempt handle), so interleaved correct logins cannot erase
+  other recorded failures; root no longer chowns files in the Boat Chat data directory. When root edits
+  that service-user-owned store (`passphrase ... chat`, `devices ... chat`) it forks a child that drops to
+  the directory owner first, and all store files are opened relative to a no-follow directory descriptor,
+  refused unless regular with one link, with exclusive temp files.
+
+- Sign-in hardening: root no longer forks the multithreaded Control Panel to change Boat Chat's store; it
+  runs `vesselstack_authctl.py` (JSON on stdin and stdout) as a separate process with the service user's
+  uid/gid. `AuthStore.transaction()` as root on a foreign-owned directory now raises. Setting the
+  Control Panel or Boat Chat passphrase is an atomic compare-and-set: a concurrent change returns 409
+  "passphrase changed, try again" instead of overwriting.
+
+- The installer asks for sign-in: `get-vesselstack.sh` offers to set a Control Panel passphrase, a Boat Chat
+  crew passphrase and a pairing link (skipped with `--yes`/`--defaults`, which print the commands instead).
+  Both wizards gain optional passphrase fields; they write only scrypt hashes (`CONTROL_PANEL_PASSPHRASE_HASH`,
+  `BOAT_CHAT_PASSPHRASE_HASH`) that `install.sh` imports and then removes from the env file. New
+  `vesselstackctl passphrase set-hash`. The first-sign-in docs now lead with the passphrase or pairing link.
+
+### Upgrade notes
+
+- Reaching the panel through a name other than localhost or the boat's own names now needs
+  `CONTROL_PANEL_ALLOWED_HOSTS`. Scripts calling `/api/auth/login` or `/api/auth/passphrase` must send an
+  `Origin` header.
+- Nothing migrates and passphrase sign-in stays off until a passphrase is set. Rollback: reinstall the
+  previous release; older versions ignore `control-panel-auth.json`.
 
 ## 0.6.2 - 2026-11-07
 

@@ -1,5 +1,17 @@
+const DEVICE_KEY = "vesselstack_device_token";
+const storedDevice = () => {
+  // localStorage holds a remembered device; sessionStorage a tab-only sign-in. Either may be unavailable.
+  try { const kept = localStorage.getItem(DEVICE_KEY); if (kept) return kept; } catch (_error) { /* storage blocked */ }
+  try { return sessionStorage.getItem(DEVICE_KEY) || ""; } catch (_error) { return ""; }
+};
+const forgetDevice = () => {
+  try { localStorage.removeItem(DEVICE_KEY); } catch (_error) { /* storage blocked */ }
+  try { sessionStorage.removeItem(DEVICE_KEY); } catch (_error) { /* storage blocked */ }
+};
 const state = {
   token: sessionStorage.getItem("vesselstack_control_token") || "",
+  device: storedDevice(),
+  passphraseSet: null,
   config: null,
   poller: null,
   components: [],
@@ -48,8 +60,10 @@ const escapeHtml = (value) => String(value ?? "")
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#039;");
 
+const signedIn = () => Boolean(state.token || state.device);
+
 async function api(path, options = {}) {
-  const headers = { "X-VesselStack-Token": state.token, ...(options.headers || {}) };
+  const headers = { ...(state.token ? { "X-VesselStack-Token": state.token } : {}), ...(state.device ? { "X-VesselStack-Device": state.device } : {}), ...(options.headers || {}) };
   if (options.body) headers["Content-Type"] = "application/json";
   const response = await fetch(path, { ...options, headers });
   const payload = await response.json().catch(() => ({}));
@@ -59,6 +73,7 @@ async function api(path, options = {}) {
     if (payload.fields && typeof payload.fields === "object") error.fields = payload.fields;
     if (Array.isArray(payload.errors)) error.errors = payload.errors;
     if (typeof payload.code === "number") error.code = payload.code;
+    if (typeof payload.retry_after === "number") error.retryAfter = payload.retry_after;
     throw error;
   }
   return payload;
@@ -279,7 +294,7 @@ function askBackupChoice(spec, first) {
         if (saved?.configuration && !isConfigDirty()) { state.config = saved.configuration; renderConfiguration(state.config); }
       }
       const next = await api("/api/backup-preflight");
-      if (session !== state.session || !state.token) return;
+      if (session !== state.session || !signedIn()) return;
       current = next;
       working = false;
       if (current.default_ok === true) {
@@ -290,7 +305,7 @@ function askBackupChoice(spec, first) {
       selected = "";
       render();
     } catch (error) {
-      if (session !== state.session || !state.token) return;
+      if (session !== state.session || !signedIn()) return;
       if (error.status === 401) { dialog.close("cancel"); requireReauth("Your session ended."); return; }
       working = false;
       render(error.message);
@@ -319,7 +334,7 @@ async function confirmWithBackup(spec) {
   } catch (error) {
     if (error.status === 401) { requireReauth("Your session ended."); return { proceed: false }; }
   }
-  if (session !== state.session || !state.token || state.busy) return { proceed: false };
+  if (session !== state.session || !signedIn() || state.busy) return { proceed: false };
   if (!pre || pre.default_ok !== false) return { proceed: await ask(spec) };
   const choice = await askBackupChoice(spec, pre);
   if (!choice) return { proceed: false };
@@ -336,7 +351,11 @@ function lock(force = false) {
   clearTimeout(state.poller);
   clearTimeout(state.reconnectTimer);
   state.poller = null;
+  // Sign this device out on the boat too; ignore failures, the local copy is dropped regardless.
+  if (state.device) api("/api/auth/logout", { method: "POST", body: "{}" }).catch(() => {});
   state.token = "";
+  state.device = "";
+  forgetDevice();
   state.session += 1;
   state.saving = false;
   state.config = null;
@@ -361,6 +380,8 @@ function lock(force = false) {
   $("#notice").innerHTML = "";
   $("#release-result").innerHTML = "";
   resetDisplays();
+  clearTimeout(pairing.timer);
+  $("#pair-result").replaceChildren();
   sessionStorage.removeItem("vesselstack_control_token");
   $("#app").hidden = true;
   $("#lock").hidden = true;
@@ -368,8 +389,11 @@ function lock(force = false) {
   $("#version-chip").hidden = true;
   $("#boat-name").textContent = "";
   $("#token").value = "";
+  $("#passphrase").value = "";
   $("#login-error").textContent = "";
+  resetSignIn();
   setConnection("locked");
+  refreshAuthStatus();
 }
 
 function loginError(message) {
@@ -384,7 +408,7 @@ async function unlock() {
     const config = await api("/api/config");
     if (session !== state.session) return;
     state.config = config;
-    sessionStorage.setItem("vesselstack_control_token", state.token);
+    if (state.token) sessionStorage.setItem("vesselstack_control_token", state.token);
     loginError("");
     $("#login").hidden = true;
     $("#app").hidden = false;
@@ -398,14 +422,16 @@ async function unlock() {
     } else {
       renderConfiguration(config);
     }
+    loadSignIn();
     await refreshStatus();
   } catch (error) {
     if (session !== state.session) return;
     setConnection("locked");
     // Only a rejected token is forgotten; a network problem keeps it for the retry.
-    if (error.status === 401) { sessionStorage.removeItem("vesselstack_control_token"); state.token = ""; }
+    const usedDevice = !state.token && Boolean(state.device);
+    if (error.status === 401) { sessionStorage.removeItem("vesselstack_control_token"); state.token = ""; state.device = ""; forgetDevice(); refreshAuthStatus(); }
     loginError(error.status === 401
-      ? "That token wasn't accepted. Paste only the token, or the whole CONTROL_PANEL_TOKEN=… line."
+      ? (usedDevice ? "This device is no longer signed in. Enter the passphrase again." : "That token wasn't accepted. Paste only the token, or the whole CONTROL_PANEL_TOKEN=… line.")
       : `Couldn't reach the Control Panel (${error.message}). Check that the SSH tunnel is still open.`);
   }
 }
@@ -417,6 +443,8 @@ function requireReauth(message) {
   state.poller = null;
   state.reconnectTimer = null;
   state.token = "";
+  state.device = "";
+  forgetDevice();
   state.session += 1;
   state.pendingOperation = null;
   state.operationRunning = false;
@@ -428,7 +456,227 @@ function requireReauth(message) {
   loginError("");
   $("#login-error").textContent = `${message} Unlock again.${state.reauthDirty ? " Your unsaved edits are kept." : ""}`;
   $("#token").value = "";
+  $("#passphrase").value = "";
+  resetSignIn();
   setConnection("locked");
+  refreshAuthStatus();
+}
+
+// ---------------------------------------------------------------- sign-in
+
+// "Safari on Mac" style default name for this device, from the user agent.
+function deviceLabel(agent = (typeof navigator !== "undefined" && navigator.userAgent) || "") {
+  const browser = /Edg\//.test(agent) ? "Edge" : /OPR\/|Opera/.test(agent) ? "Opera" : /Firefox\//.test(agent) ? "Firefox"
+    : /Chrome\/|CriOS/.test(agent) ? "Chrome" : /Safari\//.test(agent) ? "Safari" : "Browser";
+  const system = /iPhone/.test(agent) ? "iPhone" : /iPad/.test(agent) ? "iPad" : /Android/.test(agent) ? "Android"
+    : /Macintosh|Mac OS X/.test(agent) ? "Mac" : /Windows/.test(agent) ? "Windows" : /Linux/.test(agent) ? "Linux" : "";
+  return system ? `${browser} on ${system}` : browser;
+}
+
+function formatEpoch(seconds) {
+  const when = new Date(Number(seconds) * 1000);
+  return Number.isNaN(when.getTime()) ? "unknown" : when.toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function formatWait(seconds) {
+  const minutes = Math.ceil(Number(seconds) / 60);
+  return minutes <= 1 ? "a minute" : `${minutes} minutes`;
+}
+
+function resetSignIn() {
+  state.signin = { devices: null, error: "" };
+  const root = $("#signin-root");
+  if (root && root.replaceChildren) root.replaceChildren();
+  const form = $("#signin-card");
+  if (form) form.hidden = true;
+}
+
+async function refreshAuthStatus() {
+  try {
+    const response = await fetch("/api/auth/status");
+    const payload = await response.json();
+    state.passphraseSet = Boolean(payload.passphrase_set);
+  } catch (_error) {
+    state.passphraseSet = null; // unknown: leave the passphrase form usable
+  }
+  $("#passphrase-form").hidden = state.passphraseSet === false;
+  $("#passphrase-hint").hidden = state.passphraseSet !== false;
+  $("#token-disclosure").open = state.passphraseSet === false;
+}
+
+async function passphraseLogin() {
+  const passphrase = $("#passphrase").value;
+  if (!passphrase) { loginError("Enter your passphrase."); $("#passphrase").focus(); return; }
+  const remember = Boolean($("#remember-device").checked);
+  const label = $("#device-label").value.trim() || deviceLabel();
+  loginError("");
+  try {
+    const result = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ passphrase, remember, label }) });
+    forgetDevice();
+    try { (remember ? localStorage : sessionStorage).setItem(DEVICE_KEY, result.device_token); } catch (_error) { /* kept in memory for this page only */ }
+    $("#passphrase").value = "";
+    state.token = "";
+    state.device = result.device_token;
+    state.deviceId = result.device_id;
+    unlock();
+  } catch (error) {
+    $("#passphrase").value = "";
+    if (error.status === 429) loginError(`Too many attempts. Try again in ${formatWait(error.retryAfter)}, or use the long token.`);
+    else if (error.status === 401) loginError("That passphrase wasn't accepted.");
+    else if (error.status === 409) { loginError(error.message); refreshAuthStatus(); }
+    else loginError(`Couldn't sign in (${error.message}).`);
+  }
+}
+
+async function loadSignIn() {
+  const session = state.session;
+  $("#signin-card").hidden = false;
+  try {
+    const info = await api("/api/auth/devices");
+    if (session !== state.session) return;
+    state.signin = { devices: info.devices, max: info.max_devices, passphraseSet: info.passphrase_set, via: info.via, error: "" };
+  } catch (error) {
+    if (session !== state.session) return;
+    if (error.status === 401) { requireReauth("Your session ended."); return; }
+    state.signin = { devices: null, error: error.message };
+  }
+  renderSignIn();
+}
+
+function renderSignIn() {
+  const info = state.signin || {};
+  const root = $("#signin-root");
+  const rows = (info.devices || []).map((device) => h("li", { class: "device-row" },
+    h("div", { class: "d" },
+      h("strong", { text: device.label }),
+      device.current ? h("span", { class: "chip", text: "this device" }) : null,
+      h("span", { class: "small muted", text: `Signed in ${formatEpoch(device.created)} · last seen ${formatEpoch(device.last_seen)} · expires ${formatEpoch(device.expires)}` })),
+    h("button", { type: "button", "data-revoke-device": device.id, text: device.current ? "Sign out" : "Revoke" })));
+  root.replaceChildren(
+    info.error ? h("p", { class: "field-err", role: "alert", text: `Signed-in devices are unavailable: ${info.error}` }) : null,
+    info.devices && !rows.length ? h("p", { class: "small muted", text: "No devices are signed in with a passphrase." }) : null,
+    rows.length ? h("ul", { class: "device-list" }, rows) : null,
+    rows.length ? h("p", {}, h("button", { type: "button", class: "danger", "data-revoke-all": "1", text: "Revoke all devices" })) : null);
+  $("#signin-current-row").hidden = !info.passphraseSet || info.via === "token";
+  $("#passphrase-save").textContent = info.passphraseSet ? "Change passphrase" : "Set passphrase";
+  $("#signin-state").textContent = info.passphraseSet
+    ? "Passphrase sign-in is on. Changing it signs every other device out."
+    : "Passphrase sign-in is off. Set a passphrase (at least 12 characters) to use it instead of the long token.";
+}
+
+async function savePassphrase(event) {
+  event.preventDefault();
+  const next = $("#new-passphrase").value;
+  const error = $("#signin-error");
+  error.textContent = "";
+  if (next !== $("#confirm-passphrase").value) { error.textContent = "The two new passphrases differ."; return; }
+  if (next.length < 12) { error.textContent = "Use at least 12 characters; a few random words work well."; return; }
+  try {
+    const body = { new: next };
+    if (!$("#signin-current-row").hidden) body.current = $("#current-passphrase").value;
+    const result = await api("/api/auth/passphrase", { method: "POST", body: JSON.stringify(body) });
+    ["#current-passphrase", "#new-passphrase", "#confirm-passphrase"].forEach((id) => { $(id).value = ""; });
+    toast(result.revoked_others ? `Passphrase saved. ${result.revoked_others} other device(s) were signed out.` : "Passphrase saved.");
+    loadSignIn();
+  } catch (failure) {
+    if (failure.status === 401 && /current passphrase/i.test(failure.message)) error.textContent = failure.message;
+    else if (failure.status === 401) requireReauth("Your session ended.");
+    else error.textContent = failure.status === 429 ? `Too many attempts. Try again in ${formatWait(failure.retryAfter)}.` : failure.message;
+  }
+}
+
+async function revokeDevices(target) {
+  try {
+    const result = await api("/api/auth/devices/revoke", { method: "POST", body: JSON.stringify({ id: target }) });
+    if (result.revoked_current) { lock(true); return; }
+    toast(target === "all" ? "All devices were signed out." : "Device revoked.");
+    loadSignIn();
+  } catch (failure) {
+    if (failure.status === 401) requireReauth("Your session ended."); else toast(failure.message, true);
+  }
+}
+
+
+// ---------------------------------------------------------------- pairing links
+
+const PAIR_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+// What a person typed (case, dashes and spaces ignored; I/L read as 1, O as 0) -> canonical code, or "".
+function normalizePairingCode(text) {
+  const cleaned = String(text || "").toUpperCase().replace(/[\s-]/g, "").replace(/[IL]/g, "1").replace(/O/g, "0");
+  return cleaned.length === 10 && [...cleaned].every((ch) => PAIR_ALPHABET.includes(ch)) ? cleaned : "";
+}
+
+// Reads #pair=CODE and removes it from the address bar and history BEFORE anything is requested.
+function takePairFragment() {
+  if (typeof location === "undefined" || !location.hash) return "";
+  const match = /(?:^|[#&])pair=([^&]*)/.exec(location.hash);
+  if (!match) return "";
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (_error) { /* the fragment may stay visible */ }
+  try { return decodeURIComponent(match[1]); } catch (_error) { return ""; }
+}
+
+async function redeemPairing(raw) {
+  const code = normalizePairingCode(raw);
+  if (!code) { loginError("That pairing code doesn't look right. It has 10 letters and numbers, like ABCDE-FGHJK."); return false; }
+  loginError("");
+  try {
+    const result = await api("/api/auth/pair", { method: "POST", body: JSON.stringify({ code, label: deviceLabel() }) });
+    forgetDevice();
+    try { localStorage.setItem(DEVICE_KEY, result.device_token); } catch (_error) { /* kept in memory for this page only */ }
+    $("#pair-code").value = "";
+    state.token = "";
+    state.device = result.device_token;
+    state.deviceId = result.device_id;
+    unlock();
+    return true;
+  } catch (error) {
+    $("#pair-code").value = "";
+    if (error.status === 429) loginError(`Too many attempts. Try again in ${formatWait(error.retryAfter)}, or use the long token.`);
+    else if (error.status === 401) loginError("That pairing code was not accepted or has expired. Ask for a new one.");
+    else loginError(`Couldn't pair this device (${error.message}).`);
+    return false;
+  }
+}
+
+const pairing = { timer: null, expires: 0 };
+
+function renderPairing(result) {
+  const root = $("#pair-result");
+  clearTimeout(pairing.timer);
+  pairing.expires = result.expires_at;
+  const size = result.modules.length;
+  let path = "";
+  result.modules.forEach((row, y) => row.forEach((cell, x) => { if (cell) path += `M${x} ${y}h1v1h-1z`; }));
+  const tick = () => {
+    const left = Math.max(0, Math.round(pairing.expires - Date.now() / 1000));
+    const clock = $("#pair-countdown");
+    if (clock) clock.textContent = left > 0 ? `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}. Works once.` : "Expired.";
+    if (left > 0) pairing.timer = setTimeout(tick, 1000); else root.replaceChildren();
+  };
+  const target = result.for === "chat" ? "Boat Chat" : "the Control Panel";
+  root.replaceChildren(
+    h("p", { class: "small", text: `Scan with the phone camera to sign it in to ${target}${result.admin ? " with admin rights" : ""}.` }),
+    sv("svg", { class: "qr", viewBox: `-2 -2 ${size + 4} ${size + 4}`, role: "img", "aria-label": "Pairing QR code", "shape-rendering": "crispEdges" },
+      sv("rect", { x: -2, y: -2, width: size + 4, height: size + 4, fill: "#fff" }),
+      sv("path", { d: path, fill: "#000" })),
+    h("p", {}, h("a", { href: result.url, class: "mono", text: result.url })),
+    h("p", {}, "Or type this code on the sign-in screen: ", h("strong", { class: "mono", text: result.code })),
+    h("p", { id: "pair-countdown", class: "small muted" }),
+    result.tunnel ? h("p", { class: "small", text: "This service only listens on this computer. A phone cannot reach it directly: open an SSH tunnel, or run sudo vesselstackctl panel-access lan on the boat computer (Boat Chat: set BOAT_CHAT_HOST)." }) : null,
+    h("p", { class: "small muted", text: "Anyone who scans this before it expires gets a signed-in device. The link is plain HTTP on your boat network." }));
+  tick();
+}
+
+async function createPairing(target) {
+  const error = $("#pair-error");
+  error.textContent = "";
+  try {
+    const result = await api("/api/auth/pairing", { method: "POST", body: JSON.stringify({ for: target, admin: target === "chat" && Boolean($("#pair-admin").checked), label: "" }) });
+    renderPairing(result);
+  } catch (failure) {
+    if (failure.status === 401) requireReauth("Your session ended.");
+    else error.textContent = failure.message;
+  }
 }
 
 // ---------------------------------------------------------------- tabs
@@ -708,12 +956,12 @@ async function startOperation(payload, route = null) {
   renderBanner(state.operation, { active: true, uncertain: false });
   try {
     const operation = await api(route?.path || (payload.component ? "/api/component" : "/api/action"), { method: "POST", body: JSON.stringify(payload) });
-    if (session !== state.session || !state.token) return;
+    if (session !== state.session || !signedIn()) return;
     if (state.pendingOperation) state.pendingOperation.operationId = operation.id ?? null;
     renderOperation(operation);
     refreshStatus();
   } catch (error) {
-    if (session !== state.session || !state.token) return;
+    if (session !== state.session || !signedIn()) return;
     if (error.status === 401) { requireReauth("Your session ended."); return; }
     if (error.status >= 400 && error.status < 500) {
       state.pendingOperation = null;
@@ -751,11 +999,11 @@ function schedulePoll(delay) {
 
 async function refreshStatus() {
   const session = state.session;
-  if (!state.token) return;
+  if (!signedIn()) return;
   if (typeof document.hidden === "boolean" && document.hidden && !state.operationRunning) { schedulePoll(IDLE_POLL_MS); return; }
   try {
     const data = await api("/api/status");
-    if (session !== state.session || !state.token) return;
+    if (session !== state.session || !signedIn()) return;
     if (state.bootId && data.boot_id && state.bootId !== data.boot_id) {
       if (isConfigDirty()) {
         setNotice("restarted", "The Control Panel restarted. Your unsaved edits are kept. Save or discard them, then reload this page.");
@@ -783,7 +1031,7 @@ async function refreshStatus() {
     renderOperation(data.operation);
     if (!state.operationRunning) schedulePoll(IDLE_POLL_MS);
   } catch (error) {
-    if (session !== state.session || !state.token) return;
+    if (session !== state.session || !signedIn()) return;
     if (error.status === 401) { requireReauth("Your session ended."); return; }
     setConnection("disconnected");
     setBusy(true);
@@ -875,15 +1123,15 @@ async function checkReleases() {
   renderUpdates();
   try {
     const data = await api(`/api/releases?channel=${channel}`);
-    if (session !== state.session || epoch !== state.releaseEpoch || !state.token) return;
+    if (session !== state.session || epoch !== state.releaseEpoch || !signedIn()) return;
     renderReleases(data);
   } catch (error) {
-    if (session === state.session && epoch === state.releaseEpoch && state.token) {
+    if (session === state.session && epoch === state.releaseEpoch && signedIn()) {
       if (error.status === 401) requireReauth("Your session ended.");
       else { state.releaseError = error.message; state.releaseChecked = false; }
     }
   } finally {
-    if (session === state.session && epoch === state.releaseEpoch && state.token) {
+    if (session === state.session && epoch === state.releaseEpoch && signedIn()) {
       state.releaseCheckPending = false;
       renderUpdates();
     }
@@ -1075,14 +1323,15 @@ async function saveConfiguration() {
   });
   try {
     const result = await api("/api/config", { method: "POST", body: JSON.stringify({ settings }) });
-    if (session !== state.session || !state.token) return;
+    if (session !== state.session || !signedIn()) return;
     state.config = result.configuration;
     renderConfiguration(state.config);
     if (result.backup) state.rollbackPath = result.backup;
     updateConfigStatus();
-    toast("Settings saved. Nothing has changed on the boat yet. Press Apply to put them into effect.");
+    const notes = Array.isArray(result.notes) && result.notes.length ? ` ${result.notes.join(" ")}` : "";
+    toast(`Settings saved. Nothing has changed on the boat yet. Press Apply to put them into effect.${notes}`);
   } catch (error) {
-    if (session !== state.session || !state.token) return;
+    if (session !== state.session || !signedIn()) return;
     if (error.status === 401) { requireReauth("Your session ended."); return; }
     controls.forEach((control) => { control.disabled = control.dataset.wasDisabled === "true"; });
     if (error.fields) {
@@ -1090,7 +1339,7 @@ async function saveConfiguration() {
       toast(`${Object.keys(error.fields).length} ${Object.keys(error.fields).length === 1 ? "setting needs" : "settings need"} fixing before they can be saved.`, true);
     } else toast(error.message, true);
   } finally {
-    if (session === state.session && state.token) {
+    if (session === state.session && signedIn()) {
       state.saving = false;
       updateConfigStatus();
     }
@@ -1537,7 +1786,7 @@ function renderDataBrowser() {
 
 async function loadDisplays(force = false) {
   const d = state.displays;
-  if (!state.token || d.loading) return;
+  if (!signedIn() || d.loading) return;
   if (!force && d.loaded && Date.now() - d.loadedAt < DISPLAYS_STALE_MS) return;
   const session = state.session;
   const epoch = ++d.epoch;
@@ -1893,7 +2142,7 @@ function refreshDeployPanels() {
   const op = state.operation;
   if (op && UPLOAD_LABEL_RE.test(String(op.label || "")) && ["succeeded", "failed"].includes(op.state) && state.displays.reloadedFor !== operationKey(op)) {
     state.displays.reloadedFor = operationKey(op);
-    if (state.token) loadDisplays(true);
+    if (signedIn()) loadDisplays(true);
   }
 }
 
@@ -2365,6 +2614,20 @@ $("#login-form").addEventListener("submit", (event) => {
   unlock();
 });
 $("#token").addEventListener("input", () => loginError(""));
+$("#passphrase").addEventListener("input", () => loginError(""));
+$("#passphrase-form").addEventListener("submit", (event) => { event.preventDefault(); passphraseLogin(); });
+$("#device-label").value = deviceLabel();
+$("#signin-form").addEventListener("submit", savePassphrase);
+$("#pair-form").addEventListener("submit", (event) => { event.preventDefault(); redeemPairing($("#pair-code").value); });
+$("#pair-panel").addEventListener("click", () => createPairing("panel"));
+$("#pair-chat").addEventListener("click", () => createPairing("chat"));
+$("#signin-root").addEventListener("click", (event) => {
+  const one = event.target.closest && event.target.closest("[data-revoke-device]");
+  if (one) { revokeDevices(one.dataset.revokeDevice); return; }
+  if (event.target.closest && event.target.closest("[data-revoke-all]")) {
+    ask({ title: "Revoke every signed-in device?", intro: "Every device signed in with a passphrase, including this one, will have to sign in again. The long token keeps working.", ok: "Revoke all", danger: true }).then((yes) => { if (yes) revokeDevices("all"); });
+  }
+});
 $("#show-token").addEventListener("change", (event) => { $("#token").type = event.target.checked ? "text" : "password"; });
 
 $$("[data-tab]").forEach((button) => button.addEventListener("click", () => selectTab(button.dataset.tab)));
@@ -2428,7 +2691,7 @@ window.addEventListener("scroll", updateScrollSpy, { passive: true });
 $("#displays").addEventListener("click", onDisplaysClick);
 $("#displays").addEventListener("input", onDisplaysInput);
 $("#displays").addEventListener("change", onDisplaysInput);
-$("#history-panel").addEventListener("toggle", (event) => { if (event.target.open && state.token) loadHistory(); });
+$("#history-panel").addEventListener("toggle", (event) => { if (event.target.open && signedIn()) loadHistory(); });
 $("#catalog-search").addEventListener("input", (event) => { state.displays.query = event.target.value; renderDataBrowser(); });
 $("#toast-close").addEventListener("click", () => { $("#toast").className = ""; });
 $("#retry").addEventListener("click", () => { state.reconnectAttempts = 0; clearTimeout(state.reconnectTimer); refreshStatus(); });
@@ -2452,11 +2715,19 @@ $$("[data-component-filter]").forEach((button) => button.addEventListener("click
   state.componentFilter = button.dataset.componentFilter;
   renderComponents(state.components, true);
 }));
-document.addEventListener("visibilitychange", () => { if (!document.hidden && state.token && !state.busy) refreshStatus(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && signedIn() && !state.busy) refreshStatus(); });
 
 window.addEventListener("beforeunload", (event) => { if (isConfigDirty() || displaysDirty()) { event.preventDefault(); event.returnValue = ""; } });
 
-if (state.token) {
+const pairFragment = takePairFragment();
+if (pairFragment) {
+  // The code left the address bar above; redeem it before anything else is requested.
+  redeemPairing(pairFragment).then((paired) => { if (!paired) refreshAuthStatus(); });
+} else if (state.token) {
   $("#token").value = state.token;
   unlock();
+} else if (state.device) {
+  unlock();
+} else {
+  refreshAuthStatus();
 }

@@ -10,6 +10,10 @@ __pycache__/
 *.env
 !*.example.env
 *.secret
+control-panel-auth.json
+control-panel-auth.json.lock
+boat-chat/auth.json
+boat-chat/auth.json.lock
 *.env.before-fix-*
 *.sqlite
 *.sqlite3

@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const appSource = fs.readFileSync('control-panel/static/app.js', 'utf8');
 const html = fs.readFileSync('control-panel/static/index.html', 'utf8');
 const css = fs.readFileSync('control-panel/static/styles.css', 'utf8');
-const source = appSource + '\nthis.__ui = { state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, askBackupChoice, confirmWithBackup, backupOptions, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, newDraft, draftDirty, draftProblems, titleProblem, addCheck, addRowToDraft, removeItem, removePage, addPage, moveWithin, savePayload, draftShow, geometryFor, otaTargetProblem, serialProblem, uploadRequest, isNewOtaTarget, parseStages, applyBlock, defaultOtaTarget, defaultMethod, deployPanel, saveDraft, startEditing, stopEditing, applyToScreen, runDisplayAction, onDisplaysInput, openApplyDialog, renderHistory, loadHistory, restoreBackup, formatStamp, pageEditor, saveBar, rowAddControls, entryById, displaysDirty, layoutChoices, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
+const source = appSource + '\nthis.__ui = { normalizePairingCode, takePairFragment, redeemPairing, renderPairing, passphraseLogin, deviceLabel, signedIn, renderSignIn, savePassphrase, revokeDevices, state, normalizeToken, isConfigDirty, dirtyKeys, currentSettings, lock, setBusy, renderComponents, checkReleases, startOperation, renderOperation, operationSucceeded, refreshStatus, renderReleases, runComponent, runAction, installRelease, discardEdits, toast, fieldMarkup, optionLabel, updateConfigStatus, renderBand, renderUpdates, requireReauth, CONFIRMS, describeOperation, askBackupChoice, confirmWithBackup, backupOptions, setNotice, showFieldErrors, renderConfiguration, selectTab, firmwareChip, readinessItems, previewModel, newDraft, draftDirty, draftProblems, titleProblem, addCheck, addRowToDraft, removeItem, removePage, addPage, moveWithin, savePayload, draftShow, geometryFor, otaTargetProblem, serialProblem, uploadRequest, isNewOtaTarget, parseStages, applyBlock, defaultOtaTarget, defaultMethod, deployPanel, saveDraft, startEditing, stopEditing, applyToScreen, runDisplayAction, onDisplaysInput, openApplyDialog, renderHistory, loadHistory, restoreBackup, formatStamp, pageEditor, saveBar, rowAddControls, entryById, displaysDirty, layoutChoices, previewSvg, themeVars, itemInfo, liveRowsByPath, liveValue, rowBadges, rowValueText, filterCatalogRows, groupCatalogRows, loadDisplays, renderDisplays, renderDataBrowser, displayCard, resetDisplays, onDisplaysClick, h, sv };';
 const nodes = new Map();
 // A small element tree, enough to build and read back the Displays tab without a browser.
 class FakeEl {
@@ -27,7 +27,7 @@ const makeNode = () => ({
   value: '', checked: false, disabled: false, textContent: '', hidden: false, className: '', innerHTML: '', dataset: {}, open: false,
   classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
   addEventListener() {}, setAttribute() {}, removeAttribute() {}, closest: () => null, focus() {}, scrollIntoView() {},
-  querySelector() { return null; }, querySelectorAll() { return []; }, isConnected: true,
+  querySelector() { return null; }, querySelectorAll() { return []; }, isConnected: true, children: [], replaceChildren(...items) { this.children = items; },
 });
 const node = (id) => nodes.get(id) || nodes.set(id, makeNode()).get(id);
 const fields = {};
@@ -55,7 +55,9 @@ backupDialog.showModal = function showModal() {
 backupDialog.close = function close(value) { this.returnValue = value; this.open = false; if (this.onclose) this.onclose(); };
 let fetchImpl = async () => ({ ok: true, json: async () => ({ configuration: context.__ui.state.config }) });
 const context = {
-  console, setTimeout: () => 0, clearTimeout() {},
+  console, location: { hash: '', pathname: '/', search: '' }, history: { calls: [], replaceState(...args) { this.calls.push(args); context.location.hash = ''; } },
+  setTimeout: () => 0, clearTimeout() {},
+  localStorage: { values: {}, getItem(key) { return this.values[key] || ''; }, setItem(key, value) { this.values[key] = value; }, removeItem(key) { delete this.values[key]; } },
   sessionStorage: { values: {}, getItem(key) { return this.values[key] || ''; }, setItem(key, value) { this.values[key] = value; }, removeItem(key) { delete this.values[key]; } },
   window: { addEventListener() {}, confirm: () => { throw new Error('window.confirm must not be used'); }, location: { reload() {} } },
   document: {
@@ -1004,6 +1006,117 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   ui.state.token = 'tok3'; ui.selectTab('displays'); await tick();
   assert.equal(ui.state.displays.loading, false);
   ui.lock(true);
+  }
+  // ---- passphrase sign-in ---------------------------------------------------
+  {
+    const KEY = 'vesselstack_device_token';
+    const calls = [];
+    const failure = (status, payload) => ({ ok: false, status, statusText: '', json: async () => payload });
+    let loginReply = ok({ device_token: 'device-token-1', device_id: 'abc', expires_at: 1900000000 });
+    fetchImpl = async (path, options = {}) => {
+      calls.push({ path, headers: options.headers || {}, body: options.body ? JSON.parse(options.body) : null });
+      if (path === '/api/auth/login') return loginReply;
+      if (path === '/api/config') return ok({ fields: [], values: {} });
+      if (path === '/api/auth/devices') return ok({ devices: [{ id: 'abc', label: 'Safari on Mac', created: 1800000000, last_seen: 1800000000, expires: 1802592000, current: true }, { id: 'def', label: 'Phone', created: 1800000000, last_seen: 1800000000, expires: 1802592000, current: false }], max_devices: 20, passphrase_set: true, via: 'device' });
+      return ok({});
+    };
+    const forget = () => { context.localStorage.values = {}; context.sessionStorage.values = {}; ui.state.token = ''; ui.state.device = ''; calls.length = 0; };
+    forget();
+    assert.equal(ui.deviceLabel('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'), 'Safari on Mac');
+    assert.equal(ui.deviceLabel('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1'), 'Safari on iPhone');
+    assert.equal(ui.deviceLabel('Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0'), 'Firefox on Linux');
+
+    // Remember ticked: the device token goes to localStorage and rides in X-VesselStack-Device.
+    node('#passphrase').value = 'correct horse battery'; node('#remember-device').checked = true; node('#device-label').value = 'Chart table';
+    await ui.passphraseLogin(); await tick(); await tick();
+    assert.deepEqual(calls[0].body, { passphrase: 'correct horse battery', remember: true, label: 'Chart table' });
+    assert.equal(context.localStorage.values[KEY], 'device-token-1');
+    assert.equal(context.sessionStorage.values[KEY], undefined);
+    assert.equal(node('#passphrase').value, '', 'the passphrase field is cleared');
+    const authed = calls.find((call) => call.path === '/api/config');
+    assert.equal(authed.headers['X-VesselStack-Device'], 'device-token-1');
+    assert.equal('X-VesselStack-Token' in authed.headers, false);
+    assert.equal(ui.signedIn(), true);
+    const settings = calls.filter((call) => call.path === '/api/auth/devices');
+    assert.ok(settings.length >= 1, 'the Settings Sign-in list is loaded after unlocking');
+    const listed = node('#signin-root').children.filter(Boolean).map((child) => child.textContent).join(' ');
+    assert.match(listed, /Safari on Mac/); assert.match(listed, /this device/); assert.match(listed, /Phone/);
+
+    // Lock signs the device out on the boat and forgets it locally.
+    calls.length = 0;
+    ui.lock(true);
+    assert.equal(calls.find((call) => call.path === '/api/auth/logout').headers['X-VesselStack-Device'], 'device-token-1');
+    assert.equal(context.localStorage.values[KEY], undefined); assert.equal(ui.state.device, ''); assert.equal(ui.signedIn(), false);
+
+    // Not remembered: sessionStorage only.
+    forget();
+    node('#passphrase').value = 'correct horse battery'; node('#remember-device').checked = false; node('#device-label').value = '';
+    loginReply = ok({ device_token: 'device-token-2', device_id: 'xyz', expires_at: 1900000000 });
+    await ui.passphraseLogin(); await tick(); await tick();
+    assert.equal(calls[0].body.remember, false); assert.equal(calls[0].body.label, ui.deviceLabel());
+    assert.equal(context.sessionStorage.values[KEY], 'device-token-2'); assert.equal(context.localStorage.values[KEY], undefined);
+    ui.lock(true);
+    assert.equal(context.sessionStorage.values[KEY], undefined);
+
+    // Refusals leave nothing behind and say something useful.
+    forget();
+    node('#passphrase').value = 'wrong'; loginReply = failure(401, { error: 'x' });
+    await ui.passphraseLogin();
+    assert.match(node('#login-error').textContent, /wasn't accepted/); assert.equal(ui.signedIn(), false); assert.deepEqual(context.localStorage.values, {});
+    node('#passphrase').value = 'wrong'; loginReply = failure(429, { error: 'Too many', retry_after: 290 });
+    await ui.passphraseLogin();
+    assert.match(node('#login-error').textContent, /5 minutes/); assert.match(node('#login-error').textContent, /long token/);
+    node('#passphrase').value = ''; calls.length = 0;
+    await ui.passphraseLogin();
+    assert.equal(calls.length, 0, 'an empty passphrase is not sent');
+
+    // Revoking this device from the list locks the panel; the long token still works as before.
+    forget(); ui.state.device = 'device-token-3';
+    fetchImpl = async (path, options = {}) => { calls.push({ path }); return path === '/api/auth/devices/revoke' ? ok({ ok: true, revoked: 1, revoked_current: true }) : ok({}); };
+    await ui.revokeDevices('abc'); await tick();
+    assert.equal(ui.state.device, '');
+    ui.state.token = 'tok-long'; ui.state.device = '';
+    assert.equal(ui.signedIn(), true, 'the long token still counts as signed in');
+    ui.lock(true);
+    assert.doesNotMatch(appSource, /document\.cookie/, 'device tokens never use cookies');
+    assert.doesNotMatch(appSource, /innerHTML\s*=\s*[^;]*device/, 'device rows are built with textContent only');
+  }
+
+  // ---- pairing links --------------------------------------------------------
+  {
+    assert.equal(ui.normalizePairingCode('abcde-fghjk'), 'ABCDEFGHJK');
+    assert.equal(ui.normalizePairingCode(' oilo1 l0ilo '), '0110110110', 'O reads as 0, I and L as 1');
+    assert.equal(ui.normalizePairingCode('short'), '');
+    assert.equal(ui.normalizePairingCode('ABCDE-FGHJU'), '', 'U is not in the alphabet');
+    // The fragment leaves the address bar before anything is requested.
+    const requests = [];
+    fetchImpl = async (path, options = {}) => { requests.push({ path, options, hashAtRequest: context.location.hash }); return ok({ device_token: 'paired-token-0123456789abcdef', device_id: 'dev1' }); };
+    context.location.hash = '#pair=abcde-fghjk';
+    const taken = ui.takePairFragment();
+    assert.equal(taken, 'abcde-fghjk');
+    assert.equal(context.location.hash, '', 'fragment removed from the URL');
+    assert.equal(context.history.calls.length, 1);
+    assert.equal(requests.length, 0, 'nothing was requested before the fragment was stripped');
+    assert.equal(ui.takePairFragment(), '', 'no fragment, no code');
+    ui.state.token = ''; ui.state.device = '';
+    assert.equal(await ui.redeemPairing(taken), true); await tick();
+    const pair = requests.find((item) => item.path === '/api/auth/pair');
+    assert.equal(pair.hashAtRequest, '', 'the request was made after the fragment was gone');
+    assert.deepEqual(Object.keys(JSON.parse(pair.options.body)).sort(), ['code', 'label']);
+    assert.equal(JSON.parse(pair.options.body).code, 'ABCDEFGHJK');
+    assert.equal(context.localStorage.getItem('vesselstack_device_token'), 'paired-token-0123456789abcdef', 'pair links always remember the device');
+    assert.equal(ui.state.device, 'paired-token-0123456789abcdef');
+    requests.length = 0;
+    assert.equal(await ui.redeemPairing('nope'), false);
+    assert.equal(requests.length, 0, 'a malformed code is not sent');
+    // The QR renders as one SVG path built by DOM calls only.
+    const host = node('#pair-result');
+    ui.renderPairing({ url: 'http://boat.local:8780/#pair=ABCDEFGHJK', code: 'ABCDE-FGHJK', expires_at: Math.floor(Date.now() / 1000) + 600, modules: [[1, 0], [0, 1]], for: 'panel', admin: false, tunnel: false });
+    const svg = host.children.find((child) => child.tagName === 'svg');
+    assert.equal(svg.getAttribute('viewBox'), '-2 -2 6 6');
+    assert.equal(svg.children[1].getAttribute('d'), 'M0 0h1v1h-1zM1 1h1v1h-1z');
+    assert.equal(svg.find((el) => 'style' in el.attrs).length, 0, 'no inline style on the QR');
+    ui.lock(true);
   }
   console.log('control-panel UI regression checks passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

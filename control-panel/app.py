@@ -42,6 +42,86 @@ except ImportError:
 
 
 ROOT = Path(os.environ.get("VESSELSTACK_ROOT", "/opt/vesselstack"))
+
+
+def _load_shared_auth() -> Any:
+    """Load common/vesselstack_auth.py from the install root, else from the repository checkout."""
+    import importlib.util
+    candidates = [ROOT / "common" / "vesselstack_auth.py", Path(__file__).resolve().parent.parent / "common" / "vesselstack_auth.py"]
+    for candidate in candidates:
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location("vesselstack_auth", candidate)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise SystemExit("Missing shared sign-in module: " + str(candidates[0]))
+
+
+vsauth = _load_shared_auth()
+LOGIN_THROTTLE = vsauth.LoginThrottle()
+_AUTH_STORES: dict[str, Any] = {}
+_UNSET: Any = object()
+
+
+def chat_passphrase_hash() -> str | None:
+    """Boat Chat's passphrase hash (root can read the service user's file); None when unset or unreadable."""
+    try:
+        data_dir = parse_env(VESSEL_ENV).get("VESSELSTACK_DATA") or ""
+        if not data_dir:
+            return None
+        return vsauth.AuthStore(Path(data_dir) / "boat-chat" / vsauth.CHAT_STORE_NAME).snapshot()["passphrase_hash"]
+    except (OSError, vsauth.StoreError, ValueError, TypeError, AttributeError, KeyError):
+        return None  # an unreadable or corrupt store reads as "no passphrase" (fail closed), never as a 500
+
+
+def effective_chat_token(key: str, vessel: dict[str, str] | None = None) -> str:
+    """The Boat Chat code Boat Chat itself enforces: Settings-page override file first, then config/boat-chat.env."""
+    return vsauth.effective_chat_setting(key, chat_override_path(vessel), CHAT_ENV)
+
+
+def revoke_chat_devices(notes: list[str] | None = None) -> int:
+    """Sign out every Boat Chat device and drop waiting pairing links (via the privilege-dropping helper). Returns the
+    count; on failure the problem goes to ``notes`` (and 0 is returned) because the rotation itself already happened."""
+    try:
+        return chat_auth_store().revoke_all()
+    except (vsauth.StoreError, OSError):
+        if notes is not None:
+            notes.append("The Boat Chat access code changed but its signed-in devices could not be signed out. "
+                         "Run: sudo vesselstackctl devices revoke-all chat")
+        return 0
+
+
+def chat_auth_store() -> Any:
+    """Boat Chat's store, written only through the privilege-dropping path (the panel runs as root)."""
+    data_dir = parse_env(VESSEL_ENV).get("VESSELSTACK_DATA") or ""
+    if not data_dir:
+        raise vsauth.StoreError("VESSELSTACK_DATA is not configured")
+    return vsauth.AuthStore(Path(data_dir) / "boat-chat" / vsauth.CHAT_STORE_NAME, min_passphrase=vsauth.CHAT_MIN_PASSPHRASE_LENGTH,
+                            expose_role=True, inherit_owner=True)
+
+
+def auth_store() -> Any:
+    path = ROOT / "config" / vsauth.STORE_NAME
+    key = str(path)
+    if key not in _AUTH_STORES:
+        _AUTH_STORES[key] = vsauth.AuthStore(path, differs_from=chat_passphrase_hash,
+                                             differs_message="Choose a passphrase different from the Boat Chat one.")
+    return _AUTH_STORES[key]
+
+
+_HOST_ALLOWLISTS: dict[tuple[str, int], Any] = {}
+
+
+def host_allowlist(address: Any) -> Any:
+    """Host-header allowlist for the listener this request arrived on (see vsauth.HostAllowlist)."""
+    host, port = str(address[0]), int(address[1])
+    key = (host, port)
+    if key not in _HOST_ALLOWLISTS:
+        _HOST_ALLOWLISTS[key] = vsauth.HostAllowlist(host, port, extra=lambda: panel_settings().get("CONTROL_PANEL_ALLOWED_HOSTS", ""))
+    return _HOST_ALLOWLISTS[key]
+
+
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 VESSEL_ENV = Path(os.environ.get("VESSELSTACK_ENV", str(ROOT / "config/vesselstack.env")))
 CHAT_ENV = ROOT / "config/boat-chat.env"
@@ -559,18 +639,19 @@ def release_lifecycle_slot(slot_fd) -> None:
         LIFECYCLE_LOCK.release()
 
 
-def update_configuration(updates: dict[str, Any]) -> str:
+def update_configuration(updates: dict[str, Any], notes: list[str] | None = None) -> str:
     slot_fd = take_lifecycle_slot()
     try:
-        return _update_configuration(updates)
+        return _update_configuration(updates, notes)
     finally:
         release_lifecycle_slot(slot_fd)
 
 
-def _update_configuration(updates: dict[str, Any]) -> str:
+def _update_configuration(updates: dict[str, Any], notes: list[str] | None = None) -> str:
     saved_chat_keys: set[str] = set()
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
+    access_before = effective_chat_token("BOAT_CHAT_ACCESS_TOKEN", vessel)
     panel = parse_env(PANEL_ENV)
     problems: dict[str, str] = {}
     for key, raw in updates.items():
@@ -633,6 +714,11 @@ def _update_configuration(updates: dict[str, Any]) -> str:
                 shutil.copy2(snapshot, path)
         raise
     clear_chat_overrides(saved_chat_keys, vessel)
+    if "BOAT_CHAT_ACCESS_TOKEN" in saved_chat_keys and effective_chat_token("BOAT_CHAT_ACCESS_TOKEN", vessel) != access_before:
+        # Rotating the access code signs out every Boat Chat device and drops waiting pairing links.
+        revoked = revoke_chat_devices(notes)
+        if notes is not None and revoked:
+            notes.append(f"Boat Chat access code changed: {revoked} signed-in device(s) were signed out.")
     return str(backup)
 
 
@@ -1366,28 +1452,209 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print("[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), fmt % args), flush=True)
 
-    def send_json(self, status: int, payload: Any) -> None:
+    def send_json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def authenticated(self) -> bool:
+    _auth_cached: Any = _UNSET
+
+    def auth_context(self) -> dict[str, Any] | None:
+        """{"kind": "token"} or {"kind": "device", "device": {...}}; None when unauthenticated.
+
+        Evaluated once per request (the first call, normally ``require_auth``) and reused, so a device revoked or a
+        token rotated while the request is being handled cannot turn an authenticated request into a crash or a
+        different identity half way through."""
+        if self._auth_cached is _UNSET:
+            self._auth_cached = self._evaluate_auth()
+        return self._auth_cached
+
+    def _evaluate_auth(self) -> dict[str, Any] | None:
+        context: dict[str, Any] | None = None
         expected = panel_settings().get("CONTROL_PANEL_TOKEN", "").strip()
         supplied = normalize_token(self.headers.get("X-VesselStack-Token") or "")
-        return bool(expected) and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+        if expected and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8")):
+            context = {"kind": "token"}
+        else:
+            device_token = (self.headers.get("X-VesselStack-Device") or "").strip()
+            if device_token:
+                device = auth_store().verify_device_token(device_token)
+                if device:
+                    context = {"kind": "device", "device": device}
+        return context
+
+    def authenticated(self) -> bool:
+        return self._evaluate_auth() is not None
 
     def require_auth(self) -> bool:
-        if self.authenticated():
+        """Authenticate once and remember the answer for the rest of this request (see ``auth_context``)."""
+        self._auth_cached = self._evaluate_auth()
+        if self._auth_cached is not None:
             return True
-        self.send_json(401, {"error": "A valid X-VesselStack-Token header is required"})
+        self.send_json(401, {"error": "Sign in with the passphrase, or send a valid X-VesselStack-Token header"})
         return False
+
+    def host_allowed(self) -> bool:
+        """DNS-rebinding guard: refuse any Host header that does not name this machine (static files included)."""
+        if host_allowlist(self.server.server_address).allowed(self.headers.get("Host")):
+            return True
+        body = b"Misdirected request\n"
+        self.send_response(421)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+        return False
+
+    def client_ip(self) -> str:
+        return str(self.client_address[0])
+
+    def current_device_id(self) -> str | None:
+        context = self.auth_context()
+        return context["device"]["id"] if context and context["kind"] == "device" else None
+
+    def post_auth_login(self) -> None:
+        store = auth_store()
+        ip = self.client_ip()
+        try:
+            payload = self.read_payload()
+            if not store.passphrase_set():
+                self.send_json(409, {"error": "Passphrase sign-in is off until a passphrase is set. Use the long token, then set one in Settings."})
+                return
+            passphrase, remember = payload.get("passphrase"), payload.get("remember", False)
+            if not isinstance(passphrase, str) or not passphrase or not isinstance(remember, bool):
+                raise ValueError("passphrase (text) and remember (true or false) are required")
+            allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)  # checks the limits and counts this attempt in one step
+            if not allowed:
+                self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                return
+            if not store.check_passphrase(passphrase):
+                self.send_json(401, {"error": "That passphrase was not accepted."})
+                return
+            LOGIN_THROTTLE.success(attempt)
+            token, device = store.create_device(payload.get("label"), remember)
+            self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": remember})
+        except vsauth.DeviceLimitError as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
+
+    def post_auth_pair(self) -> None:
+        """Redeem a pairing code for a remembered device. Same throttle, Origin and Host rules as login."""
+        store = auth_store()
+        ip = self.client_ip()
+        try:
+            payload = self.read_payload()
+            code_text, label = payload.get("code"), payload.get("label")
+            if not isinstance(code_text, str) or not code_text:
+                raise ValueError("code (text) is required")
+            allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)
+            if not allowed:
+                self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                return
+            code = vsauth.normalize_pairing_code(code_text)
+            result = store.redeem_pairing(code, label) if code else None
+            if result is None:
+                self.send_json(401, {"error": "That pairing code was not accepted or has expired."})
+                return
+            LOGIN_THROTTLE.success(attempt)
+            token, device = result
+            self.send_json(200, {"device_token": token, "device_id": device["id"], "expires_at": device["expires"], "remember": True})
+        except vsauth.DeviceLimitError as exc:
+            self.send_json(409, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
+
+    def post_auth_pairing(self, payload: dict[str, Any]) -> None:
+        """Create a pairing link for the panel or Boat Chat (authenticated)."""
+        target, admin = payload.get("for", "panel"), payload.get("admin", False)
+        if target not in {"panel", "chat"} or not isinstance(admin, bool) or (admin and target != "chat"):
+            raise ValueError('for ("panel" or "chat") and admin (true only with chat) are required')
+        label = payload.get("label")
+        if label is not None and not isinstance(label, str):
+            raise ValueError("label must be text")
+        if target == "panel":
+            store, bind, port = auth_store(), self.server.server_address[0], int(self.server.server_address[1])
+        else:
+            store = chat_auth_store()
+            chat = parse_env(CHAT_ENV)
+            bind = chat.get("BOAT_CHAT_HOST") or "0.0.0.0"
+            port = int(chat.get("BOAT_CHAT_PORT") or 8765)
+        admin_code = effective_chat_token("BOAT_CHAT_SETTINGS_TOKEN") if admin else ""
+        if admin and not admin_code:
+            raise ValueError("Admin pairing needs an admin code: set BOAT_CHAT_SETTINGS_TOKEN in the Boat Chat settings first.")
+        binding = store.admin_binding(admin_code, create=True) if admin else ""
+        code, expires = store.create_pairing("admin" if admin else "access", label or "", binding)
+        links = vsauth.pairing_urls(code, str(bind), port)
+        self.send_json(200, {"url": links["urls"][0], "urls": links["urls"], "tunnel": links["tunnel"], "code": vsauth.format_pairing_code(code),
+                             "expires_at": expires, "modules": vsauth.qr_matrix(links["urls"][0]), "for": target, "admin": admin})
+
+    def post_auth(self, path: str, payload: dict[str, Any]) -> None:
+        store = auth_store()
+        context = self.auth_context() or {}
+        current = self.current_device_id()
+        try:
+            if path == "/api/auth/logout":
+                if current:
+                    store.revoke(current)
+                self.send_json(200, {"ok": True, "revoked": bool(current)})
+            elif path == "/api/auth/devices/revoke":
+                target = payload.get("id")
+                if target == "all":
+                    count = store.revoke_all()
+                    self.send_json(200, {"ok": True, "revoked": count, "revoked_current": current is not None})
+                elif isinstance(target, str) and target:
+                    found = store.revoke(target)
+                    if not found:
+                        self.send_json(404, {"error": "No such signed-in device"})
+                        return
+                    self.send_json(200, {"ok": True, "revoked": 1, "revoked_current": target == current})
+                else:
+                    raise ValueError('id (a device id or "all") is required')
+            elif path == "/api/auth/pairing":
+                self.post_auth_pairing(payload)
+            elif path == "/api/auth/passphrase":
+                new = payload.get("new")
+                before = store.current_hash()  # authorization and the write both hinge on this one read (compare-and-set)
+                if before is not None and context.get("kind") != "token":
+                    ip = self.client_ip()
+                    allowed, wait, attempt = LOGIN_THROTTLE.begin(ip)
+                    if not allowed:
+                        self.send_json(429, {"error": "Too many attempts. Try again later.", "retry_after": wait}, {"Retry-After": str(wait)})
+                        return
+                    if not store.check_passphrase(payload.get("current")):
+                        self.send_json(401, {"error": "The current passphrase was not accepted."})
+                        return
+                    LOGIN_THROTTLE.success(attempt)
+                try:
+                    revoked = store.set_passphrase(vsauth.check_new_passphrase(new), keep_device=current, expect_hash=before)
+                except vsauth.PassphraseChanged:
+                    self.send_json(409, {"error": "passphrase changed, try again"})
+                    return
+                self.send_json(200, {"ok": True, "revoked_others": revoked})
+            else:
+                self.send_json(404, {"error": "Not found"})
+        except (vsauth.AuthError, ValueError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except (vsauth.StoreError, OSError):
+            self.send_json(500, {"error": "The sign-in store could not be used."})
 
     def read_payload(self) -> dict[str, Any]:
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1428,6 +1695,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
@@ -1481,14 +1749,23 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "The display tool failed unexpectedly."})
 
     def do_GET(self) -> None:
+        self._auth_cached = _UNSET
+        if not self.host_allowed():
+            return
         path = urllib.parse.urlparse(self.path).path
         if path == "/health":
             self.send_json(200, {"ok": True, "version": RUNNING_IDENTITY["running_version"], "boot_id": RUNNING_IDENTITY["boot_id"]})
             return
+        if path == "/api/auth/status":
+            self.send_json(200, {"passphrase_set": auth_store().passphrase_set()})
+            return
         if path.startswith("/api/"):
             if not self.require_auth():
                 return
-            if path == "/api/config":
+            if path == "/api/auth/devices":
+                store = auth_store()
+                self.send_json(200, {"devices": store.list_devices(self.current_device_id()), "max_devices": vsauth.MAX_DEVICES, "passphrase_set": store.passphrase_set(), "via": (self.auth_context() or {}).get("kind", "token")})
+            elif path == "/api/config":
                 self.send_json(200, public_configuration())
             elif path == "/api/status":
                 persisted = public_operation(ROOT)
@@ -1521,8 +1798,15 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_static(self.static_target(path))
 
     def do_POST(self) -> None:
+        self._auth_cached = _UNSET
+        if not self.host_allowed():
+            return
         path = urllib.parse.urlparse(self.path).path
         origin = self.headers.get("Origin")
+        if path in {"/api/auth/login", "/api/auth/passphrase", "/api/auth/pair", "/api/auth/pairing"} and not origin:
+            # Sign-in changes must come from a page that names its origin, whichever credential it carries.
+            self.send_json(403, {"error": "request origin is not allowed"})
+            return
         if origin:
             try:
                 parsed = urllib.parse.urlsplit(origin)
@@ -1532,10 +1816,23 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeError):
                 self.send_json(403, {"error": "request origin is not allowed"})
                 return
+        if path == "/api/auth/login":
+            self.post_auth_login()
+            return
+        if path == "/api/auth/pair":
+            self.post_auth_pair()
+            return
         if not self.require_auth():
+            return
+        if (self.auth_context() or {}).get("kind") == "device" and not origin:
+            # Device tokens ride in a header a page could be tricked into sending; insist the browser names its origin.
+            self.send_json(403, {"error": "request origin is not allowed"})
             return
         try:
             payload = self.read_payload()
+            if path.startswith("/api/auth/"):
+                self.post_auth(path, payload)
+                return
             if path.startswith("/api/displays/"):
                 self.post_displays(path, payload)
                 return
@@ -1543,8 +1840,9 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 updates = payload.get("settings", payload)
                 if not isinstance(updates, dict):
                     raise ValueError("settings object required")
-                backup = update_configuration(updates)
-                self.send_json(200, {"ok": True, "backup": backup, "configuration": public_configuration(), "restart_note": "Apply configuration to render service changes. Restart the panel from the recovery shell after changing its listener."})
+                notes: list[str] = []
+                backup = update_configuration(updates, notes)
+                self.send_json(200, {"ok": True, "backup": backup, "notes": notes, "configuration": public_configuration(), "restart_note": "Apply configuration to render service changes. Restart the panel from the recovery shell after changing its listener."})
                 return
             if path == "/api/action":
                 action = str(payload.get("action", ""))

@@ -103,6 +103,7 @@ class AccessTests(ServerCase):
 class SettingsTests(ServerCase):
     def handler(self, address, header=None):
         stub = mock.Mock()
+        stub.admin_device.return_value = False
         stub.client_address = (address, 1234)
         stub.headers = {"X-Boat-Chat-Token": header} if header is not None else {}
         return app.BoatChatHandler.settings_write_allowed(stub)
@@ -116,6 +117,7 @@ class SettingsTests(ServerCase):
 
     def host_handler(self, host, bound=None):
         stub = mock.Mock()
+        stub.admin_device.return_value = False
         stub.client_address = ("127.0.0.1", 1234)
         stub.headers = {"Host": host}
         stub.loopback_host_allowed = lambda: app.BoatChatHandler.loopback_host_allowed(stub)
@@ -133,6 +135,7 @@ class SettingsTests(ServerCase):
     def test_host_allowlist_does_not_apply_when_settings_token_is_configured(self):
         os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "settings-secret"
         stub = mock.Mock()
+        stub.admin_device.return_value = False
         stub.client_address = (".".join(("192", "168", "1", "20")), 1234)
         stub.headers = {"Host": "boat.lan:8765", "X-Boat-Chat-Token": "settings-secret"}
         self.assertTrue(app.BoatChatHandler.settings_write_allowed(stub)[0])
@@ -161,6 +164,7 @@ class SettingsTests(ServerCase):
             status, _ = self.call(method, path, {"message": "hi"} if method == "POST" else None, token="t\u00f6ken")
             self.assertIn(status, (401, 403), path)
         stub = mock.Mock()
+        stub.admin_device.return_value = False
         stub.headers = {"X-Boat-Chat-Token": "t\u00f6ken", "X-Boat-Chat-Debug": "true"}
         self.assertEqual(["query_plan", "context_profile"], list(app.BoatChatHandler.safe_context(stub, {})))
 

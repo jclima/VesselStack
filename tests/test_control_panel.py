@@ -561,6 +561,57 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(panel.normalize_token("abc=def"), "abc=def")
 
 
+class TokenRotationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.vessel, self.chat, self.control = root / "vessel.env", root / "chat.env", root / "control.env"
+        panel.write_env(self.vessel, {"BOAT_NAME": "Test"}, [])
+        panel.write_env(self.chat, {"BOAT_CHAT_ACCESS_TOKEN": "old-access-code"}, [])
+        panel.write_env(self.control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
+        patch = mock.patch.multiple(panel, VESSEL_ENV=self.vessel, CHAT_ENV=self.chat, PANEL_ENV=self.control, CONFIG_BACKUP_ROOT=root / "backups")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.store = mock.Mock()
+        self.store.revoke_all.return_value = 3
+        chat_store = mock.patch.object(panel, "chat_auth_store", return_value=self.store)
+        chat_store.start()
+        self.addCleanup(chat_store.stop)
+
+    def test_new_access_code_signs_out_all_boat_chat_devices_through_the_helper_store(self) -> None:
+        notes: list[str] = []
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "new-access-code", "BOAT_NAME": "Renamed"}, notes)
+        self.store.revoke_all.assert_called_once_with()
+        self.assertEqual(panel.parse_env(self.chat)["BOAT_CHAT_ACCESS_TOKEN"], "new-access-code")
+        self.assertTrue(any("3 signed-in device" in note for note in notes), notes)
+
+    def test_unchanged_blank_or_unrelated_saves_keep_devices(self) -> None:
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "old-access-code"})
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": ""})
+        panel.update_configuration({"BOAT_NAME": "Other"})
+        self.store.revoke_all.assert_not_called()
+
+    def test_override_file_shadowing_counts_as_the_effective_old_value(self) -> None:
+        data = Path(self._tmp.name) / "data"
+        (data / "boat-chat").mkdir(parents=True)
+        panel.write_env(self.vessel, {"BOAT_NAME": "Test", "VESSELSTACK_DATA": str(data)}, [])
+        (data / "boat-chat" / "boat-chat.env").write_text("BOAT_CHAT_ACCESS_TOKEN=page-code\n")
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "old-access-code"})  # equals the file value, but not what was in force
+        self.store.revoke_all.assert_called_once_with()
+
+    def test_failed_revocation_is_reported_not_hidden(self) -> None:
+        self.store.revoke_all.side_effect = panel.vsauth.StoreError("boom")
+        notes: list[str] = []
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "another-access-code"}, notes)
+        self.assertEqual(panel.parse_env(self.chat)["BOAT_CHAT_ACCESS_TOKEN"], "another-access-code")
+        self.assertTrue(any("revoke-all chat" in note for note in notes), notes)
+
+    def test_panel_never_writes_the_chat_store_in_process_as_root(self) -> None:
+        source = (Path(panel.__file__)).read_text()
+        self.assertIn("inherit_owner=True", source[source.index("def chat_auth_store"):source.index("def auth_store")])
+
+
 class SettingsValidationTests(unittest.TestCase):
     def check(self, key: str, value: str) -> str:
         return panel.validate_value(panel.FIELD_BY_KEY[key], value)
@@ -1350,5 +1401,449 @@ class DisplaysPreviewFixtureTests(unittest.TestCase):
         self.assertEqual(json.loads(self.FIXTURE.read_text()), json.loads(json.dumps(current, sort_keys=True)),
                          "regenerate with UPDATE_PANEL_FIXTURE=1 python3 -B -m unittest tests/test_control_panel.py")
 
+class SignInApiTests(DisplaysApiBase):
+    PASSPHRASE = "correct horse battery"
+
+    def setUp(self) -> None:
+        super().setUp()
+        root = tempfile.mkdtemp(prefix="vesselstack-signin-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        for patch in (mock.patch.object(panel, "ROOT", Path(root)), mock.patch.object(panel, "LOGIN_THROTTLE", panel.vsauth.LoginThrottle())):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.root = Path(root)
+
+    def call(self, method, path, body=None, headers=None):
+        data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
+        all_headers = {"Content-Type": "application/json"} if data is not None else {}
+        if path in {"/api/auth/login", "/api/auth/passphrase"} and method == "POST":
+            all_headers.update(self.origin)  # these two endpoints require an Origin; pass {"Origin": None} to omit it
+        all_headers.update(headers or {})
+        all_headers = {k: v for k, v in all_headers.items() if v is not None}
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_address[1]}{path}", data=data, headers=all_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read().decode() or "{}"), dict(response.headers)
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read().decode() or "{}"), dict(exc.headers)
+            finally:
+                exc.close()
+
+    @property
+    def origin(self):
+        return {"Origin": f"http://127.0.0.1:{self.server.server_address[1]}"}
+
+    def tokenh(self):
+        return {"X-VesselStack-Token": self.TOKEN}
+
+    def set_passphrase(self):
+        status, payload, _ = self.call("POST", "/api/auth/passphrase", {"new": self.PASSPHRASE}, self.tokenh())
+        self.assertEqual(status, 200, payload)
+
+    def login(self, remember=True, passphrase=None, label="Safari on Mac"):
+        return self.call("POST", "/api/auth/login", {"passphrase": passphrase or self.PASSPHRASE, "remember": remember, "label": label})
+
+    def device(self, token):
+        return {"X-VesselStack-Device": token, **self.origin}
+
+    # -- pairing links ------------------------------------------------------
+    def make_pairing(self, target="panel", admin=False, headers=None):
+        body = {"for": target, "admin": admin}
+        return self.call("POST", "/api/auth/pairing", body, headers or {**self.tokenh(), **self.origin})
+
+    def redeem(self, code, **extra):
+        return self.call("POST", "/api/auth/pair", {"code": code, **extra}, self.origin)
+
+    def test_pairing_matrix_requires_auth_and_origin(self) -> None:
+        self.assertEqual(self.call("POST", "/api/auth/pairing", {"for": "panel"}, self.origin)[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/pairing", {"for": "panel"}, self.tokenh())[0], 403, "Origin is mandatory")
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": "ABCDE-FGHJK"})[0], 403, "redeeming needs an Origin too")
+        self.assertEqual(self.call("POST", "/api/auth/pair", {"code": "ABCDE-FGHJK"}, {"Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.make_pairing("nope")[0], 400)
+        self.assertEqual(self.make_pairing("panel", admin=True)[0], 400, "admin pairing is Boat Chat only")
+
+    def test_panel_pairing_round_trip_is_single_use(self) -> None:
+        status, link, _ = self.make_pairing()
+        self.assertEqual(status, 200, link)
+        self.assertRegex(link["code"], r"^[0-9A-Z]{5}-[0-9A-Z]{5}$")
+        self.assertTrue(link["tunnel"])
+        self.assertIn("#pair=" + link["code"].replace("-", ""), link["url"])
+        size = len(link["modules"])
+        self.assertTrue(all(len(row) == size for row in link["modules"]))
+        self.assertNotIn(link["code"].replace("-", ""), (self.root / "config" / "control-panel-auth.json").read_text())
+        status, paired, headers = self.redeem(link["code"].lower(), label="Pixel", remember=False)
+        self.assertEqual(status, 200, paired)
+        self.assertEqual(set(paired), {"device_token", "device_id", "expires_at", "remember"})
+        self.assertTrue(paired["remember"], "remember is ignored; pair links always remember")
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(paired["device_token"]))[0], 200)
+        self.assertEqual(self.redeem(link["code"])[0], 401, "single use")
+
+    def test_bad_pairing_codes_are_throttled(self) -> None:
+        results = [self.redeem("ZZZZZ-ZZZZZ")[0] for _ in range(8)]
+        self.assertEqual(results.count(401), panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(results.count(429), 8 - panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+
+    def test_chat_pairing_is_written_to_the_chat_store_with_role(self) -> None:
+        data = self.root / "data"
+        (data / "boat-chat").mkdir(parents=True)
+        env = self.root / "vesselstack.env"
+        env.write_text(f'VESSELSTACK_DATA="{data}"\n')
+        chat_env = self.root / "boat-chat.env"
+        chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\n')
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+            self.assertEqual(self.make_pairing("chat", admin=True)[0], 400, "admin pairing needs BOAT_CHAT_SETTINGS_TOKEN")
+        self.assertFalse((data / "boat-chat" / "auth.json").exists())
+        chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\nBOAT_CHAT_SETTINGS_TOKEN="admin-code"\n')
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+            status, link, _ = self.make_pairing("chat", admin=True)
+        self.assertEqual(status, 200, link)
+        self.assertTrue(link["url"].startswith("http://198.51.100.9:8765/#pair="))
+        self.assertFalse(link["tunnel"])
+        stored = json.loads((data / "boat-chat" / "auth.json").read_text())
+        self.assertEqual([p["role"] for p in stored["pairings"]], ["admin"])
+        self.assertNotIn(link["code"].replace("-", ""), json.dumps(stored))
+        for _ in range(2):
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+                self.assertEqual(self.make_pairing("chat")[0], 200)
+            pass
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+            status, body, _ = self.make_pairing("chat")
+        self.assertEqual(status, 400, "at most three outstanding")
+        self.assertIn("already waiting", body["error"])
+
+    def chat_dirs(self):
+        data = self.root / "data"
+        (data / "boat-chat").mkdir(parents=True, exist_ok=True)
+        env = self.root / "vesselstack.env"
+        env.write_text(f'VESSELSTACK_DATA="{data}"\n')
+        chat_env = self.root / "boat-chat.env"
+        return data, env, chat_env
+
+    def test_admin_pairing_binds_to_the_effective_settings_token(self) -> None:
+        data, env, chat_env = self.chat_dirs()
+        chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_SETTINGS_TOKEN="env-code"\n')
+        override = data / "boat-chat" / "boat-chat.env"
+        bindings = []
+        for text in ("", "BOAT_CHAT_SETTINGS_TOKEN='page-code'\n"):
+            override.write_text(text)
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+                self.assertEqual(self.make_pairing("chat", admin=True)[0], 200)
+            stored = json.loads((data / "boat-chat" / "auth.json").read_text())
+            bindings.append((stored["pairings"][-1]["binding"], stored["binding_key"]))
+        self.assertEqual(bindings[0][0], panel.vsauth.admin_binding(bindings[0][1], "env-code"), "base file when no override")
+        self.assertEqual(bindings[1][0], panel.vsauth.admin_binding(bindings[1][1], "page-code"), "Settings-page override wins, as in Boat Chat")
+        self.assertEqual(bindings[0][1], bindings[1][1], "one key per store")
+
+    def test_auth_context_is_evaluated_once_per_request(self) -> None:
+        self.set_passphrase()
+        token = self.login()[1]["device_token"]
+        store = panel.auth_store()
+        handler = object.__new__(panel.ControlPanelHandler)
+        handler.headers = {"X-VesselStack-Device": token}
+        handler.send_json = lambda *a, **k: self.fail("unexpected rejection")
+        self.assertTrue(handler.require_auth())
+        device_id = handler.current_device_id()
+        self.assertTrue(store.revoke(device_id), "revoked while the request is still being handled")
+        self.assertEqual(handler.auth_context()["kind"], "device")
+        self.assertEqual(handler.current_device_id(), device_id, "the same identity for the whole request")
+        self.assertFalse(handler.authenticated(), "a fresh evaluation does see the revocation")
+        fresh = object.__new__(panel.ControlPanelHandler)
+        fresh.headers = {"X-VesselStack-Device": token}
+        sent = []
+        fresh.send_json = lambda status, payload, headers=None: sent.append(status)
+        self.assertFalse(fresh.require_auth())
+        self.assertEqual(sent, [401])
+
+    def test_device_revoked_mid_request_never_crashes_the_handler(self) -> None:
+        self.set_passphrase()
+        token = self.login()[1]["device_token"]
+        real = panel.vsauth.AuthStore.list_devices
+
+        def revoking(store, current_id=None):
+            store.revoke_all()
+            return real(store, current_id)
+        with mock.patch.object(panel.vsauth.AuthStore, "list_devices", revoking):
+            status, body, _ = self.call("GET", "/api/auth/devices", {}, self.device(token))
+        self.assertEqual((status, body["via"]), (200, "device"))
+        self.assertEqual(self.call("GET", "/api/auth/devices", {}, self.device(token))[0], 401, "the next request is refused")
+        # same on POST: the Origin gate and the handler both use the context fixed at authentication
+        token = self.login()[1]["device_token"]
+        original = panel.ControlPanelHandler.read_payload
+
+        def revoking_payload(handler):
+            panel.auth_store().revoke_all()
+            return original(handler)
+        with mock.patch.object(panel.ControlPanelHandler, "read_payload", revoking_payload):
+            status, body, _ = self.call("POST", "/api/auth/devices/revoke", {"id": "all"}, self.device(token))
+        self.assertEqual(status, 200, body)
+
+    def test_corrupt_chat_store_degrades_in_the_panel(self) -> None:
+        data, env, _ = self.chat_dirs()
+        (data / "boat-chat" / "auth.json").write_text(json.dumps({"schema": 1, "devices": 5, "pairings": [{"created": []}]}))
+        with mock.patch.object(panel, "VESSEL_ENV", env):
+            self.assertIsNone(panel.chat_passphrase_hash())
+            self.set_passphrase()  # the "must differ from Boat Chat" rule just does not apply
+            self.assertEqual(self.login()[0], 200)
+            self.assertEqual(self.make_pairing("chat")[0], 500, "reported, not crashed, and the unreadable store is left alone")
+        self.assertEqual(json.loads((data / "boat-chat" / "auth.json").read_text())["devices"], 5)
+
+    def test_success_does_not_wipe_address_backoff_over_http(self) -> None:
+        self.set_passphrase()
+        for _ in range(3):
+            self.assertEqual(self.login(passphrase="wrong passphrase!")[0], 401)
+        self.assertEqual(self.login()[0], 200)
+        self.assertEqual(panel.LOGIN_THROTTLE._ips["127.0.0.1"]["count"], 3, "the earlier failures still count after a success")
+        self.assertEqual(self.login(passphrase="wrong passphrase!")[0], 401)
+        self.assertEqual(self.login(passphrase="wrong passphrase!")[0], 401)
+        self.assertEqual(self.login()[0], 429, "5 failures in a row still trip the backoff even with a success between")
+
+    def test_status_leaks_only_whether_a_passphrase_is_set(self) -> None:
+        status, payload, _ = self.call("GET", "/api/auth/status")
+        self.assertEqual((status, payload), (200, {"passphrase_set": False}))
+        self.set_passphrase()
+        self.assertEqual(self.call("GET", "/api/auth/status")[1], {"passphrase_set": True})
+
+    def test_login_is_off_until_a_passphrase_is_set(self) -> None:
+        status, payload, _ = self.login()
+        self.assertEqual(status, 409)
+        self.assertIn("off until a passphrase is set", payload["error"])
+
+    def test_login_returns_a_device_token_that_works_for_existing_apis(self) -> None:
+        self.set_passphrase()
+        status, payload, headers = self.login(remember=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(set(payload), {"device_token", "device_id", "expires_at", "remember"})
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        token = payload["device_token"]
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(token))[0], 200)
+        self.assertEqual(self.call("GET", "/api/config")[0], 401)
+        self.assertEqual(self.call("GET", "/api/config", headers={"X-VesselStack-Device": "nope" * 10})[0], 401)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.tokenh())[0], 200, "long token unchanged")
+        raw = (self.root / "config/control-panel-auth.json").read_text()
+        self.assertNotIn(token, raw)
+
+    def test_non_remembered_login_lasts_twelve_hours(self) -> None:
+        self.set_passphrase()
+        _, short, _ = self.login(remember=False)
+        _, long, _ = self.login(remember=True)
+        now = time.time()
+        self.assertAlmostEqual(short["expires_at"] - now, 12 * 3600, delta=60)
+        self.assertAlmostEqual(long["expires_at"] - now, 30 * 86400, delta=60)
+
+    def test_wrong_passphrase_is_a_generic_401_and_bad_payloads_are_400(self) -> None:
+        self.set_passphrase()
+        status, payload, _ = self.login(passphrase="not the passphrase")
+        self.assertEqual(status, 401)
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": "x"})[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": 5, "remember": True})[0], 400)
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": self.PASSPHRASE, "remember": "yes"})[0], 400)
+
+    def test_lockout_returns_429_but_the_token_still_works(self) -> None:
+        self.set_passphrase()
+        for _ in range(5):
+            self.assertEqual(self.login(passphrase="wrong wrong wrong")[0], 401)
+        status, payload, headers = self.login()
+        self.assertEqual(status, 429)
+        self.assertGreater(payload["retry_after"], 0)
+        self.assertEqual(headers["Retry-After"], str(payload["retry_after"]))
+        self.assertEqual(self.call("GET", "/api/config", headers=self.tokenh())[0], 200)
+
+    def test_login_and_passphrase_require_an_origin_whatever_the_credential(self) -> None:
+        self.set_passphrase()
+        none = {"Origin": None}
+        self.assertEqual(self.call("POST", "/api/auth/login", {"passphrase": self.PASSPHRASE, "remember": True}, none)[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": "another long passphrase"}, {**self.tokenh(), **none})[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": "another long passphrase"}, self.tokenh())[0], 200)
+
+    def test_concurrent_wrong_attempts_are_limited_before_any_is_evaluated(self) -> None:
+        self.set_passphrase()
+        evaluated = []
+        real = panel.vsauth.AuthStore.check_passphrase
+
+        def counting(store, passphrase):
+            evaluated.append(passphrase)
+            time.sleep(0.05)
+            return real(store, passphrase)
+        results = []
+        with mock.patch.object(panel.vsauth.AuthStore, "check_passphrase", counting):
+            threads = [threading.Thread(target=lambda: results.append(self.login(passphrase="wrong wrong wrong")[0])) for _ in range(12)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(sorted(results).count(401), panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(sorted(results).count(429), 12 - panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+        self.assertEqual(len(evaluated), panel.vsauth.LoginThrottle.IP_FREE_FAILURES)
+
+    def test_global_lockout_applies_to_other_addresses(self) -> None:
+        self.set_passphrase()
+        throttle = panel.LOGIN_THROTTLE
+        for index in range(21):
+            throttle.failure(f"192.0.2.{index + 10}")
+        self.assertEqual(self.login()[0], 429)
+
+    def test_device_posts_need_a_matching_origin_but_token_posts_do_not(self) -> None:
+        self.set_passphrase()
+        token = self.login()[1]["device_token"]
+        body = {"id": "all"}
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", body, {"X-VesselStack-Device": token})[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", body, {"X-VesselStack-Device": token, "Origin": "http://evil.example"})[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", body, self.tokenh())[0], 200)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(token))[0], 401, "revoked")
+
+    def test_devices_list_marks_current_and_hides_hashes(self) -> None:
+        self.set_passphrase()
+        first = self.login(label="Phone")[1]
+        second = self.login(label="Laptop")[1]
+        status, payload, _ = self.call("GET", "/api/auth/devices", headers=self.device(first["device_token"]))
+        self.assertEqual(status, 200)
+        self.assertEqual({d["label"]: d["current"] for d in payload["devices"]}, {"Phone": True, "Laptop": False})
+        for entry in payload["devices"]:
+            self.assertEqual(set(entry), {"id", "label", "created", "last_seen", "expires", "current"})
+        self.assertEqual(self.call("GET", "/api/auth/devices")[0], 401)
+        self.assertNotIn("token_sha256", json.dumps(payload))
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": second["device_id"]}, self.device(first["device_token"]))[0], 200)
+        self.assertEqual(len(self.call("GET", "/api/auth/devices", headers=self.tokenh())[1]["devices"]), 1)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "missing"}, self.tokenh())[0], 404)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {}, self.tokenh())[0], 400)
+
+    def test_logout_revokes_only_the_current_device(self) -> None:
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        other = self.login()[1]["device_token"]
+        self.assertEqual(self.call("POST", "/api/auth/logout", {}, self.device(mine))[0], 200)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(mine))[0], 401)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(other))[0], 200)
+        self.assertEqual(self.call("POST", "/api/auth/logout", {}, self.tokenh())[1]["revoked"], False)
+        self.assertEqual(self.call("POST", "/api/auth/logout", {})[0], 401)
+
+    def test_changing_the_passphrase(self) -> None:
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        other = self.login()[1]["device_token"]
+        new = "a different long phrase"
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": new}, self.device(mine))[0], 401, "needs current")
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"current": "wrong wrong wrong", "new": new}, self.device(mine))[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/passphrase", {"current": self.PASSPHRASE, "new": "short"}, self.device(mine))[0], 400)
+        status, payload, _ = self.call("POST", "/api/auth/passphrase", {"current": self.PASSPHRASE, "new": new}, self.device(mine))
+        self.assertEqual((status, payload["revoked_others"]), (200, 1))
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(mine))[0], 200)
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(other))[0], 401)
+        self.assertEqual(self.login(passphrase=self.PASSPHRASE)[0], 401)
+        self.assertEqual(self.login(passphrase=new)[0], 200)
+
+    def test_passphrase_change_loses_to_a_concurrent_change_with_409(self) -> None:
+        self.set_passphrase()
+        mine = self.login()[1]["device_token"]
+        real = panel.vsauth.AuthStore.check_passphrase
+        fired = []
+
+        def racing(store, *args):
+            value = real(store, *args)
+            if not fired:
+                fired.append(1)
+                panel.vsauth.AuthStore(self.root / "config" / panel.vsauth.STORE_NAME).set_passphrase("rival long passphrase")
+            return value
+        with mock.patch.object(panel.vsauth.AuthStore, "check_passphrase", racing):
+            status, payload, _ = self.call("POST", "/api/auth/passphrase", {"current": self.PASSPHRASE, "new": "a different long phrase"}, self.device(mine))
+        self.assertEqual((status, payload["error"]), (409, "passphrase changed, try again"))
+        self.assertEqual(self.login(passphrase="rival long passphrase")[0], 200)
+
+    def test_long_token_may_change_the_passphrase_without_the_current_one(self) -> None:
+        self.set_passphrase()
+        device = self.login()[1]["device_token"]
+        status, payload, _ = self.call("POST", "/api/auth/passphrase", {"new": "brand new long phrase"}, self.tokenh())
+        self.assertEqual((status, payload["revoked_others"]), (200, 1))
+        self.assertEqual(self.call("GET", "/api/config", headers=self.device(device))[0], 401)
+
+    def test_password_endpoints_require_authentication(self) -> None:
+        for path in ("/api/auth/logout", "/api/auth/devices/revoke", "/api/auth/passphrase"):
+            self.assertEqual(self.call("POST", path, {"new": self.PASSPHRASE})[0], 401, path)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class HostAllowlistApiTests(SignInApiTests):
+    """DNS-rebinding guard: every request needs a Host naming this machine."""
+
+    def raw(self, method, path, host, headers=None, body=None):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            connection.putrequest(method, path, skip_host=True)
+            if host is not None:
+                connection.putheader("Host", host)
+            for name, value in (headers or {}).items():
+                connection.putheader(name, value)
+            data = json.dumps(body).encode() if body is not None else None
+            if data is not None:
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Content-Length", str(len(data)))
+            connection.endheaders(data)
+            response = connection.getresponse()
+            return response.status, response.read().decode()
+        finally:
+            connection.close()
+
+    def test_wrong_host_is_refused_for_static_files_and_api(self) -> None:
+        port = self.server.server_address[1]
+        self.set_passphrase()
+        for host in ("evil.example", f"evil.example:{port}", f"127.0.0.1:{port + 1}", "127.0.0.1", "", None, f"127.0.0.1:{port}.evil.example"):
+            for method, path in (("GET", "/"), ("GET", "/health"), ("GET", "/api/auth/status"), ("GET", "/api/config")):
+                status, text = self.raw(method, path, host, self.tokenh())
+                self.assertIn(status, (400, 421), (host, path))
+                self.assertNotIn("passphrase", text.lower())
+            status, _ = self.raw("POST", "/api/auth/login", host, {"Origin": f"http://{host}"} if host else {}, {"passphrase": self.PASSPHRASE, "remember": True})
+            self.assertIn(status, (400, 421), host)
+        self.assertEqual(self.call("GET", "/api/auth/status")[1], {"passphrase_set": True}, "no attempt was counted")
+        self.assertEqual(panel.LOGIN_THROTTLE.retry_after("127.0.0.1"), 0)
+
+    def test_allowed_host_forms_are_accepted(self) -> None:
+        port = self.server.server_address[1]
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"LocalHost:{port}", f"[::1]:{port}"):
+            self.assertEqual(self.raw("GET", "/api/config", host, self.tokenh())[0], 200, host)
+            self.assertEqual(self.raw("GET", "/", host)[0], 200, host)
+
+    def test_extra_hosts_come_from_the_environment(self) -> None:
+        port = self.server.server_address[1]
+        self.assertEqual(self.raw("GET", "/health", f"boat.example:{port}")[0], 421)
+        panel._HOST_ALLOWLISTS.clear()
+        with mock.patch.dict(panel.os.environ, {"CONTROL_PANEL_ALLOWED_HOSTS": "boat.example, other.example:9"}):
+            panel._HOST_ALLOWLISTS.clear()
+            allowlist = panel.host_allowlist(self.server.server_address)
+            allowlist._expires = float("-inf")
+            self.assertEqual(self.raw("GET", "/health", f"boat.example:{port}")[0], 200)
+            self.assertEqual(self.raw("GET", "/health", "boat.example")[0], 421, "port is required unless it is 80")
+            self.assertEqual(self.raw("GET", "/health", "other.example:9")[0], 200)
+        panel._HOST_ALLOWLISTS.clear()
+
+
+class HostAllowlistUnitTests(unittest.TestCase):
+    def test_lan_mode_adds_machine_names_and_refreshes(self) -> None:
+        clock = [0.0]
+        names = [{"boat", "boat.local", "203.0.113.20"}]
+        allow = panel.vsauth.HostAllowlist("0.0.0.0", 8780, clock=lambda: clock[0], discover=lambda: names[0])
+        self.assertTrue(allow.allowed("boat.local:8780"))
+        self.assertTrue(allow.allowed("203.0.113.20:8780"))
+        self.assertFalse(allow.allowed("203.0.113.20"), "port required")
+        self.assertFalse(allow.allowed("203.0.113.21:8780"))
+        names[0] = {"boat", "boat.local", "203.0.113.21"}
+        self.assertFalse(allow.allowed("203.0.113.21:8780"), "cached until the refresh interval")
+        clock[0] = 61
+        self.assertTrue(allow.allowed("203.0.113.21:8780"))
+        self.assertFalse(allow.allowed("203.0.113.20:8780"))
+        self.assertFalse(allow.allowed("attacker.example:8780"))
+
+    def test_loopback_mode_does_not_trust_machine_names(self) -> None:
+        allow = panel.vsauth.HostAllowlist("127.0.0.1", 8780, discover=lambda: {"boat.local"})
+        self.assertFalse(allow.allowed("boat.local:8780"))
+        self.assertTrue(allow.allowed("localhost:8780"))
+
+    def test_port_80_may_omit_the_port(self) -> None:
+        allow = panel.vsauth.HostAllowlist("127.0.0.1", 80)
+        self.assertTrue(allow.allowed("localhost"))
+        self.assertTrue(allow.allowed("localhost:80"))

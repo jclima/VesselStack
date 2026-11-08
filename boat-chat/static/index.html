@@ -86,8 +86,22 @@
     <dialog id="connect-dialog">
       <form id="connect-form">
         <header class="dialog-header"><h2>Connect this device</h2><button id="connect-close" type="button">Close</button></header>
-        <p>Enter your Boat Chat access code. It stays in this tab and is cleared when you disconnect.</p>
-        <label>Access code <input id="connect-token" type="password" required autocomplete="off" /></label>
+        <div id="passphrase-block">
+          <p>Sign in with the Boat Chat passphrase your skipper chose.</p>
+          <label>Passphrase <input id="connect-passphrase" type="password" autocomplete="current-password" /></label>
+          <label class="check-row"><input id="connect-remember" type="checkbox" /> Remember this device (30 days)</label>
+        </div>
+        <details id="code-block">
+          <summary>Use the access code instead</summary>
+          <p>Your Boat Chat access code stays in this tab and is cleared when you disconnect.</p>
+          <label>Access code <input id="connect-token" type="password" autocomplete="off" /></label>
+        </details>
+        <details id="pair-block">
+          <summary>Have a pairing code?</summary>
+          <p>Type the code from <code>sudo vesselstackctl panel-link --for chat</code> or from the Control Panel.</p>
+          <label>Pairing code <input id="connect-pair-code" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDE-FGHJK" /></label>
+          <button id="connect-pair-submit" type="button">Pair this device</button>
+        </details>
         <p id="connect-message" role="status"></p>
         <footer class="dialog-footer"><button id="disconnect-device" type="button">Disconnect</button><button type="submit">Connect</button></footer>
       </form>
@@ -376,6 +390,18 @@
           </details>
         </section>
 
+        <section class="settings-section" id="signin-section">
+          <h3>Sign-in</h3>
+          <p class="setting-help" id="signin-state">Checking passphrase sign-in…</p>
+          <ul id="signin-devices" class="device-list"></ul>
+          <div class="signin-actions"><button id="signin-revoke-all" type="button" hidden>Sign out all devices</button></div>
+          <label>Current passphrase <input id="signin-current" type="password" autocomplete="current-password" /></label>
+          <label>New passphrase (at least 8 characters) <input id="signin-new" type="password" autocomplete="new-password" /></label>
+          <div class="signin-actions"><button id="signin-change" type="button">Set passphrase</button></div>
+          <p class="setting-help">Changing the passphrase signs out every other device. Without the current passphrase, use the admin code in the field above. Crew can sign out only this device; signing out others, or setting the first passphrase, needs the admin code.</p>
+          <p id="signin-message" role="status"></p>
+        </section>
+
         <footer class="dialog-footer">
           <span id="settings-message" role="status"></span>
           <button id="settings-save" type="submit">Save</button>
@@ -394,6 +420,6 @@
         <div id="insights-content" class="insights-content">Loading Boat Hub…</div>
       </section>
     </dialog>
-    <script src="/app.js?v=20261102-brand-a11y"></script>
+    <script src="/app.js?v=20261107-pairing"></script>
   </body>
 </html>

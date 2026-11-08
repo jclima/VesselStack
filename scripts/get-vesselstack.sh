@@ -1418,6 +1418,7 @@ step_install() {
         fi
         "$ctl" doctor </dev/null || healthy=0
     fi
+    offer_signin "$ctl"
     say ""
     say "  Where to find things:"
     "$ctl" urls </dev/null || true
@@ -1428,6 +1429,101 @@ step_install() {
     else
         ok "doctor reports a healthy installation"
     fi
+}
+
+# ---------------------------------------------------------------- sign-in passphrases
+
+# True when the passphrase questions may be asked: a real terminal, and neither --yes nor --defaults.
+# (A scripted-answers file counts as a terminal only for tests that opt in with VESSELSTACK_SIGNIN_QUESTIONS=1,
+# so existing answer files do not run out of lines.)
+signin_questions_allowed() {
+    [ "$ASSUME_YES" -eq 0 ] && [ "$DEFAULTS_ONLY" -eq 0 ] || return 1
+    if [ -n "${VESSELSTACK_BOOTSTRAP_ANSWERS:-}" ] && [ "${VESSELSTACK_SIGNIN_QUESTIONS:-}" != 1 ]; then return 1; fi
+    open_prompt
+}
+
+# signin_is_set CTL SCOPE: true when that service already has a passphrase.
+signin_is_set() {
+    "$1" passphrase status "$2" </dev/null 2>/dev/null | grep -q "^$2 passphrase: set"
+}
+
+# Reads a passphrase twice without echo and hands it to the controller on its standard input: it is never put
+# in an argument, an environment variable or a log. Up to three tries; an empty answer skips.
+set_signin_passphrase() {
+    local ctl=$1 scope=$2 label=$3 attempt first second out
+    for attempt in 1 2 3; do
+        printf '  New %s passphrase (typing is hidden; just Enter skips): ' "$label" >&2
+        IFS= read -rs first <&3 || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+        if [ -z "$first" ]; then say "  Skipped."; return 1; fi
+        printf '  Type it again: ' >&2
+        IFS= read -rs second <&3 || { printf '\n' >&2; return 1; }
+        printf '\n' >&2
+        if [ "$first" != "$second" ]; then
+            warn "The two entries differ. Try again ($attempt of 3)."
+            continue
+        fi
+        if out=$(printf '%s\n' "$first" | "$ctl" passphrase set "$scope" --stdin 2>&1); then
+            first=; second=
+            ok "$label passphrase set"
+            return 0
+        fi
+        first=; second=
+        warn "${out:-The passphrase was not accepted.} ($attempt of 3)"
+    done
+    say "  Skipped. Set it later with: sudo vesselstackctl passphrase set $scope"
+    return 1
+}
+
+# After a successful install or update: offer to set the sign-in passphrases and a pairing link.
+offer_signin() {
+    local ctl=$1 asked=0
+    if ! signin_questions_allowed; then
+        say ""
+        say "  Sign-in passphrases were not asked (no terminal questions with --yes, --defaults or a script). Set them later:"
+        info "sudo vesselstackctl passphrase set panel      (Control Panel)"
+        info "sudo vesselstackctl passphrase set chat       (Boat Chat crew passphrase)"
+        info "sudo vesselstackctl panel-link --for chat     (pair a phone or laptop with a QR code)"
+        return 0
+    fi
+    if ! signin_is_set "$ctl" panel; then
+        say ""
+        asked=1
+        if ask_yn "Set a Control Panel passphrase now? (recommended)" y; then
+            set_signin_passphrase "$ctl" panel "Control Panel" && changed "Control Panel passphrase set"
+        fi
+    fi
+    if ! signin_is_set "$ctl" chat; then
+        say ""
+        asked=1
+        if ask_yn "Set a Boat Chat crew passphrase now? (at least 8 characters, different from the panel one)" y; then
+            set_signin_passphrase "$ctl" chat "Boat Chat crew" && changed "Boat Chat passphrase set"
+        fi
+    fi
+    if [ "$asked" -eq 1 ] && ask_yn "Pair this phone/laptop with Boat Chat now? (prints a link and QR code)" n; then
+        "$ctl" panel-link --for chat </dev/null || warn "Could not create a pairing link. Later: sudo vesselstackctl panel-link --for chat"
+    fi
+}
+
+# How to sign in, for the summary: the passphrase when one is set, else the commands. Tokens are secondary.
+print_signin_lines() {
+    local ctl=$1 app_root=$2
+    say "  Signing in:"
+    if [ -n "$ctl" ] && signin_is_set "$ctl" panel; then
+        info "Control Panel: enter the passphrase you chose (tick Remember this device to skip it for 30 days)."
+    else
+        info "Control Panel: set a passphrase with  sudo vesselstackctl passphrase set panel"
+        info "or get a one-time link and QR code for a phone or laptop with  sudo vesselstackctl panel-link"
+    fi
+    if [ -n "$ctl" ] && signin_is_set "$ctl" chat; then
+        info "Boat Chat: enter the crew passphrase you chose."
+    else
+        info "Boat Chat: set a crew passphrase with  sudo vesselstackctl passphrase set chat"
+        info "or pair a device with  sudo vesselstackctl panel-link --for chat"
+    fi
+    info "Scripts and older sessions can still use the long tokens, stored root-only:"
+    info "sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+    info "sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' $app_root/config/boat-chat.env"
 }
 
 final_report() {
@@ -1501,8 +1597,6 @@ print_access_info() {
     if [ -n "$ip" ]; then info "(or $host.local instead of $ip if your network resolves that name)"; fi
     say ""
     say "  Generated passwords and tokens are stored root-only under $app_root/config/."
-    say "  Show the Boat Chat access token (it is printed only when you run this):"
-    info "sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' $app_root/config/boat-chat.env"
     say "  Control panel (administration, port $panel_port):"
     if [ "$panel_host" = 127.0.0.1 ] || [ "$panel_host" = ::1 ]; then
         info "It is limited to this Pi. From your own computer:"
@@ -1510,18 +1604,16 @@ print_access_info() {
         [ "$panel_host" = ::1 ] && panel_url_host='[::1]'
         info "ssh -L $panel_port:$panel_url_host:$panel_port $user@$where"
         info "then browse to http://127.0.0.1:$panel_port on that computer."
-        info "The panel token is stored root-only: sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
     elif [ "$panel_host" = 0.0.0.0 ]; then
         info "It listens on all interfaces: http://$where:$panel_port"
-        info "The control panel requires its access token. HTTP is unencrypted; strict firewall rules may block this access, and this installer never relaxes them."
-        info "The panel token is stored root-only: sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+        info "The control panel requires sign-in. HTTP is unencrypted; strict firewall rules may block this access, and this installer never relaxes them."
     else
         panel_url_host=$panel_host
         case "$panel_url_host" in *:*) panel_url_host="[$panel_url_host]" ;; esac
         info "It listens on the configured interface: http://$panel_url_host:$panel_port"
-        info "The control panel requires its access token. HTTP is unencrypted; strict firewall rules may block this access, and this installer never relaxes them."
-        info "The panel token is stored root-only: sudo grep '^CONTROL_PANEL_TOKEN=' $app_root/config/control-panel.env"
+        info "The control panel requires sign-in. HTTP is unencrypted; strict firewall rules may block this access, and this installer never relaxes them."
     fi
+    print_signin_lines "$(find_ctl 2>/dev/null || true)" "$app_root"
 }
 
 find_ctl() {

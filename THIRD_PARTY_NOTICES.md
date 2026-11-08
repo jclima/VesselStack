@@ -49,3 +49,12 @@ Managed SignalK installs may preload `signalk-vesseltwin` 0.2.3 from npm using
 an immutable SHA-512 pin. It is an optional third-party plugin; upstream
 license and notices remain authoritative. See the [upstream repository](https://github.com/jclima/signalk-vesseltwin)
 and its Apache-2.0 license. The pinned package declares no runtime dependencies.
+
+## QR Code generator library (Python)
+
+`common/qrcodegen.py` is Project Nayuki's QR Code generator library for Python,
+version 1.8.0, vendored unmodified with its MIT license header intact
+(Copyright (c) Project Nayuki, <https://www.nayuki.io/page/qr-code-generator-library>).
+It renders the pairing QR codes printed by `vesselstackctl panel-link` and shown in
+the Control Panel; it has no dependencies. The license permits copying, modification
+and redistribution provided the copyright and permission notice stay with the file.

@@ -74,6 +74,8 @@ install -d -m 0700 -o root -g root "$FIXTURE" "$FIXTURE/config" "$FIXTURE/instal
 [[ "$(stat -c '%u' -- "$FIXTURE")" == 0 && "$(stat -c '%a' -- "$FIXTURE")" == 700 ]] || fail "fixture root is not root-owned mode 0700"
 cp -a "$REPO_ROOT/control-panel/app.py" "$REPO_ROOT/control-panel/browser_updates.py" "$FIXTURE/control-panel/"
 cp -a "$REPO_ROOT/control-panel/static" "$FIXTURE/control-panel/"
+install -d -m 0755 "$FIXTURE/common"
+cp -a "$REPO_ROOT/common/vesselstack_auth.py" "$FIXTURE/common/"
 cp "$REPO_ROOT/VERSION" "$FIXTURE/installer/VERSION"
 cat > "$FIXTURE/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$FIXTURE

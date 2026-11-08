@@ -88,9 +88,22 @@ stay on the Pi. Units offers 1 US customary (feet, degrees F, psi, US gallons; t
 ```
 
 At the end, the installer prints the service addresses to use from another
-computer (Grafana, Home Assistant, and Boat Chat), the command that shows the
-Boat Chat access token, and the SSH tunnel hint for the control panel
-(`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
+computer (Grafana, Home Assistant, and Boat Chat), how to sign in, and the SSH tunnel hint for the
+control panel (`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
+
+**Sign-in questions.** After a successful install or update the guided installer asks, when a terminal
+is available and neither `--yes` nor `--defaults` is used: "Set a Control Panel passphrase now?" and
+"Set a Boat Chat crew passphrase now?" (each typed twice with hidden input, up to three tries, policy
+errors are shown; Enter skips), then "Pair this phone/laptop with Boat Chat now?" (default no), which
+prints `vesselstackctl panel-link --for chat` with its QR code. Passphrases go to `vesselstackctl` on
+standard input only; they are never in arguments, environment variables or logs. The terminal wizard and
+the browser wizard also offer both passphrases as optional fields; they hash them with the same scrypt
+code and write only `CONTROL_PANEL_PASSPHRASE_HASH` / `BOAT_CHAT_PASSPHRASE_HASH`, which `install.sh`
+imports into the sign-in stores and then removes from the env file (never kept in `vesselstack.env`). Each
+is imported only when no passphrase is stored yet, so a re-install never overwrites one you changed later; a
+note says so and points to `sudo vesselstackctl passphrase set panel|chat`.
+Skipped or scripted installs can do it later: `sudo vesselstackctl passphrase set panel`,
+`sudo vesselstackctl passphrase set chat`, `sudo vesselstackctl panel-link [--for chat]`.
 
 The administration panel remains loopback-only unless explicitly changed. To
 make only that panel reachable on a trusted LAN, use
@@ -101,9 +114,10 @@ change. The command requires the existing root-owned config files and a
 non-empty panel token, and restarts only the control-panel service.
 
 **First sign-in.** Run the tunnel command above on your own computer, open
-`http://127.0.0.1:8780`, and paste the token from
-`sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env` into **Control
-Panel token** (the whole `CONTROL_PANEL_TOKEN=…` line works too), then press **Unlock**. If you
+`http://127.0.0.1:8780`, and enter the Control Panel passphrase you chose (or use a pairing link from
+`sudo vesselstackctl panel-link`). No passphrase yet? `sudo vesselstackctl passphrase set panel`. The
+long token remains as a fallback for scripts: `sudo grep '^CONTROL_PANEL_TOKEN='
+/opt/vesselstack/config/control-panel.env` (paste into **Control Panel token**, then **Unlock**). If you
 changed the panel port in Settings, use that number. See the
 [Control Panel guide](CONTROL_PANEL.md) for a tour of the four tabs.
 
