@@ -31,6 +31,7 @@ class SignInCase(unittest.TestCase):
         os.environ["BOAT_CHAT_MEMORY_DB"] = str(Path(self.tmp.name) / "m.sqlite")
         os.environ["BOAT_CHAT_PROVIDER"] = "local"
         os.environ["BOAT_CHAT_ACCESS_TOKEN"] = CODE
+        os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
         for patch in (mock.patch.object(app, "ENV_CONFIG", Path(self.tmp.name) / "boat-chat.env"),
                       mock.patch.object(app, "LOGIN_THROTTLE", app.vsauth.LoginThrottle()),
                       mock.patch.dict(app._AUTH_STORES, clear=True),
@@ -82,8 +83,12 @@ class SignInCase(unittest.TestCase):
     def code(self):
         return {"X-Boat-Chat-Token": CODE}
 
+    def admin(self):
+        return {"X-Boat-Chat-Token": ADMIN}
+
     def set_passphrase(self, value=CREW):
-        status, body = self.call("POST", "/api/auth/passphrase", {"new": value}, self.code())
+        """The first passphrase needs the admin code (or an admin device), not just the access code."""
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": value}, self.admin())
         self.assertEqual(status, 200, body)
 
     def login(self, passphrase=CREW, remember=True, **kwargs):
@@ -91,6 +96,12 @@ class SignInCase(unittest.TestCase):
 
     def device(self, token):
         return {"X-Boat-Chat-Device": token}
+
+    def redeem_admin(self, store):
+        code, _ = store.create_pairing("admin", "", store.admin_binding(ADMIN, create=True))
+        status, body = self.call("POST", "/api/auth/pair", {"code": code})
+        self.assertEqual((status, body["role"]), (200, "admin"), body)
+        return body
 
 
 class EndpointTests(SignInCase):
@@ -100,9 +111,13 @@ class EndpointTests(SignInCase):
         self.set_passphrase()
         self.assertEqual(self.call("GET", "/api/auth/status"), (200, {"passphrase_set": True}))
 
-    def test_first_passphrase_needs_access_and_minimum_length(self):
+    def test_first_passphrase_needs_admin_and_minimum_length(self):
         self.assertEqual(self.call("POST", "/api/auth/passphrase", {"new": CREW})[0], 401)
-        status, body = self.call("POST", "/api/auth/passphrase", {"new": "short"}, self.code())
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": CREW}, self.code())
+        self.assertEqual(status, 403, "mere access (the access code) cannot set the first passphrase")
+        self.assertIn("admin code", body["error"])
+        self.assertFalse(self.call("GET", "/api/auth/status")[1]["passphrase_set"])
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": "short"}, self.admin())
         self.assertEqual(status, 400)
         self.assertIn("at least 8", body["error"])
         self.set_passphrase("12345678")
@@ -152,16 +167,98 @@ class EndpointTests(SignInCase):
     def test_logout_revoke_and_revoke_all(self):
         self.set_passphrase()
         first, second = self.login()[1], self.login()[1]
-        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": second["device_id"]}, self.device(first["device_token"]))[0], 200)
+        mine = self.device(first["device_token"])
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "missing"}, self.admin())[0], 404)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {}, self.admin())[0], 400)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": second["device_id"]}, self.admin())[0], 200)
         self.assertEqual(self.call("GET", "/api/settings", headers=self.device(second["device_token"]))[0], 401)
-        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "missing"}, self.code())[0], 404)
-        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {}, self.code())[0], 400)
-        self.assertEqual(self.call("POST", "/api/auth/logout", {}, self.device(first["device_token"]))[0], 200)
-        self.assertEqual(self.call("GET", "/api/settings", headers=self.device(first["device_token"]))[0], 401)
+        self.assertEqual(self.call("POST", "/api/auth/logout", {}, mine)[0], 200)
+        self.assertEqual(self.call("GET", "/api/settings", headers=mine)[0], 401)
         third = self.login()[1]
-        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "all"}, self.code())[0], 200)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "all"}, self.admin())[0], 200)
         self.assertEqual(self.call("GET", "/api/settings", headers=self.device(third["device_token"]))[0], 401)
         self.assertEqual(self.call("GET", "/api/auth/devices")[0], 401)
+
+    def test_crew_may_revoke_only_their_own_device(self):
+        self.set_passphrase()
+        mine, other = self.login()[1], self.login()[1]
+        crew = self.device(mine["device_token"])
+        for headers in (crew, self.code()):
+            for target in ("all", other["device_id"], "missing", ""):
+                status, body = self.call("POST", "/api/auth/devices/revoke", {"id": target}, headers)
+                self.assertEqual(status, 403, (target, body))
+            self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {}, headers)[0], 403)
+        self.assertEqual(self.call("GET", "/api/settings", headers=self.device(other["device_token"]))[0], 200, "nothing was revoked")
+        status, body = self.call("GET", "/api/auth/devices", headers=crew)
+        self.assertEqual((status, body["admin"]), (200, False))
+        status, body = self.call("POST", "/api/auth/devices/revoke", {"id": mine["device_id"]}, crew)
+        self.assertEqual((status, body["revoked_current"]), (200, True))
+        self.assertEqual(self.call("GET", "/api/settings", headers=crew)[0], 401)
+
+    def test_admin_code_or_admin_device_may_revoke_others_and_everyone(self):
+        self.set_passphrase()
+        store = app.chat_auth_store()
+        admin = self.redeem_admin(store)
+        crew = [self.login()[1] for _ in range(2)]
+        status, body = self.call("GET", "/api/auth/devices", headers=self.admin())
+        self.assertEqual((status, body["admin"]), (200, True), "the admin code alone is enough to list and manage")
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": crew[0]["device_id"]}, self.device(admin["device_token"]))[0], 200)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "all"}, self.admin())[0], 200)
+        for device in (crew[1], admin):
+            self.assertEqual(self.call("GET", "/api/settings", headers=self.device(device["device_token"]))[0], 401)
+
+    def test_rotating_the_access_code_in_settings_signs_out_all_devices(self):
+        self.set_passphrase()
+        a, b = self.login()[1], self.login()[1]
+        store = app.chat_auth_store()
+        store.create_pairing("access")
+        with mock.patch.object(app, "ENV_CONFIG", Path(self.tmp.name) / "boat-chat.env"):
+            result = app.update_settings({"BOAT_CHAT_MAX_TOKENS": "321"})
+            self.assertNotIn("devices_signed_out", result)
+            self.assertEqual(len(store.list_devices()), 2, "unrelated settings keep devices")
+            result = app.update_settings({"BOAT_CHAT_ACCESS_TOKEN": CODE})
+            self.assertEqual(len(store.list_devices()), 2, "saving the same code is not a rotation")
+            result = app.update_settings({"BOAT_CHAT_ACCESS_TOKEN": "a-brand-new-access-code"})
+        self.assertEqual(result["devices_signed_out"], 2)
+        self.assertEqual((store.list_devices(), store.pending_pairings()), ([], 0))
+        self.assertEqual(self.call("GET", "/api/settings", headers=self.device(a["device_token"]))[0], 401)
+
+    def test_rotating_the_admin_code_in_settings_ends_admin_devices_only(self):
+        self.set_passphrase()
+        store = app.chat_auth_store()
+        admin = self.redeem_admin(store)
+        crew = self.login()[1]
+        with mock.patch.object(app, "ENV_CONFIG", Path(self.tmp.name) / "boat-chat.env"):
+            app.update_settings({"BOAT_CHAT_SETTINGS_TOKEN": "a-brand-new-admin-code"})
+        self.assertEqual(self.call("GET", "/api/settings", headers=self.device(admin["device_token"]))[0], 401, "admin device pruned")
+        self.assertEqual(self.call("GET", "/api/settings", headers=self.device(crew["device_token"]))[0], 200)
+
+    def test_legacy_unkeyed_admin_binding_is_not_admin(self):
+        self.set_passphrase()
+        store = app.chat_auth_store()
+        code, _ = store.create_pairing("access")
+        device = self.call("POST", "/api/auth/pair", {"code": code})[1]
+        store.transaction(lambda data: data["devices"][0].update(role="admin", binding=app.vsauth.token_digest(ADMIN)))
+        store.admin_binding(ADMIN, create=True)
+        self.assertEqual(self.call("POST", "/api/settings", {"settings": {}}, self.device(device["device_token"]))[0], 403)
+        self.assertEqual(self.call("POST", "/api/auth/devices/revoke", {"id": "all"}, self.device(device["device_token"]))[0], 403)
+
+    def test_corrupt_store_degrades_without_a_500(self):
+        (Path(self.tmp.name) / "auth.json").write_text(json.dumps({"schema": 1, "devices": 5, "pairings": [{"created": []}]}))
+        self.assertEqual(self.call("GET", "/api/auth/status"), (200, {"passphrase_set": False}))
+        self.assertEqual(self.login()[0], 409)
+        self.assertEqual(self.call("GET", "/api/settings", headers=self.device("x" * 30))[0], 401)
+        self.assertEqual(self.call("GET", "/api/settings", headers=self.code())[0], 200, "the access code still works")
+        status, body = self.call("POST", "/api/auth/passphrase", {"new": CREW}, self.admin())
+        self.assertEqual(status, 500, "never overwritten; reported, not crashed")
+        self.assertEqual(json.loads((Path(self.tmp.name) / "auth.json").read_text())["devices"], 5)
+
+    def test_static_pages_cannot_be_framed(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        connection.request("GET", "/", headers={"Host": f"127.0.0.1:{self.port}"})
+        response = connection.getresponse(); response.read(); connection.close()
+        self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+        self.assertEqual(response.getheader("X-Frame-Options"), "DENY")
 
     def _race(self, rival, method="current_hash"):
         """Make ``rival`` write the store right after the handler's read (or current-passphrase check)."""
@@ -178,7 +275,7 @@ class EndpointTests(SignInCase):
     def test_first_set_loses_to_a_concurrent_first_set_with_409(self):
         rival = lambda: app.vsauth.AuthStore(Path(self.tmp.name) / "auth.json", min_passphrase=8).set_passphrase("rival passphrase")
         with self._race(rival):
-            status, body = self.call("POST", "/api/auth/passphrase", {"new": CREW}, self.code())
+            status, body = self.call("POST", "/api/auth/passphrase", {"new": CREW}, self.admin())
         self.assertEqual((status, body), (409, {"error": "passphrase changed, try again"}))
         self.assertEqual(self.login(passphrase="rival passphrase")[0], 200)
         self.assertEqual(self.login(passphrase=CREW)[0], 401)
@@ -302,7 +399,7 @@ class PairingTests(SignInCase):
         self.set_passphrase()
         store = self.pair_store()
         os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
-        admin = self.redeem(store.create_pairing("admin", "", app.vsauth.admin_binding(ADMIN))[0])[1]
+        admin = self.redeem(store.create_pairing("admin", "", store.admin_binding(ADMIN, create=True))[0])[1]
         access = self.redeem(store.create_pairing("access")[0])[1]
         self.assertEqual(admin["role"], "admin")
         status, body = self.call("POST", "/api/settings", {"settings": {}}, self.device(access["device_token"]))
@@ -319,7 +416,7 @@ class PairingTests(SignInCase):
         self.set_passphrase()
         store = self.pair_store()
         os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = ADMIN
-        admin = self.redeem(store.create_pairing("admin", "", app.vsauth.admin_binding(ADMIN))[0])[1]
+        admin = self.redeem(store.create_pairing("admin", "", store.admin_binding(ADMIN, create=True))[0])[1]
         headers = self.device(admin["device_token"])
         self.assertNotEqual(self.call("POST", "/api/settings", {"settings": {}}, headers)[0], 403)
         os.environ["BOAT_CHAT_SETTINGS_TOKEN"] = "rotated-admin-code"          # rotate: the old device loses admin
@@ -328,7 +425,7 @@ class PairingTests(SignInCase):
         status, body = self.call("POST", "/api/auth/passphrase", {"new": "another crew pass"}, headers)
         self.assertIn(status, (401, 403), body)
         with self.assertRaises(app.vsauth.AuthError):
-            store.create_pairing("admin", "", app.vsauth.admin_binding(""))
+            store.create_pairing("admin", "", store.admin_binding(""))
 
 
 def auth_format(code):

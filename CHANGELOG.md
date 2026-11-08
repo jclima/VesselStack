@@ -7,6 +7,17 @@ Semantic Versioning.
 
 ### Highlights
 
+- Sign-in review fixes: rotating `CONTROL_PANEL_TOKEN`, `BOAT_CHAT_ACCESS_TOKEN` or
+  `BOAT_CHAT_SETTINGS_TOKEN` (installer, Boat Chat Settings, panel Settings) now signs out the devices
+  issued under the old value (`sudo vesselstackctl devices revoke-all [chat]` for a manual sweep). A sign-in
+  store with wrong types is treated as corrupt (fail closed, never overwritten, no 500). In Boat Chat, crew
+  can sign out only their own device; others, "all", and the first passphrase need the admin code or an admin
+  device. The Control Panel authenticates once per request. Admin bindings are HMAC-SHA256 under a random key
+  in the store and are computed from the admin code Boat Chat actually uses (Settings override, then env);
+  admin devices from earlier builds must be paired again. A correct sign-in no longer clears an address's
+  backoff (global lockout trade-off documented). `vesselstackctl` runs the helper with `python3 -B -I`;
+  Boat Chat sends `frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+
 - Homepage (gethomepage.dev, `ghcr.io/gethomepage/homepage:v2.7.0` pinned by multi-arch digest) replaces
   Heimdall as the front door on port 80 (`HOMEPAGE_PORT`). Tiles follow the enabled components and are
   rendered by `vesselstackctl homepage sync` without secrets; custom tiles live in

@@ -2317,10 +2317,10 @@ auth_command() {
     panel_port=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_PORT)
     chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
     chat_port=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_PORT)
-    PYTHONDONTWRITEBYTECODE=1 VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+    VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
         VS_PANEL_HOST="${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}" VS_PANEL_PORT="${panel_port:-${CONTROL_PANEL_PORT:-8780}}" \
         VS_CHAT_HOST="${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}" VS_CHAT_PORT="${chat_port:-${BOAT_CHAT_PORT:-8765}}" \
-        python3 "$helper" "$@"
+        python3 -B -I "$helper" "$@"
 }
 
 [ $# -gt 0 ] || { usage; exit 2; }

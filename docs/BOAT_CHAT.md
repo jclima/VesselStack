@@ -41,7 +41,7 @@ sudo vesselstackctl panel-link --for chat --admin       # also the admin-code ri
 
 or use **Pair a phone to Boat Chat** in the Control Panel (Settings, Sign-in). The phone opens the link (or
 types the `XXXXX-XXXXX` code under **Have a pairing code?** in Connect) and stays signed in for 30 days. An
-admin device passes the admin-code checks, so it can change settings and the passphrase without the code. An admin device is bound to the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) it was paired under: it stops being an admin as soon as that code is changed or removed, and `--admin` pairing is refused while no admin code is set.
+admin device passes the admin-code checks, so it can change settings and the passphrase without the code. An admin device is bound to the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) it was paired under (an HMAC-SHA256 under a random key in `auth.json`, not the code itself): it stops being an admin as soon as that code is changed or removed, and `--admin` pairing is refused while no admin code is set. The code used is the one Boat Chat enforces: the Settings-page value first, then `config/boat-chat.env`. Admin devices paired by an earlier release carry the old marker and read as non-admin: pair them again.
 Boat Chat only redeems pairings (`POST /api/auth/pair`); it never creates them. Treat the QR code as a
 password while it is valid: whoever scans it first gets the device.
 
@@ -50,6 +50,21 @@ You can also set it in Boat Chat under **Settings, Sign-in** (after connecting w
 the access code sits under **Use the access code instead**. Settings, Sign-in lists signed-in devices
 with **Sign out**, **Sign out all devices** and a change-passphrase form: changing it needs the current
 passphrase, or the admin code, and signs out every other device.
+
+Who may do what: crew (access code or passphrase sign-in) can sign out **only their own device**. Signing out
+another device or **all devices**, and setting the **very first** passphrase, need the admin code or an
+admin device; the page hides those controls otherwise (`GET /api/auth/devices` reports `admin`). On the
+boat, `sudo vesselstackctl passphrase set chat` and `devices revoke-all chat` always work.
+
+**Rotating a token signs out all devices.** Saving a new **Access code** in Settings (or re-running the
+installer, or saving it in the Control Panel) revokes every Boat Chat device and waiting pairing link; a
+new **Admin code** ends every admin device. Settings reports how many devices were signed out, or the
+command to run when that failed. Manually: `sudo vesselstackctl devices revoke-all chat`.
+
+**A note on the lockout.** Boat Chat is reachable from the boat network, so the global brute-force limit is
+shared: 21 wrong passphrases or pairing codes within 15 minutes, from any addresses, pause passphrase and
+pairing sign-in for everyone for 15 minutes. The access code and admin code are not throttled and keep working;
+restarting Boat Chat clears the pause. A correct sign-in does not erase an address's own wait.
 
 - The passphrase grants **access only** (what the access code grants). Settings changes still need the
   admin code exactly as before; the access code and admin code keep working unchanged.
@@ -73,8 +88,9 @@ passphrase, or the admin code, and signs out every other device.
 |---|---|
 | `GET /api/auth/status` | Nothing (reports whether a passphrase is set) |
 | `POST /api/auth/login` | Passphrase in the JSON body, plus `Origin` |
-| `POST /api/auth/logout`, `GET /api/auth/devices`, `POST /api/auth/devices/revoke` | Access code or device token |
-| `POST /api/auth/passphrase` | Current passphrase, or the admin code; the very first passphrase only needs access. Needs `Origin` |
+| `POST /api/auth/logout`, `GET /api/auth/devices` | Access code or device token |
+| `POST /api/auth/devices/revoke` | Your own device id: access code or device token. Any other id, or `all`: the admin code or an admin device (403 otherwise) |
+| `POST /api/auth/passphrase` | Current passphrase, or the admin code / an admin device; the very first passphrase needs the admin code or an admin device (403 for access alone). Needs `Origin` |
 | Chat, status, insights, maintenance, `GET /api/settings` | Access code **or** `X-Boat-Chat-Device` |
 
 ## A tour of the interface

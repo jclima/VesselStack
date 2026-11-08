@@ -1357,6 +1357,18 @@ while IFS= read -r key; do
 done < <(vesselstack_env_keys)
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
 
+# Tokens as installed before this run, to notice a rotation afterwards (plain text compare, never evaluated;
+# the app env files are writable by the service user).
+previous_env_value() {
+    local value
+    value=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1) || value=
+    value=${value#[\'\"]}; value=${value%[\'\"]}
+    printf '%s' "$value"
+}
+PREVIOUS_CONTROL_PANEL_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/control-panel.env" CONTROL_PANEL_TOKEN)
+PREVIOUS_BOAT_CHAT_ACCESS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_ACCESS_TOKEN)
+PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_SETTINGS_TOKEN)
+
 # Retain provider credentials and optional Boat Chat settings across installer
 # re-renders while replacing the integration values owned by VesselStack.
 new_env_temp boat-chat.env; boat_chat_temp=$NEW_ENV_TEMP
@@ -1444,6 +1456,25 @@ import_signin_hash() {
 import_signin_hash CONTROL_PANEL_PASSPHRASE_HASH panel "Control Panel" || true
 import_signin_hash BOAT_CHAT_PASSPHRASE_HASH chat "Boat Chat" || true
 CONTROL_PANEL_PASSPHRASE_HASH=; BOAT_CHAT_PASSPHRASE_HASH=
+
+# A rotated token signs out every device of that service (a device must not outlive the credential it was
+# issued under). Only when an earlier, different token existed; a first install has no devices.
+revoke_after_rotation() {
+    local scope=$1 label=$2 previous=$3 current=$4
+    [ -n "$previous" ] && [ "$previous" != "$current" ] || return 0
+    if env VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
+        python3 -B -I "$VESSELSTACK_ROOT/common/vesselstack_authctl.py" devices revoke-all "$scope" >/dev/null 2>&1; then
+        echo "A $label token changed: every signed-in $label device was signed out."
+    else
+        echo "WARNING: a $label token changed but its signed-in devices could not be signed out. Run: sudo vesselstackctl devices revoke-all $scope" >&2
+    fi
+}
+revoke_after_rotation panel "Control Panel" "$PREVIOUS_CONTROL_PANEL_TOKEN" "$CONTROL_PANEL_TOKEN"
+if [ -n "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN" ] && [ "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN" != "$BOAT_CHAT_ACCESS_TOKEN" ]; then
+    revoke_after_rotation chat "Boat Chat" "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN" "$BOAT_CHAT_ACCESS_TOKEN"
+elif [ -n "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN" ] && [ "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN" != "$BOAT_CHAT_SETTINGS_TOKEN" ]; then
+    revoke_after_rotation chat "Boat Chat" "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN" "$BOAT_CHAT_SETTINGS_TOKEN"
+fi
 
 # Vessel identity is generated into a root-owned temporary file in the (root-owned)
 # application directory and renamed into place; the service user can only read it.

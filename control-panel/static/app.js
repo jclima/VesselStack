@@ -1328,7 +1328,8 @@ async function saveConfiguration() {
     renderConfiguration(state.config);
     if (result.backup) state.rollbackPath = result.backup;
     updateConfigStatus();
-    toast("Settings saved. Nothing has changed on the boat yet. Press Apply to put them into effect.");
+    const notes = Array.isArray(result.notes) && result.notes.length ? ` ${result.notes.join(" ")}` : "";
+    toast(`Settings saved. Nothing has changed on the boat yet. Press Apply to put them into effect.${notes}`);
   } catch (error) {
     if (session !== state.session || !signedIn()) return;
     if (error.status === 401) { requireReauth("Your session ended."); return; }

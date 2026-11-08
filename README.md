@@ -1157,7 +1157,38 @@ release; older versions ignore `control-panel-auth.json` and only the token work
 `sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
 [Control Panel guide](docs/CONTROL_PANEL.md).
 
-**Sign-in hardening (unreleased):** setting or changing a passphrase (panel or Boat Chat) also clears waiting pairing links. A Boat Chat admin device (`panel-link --for chat --admin`, or the panel pairing option) records a SHA-256 marker of the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) at pairing time and counts as admin only while that marker matches the current code; rotating or removing the code ends its admin rights (stale admin devices are pruned when the code is changed in Boat Chat settings), and without an admin code a device never overrides the loopback-only settings rule. Admin pairing is refused with a clear error while no admin code is set. Rollback: `sudo vesselstackctl devices revoke-all` and pair again.
+**Sign-in hardening (unreleased):** setting or changing a passphrase (panel or Boat Chat) also clears waiting pairing links. A Boat Chat admin device (`panel-link --for chat --admin`, or the panel pairing option) records a keyed marker of the admin code (`BOAT_CHAT_SETTINGS_TOKEN`; HMAC-SHA256 under a random key kept in the Boat Chat store, see the review follow-ups below) at pairing time and counts as admin only while that marker matches the current code; rotating or removing the code ends its admin rights (stale admin devices are pruned when the code is changed in Boat Chat settings), and without an admin code a device never overrides the loopback-only settings rule. Admin pairing is refused with a clear error while no admin code is set. Rollback: `sudo vesselstackctl devices revoke-all` and pair again.
+
+**Sign-in review follow-ups (unreleased):**
+- **Rotating a token signs out every device.** Changing `CONTROL_PANEL_TOKEN` (installer re-run with a new
+  value) revokes all Control Panel devices and pairing links; changing `BOAT_CHAT_ACCESS_TOKEN` (installer,
+  Boat Chat Settings, or the panel's Boat Chat settings) revokes all Boat Chat devices and pairing links;
+  changing `BOAT_CHAT_SETTINGS_TOKEN` (installer or Boat Chat Settings) ends every admin device (the
+  installer signs out all Boat Chat devices in that case). The installer prints what it did; the root
+  paths use the privilege-dropping helper for Boat Chat's store. If a revocation fails the rotation still
+  stands and a warning gives the manual command: `sudo vesselstackctl devices revoke-all [panel|chat]`.
+  Operational impact: after a rotation everyone signs in again (passphrase or pairing link).
+- **Unreadable sign-in stores fail closed.** Wrong types anywhere in `auth.json` / `control-panel-auth.json`
+  (for example `"devices": 5`) count as corruption: no passphrase, no devices, access code and token still
+  work, nothing is rewritten, and the panel/Boat Chat answer normally instead of a 500. Repair or delete the
+  file (`passphrase clear` cannot rewrite what it cannot read), then set the passphrase again.
+- **Boat Chat revoke rules.** Crew (access code or passphrase sign-in) can sign out only their own device;
+  signing out another device or everyone, and setting the very first passphrase, need the admin code or an
+  admin device (`vesselstackctl passphrase set chat` on the boat always works). The Sign-in page hides what
+  does not apply.
+- **Admin binding** is now HMAC-SHA256 of the admin code under a random 32-byte `binding_key` created on
+  first need in the Boat Chat store; the panel and `panel-link --admin` resolve the admin code exactly as
+  Boat Chat does (Settings-page override file first, then `config/boat-chat.env`). Admin devices paired
+  before this change carry the old format and read as non-admin: pair them again. Rollback: reinstall the
+  previous release (older versions ignore `binding_key`; old-format admin devices must be paired again).
+- **Throttle.** A successful sign-in no longer clears the address's backoff; it withdraws only its own
+  attempt, and an hour of quiet forgives old failures. Boat Chat listens on the LAN, so the global lockout
+  is a known trade-off: 21 bad attempts in 15 minutes from anywhere lock passphrase and pairing sign-in for
+  everyone for 15 minutes; the access code and admin code keep working, and restarting Boat Chat clears it.
+- Hardening: `vesselstackctl` runs the sign-in helper with `python3 -B -I`; Boat Chat pages send
+  `frame-ancestors 'none'` and `X-Frame-Options: DENY` (the panel already did; it now sends the header too).
+  Verify: `python3 -B -m unittest discover -s tests`, then rotate a token on a test boat and check
+  `sudo vesselstackctl devices list [chat]` is empty.
 
 **Passphrases at install time (unreleased):** `get-vesselstack.sh` asks, after a successful install or update
 and only on a real terminal without `--yes`/`--defaults`, "Set a Control Panel passphrase now? (recommended)",

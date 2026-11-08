@@ -561,6 +561,57 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(panel.normalize_token("abc=def"), "abc=def")
 
 
+class TokenRotationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.vessel, self.chat, self.control = root / "vessel.env", root / "chat.env", root / "control.env"
+        panel.write_env(self.vessel, {"BOAT_NAME": "Test"}, [])
+        panel.write_env(self.chat, {"BOAT_CHAT_ACCESS_TOKEN": "old-access-code"}, [])
+        panel.write_env(self.control, {"CONTROL_PANEL_TOKEN": "panel-token"}, [])
+        patch = mock.patch.multiple(panel, VESSEL_ENV=self.vessel, CHAT_ENV=self.chat, PANEL_ENV=self.control, CONFIG_BACKUP_ROOT=root / "backups")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.store = mock.Mock()
+        self.store.revoke_all.return_value = 3
+        chat_store = mock.patch.object(panel, "chat_auth_store", return_value=self.store)
+        chat_store.start()
+        self.addCleanup(chat_store.stop)
+
+    def test_new_access_code_signs_out_all_boat_chat_devices_through_the_helper_store(self) -> None:
+        notes: list[str] = []
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "new-access-code", "BOAT_NAME": "Renamed"}, notes)
+        self.store.revoke_all.assert_called_once_with()
+        self.assertEqual(panel.parse_env(self.chat)["BOAT_CHAT_ACCESS_TOKEN"], "new-access-code")
+        self.assertTrue(any("3 signed-in device" in note for note in notes), notes)
+
+    def test_unchanged_blank_or_unrelated_saves_keep_devices(self) -> None:
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "old-access-code"})
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": ""})
+        panel.update_configuration({"BOAT_NAME": "Other"})
+        self.store.revoke_all.assert_not_called()
+
+    def test_override_file_shadowing_counts_as_the_effective_old_value(self) -> None:
+        data = Path(self._tmp.name) / "data"
+        (data / "boat-chat").mkdir(parents=True)
+        panel.write_env(self.vessel, {"BOAT_NAME": "Test", "VESSELSTACK_DATA": str(data)}, [])
+        (data / "boat-chat" / "boat-chat.env").write_text("BOAT_CHAT_ACCESS_TOKEN=page-code\n")
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "old-access-code"})  # equals the file value, but not what was in force
+        self.store.revoke_all.assert_called_once_with()
+
+    def test_failed_revocation_is_reported_not_hidden(self) -> None:
+        self.store.revoke_all.side_effect = panel.vsauth.StoreError("boom")
+        notes: list[str] = []
+        panel.update_configuration({"BOAT_CHAT_ACCESS_TOKEN": "another-access-code"}, notes)
+        self.assertEqual(panel.parse_env(self.chat)["BOAT_CHAT_ACCESS_TOKEN"], "another-access-code")
+        self.assertTrue(any("revoke-all chat" in note for note in notes), notes)
+
+    def test_panel_never_writes_the_chat_store_in_process_as_root(self) -> None:
+        source = (Path(panel.__file__)).read_text()
+        self.assertIn("inherit_owner=True", source[source.index("def chat_auth_store"):source.index("def auth_store")])
+
+
 class SettingsValidationTests(unittest.TestCase):
     def check(self, key: str, value: str) -> str:
         return panel.validate_value(panel.FIELD_BY_KEY[key], value)
@@ -1461,6 +1512,92 @@ class SignInApiTests(DisplaysApiBase):
             status, body, _ = self.make_pairing("chat")
         self.assertEqual(status, 400, "at most three outstanding")
         self.assertIn("already waiting", body["error"])
+
+    def chat_dirs(self):
+        data = self.root / "data"
+        (data / "boat-chat").mkdir(parents=True, exist_ok=True)
+        env = self.root / "vesselstack.env"
+        env.write_text(f'VESSELSTACK_DATA="{data}"\n')
+        chat_env = self.root / "boat-chat.env"
+        return data, env, chat_env
+
+    def test_admin_pairing_binds_to_the_effective_settings_token(self) -> None:
+        data, env, chat_env = self.chat_dirs()
+        chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_SETTINGS_TOKEN="env-code"\n')
+        override = data / "boat-chat" / "boat-chat.env"
+        bindings = []
+        for text in ("", "BOAT_CHAT_SETTINGS_TOKEN='page-code'\n"):
+            override.write_text(text)
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+                self.assertEqual(self.make_pairing("chat", admin=True)[0], 200)
+            stored = json.loads((data / "boat-chat" / "auth.json").read_text())
+            bindings.append((stored["pairings"][-1]["binding"], stored["binding_key"]))
+        self.assertEqual(bindings[0][0], panel.vsauth.admin_binding(bindings[0][1], "env-code"), "base file when no override")
+        self.assertEqual(bindings[1][0], panel.vsauth.admin_binding(bindings[1][1], "page-code"), "Settings-page override wins, as in Boat Chat")
+        self.assertEqual(bindings[0][1], bindings[1][1], "one key per store")
+
+    def test_auth_context_is_evaluated_once_per_request(self) -> None:
+        self.set_passphrase()
+        token = self.login()[1]["device_token"]
+        store = panel.auth_store()
+        handler = object.__new__(panel.ControlPanelHandler)
+        handler.headers = {"X-VesselStack-Device": token}
+        handler.send_json = lambda *a, **k: self.fail("unexpected rejection")
+        self.assertTrue(handler.require_auth())
+        device_id = handler.current_device_id()
+        self.assertTrue(store.revoke(device_id), "revoked while the request is still being handled")
+        self.assertEqual(handler.auth_context()["kind"], "device")
+        self.assertEqual(handler.current_device_id(), device_id, "the same identity for the whole request")
+        self.assertFalse(handler.authenticated(), "a fresh evaluation does see the revocation")
+        fresh = object.__new__(panel.ControlPanelHandler)
+        fresh.headers = {"X-VesselStack-Device": token}
+        sent = []
+        fresh.send_json = lambda status, payload, headers=None: sent.append(status)
+        self.assertFalse(fresh.require_auth())
+        self.assertEqual(sent, [401])
+
+    def test_device_revoked_mid_request_never_crashes_the_handler(self) -> None:
+        self.set_passphrase()
+        token = self.login()[1]["device_token"]
+        real = panel.vsauth.AuthStore.list_devices
+
+        def revoking(store, current_id=None):
+            store.revoke_all()
+            return real(store, current_id)
+        with mock.patch.object(panel.vsauth.AuthStore, "list_devices", revoking):
+            status, body, _ = self.call("GET", "/api/auth/devices", {}, self.device(token))
+        self.assertEqual((status, body["via"]), (200, "device"))
+        self.assertEqual(self.call("GET", "/api/auth/devices", {}, self.device(token))[0], 401, "the next request is refused")
+        # same on POST: the Origin gate and the handler both use the context fixed at authentication
+        token = self.login()[1]["device_token"]
+        original = panel.ControlPanelHandler.read_payload
+
+        def revoking_payload(handler):
+            panel.auth_store().revoke_all()
+            return original(handler)
+        with mock.patch.object(panel.ControlPanelHandler, "read_payload", revoking_payload):
+            status, body, _ = self.call("POST", "/api/auth/devices/revoke", {"id": "all"}, self.device(token))
+        self.assertEqual(status, 200, body)
+
+    def test_corrupt_chat_store_degrades_in_the_panel(self) -> None:
+        data, env, _ = self.chat_dirs()
+        (data / "boat-chat" / "auth.json").write_text(json.dumps({"schema": 1, "devices": 5, "pairings": [{"created": []}]}))
+        with mock.patch.object(panel, "VESSEL_ENV", env):
+            self.assertIsNone(panel.chat_passphrase_hash())
+            self.set_passphrase()  # the "must differ from Boat Chat" rule just does not apply
+            self.assertEqual(self.login()[0], 200)
+            self.assertEqual(self.make_pairing("chat")[0], 500, "reported, not crashed, and the unreadable store is left alone")
+        self.assertEqual(json.loads((data / "boat-chat" / "auth.json").read_text())["devices"], 5)
+
+    def test_success_does_not_wipe_address_backoff_over_http(self) -> None:
+        self.set_passphrase()
+        for _ in range(3):
+            self.assertEqual(self.login(passphrase="wrong passphrase!")[0], 401)
+        self.assertEqual(self.login()[0], 200)
+        self.assertEqual(panel.LOGIN_THROTTLE._ips["127.0.0.1"]["count"], 3, "the earlier failures still count after a success")
+        self.assertEqual(self.login(passphrase="wrong passphrase!")[0], 401)
+        self.assertEqual(self.login(passphrase="wrong passphrase!")[0], 401)
+        self.assertEqual(self.login()[0], 429, "5 failures in a row still trip the backoff even with a success between")
 
     def test_status_leaks_only_whether_a_passphrase_is_set(self) -> None:
         status, payload, _ = self.call("GET", "/api/auth/status")

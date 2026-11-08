@@ -590,6 +590,7 @@ def validate_settings_update(updates: dict[str, Any]) -> None:
 
 def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
     validate_settings_update(updates)
+    access_before = (setting_value("BOAT_CHAT_ACCESS_TOKEN") or "").strip()
     with env_config.locked(ENV_CONFIG):
         current = parse_env_config()
         for key, value in updates.items():
@@ -608,12 +609,28 @@ def update_settings(updates: dict[str, Any]) -> dict[str, Any]:
             else:
                 current[key] = text
         _write_env_config_unlocked(current)
+    warning = ""
+    signed_out = 0
     if vsauth is not None and "BOAT_CHAT_SETTINGS_TOKEN" in updates:
         try:  # admin devices paired under the old admin code lose their rights (the binding check already refuses them)
-            chat_auth_store().prune_admin_devices(vsauth.admin_binding(current.get("BOAT_CHAT_SETTINGS_TOKEN") or os.environ.get("BOAT_CHAT_SETTINGS_TOKEN", "")))
+            effective = current["BOAT_CHAT_SETTINGS_TOKEN"] if "BOAT_CHAT_SETTINGS_TOKEN" in current else os.environ.get("BOAT_CHAT_SETTINGS_TOKEN", "")
+            store = chat_auth_store()
+            store.prune_admin_devices(store.admin_binding(effective, create=True))
         except (OSError, vsauth.StoreError):
-            pass
-    return public_settings()
+            warning = "Admin devices could not be checked; they stay refused until the admin code matches. Run: sudo vesselstackctl devices revoke-all chat"
+    if vsauth is not None and "BOAT_CHAT_ACCESS_TOKEN" in updates:
+        access_after = (current["BOAT_CHAT_ACCESS_TOKEN"] if "BOAT_CHAT_ACCESS_TOKEN" in current else os.environ.get("BOAT_CHAT_ACCESS_TOKEN", "")).strip()
+        if access_after != access_before:
+            try:  # a new access code signs out every device and cancels waiting pairing links
+                signed_out = chat_auth_store().revoke_all()
+            except (OSError, vsauth.StoreError):
+                warning = "Devices could not be signed out. Run: sudo vesselstackctl devices revoke-all chat"
+    result = public_settings()
+    if signed_out:
+        result["devices_signed_out"] = signed_out
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 def http_get_json(url: str, headers: dict[str, str] | None = None, timeout: int = 8) -> Any:
@@ -5370,7 +5387,13 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         # Bound to the admin code it was paired under: rotating or removing BOAT_CHAT_SETTINGS_TOKEN ends the privilege,
         # and with no token configured only loopback may write settings (a device never overrides that).
         token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
-        return bool(token) and vsauth is not None and hmac.compare_digest(str(device.get("binding") or ""), vsauth.admin_binding(token))
+        if not token or vsauth is None:
+            return False
+        try:  # never creates the key: a store without one cannot hold a valid binding
+            expected = chat_auth_store().admin_binding(token)
+        except (OSError, vsauth.StoreError):
+            return False
+        return expected is not None and hmac.compare_digest(str(device.get("binding") or ""), expected)
 
     def admin_code_supplied(self) -> bool:
         token = (setting_value("BOAT_CHAT_SETTINGS_TOKEN") or "").strip()
@@ -5439,11 +5462,12 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             if path == "/api/auth/status":
                 self.send_json(200, {"passphrase_set": store.passphrase_set()}); return
             if path == "/api/auth/devices":
-                if not self.access_allowed():
+                admin = self.admin_code_supplied()
+                if not (admin or self.access_allowed()):
                     self.send_json(401, {"error": "Sign in first"}); return
                 device = self.device_context()
                 self.send_json(200, {"devices": store.list_devices(device["id"] if device else None), "max_devices": vsauth.MAX_DEVICES,
-                                     "passphrase_set": store.passphrase_set(), "via": "device" if device else "code"}); return
+                                     "passphrase_set": store.passphrase_set(), "via": "device" if device else "code", "admin": admin}); return
         except (vsauth.StoreError, OSError):
             self.send_json(500, {"error": "The sign-in store could not be used."}); return
         self.send_json(404, {"error": "Not found"})
@@ -5506,8 +5530,9 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                     if not matched:
                         self.send_json(401, {"error": "The current passphrase was not accepted."}); return
                     LOGIN_THROTTLE.success(matched)
-                elif before is None and not (self.admin_code_supplied() or self.access_allowed()):
-                    self.send_json(401, {"error": "Sign in with the access code first"}); return
+                elif before is None and not self.admin_code_supplied():
+                    # The first passphrase is a shared credential for the whole crew: admin code or admin device only.
+                    self.send_json(403 if self.access_allowed() else 401, {"error": "Setting the first passphrase needs the admin code (or an admin device)."}); return
                 device = self.device_context()
                 try:
                     revoked = store.set_passphrase(vsauth.check_new_passphrase(payload.get("new"), vsauth.CHAT_MIN_PASSPHRASE_LENGTH),
@@ -5515,7 +5540,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
                 except vsauth.PassphraseChanged:
                     self.send_json(409, {"error": "passphrase changed, try again"}); return
                 self.send_json(200, {"ok": True, "revoked_others": revoked}); return
-            if not self.access_allowed():
+            admin = self.admin_code_supplied()
+            if not (admin or self.access_allowed()):
                 self.send_json(401, {"error": "Sign in first"}); return
             device = self.device_context()
             current = device["id"] if device else None
@@ -5526,6 +5552,9 @@ class BoatChatHandler(BaseHTTPRequestHandler):
             if path == "/api/auth/devices/revoke":
                 payload = self.read_json_body()
                 target = payload.get("id")
+                # Crew (access) may sign out only their own device; signing out others or everyone needs the admin code.
+                if not admin and (target == "all" or not isinstance(target, str) or not current or target != current):
+                    self.send_json(403, {"error": "You can sign out only this device. Signing out others needs the admin code."}); return
                 if target == "all":
                     self.send_json(200, {"ok": True, "revoked": store.revoke_all(), "revoked_current": current is not None}); return
                 if isinstance(target, str) and target:
@@ -5613,7 +5642,8 @@ class BoatChatHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         if include_body:
             self.wfile.write(content)

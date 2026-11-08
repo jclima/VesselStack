@@ -84,6 +84,8 @@ it arrives, so a burst of simultaneous guesses cannot slip past the limit.
 > global (so a shared tunnel address cannot be used to guess slowly), anyone who
 > can reach the panel can trigger a 15-minute passphrase lockout by sending wrong
 > passphrases. The long token keeps working during it. This is an accepted trade-off; keep the panel on the SSH tunnel.
+> A correct sign-in does not clear an address's growing wait (it only withdraws its own attempt); an hour of
+> quiet does.
 
 ### Pair a phone (link or QR code)
 
@@ -227,6 +229,13 @@ device. These are not part of Save and Apply and take effect at once.
 
 On the boat computer: `sudo vesselstackctl devices list`, `devices revoke ID`,
 `devices revoke-all`, `passphrase status` and `passphrase clear panel`.
+
+**Rotating a token signs out every device.** A new `CONTROL_PANEL_TOKEN` (re-running the installer with a
+different value) revokes all Control Panel devices and waiting pairing links; a new Boat Chat access code
+saved under Settings revokes all Boat Chat devices and links (the save reports how many were signed out, or
+the command to run if that failed). To do it by hand: `sudo vesselstackctl devices revoke-all` (panel) or
+`sudo vesselstackctl devices revoke-all chat`. Admin pairing for Boat Chat uses the admin code Boat Chat
+actually enforces (its Settings-page value first, then `config/boat-chat.env`).
 
 ### Displays
 

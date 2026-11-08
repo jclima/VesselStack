@@ -27,6 +27,8 @@ auth = load("vesselstack_auth_under_test", "common/vesselstack_auth.py")
 PASS = "correct horse battery"
 
 
+BKEY = "ab" * 32
+
 class Clock:
     def __init__(self, now: float = 1_800_000_000.0) -> None:
         self.now = now
@@ -240,19 +242,43 @@ class ThrottleTests(unittest.TestCase):
             throttle.failure("192.0.2.5")
         self.assertLessEqual(throttle.retry_after("192.0.2.5"), 15 * 60 + 1)
 
-    def test_success_clears_the_address(self) -> None:
-        throttle = auth.LoginThrottle(Clock())
+    def test_success_does_not_clear_the_address_backoff(self) -> None:
+        clock = Clock()
+        throttle = auth.LoginThrottle(clock)
         for _ in range(5):
             throttle.failure("192.0.2.5")
-        self.assertGreater(throttle.retry_after("192.0.2.5"), 0)
-        _, _, handle = throttle.begin("192.0.2.6")
-        throttle.failure("192.0.2.6")  # unrelated address
+        blocked = throttle.retry_after("192.0.2.5")
+        self.assertGreater(blocked, 0)
+        # a success from another address (or a stale handle) never lifts it
         ok, _, mine = throttle.begin("192.0.2.7")
         throttle.success(mine)
         self.assertEqual(throttle.retry_after("192.0.2.7"), 0)
-        self.assertGreater(throttle.retry_after("192.0.2.5"), 0, "success clears only its own address")
+        self.assertEqual(throttle.retry_after("192.0.2.5"), blocked)
         with self.assertRaises(TypeError):
             throttle.success("192.0.2.5")
+        # the blocked address cannot sign in again until the backoff runs out; the count then decays with time
+        self.assertFalse(throttle.begin("192.0.2.5")[0])
+        clock.now += blocked
+        ok, _, handle = throttle.begin("192.0.2.5")
+        self.assertTrue(ok)
+        throttle.success(handle)
+        self.assertGreater(throttle._ips["192.0.2.5"]["count"], 0, "earlier failures stay counted after a success")
+
+    def test_success_withdraws_only_its_own_count_and_block(self) -> None:
+        throttle = auth.LoginThrottle(Clock())
+        ip = "192.0.2.8"
+        for _ in range(4):
+            throttle.failure(ip)
+        ok, _, fifth = throttle.begin(ip)  # this attempt would trip the first backoff
+        self.assertTrue(ok)
+        self.assertGreater(throttle.retry_after(ip), 0)
+        throttle.success(fifth)
+        self.assertEqual(throttle.retry_after(ip), 0, "the block this very attempt set is undone")
+        self.assertEqual(throttle._ips[ip]["count"], 4, "the four real failures remain")
+        ok, _, again = throttle.begin(ip)
+        self.assertTrue(ok)
+        throttle.failure(again)
+        self.assertGreater(throttle.retry_after(ip), 0)
 
     def test_interleaved_success_never_erases_other_failures(self) -> None:
         throttle = auth.LoginThrottle(Clock())
@@ -370,15 +396,17 @@ class StoreHardeningTests(unittest.TestCase):
             calls.append((command, kwargs))
             reply = {"passphrase": {"set-hash": {"ok": True, "revoked": 2}, "clear": {"ok": True, "revoked": 3}},
                      "pairing": {"create": {"ok": True, "code": "ABCDE12345", "expires": 1800000600}},
-                     "devices": {"revoke": {"ok": True, "found": True}, "revoke-all": {"ok": True, "revoked": 4}}}[command[3]][command[4]]
+                     "devices": {"revoke": {"ok": True, "found": True}, "revoke-all": {"ok": True, "revoked": 4}},
+                     "binding-key": {"ensure": {"ok": True, "key": BKEY}}}[command[3]][command[4]]
             return mock.Mock(stdout=json.dumps(reply).encode(), returncode=0)
         store = self._root_store(runner=runner)
         with mock.patch("os.fchown") as fchown, mock.patch("os.chown") as chown:
             self.assertEqual(store.set_passphrase(PASS, keep_device="abc"), 2)
             self.assertEqual(store.clear_passphrase(), 3)
-            self.assertEqual(store.create_pairing("admin", "Phone", auth.admin_binding("admin-code")), ("ABCDE12345", 1800000600))
+            self.assertEqual(store.create_pairing("admin", "Phone", auth.admin_binding(BKEY, "admin-code")), ("ABCDE12345", 1800000600))
             self.assertTrue(store.revoke("dev1"))
             self.assertEqual(store.revoke_all(keep="k"), 4)
+            self.assertEqual(store.ensure_binding_key(), BKEY)
         fchown.assert_not_called()
         chown.assert_not_called()
         self.assertFalse(self.path.exists(), "root wrote nothing itself")
@@ -390,12 +418,12 @@ class StoreHardeningTests(unittest.TestCase):
             self.assertEqual((kwargs["capture_output"], kwargs["timeout"]), (True, 30))
             self.assertEqual(set(kwargs["env"]), {"PATH", "LANG", "VESSELSTACK_DATA", "VESSELSTACK_ROOT"})
         self.assertEqual([c[0][3:-1] for c in calls], [["passphrase", "set-hash", "chat"], ["passphrase", "clear", "chat"], ["pairing", "create", "chat"],
-                                                      ["devices", "revoke", "chat"], ["devices", "revoke-all", "chat"]])
+                                                      ["devices", "revoke", "chat"], ["devices", "revoke-all", "chat"], ["binding-key", "ensure", "chat"]])
         sent = json.loads(calls[0][1]["input"])
         self.assertTrue(auth.valid_hash(sent["hash"]))
         self.assertNotIn(PASS, calls[0][1]["input"].decode(), "the helper gets a hash, never the passphrase")
         self.assertEqual(sent["keep_device"], "abc")
-        self.assertEqual(json.loads(calls[2][1]["input"]), {"role": "admin", "label": "Phone", "binding": auth.admin_binding("admin-code")})
+        self.assertEqual(json.loads(calls[2][1]["input"]), {"role": "admin", "label": "Phone", "binding": auth.admin_binding(BKEY, "admin-code")})
         self.assertEqual(json.loads(calls[3][1]["input"]), {"id": "dev1"})
         self.assertEqual(json.loads(calls[4][1]["input"]), {"keep": "k"})
 
@@ -432,8 +460,11 @@ class StoreHardeningTests(unittest.TestCase):
         self.assertEqual((code, reply["ok"], reply["kind"]), (1, False, "auth"))
         code, reply = run(["passphrase", "set-hash", "chat"], {"hash": encoded, "expect_hash": None})
         self.assertEqual((code, reply["kind"]), (1, "changed"))
-        code, reply = run(["pairing", "create", "chat"], {"role": "admin", "label": "Tablet", "binding": auth.admin_binding("admin-code")})
+        code, reply = run(["pairing", "create", "chat"], {"role": "admin", "label": "Tablet", "binding": auth.admin_binding(BKEY, "admin-code")})
         self.assertEqual((code, reply["ok"], len(reply["code"])), (0, True, 10))
+        code, reply = run(["binding-key", "ensure", "chat"], {})
+        self.assertEqual((code, reply["ok"], len(reply["key"])), (0, True, 64))
+        self.assertEqual(run(["binding-key", "ensure", "chat"], {})[1]["key"], reply["key"], "created once")
         self.assertEqual(run(["devices", "revoke", "chat"], {"id": "nope"}), (0, {"ok": True, "found": False}))
         self.assertEqual(run(["devices", "revoke-all", "chat"], {}), (0, {"ok": True, "revoked": 0}))
         self.assertEqual(run(["passphrase", "clear", "chat"], {}), (0, {"ok": True, "revoked": 0}))
@@ -511,12 +542,12 @@ class PairingStoreTests(unittest.TestCase):
         with self.assertRaises(auth.AuthError):
             chat.create_pairing("admin")
         with self.assertRaises(auth.AuthError):
-            chat.create_pairing("admin", "", auth.admin_binding(""))
-        code, _ = chat.create_pairing("admin", "", auth.admin_binding("admin-code"))
+            chat.create_pairing("admin", "", auth.admin_binding(BKEY, ""))
+        code, _ = chat.create_pairing("admin", "", auth.admin_binding(BKEY, "admin-code"))
         token, device = chat.redeem_pairing(code, "Skipper")
         self.assertEqual(device["role"], "admin")
-        self.assertEqual(chat.verify_device_token(token)["binding"], auth.admin_binding("admin-code"))
-        self.assertEqual(chat.prune_admin_devices(auth.admin_binding("rotated")), 1)
+        self.assertEqual(chat.verify_device_token(token)["binding"], auth.admin_binding(BKEY, "admin-code"))
+        self.assertEqual(chat.prune_admin_devices(auth.admin_binding(BKEY, "rotated")), 1)
         self.assertEqual(chat.list_devices(), [])
         with self.assertRaises(auth.AuthError):
             self.store().create_pairing("admin")
@@ -658,12 +689,14 @@ class CliTests(unittest.TestCase):
 
 
 class PairLinkCliTests(unittest.TestCase):
-    def run_cli(self, args, env_extra=None, settings_token=None):
+    def run_cli(self, args, env_extra=None, settings_token=None, override_token=None):
         cli = load("vesselstack_authctl_under_test", "common/vesselstack_authctl.py")
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         data = Path(self.tmp.name) / "data"
         (data / "boat-chat").mkdir(parents=True)
+        if override_token is not None:
+            (data / "boat-chat" / "boat-chat.env").write_text(f"BOAT_CHAT_SETTINGS_TOKEN={override_token}\n")
         if settings_token:
             (Path(self.tmp.name) / "config").mkdir()
             (Path(self.tmp.name) / "config" / "boat-chat.env").write_text(f"BOAT_CHAT_PORT='8765'\nBOAT_CHAT_SETTINGS_TOKEN='{settings_token}'\n")
@@ -687,6 +720,19 @@ class PairLinkCliTests(unittest.TestCase):
         self.assertNotIn("passphrase_hash", out)
         self.assertNotIn("token_sha256", out)
 
+    def test_admin_binding_uses_the_effective_token_override_first_then_env(self) -> None:
+        def binding(**kwargs):
+            code, _, err, data = self.run_cli(["panel-link", "--for", "chat", "--admin"], {"VS_CHAT_HOST": "198.51.100.9"}, **kwargs)
+            stored = json.loads((data / "boat-chat" / "auth.json").read_text()) if code == 0 else {}
+            return code, stored.get("pairings", [{}])[0].get("binding"), stored.get("binding_key")
+        code, from_env, key = binding(settings_token="env-code")
+        self.assertEqual((code, from_env), (0, auth.admin_binding(key, "env-code")))
+        code, from_override, key = binding(settings_token="env-code", override_token="'settings-page-code'")
+        self.assertEqual((code, from_override), (0, auth.admin_binding(key, "settings-page-code")), "the Settings-page value is what Boat Chat enforces")
+        code, only_override, key = binding(override_token="override-only")
+        self.assertEqual((code, only_override), (0, auth.admin_binding(key, "override-only")))
+        self.assertEqual(binding(settings_token="env-code", override_token="")[0], 1, "an explicit empty override means no admin code")
+
     def test_chat_admin_link_and_validation(self) -> None:
         code, out, err, data = self.run_cli(["panel-link", "--for", "chat", "--admin"], {"VS_CHAT_HOST": "198.51.100.9", "VS_CHAT_PORT": "8765"})
         self.assertEqual(code, 1, "no BOAT_CHAT_SETTINGS_TOKEN: admin pairing is refused")
@@ -698,7 +744,9 @@ class PairLinkCliTests(unittest.TestCase):
         self.assertIn("(admin)", out)
         stored = json.loads((data / "boat-chat" / "auth.json").read_text())
         self.assertEqual([p["role"] for p in stored["pairings"]], ["admin"])
-        self.assertEqual(stored["pairings"][0]["binding"], auth.admin_binding("admin-code"))
+        self.assertEqual(stored["pairings"][0]["binding"], auth.admin_binding(stored["binding_key"], "admin-code"))
+        self.assertRegex(stored["binding_key"], "^[0-9a-f]{64}$")
+        self.assertTrue(stored["pairings"][0]["binding"].startswith("h1:"))
         self.assertEqual(self.run_cli(["panel-link", "--admin"])[0], 2)
         self.assertEqual(self.run_cli(["panel-link", "--for", "nope"])[0], 2)
         self.assertEqual(self.run_cli(["panel-link", "--bogus"])[0], 2)
@@ -819,3 +867,127 @@ class InstallerImportTests(unittest.TestCase):
         self.assertIn("scrub_signin_hash", text)
         self.assertIn("passphrase set-hash", text)
         self.assertIn("--if-unset", text)
+
+
+class CorruptStoreTests(unittest.TestCase):
+    """Wrong types anywhere in the store are corruption: fail closed (no passphrase, no devices), never overwrite."""
+
+    CASES = {
+        "devices_not_a_list": {"schema": 1, "devices": 5},
+        "pairings_not_a_list": {"schema": 1, "pairings": "x"},
+        "created_is_a_list": {"schema": 1, "devices": [{"id": "a", "token_sha256": "b", "created": [1]}]},
+        "expires_is_a_dict": {"schema": 1, "devices": [{"id": "a", "token_sha256": "b", "expires": {}}]},
+        "last_seen_is_text": {"schema": 1, "devices": [{"id": "a", "token_sha256": "b", "last_seen": "soon"}]},
+        "pairing_created_bool": {"schema": 1, "pairings": [{"id": "a", "code_sha256": "b", "created": True}]},
+        "root_is_a_list": [],
+        "root_is_text": "text",
+        "wrong_schema": {"schema": 2},
+    }
+
+    def make(self, content: str) -> tuple[Path, "auth.AuthStore"]:
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        path = directory / "auth.json"
+        path.write_text(content)
+        return path, auth.AuthStore(path, min_passphrase=8, expose_role=True)
+
+    def test_every_malformed_shape_fails_closed_and_is_not_overwritten(self) -> None:
+        for name, document in {**self.CASES, "infinite_number": None}.items():
+            text = '{"schema": 1, "devices": [{"id": "a", "token_sha256": "b", "created": Infinity}]}' if document is None else json.dumps(document)
+            with self.subTest(name):
+                path, store = self.make(text)
+                self.assertFalse(store.passphrase_set())
+                self.assertFalse(store.check_passphrase("anything at all"))
+                self.assertIsNone(store.current_hash())
+                self.assertEqual(store.list_devices(), [])
+                self.assertIsNone(store.verify_device_token("x" * 40))
+                self.assertEqual(store.pending_pairings(), 0)
+                for mutate in (lambda: store.set_passphrase("a good passphrase"), lambda: store.create_device("x", True),
+                               lambda: store.revoke_all(), lambda: store.create_pairing(), lambda: store.ensure_binding_key()):
+                    with self.assertRaises(auth.StoreError):
+                        mutate()
+                self.assertEqual(path.read_text(), text, "a store that cannot be understood is never rewritten")
+
+    def test_garbage_bytes_and_deep_nesting_are_corruption(self) -> None:
+        for text in ("{" * 100000, "\x00\x01", "not json", ""):
+            path, store = self.make(text)
+            self.assertFalse(store.passphrase_set())
+            with self.assertRaises(auth.StoreError):
+                store.revoke_all()
+
+    def test_null_lists_and_unknown_extra_keys_are_fine(self) -> None:
+        path, store = self.make(json.dumps({"schema": 1, "devices": None, "pairings": None, "future": {"x": 1}}))
+        token, _ = store.create_device("ok", True)
+        self.assertIsNotNone(store.verify_device_token(token))
+        self.assertEqual(json.loads(path.read_text())["future"], {"x": 1})
+
+
+class AdminBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "auth.json"
+        self.store = auth.AuthStore(self.path, min_passphrase=8, expose_role=True)
+
+    def test_binding_is_an_hmac_under_a_random_stored_key(self) -> None:
+        self.assertEqual(self.store.admin_binding(""), "none")
+        self.assertIsNone(self.store.admin_binding("admin-code"), "a check never creates the key")
+        self.assertFalse(self.path.exists())
+        first = self.store.admin_binding("admin-code", create=True)
+        key = json.loads(self.path.read_text())["binding_key"]
+        self.assertRegex(key, "^[0-9a-f]{64}$")
+        self.assertEqual(first, auth.admin_binding(key, "admin-code"))
+        self.assertTrue(first.startswith("h1:"))
+        self.assertNotEqual(first, "h1:" + auth.token_digest("admin-code"), "not a plain hash of the code")
+        self.assertEqual(self.store.admin_binding(" admin-code ", create=True), first)
+        self.assertNotEqual(self.store.admin_binding("rotated", create=True), first)
+        other = auth.AuthStore(Path(self.directory.name) / "other.json")
+        self.assertNotEqual(other.admin_binding("admin-code", create=True), first, "each store has its own key")
+
+    def test_key_survives_passphrase_and_revoke_operations(self) -> None:
+        binding = self.store.admin_binding("admin-code", create=True)
+        self.store.set_passphrase("a good passphrase")
+        self.store.revoke_all()
+        self.store.clear_passphrase()
+        self.assertEqual(self.store.admin_binding("admin-code"), binding)
+
+    def test_legacy_sha256_binding_never_matches(self) -> None:
+        legacy = auth.token_digest("admin-code")  # the previous, unkeyed format
+        code, _ = self.store.create_pairing("access")
+        token, _ = self.store.redeem_pairing(code, "old admin")
+        self.store.transaction(lambda data: data["devices"][0].update(role="admin", binding=legacy))
+        current = self.store.admin_binding("admin-code", create=True)
+        self.assertNotEqual(self.store.verify_device_token(token)["binding"], current)
+        self.assertEqual(self.store.prune_admin_devices(current), 1, "pruned as soon as the admin code is next checked")
+
+    def test_admin_pairing_rejects_legacy_and_none_bindings(self) -> None:
+        for bad in ("", "none", auth.token_digest("admin-code")):
+            with self.assertRaises(auth.AuthError):
+                self.store.create_pairing("admin", "", bad)
+
+    def test_effective_setting_reads_override_file_first_then_base(self) -> None:
+        base, override = Path(self.directory.name) / "base.env", Path(self.directory.name) / "override.env"
+        key = "BOAT_CHAT_SETTINGS_TOKEN"
+        self.assertEqual(auth.effective_chat_setting(key, override, base), "")
+        base.write_text("BOAT_NAME=x\nBOAT_CHAT_SETTINGS_TOKEN='from base'\n")
+        self.assertEqual(auth.effective_chat_setting(key, override, base), "from base")
+        override.write_text("# c\nBOAT_CHAT_SETTINGS_TOKEN=from-override\n")
+        self.assertEqual(auth.effective_chat_setting(key, override, base), "from-override")
+        override.write_text("BOAT_CHAT_SETTINGS_TOKEN=\n")
+        self.assertEqual(auth.effective_chat_setting(key, override, base), "", "an explicit empty override wins, as in Boat Chat")
+        override.unlink()
+        override.symlink_to(base)
+        self.assertEqual(auth.effective_chat_setting(key, override, base), "from base", "a symlinked override is ignored")
+        self.assertEqual(auth.effective_chat_setting(key, None, None), "")
+
+
+class RotationWiringTests(unittest.TestCase):
+    def test_installer_revokes_after_a_token_rotation_and_ctl_hardens_the_helper(self) -> None:
+        text = (ROOT / "install.sh").read_text()
+        self.assertIn('revoke_after_rotation panel "Control Panel" "$PREVIOUS_CONTROL_PANEL_TOKEN" "$CONTROL_PANEL_TOKEN"', text)
+        self.assertIn('revoke_after_rotation chat "Boat Chat" "$PREVIOUS_BOAT_CHAT_ACCESS_TOKEN"', text)
+        self.assertIn('revoke_after_rotation chat "Boat Chat" "$PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN"', text)
+        self.assertIn('vesselstack_authctl.py" devices revoke-all "$scope"', text)
+        self.assertLess(text.index("PREVIOUS_CONTROL_PANEL_TOKEN=$("), text.index("mv -f -- \"$control_panel_temp\""), "old values are read before the files are replaced")
+        ctl = (ROOT / "scripts" / "vesselstackctl").read_text()
+        self.assertIn('python3 -B -I "$helper" "$@"', ctl)

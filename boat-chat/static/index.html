@@ -394,11 +394,11 @@
           <h3>Sign-in</h3>
           <p class="setting-help" id="signin-state">Checking passphrase sign-in…</p>
           <ul id="signin-devices" class="device-list"></ul>
-          <div class="signin-actions"><button id="signin-revoke-all" type="button">Sign out all devices</button></div>
+          <div class="signin-actions"><button id="signin-revoke-all" type="button" hidden>Sign out all devices</button></div>
           <label>Current passphrase <input id="signin-current" type="password" autocomplete="current-password" /></label>
           <label>New passphrase (at least 8 characters) <input id="signin-new" type="password" autocomplete="new-password" /></label>
           <div class="signin-actions"><button id="signin-change" type="button">Set passphrase</button></div>
-          <p class="setting-help">Changing the passphrase signs out every other device. Without the current passphrase, use the admin code in the field above.</p>
+          <p class="setting-help">Changing the passphrase signs out every other device. Without the current passphrase, use the admin code in the field above. Crew can sign out only this device; signing out others, or setting the first passphrase, needs the admin code.</p>
           <p id="signin-message" role="status"></p>
         </section>
 

@@ -133,10 +133,67 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def admin_binding(token: Any) -> str:
-    """Generation marker for admin devices: SHA-256 of the admin code (BOAT_CHAT_SETTINGS_TOKEN) they were paired under, or "none"."""
+BINDING_PREFIX = "h1:"
+MAX_BINDING_LENGTH = 80
+_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def admin_binding(key: Any, token: Any) -> str:
+    """Generation marker for admin devices: HMAC-SHA256 of the admin code (BOAT_CHAT_SETTINGS_TOKEN) under the
+    store's random ``binding_key``, or "none" when no admin code is configured.
+
+    Bindings from before this format (plain SHA-256, no prefix) never equal a computed one, so such devices read as
+    non-admin (fail closed)."""
     text = token.strip() if isinstance(token, str) else ""
-    return token_digest(text) if text else "none"
+    if not text:
+        return "none"
+    if not isinstance(key, str) or not _KEY_PATTERN.match(key):
+        raise StoreError("the sign-in store has no usable binding key")
+    return BINDING_PREFIX + hmac.new(key.encode("ascii"), text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def read_env_value(path: str | os.PathLike[str], key: str) -> str | None:
+    """Value of ``key`` in a KEY=VALUE env file (last assignment wins, shell-style quoting like Boat Chat's own parser),
+    or None when the file is unreadable (not a regular file, a symlink, missing) or the key is absent. Read-only."""
+    import shlex
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            lines = handle.read(1024 * 1024).decode("utf-8", "ignore").splitlines()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    found: str | None = None
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() != key:
+            continue
+        try:
+            parsed = shlex.split(value, comments=False, posix=True)
+            found = " ".join(parsed) if parsed else ""
+        except ValueError:
+            found = value.strip().strip("'\"")
+    return found
+
+
+def effective_chat_setting(key: str, override_path: str | os.PathLike[str] | None, base_path: str | os.PathLike[str] | None) -> str:
+    """The value Boat Chat itself resolves for ``key``: the Settings-page override file wins when it names the key
+    (even with an empty value), otherwise the root-managed ``boat-chat.env``. Stripped; "" when unset."""
+    for path in (override_path, base_path):
+        if path:
+            value = read_env_value(path, key)
+            if value is not None:
+                return value.strip()
+    return ""
 
 
 def clean_label(label: Any) -> str:
@@ -169,33 +226,54 @@ def format_pairing_code(code: str) -> str:
 
 
 def _empty() -> dict[str, Any]:
-    return {"schema": SCHEMA, "passphrase_hash": None, "devices": [], "pairings": []}
+    return {"schema": SCHEMA, "passphrase_hash": None, "devices": [], "pairings": [], "binding_key": None}
+
+
+def _whole(item: dict[str, Any], key: str) -> int:
+    """A stored timestamp: absent/null is 0; anything but a number is corruption (TypeError, handled by the reader)."""
+    value = item.get(key)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{key} is not a number")
+    return int(value)
+
+
+def _binding(item: dict[str, Any]) -> str:
+    value = item.get("binding")
+    return value if isinstance(value, str) and len(value) <= MAX_BINDING_LENGTH else ""
 
 
 def _normalize(data: Any) -> dict[str, Any]:
+    """Validated copy of a store. Wrong types raise (StoreError, or TypeError/OverflowError that ``_read_at`` maps to
+    StoreError): a store that cannot be understood is never repaired or overwritten."""
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         raise StoreError("unsupported or malformed sign-in store")
     result = dict(data)
     stored = result.get("passphrase_hash")
     result["passphrase_hash"] = stored if isinstance(stored, str) and stored else None
+    key = result.get("binding_key")
+    result["binding_key"] = key if isinstance(key, str) and _KEY_PATTERN.match(key) else None
+    for name in ("devices", "pairings"):
+        if result.get(name) is None:
+            result[name] = []
+        if not isinstance(result[name], list):
+            raise StoreError("malformed sign-in store")
     devices = []
-    for item in result.get("devices") or []:
+    for item in result["devices"]:
         if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("token_sha256"), str):
             devices.append({
                 "id": item["id"], "token_sha256": item["token_sha256"], "label": clean_label(item.get("label")),
-                "created": int(item.get("created") or 0), "last_seen": int(item.get("last_seen") or 0),
-                "expires": int(item.get("expires") or 0),
-                "role": item.get("role") if item.get("role") in ROLES else "access",
-                "binding": item["binding"] if isinstance(item.get("binding"), str) and len(item["binding"]) <= 64 else "",
+                "created": _whole(item, "created"), "last_seen": _whole(item, "last_seen"), "expires": _whole(item, "expires"),
+                "role": item.get("role") if item.get("role") in ROLES else "access", "binding": _binding(item),
             })
     result["devices"] = devices
     pairings = []
-    for item in result.get("pairings") or []:
+    for item in result["pairings"]:
         if isinstance(item, dict) and isinstance(item.get("code_sha256"), str) and isinstance(item.get("id"), str):
             pairings.append({"id": item["id"], "code_sha256": item["code_sha256"], "label": clean_label(item.get("label")) if item.get("label") else "",
-                             "created": int(item.get("created") or 0), "expires": int(item.get("expires") or 0),
-                             "role": item.get("role") if item.get("role") in ROLES else "access",
-                             "binding": item["binding"] if isinstance(item.get("binding"), str) and len(item["binding"]) <= 64 else ""})
+                             "created": _whole(item, "created"), "expires": _whole(item, "expires"),
+                             "role": item.get("role") if item.get("role") in ROLES else "access", "binding": _binding(item)})
     result["pairings"] = pairings
     return result
 
@@ -280,7 +358,9 @@ class AuthStore:
             os.close(fd)
         try:
             data = _normalize(json.loads(raw.decode("utf-8")))
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, TypeError, AttributeError, KeyError, OverflowError, RecursionError) as exc:
+            # Wrong types anywhere in the file are corruption too: fail closed (no passphrase, no devices) and never
+            # let a mutation overwrite what could not be understood.
             raise StoreError("the sign-in store is not valid JSON") from exc
         return data, (info.st_mtime_ns, info.st_ino, info.st_size)
 
@@ -485,7 +565,7 @@ class AuthStore:
         An admin pairing needs ``binding`` (see ``admin_binding``): the device stops being admin when the admin code changes."""
         if role not in ROLES or (role == "admin" and not self.expose_role):
             raise AuthError("Admin pairing is only available for Boat Chat.")
-        if role == "admin" and (not isinstance(binding, str) or binding in {"", "none"} or len(binding) > 64):
+        if role == "admin" and (not isinstance(binding, str) or not binding.startswith(BINDING_PREFIX) or len(binding) > MAX_BINDING_LENGTH):
             raise AuthError("Admin pairing needs an admin code: set BOAT_CHAT_SETTINGS_TOKEN first.")
         if role != "admin":
             binding = ""
@@ -548,6 +628,31 @@ class AuthStore:
             self._touch(found["id"], now)
         return {**self.public_device(found, role=True), "binding": found.get("binding", "")}
 
+    def binding_key(self) -> str | None:
+        return self.snapshot().get("binding_key")
+
+    def ensure_binding_key(self) -> str:
+        """The random key behind admin bindings, created on first need (in the helper process when root faces a
+        service-owned directory)."""
+        existing = self.binding_key()
+        if existing:
+            return existing
+
+        def mutate(data: dict[str, Any]) -> str:
+            if not data.get("binding_key"):
+                data["binding_key"] = secrets.token_hex(32)
+            return data["binding_key"]
+        return self._mutating(["binding-key", "ensure", "chat"], {}, "key", lambda: self.transaction(mutate))
+
+    def admin_binding(self, token: Any, *, create: bool = False) -> str | None:
+        """Binding for the admin code ``token`` ("none" when empty). None when no key exists yet and ``create`` is false
+        (nothing can have been bound), so a check never writes."""
+        text = token.strip() if isinstance(token, str) else ""
+        if not text:
+            return "none"
+        key = self.ensure_binding_key() if create else self.binding_key()
+        return admin_binding(key, text) if key else None
+
     def prune_admin_devices(self, current_binding: str) -> int:
         """Drop admin devices (and waiting admin links) paired under a different admin code. Runs as the store's owner."""
         def mutate(data: dict[str, Any]) -> int:
@@ -597,11 +702,13 @@ class AuthStore:
 class Attempt:
     """Handle for one attempt admitted by ``LoginThrottle.begin()``."""
 
-    __slots__ = ("ip", "stamp_id")
+    __slots__ = ("ip", "stamp_id", "set_block", "prev_block")
 
-    def __init__(self, ip: str, stamp_id: int) -> None:
+    def __init__(self, ip: str, stamp_id: int, set_block: float | None = None, prev_block: float = 0.0) -> None:
         self.ip = ip
         self.stamp_id = stamp_id
+        self.set_block = set_block  # the backoff deadline this very attempt put in place, if any
+        self.prev_block = prev_block
 
 
 class LoginThrottle:
@@ -610,8 +717,12 @@ class LoginThrottle:
     ``begin()`` is the atomic entry point: under one lock it checks both limits and, when the attempt
     is allowed, records it as a failure up front ("pending") and returns an ``Attempt`` handle.
     Concurrent requests therefore cannot all pass the check before any failure is counted.
-    ``success(handle)`` withdraws only that one attempt from the global window and clears the address's
-    backoff; every other recorded failure (the caller's or anyone else's) stays counted.
+    ``success(handle)`` withdraws only that one attempt: its slot in the global window, its own count against the
+    address, and the backoff deadline that very attempt set. Every other recorded failure (the caller's or anyone
+    else's) stays counted and the address's backoff is NOT cleared by a success; it decays with time (an hour
+    of quiet forgives the count). Tradeoff: bad attempts from many addresses can still trip the global lockout
+    (more than GLOBAL_LIMIT in GLOBAL_WINDOW), which blocks passphrase and pairing sign-in for everyone until it
+    expires or the service restarts; access codes and tokens are not throttled.
     ``failure(handle)`` just confirms the attempt (no double count).
     """
 
@@ -653,12 +764,14 @@ class LoginThrottle:
             wait = self._wait_locked(ip, now)
             if wait > 0:
                 return False, int(wait) + 1, None
+            before = self._ips.get(ip, {}).get("blocked_until", 0.0)
             stamp_id = self._record_locked(ip, now)
+            after = self._ips.get(ip, {}).get("blocked_until", 0.0)
             self._pending.add(stamp_id)
             if len(self._pending) > 4 * self.MAX_TRACKED:
                 live = {entry[0] for entry in self._global}
                 self._pending &= live
-        return True, 0, Attempt(ip, stamp_id)
+        return True, 0, Attempt(ip, stamp_id, after if after != before else None, before)
 
     def _record_locked(self, ip: str, now: float) -> int:
         entry = self._ips.setdefault(ip, {"count": 0, "blocked_until": 0.0, "last": now})
@@ -691,11 +804,15 @@ class LoginThrottle:
             self._record_locked(str(attempt), self.clock())
 
     def success(self, attempt: Attempt) -> None:
-        """A correct credential: withdraw only this attempt from the global window and clear the address backoff."""
+        """A correct credential: withdraw only this attempt (see the class docstring); other backoff stays."""
         if not isinstance(attempt, Attempt):
             raise TypeError("success() needs the handle returned by begin()")
         with self._lock:
-            self._ips.pop(attempt.ip, None)
+            entry = self._ips.get(attempt.ip)
+            if entry is not None and attempt.stamp_id in self._pending:
+                entry["count"] = max(entry["count"] - 1, 0)
+                if attempt.set_block is not None and entry["blocked_until"] == attempt.set_block:
+                    entry["blocked_until"] = attempt.prev_block
             self._pending.discard(attempt.stamp_id)
             for index, (stamp_id, _) in enumerate(self._global):
                 if stamp_id == attempt.stamp_id:

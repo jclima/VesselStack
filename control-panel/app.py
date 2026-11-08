@@ -61,6 +61,7 @@ def _load_shared_auth() -> Any:
 vsauth = _load_shared_auth()
 LOGIN_THROTTLE = vsauth.LoginThrottle()
 _AUTH_STORES: dict[str, Any] = {}
+_UNSET: Any = object()
 
 
 def chat_passphrase_hash() -> str | None:
@@ -70,8 +71,25 @@ def chat_passphrase_hash() -> str | None:
         if not data_dir:
             return None
         return vsauth.AuthStore(Path(data_dir) / "boat-chat" / vsauth.CHAT_STORE_NAME).snapshot()["passphrase_hash"]
-    except (OSError, vsauth.StoreError):
-        return None
+    except (OSError, vsauth.StoreError, ValueError, TypeError, AttributeError, KeyError):
+        return None  # an unreadable or corrupt store reads as "no passphrase" (fail closed), never as a 500
+
+
+def effective_chat_token(key: str, vessel: dict[str, str] | None = None) -> str:
+    """The Boat Chat code Boat Chat itself enforces: Settings-page override file first, then config/boat-chat.env."""
+    return vsauth.effective_chat_setting(key, chat_override_path(vessel), CHAT_ENV)
+
+
+def revoke_chat_devices(notes: list[str] | None = None) -> int:
+    """Sign out every Boat Chat device and drop waiting pairing links (via the privilege-dropping helper). Returns the
+    count; on failure the problem goes to ``notes`` (and 0 is returned) because the rotation itself already happened."""
+    try:
+        return chat_auth_store().revoke_all()
+    except (vsauth.StoreError, OSError):
+        if notes is not None:
+            notes.append("The Boat Chat access code changed but its signed-in devices could not be signed out. "
+                         "Run: sudo vesselstackctl devices revoke-all chat")
+        return 0
 
 
 def chat_auth_store() -> Any:
@@ -621,18 +639,19 @@ def release_lifecycle_slot(slot_fd) -> None:
         LIFECYCLE_LOCK.release()
 
 
-def update_configuration(updates: dict[str, Any]) -> str:
+def update_configuration(updates: dict[str, Any], notes: list[str] | None = None) -> str:
     slot_fd = take_lifecycle_slot()
     try:
-        return _update_configuration(updates)
+        return _update_configuration(updates, notes)
     finally:
         release_lifecycle_slot(slot_fd)
 
 
-def _update_configuration(updates: dict[str, Any]) -> str:
+def _update_configuration(updates: dict[str, Any], notes: list[str] | None = None) -> str:
     saved_chat_keys: set[str] = set()
     vessel = parse_env(VESSEL_ENV)
     chat = parse_env(CHAT_ENV)
+    access_before = effective_chat_token("BOAT_CHAT_ACCESS_TOKEN", vessel)
     panel = parse_env(PANEL_ENV)
     problems: dict[str, str] = {}
     for key, raw in updates.items():
@@ -695,6 +714,11 @@ def _update_configuration(updates: dict[str, Any]) -> str:
                 shutil.copy2(snapshot, path)
         raise
     clear_chat_overrides(saved_chat_keys, vessel)
+    if "BOAT_CHAT_ACCESS_TOKEN" in saved_chat_keys and effective_chat_token("BOAT_CHAT_ACCESS_TOKEN", vessel) != access_before:
+        # Rotating the access code signs out every Boat Chat device and drops waiting pairing links.
+        revoked = revoke_chat_devices(notes)
+        if notes is not None and revoked:
+            notes.append(f"Boat Chat access code changed: {revoked} signed-in device(s) were signed out.")
     return str(backup)
 
 
@@ -1436,14 +1460,26 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    _auth_cached: Any = _UNSET
+
     def auth_context(self) -> dict[str, Any] | None:
-        """{"kind": "token"} or {"kind": "device", "device": {...}}; None when unauthenticated."""
+        """{"kind": "token"} or {"kind": "device", "device": {...}}; None when unauthenticated.
+
+        Evaluated once per request (the first call, normally ``require_auth``) and reused, so a device revoked or a
+        token rotated while the request is being handled cannot turn an authenticated request into a crash or a
+        different identity half way through."""
+        if self._auth_cached is _UNSET:
+            self._auth_cached = self._evaluate_auth()
+        return self._auth_cached
+
+    def _evaluate_auth(self) -> dict[str, Any] | None:
         context: dict[str, Any] | None = None
         expected = panel_settings().get("CONTROL_PANEL_TOKEN", "").strip()
         supplied = normalize_token(self.headers.get("X-VesselStack-Token") or "")
@@ -1458,10 +1494,12 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         return context
 
     def authenticated(self) -> bool:
-        return self.auth_context() is not None
+        return self._evaluate_auth() is not None
 
     def require_auth(self) -> bool:
-        if self.authenticated():
+        """Authenticate once and remember the answer for the rest of this request (see ``auth_context``)."""
+        self._auth_cached = self._evaluate_auth()
+        if self._auth_cached is not None:
             return True
         self.send_json(401, {"error": "Sign in with the passphrase, or send a valid X-VesselStack-Token header"})
         return False
@@ -1559,9 +1597,10 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             chat = parse_env(CHAT_ENV)
             bind = chat.get("BOAT_CHAT_HOST") or "0.0.0.0"
             port = int(chat.get("BOAT_CHAT_PORT") or 8765)
-        if admin and not (chat.get("BOAT_CHAT_SETTINGS_TOKEN") or "").strip():
+        admin_code = effective_chat_token("BOAT_CHAT_SETTINGS_TOKEN") if admin else ""
+        if admin and not admin_code:
             raise ValueError("Admin pairing needs an admin code: set BOAT_CHAT_SETTINGS_TOKEN in the Boat Chat settings first.")
-        binding = vsauth.admin_binding(chat.get("BOAT_CHAT_SETTINGS_TOKEN")) if admin else ""
+        binding = store.admin_binding(admin_code, create=True) if admin else ""
         code, expires = store.create_pairing("admin" if admin else "access", label or "", binding)
         links = vsauth.pairing_urls(code, str(bind), port)
         self.send_json(200, {"url": links["urls"][0], "urls": links["urls"], "tunnel": links["tunnel"], "code": vsauth.format_pairing_code(code),
@@ -1656,6 +1695,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
@@ -1709,6 +1749,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "The display tool failed unexpectedly."})
 
     def do_GET(self) -> None:
+        self._auth_cached = _UNSET
         if not self.host_allowed():
             return
         path = urllib.parse.urlparse(self.path).path
@@ -1723,7 +1764,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/auth/devices":
                 store = auth_store()
-                self.send_json(200, {"devices": store.list_devices(self.current_device_id()), "max_devices": vsauth.MAX_DEVICES, "passphrase_set": store.passphrase_set(), "via": self.auth_context()["kind"]})
+                self.send_json(200, {"devices": store.list_devices(self.current_device_id()), "max_devices": vsauth.MAX_DEVICES, "passphrase_set": store.passphrase_set(), "via": (self.auth_context() or {}).get("kind", "token")})
             elif path == "/api/config":
                 self.send_json(200, public_configuration())
             elif path == "/api/status":
@@ -1757,6 +1798,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
         self.send_static(self.static_target(path))
 
     def do_POST(self) -> None:
+        self._auth_cached = _UNSET
         if not self.host_allowed():
             return
         path = urllib.parse.urlparse(self.path).path
@@ -1782,7 +1824,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             return
         if not self.require_auth():
             return
-        if self.auth_context()["kind"] == "device" and not origin:
+        if (self.auth_context() or {}).get("kind") == "device" and not origin:
             # Device tokens ride in a header a page could be tricked into sending; insist the browser names its origin.
             self.send_json(403, {"error": "request origin is not allowed"})
             return
@@ -1798,8 +1840,9 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 updates = payload.get("settings", payload)
                 if not isinstance(updates, dict):
                     raise ValueError("settings object required")
-                backup = update_configuration(updates)
-                self.send_json(200, {"ok": True, "backup": backup, "configuration": public_configuration(), "restart_note": "Apply configuration to render service changes. Restart the panel from the recovery shell after changing its listener."})
+                notes: list[str] = []
+                backup = update_configuration(updates, notes)
+                self.send_json(200, {"ok": True, "backup": backup, "notes": notes, "configuration": public_configuration(), "restart_note": "Apply configuration to render service changes. Restart the panel from the recovery shell after changing its listener."})
                 return
             if path == "/api/action":
                 action = str(payload.get("action", ""))

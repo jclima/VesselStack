@@ -937,7 +937,7 @@ async function saveSettings(event) {
     if (settings.BOAT_CHAT_ACCESS_TOKEN) {
       sessionStorage.setItem("boatChatAccessToken", settings.BOAT_CHAT_ACCESS_TOKEN);
     }
-    settingsMessage.textContent = "Saved";
+    settingsMessage.textContent = "Saved" + (data && data.devices_signed_out ? `. ${data.devices_signed_out} signed-in device(s) were signed out.` : "") + (data && data.warning ? ` ${data.warning}` : "");
     await loadModelCatalog();
     await loadSettings();
     await loadHealth();
@@ -1091,26 +1091,36 @@ async function loadSignin() {
   const list = document.querySelector("#signin-devices"), state = document.querySelector("#signin-state");
   list.replaceChildren(); signinMessage.textContent = "";
   try {
-    const response = await fetch("/api/auth/devices", { headers: accessCode() ? { "X-Boat-Chat-Token": accessCode() } : {} });
+    const headers = adminHeaders(); delete headers["Content-Type"];
+    const response = await fetch("/api/auth/devices", { headers });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) { state.textContent = "Connect this device to manage sign-in."; return; }
-    state.textContent = data.passphrase_set ? `Passphrase sign-in is on. ${data.devices.length} of ${data.max_devices} devices signed in.` : "No passphrase is set yet. Set one below so crew can sign in without the access code.";
+    // Crew can sign out only this device; signing out others or everyone, and setting the first passphrase, need the admin code.
+    const admin = data.admin === true;
+    document.querySelector("#signin-revoke-all").hidden = !admin;
+    const blocked = !data.passphrase_set && !admin;
+    document.querySelector("#signin-change").disabled = blocked;
+    state.textContent = data.passphrase_set ? `Passphrase sign-in is on. ${data.devices.length} of ${data.max_devices} devices signed in.` : admin ? "No passphrase is set yet. Set one below so crew can sign in without the access code." : "No passphrase is set yet. Setting the first one needs the admin code (enter it in the field above) or an admin device.";
     data.devices.forEach((device) => {
       const row = document.createElement("li"); const info = document.createElement("span");
       info.textContent = device.label + (device.current ? " (this device)" : "");
       const detail = document.createElement("small"); detail.textContent = `Signed in until ${new Date(device.expires * 1000).toLocaleString()}`; info.appendChild(detail);
-      const revoke = document.createElement("button"); revoke.type = "button"; revoke.textContent = "Sign out";
-      revoke.addEventListener("click", async () => {
-        const result = await fetch("/api/auth/devices/revoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: device.id }) });
-        if (result.ok && device.current) clearDeviceToken();
-        loadSignin();
-      });
-      row.append(info, revoke); list.appendChild(row);
+      row.append(info);
+      if (admin || device.current) {
+        const revoke = document.createElement("button"); revoke.type = "button"; revoke.textContent = "Sign out";
+        revoke.addEventListener("click", async () => {
+          const result = await fetch("/api/auth/devices/revoke", { method: "POST", headers: adminHeaders(), body: JSON.stringify({ id: device.id }) });
+          if (result.ok && device.current) clearDeviceToken();
+          loadSignin();
+        });
+        row.append(revoke);
+      }
+      list.appendChild(row);
     });
   } catch { state.textContent = "Could not read the sign-in list."; }
 }
 document.querySelector("#signin-revoke-all").addEventListener("click", async () => {
-  const result = await fetch("/api/auth/devices/revoke", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: "all" }) });
+  const result = await fetch("/api/auth/devices/revoke", { method: "POST", headers: adminHeaders(), body: JSON.stringify({ id: "all" }) });
   if (result.ok) clearDeviceToken(); loadSignin();
 });
 document.querySelector("#signin-change").addEventListener("click", async () => {
