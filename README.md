@@ -514,6 +514,26 @@ network; use a trusted LAN only. Rollback: reinstall 0.6.2 with its pinned insta
 by Heimdall only on that reinstall; older versions ignore the sign-in store files). Before downgrading
 below 0.6.2, run `sudo vesselstackctl display set-theme ID classic` for every themed display.
 
+**Updating to 0.6.3 from an older version can end with a shell error (known issue).** Releases before the
+next one rewrote `/usr/local/sbin/vesselstackctl` in place while the older `vesselstackctl update` (or the
+pinned installer, which starts it) was still running, and that older script is read from disk as it runs. When
+the installer finished, the old command carried on reading the new file from its old position and could print
+`/usr/local/sbin/vesselstackctl: line N: syntax error near unexpected token ...` after the installer's final
+`Control panel:` line. **The install has completed**; the message comes from the old command after the work is
+done. Do not restore a backup because of it. To verify:
+
+```bash
+cat /opt/vesselstack/config/installed-version     # 0.6.3
+sudo vesselstackctl doctor
+sudo vesselstackctl status
+```
+
+Restore only if one of these fails. The installer in the release after 0.6.3 writes the new file beside the
+old one and renames it into place, so a running older command keeps its own copy and the message cannot
+happen on later updates. **Operational
+impact:** none at runtime; only the final message of the update is affected, and the installed command is the
+correct 0.6.3 one. **Rollback:** this note changes nothing to roll back. If you need to leave 0.6.3, downgrades are refused, so restore the verified pre-update backup as described under Rollback below.
+
 Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
 needs no other manual step.
 

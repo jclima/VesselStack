@@ -1322,14 +1322,29 @@ install -m 0644 "$SCRIPT_DIR/templates/homeassistant/lovelace-vesselstack.exampl
     "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml"
 # The installed copy defaults to this installation's root, so a custom
 # VESSELSTACK_ROOT works without exporting it (the environment still overrides).
+# Render into a temporary file beside the target and rename it into place. A running
+# `vesselstackctl update` (the parent of this installer) is a bash script that bash keeps
+# reading from disk; rewriting the file in place would make it continue in the NEW content
+# at its old byte offset. A rename gives the file a new inode, so that process keeps reading
+# its own, now unlinked, copy. The temp name is dotted and specific; leftovers from a killed
+# run are removed first, and nothing else is touched. (No trap here: later traps in this
+# installer replace earlier ones, so cleanup is explicit.)
+vsctl_tmp="$SBIN_DIR/.vesselstackctl.new.$$"
+vsctl_abort() {
+    rm -f -- "$vsctl_tmp"
+    echo "ERROR: could not install $SBIN_DIR/vesselstackctl; the existing file was left unchanged" >&2
+    exit 1
+}
+rm -f -- "$SBIN_DIR"/.vesselstackctl.new.*
 if [[ $VESSELSTACK_ROOT =~ ^[A-Za-z0-9_./+-]+$ ]]; then
     sed "s|^ROOT=\${VESSELSTACK_ROOT:-/opt/vesselstack}\$|ROOT=\${VESSELSTACK_ROOT:-$VESSELSTACK_ROOT}|" \
-        "$SCRIPT_DIR/scripts/vesselstackctl" > "$SBIN_DIR/vesselstackctl"
+        "$SCRIPT_DIR/scripts/vesselstackctl" > "$vsctl_tmp" || vsctl_abort
 else
     echo "WARN: VESSELSTACK_ROOT contains unusual characters; export VESSELSTACK_ROOT when running vesselstackctl" >&2
-    cp "$SCRIPT_DIR/scripts/vesselstackctl" "$SBIN_DIR/vesselstackctl"
+    cp "$SCRIPT_DIR/scripts/vesselstackctl" "$vsctl_tmp" || vsctl_abort
 fi
-chmod 0755 "$SBIN_DIR/vesselstackctl"
+chmod 0755 "$vsctl_tmp" || vsctl_abort
+mv -f -- "$vsctl_tmp" "$SBIN_DIR/vesselstackctl" || vsctl_abort
 install -m 0755 "$SCRIPT_DIR/scripts/vesselstack-firewall" "$SBIN_DIR/vesselstack-firewall"
 # The update launcher and the helper it runs as root are installed root-owned and
 # never executed from a source checkout. A new helper version only arrives through
