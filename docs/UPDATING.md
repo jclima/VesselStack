@@ -39,6 +39,12 @@ cancel with nothing changed). A root-only copy of the previous settings file is 
 without a terminal (the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) still stop
 before changing anything and print the exact fix. Details: [Upgrading to 0.6.0](../README.md#upgrading-to-060).
 
+Updating to 0.6.3 from an older version can end with `/usr/local/sbin/vesselstackctl: line N: syntax error
+near unexpected token ...` after the installer's `Control panel:` line. The install has completed; confirm
+with `cat /opt/vesselstack/config/installed-version`, `sudo vesselstackctl doctor` and
+`sudo vesselstackctl status`, and restore only if one fails. Later installers replace the command atomically.
+See [Upgrading to 0.6.0](../README.md#upgrading-to-060).
+
 ## From the Control Panel
 
 Open the **Updates** tab and press **Check for updates**. This is the only thing that

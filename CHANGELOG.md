@@ -3,6 +3,15 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+- The installer now replaces `/usr/local/sbin/vesselstackctl` atomically (temporary file in the same
+  directory, then rename) instead of rewriting it in place. Before, updating with an older
+  `vesselstackctl update` could end with `line N: syntax error near unexpected token` after the installer
+  finished, because the running old script kept reading the new file. Updating to 0.6.3 from an older
+  version can still show that message once (the install has completed; verify with `vesselstackctl doctor`
+  and `status`). No runtime change, no state change; to go back, restore the pre-update backup (downgrades are refused).
+
 ## 0.6.3 - 2026-11-08
 
 ### Highlights

@@ -161,8 +161,32 @@ if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     echo "Preflight accepted a backup directory inside the data tree" >&2
     exit 1
 fi
+# An older `vesselstackctl update` is a bash script that bash reads from disk while it runs this
+# installer as a child. The installer must replace the file by rename (new inode), never by
+# rewriting it in place, or the old process continues in the new content at its old offset.
+SBIN="$SYSTEM_ROOT/usr/local/sbin"
+install -d -m 0755 "$SBIN"
+printf '#!/bin/bash\n# old vesselstackctl: must stay readable through its open descriptor\necho old\n' > "$SBIN/vesselstackctl"
+chmod 0755 "$SBIN/vesselstackctl"
+cp "$SBIN/vesselstackctl" "$TEST_ROOT/old-vesselstackctl.expected"
+: > "$SBIN/.vesselstackctl.new.99999"   # leftover of a killed run: removed
+: > "$SBIN/.unrelated.new.99999"        # anything else: untouched
+old_inode=$(stat -c %i "$SBIN/vesselstackctl")
+exec 9< "$SBIN/vesselstackctl"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+cat <&9 > "$TEST_ROOT/old-vesselstackctl.read"
+exec 9<&-
+cmp "$TEST_ROOT/old-vesselstackctl.expected" "$TEST_ROOT/old-vesselstackctl.read"
+test "$(stat -c %i "$SBIN/vesselstackctl")" != "$old_inode"
+test "$(stat -c %a "$SBIN/vesselstackctl")" = 755
+grep -qxF "ROOT=\${VESSELSTACK_ROOT:-$APP_ROOT}" "$SBIN/vesselstackctl"
+if compgen -G "$SBIN/.vesselstackctl.new.*" >/dev/null; then
+    echo "The installer left a temporary vesselstackctl behind" >&2
+    exit 1
+fi
+test -e "$SBIN/.unrelated.new.99999"
+rm -f -- "$SBIN/.unrelated.new.99999"
 
 test -x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
 # The installed command defaults to this installation's root (no exported VESSELSTACK_ROOT needed).
