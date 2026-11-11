@@ -22,6 +22,7 @@ import telegram_bot
 CONTROL_SPEC = __import__("importlib.util").util.spec_from_file_location("panel_under_test", ROOT / "control-panel/app.py")
 panel = __import__("importlib.util").util.module_from_spec(CONTROL_SPEC)
 CONTROL_SPEC.loader.exec_module(panel)
+os.environ["VESSELSTACK_SYSTEM_ROOT"] = tempfile.mkdtemp(prefix="vesselstack-access-system-")
 
 MANAGED = ("BOAT_CHAT_ACCESS_TOKEN", "BOAT_CHAT_ALLOW_OPEN", "BOAT_CHAT_SETTINGS_TOKEN", "BOAT_CHAT_ENV")
 

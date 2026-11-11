@@ -16,6 +16,7 @@ the boat's local network when the internet is unavailable.
 - [First-run setup](#9-complete-first-run-setup): Home Assistant, Signal K, InfluxDB, Grafana, Boat Chat, Control Panel
 - [MQTT access control](#mqtt-access-control), [network access](#reaching-vesselstack-from-other-devices) and [network security](#network-security)
 - [Backups](#backups), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
+- [Boat profile](docs/BOAT_PROFILE.md) for shared engine, battery, and tank configuration
 - [Troubleshooting](#troubleshooting)
 - [Developer validation](#developer-validation), [Documentation policy](#documentation-policy), [License and security](#license-and-security), [Moved sections](#moved-sections)
 
@@ -120,6 +121,38 @@ or use the corresponding `vesselstackctl` commands. Hardware and systemd
 services remain configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
 for acceptance steps.
 
+### Lifecycle recovery
+
+Applying a restore is a bounded transaction. VesselStack stages and validates
+both application and data trees, journals the managed
+systemd units, launchers, libexec helpers, update environment, and enable links
+outside those trees, then stops services before swapping anything. If a later
+swap, daemon reload, installer, or start fails, the old trees and journaled
+managed paths are restored and a best-effort daemon reload/start is attempted;
+failed trees and recovery materials are retained for inspection. If stopping the
+running stack fails, no rollback is attempted under live services. Unrelated
+`/etc` files, Docker services, AIS devices, and SocketCAN interfaces are not
+removed. A restore still requires `--yes`, sufficient same-filesystem space,
+and a verified archive; inspect and remove `*.pre-restore-*` only after health
+checks pass.
+
+### Shared lifecycle lock
+
+`common/lifecycle_lock.py` provides the shared, non-blocking lock used by the
+mutating installer, `vesselstackctl`, Control Panel operation slot, and detached
+browser-update worker. It keeps the lock outside the application and data trees
+and supports validated descriptor handoff to child processes. Read-only
+`vesselstackctl` commands remain unlocked.
+Direct boat-profile `set` and `init` commands use the same lock; in-process
+profile-library writes remain the caller's responsibility.
+Direct `deploy-chat.py` apply/rollback operations also use the shared lock;
+read-only preview operations remain unlocked.
+The real-systemd browser-update acceptance fixture copies these shared modules
+alongside the panel so its service-start check exercises the same import set as
+an installed release. The panel releases the shared lifecycle lock before handing
+off its browser-update lock, so a detached updater cannot wake between those two
+steps and report a spurious busy state.
+
 ## Optional integrations
 
 These features are off or inert until you deliberately enable them. Neither is needed for the core stack.
@@ -186,18 +219,18 @@ session), run the pinned release installer and answer the questions in the same 
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash
 ```
 
-The same release is also selected by `VESSELSTACK_VERSION=0.6.4` or `--version 0.6.4`:
+The same release is also selected by `VESSELSTACK_VERSION=0.7.0` or `--version 0.7.0`:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.6.4 bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh | sudo bash -s -- --version 0.6.4
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.7.0 bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash -s -- --version 0.7.0
 ```
 
 > [!NOTE]
-> The pinned URL names the release explicitly, so it installs exactly 0.6.4 whatever
+> The pinned URL names the release explicitly, so it installs exactly 0.7.0 whatever
 > GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a prerelease, so that URL kept serving
@@ -244,10 +277,10 @@ that does not point at the exact commit being built, before building anything. T
 
 ```bash
 # defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 # every question's own default answer, nothing asked
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh | sudo bash -s -- --defaults
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash -s -- --defaults
 # a ready-made vesselstack.env (optionally with --set overrides)
 sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
 ```
@@ -386,8 +419,8 @@ script is wrapped in functions and ends with a single `main "$@"` call, so a
 truncated download cannot half-run. If you prefer to read it first (recommended):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -409,7 +442,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.6.4
+git checkout v0.7.0
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the optional browser wizard
 ```
@@ -452,6 +485,17 @@ After installation, use the printed URLs from a trusted local device, run
 Keep the generated credentials per host, schedule backups to a separate device,
 and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
+
+VesselStack 0.7.0 is currently a pre-release for reliability validation. Physical
+Raspberry Pi acceptance is pending, so it is not the release GitHub marks Latest;
+use the pinned 0.7.0 URL only for a reviewed lab test. Upgrade from 0.6.4 with the
+full installer or `vesselstackctl update` so shared modules, configuration and
+services are updated together; the application-only updater is not sufficient for
+this release. The installer takes a verified backup first. If rollback is needed,
+verify and restore that backup rather than downgrading. Database changes are
+additive columns only; historical samples without verified source timestamps remain
+excluded from inferred-energy calculations. For release-history context, 0.6.3 was
+promoted after physical Pi acceptance, while 0.6.2 was marked Latest directly.
 
 ## Upgrading to 0.6.0
 
@@ -631,14 +675,14 @@ command under Rollback below, fix the value, and update again.
 **Verify after updating**
 
 ```bash
-cat /opt/vesselstack/config/installed-version     # 0.6.4
+cat /opt/vesselstack/config/installed-version     # 0.7.0
 sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
 
 Open Boat Chat and the Control Panel, and confirm the dashboards show live values.
 
-**Rollback.** Downgrades are refused (`Downgrade from 0.6.4 to ... is not supported`). Restore the
+**Rollback.** Downgrades are refused (`Downgrade from 0.7.0 to ... is not supported`). Restore the
 verified pre-update backup instead:
 
 ```bash
@@ -751,26 +795,26 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-To work from the 0.6.4 release, check out its tag:
+To work from the 0.7.0 release, check out its tag:
 
 ```bash
 git fetch --tags
-git checkout v0.6.4
+git checkout v0.7.0
 ```
 
-`v0.6.4` is an SSH-signed tag (Ed25519 release key, verified by the release workflow against
-`.github/allowed_signers`). It is published first as a pre-release and marked Latest after the
-maintainer's physical Raspberry Pi install passes; see the [CHANGELOG](CHANGELOG.md). Verify the
-tag yourself (needs `ssh-keygen`, which ships with OpenSSH):
+`v0.7.0` is intended to be published first as a pre-release and is not Latest while
+physical Raspberry Pi acceptance is pending; see the [CHANGELOG](CHANGELOG.md). Once
+the signed release tag exists, verify it yourself (needs `ssh-keygen`, which ships
+with OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.6.4
+scripts/verify-release-tag.sh v0.7.0
 # maintainers and owners: also bind the tag to the commit you recorded when it was built
 # (the full 40-character SHA from your release notes, not one read back from the tag itself)
-scripts/verify-release-tag.sh v0.6.4 .github/allowed_signers "$RECORDED_COMMIT"
+scripts/verify-release-tag.sh v0.7.0 .github/allowed_signers "$RECORDED_COMMIT"
 # equivalent plain git command:
-git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.6.4
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.7.0
 ```
 
 The script prints the signer and key fingerprint, and exits non-zero for an unsigned,
@@ -1471,6 +1515,14 @@ fails the previous trees are put back. `/opt/vesselstack` and
 `/opt/vesselstack-data` must be plain directories on one filesystem with their
 parent; restore refuses a mount point (restore manually in that case).
 
+The swap is a journaled transaction: managed unit/helper files and `update.env`
+are recorded as present or absent before stopping, publication uses adjacent
+temporary names, and a failed publication, daemon reload, or restored-controller
+start attempts one rollback. Failed restored trees are renamed to
+`*.failed-restore-STAMP`; the recovery journal is retained whenever rollback
+itself fails, and unrelated files outside the explicit managed inventory are
+never removed.
+
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall
 --purge-data`). Verify the system first, then
@@ -1509,7 +1561,7 @@ not mounted (see [Backups](#backups)).
 2. **Re-run the pinned release installer.** On the Pi, over `ssh -t`:
 
    ```bash
-   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.6.4/get-vesselstack.sh | sudo bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash
    ```
 
    The installer finds the installed system, never overwrites it silently, and offers
@@ -1522,7 +1574,7 @@ not mounted (see [Backups](#backups)).
    before anything is stopped, whether to mount it, pick a USB drive, check again, or back up
    to the system disk once (see [Backups](#backups)); `--yes` and `--defaults` never choose and
    the update stops with the reason. Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
-   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.6.4`.
+   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.7.0`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
 
@@ -1540,16 +1592,16 @@ not mounted (see [Backups](#backups)).
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
    backed up; configuration and data are.
 
-| Installed version | Update to 0.6.4 |
+| Installed version | Update to 0.7.0 |
 |---|---|
-| 0.6.0 to 0.6.3 | Control Panel or the pinned installer. While 0.6.4 is a pre-release, enable **Include early test releases** on the Updates tab to see it |
-| 0.5.7 | Control Panel or the pinned installer. 0.6.4 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.6.4 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
+| 0.6.0 to 0.6.3 | Control Panel or the pinned installer. While 0.7.0 is a pre-release, enable **Include early test releases** on the Updates tab to see it |
+| 0.5.7 | Control Panel or the pinned installer. 0.7.0 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.7.0 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 
-A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.6.4` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.7.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 
-Updating to 0.6.4 no longer shows the shell error described under [Upgrading to 0.6.0](#upgrading-to-060), even from older versions, because the 0.6.4 installer replaces the `vesselstackctl` command atomically.
+Updating to 0.7.0 no longer shows the shell error described under [Upgrading to 0.6.0](#upgrading-to-060), even from older versions, because the 0.7.0 installer replaces the `vesselstackctl` command atomically.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:
@@ -1565,7 +1617,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on a connected machine, carry it to the boat, and install with
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.6.4.tar.gz`.
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.7.0.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
 
 ## Stopping or removing services
@@ -1713,6 +1765,10 @@ ownership: containers use different internal user IDs.
 Run `python3 -m unittest discover -s tests -p 'test_*.py'` and the shell suites under `tests/`
 (protected temporary roots, CI jobs, and the ESPHome config test) as described in
 [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
+For the lifecycle/install boundary, also run `bash tests/test-clean-install.sh`
+and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
+dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
+bytecode in the source or bundled runtime tree.
 
 Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
 Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order. `tests/test-clean-install.sh` does the same for the installer's `--dry-run` output (written to a file, then searched).
@@ -1786,3 +1842,29 @@ Historical release scope and review-fix notes are kept in
 
 Contributors: CI runs ShellCheck 0.9.0 from the Ubuntu package at info severity; a clean run of a newer
 local ShellCheck is not enough (see [Development](docs/DEVELOPMENT.md)).
+
+### Boat equipment profiles
+
+Boat Chat reads the optional `config/boat-profile.json` on each request and
+telemetry-indexer run. The validated shared profile controls engine, battery
+bank, and fuel-tank paths and labels; a missing file uses the historical
+two-engine profile. A malformed file remains actionable in chat/settings while
+profile-dependent analytics are reported unavailable. Derived cache keys and
+power observations include the profile fingerprint, so changing equipment
+takes effect without a restart and never joins energy intervals across profiles.
+Paired port/starboard comparisons are only available for the exact legacy
+paths and capabilities; display labels and declaration order do not affect
+compatibility. Arbitrary profiles receive an explicit unsupported diagnostic.
+
+### Shared configuration contract
+
+The installation wizard and Control Panel use the data-only registry in
+`common/config_registry.py` for shared defaults, types, ranges, choices,
+ownership, and component mappings. The registry validates configuration without
+contacting services or reading secrets. Boat Chat endpoint resolution uses the
+saved state and an explicit `BOAT_CHAT_ENV` file when supplied; an empty port
+means the app default (8765), while an invalid explicit port is an error.
+Managed listener addresses are IPv4 values, and `BOAT_NAME` is limited to safe
+display characters.
+
+Boat Chat fuel totals require finite, non-negative values and complete channel coverage within the returned running observation minutes; missing RPM or rates are never treated as zero. Gaps or unreturned minutes in the requested window are not known zero. Incomplete windows report labeled observed partial consumption instead of an authoritative total. Power/solar integration retains source-timestamp provenance, excludes legacy or unverified observations, rejects stale/future/repeated/out-of-order samples, and does not bridge rejected gaps. Status cards and briefings use a 600-second source-age limit with 60 seconds of future tolerance. Legacy power history remains visible but cannot be retroactively verified without source timestamps.

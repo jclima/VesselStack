@@ -6,7 +6,13 @@ umask 077
 
 ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
-CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
+REGISTRY_CLI="$ROOT/common/config_registry.py"
+if [ -r "$REGISTRY_CLI" ]; then
+    CORE_COMPONENTS=()
+    while IFS= read -r component; do CORE_COMPONENTS+=("$component"); done < <(python3 -I "$REGISTRY_CLI" --core-components)
+else
+    CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
+fi
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
 SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
@@ -14,12 +20,40 @@ SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
 SYSTEM_BACKUP_DIR="$SYSTEM_ROOT/var/backups/vesselstack"
 LIBEXEC_DIR="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 
+command_needs_lifecycle_lock() {
+    case "${1:-}" in
+        status|doctor|urls|version|logs|verify-backup) return 1 ;;
+        profile) case "${2:-}" in show|validate) return 1 ;; esac ;;
+        ha-http) [ "${2:-}" = status ] && return 1 ;;
+        backup-drive) [ "${2:-}" = list ] && return 1 ;;
+        display)
+            case "${2:-}" in list|status|render|export|themes|catalog|show|serial-ports|validate) return 1 ;; esac ;;
+        passphrase) [ "${2:-}" = status ] && return 1 ;;
+        devices) [ "${2:-}" = list ] && return 1 ;;
+        lan) for arg in "${@:2}"; do [ "$arg" = --dry-run ] || continue; return 1; done ;;
+    esac
+    return 0
+}
+
+ensure_lifecycle_lock() {
+    command_needs_lifecycle_lock "$@" || return 0
+    local helper="$ROOT/common/lifecycle_lock.py" system_root=${VESSELSTACK_SYSTEM_ROOT:-}
+    [ -r "$helper" ] || { echo "Missing lifecycle lock helper: $helper (rerun the installer)" >&2; exit 1; }
+    if [ -n "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
+        python3 -I "$helper" check --root "$ROOT" --system-root "$system_root" || exit $?
+    else
+        exec python3 -I "$helper" run --root "$ROOT" --system-root "$system_root" -- "$0" "$@"
+    fi
+}
+
 usage() {
     cat <<'EOF'
 Usage: vesselstackctl COMMAND [ARGUMENTS]
 
 Commands:
   status                       Show a concise service and endpoint summary
+  profile show|validate FILE|set FILE
+                               Show, validate, or install the shared boat profile
   doctor                       Validate config, dependencies, disk, and health
   urls                         Show who can reach each service (real listening state) and the
                                addresses to use from other devices
@@ -92,6 +126,17 @@ EOF
 
 require_root() {
     [ "$(id -u)" -eq 0 ] || { echo "This command requires root" >&2; exit 1; }
+}
+
+profile_command() {
+    local helper="$ROOT/common/boat_profile_cli.py"
+    [ -r "$helper" ] || { echo "Missing installed boat profile helper: $helper (rerun the installer)" >&2; exit 1; }
+    case "$1" in
+        show) [ "$#" -eq 1 ] || { usage; exit 2; }; python3 -I "$helper" show --root "$ROOT" ;;
+        validate) [ "$#" -eq 2 ] || { usage; exit 2; }; python3 -I "$helper" validate "$2" ;;
+        set) [ "$#" -eq 2 ] || { usage; exit 2; }; python3 -I "$helper" set "$2" --root "$ROOT" ;;
+        *) echo "Unknown profile action: $1" >&2; exit 2 ;;
+    esac
 }
 
 load_config() {
@@ -320,6 +365,12 @@ ensure_memory_index() {
 
 start_stack() {
     local installer_scripts="$VESSELSTACK_ROOT/installer/scripts"
+    if [ -x "$installer_scripts/reconcile-lifecycle.sh" ]; then
+        "$installer_scripts/reconcile-lifecycle.sh" "$ENV_FILE" apply || return 1
+    else
+        echo "Missing bundled lifecycle reconciler: $installer_scripts/reconcile-lifecycle.sh (rerun the installer)" >&2
+        return 1
+    fi
     if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
         [ -x "$installer_scripts/configure-hardware.sh" ] || {
             echo "Missing bundled hardware configurator: $installer_scripts/configure-hardware.sh" >&2
@@ -509,7 +560,9 @@ status_stack() {
             failed=1
         fi
     done
-    check_chat_endpoint "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" || failed=1
+    local chat_port
+    chat_port=$(effective_chat_port) || { echo "Invalid effective Boat Chat port" >&2; return 1; }
+    check_chat_endpoint "http://127.0.0.1:${chat_port}/health" || failed=1
     check_endpoint 'Control Panel' "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}/health" || failed=1
     check_endpoint SignalK "${SIGNALK_URL%/}/signalk" || failed=1
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homeassistant,*) ;; *) check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1 ;; esac
@@ -526,6 +579,18 @@ env_file_value() {
     value=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)
     value=${value#\'}; value=${value%\'}; value=${value#\"}; value=${value%\"}
     printf '%s' "$value"
+}
+
+effective_chat_port() {
+    local helper="$ROOT/common/config_registry.py"
+    [ -r "$helper" ] || { echo "Missing shared configuration registry: $helper" >&2; return 1; }
+    python3 -I "$helper" --endpoint-root "$ROOT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])'
+}
+
+effective_chat_host() {
+    local helper="$ROOT/common/config_registry.py"
+    [ -r "$helper" ] || { echo "Missing shared configuration registry: $helper" >&2; return 1; }
+    python3 -I "$helper" --endpoint-root "$ROOT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["host"])'
 }
 
 # Classify a configured bind address: all | loopback | other.
@@ -659,8 +724,7 @@ url_host_port() {
 show_urls() {
     local chat_host panel_host panel_port data_bind=${VESSELSTACK_DATA_BIND_ADDRESS:-127.0.0.1}
     local web_bind=${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0} host port i
-    chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
-    chat_host=${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}
+    chat_host=$(effective_chat_host) || return 1
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_host=${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}
     panel_port=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_PORT)
@@ -682,7 +746,9 @@ show_urls() {
         *,homepage,*) printf '%-20s %s\n' 'Home page' 'removed (sudo vesselstackctl component add homepage)' ;;
         *) show_service 'Home page' "${HOMEPAGE_PORT:-80}" http "$web_bind" no 'start here: links to every boat page' 'to change: sudo vesselstackctl lan dashboards' ;;
     esac
-    show_service 'Boat Chat' "${BOAT_CHAT_PORT:-8765}" http "$chat_host" no 'access token required' \
+    local chat_port
+    chat_port=$(effective_chat_port) || { echo "Invalid effective Boat Chat port" >&2; return 1; }
+    show_service 'Boat Chat' "$chat_port" http "$chat_host" no 'access token required' \
         'to change: sudo vesselstackctl lan dashboards'
     local panel_note='root-level editor'
     [ "$(bind_kind "$panel_host")" = loopback ] && panel_note='root-level editor, loopback by design'
@@ -756,9 +822,7 @@ lan_values() {
 }
 
 lan_current_chat_host() {
-    local host
-    host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
-    printf '%s' "${host:-0.0.0.0}"
+    effective_chat_host
 }
 
 lan_current_preset() {
@@ -1509,9 +1573,10 @@ check_prometheus_data_dir() {
 # running service first (its /health readiness); if it does not answer, ask the helper,
 # which opens the database as the service user (root must never create SQLite files there).
 check_memory_index() {
-    local body chunks=''
+    local body chunks='' chat_port
+    chat_port=$(effective_chat_port) || return 1
     body=$(curl --connect-timeout 3 --max-time 10 --fail --silent \
-        "http://127.0.0.1:${BOAT_CHAT_PORT:-8765}/health" 2>/dev/null || true)
+        "http://127.0.0.1:${chat_port}/health" 2>/dev/null || true)
     if [ -n "$body" ]; then
         chunks=$(python3 -c '
 import json, sys
@@ -1821,7 +1886,12 @@ PY
         check_backup_tree_overlap "$destination"
     fi
     mapfile -t extras < <(extra_backup_paths)
-    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    stamp=$(date -u +%Y%m%dT%H%M%S%NZ)-$$
+    # Never reuse rollback names, even when two restores start in one second.
+    while [ -e "$ROOT.pre-restore-$stamp" ] || [ -e "$VESSELSTACK_DATA.pre-restore-$stamp" ] || \
+          [ -e "$ROOT.failed-restore-$stamp" ] || [ -e "$VESSELSTACK_DATA.failed-restore-$stamp" ]; do
+        stamp=$(date -u +%Y%m%dT%H%M%S%NZ)-$$-$RANDOM
+    done
     archive="$destination/vesselstack-$stamp.tar.gz"
     manifest="$archive.sha256"
     install -d -m 0700 "$destination"
@@ -1954,6 +2024,215 @@ swap_in() {
     mv -- "$staged" "$target" || return 1
 }
 
+# Snapshot the exact managed external files before the first stop. The journal
+# records absence as well as presence, so rollback removes files introduced by a
+# failed restore without touching unrelated /etc content.
+restore_external_candidates() {
+    local p unit
+    # This is the installer output allowlist.  It intentionally includes absent
+    # paths so a newer archive can remove files introduced by an old release.
+    for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service \
+        vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
+        vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.service vesselstack-telemetry-sample.timer \
+        vesselstack-signalk.service vesselstack-socketcan.service vesselstack-displays-bridge.service \
+        vesselstack-control-panel.service; do
+        printf '%s\n' "$SYSTEMD_DIR/$unit"
+    done
+    for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.timer \
+        vesselstack-telemetry-sample.timer vesselstack-signalk.service vesselstack-socketcan.service \
+        vesselstack-displays-bridge.service vesselstack-control-panel.service; do
+        printf '%s\n' "$SYSTEMD_DIR/multi-user.target.wants/$unit"
+        printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/$unit"
+    done
+    for p in "$SBIN_DIR/vesselstackctl" "$SBIN_DIR/vesselstack-firewall" "$SBIN_DIR/vesselstack-update" \
+        "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" \
+        "$LIBEXEC_DIR/reconcile-lifecycle.sh" "$SYSTEM_ROOT/etc/vesselstack/update.env"; do
+        printf '%s\n' "$p"
+    done
+}
+
+restore_external_validate_path() {
+    local path=$1 cur parent
+    [ -n "$path" ] && [ "${path#/}" != "$path" ] || return 1
+    cur=/
+    while :; do
+        parent=$(dirname -- "$path")
+        [ "$parent" = "$path" ] && break
+        path=$parent
+    done
+    cur=$(dirname -- "$1")
+    while [ "$cur" != / ] && [ "$cur" != "${SYSTEM_ROOT:-}" ]; do
+        if [ -L "$cur" ]; then return 1; fi
+        if [ -e "$cur" ] && [ ! -d "$cur" ] && [ "$cur" != "$1" ]; then return 1; fi
+        cur=$(dirname -- "$cur")
+    done
+    if [ -e "$1" ] && [ ! -f "$1" ] || [ -d "$1" ] && [ ! -L "$1" ]; then return 1; fi
+    return 0
+}
+restore_snapshot_externals() {
+    local journal=$1 stage=$2 p rel src inventory
+    install -d -m 0700 "$journal/files" || return 1
+    inventory="$journal/inventory"
+    restore_external_candidates > "$inventory" || return 1
+    if [ -d "$stage/vesselstack-backup" ]; then
+        find "$stage/vesselstack-backup" \( -type f -o -type l \) > "$journal/staged-all" || return 1
+        while IFS= read -r src; do
+            rel=${src#"$stage/vesselstack-backup"}
+            case "$rel" in
+                "$SYSTEMD_DIR"/*|"$SBIN_DIR"/*|"$LIBEXEC_DIR"/*|"$SYSTEM_ROOT/etc/vesselstack/update.env")
+                p=$rel; printf '%s\n' "$p" >> "$inventory" || return 1 ;;
+            esac
+        done < "$journal/staged-all"
+    fi
+    sort -u "$inventory" > "$journal/inventory.sorted" || return 1
+    mv -- "$journal/inventory.sorted" "$inventory" || return 1
+    : > "$journal/manifest" || return 1
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        restore_external_validate_path "$p" || return 1
+        rel=${p#/}
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            printf 'present\t%s\n' "$p" >> "$journal/manifest" || return 1
+            install -d -m 0700 "$journal/files/$(dirname "$rel")" || return 1
+            cp -a -- "$p" "$journal/files/$rel" || return 1
+        else
+            printf 'absent\t%s\n' "$p" >> "$journal/manifest" || return 1
+        fi
+    done < "$inventory"
+}
+restore_restore_externals() {
+    local journal=$1 p rel failed=0 state
+    while IFS=$'\t' read -r state p; do
+        [ -n "$p" ] || continue
+        restore_external_validate_path "$p" || return 1
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            if [ -d "$p" ] && [ ! -L "$p" ]; then return 1; fi
+            rm -f -- "$p" || return 1
+        fi
+        if [ "$state" = present ]; then
+            rel=${p#/}
+            install -d -m 0755 "$(dirname "$p")" || failed=1
+            cp -a -- "$journal/files/$rel" "$p" || failed=1
+        fi
+    done < "$journal/manifest"
+    return "$failed"
+}
+restore_publish_externals() {
+    local journal=$1 stage=$2 src rel target tmp staged_target
+    [ -r "$journal/staged-all" ] || return 1
+    : > "$journal/publish-list" || return 1
+    while IFS= read -r src; do
+        rel=${src#"$stage/vesselstack-backup"}
+        staged_target=$rel
+        case "$staged_target" in
+            "$SYSTEMD_DIR"/*|"$SBIN_DIR"/*|"$LIBEXEC_DIR"/*|"$SYSTEM_ROOT/etc/vesselstack/update.env")
+                printf '%s\n' "$src" >> "$journal/publish-list" || return 1 ;;
+        esac
+    done < "$journal/staged-all"
+    while IFS= read -r src; do
+        rel=${src#"$stage/vesselstack-backup"}; target=$rel
+        restore_external_validate_path "$target" || return 1
+        install -d -m 0755 "$(dirname "$target")" || return 1
+        tmp=$(mktemp "$(dirname "$target")/.restore-publish.XXXXXX") || return 1
+        rm -f -- "$tmp" || return 1
+        if ! cp -a -- "$src" "$tmp" || ! mv -f -- "$tmp" "$target"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    done < "$journal/publish-list"
+}
+restore_run_controller() {
+    local journal=$1 controller=$2 action=$3
+    [ "$action" = stop ] || [ "$action" = start ] || return 2
+    if [ -x "$controller" ]; then
+        VESSELSTACK_ROOT="$ROOT" VESSELSTACK_ENV="$ENV_FILE" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+            bash "$controller" "$action" || return 1
+    else
+        echo "Missing controller for restore $action: $controller" >&2
+        return 1
+    fi
+}
+
+restore_config_identity() {
+    python3 - "$1" "$2" "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" <<'PY'
+import shlex, sys
+def read(path):
+    values = {}
+    for raw in open(path, encoding="utf-8"):
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        if line.startswith("export "): line = line[7:].lstrip()
+        if "=" not in line: raise SystemExit(2)
+        key, value = line.split("=", 1)
+        if not key or not key.replace("_", "A").isalnum(): raise SystemExit(2)
+        parts = shlex.split(value, comments=True)
+        if len(parts) > 1: raise SystemExit(2)
+        values[key] = parts[0] if parts else ""
+    return values
+a, b = read(sys.argv[1]), read(sys.argv[2])
+for key in ("VESSELSTACK_ROOT", "VESSELSTACK_DATA"):
+    if a.get(key) != b.get(key) or a.get(key) != sys.argv[3 if key.endswith("ROOT") else 4]: raise SystemExit(1)
+PY
+}
+
+restore_commit_transaction() {
+    local stage=$1 journal=$2 root=$3 data=$4 stamp=$5 old_controller=$6 new_controller=$7 skip_installer=$8
+    local root_old_moved=0 data_old_moved=0 root_new_published=0 data_new_published=0 new_start_attempted=0
+    local failed_root="$root.failed-restore-$stamp" failed_data="$data.failed-restore-$stamp"
+    restore_recover() {
+        if [ "$new_start_attempted" -eq 1 ]; then
+            restore_run_controller "$journal" "$new_controller" stop || return 1
+        fi
+        if [ "$root_new_published" -eq 1 ]; then mv -- "$root" "$failed_root" || return 1; fi
+        if [ "$data_new_published" -eq 1 ]; then mv -- "$data" "$failed_data" || return 1; fi
+        if [ "$root_old_moved" -eq 1 ]; then
+            [ ! -e "$root" ] && [ ! -L "$root" ] || return 1
+            mv -- "$root.pre-restore-$stamp" "$root" || return 1
+        fi
+        if [ "$data_old_moved" -eq 1 ]; then
+            [ ! -e "$data" ] && [ ! -L "$data" ] || return 1
+            mv -- "$data.pre-restore-$stamp" "$data" || return 1
+        fi
+        [ -d "$root" ] && [ ! -L "$root" ] && [ -d "$data" ] && [ ! -L "$data" ] || return 1
+        restore_restore_externals "$journal" || return 1
+        systemctl daemon-reload || return 1
+        restore_run_controller "$journal" "$old_controller" start || return 1
+    }
+    restore_fail() {
+        local reason=$1
+        echo "Restore failed: $reason" >&2
+        echo "Recovery journal: $journal" >&2
+        echo "Failed trees (if published): $failed_root $failed_data" >&2
+        if restore_recover; then echo "Restore rollback completed; previous trees restored" >&2
+        else echo "RECOVERY ERROR: evidence retained; inspect journal and failed trees" >&2; fi
+        return 1
+    }
+    if ! restore_run_controller "$journal" "$old_controller" stop; then
+        if ! restore_run_controller "$journal" "$old_controller" start; then
+            echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
+        fi
+        echo "Restore failed: old controller stop failed; journal retained at $journal" >&2
+        return 1
+    fi
+    if ! mv -- "$data" "$data.pre-restore-$stamp"; then restore_fail "data old-tree rename"; return 1; fi
+    data_old_moved=1
+    if ! mv -- "$stage/vesselstack-backup/${data#/}" "$data"; then restore_fail "data publication"; return 1; fi
+    data_new_published=1
+    if ! mv -- "$root" "$root.pre-restore-$stamp"; then restore_fail "root old-tree rename"; return 1; fi
+    root_old_moved=1
+    if ! mv -- "$stage/vesselstack-backup/${root#/}" "$root"; then restore_fail "root publication"; return 1; fi
+    root_new_published=1
+    if ! restore_publish_externals "$journal" "$stage"; then restore_fail "managed external publication"; return 1; fi
+    if ! systemctl daemon-reload; then restore_fail "daemon reload"; return 1; fi
+    new_start_attempted=1
+    if [ "$skip_installer" -eq 0 ] && [ -x "$root/installer/install.sh" ]; then
+        if ! "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start; then restore_fail "restored installer start"; return 1; fi
+    else
+        if ! restore_run_controller "$journal" "$new_controller" start; then restore_fail "restored controller start"; return 1; fi
+    fi
+    return 0
+}
+
 restore_stack() {
     local archive='' confirmation='' skip_installer=0 argument
     for argument in "$@"; do
@@ -1976,12 +2255,25 @@ restore_stack() {
         fi
     done
     local stage_parent stamp stage need_kib free_kib
+    local data_old_moved=0 data_new_published=0 root_old_moved=0 root_new_published=0 new_start_attempted=0
     stage_parent=$(dirname "$data")
+    for path in "$root" "$data"; do
+        [ -d "$path" ] && [ ! -L "$path" ] || {
+            echo "Refusing to restore: $path must be an ordinary directory (not a symlink or special file)" >&2
+            exit 1
+        }
+    done
     [ "$(stat -c %d "$stage_parent")" = "$(stat -c %d "$(dirname "$root")")" ] || {
         echo "Refusing to restore: application and data trees are on different filesystems from their parent directories" >&2
         exit 1
     }
-    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+    while [ -e "$root.pre-restore-$stamp" ] || [ -L "$root.pre-restore-$stamp" ] || \
+          [ -e "$data.pre-restore-$stamp" ] || [ -L "$data.pre-restore-$stamp" ] || \
+          [ -e "$root.failed-restore-$stamp" ] || [ -L "$root.failed-restore-$stamp" ] || \
+          [ -e "$data.failed-restore-$stamp" ] || [ -L "$data.failed-restore-$stamp" ]; do
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+    done
     # Staging holds a full second copy next to the live trees (same filesystem so the
     # swap is a rename); the old trees are then kept too, so check the space first.
     need_kib=$(python3 - "$archive" <<'PY'
@@ -2011,68 +2303,41 @@ PY
             exit 1
         }
     done
-    stop_stack
-    if ! swap_in "$stage/vesselstack-backup/${data#/}" "$data" "$stamp"; then
-        [ -e "$data" ] || { [ ! -e "$data.pre-restore-$stamp" ] || mv -- "$data.pre-restore-$stamp" "$data"; }
-        echo "Restore failed while swapping the data tree; nothing else changed" >&2
-        exit 1
-    fi
-    if ! swap_in "$stage/vesselstack-backup/${root#/}" "$root" "$stamp"; then
-        # Put both trees back so root and data stay a matching pair.
-        if [ ! -e "$root" ] && [ -e "$root.pre-restore-$stamp" ]; then
-            mv -- "$root.pre-restore-$stamp" "$root" || true
-        fi
-        if [ -e "$data.pre-restore-$stamp" ]; then
-            rm -rf -- "$data"
-            mv -- "$data.pre-restore-$stamp" "$data" || true
-        fi
-        echo "Restore failed while swapping the application tree; previous trees put back" >&2
-        exit 1
-    fi
-    # Restore unit files, control scripts and update.env via rename (the running
-    # script keeps its old inode).
-    local extra target
-    while IFS= read -r extra; do
-        target=/${extra#"$stage/vesselstack-backup/"}
-        install -d -m 0755 "$(dirname "$target")"
-        cp -p -- "$extra" "$target.restore-tmp"
-        mv -f -- "$target.restore-tmp" "$target"
-    done < <(find "$stage/vesselstack-backup" -type f \
-        \( -path "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/vesselstack-*" \
-        -o -path "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstack*" \
-        -o -path "$stage/vesselstack-backup/${SYSTEM_ROOT#/}/etc/vesselstack/update.env" \))
-    rm -rf -- "$stage"
-    systemctl daemon-reload
-    restore_start_failed() {
-        echo "Restore startup failed; attempting rollback to prior trees" >&2
-        if ! stop_stack; then
-            echo "Could not stop restored services; preserving restored and rollback trees" >&2
-            return 1
-        fi
-        local failed_root="$root.failed-restore-$stamp" failed_data="$data.failed-restore-$stamp"
-        mv -- "$root" "$failed_root" || return 1
-        mv -- "$data" "$failed_data" || return 1
-        mv -- "$root.pre-restore-$stamp" "$root" || return 1
-        mv -- "$data.pre-restore-$stamp" "$data" || return 1
-        load_config
-        start_stack || return 1
-        echo "Restored trees retained at $failed_root and $failed_data" >&2
-        return 1
+    [ -r "$stage/vesselstack-backup/${root#/}/config/vesselstack.env" ] || {
+        rm -rf -- "$stage"; echo "Backup has no restored vesselstack.env; nothing was changed" >&2; exit 1;
     }
-    if [ "$skip_installer" -eq 0 ] && [ -x "$root/installer/install.sh" ]; then
-        # The backup excludes the Python virtualenv; the restored bundled installer
-        # rebuilds it, re-renders units and starts the stack.
-        "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start || { restore_start_failed || exit 1; }
+    bash -n "$stage/vesselstack-backup/${root#/}/config/vesselstack.env" || {
+        rm -rf -- "$stage"; echo "Restored vesselstack.env is not safely parseable; nothing was changed" >&2; exit 1;
+    }
+    restore_config_identity "$ENV_FILE" "$stage/vesselstack-backup/${root#/}/config/vesselstack.env" || {
+        rm -rf -- "$stage"; echo "Restored config does not identify the live root/data trees; nothing was changed" >&2; exit 1;
+    }
+    local journal_parent="$SYSTEM_ROOT/var/lib/vesselstack" journal old_controller new_controller
+    install -d -m 0700 "$journal_parent" || exit 1
+    journal=$(mktemp -d "$journal_parent/.restore-journal.XXXXXX") || exit 1
+    old_controller="$journal/old-controller"
+    cp -a -- "$0" "$old_controller" || { rm -rf -- "$journal"; exit 1; }
+    restore_snapshot_externals "$journal" "$stage" || {
+        rm -rf -- "$stage"
+        echo "Could not create the recovery journal; nothing was changed" >&2
+        exit 1
+    }
+    new_controller="$journal/new-controller"
+    if [ -f "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ]; then
+        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || { rm -rf -- "$stage"; exit 1; }
+    elif [ -f "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ]; then
+        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || { rm -rf -- "$stage"; exit 1; }
     else
-        # A restored archive may carry different membership than the process
-        # that invoked restore; reload it before the fallback start.
-        load_config
-        start_stack || { restore_start_failed || exit 1; }
-        echo "NOTE: the Boat Chat virtualenv was not rebuilt. Run: sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
+        echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage"; exit 1
     fi
-    echo "Restore completed"
-    echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
-    echo "Verify the system, then remove them to free disk space: sudo rm -rf -- '$root.pre-restore-$stamp' '$data.pre-restore-$stamp'"
+    [ -x "$old_controller" ] && [ -x "$new_controller" ] || { echo "Restore controllers are not executable" >&2; rm -rf -- "$stage"; exit 1; }
+    if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$old_controller" "$new_controller" "$skip_installer"; then
+        rm -rf -- "$stage" "$journal"
+        echo "Restore completed"
+        echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
+        return 0
+    fi
+    return 1
 }
 
 # ---------------------------------------------------------------- backup drive (control panel helpers)
@@ -2312,11 +2577,13 @@ uninstall_stack() {
 auth_command() {
     local helper="$VESSELSTACK_ROOT/common/vesselstack_authctl.py"
     [ -r "$helper" ] || { echo "Missing sign-in tool: $helper" >&2; return 1; }
-    local panel_host panel_port chat_host chat_port
+    local panel_host panel_port chat_host chat_port endpoint registry_helper="$ROOT/common/config_registry.py"
     panel_host=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_HOST)
     panel_port=$(env_file_value "$ROOT/config/control-panel.env" CONTROL_PANEL_PORT)
-    chat_host=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_HOST)
-    chat_port=$(env_file_value "$ROOT/config/boat-chat.env" BOAT_CHAT_PORT)
+    [ -r "$registry_helper" ] || { echo "Missing shared configuration registry: $registry_helper" >&2; return 1; }
+    endpoint=$(python3 -I "$registry_helper" --endpoint-root "$ROOT") || return 1
+    chat_host=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["host"])' <<<"$endpoint")
+    chat_port=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["port"])' <<<"$endpoint")
     VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
         VS_PANEL_HOST="${panel_host:-${CONTROL_PANEL_HOST:-127.0.0.1}}" VS_PANEL_PORT="${panel_port:-${CONTROL_PANEL_PORT:-8780}}" \
         VS_CHAT_HOST="${chat_host:-${BOAT_CHAT_HOST:-0.0.0.0}}" VS_CHAT_PORT="${chat_port:-${BOAT_CHAT_PORT:-8765}}" \
@@ -2330,6 +2597,12 @@ case "$command" in
     help|-h|--help) usage; exit 0 ;;
 esac
 require_root
+ensure_lifecycle_lock "$command" "$@"
+if [ "$command" = profile ]; then
+    [ "$#" -ge 1 ] || { usage; exit 2; }
+    profile_command "$@"
+    exit $?
+fi
 if [ "$command" = panel-access ]; then
     panel_access_preflight 0
 fi

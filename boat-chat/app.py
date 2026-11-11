@@ -35,6 +35,7 @@ import telemetry_cache
 import status_model
 from cruise_efficiency import matched_sample
 import display_units
+import profile_runtime
 
 
 ROOT = Path(__file__).resolve().parent
@@ -834,6 +835,7 @@ def ha_state_history(entity_id: str, days: int = 30) -> list[dict[str, Any]]:
 
 
 def shore_power_history_summary(message: str, days: int = 30, use_cache: bool = True) -> dict[str, Any]:
+    runtime = profile_runtime.current()
     entity_id = "binary_sensor.shore_power_connected"
     lower = message.lower()
     if any(term in lower for term in ["off", "lost", "disconnected", "turned off", "turn off"]):
@@ -842,16 +844,17 @@ def shore_power_history_summary(message: str, days: int = 30, use_cache: bool = 
         target_state = "on"
     else:
         target_state = ""
-    cache_key = shore_power_cache_key(target_state or None, days)
+    cache_key = shore_power_cache_key(target_state or None, days, runtime)
     if use_cache:
         cached = telemetry_cache.get_summary("shore_power_history", cache_key, max_age_seconds=TELEMETRY_CACHE_FRESH_SECONDS)
-        if cached:
+        if profile_cache_usable(cached, runtime):
             return cached
     current = get_ha_states([entity_id]).get(entity_id, {})
     history = ha_state_history(entity_id, days=days)
     matches = [item for item in history if not target_state or item.get("state") == target_state]
     latest = matches[-1] if matches else None
     summary = {
+        "profile_fingerprint": runtime["fingerprint"],
         "entity_id": entity_id,
         "lookback_days": days,
         "target_state": target_state or None,
@@ -888,10 +891,13 @@ def flatten_signalk(node: Any, prefix: str = "") -> dict[str, Any]:
 
 
 def safe_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         if value in ("", None, "unknown", "unavailable"):
             return None
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except Exception:
         return None
 
@@ -1131,26 +1137,39 @@ def rpm_cache_suffix(rpm_threshold: float) -> str:
     return f"{rpm_threshold:g}rpm"
 
 
-def engine_run_cache_key(direction: str, days: int, rpm_threshold: float) -> str:
-    return f"{direction}:{int(days)}d:{rpm_cache_suffix(rpm_threshold)}"
+def engine_run_cache_key(direction: str, days: int, rpm_threshold: float, runtime: dict[str, Any] | None = None) -> str:
+    runtime = runtime or profile_runtime.current()
+    return f"{direction}:{int(days)}d:{rpm_cache_suffix(rpm_threshold)}:profile-{runtime['fingerprint'][:16]}"
 
 
-def fuel_usage_cache_key(window: dict[str, Any], rpm_threshold: float) -> str:
+def fuel_usage_cache_key(window: dict[str, Any], rpm_threshold: float, runtime: dict[str, Any] | None = None) -> str:
+    runtime = runtime or profile_runtime.current()
     if window.get("cache_key"):
-        return f"{window['cache_key']}:{rpm_cache_suffix(rpm_threshold)}"
-    return f"{window['start_utc']}:{window['stop_utc']}:{rpm_cache_suffix(rpm_threshold)}"
+        return f"{window['cache_key']}:{rpm_cache_suffix(rpm_threshold)}:profile-{runtime['fingerprint'][:16]}"
+    return f"{window['start_utc']}:{window['stop_utc']}:{rpm_cache_suffix(rpm_threshold)}:profile-{runtime['fingerprint'][:16]}"
 
 
-def shore_power_cache_key(target_state: str | None, days: int) -> str:
-    return f"{target_state or 'any'}:{int(days)}d"
+def shore_power_cache_key(target_state: str | None, days: int, runtime: dict[str, Any] | None = None) -> str:
+    runtime = runtime or profile_runtime.current()
+    return f"{target_state or 'any'}:{int(days)}d:profile-{runtime['fingerprint'][:16]}"
 
 
-def fuel_economy_cache_key(days: int, rpm_threshold: float) -> str:
-    return f"{int(days)}d:{rpm_cache_suffix(rpm_threshold)}"
+def fuel_economy_cache_key(days: int, rpm_threshold: float, runtime: dict[str, Any] | None = None) -> str:
+    runtime = runtime or profile_runtime.current()
+    return f"{int(days)}d:{rpm_cache_suffix(rpm_threshold)}:profile-{runtime['fingerprint'][:16]}"
 
 
-def battery_voltage_cache_key(days: int) -> str:
-    return f"{int(days)}d"
+def battery_voltage_cache_key(days: int, runtime: dict[str, Any] | None = None) -> str:
+    runtime = runtime or profile_runtime.current()
+    return f"{int(days)}d:profile-{runtime['fingerprint'][:16]}"
+
+
+def profile_cache_usable(cached: Any, runtime: dict[str, Any]) -> bool:
+    """Never reuse a cache without an explicit-profile fingerprint."""
+    if not isinstance(cached, dict):
+        return False
+    fingerprint = cached.get("profile_fingerprint")
+    return bool(fingerprint == runtime["fingerprint"] or (runtime.get("legacy") and not fingerprint))
 
 
 def agm_soc_from_voltage(voltage: float | None) -> float | None:
@@ -1833,6 +1852,24 @@ def resolve_history_days(message: str, default_days: int = 7) -> int:
 
 
 def generic_influx_history_summary(message: str, limit: int = 24, include_numeric: bool | None = None, ha_telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime = profile_runtime.current()
+    equipment_prefixes = tuple(
+        item["path"] for group in ("engines", "battery_banks", "fuel_tanks")
+        for item in runtime["profile"].get(group, [])
+    )
+    engine_paths = tuple(item["path"] for item in runtime["profile"].get("engines", []))
+    restricted_prefixes = ("propulsion.", "electrical.batteries.", "tanks.fuel.")
+    def eligible(measurement: str, bucket: str) -> bool:
+        if bucket != INFLUX_HISTORY_BUCKET:
+            # HA aliases are retained only when they map to configured
+            # equipment; unrelated aliases must not become engine evidence.
+            lowered = measurement.lower()
+            if any(term in lowered for term in ("engine", "propulsion", "battery", "fuel", "tank")):
+                return any(item == measurement or item in measurement for item in equipment_prefixes)
+            return True
+        if not measurement.startswith(restricted_prefixes):
+            return True
+        return any(measurement == prefix or measurement.startswith(prefix + ".") for prefix in equipment_prefixes)
     tokens = message_tokens(message)
     plan = query_planner.build_query_plan(message)
     concepts = telemetry_concepts(message) | set(plan["signals"])
@@ -1848,11 +1885,16 @@ def generic_influx_history_summary(message: str, limit: int = 24, include_numeri
         except Exception as exc:
             buckets[bucket] = {"error": str(exc)}
             continue
-        matched = [item for item in measurements if influx_measurement_matches(item, message)] if tokens or telemetry_concepts(message) else []
+        matched = [
+            item for item in measurements
+            if eligible(item, bucket)
+            and influx_measurement_matches(item, message)
+        ] if tokens or telemetry_concepts(message) else []
         if overview and not matched:
-            matched = measurements
+            matched = [item for item in measurements if eligible(item, bucket)]
         if bucket == INFLUX_HISTORY_BUCKET and "trip" in concepts:
             matched.extend(item for item in TRIP_CORE_PATHS if item in measurements and item not in matched)
+        matched = [item for item in matched if eligible(item, bucket)]
         matched = sort_measurements_for_query(matched, message)
         if (
             bucket == INFLUX_HISTORY_BUCKET
@@ -1861,10 +1903,8 @@ def generic_influx_history_summary(message: str, limit: int = 24, include_numeri
         ):
             support = [
                 item
-                for item in [
-                    "propulsion.port.revolutions",
-                    "propulsion.starboard.revolutions",
-                ]
+                for path in engine_paths
+                for item in [f"{path}.revolutions"]
                 if item in measurements and measurement_side_allowed(item, requested_engine_sides(message))
             ]
             matched.extend(item for item in support if item not in matched)
@@ -2084,25 +2124,31 @@ def resolve_solar_history_days(message: str) -> int:
 
 
 def solar_inference_summary(message: str) -> dict[str, Any]:
+    runtime = profile_runtime.current()
     days = resolve_solar_history_days(message)
-    key = f"{days}d"
+    key = f"{days}d:profile-{runtime['fingerprint'][:16]}"
     cached = telemetry_cache.get_summary("solar_inference", key, max_age_seconds=TELEMETRY_CACHE_FRESH_SECONDS)
-    if cached:
+    if profile_cache_usable(cached, runtime) and cached.get("calculation_version") == 2:
         return cached
     return telemetry_cache.power_tracking_summary(days)
 
 
 def battery_voltage_summary(days: int = 14, use_cache: bool = True) -> dict[str, Any]:
     days = max(1, min(int(days), 365))
-    cache_key = battery_voltage_cache_key(days)
+    runtime = profile_runtime.current()
+    cache_key = battery_voltage_cache_key(days, runtime)
     if use_cache:
         cached = telemetry_cache.get_summary("battery_voltage", cache_key, max_age_seconds=TELEMETRY_CACHE_FRESH_SECONDS)
-        if cached:
+        if profile_cache_usable(cached, runtime):
             return cached
+    bank = next((b for b in runtime["profile"].get("battery_banks", []) if b.get("id") == runtime["profile"].get("primary_battery_bank")), None)
+    if not bank:
+        return {"available": False, "diagnostic": "Battery history is unavailable: no primary battery bank is configured.", "lookback_days": days}
+    bp = bank["path"]
     flux = f'''
 from(bucket: "{INFLUX_HISTORY_BUCKET}")
   |> range(start: -{days}d)
-  |> filter(fn: (r) => r._measurement == "electrical.batteries.shunt.voltage" or r._measurement == "electrical.batteries.shunt.capacity.stateOfCharge" or r._measurement == "electrical.batteries.shunt.current")
+  |> filter(fn: (r) => r._measurement == "{bp}.voltage" or r._measurement == "{bp}.capacity.stateOfCharge" or r._measurement == "{bp}.current")
   |> filter(fn: (r) => r._field == "value")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
   |> keep(columns: ["_time", "_measurement", "_value"])
@@ -2112,12 +2158,12 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
     rows = query_influx(flux)
     readings: list[dict[str, Any]] = []
     for row in rows:
-        voltage = safe_float(row.get("electrical.batteries.shunt.voltage"))
+        voltage = safe_float(row.get(f"{bp}.voltage"))
         if voltage is None:
             continue
-        soc_raw = safe_float(row.get("electrical.batteries.shunt.capacity.stateOfCharge"))
+        soc_raw = safe_float(row.get(f"{bp}.capacity.stateOfCharge"))
         soc = soc_raw * 100.0 if soc_raw is not None and soc_raw <= 1.2 else soc_raw
-        current = safe_float(row.get("electrical.batteries.shunt.current"))
+        current = safe_float(row.get(f"{bp}.current"))
         readings.append(
             {
                 "time_utc": row.get("_time"),
@@ -2141,7 +2187,10 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
     )
     voltage_stats = numeric_stats(voltages, digits=3)
     summary = {
+        "profile_fingerprint": runtime["fingerprint"],
         "label": f"last {days} days",
+        "battery_id": bank.get("id"),
+        "battery_label": bank.get("label", bank.get("id")),
         "lookback_days": days,
         "source_bucket": INFLUX_HISTORY_BUCKET,
         "sample_interval": "1h mean",
@@ -2158,7 +2207,7 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         "agm_voltage_soc_estimate": {
             "min_voltage_percent": agm_soc_from_voltage(voltage_stats.get("min")),
             "latest_voltage_percent": agm_soc_from_voltage(voltage_stats.get("latest")),
-            "note": "AGM voltage-to-SOC is a resting-voltage reference; charging, float mode, and active loads can make it misleading.",
+            "note": "AGM voltage-to-SOC is only available for the historical Shunt bank; configured custom banks do not assume AGM chemistry.",
         },
         "thresholds": {
             "below_11_8_samples": sum(1 for voltage in voltages if voltage < 11.8),
@@ -2167,6 +2216,8 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
             "charging_or_float_samples": charging_or_float_samples,
         },
     }
+    if bank.get("id") != "shunt":
+        summary["agm_voltage_soc_estimate"] = {"available": False, "note": "No battery chemistry is configured for this bank; voltage-to-SOC estimate is unavailable."}
     telemetry_cache.put_summary("battery_voltage", cache_key, summary)
     return summary
 
@@ -2177,18 +2228,23 @@ def engine_run_history_summary(
     rpm_threshold: float = ENGINE_RUNNING_RPM,
     use_cache: bool = True,
 ) -> dict[str, Any]:
-    cache_key = engine_run_cache_key(direction, days, rpm_threshold)
+    runtime = profile_runtime.current()
+    cache_key = engine_run_cache_key(direction, days, rpm_threshold, runtime)
     if use_cache:
         max_age = TELEMETRY_CACHE_STATIC_SECONDS if direction == "first" else TELEMETRY_CACHE_FRESH_SECONDS
         cached = telemetry_cache.get_summary("engine_run_history", cache_key, max_age_seconds=max_age)
-        if cached:
+        if profile_cache_usable(cached, runtime):
             return cached
+    engines = runtime["profile"].get("engines", [])
+    if not engines:
+        return {"available": False, "diagnostic": "Engine history is unavailable: no engines are configured."}
     threshold_rev_s = rpm_threshold / 60.0
+    filters = " or ".join(f'r._measurement == "{e["path"]}.revolutions"' for e in engines)
     desc = "true" if direction == "last" else "false"
     flux = f'''
 from(bucket: "{INFLUX_HISTORY_BUCKET}")
   |> range(start: -{int(days)}d)
-  |> filter(fn: (r) => r._measurement == "propulsion.port.revolutions" or r._measurement == "propulsion.starboard.revolutions")
+  |> filter(fn: (r) => {filters})
   |> filter(fn: (r) => r._field == "value")
   |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
   |> filter(fn: (r) => r._value >= {threshold_rev_s})
@@ -2203,18 +2259,23 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         if rpm is None:
             continue
         measurement = row.get("_measurement", "")
-        side = "port" if ".port." in measurement else "starboard" if ".starboard." in measurement else measurement
+        engine = next((e for e in engines if measurement == f"{e['path']}.revolutions"), None)
+        side = engine.get("id", measurement) if engine else measurement
+        label = engine.get("label", side) if engine else side
         samples.append(
             {
                 "time_utc": row.get("_time"),
                 "time_local": format_local_time(row.get("_time")),
                 "side": side,
+                "engine_id": side,
+                "engine_label": label,
                 "rpm": round(rpm * 60.0, 1),
             }
         )
     first = samples[0] if samples else None
     same_minute = [sample for sample in samples if first and sample["time_utc"] == first["time_utc"]]
     summary = {
+        "profile_fingerprint": runtime["fingerprint"],
         "direction": direction,
         "lookback_days": days,
         "source_bucket": INFLUX_HISTORY_BUCKET,
@@ -2223,7 +2284,7 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         "same_minute_samples": same_minute,
         "sample_count_returned": len(samples),
         "interpretation_note": (
-            "Retained 1-minute downsample where either engine RPM exceeded threshold; "
+            "Retained 1-minute downsample where any configured engine RPM exceeded threshold; "
             "not necessarily vessel lifetime history."
         ),
     }
@@ -2395,21 +2456,30 @@ def fuel_usage_summary(
     rpm_threshold: float = ENGINE_RUNNING_RPM,
     use_cache: bool = True,
 ) -> dict[str, Any]:
-    cache_key = fuel_usage_cache_key(window, rpm_threshold)
+    runtime = profile_runtime.current()
+    cache_key = fuel_usage_cache_key(window, rpm_threshold, runtime)
     if use_cache:
         stop = window.get("stop")
         now = dt.datetime.now(LOCAL_TZ)
         window_closed = isinstance(stop, dt.datetime) and stop < now - dt.timedelta(minutes=5)
         max_age = TELEMETRY_CACHE_STATIC_SECONDS if window_closed else TELEMETRY_CACHE_FRESH_SECONDS
         cached = telemetry_cache.get_summary("fuel_usage", cache_key, max_age_seconds=max_age)
-        if cached:
+        if profile_cache_usable(cached, runtime) and cached.get("calculation_version") == 3:
             return cached
+    profile = runtime["profile"]
+    engines = [e for e in profile.get("engines", []) if e.get("fuel_rate_supported")]
+    if not engines:
+        result = {"calculation_version": 3, "label": window["label"], "available": False,
+                  "diagnostic": "Fuel usage is unavailable: no configured engine supports fuel rate.",
+                  "profile_fingerprint": runtime["fingerprint"]}
+        telemetry_cache.put_summary("fuel_usage", cache_key, result)
+        return result
     start = window["start"]
     stop = window["stop"]
     flux = f'''
 from(bucket: "{INFLUX_HISTORY_BUCKET}")
   |> range(start: {flux_time(start)}, stop: {flux_time(stop)})
-  |> filter(fn: (r) => r._measurement == "propulsion.port.fuel.rate" or r._measurement == "propulsion.starboard.fuel.rate" or r._measurement == "propulsion.port.revolutions" or r._measurement == "propulsion.starboard.revolutions")
+  |> filter(fn: (r) => {" or ".join(f'r._measurement == "{e["path"]}.fuel.rate" or r._measurement == "{e["path"]}.revolutions"' for e in engines)})
   |> filter(fn: (r) => r._field == "value")
   |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
   |> keep(columns: ["_time", "_measurement", "_value"])
@@ -2418,36 +2488,38 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
 '''
     rows = query_influx(flux)
     running: list[dict[str, Any]] = []
-    port_liters = 0.0
-    stbd_liters = 0.0
-    port_fuel_samples = 0
-    stbd_fuel_samples = 0
+    liters_by_engine = {e["id"]: 0.0 for e in engines}
+    partial_by_engine = {e["id"]: 0.0 for e in engines}
+    fuel_samples = {e["id"]: 0 for e in engines}
+    running_samples = {e["id"]: 0 for e in engines}
+    rpm_unknown_minutes = 0
+    rpm_invalid_minutes = 0
     for row in rows:
-        port_rpm_raw = safe_float(row.get("propulsion.port.revolutions"))
-        stbd_rpm_raw = safe_float(row.get("propulsion.starboard.revolutions"))
-        port_fuel_raw = safe_float(row.get("propulsion.port.fuel.rate"))
-        stbd_fuel_raw = safe_float(row.get("propulsion.starboard.fuel.rate"))
-        port_rpm = port_rpm_raw * 60.0 if port_rpm_raw is not None else None
-        stbd_rpm = stbd_rpm_raw * 60.0 if stbd_rpm_raw is not None else None
-        if (port_rpm or 0.0) < rpm_threshold and (stbd_rpm or 0.0) < rpm_threshold:
+        samples = {e["id"]: (safe_float(row.get(f"{e['path']}.revolutions")), safe_float(row.get(f"{e['path']}.fuel.rate"))) for e in engines}
+        rpms = {ident: rpm * 60.0 if rpm is not None else None for ident, (rpm, _fuel) in samples.items()}
+        if any(rpm is None or rpm < 0 for rpm in rpms.values()):
+            rpm_invalid_minutes += 1
+        if all(rpm is None for rpm in rpms.values()):
+            rpm_unknown_minutes += 1
             continue
-        if port_fuel_raw is not None:
-            port_liters += (port_fuel_raw * 3600000.0) / 60.0
-            port_fuel_samples += 1
-        if stbd_fuel_raw is not None:
-            stbd_liters += (stbd_fuel_raw * 3600000.0) / 60.0
-            stbd_fuel_samples += 1
-        running.append(
-            {
-                "time": row.get("_time", ""),
-                "port_rpm": round(port_rpm or 0.0, 1),
-                "starboard_rpm": round(stbd_rpm or 0.0, 1),
-            }
-        )
+        running_ids = [ident for ident, rpm in rpms.items() if rpm is not None and rpm >= rpm_threshold]
+        if not running_ids:
+            continue
+        # Coverage is complete only when every configured fuel-capable channel
+        # supplied a rate for each minute in which propulsion was active.
+        for ident in (e["id"] for e in engines):
+            running_samples[ident] += 1
+            fuel = samples[ident][1]
+            if fuel is not None and fuel >= 0:
+                amount = (fuel * 3600000.0) / 60.0
+                liters_by_engine[ident] += amount; partial_by_engine[ident] += amount; fuel_samples[ident] += 1
+        running.append({"time": row.get("_time", ""), "engine_rpm": rpms})
 
     running_hours = len(running) / 60.0
-    total_liters = port_liters + stbd_liters
+    complete_coverage = bool(running) and rpm_invalid_minutes == 0 and all(running_samples[e["id"]] == fuel_samples[e["id"]] for e in engines)
+    total_liters = sum(liters_by_engine.values()) if complete_coverage else None
     summary = {
+        "calculation_version": 3,
         "label": window["label"],
         "source_bucket": INFLUX_HISTORY_BUCKET,
         "rpm_threshold": rpm_threshold,
@@ -2461,27 +2533,36 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         "first_running_sample_local": format_local_time(str(running[0]["time"])) if running else None,
         "last_running_sample_local": format_local_time(str(running[-1]["time"])) if running else None,
         "totals": {
-            "port_liters": round(port_liters, 2),
-            "starboard_liters": round(stbd_liters, 2),
-            "total_liters": round(total_liters, 2),
-            "port_gallons": round(port_liters * US_GALLONS_PER_LITER, 2),
-            "starboard_gallons": round(stbd_liters * US_GALLONS_PER_LITER, 2),
-            "total_gallons": round(total_liters * US_GALLONS_PER_LITER, 2),
+            **{f"{e['id']}_liters": round(liters_by_engine[e['id']], 2) if complete_coverage else None for e in engines},
+            "total_liters": round(total_liters, 2) if total_liters is not None else None,
+            **{f"{e['id']}_gallons": round(liters_by_engine[e['id']] * US_GALLONS_PER_LITER, 2) if complete_coverage else None for e in engines},
+            "total_gallons": round(total_liters * US_GALLONS_PER_LITER, 2) if total_liters is not None else None,
         },
         "averages": {
-            "port_gph_running": round(port_liters * US_GALLONS_PER_LITER / running_hours, 3) if running_hours else None,
-            "starboard_gph_running": round(stbd_liters * US_GALLONS_PER_LITER / running_hours, 3) if running_hours else None,
-            "total_gph_running": round(total_liters * US_GALLONS_PER_LITER / running_hours, 3) if running_hours else None,
+            **{f"{e['id']}_gph_running": round(liters_by_engine[e['id']] * US_GALLONS_PER_LITER / running_hours, 3) if complete_coverage and running_hours else None for e in engines},
+            "total_gph_running": round(total_liters * US_GALLONS_PER_LITER / running_hours, 3) if total_liters is not None and running_hours else None,
         },
         "sample_counts": {
             "running_minutes": len(running),
-            "port_fuel_samples": port_fuel_samples,
-            "starboard_fuel_samples": stbd_fuel_samples,
+            **{f"{e['id']}_running_minutes": running_samples[e['id']] for e in engines},
+            "rpm_unknown_minutes": rpm_unknown_minutes,
+            "rpm_invalid_minutes": rpm_invalid_minutes,
+            **{f"{e['id']}_fuel_samples": fuel_samples[e['id']] for e in engines},
+        },
+        "coverage_complete": complete_coverage,
+        "coverage_scope": "returned_observation_minutes",
+        "observed_partial_consumption": {
+            **{f"{e['id']}_liters": round(partial_by_engine[e['id']], 2) for e in engines},
+            "total_liters": round(sum(partial_by_engine.values()), 2) if any(fuel_samples.values()) else None,
+            **{f"{e['id']}_gallons": round(partial_by_engine[e['id']] * US_GALLONS_PER_LITER, 2) for e in engines},
+            "total_gallons": round(sum(partial_by_engine.values()) * US_GALLONS_PER_LITER, 2) if any(fuel_samples.values()) else None,
         },
         "notes": [
-            "Fuel totals integrate 1-minute average fuel-rate samples while either engine RPM exceeds threshold.",
+            "Fuel totals integrate 1-minute average fuel-rate samples while any configured engine RPM exceeds threshold.",
+            "Completeness applies to returned running observation minutes; gaps or unreturned minutes in the requested window are not known zero.",
             "Fuel rate is integrated by minute and reported in US gallons (gal, gal/h).",
         ],
+        "profile_fingerprint": runtime["fingerprint"],
     }
     telemetry_cache.put_summary("fuel_usage", cache_key, summary)
     return summary
@@ -2506,14 +2587,18 @@ def fuel_economy_summary(
     require_both_engines: bool = False,
     use_cache: bool = True,
 ) -> dict[str, Any]:
-    cache_key = fuel_usage_cache_key(window, rpm_threshold) if window else fuel_economy_cache_key(days, rpm_threshold)
+    runtime = profile_runtime.current()
+    engines = [e for e in runtime["profile"].get("engines", []) if e.get("fuel_rate_supported")]
+    if not engines:
+        return {"available": False, "diagnostic": "Fuel economy is unavailable: no configured engine supports fuel rate.", "profile_fingerprint": runtime["fingerprint"]}
+    cache_key = fuel_usage_cache_key(window, rpm_threshold, runtime) if window else fuel_economy_cache_key(days, rpm_threshold, runtime)
     if rpm_band:
         cache_key += f":{rpm_band[0]:g}-{rpm_band[1]:g}rpm:{'both' if require_both_engines else 'either'}"
     if require_both_engines:
         cache_key += ":both"
     if use_cache:
         cached = telemetry_cache.get_summary("fuel_economy", cache_key, max_age_seconds=TELEMETRY_CACHE_FRESH_SECONDS)
-        if cached and cached.get("calculation_version") == 2:
+        if profile_cache_usable(cached, runtime) and cached.get("calculation_version") == 2:
             return cached
     bucket = INFLUX_HISTORY_BUCKET
     if window:
@@ -2527,7 +2612,7 @@ def fuel_economy_summary(
     flux = f'''
 from(bucket: "{bucket}")
   |> {range_clause}
-  |> filter(fn: (r) => r._measurement == "propulsion.port.fuel.rate" or r._measurement == "propulsion.starboard.fuel.rate" or r._measurement == "propulsion.port.revolutions" or r._measurement == "propulsion.starboard.revolutions" or r._measurement == "navigation.speedOverGround")
+  |> filter(fn: (r) => {" or ".join(f'r._measurement == "{e["path"]}.fuel.rate" or r._measurement == "{e["path"]}.revolutions"' for e in engines)} or r._measurement == "navigation.speedOverGround")
   |> filter(fn: (r) => r._field == "value")
   |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
   |> keep(columns: ["_time", "_measurement", "_value"])
@@ -2543,33 +2628,26 @@ from(bucket: "{bucket}")
     first_running: str | None = None
     last_running: str | None = None
     for row in rows:
-        port_rpm_raw = safe_float(row.get("propulsion.port.revolutions"))
-        stbd_rpm_raw = safe_float(row.get("propulsion.starboard.revolutions"))
-        port_fuel_raw = safe_float(row.get("propulsion.port.fuel.rate"))
-        stbd_fuel_raw = safe_float(row.get("propulsion.starboard.fuel.rate"))
         speed_mps = safe_float(row.get("navigation.speedOverGround"))
-        port_rpm = port_rpm_raw * 60.0 if port_rpm_raw is not None else None
-        stbd_rpm = stbd_rpm_raw * 60.0 if stbd_rpm_raw is not None else None
-        if require_both_engines and (port_rpm is None or stbd_rpm is None or min(port_rpm, stbd_rpm) < rpm_threshold):
+        rpms = {e["id"]: (safe_float(row.get(f"{e['path']}.revolutions")) or 0.0) * 60.0 for e in engines}
+        fuels = {e["id"]: safe_float(row.get(f"{e['path']}.fuel.rate")) for e in engines}
+        if require_both_engines and (any(fuels[e["id"]] is None or rpms[e["id"]] < rpm_threshold for e in engines)):
             continue
         if rpm_band:
             low, high = rpm_band
-            port_in_band = port_rpm is not None and low <= port_rpm <= high
-            stbd_in_band = stbd_rpm is not None and low <= stbd_rpm <= high
-            if (require_both_engines and not (port_in_band and stbd_in_band)) or (
-                not require_both_engines and not (port_in_band or stbd_in_band)
-            ):
+            in_band = [low <= rpms[e["id"]] <= high for e in engines]
+            if (require_both_engines and not all(in_band)) or (not require_both_engines and not any(in_band)):
                 continue
-        if (port_rpm or 0.0) < rpm_threshold and (stbd_rpm or 0.0) < rpm_threshold:
+        if all(rpms[e["id"]] < rpm_threshold for e in engines):
             continue
         running_minutes += 1
         first_running = first_running or row.get("_time")
         last_running = row.get("_time")
-        sample = matched_sample(row, rpm_threshold)
+        sample = matched_sample(row, rpm_threshold, engines=engines)
         if sample is None:
             continue
         matched_minutes += 1
-        fuel_liters += (port_fuel_raw + stbd_fuel_raw) * 60000.0
+        fuel_liters += sum(fuels.values()) * 60000.0
         distance_nm += speed_mps * 60.0 / 1852.0
         distance_samples += 1
 
@@ -2577,6 +2655,7 @@ from(bucket: "{bucket}")
     running_hours = matched_minutes / 60.0
     summary = {
         "calculation_version": 2,
+        "profile_fingerprint": runtime["fingerprint"],
         "label": label,
         "source_bucket": bucket,
         "rpm_threshold": rpm_threshold,
@@ -2622,6 +2701,8 @@ from(bucket: "{bucket}")
 
 
 def fuel_balance_summary(hours: int = 168, rpm_threshold: float = ENGINE_RUNNING_RPM) -> dict[str, Any]:
+    if not profile_runtime.legacy_pair(profile_runtime.current()["profile"]):
+        return profile_runtime.unsupported(profile_runtime.current()["profile"], "Fuel balance comparison")
     bucket = history_bucket_for_hours(hours)
     flux = f'''
 from(bucket: "{bucket}")
@@ -2840,25 +2921,21 @@ from(bucket: "{INFLUX_RAW_BUCKET}")
 def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
     signalk = get_signalk_self()
     flat = flatten_signalk(signalk) if "error" not in signalk else {}
+    runtime = profile_runtime.current()
+    equipment = runtime["profile"]
     baseline = {
         "navigation.speedOverGround",
         "navigation.courseOverGroundTrue",
         "navigation.headingMagnetic",
         "navigation.position",
         "environment.depth.belowTransducer",
-        "electrical.batteries.shunt.capacity.stateOfCharge",
-        "electrical.batteries.shunt.voltage",
-        "electrical.batteries.shunt.current",
-        "electrical.batteries.shunt.power",
-        "propulsion.port.revolutions",
-        "propulsion.starboard.revolutions",
-        "propulsion.port.fuel.rate",
-        "propulsion.starboard.fuel.rate",
-        "propulsion.port.engineLoad",
-        "propulsion.starboard.engineLoad",
-        "tanks.fuel.0.currentLevel",
-        "tanks.fuel.1.currentLevel",
     }
+    for bank in equipment.get("battery_banks", []):
+        baseline.update(f"{bank['path']}.{suffix}" for suffix in ("capacity.stateOfCharge", "voltage", "current", "power"))
+    for engine in equipment.get("engines", []):
+        baseline.update(f"{engine['path']}.{suffix}" for suffix in ("revolutions", "fuel.rate", "engineLoad", "engineTorque", "temperature", "oilPressure"))
+    for tank in equipment.get("fuel_tanks", []):
+        baseline.add(f"{tank['path']}.currentLevel")
     current_prefixes = ("electrical.", "environment.", "navigation.", "notifications.", "performance.", "propulsion.", "tanks.")
     concepts = telemetry_concepts(message)
     matched = {
@@ -2866,6 +2943,8 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         for key in flat
         if message
         and key.startswith(current_prefixes)
+        and (not (key.startswith(("propulsion.", "electrical.batteries.", "tanks.fuel.")))
+             or any(key == path or key.startswith(path + ".") for path in profile_runtime.paths(equipment)))
         and semantic_match_score(key, message) > 0
     }
     selected_paths = matched if concepts == {"ais"} else baseline.union(matched)
@@ -2946,6 +3025,9 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         ],
         "quality_flags": quality_flags,
     })
+    if runtime.get("diagnostic"):
+        result["profile_diagnostic"] = runtime["diagnostic"]
+    result["profile_fingerprint"] = runtime["fingerprint"]
     return result
 
 
@@ -3216,7 +3298,7 @@ def classify_question(message: str) -> dict[str, Any]:
         term in lower
         for term in ["right now", "currently", "current ", "now?", "at the moment", "remains", "remaining", "fuel left"]
     )
-    return {
+    result = {
         "identity": any(re.search(pattern, lower) for pattern in identity_patterns),
         "first_engine_run": first_engine_run,
         "last_engine_run": last_engine_run,
@@ -3243,6 +3325,7 @@ def classify_question(message: str) -> dict[str, Any]:
         "concepts": sorted(concepts),
         "query_plan": query_plan,
     }
+    return result
 
 
 def ha_entity_ids_for_question(kind: dict[str, Any]) -> list[str]:
@@ -3479,7 +3562,7 @@ def answer_from_solar_inference(context: dict[str, Any]) -> str | None:
     if intervals <= 0:
         lines.append(
             "No complete qualifying interval has been measured yet. A qualifying interval requires evidence that the "
-            "boat is underway, beyond the dock radius, or not charging; both engines below 200 RPM; battery power; "
+            "boat is underway, beyond the dock radius, or not charging; configured engines below 200 RPM; battery power; "
             "and no sampling gap longer than 15 minutes."
         )
     else:
@@ -3502,7 +3585,7 @@ def answer_from_solar_inference(context: dict[str, Any]) -> str | None:
         )
     lines.append(
         "The current shore-power entity is a charging proxy, not a physical AC-input sensor. Away from the dock, this "
-        "attributes positive SmartShunt power to solar or another uninstrumented source after excluding engine charging. "
+        "attributes positive configured-battery power to solar or another uninstrumented source after excluding engine charging. "
         "It measures net battery charging after onboard loads, not gross panel production."
     )
     return "\n".join(lines)
@@ -3572,10 +3655,37 @@ def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
         return None
     values=(context.get("current_telemetry") or {}).get("values",{}); states=context.get("ha_states") or {}
     state=lambda entity,default="unknown":str((states.get(entity) or {}).get("state",default))
-    soc=safe_float(values.get("electrical.batteries.shunt.capacity.stateOfCharge")); voltage=safe_float(values.get("electrical.batteries.shunt.voltage")); port=safe_float(values.get("propulsion.port.revolutions")) or 0; starboard=safe_float(values.get("propulsion.starboard.revolutions")) or 0
+    timestamps = (context.get("current_telemetry") or {}).get("timestamps", {})
+    now = dt.datetime.now(dt.timezone.utc)
+    def fresh(path: str) -> bool:
+        try:
+            stamp = dt.datetime.fromisoformat(str(timestamps[path]).replace("Z", "+00:00"))
+            age = (now - stamp).total_seconds()
+            return age <= 600 and age >= -60
+        except (KeyError, TypeError, ValueError):
+            return False
+    def current(path: str) -> float | None:
+        return safe_float(values.get(path)) if fresh(path) else None
+    runtime = profile_runtime.current()
+    profile = runtime["profile"]
+    primary = next((b for b in profile.get("battery_banks", []) if b.get("id") == profile.get("primary_battery_bank")), None)
+    soc=current(f"{primary['path']}.capacity.stateOfCharge") if primary else None
+    voltage=current(f"{primary['path']}.voltage") if primary else None
+    engines = [(e, current(f"{e['path']}.revolutions")) for e in profile.get("engines", [])]
     lines=[f"Boat briefing: {state('sensor.boat_health_summary','health unknown')}; {state('sensor.boat_watch_summary','watch state unavailable')}."]
-    if soc is not None or voltage is not None: lines.append(f"Battery: {f'{soc:g}%' if soc is not None else 'SOC unavailable'}, {f'{voltage:.2f} V' if voltage is not None else 'voltage unavailable'}.")
-    lines.append(f"Engines: port {port:.0f} RPM, starboard {starboard:.0f} RPM. Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
+    if runtime.get("diagnostic"):
+        lines.append(runtime["diagnostic"] + ".")
+    elif primary:
+        lines.append(f"Battery ({primary.get('label', primary['id'])}): {f'{soc:g}%' if soc is not None else 'SOC unavailable'}, {f'{voltage:.2f} V' if voltage is not None else 'voltage unavailable'}.")
+    else:
+        lines.append("Battery: not configured.")
+    if engines:
+        def engine_label(e):
+            return e['id'] if e.get('id') in {'port', 'starboard'} and e.get('label') in {'Port', 'Starboard'} else e.get('label', e['id'])
+        engine_text = ", ".join(f"{engine_label(e)} {v:.0f} RPM" if v is not None else f"{engine_label(e)} unavailable" for e, v in engines)
+        lines.append(f"Engines: {engine_text}. Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
+    else:
+        lines.append("Engines: not configured.")
     alarms=(context.get("current_telemetry") or {}).get("alarm_summary")
     if alarms: lines.append(str(alarms))
     return "\n".join(lines)
@@ -3666,6 +3776,8 @@ def answer_from_engine_history(context: dict[str, Any]) -> str | None:
     if not kind.get("engine_run_history"):
         return None
     summary = context.get("engine_run_history", {}) or context.get("engine_first_run", {})
+    if summary.get("available") is False:
+        return str(summary.get("diagnostic") or "Engine history is unavailable for the configured equipment profile.")
     selected = summary.get("selected") or summary.get("first")
     direction = summary.get("direction") or kind.get("engine_run_direction") or "first"
     label = "first retained" if direction == "first" else "last retained"
@@ -3676,7 +3788,7 @@ def answer_from_engine_history(context: dict[str, Any]) -> str | None:
             f"using RPM >= {summary.get('rpm_threshold', ENGINE_RUNNING_RPM)}."
         )
     samples = summary.get("same_minute_samples") or [selected]
-    rpm_text = ", ".join(f"{sample.get('side')}: {sample.get('rpm')} RPM" for sample in samples)
+    rpm_text = ", ".join(f"{sample.get('engine_label') or sample.get('side')}: {sample.get('rpm')} RPM" for sample in samples)
     return (
         f"The {label} engine-running sample is {selected.get('time_local')} "
         f"({selected.get('time_utc')}). Detected above {summary.get('rpm_threshold', ENGINE_RUNNING_RPM)} RPM: {rpm_text}. "
@@ -3694,7 +3806,10 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
         if error:
             return f"I could not compute fuel usage from InfluxDB: {error}"
         return None
+    if summary.get("available") is False:
+        return str(summary.get("diagnostic") or "Fuel usage is unavailable for the configured equipment profile.")
     metric = display_units.preference(setting_value) == "metric"
+    runtime_profile = profile_runtime.current()["profile"]
     shown = display_units.normalize_context(summary, display_units.preference(setting_value))
     running_minutes = int(summary.get("running_minutes") or 0)
     if running_minutes <= 0:
@@ -3708,15 +3823,29 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
     volume_unit = "L" if metric else "gal"
     rate_unit = "L/h" if metric else "gal/h"
     total_key = "total_liters" if metric else "total_gallons"
-    port_key = "port_liters" if metric else "port_gallons"
-    stbd_key = "starboard_liters" if metric else "starboard_gallons"
     rate_key = "total_lph_running" if metric else "total_gph_running"
+    if not summary.get("coverage_complete") or totals.get(total_key) is None:
+        partial = shown.get("observed_partial_consumption", {})
+        partial_key = "total_liters" if metric else "total_gallons"
+        partial_value = partial.get(partial_key)
+        partial_text = f"{partial_value} {volume_unit}" if partial_value is not None else "unavailable (no valid fuel-rate samples)"
+        return (
+            f"Fuel usage for {summary.get('label', 'the requested period')} is incomplete: "
+            "one or more running-channel RPM or fuel-rate samples were missing or invalid within the returned observation minutes. "
+            f"Observed partial consumption across {running_minutes} sampled running minutes is {partial_text}; "
+            "I cannot report an authoritative total."
+        )
+    per_engine = []
+    for engine in profile_runtime.engines(runtime_profile):
+        key = f"{engine['id']}_{'liters' if metric else 'gallons'}"
+        if key in totals:
+            per_engine.append(f"{engine.get('label', engine['id'])}: {totals.get(key)} {volume_unit}")
+    breakdown = "; ".join(per_engine)
     return (
-        f"Fuel used for {summary.get('label', 'the requested period')} "
+        f"Observed fuel consumption for {summary.get('label', 'the requested period')} "
         f"({summary.get('start_local')} to {summary.get('stop_local')}): "
-        f"{totals.get(total_key)} {volume_unit} total. "
-        f"Port: {totals.get(port_key)} {volume_unit}; "
-        f"starboard: {totals.get(stbd_key)} {volume_unit}. "
+        f"{totals.get(total_key)} {volume_unit} across {running_minutes} sampled running minutes. "
+        f"{breakdown}. "
         f"Running time: {running_minutes} minutes, from {summary.get('first_running_sample_local')} "
         f"to {summary.get('last_running_sample_local')}. "
         f"Average burn while running: {averages.get(rate_key)} {rate_unit} total. "
@@ -3734,6 +3863,8 @@ def answer_from_fuel_economy(context: dict[str, Any]) -> str | None:
         if error:
             return f"I could not compute fuel economy from InfluxDB: {error}"
         return None
+    if summary.get("available") is False:
+        return str(summary.get("diagnostic") or "Fuel economy is unavailable for the configured equipment profile.")
     metric = display_units.preference(setting_value) == "metric"
     shown = display_units.normalize_context(summary, display_units.preference(setting_value))
     running_minutes = int(summary.get("running_minutes") or 0)
@@ -3815,6 +3946,8 @@ def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
         if error:
             return f"I could not compute battery voltage history from InfluxDB: {error}"
         return None
+    if summary.get("available") is False:
+        return str(summary.get("diagnostic") or "Battery history is unavailable for the configured equipment profile.")
     samples = int(summary.get("samples") or 0)
     if samples <= 0:
         return f"I found no retained battery-voltage samples for {summary.get('label', 'the requested period')}."
@@ -3835,7 +3968,7 @@ def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
     ]
     if soc.get("count"):
         lines.append(
-            f"SmartShunt SOC: {fmt(soc.get('min'), 1)}-{fmt(soc.get('max'), 1)}%, "
+            f"{summary.get('battery_label', 'Battery')} SOC: {fmt(soc.get('min'), 1)}-{fmt(soc.get('max'), 1)}%, "
             f"latest {fmt(soc.get('latest'), 1)}%."
         )
 
@@ -3844,15 +3977,15 @@ def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
     if below_118 or below_50:
         lines.append(f"Low-voltage flags: {below_118} hourly samples below 11.8 V; {below_50} below 12.05 V.")
     else:
-        lines.append("No hourly samples were below 11.8 V or the 50% AGM resting reference of 12.05 V.")
+        lines.append("No hourly samples were below the configured voltage thresholds.")
 
     charging_samples = int(thresholds.get("charging_or_float_samples") or 0)
     if charging_samples > samples / 2:
-        lines.append("Most samples look like charging/float, so SmartShunt SOC is the better level signal than the AGM voltage chart.")
+        lines.append("Most samples look like charging/float; treat voltage-based level estimates as a reference.")
     elif isinstance(voltage.get("latest"), (int, float)) and float(voltage["latest"]) >= 13.0:
-        lines.append("Latest voltage is at or above the AGM 100% resting reference; treat the chart as a reference, not a precise SOC reading.")
+        lines.append("Latest voltage is high; treat voltage-based level estimates as a reference, not a precise SOC reading.")
     elif agm.get("latest_voltage_percent") is not None:
-        lines.append(f"AGM resting-voltage estimate from latest voltage: about {fmt(agm.get('latest_voltage_percent'), 1)}%.")
+        lines.append(f"Resting-voltage estimate from latest voltage: about {fmt(agm.get('latest_voltage_percent'), 1)}%.")
     return "\n".join(lines)
 
 
@@ -3873,6 +4006,8 @@ def answer_from_fuel_balance(context: dict[str, Any]) -> str | None:
         return f"{value:+.{digits}f}" if isinstance(value, (int, float)) else "unknown"
 
     for label, summary in summaries:
+        if summary.get("unsupported"):
+            return summary.get("diagnostic") or "Fuel balance comparison is unsupported for this equipment profile."
         running_minutes = int(summary.get("running_minutes") or 0)
         if running_minutes <= 0:
             lines.append(f"- {label}: no engine-running samples found.")
@@ -4153,12 +4288,29 @@ def answer_from_event_history(context: dict[str, Any]) -> str | None:
     return f"{name} was active for approximately {total_seconds / 3600:.2f} hours during {label}, based on retained Home Assistant transitions."
 
 
-def collect_context(message: str, history: list[dict[str, str]] | None = None, prior_query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+def _collect_context(message: str, history: list[dict[str, str]] | None = None, prior_query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.monotonic()
+    runtime = profile_runtime.current()
+    if runtime.get("diagnostic"):
+        # Invalid profiles must fail closed before any source discovery or
+        # telemetry/Home Assistant I/O occurs.
+        return {
+            "profile": runtime["profile"],
+            "profile_fingerprint": runtime["fingerprint"],
+            "profile_diagnostic": runtime["diagnostic"],
+            "_profile_runtime": runtime,
+            "question_type": {"concepts": [], "query_plan": {}},
+            "query_plan": {},
+            "context_profile": {"elapsed_ms": int((time.monotonic() - started) * 1000), "history": False},
+        }
     conversation = sanitize_conversation_history(history)
     query = effective_question(message, conversation)
     kind = classify_question(query)
     context: dict[str, Any] = {
+        "profile": runtime["profile"],
+        "profile_fingerprint": runtime["fingerprint"],
+        "profile_diagnostic": runtime.get("diagnostic"),
+        "_profile_runtime": runtime,
         "question_type": kind,
         "query_plan": kind.get("query_plan", {}),
         "match_tokens": sorted(message_tokens(query)),
@@ -4329,6 +4481,12 @@ def collect_context(message: str, history: list[dict[str, str]] | None = None, p
     return context
 
 
+def collect_context(message: str, history: list[dict[str, str]] | None = None, prior_query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Collect one internally consistent equipment snapshot per request."""
+    with profile_runtime.scope():
+        return _collect_context(message, history, prior_query_plan)
+
+
 def configured_provider() -> str:
     provider = (setting_value("BOAT_CHAT_PROVIDER", "") or "").strip().lower()
     if provider:
@@ -4409,29 +4567,40 @@ def active_models() -> dict[str, str]:
 
 
 def readiness_status() -> dict[str, Any]:
+    runtime = profile_runtime.current()
     memory = memory_index.status()
     cache = telemetry_cache.status()
-    indexer = next((item for item in cache.get("items", []) if item.get("category") == "indexer" and item.get("key") == "last_run"), None)
-    cache_age = indexer.get("age_seconds") if indexer else None
+    indexer = telemetry_cache.get_summary("indexer", "last_run") or {}
+    cache_meta = indexer.get("cache", {}) if isinstance(indexer, dict) else {}
+    cache_age = cache_meta.get("age_seconds")
     provider = configured_provider()
+    indexer_profile_match = bool(indexer.get("profile_fingerprint") == runtime["fingerprint"])
     layers = {
         "process": {"ready": True},
         "memory": {"ready": bool(memory.get("exists") and memory.get("chunks", 0) > 0), "chunks": memory.get("chunks", 0)},
-        "telemetry_cache": {"ready": cache_age is not None and int(cache_age) <= 15 * 60, "age_seconds": cache_age},
+        "telemetry_cache": {"ready": cache_age is not None and int(cache_age) <= 15 * 60 and indexer_profile_match, "age_seconds": cache_age, "profile_match": indexer_profile_match},
         "answer_provider": {"ready": provider in PROVIDER_OPTIONS, "provider": provider},
     }
     return {"ready": all(layer["ready"] for layer in layers.values()), "layers": layers}
 
 
 def experience_status() -> dict[str, Any]:
+    runtime = profile_runtime.current()
     cached = telemetry_cache.get_summary("latest_context", "boat_status") or {}
-    return status_model.normalize(cached)
+    if not profile_cache_usable(cached, runtime):
+        return {"cards": [], "alerts": [], "attention": [{"label": "Boat profile", "value": "Changed", "severity": "unknown", "reason": "Status snapshot predates the current equipment profile"}], "condition": "Status incomplete", "freshness": "unavailable"}
+    with profile_runtime.scope(runtime=runtime):
+        return status_model.normalize(cached)
 
 
 def experience_insights() -> dict[str, Any]:
+    runtime = profile_runtime.current()
     cached = telemetry_cache.get_summary("latest_context", "boat_status") or {}
-    values = (cached.get("current_telemetry") or {}).get("values", {})
-    status = status_model.normalize(cached)
+    if not profile_cache_usable(cached, runtime):
+        return {"insights": [], "diagnostic": "Insights are unavailable until telemetry is refreshed for the current equipment profile."}
+    with profile_runtime.scope(runtime=runtime):
+        values = (cached.get("current_telemetry") or {}).get("values", {})
+        status = status_model.normalize(cached)
     alerts = status["alerts"]
     latitude = safe_float(values.get("navigation.position.latitude"))
     longitude = safe_float(values.get("navigation.position.longitude"))
@@ -4541,8 +4710,12 @@ def fallback_answer(message: str, context: dict[str, Any], reason: str | None = 
     return "I gathered the available boat data, but no answer model is configured."
 
 
-def generate_answer(message: str, context: dict[str, Any]) -> str:
+def _generate_answer(message: str, context: dict[str, Any]) -> str:
     """Keep exact calculations while honoring requests for richer answers."""
+    if context.get("profile_diagnostic"):
+        return str(context["profile_diagnostic"])
+    if context.get("question_type", {}).get("fuel_balance_complex") and not profile_runtime.legacy_pair(context.get("profile") or profile_runtime.current()["profile"]):
+        return "Paired fuel-balance analysis is unsupported for this equipment profile; no legacy comparison was used."
     clarification = answer_from_clarification(context)
     if clarification:
         return clarification
@@ -4565,6 +4738,11 @@ def generate_answer(message: str, context: dict[str, Any]) -> str:
         or answer_from_event_history(context)
         or answer_from_generic_history(context)
     )
+    if deterministic and any(
+        isinstance(context.get(key), dict) and context[key].get("available") is False
+        for key in ("engine_run_history", "fuel_usage", "fuel_economy", "battery_voltage", "solar_inference")
+    ):
+        return deterministic
     plan = context.get("query_plan") or {}
     rich_answer = (
         context.get("answer_mode", "concise") != "concise"
@@ -4583,10 +4761,18 @@ def generate_answer(message: str, context: dict[str, Any]) -> str:
     return answer
 
 
+def generate_answer(message: str, context: dict[str, Any]) -> str:
+    with profile_runtime.scope(runtime=context.get("_profile_runtime")):
+        return _generate_answer(message, context)
+
+
 def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, Any]:
     # question_type and context_strategy are routing metadata, not evidence;
     # excluding them saves prompt tokens without changing answers.
     compact = {
+        "profile": context.get("profile"),
+        "profile_fingerprint": context.get("profile_fingerprint"),
+        "profile_diagnostic": context.get("profile_diagnostic"),
         "boat_facts": context.get("boat_facts"),
         "conversation": context.get("conversation"),
         "interpreted_question": context.get("interpreted_question"),

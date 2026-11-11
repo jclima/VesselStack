@@ -9,11 +9,13 @@ import json
 import math
 import re
 import time
+import datetime as dt
 from typing import Any
 
 import app
 import memory_index
 import telemetry_cache
+import profile_runtime
 
 
 HEALTH_ENTITY_IDS = [
@@ -273,6 +275,7 @@ def refresh_all() -> dict[str, Any]:
     ok = all(item.get("ok") for item in results)
     output = {
         "ok": ok,
+        "profile_fingerprint": profile_runtime.current()["fingerprint"],
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "pruned": pruned,
         "items": results,
@@ -282,11 +285,13 @@ def refresh_all() -> dict[str, Any]:
 
 
 def refresh_latest_context() -> dict[str, Any]:
-    current_telemetry = app.current_telemetry_snapshot(
-        "solar battery power current voltage state of charge both engine RPM alternator position latitude longitude"
-    )
-    ha_states = app.get_ha_states(HEALTH_ENTITY_IDS)
-    solar_inference = refresh_solar_inference(current_telemetry, ha_states)
+    runtime = profile_runtime.current()
+    with profile_runtime.scope(runtime=runtime):
+        current_telemetry = app.current_telemetry_snapshot(
+            "solar battery power current voltage state of charge engine RPM alternator position latitude longitude"
+        )
+        ha_states = app.get_ha_states(HEALTH_ENTITY_IDS)
+        solar_inference = refresh_solar_inference(current_telemetry, ha_states, runtime=runtime)
     ha_errors = [item.get("error", "") for item in ha_states.values() if isinstance(item, dict) and item.get("error")]
     ha_configured = bool(app.load_auth_headers("ha").get("Authorization"))
     non_404_ha_error = any(not re.search(r"(?:HTTP Error )?404\b", str(error), re.IGNORECASE) for error in ha_errors)
@@ -295,6 +300,8 @@ def refresh_latest_context() -> dict[str, Any]:
         "current_telemetry": current_telemetry,
         "ha_states": ha_states,
         "solar_inference": solar_inference,
+        "profile_fingerprint": runtime["fingerprint"],
+        "profile_diagnostic": runtime.get("diagnostic"),
         "ais": app.current_ais_context(limit=12),
         "source_availability": {
             "signalk": "unknown" if current_telemetry.get("signalk_error") else "available",
@@ -318,6 +325,15 @@ def _unit_factor_to_ft(unit: Any) -> float | None:
 def distance_ft_from_ha(state: Any) -> float | None:
     if not isinstance(state, dict):
         return None
+    stamp_text = state.get("last_reported") or state.get("last_updated")
+    if stamp_text:
+        try:
+            stamp = dt.datetime.fromisoformat(str(stamp_text).replace("Z", "+00:00")).timestamp()
+            age = time.time() - stamp
+            if age > 600 or age < -60:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
     try:
         number = float(state.get("state"))
     except (TypeError, ValueError):
@@ -330,15 +346,86 @@ def distance_ft_from_ha(state: Any) -> float | None:
     return number * factor if factor is not None else None
 
 
+def ha_state_is_fresh(state: Any, now: float | None = None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    stamp_text = state.get("last_reported") or state.get("last_updated")
+    if not stamp_text:
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(str(stamp_text).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return False
+        age = (now or time.time()) - parsed.timestamp()
+        return -60 <= age <= 600
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def refresh_solar_inference(
     current_telemetry: dict[str, Any],
     ha_states: dict[str, Any],
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     values = current_telemetry.get("values", {}) if isinstance(current_telemetry, dict) else {}
     shore = ha_states.get("binary_sensor.shore_power_connected", {})
     underway = ha_states.get("input_boolean.underway_mode", {})
     distance_from_dock = ha_states.get("sensor.distance_from_dock", {})
     dock_radius = ha_states.get("input_number.dock_radius", {})
+    now = time.time()
+    runtime_obj = runtime or profile_runtime.current()
+    equipment = runtime_obj["profile"]
+    engines = equipment.get("engines", [])
+    banks = equipment.get("battery_banks", [])
+    primary = next((b for b in banks if b.get("id") == equipment.get("primary_battery_bank") and b.get("role") == "house"), None)
+    if primary is None:
+        # Persist an explicit profile barrier.  Without this marker, a later
+        # valid profile could integrate across an unavailable/invalid profile.
+        telemetry_cache.put_power_observation(
+            shore_power_state="unknown",
+            port_rpm=None,
+            starboard_rpm=None,
+            battery_power_w=None,
+            battery_current_a=None,
+            battery_voltage_v=None,
+            battery_soc_pct=None,
+            engine_rpms={e["id"]: None for e in engines},
+            profile_fingerprint=runtime_obj["fingerprint"],
+            source_timestamp_quality="profile_unavailable",
+        )
+        return {"available": False, "diagnostic": "Solar inference unavailable: no valid primary house battery bank."}
+    source_paths = [f"{e['path']}.revolutions" for e in engines]
+    source_paths.append(f"{primary['path']}.power")
+    timestamps = current_telemetry.get("timestamps", {}) if isinstance(current_telemetry, dict) else {}
+    source_times = []
+    for path in source_paths:
+        try:
+            parsed = dt.datetime.fromisoformat(str(timestamps[path]).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("naive source timestamp")
+            stamp = parsed.timestamp()
+            if math.isfinite(stamp) and stamp <= now + 60 and now - stamp <= 600:
+                source_times.append(stamp)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+    source_quality = "verified" if len(source_times) == len(source_paths) else "legacy_unverified"
+    source_timestamp = None
+    try:
+        parsed = dt.datetime.fromisoformat(str(timestamps[f"{primary['path']}.power"]).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("naive source timestamp")
+        source_timestamp = int(parsed.timestamp())
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass
+    if isinstance(distance_from_dock, dict):
+        # HA helper state is valid until replaced; use its report/update time
+        # for provenance, never last_changed (which is intentionally stable).
+        distance_from_dock = dict(distance_from_dock)
+        distance_from_dock["source_timestamp"] = distance_from_dock.get("last_reported") or distance_from_dock.get("last_updated")
+    if not ha_state_is_fresh(shore, now):
+        shore = {"state": "unknown"}
+    if distance_from_dock and not ha_state_is_fresh(distance_from_dock, now):
+        distance_from_dock = {"state": "unknown"}
     observation = telemetry_cache.put_power_observation(
         shore_power_state=shore.get("state") if isinstance(shore, dict) else None,
         underway_state=underway.get("state") if isinstance(underway, dict) else None,
@@ -346,18 +433,23 @@ def refresh_solar_inference(
         dock_radius_ft=distance_ft_from_ha(dock_radius),
         port_rpm=values.get("propulsion.port.revolutions"),
         starboard_rpm=values.get("propulsion.starboard.revolutions"),
-        battery_power_w=values.get("electrical.batteries.shunt.power"),
-        battery_current_a=values.get("electrical.batteries.shunt.current"),
-        battery_voltage_v=values.get("electrical.batteries.shunt.voltage"),
-        battery_soc_pct=values.get("electrical.batteries.shunt.capacity.stateOfCharge"),
+        battery_power_w=values.get(f"{primary['path']}.power"),
+        battery_current_a=values.get(f"{primary['path']}.current"),
+        battery_voltage_v=values.get(f"{primary['path']}.voltage"),
+        battery_soc_pct=values.get(f"{primary['path']}.capacity.stateOfCharge"),
+        engine_rpms={e["id"]: values.get(f"{e['path']}.revolutions") for e in engines},
+        profile_fingerprint=runtime_obj["fingerprint"],
+        source_observed_at=source_timestamp,
+        source_timestamp_quality=source_quality,
     )
     telemetry_cache.prune_power_observations(keep_days=400)
     summaries: dict[str, Any] = {}
     keep_keys: set[str] = set()
     for days in [1, 7, 30]:
-        key = f"{days}d"
+        key = f"{days}d:profile-{runtime_obj['fingerprint'][:16]}"
         keep_keys.add(key)
-        summary = telemetry_cache.power_tracking_summary(days)
+        summary = telemetry_cache.power_tracking_summary(days, profile_fingerprint=runtime_obj["fingerprint"])
+        summary["profile_fingerprint"] = runtime_obj["fingerprint"]
         telemetry_cache.put_summary("solar_inference", key, summary, source="telemetry_indexer")
         summaries[key] = summary
     telemetry_cache.prune_category("solar_inference", keep_keys)
@@ -379,7 +471,8 @@ def main() -> None:
     mode = "sample" if args.command == "sample" else "history"
     try:
         with ModeLock(mode):
-            payload = refresh_latest_context() if mode == "sample" else refresh_all()
+            with profile_runtime.scope():
+                payload = refresh_latest_context() if mode == "sample" else refresh_all()
             if mode == "sample":
                 error = _error_payload(payload)
                 result = _safe_result(error is None, 1, int(error is not None), error)

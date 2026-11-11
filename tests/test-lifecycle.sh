@@ -14,6 +14,7 @@ BACKUP_ROOT="$TEST_ROOT/backups"
 FAKE_BIN="$TEST_ROOT/bin"
 SYSTEM_ROOT="$TEST_ROOT/system-root"
 install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_BIN" \
+    "$APP_ROOT/common" \
     "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin" \
     "$DATA_ROOT/grafana" "$DATA_ROOT/influxdb"
 
@@ -58,6 +59,9 @@ install -d "$APP_ROOT/boat-chat/knowledge" "$DATA_ROOT/boat-chat"
 cp "$REPO_ROOT/boat-chat/memory_index.py" "$APP_ROOT/boat-chat/"
 cp "$REPO_ROOT"/boat-chat/knowledge/*.md "$APP_ROOT/boat-chat/knowledge/"
 cp "$REPO_ROOT/scripts/memory-index.sh" "$APP_ROOT/installer/scripts/memory-index.sh"
+cp "$REPO_ROOT/scripts/reconcile-lifecycle.sh" "$APP_ROOT/installer/scripts/reconcile-lifecycle.sh"
+cp "$REPO_ROOT/common/lifecycle_lock.py" "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/boat_profile.py" "$REPO_ROOT/common/boat_profile_cli.py" "$APP_ROOT/common/"
+chmod +x "$APP_ROOT/installer/scripts/reconcile-lifecycle.sh"
 cp "$REPO_ROOT/scripts/render-homepage.py" "$APP_ROOT/installer/scripts/render-homepage.py"
 install -d "$APP_ROOT/installer/brand"
 cp "$REPO_ROOT/brand/icon.png" "$APP_ROOT/installer/brand/icon.png"
@@ -255,6 +259,7 @@ export FAKE_MOUNT_COUNT="$TEST_ROOT/mount-count"
 printf 'unit one\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 printf '#!/bin/sh\necho ctl-one\n' > "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl"
 printf '#!/bin/sh\n' > "$SYSTEM_ROOT/usr/local/sbin/vesselstack-firewall"
+chmod +x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" "$SYSTEM_ROOT/usr/local/sbin/vesselstack-firewall"
 install -d "$SYSTEM_ROOT/etc/vesselstack"
 printf 'UPDATE_KEY=one\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
 printf '#!/bin/bash\necho "$@" > "%s/installer-ran"\n' "$TEST_ROOT" > "$APP_ROOT/installer/install.sh"
@@ -288,10 +293,11 @@ grep -qx 'systemctl start vesselstack-telemetry-sample.timer vesselstack-telemet
 set_telemetry_flag false
 : > "$FAKE_BIN/calls.log"
 run_ctl start >/dev/null
-test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '1p')" = 'systemctl stop vesselstack-telemetry-sample.timer'
-test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '2p')" = 'systemctl stop vesselstack-telemetry-indexer.timer'
-test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '3p')" = 'systemctl stop vesselstack-telemetry-sample.service'
-test "$(grep '^systemctl stop ' "$FAKE_BIN/calls.log" | sed -n '4p')" = 'systemctl stop vesselstack-telemetry-indexer.service'
+telemetry_stops=$(grep '^systemctl stop vesselstack-telemetry-' "$FAKE_BIN/calls.log")
+test "$(printf '%s\n' "$telemetry_stops" | sed -n '1p')" = 'systemctl stop vesselstack-telemetry-sample.timer'
+test "$(printf '%s\n' "$telemetry_stops" | sed -n '2p')" = 'systemctl stop vesselstack-telemetry-indexer.timer'
+test "$(printf '%s\n' "$telemetry_stops" | sed -n '3p')" = 'systemctl stop vesselstack-telemetry-sample.service'
+test "$(printf '%s\n' "$telemetry_stops" | sed -n '4p')" = 'systemctl stop vesselstack-telemetry-indexer.service'
 if grep -q '^systemctl start vesselstack-telemetry-' "$FAKE_BIN/calls.log"; then
     echo 'disabled telemetry start path started a telemetry unit' >&2
     exit 1
@@ -1176,6 +1182,8 @@ mv "$APP_ROOT/boat-chat/.venv/bin/python.away" "$APP_ROOT/boat-chat/.venv/bin/py
 # conflicting cases are refused. Uses its own installation tree.
 LAN_ROOT="$TEST_ROOT/lan"
 install -d "$LAN_ROOT/config" "$LAN_ROOT/data/boat-chat"
+install -d "$LAN_ROOT/common"
+cp "$REPO_ROOT/common/lifecycle_lock.py" "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/boat_profile.py" "$REPO_ROOT/common/boat_profile_cli.py" "$LAN_ROOT/common/"
 sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=$LAN_ROOT|" -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=$LAN_ROOT/data|" \
     "$APP_ROOT/config/vesselstack.env" > "$LAN_ROOT/config/vesselstack.env"
 printf 'BOAT_CHAT_HOST=0.0.0.0\nBOAT_CHAT_PORT=9876\nOPENAI_API_KEY=keep-this-secret\n' > "$LAN_ROOT/config/boat-chat.env"

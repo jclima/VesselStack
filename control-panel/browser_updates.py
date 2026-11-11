@@ -30,6 +30,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from common.lifecycle_lock import LifecycleLock
+except ImportError:  # Detached runner is copied outside the source tree.
+    LifecycleLock = None  # type: ignore[assignment,misc]
+
 REPOSITORY = "jclima/VesselStack"
 API_RELEASES = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=30"
 API_RELEASE_BASE = f"https://api.github.com/repos/{REPOSITORY}/releases"
@@ -432,7 +437,7 @@ def start_detached(action: str, root: Path, old_identity: dict[str, str], releas
         if not isinstance(target_version, str):
             raise ValueError("release snapshot is invalid")
     target_version = target_version or running_identity(root)["running_version"]
-    request = {"id": int(time.time() * 1000), "action": action, "root": str(root), "config": str(root / "config" / "vesselstack.env"), "ctl": ctl, "old_boot_id": old_identity.get("boot_id", ""), "target_version": target_version, "release_id": release_id, "channel": channel}
+    request = {"id": int(time.time() * 1000), "action": action, "root": str(root), "system_root": os.environ.get("VESSELSTACK_SYSTEM_ROOT", ""), "config": str(root / "config" / "vesselstack.env"), "ctl": ctl, "old_boot_id": old_identity.get("boot_id", ""), "target_version": target_version, "release_id": release_id, "channel": channel}
     if action == "update-release":
         request["release_snapshot"] = snapshot
         if backup is not None:
@@ -540,9 +545,10 @@ bounded_download = _download
 
 
 def run_command(argv: list[str], root: Path, operation: dict[str, Any], timeout: float,
-                env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                env: dict[str, str] | None = None,
+                pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               env=env, start_new_session=True)
+                               env=env, pass_fds=pass_fds, start_new_session=True)
     selector = selectors.DefaultSelector()
     assert process.stdout is not None
     selector.register(process.stdout, selectors.EVENT_READ)
@@ -705,7 +711,7 @@ def ctl_supports(token: str, ctl: str = FIXED_CTL) -> bool:
     return token in (result.stdout or "")
 
 
-def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -> None:
+def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path, shared_lock=None) -> None:
     """Execute the reviewed update sequence for a detached worker request."""
     release_id = int(request["release_id"])
     channel = str(request["channel"])
@@ -756,10 +762,12 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
         if not installer.is_file():
             raise ValueError("release installer missing")
 
-        child_env = dict(os.environ, VESSELSTACK_ROOT=str(root), VESSELSTACK_ENV=config, VESSELSTACK_NONINTERACTIVE="true")
+        base_env = dict(os.environ, VESSELSTACK_ROOT=str(root), VESSELSTACK_ENV=config, VESSELSTACK_NONINTERACTIVE="true")
+        child_env = shared_lock.child_env(base_env) if shared_lock is not None else base_env
+        child_pass_fds = shared_lock.pass_fds() if shared_lock is not None else ()
         _validate_fixed_ctl()
         operation.update(phase="preflight"); write_operation(root, operation)
-        run_command([str(installer), "--config", config, "--dry-run"], root, operation, 1800, child_env)
+        run_command([str(installer), "--config", config, "--dry-run"], root, operation, 1800, child_env, child_pass_fds)
         choice, note = effective_backup_choice(choice, Path(config))
         mode = choice["mode"] if choice else "require_mounted"
         # The record names the handling that is really used (a fallback to the normal backup clears it).
@@ -772,7 +780,7 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
                 raise ValueError("The installed vesselstackctl is older than this Control Panel and cannot mount the backup drive. Mount the drive by hand, or run the update from a terminal.")
             operation.update(phase="mounting-backup-drive"); write_operation(root, operation)
             mount_argv = [FIXED_CTL, "backup-drive", "mount"] + (["--fstab"] if mode == "mount_fstab" else ["--uuid", choice["uuid"]])
-            run_command(mount_argv, root, operation, 300, child_env)
+            run_command(mount_argv, root, operation, 300, child_env, child_pass_fds)
         elif mode == "system_disk_once" and not ctl_supports("--system-disk-once"):
             raise ValueError("The installed vesselstackctl is older than this Control Panel and cannot back up to the system disk this once. Mount the drive by hand, or run the update from a terminal.")
         if mode in {"skip", "system_disk_once"} and (backup_locked(Path(config)) or os.environ.get("VESSELSTACK_BACKUP_ALLOW_UNMOUNTED") == "false"):
@@ -785,7 +793,7 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
         else:
             operation.update(phase="backing-up"); write_operation(root, operation)
             backup_argv = [FIXED_CTL, "backup", "--system-disk-once"] if mode == "system_disk_once" else [FIXED_CTL, "backup", "--require-mounted"]
-            backup_result = run_command(backup_argv, root, operation, 1800, child_env)
+            backup_result = run_command(backup_argv, root, operation, 1800, child_env, child_pass_fds)
             output = (backup_result.stdout or "").splitlines()
             if not output or not output[-1].strip():
                 raise ValueError("backup did not report an archive path")
@@ -798,10 +806,10 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path) -
         install_env["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
         install_env["VESSELSTACK_ROOT"] = str(root)
         install_env["VESSELSTACK_ENV"] = config
-        run_command([str(installer), "--config", config, "--start"], root, operation, 1800, install_env)
+        run_command([str(installer), "--config", config, "--start"], root, operation, 1800, install_env, child_pass_fds)
         keep_skip_warning(operation)
         operation.update(phase="restarting"); write_operation(root, operation)
-        run_command(["systemctl", "restart", "vesselstack-control-panel.service"], root, operation, 60)
+        run_command(["systemctl", "restart", "vesselstack-control-panel.service"], root, operation, 60, child_env, child_pass_fds)
         keep_skip_warning(operation)
         operation.update(phase="verifying-restart"); write_operation(root, operation)
         identity = verify_restart(root, str(request["old_boot_id"]), target_version)
@@ -820,7 +828,20 @@ def run_worker(request_path: Path) -> None:
     request = _read_json_private(request_path, 64 * 1024)
     root = Path(str(request.get("root", "")))
     lock = acquire_runner_lock(root)
+    shared = None
+    operation = read_operation(root)
     try:
+        global LifecycleLock
+        if LifecycleLock is None:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("vesselstack_lifecycle_lock", root / "common" / "lifecycle_lock.py")
+            if not spec or not spec.loader:
+                raise ValueError("shared lifecycle lock helper is unavailable")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            LifecycleLock = module.LifecycleLock
+        shared = LifecycleLock(root, request.get("system_root", os.environ.get("VESSELSTACK_SYSTEM_ROOT", "")))
+        shared.acquire()
         request = _read_json_private(request_path, 64 * 1024)
         operation = read_operation(root)
         if operation.get("id") != request.get("id"):
@@ -830,10 +851,11 @@ def run_worker(request_path: Path) -> None:
         if Path(str(request.get("root"))).resolve() != root.resolve() or Path(str(request.get("config"))).resolve() != (root / "config" / "vesselstack.env").resolve() or request.get("ctl", FIXED_CTL) != FIXED_CTL:
             raise ValueError("detached request path is not fixed")
         if request.get("action") == "update-release":
-            run_update(request, operation, root)
+            run_update(request, operation, root, shared)
             return
         operation.update(phase="restarting"); write_operation(root, operation)
-        subprocess.run(["systemctl", "restart", "vesselstack-control-panel.service"], check=True, timeout=60)
+        subprocess.run(["systemctl", "restart", "vesselstack-control-panel.service"], check=True, timeout=60,
+                       env=shared.child_env())
         active = subprocess.run(["systemctl", "is-active", "vesselstack-control-panel.service"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False).stdout.strip()
         if active != "active": raise RuntimeError("control panel did not become active")
         operation.update(phase="verifying-restart"); write_operation(root, operation)
@@ -845,7 +867,10 @@ def run_worker(request_path: Path) -> None:
         operation.update(state="failed", phase="failed", finished_at=int(time.time()), exit_code=1, output=prior[-400:])
         keep_skip_warning(operation)
     finally:
-        write_operation(root, operation); release_slot(lock)
+        write_operation(root, operation)
+        if shared is not None:
+            shared.release()
+        release_slot(lock)
 
 
 if __name__ == "__main__":

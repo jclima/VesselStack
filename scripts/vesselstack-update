@@ -84,6 +84,12 @@ source "$CONFIG_FILE"
 : "${SOURCE_DIRECTORY:?Set SOURCE_DIRECTORY in the update configuration}"
 : "${TARGET_DIRECTORY:?Set TARGET_DIRECTORY in the update configuration}"
 : "${CHAT_SERVICE:?Set CHAT_SERVICE in the update configuration}"
+if [ "$IS_ROOT" = true ] && [ -z "${HEALTH_URL:-}" ] && [ -r "$TARGET_DIRECTORY/common/config_registry.py" ]; then
+    require_root_controlled "configuration registry" "$TARGET_DIRECTORY/common/config_registry.py" || exit 1
+fi
+if [ -z "${HEALTH_URL:-}" ] && [ -r "$TARGET_DIRECTORY/common/config_registry.py" ]; then
+    HEALTH_URL="$(python3 -I "$TARGET_DIRECTORY/common/config_registry.py" --endpoint-root "$TARGET_DIRECTORY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["url"] + "/health")')"
+fi
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8765/health}"
 # Pinned origin: the helper refuses to fetch when the checkout's origin differs.
 EXPECTED_REMOTE_URL="${EXPECTED_REMOTE_URL:-https://github.com/jclima/VesselStack.git}"

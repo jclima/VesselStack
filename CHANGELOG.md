@@ -3,6 +3,32 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.7.0 - 2026-11-10
+
+### Highlights
+
+- Added schema-v1 boat profiles for engines, battery banks, fuel tanks, and safe Signal K
+  paths, including a selected primary house battery bank and combustion/electric engine
+  capabilities. Profiles do not generate Home Assistant, Grafana, or display mappings.
+- Added a shared configuration registry used separately by the installer, wizard, and
+  Control Panel for validation and effective endpoint resolution; it does not read secrets
+  or contact services.
+- Added telemetry correctness and cache/index improvements: fuel totals distinguish unknown,
+  stale, and missing sampled minutes, while historical samples without verified source
+  timestamps are excluded from inferred-energy calculations. Added transactional restore
+  handling with an external recovery journal, shared lifecycle locking, and mode
+  reconciliation across installer, Control Panel, Boat Chat, and profile operations.
+- Added lifecycle reconciliation and reliability checks across update, restore, and
+  component callers. Existing backups remain the rollback path; use the full installer
+  for common-module and configuration changes rather than an application-only update.
+- Upgrade from 0.6.4 with the verified backup workflow. Database changes add columns
+  only; historical samples without verified source timestamps remain excluded from
+  inferred-energy calculations.
+
+This is a pre-release. Physical Raspberry Pi acceptance is still pending, so it is not
+the release marked Latest. Do not deploy it to a boat until the documented Pi and
+lifecycle acceptance checks pass.
+
 ## 0.6.4 - 2026-11-08
 
 ### Highlights

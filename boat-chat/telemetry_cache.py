@@ -18,6 +18,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import memory_index
+try:
+    import profile_runtime
+except ImportError:
+    profile_runtime = None
 
 
 DEFAULT_POWER_DB_PATH = memory_index.STATE_DIR / "data" / "power_tracking.sqlite"
@@ -88,7 +92,11 @@ def connect_power(path: Path | None = None) -> sqlite3.Connection:
             battery_power_w real,
             battery_current_a real,
             battery_voltage_v real,
-            battery_soc_pct real
+            battery_soc_pct real,
+            source_observed_at integer,
+            source_timestamp_quality text not null default 'legacy_unverified'
+            ,profile_fingerprint text
+            ,engine_rpm_state_json text
         );
         create index if not exists power_observations_time
             on power_observations(observed_at);
@@ -102,6 +110,10 @@ def connect_power(path: Path | None = None) -> sqlite3.Connection:
         "underway_state": "text",
         "distance_from_dock_ft": "real",
         "dock_radius_ft": "real",
+        "source_observed_at": "integer",
+        "source_timestamp_quality": "text not null default 'legacy_unverified'",
+        "profile_fingerprint": "text",
+        "engine_rpm_state_json": "text",
     }.items():
         if column not in existing_columns:
             conn.execute(f"alter table power_observations add column {column} {declaration}")
@@ -110,6 +122,8 @@ def connect_power(path: Path | None = None) -> sqlite3.Connection:
 
 
 def _optional_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         if value in ("", None, "unknown", "unavailable"):
             return None
@@ -132,9 +146,19 @@ def put_power_observation(
     battery_voltage_v: Any,
     battery_soc_pct: Any,
     observed_at: int | None = None,
+    source_observed_at: int | None = None,
+    source_timestamp_quality: str | None = None,
+    profile_fingerprint: str | None = None,
+    engine_rpms: dict[str, Any] | None = None,
     path: Path | None = None,
 ) -> dict[str, Any]:
     timestamp = int(observed_at or time.time())
+    source_timestamp = int(source_observed_at) if source_observed_at is not None else timestamp
+    quality = str(source_timestamp_quality or ("verified" if source_observed_at is not None else "legacy_unverified"))
+    if source_observed_at is None:
+        quality = "legacy_unverified"
+    if quality not in {"verified", "legacy_unverified"}:
+        quality = "legacy_unverified"
     normalized_state = str(shore_power_state or "unknown").strip().lower()
     if normalized_state not in {"on", "off"}:
         normalized_state = "unknown"
@@ -153,6 +177,12 @@ def put_power_observation(
         "battery_current_a": _optional_float(battery_current_a),
         "battery_voltage_v": _optional_float(battery_voltage_v),
         "battery_soc_pct": _optional_float(battery_soc_pct),
+        "source_observed_at": source_timestamp,
+        "source_timestamp_quality": quality,
+        "profile_fingerprint": profile_fingerprint or (profile_runtime.current()["fingerprint"] if profile_runtime else None),
+        "engine_rpm_state_json": (json.dumps({str(k): _optional_float(v) for k, v in engine_rpms.items()}, sort_keys=True) if engine_rpms is not None else None),
+        "engine_rpms": {str(k): _optional_float(v) for k, v in (engine_rpms or {}).items()},
+        "engine_state_explicit": engine_rpms is not None,
     }
     conn = connect_power(path)
     with conn:
@@ -161,8 +191,9 @@ def put_power_observation(
             insert into power_observations (
                 observed_at, shore_power_state, underway_state, distance_from_dock_ft, dock_radius_ft,
                 port_rpm, starboard_rpm,
-                battery_power_w, battery_current_a, battery_voltage_v, battery_soc_pct
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                battery_power_w, battery_current_a, battery_voltage_v, battery_soc_pct,
+                source_observed_at, source_timestamp_quality, profile_fingerprint, engine_rpm_state_json
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(observed_at) do update set
                 shore_power_state = excluded.shore_power_state,
                 underway_state = excluded.underway_state,
@@ -173,9 +204,17 @@ def put_power_observation(
                 battery_power_w = excluded.battery_power_w,
                 battery_current_a = excluded.battery_current_a,
                 battery_voltage_v = excluded.battery_voltage_v,
-                battery_soc_pct = excluded.battery_soc_pct
+                battery_soc_pct = excluded.battery_soc_pct,
+                source_observed_at = excluded.source_observed_at,
+                source_timestamp_quality = excluded.source_timestamp_quality
+                ,profile_fingerprint = excluded.profile_fingerprint,
+                engine_rpm_state_json = excluded.engine_rpm_state_json
             """,
-            tuple(observation[key] for key in observation),
+            tuple(observation[key] for key in (
+                "observed_at", "shore_power_state", "underway_state", "distance_from_dock_ft", "dock_radius_ft",
+                "port_rpm", "starboard_rpm", "battery_power_w", "battery_current_a", "battery_voltage_v", "battery_soc_pct",
+                "source_observed_at", "source_timestamp_quality", "profile_fingerprint", "engine_rpm_state_json",
+            )),
         )
     conn.close()
     observation["observed_at_local"] = dt.datetime.fromtimestamp(timestamp, LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
@@ -198,9 +237,19 @@ def classify_power_observation(observation: dict[str, Any], engine_rpm: float = 
         if observation.get("shore_power_state") == "on":
             return "charging_proxy_on_near_dock"
         return "shore_connection_unknown"
+    dynamic = observation.get("engine_rpms")
+    if isinstance(dynamic, dict) and observation.get("engine_state_explicit"):
+        rpms = [_optional_float(value) for value in dynamic.values()]
+        if any(value is None or value < 0 for value in rpms):
+            return "engine_state_unknown"
+        if any(value >= engine_rpm for value in rpms):
+            return "engine_running"
+        if _optional_float(observation.get("battery_power_w")) is None:
+            return "battery_power_unknown"
+        return "off_shore_engines_off"
     port_rpm = _optional_float(observation.get("port_rpm"))
     starboard_rpm = _optional_float(observation.get("starboard_rpm"))
-    if port_rpm is None or starboard_rpm is None:
+    if port_rpm is None or starboard_rpm is None or port_rpm < 0 or starboard_rpm < 0:
         return "engine_state_unknown"
     if port_rpm >= engine_rpm or starboard_rpm >= engine_rpm:
         return "engine_running"
@@ -229,6 +278,7 @@ def power_tracking_summary(
     now: int | None = None,
     path: Path | None = None,
     max_gap_seconds: int = POWER_MAX_GAP_SECONDS,
+    profile_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     end = int(now or time.time())
     start = end - max(1, int(days)) * 86400
@@ -237,8 +287,8 @@ def power_tracking_summary(
         dict(row)
         for row in conn.execute(
             """
-            select observed_at, shore_power_state, underway_state, distance_from_dock_ft, dock_radius_ft,
-                   port_rpm, starboard_rpm,
+            select observed_at, source_observed_at, source_timestamp_quality, profile_fingerprint, shore_power_state, underway_state, distance_from_dock_ft, dock_radius_ft,
+                   port_rpm, starboard_rpm, engine_rpm_state_json,
                    battery_power_w, battery_current_a, battery_voltage_v, battery_soc_pct
             from power_observations
             where observed_at >= ? and observed_at <= ?
@@ -251,17 +301,59 @@ def power_tracking_summary(
     first_row = conn.execute("select min(observed_at) from power_observations").fetchone()
     conn.close()
 
-    visible_rows = [row for row in rows if int(row["observed_at"]) >= start]
-    qualifying = [row for row in visible_rows if classify_power_observation(row) == "off_shore_engines_off"]
+    runtime = profile_runtime.current() if profile_runtime else {"fingerprint": None, "legacy": True}
+    active_fp = profile_fingerprint or runtime["fingerprint"]
+    allow_unfingerprinted = bool(runtime.get("legacy") and profile_fingerprint is None)
+    visible_rows = [
+        row for row in rows
+        if int(row["observed_at"]) >= start
+        and (row.get("profile_fingerprint") == active_fp or (allow_unfingerprinted and not row.get("profile_fingerprint")))
+    ]
+    for row in rows:
+        try:
+            row["engine_state_explicit"] = bool(row.get("engine_rpm_state_json"))
+            row["engine_rpms"] = json.loads(row.get("engine_rpm_state_json") or "{}")
+        except (TypeError, json.JSONDecodeError): row["engine_rpms"] = {}
+    qualifying = [
+        row for row in visible_rows
+        if row.get("source_timestamp_quality") == "verified"
+        and classify_power_observation(row) == "off_shore_engines_off"
+    ]
     positive_wh = 0.0
     negative_wh = 0.0
     net_wh = 0.0
     covered_seconds = 0.0
     valid_intervals = 0
     skipped_gaps = 0
+    source_barrier = False
+    source_highwater: int | None = None
     for previous, current in zip(rows, rows[1:]):
-        previous_time = int(previous["observed_at"])
-        current_time = int(current["observed_at"])
+        previous_ok = previous.get("profile_fingerprint") == active_fp or (allow_unfingerprinted and not previous.get("profile_fingerprint"))
+        current_ok = current.get("profile_fingerprint") == active_fp or (allow_unfingerprinted and not current.get("profile_fingerprint"))
+        if not (previous_ok and current_ok):
+            # Retain mismatched rows as barriers: removing them would
+            # accidentally integrate an interval across a profile switch.
+            continue
+        if previous.get("source_timestamp_quality") != "verified" or current.get("source_timestamp_quality") != "verified":
+            continue
+        previous_time = int(previous.get("source_observed_at") or previous["observed_at"])
+        current_time = int(current.get("source_observed_at") or current["observed_at"])
+        if current_time <= previous_time:
+            # Repeated/stale source timestamps are retained as observations but
+            # cannot represent elapsed time or add energy.
+            source_barrier = True
+            source_highwater = max(source_highwater or previous_time, previous_time, current_time)
+            continue
+        if source_highwater is not None and previous_time < source_highwater:
+            source_barrier = True
+            source_highwater = max(source_highwater, current_time)
+            continue
+        if source_barrier:
+            if previous_time == source_highwater:
+                source_barrier = False
+            else:
+                source_highwater = max(source_highwater or current_time, current_time)
+                continue
         interval_start = max(previous_time, start)
         interval_end = min(current_time, end)
         seconds = interval_end - interval_start
@@ -291,6 +383,7 @@ def power_tracking_summary(
         net_wh += (previous_power + current_power) * 0.5 * hours
         covered_seconds += seconds
         valid_intervals += 1
+        source_highwater = current_time
 
     first_timestamp = int(first_row[0]) if first_row and first_row[0] is not None else None
     latest = visible_rows[-1] if visible_rows else (rows[-1] if rows else None)
@@ -303,6 +396,7 @@ def power_tracking_summary(
     covered_hours = covered_seconds / 3600.0
     confidence = "none" if valid_intervals == 0 else "low" if covered_hours < 6 else "medium"
     return {
+        "calculation_version": 2,
         "label": f"last {max(1, int(days))} days",
         "lookback_days": max(1, int(days)),
         "tracking_started_local": (
@@ -311,6 +405,8 @@ def power_tracking_summary(
             else None
         ),
         "observation_count": len(visible_rows),
+        "verified_observation_count": sum(1 for row in visible_rows if row.get("source_timestamp_quality") == "verified"),
+        "unverified_legacy_observation_count": sum(1 for row in visible_rows if row.get("source_timestamp_quality") != "verified"),
         "total_observation_count": total_count,
         "qualifying_sample_count": len(qualifying),
         "valid_interval_count": valid_intervals,
@@ -331,9 +427,10 @@ def power_tracking_summary(
         "limitations": [
             "No dedicated solar-controller signal is present.",
             "The Home Assistant shore-power entity is a battery-charging proxy, not a physical AC-input sensor.",
-            "Positive SmartShunt power is counted only when underway, beyond the configured dock radius, or the charging proxy is off, with both engines below 200 RPM.",
+            "Positive configured-battery power is counted only when underway, beyond the configured dock radius, or the charging proxy is off, with configured engines below 200 RPM.",
             "This is net battery charging after onboard loads, not gross panel production.",
             "Intervals longer than 15 minutes are excluded instead of interpolated.",
+            "Legacy observations without verified source timestamps are retained for visibility but excluded from energy integration.",
         ],
     }
 

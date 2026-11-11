@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'boat-chat'))
 import app
+import profile_runtime
 from cruise_efficiency import speed_bands
 
 
@@ -25,15 +26,20 @@ def main():
         speed_bands([], args.minimum, args.maximum, args.step)
     except ValueError as exc:
         parser.error(str(exc))
+    runtime = profile_runtime.snapshot()
+    engines = [e for e in runtime["profile"].get("engines", []) if e.get("fuel_rate_supported")]
+    if not engines:
+        parser.error("no configured fuel-capable engines")
+    filters = " or ".join(f'r._measurement == "{e["path"]}.fuel.rate" or r._measurement == "{e["path"]}.revolutions"' for e in engines)
     query = f'''from(bucket: "{app.INFLUX_HISTORY_BUCKET}")
       |> range(start: -{args.days}d)
-      |> filter(fn: (r) => r._measurement == "propulsion.port.fuel.rate" or r._measurement == "propulsion.starboard.fuel.rate" or r._measurement == "propulsion.port.revolutions" or r._measurement == "propulsion.starboard.revolutions" or r._measurement == "navigation.speedOverGround")
+      |> filter(fn: (r) => {filters} or r._measurement == "navigation.speedOverGround")
       |> filter(fn: (r) => r._field == "value")
       |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
       |> keep(columns: ["_time", "_measurement", "_value"])
       |> pivot(rowKey: ["_time"], columnKey: ["_measurement"], valueColumn: "_value")
       |> sort(columns: ["_time"])'''
-    result = speed_bands(app.query_influx(query), args.minimum, args.maximum, args.step)
+    result = speed_bands(app.query_influx(query), args.minimum, args.maximum, args.step, engines=engines)
     result['lookback_days'] = args.days
     if args.json:
         print(json.dumps(result, indent=2, allow_nan=False))
