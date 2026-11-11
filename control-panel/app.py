@@ -656,9 +656,13 @@ def release_lifecycle_slot(slot_fd) -> None:
     try:
         if isinstance(slot_fd, LifecycleSlot):
             try:
-                release_slot(slot_fd.browser_fd)
-            finally:
+                # Release the shared lock first.  Detached browser-update workers
+                # wait on the browser fd and then immediately acquire this lock;
+                # reversing the order avoids waking one before the parent has
+                # actually released the shared lifecycle reservation.
                 slot_fd.shared.release()
+            finally:
+                release_slot(slot_fd.browser_fd)
         else:
             release_slot(slot_fd)
     finally:

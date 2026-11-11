@@ -149,7 +149,9 @@ Direct `deploy-chat.py` apply/rollback operations also use the shared lock;
 read-only preview operations remain unlocked.
 The real-systemd browser-update acceptance fixture copies these shared modules
 alongside the panel so its service-start check exercises the same import set as
-an installed release.
+an installed release. The panel releases the shared lifecycle lock before handing
+off its browser-update lock, so a detached updater cannot wake between those two
+steps and report a spurious busy state.
 
 ## Optional integrations
 
