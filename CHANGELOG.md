@@ -3,6 +3,26 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.7.0 - 2026-11-10
+
+### Highlights
+
+- Added boat profiles and shared configuration registration for explicit boat identity,
+  units, timezone, solar and display-related settings, with a documented example and
+  migration-safe additive configuration behavior.
+- Added telemetry correctness and cache/index improvements, transactional restore
+  handling, shared lifecycle locking, and mode reconciliation for installer, Control
+  Panel, Boat Chat, and profile operations.
+- Added lifecycle reconciliation and reliability checks across update, restore, and
+  component callers. Existing backups remain the rollback path; use the full installer
+  for common-module and configuration changes rather than an application-only update.
+- Upgrade from 0.6.4 with the verified backup workflow. Database changes add columns
+  only; historical data has not been re-verified by physical-device testing.
+
+This is a pre-release. Physical Raspberry Pi acceptance is still pending, so it is not
+the release marked Latest. Do not deploy it to a boat until the documented Pi and
+lifecycle acceptance checks pass.
+
 ## 0.6.4 - 2026-11-08
 
 ### Highlights
