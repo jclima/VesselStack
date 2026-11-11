@@ -492,7 +492,8 @@ services are updated together; the application-only updater is not sufficient fo
 this release. The installer takes a verified backup first. If rollback is needed,
 verify and restore that backup rather than downgrading. Database changes are
 additive columns only; historical samples without verified source timestamps remain
-excluded from inferred-energy calculations.
+excluded from inferred-energy calculations. For release-history context, 0.6.3 was
+promoted after physical Pi acceptance, while 0.6.2 was marked Latest directly.
 
 ## Upgrading to 0.6.0
 

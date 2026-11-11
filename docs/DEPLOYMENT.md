@@ -30,8 +30,9 @@ the section 7 acceptance gate remain release-owner steps.
 History: `v0.5.7` was published as an unsigned lab prerelease that was not marked latest, and
 `v0.4.4` stayed the release GitHub marks Latest through the 0.5.x series. The `v0.5.1` tag is
 untouched; its release pipeline was blocked by the bridge startup-status race. `v0.6.4` was the
-previous release and is the update source for the rehearsal in section 3.5.1. `v0.6.3` was marked Latest
-directly rather than after physical Pi acceptance. `v0.6.1` and `v0.6.0` were published first as
+previous release and is the update source for the rehearsal in section 3.5.1. `v0.6.3` was published
+first as a pre-release and marked Latest after physical Pi acceptance; `v0.6.2` was marked Latest
+directly rather than staying a pre-release. `v0.6.1` and `v0.6.0` were published first as
 pre-releases and marked Latest only after physical Pi acceptance. Published
 tags are never recreated, moved or promoted by retagging.
 
