@@ -29,8 +29,8 @@ the section 7 acceptance gate remain release-owner steps.
 
 History: `v0.5.7` was published as an unsigned lab prerelease that was not marked latest, and
 `v0.4.4` stayed the release GitHub marks Latest through the 0.5.x series. The `v0.5.1` tag is
-untouched; its release pipeline was blocked by the bridge startup-status race. `v0.6.3` was the
-previous release (the update source for the rehearsal in section 3.5.1). `v0.6.2` was marked Latest
+untouched; its release pipeline was blocked by the bridge startup-status race. `v0.6.4` was the
+previous release and is the update source for the rehearsal in section 3.5.1. `v0.6.3` was marked Latest
 directly rather than after physical Pi acceptance. `v0.6.1` and `v0.6.0` were published first as
 pre-releases and marked Latest only after physical Pi acceptance. Published
 tags are never recreated, moved or promoted by retagging.
@@ -519,7 +519,7 @@ values, and record the `doctor` result and data-directory size each day.
    8. Token rotation: rotate `CONTROL_PANEL_TOKEN` (panel Settings or the installer) and confirm every
       remembered device is signed out while the new token works.   # [MUTATES HOST]
 
-7. **Atomic `vesselstackctl` install.** On the lab Pi, with an update from an older release (0.6.3 or
+7. **Atomic `vesselstackctl` install.** On the lab Pi, with an update from an older release (0.6.4 or
    earlier, section 3.5.1). Record the outcome in your private lab notes, not in the repository.
 
    1. Run `sudo vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.7.0` from the older

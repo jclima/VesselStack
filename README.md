@@ -491,8 +491,8 @@ full installer or `vesselstackctl update` so shared modules, configuration and
 services are updated together; the application-only updater is not sufficient for
 this release. The installer takes a verified backup first. If rollback is needed,
 verify and restore that backup rather than downgrading. Database changes are
-additive columns only; historical telemetry has not been re-verified on physical
-hardware.
+additive columns only; historical samples without verified source timestamps remain
+excluded from inferred-energy calculations.
 
 ## Upgrading to 0.6.0
 

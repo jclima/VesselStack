@@ -70,6 +70,8 @@ Do not build and upload files by hand.
    caught the bridge startup-status race. `v0.6.4` is an SSH-signed tag, published first as a
    pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes
    (see the CHANGELOG).
+   The current `v0.7.0` work is pre-release preparation only: it is not Latest and
+   physical Raspberry Pi acceptance remains pending.
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate
