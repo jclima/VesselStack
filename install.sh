@@ -3,6 +3,7 @@
 
 set -euo pipefail
 umask 077
+export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$SCRIPT_DIR
@@ -37,6 +38,32 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$CONFIG_FILE" ] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# Validate registry-owned values without sourcing or evaluating the input file.
+# Unknown keys remain available to the installer for legacy/provider settings.
+python3 - "$CONFIG_FILE" "$SCRIPT_DIR" <<'PY'
+import re, shlex, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from common.config_registry import SETTINGS, validate_value
+path = Path(sys.argv[1])
+for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"): continue
+    match = re.fullmatch(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+    if not match: raise SystemExit(f"Invalid config line {number}: expected KEY=VALUE")
+    key, encoded = match.groups()
+    if key not in SETTINGS: continue
+    try: tokens = shlex.split(encoded, posix=True, comments=True)
+    except ValueError as exc: raise SystemExit(f"Invalid quoting for {key} on line {number}: {exc}")
+    if len(tokens) > 1: raise SystemExit(f"Invalid value for {key} on line {number}")
+    value = tokens[0] if tokens else ""
+    # The shell preflight below owns legacy nautical normalization and the
+    # interactive remediation path for invalid units.
+    if key == "BOAT_UNITS": continue
+    if key in {"VESSELSTACK_UID", "VESSELSTACK_GID"} and value == "0": continue
+    try: validate_value(key, value)
+    except ValueError as exc: raise SystemExit(f"Invalid {key}: {exc}")
+PY
 # Prompt helpers for the fixes offered below (see scripts/lib/remediate.sh).
 # shellcheck source=scripts/lib/remediate.sh
 source "$SCRIPT_DIR/scripts/lib/remediate.sh"
@@ -50,6 +77,20 @@ FIX_BOAT_UNITS=0
 FIX_TOKEN_KEY=
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+
+# Acquire before remediation prompts: config fixes below can write the input
+# file and must serialize with every other lifecycle mutation. Dry runs remain
+# read-only and deliberately skip this block.
+if [ "$DRY_RUN" -eq 0 ]; then
+    [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+    LIFECYCLE_LOCK_HELPER="$SOURCE_ROOT/common/lifecycle_lock.py"
+    [ -r "$LIFECYCLE_LOCK_HELPER" ] || { echo "Missing lifecycle lock helper: $LIFECYCLE_LOCK_HELPER" >&2; exit 1; }
+    if [ -n "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
+        python3 -I "$LIFECYCLE_LOCK_HELPER" check --root "$VESSELSTACK_ROOT" --system-root "${VESSELSTACK_SYSTEM_ROOT:-}" || exit $?
+    else
+        exec python3 -I "$LIFECYCLE_LOCK_HELPER" run --root "$VESSELSTACK_ROOT" --system-root "${VESSELSTACK_SYSTEM_ROOT:-}" -- "$SCRIPT_DIR/install.sh" "${ORIGINAL_ARGS[@]}"
+    fi
+fi
 
 # Existing 0.x installations did not define configurable bucket names.
 : "${INFLUXDB_RAW_BUCKET:=vesselstack_raw}"
@@ -94,11 +135,18 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 # never carries it (it lives in config/boat-chat.env), so a re-render from it must keep
 # the installed value (for example one set by `vesselstackctl lan local`), not reset it.
 BOAT_CHAT_HOST_FROM_CONFIG=${BOAT_CHAT_HOST+x}
+BOAT_CHAT_PORT_FROM_CONFIG=${BOAT_CHAT_PORT+x}
 : "${BOAT_CHAT_HOST:=0.0.0.0}"
 : "${VESSELSTACK_DATA_BIND_ADDRESS:=127.0.0.1}"
 : "${VESSELSTACK_WEB_BIND_ADDRESS:=0.0.0.0}"
 : "${HOMEASSISTANT_BIND_ADDRESS:=0.0.0.0}"
 : "${BOAT_CHAT_PORT:=8765}"
+# Preserve an existing Boat Chat Settings-page port when the installer input
+# omits BOAT_CHAT_PORT, so collision checks match the effective endpoint.
+if [ -z "${BOAT_CHAT_PORT_FROM_CONFIG:-}" ] && [ -r "$SOURCE_ROOT/common/config_registry.py" ]; then
+    BOAT_CHAT_PORT=$(python3 -I "$SOURCE_ROOT/common/config_registry.py" --endpoint-root "$VESSELSTACK_ROOT" 2>/dev/null | \
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["port"])') || exit 1
+fi
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
@@ -127,7 +175,12 @@ fi
 : "${PROMETHEUS_RETENTION:=30d}"
 : "${VESSELSTACK_DISABLED_COMPONENTS:=}"
 
-CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
+if [ -r "$SOURCE_ROOT/common/config_registry.py" ]; then
+    CORE_COMPONENTS=()
+    while IFS= read -r component; do CORE_COMPONENTS+=("$component"); done < <(python3 -I "$SOURCE_ROOT/common/config_registry.py" --core-components)
+else
+    CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
+fi
 disabled_input=$VESSELSTACK_DISABLED_COMPONENTS
 VESSELSTACK_DISABLED_COMPONENTS=""
 component_disabled() { case ",${VESSELSTACK_DISABLED_COMPONENTS}," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
@@ -157,6 +210,15 @@ required=(BOAT_NAME BOAT_TIMEZONE VESSELSTACK_USER VESSELSTACK_ROOT VESSELSTACK_
 for key in "${required[@]}"; do
     [ -n "${!key:-}" ] || { echo "Required setting is empty: $key" >&2; exit 1; }
 done
+# Validate an existing boat profile before any installation mutation. A missing
+# profile is initialized only after the canonical env and configured GID exist.
+PROFILE_PATH="$VESSELSTACK_ROOT/config/boat-profile.json"
+if [ -e "$PROFILE_PATH" ] || [ -L "$PROFILE_PATH" ]; then
+    python3 "$SOURCE_ROOT/common/boat_profile_cli.py" validate "$PROFILE_PATH" >/dev/null || {
+        echo "Existing boat profile is invalid; refusing to modify the installation." >&2
+        exit 1
+    }
+fi
 
 case "$VESSELSTACK_ROOT:$VESSELSTACK_DATA" in
     *" "*) echo "Install paths cannot contain spaces" >&2; exit 1 ;;
@@ -942,6 +1004,16 @@ if ! python3 -m venv "$STAGING_VENV" \
     exit 1
 fi
 
+if [ "$START" -eq 1 ]; then
+    # Reconcile before managed data ownership repair or native installation can
+    # touch SignalK shared state. Desired values are from validated input.
+    VESSELSTACK_DESIRED_SIGNALK_MODE="$SIGNALK_MODE" \
+        VESSELSTACK_DESIRED_AIS_ENABLE="$AIS_ENABLE" \
+        VESSELSTACK_DESIRED_SOCKETCAN_ENABLE="$SOCKETCAN_ENABLE" \
+        SYSTEM_ROOT="$SYSTEM_ROOT" "$SCRIPT_DIR/scripts/reconcile-lifecycle.sh" \
+        "$VESSELSTACK_ROOT/config/vesselstack.env" apply
+fi
+
 # Only boats that opt in need the extra network download. It runs before
 # anything is rendered, so an offline boat fails here with the installation
 # untouched. The environment is root-owned but readable by the service user
@@ -1197,7 +1269,9 @@ tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -c
 # Shared stdlib-only modules (sign-in store and CLI helper). Root-owned and
 # not writable by anyone else: the panel and vesselstackctl load them as root.
 install -d -m 0755 "$VESSELSTACK_ROOT/common"
-install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$SOURCE_ROOT/common/qrcodegen.py" "$VESSELSTACK_ROOT/common/"
+install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$SOURCE_ROOT/common/qrcodegen.py" \
+    "$SOURCE_ROOT/common/config_registry.py" "$SOURCE_ROOT/common/boat_profile.py" "$SOURCE_ROOT/common/boat_profile_cli.py" \
+    "$SOURCE_ROOT/common/lifecycle_lock.py" "$VESSELSTACK_ROOT/common/"
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -
 # GNU tar run as root keeps the archive's modes, which are only as readable as the
@@ -1210,6 +1284,9 @@ if [ "$SOURCE_ROOT" != "$VESSELSTACK_ROOT/installer" ]; then
     tar -C "$SOURCE_ROOT" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' \
         -cf - install.sh VERSION scripts systemd templates boat-chat control-panel common displays \
         | tar --no-same-owner -C "$VESSELSTACK_ROOT/installer" -xf -
+    # The installer UI uses the same icon as the release package.
+    install -d -m 0755 "$VESSELSTACK_ROOT/installer/brand"
+    install -m 0644 "$SOURCE_ROOT/brand/icon.png" "$VESSELSTACK_ROOT/installer/brand/icon.png"
 fi
 # The source application keeps legacy defaults for compatibility. Installed
 # branding is vessel-specific; the generated facts file remains authoritative.
@@ -1351,6 +1428,9 @@ install -m 0755 "$SCRIPT_DIR/scripts/vesselstack-firewall" "$SBIN_DIR/vesselstac
 # this installer (i.e. from a reviewed/verified release tree).
 install -d -m 0755 -o root -g root "$LIBEXEC_PARENT" "$LIBEXEC_DIR"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-update" "$SBIN_DIR/vesselstack-update"
+if [ "$SCRIPT_DIR/scripts/reconcile-lifecycle.sh" != "$VESSELSTACK_ROOT/installer/scripts/reconcile-lifecycle.sh" ]; then
+    install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/reconcile-lifecycle.sh" "$VESSELSTACK_ROOT/installer/scripts/reconcile-lifecycle.sh"
+fi
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
@@ -1371,6 +1451,9 @@ while IFS= read -r key; do
     env_line "$key" "${!key:-}" >> "$vs_env_tmp"
 done < <(vesselstack_env_keys)
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
+if [ ! -e "$VESSELSTACK_ROOT/config/boat-profile.json" ] && [ ! -L "$VESSELSTACK_ROOT/config/boat-profile.json" ]; then
+    python3 -I "$VESSELSTACK_ROOT/common/boat_profile_cli.py" init --root "$VESSELSTACK_ROOT" >/dev/null
+fi
 
 # Tokens as installed before this run, to notice a rotation afterwards (plain text compare, never evaluated;
 # the app env files are writable by the service user).
@@ -1401,6 +1484,7 @@ done
 for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
     key_given=${!key+x}
     [ "$key" != BOAT_CHAT_HOST ] || key_given=$BOAT_CHAT_HOST_FROM_CONFIG
+    [ "$key" != BOAT_CHAT_PORT ] || key_given=$BOAT_CHAT_PORT_FROM_CONFIG
     if [ -n "$key_given" ]; then
         sed -i "/^${key}=/d" "$boat_chat_temp"
         env_line "$key" "${!key}" >> "$boat_chat_temp"

@@ -324,6 +324,8 @@ class PowerTrackingTests(unittest.TestCase):
                     battery_voltage_v=13.0,
                     battery_soc_pct=80,
                     observed_at=start + offset,
+                    source_observed_at=start + offset,
+                    source_timestamp_quality="verified",
                     path=path,
                 )
             summary = telemetry_cache.power_tracking_summary(days=1, now=start + 600, path=path)
@@ -341,7 +343,7 @@ class PowerTrackingTests(unittest.TestCase):
                 telemetry_cache.put_power_observation(
                     shore_power_state="off", port_rpm=0, starboard_rpm=0, battery_power_w=power,
                     battery_current_a=power / 13.0, battery_voltage_v=13.0, battery_soc_pct=80,
-                    observed_at=start + offset, path=path,
+                    observed_at=start + offset, source_observed_at=start + offset, source_timestamp_quality="verified", path=path,
                 )
             summary = telemetry_cache.power_tracking_summary(days=1, now=start + 600, path=path)
             hours = 600 / 3600.0
@@ -356,7 +358,7 @@ class PowerTrackingTests(unittest.TestCase):
                 telemetry_cache.put_power_observation(
                     shore_power_state="off", port_rpm=0, starboard_rpm=0, battery_power_w=power,
                     battery_current_a=power / 13.0, battery_voltage_v=13.0, battery_soc_pct=80,
-                    observed_at=start + offset, path=path,
+                    observed_at=start + offset, source_observed_at=start + offset, source_timestamp_quality="verified", path=path,
                 )
             summary = telemetry_cache.power_tracking_summary(days=1, now=start + 300, path=path)
             self.assertEqual(summary["peak_inferred_charge_w"], 0.0)
@@ -382,6 +384,8 @@ class PowerTrackingTests(unittest.TestCase):
                     battery_voltage_v=13.0,
                     battery_soc_pct=80,
                     observed_at=start + offset,
+                    source_observed_at=start + offset,
+                    source_timestamp_quality="verified",
                     path=path,
                 )
             summary = telemetry_cache.power_tracking_summary(days=1, now=start + 1800, path=path)
@@ -406,6 +410,8 @@ class PowerTrackingTests(unittest.TestCase):
                     battery_voltage_v=13.3,
                     battery_soc_pct=80,
                     observed_at=start + offset,
+                    source_observed_at=start + offset,
+                    source_timestamp_quality="verified",
                     path=path,
                 )
             summary = telemetry_cache.power_tracking_summary(days=1, now=start + 300, path=path)

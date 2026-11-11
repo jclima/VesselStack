@@ -54,7 +54,7 @@ class ProcessRunnerTests(unittest.TestCase):
     def test_update_children_never_wait_for_a_terminal(self) -> None:
         # The panel cannot answer prompts, so every child it launches runs non-interactively.
         source = (ROOT / "control-panel" / "browser_updates.py").read_text()
-        self.assertRegex(source, r'child_env = dict\(os\.environ,[^\n]*VESSELSTACK_NONINTERACTIVE="true"')
+        self.assertRegex(source, r'base_env = dict\(os\.environ,[^\n]*VESSELSTACK_NONINTERACTIVE="true"')
         self.assertIn("install_env = dict(child_env)", source)
 
     def test_nonzero_child_preserves_actionable_tail_and_never_completes(self) -> None:

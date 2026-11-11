@@ -4,27 +4,16 @@
 import argparse, contextlib, hmac, importlib.util, ipaddress, json, os, platform, re, secrets, shlex, shutil, subprocess, sys, threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 ROOT = Path(__file__).resolve().parent
 WIZARD = ROOT / "wizard"
 OUTPUT = ROOT / "vesselstack.env"
 ALLOWED = re.compile(r"^[A-Za-z0-9 _.,:/@+()-]*$")
 CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "homepage")
-
-DEFAULTS = {
- "SIGNALK_VESSELTWIN_PRELOAD":"true",
- "BOAT_NAME":"My Boat","BOAT_TYPE":"Motor vessel","BOAT_MMSI":"","BOAT_CALLSIGN":"","BOAT_LOA_M":"","BOAT_BEAM_M":"","BOAT_TIMEZONE":"UTC","BOAT_UNITS":"us_customary",
- "VESSELSTACK_USER":"boat","VESSELSTACK_UID":"1000","VESSELSTACK_GID":"1000","VESSELSTACK_ROOT":"/opt/vesselstack","VESSELSTACK_DATA":"/opt/vesselstack-data","VESSELSTACK_BACKUP":"/media/vesselstack-backup/backups",
- "SIGNALK_MODE":"docker","SIGNALK_VERSION":"v2.27.0","SIGNALK_URL":"http://127.0.0.1:3000","SOCKETCAN_ENABLE":"false","VESSELSTACK_CAN_CREATE_VCAN":"false","SOCKETCAN_INTERFACE":"can0","SOCKETCAN_BITRATE":"250000",
- "AIS_ENABLE":"false","AIS_IMAGE":"ghcr.io/jvde-github/ais-catcher:v0.70","AIS_DEVICE":"/dev/bus/usb","AIS_CATCHER_ARGS":"-q -N 8100 -S 5011","AIS_WEB_PORT":"8100","AIS_TCP_PORT":"5011",
- "HOME_ASSISTANT_URL":"http://127.0.0.1:8123","HOME_ASSISTANT_TOKEN":"","INFLUXDB_URL":"http://127.0.0.1:8086","INFLUXDB_PORT":"8086","INFLUXDB_CONTAINER_NAME":"vesselstack-influxdb","INFLUXDB_ORG":"vesselstack","INFLUXDB_USERNAME":"boatadmin",
- "INFLUXDB_RAW_BUCKET":"signalk","INFLUXDB_HISTORY_BUCKET":"signalk_1m","INFLUXDB_HOME_ASSISTANT_BUCKET":"homeassistant","INFLUXDB_AIS_BUCKET":"ais","INFLUXDB_RAW_RETENTION":"","INFLUXDB_PASSWORD":"GENERATE","INFLUXDB_TOKEN":"GENERATE","GRAFANA_ADMIN_PASSWORD":"GENERATE",
- "MQTT_USERNAME":"homeassistant","MQTT_PASSWORD":"GENERATE","MQTT_PORT":"1883","BOAT_CHAT_PROVIDER":"local","BOAT_CHAT_HOST":"0.0.0.0","BOAT_CHAT_PORT":"8765","BOAT_CHAT_SETTINGS_TOKEN":"GENERATE","BOAT_CHAT_ACCESS_TOKEN":"GENERATE","VESSELSTACK_DATA_BIND_ADDRESS":"127.0.0.1","VESSELSTACK_WEB_BIND_ADDRESS":"0.0.0.0","HOMEASSISTANT_BIND_ADDRESS":"0.0.0.0","TELEGRAM_ENABLE":"false","TELEMETRY_INDEXER_ENABLE":"true","NODE_EXPORTER_ENABLE":"false",
- "GRAFANA_PORT":"43000","HOMEPAGE_PORT":"80","PROMETHEUS_PORT":"9090","PROMETHEUS_RETENTION":"30d","VESSELSTACK_UNTRUSTED_INTERFACE":"wlan0","VESSELSTACK_FIREWALL_ENABLE":"false","VESSELSTACK_FIREWALL_STRICT":"false","VESSELSTACK_FIREWALL_ALLOW_TCP":"22","VESSELSTACK_FIREWALL_ALLOW_UDP":"","CONTROL_PANEL_HOST":"127.0.0.1","CONTROL_PANEL_PORT":"8780",
- "DISPLAYS_ENABLE":"false","DISPLAYS_BRIDGE_MQTT_USERNAME":"vesselstack-bridge","DISPLAYS_SIGNALK_TOKEN":"","DISPLAYS_HA_TOKEN":"",
- "VESSELSTACK_DISABLED_COMPONENTS":"","HOMEPAGE_ALLOWED_HOSTS":"","HOMEPAGE_ALLOWED_HOSTS_EXTRA":"",
- "CONTROL_PANEL_PASSPHRASE_HASH":"","BOAT_CHAT_PASSPHRASE_HASH":"",
-}
+from common.config_registry import DEFAULTS as REGISTRY_DEFAULTS, CORE_COMPONENTS as REGISTRY_CORE_COMPONENTS, validate_value as registry_validate_value
+CORE_COMPONENTS = REGISTRY_CORE_COMPONENTS
+DEFAULTS = dict(REGISTRY_DEFAULTS)
 # Sign-in passphrases are hashed here (scrypt, the shared module) and only the hash is ever written; install.sh
 # imports each hash into its sign-in store and removes the key. The plaintext never reaches validate() or render().
 HASH_KEYS=("CONTROL_PANEL_PASSPHRASE_HASH","BOAT_CHAT_PASSPHRASE_HASH")
@@ -85,15 +74,14 @@ def normalize_units(value):
     return text if text in {"us_customary","metric"} else value
 
 def validate(values):
-    unknown=set(values)-set(DEFAULTS)
-    if unknown: raise ValueError("Unknown settings: "+", ".join(sorted(unknown)))
     result=DEFAULTS.copy()
     for key,value in values.items():
         if key in HASH_KEYS:
             if not isinstance(value,str) or (value and not auth_module().valid_hash(value)): raise ValueError(f"Invalid value for {key}: it must be a hash made by this wizard")
             result[key]=value; continue
         if not isinstance(value,str) or "\n" in value or "\r" in value or not ALLOWED.fullmatch(value): raise ValueError(f"Invalid value for {key}")
-        result[key]=value
+        if key == "BOAT_UNITS": value = normalize_units(value)
+        result[key]=registry_validate_value(key,value)
     result["VESSELSTACK_DISABLED_COMPONENTS"] = normalize_disabled_components(result["VESSELSTACK_DISABLED_COMPONENTS"])
     if result["SIGNALK_MODE"] not in {"existing","docker","native"}: raise ValueError("Invalid SignalK mode")
     result["BOAT_UNITS"]=normalize_units(result["BOAT_UNITS"])

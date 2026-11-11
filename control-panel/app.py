@@ -22,6 +22,19 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from common.config_registry import (
+    COMPOSE_COMPONENTS as REGISTRY_COMPOSE_COMPONENTS,
+    CORE_COMPONENTS as REGISTRY_CORE_COMPONENTS,
+    SYSTEMD_COMPONENTS as REGISTRY_SYSTEMD_COMPONENTS,
+    SETTINGS as CONFIG_SETTINGS,
+    effective_chat_port,
+    load_effective_chat_endpoint,
+    validate_value as registry_validate_value,
+)
+from common.lifecycle_lock import LifecycleLock, LifecycleLockError
 
 try:
     from browser_updates import installed_version, release_catalog, read_operation, public_operation, release_snapshot, running_identity, acquire_slot, release_slot, start_detached
@@ -291,18 +304,8 @@ FIELDS = [
 ]
 FIELD_BY_KEY = {item["key"]: item for item in FIELDS}
 
-COMPOSE_COMPONENTS = {
-    "homeassistant": "homeassistant",
-    "influxdb": "influxdb",
-    "grafana": "grafana",
-    "prometheus": "prometheus",
-    "mosquitto": "mosquitto",
-    "homepage": "homepage",
-    "signalk": "signalk",
-    "ais-catcher": "ais-catcher",
-    "node-exporter": "node-exporter",
-}
-CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "homepage")
+COMPOSE_COMPONENTS = dict(REGISTRY_COMPOSE_COMPONENTS)
+CORE_COMPONENTS = REGISTRY_CORE_COMPONENTS
 # Display name, plain description and the Settings section that configures it.
 COMPONENT_INFO = {
     "homeassistant": ("Home Assistant", "Dashboards and automations for the boat.", SEC_HA),
@@ -328,23 +331,27 @@ RUNNING_STATES = {"running", "active", "activating", "reloading", "restarting"}
 LIFECYCLE_LOCK = threading.Lock()
 
 
+class LifecycleSlot:
+    """The in-process reservation, browser lock, and shared lifecycle lock."""
+
+    def __init__(self, browser_fd: int, shared: LifecycleLock):
+        self.browser_fd = browser_fd
+        self.shared = shared
+
+    def child_env(self, env: dict[str, str] | None = None) -> dict[str, str]:
+        return self.shared.child_env(env)
+
+    def pass_fds(self) -> tuple[int, ...]:
+        return self.shared.pass_fds()
+
+
 def disabled_components(settings: dict[str, str] | None = None) -> set[str]:
     raw = (settings or parse_env(VESSEL_ENV)).get("VESSELSTACK_DISABLED_COMPONENTS", "")
     values = [item.strip() for item in raw.split(",") if item.strip()]
     if len(values) != len(set(values)) or any(item not in CORE_COMPONENTS for item in values):
         raise ValueError("Invalid disabled component configuration")
     return set(values)
-SYSTEMD_COMPONENTS = {
-    "boat-chat": "vesselstack-chat.service",
-    "telegram": "vesselstack-chat-telegram.service",
-    "telemetry-indexer": "vesselstack-telemetry-indexer.timer",
-    "telemetry-sample": "vesselstack-telemetry-sample.timer",
-    "displays-bridge": "vesselstack-displays-bridge.service",
-    "signalk-native": "vesselstack-signalk.service",
-    "socketcan": "vesselstack-socketcan.service",
-    "firewall": "vesselstack-firewall.service",
-    "control-panel": "vesselstack-control-panel.service",
-}
+SYSTEMD_COMPONENTS = dict(REGISTRY_SYSTEMD_COMPONENTS)
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -445,6 +452,10 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
     kind = spec["kind"]
     if "\x00" in text or "\n" in text or "\r" in text:
         raise ValueError(f"{spec['label']} contains unsupported characters")
+    # The registry owns shared known-value rules. Chat-only fields remain
+    # intentionally local because they are provider secrets/free-form names.
+    if spec["key"] in CONFIG_SETTINGS:
+        registry_validate_value(spec["key"], text)
     if kind == "boolean":
         if text.lower() not in {"true", "false"}:
             raise ValueError(f"{spec['label']} must be true or false")
@@ -625,16 +636,31 @@ def public_configuration() -> dict[str, Any]:
 def take_lifecycle_slot():
     if not LIFECYCLE_LOCK.acquire(blocking=False):
         raise ValueError("Another operation is already running")
+    browser_fd = None
+    shared = None
     try:
-        return acquire_slot(ROOT)
+        browser_fd = acquire_slot(ROOT)
+        shared = LifecycleLock(ROOT, os.environ.get("VESSELSTACK_SYSTEM_ROOT", ""))
+        shared.acquire()
+        return LifecycleSlot(browser_fd, shared)
     except Exception:
+        if shared is not None:
+            shared.release()
+        if browser_fd is not None:
+            release_slot(browser_fd)
         LIFECYCLE_LOCK.release()
         raise
 
 
 def release_lifecycle_slot(slot_fd) -> None:
     try:
-        release_slot(slot_fd)
+        if isinstance(slot_fd, LifecycleSlot):
+            try:
+                release_slot(slot_fd.browser_fd)
+            finally:
+                slot_fd.shared.release()
+        else:
+            release_slot(slot_fd)
     finally:
         LIFECYCLE_LOCK.release()
 
@@ -796,7 +822,7 @@ def action_command(action: str, parameters: dict[str, Any], backup_choice: dict[
         command = [str(INSTALLER), "--config", str(VESSEL_ENV)]
         if action == "preflight":
             command.append("--dry-run")
-        elif action == "install":
+        elif action in {"apply", "install"}:
             command.append("--start")
         return command
     if action in {"start", "stop", "restart", "backup"}:
@@ -1390,7 +1416,7 @@ class OperationStore:
             raise
 
     def _run(self, operation: dict[str, Any], command: list[str], slot_fd, steps: list[list[str]] | None = None) -> None:
-        environment = os.environ.copy()
+        environment = (slot_fd.child_env() if isinstance(slot_fd, LifecycleSlot) else os.environ.copy())
         environment["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
         environment["VESSELSTACK_NONINTERACTIVE"] = "true"  # the panel cannot answer prompts; scripts print "To fix:" guidance instead
         exit_code = 1
@@ -1399,7 +1425,9 @@ class OperationStore:
             # Steps (for example mounting the backup drive) run first; the first failure stops everything.
             exit_code = 0
             for step in [*(steps or []), command]:
-                process = subprocess.Popen(step, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
+                process = subprocess.Popen(step, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            env=environment,
+                                            pass_fds=slot_fd.pass_fds() if isinstance(slot_fd, LifecycleSlot) else ())
                 assert process.stdout is not None
                 for line in process.stdout:
                     with self.lock:
@@ -1594,9 +1622,8 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             store, bind, port = auth_store(), self.server.server_address[0], int(self.server.server_address[1])
         else:
             store = chat_auth_store()
-            chat = parse_env(CHAT_ENV)
-            bind = chat.get("BOAT_CHAT_HOST") or "0.0.0.0"
-            port = int(chat.get("BOAT_CHAT_PORT") or 8765)
+            endpoint = load_effective_chat_endpoint(ROOT, data=parse_env(VESSEL_ENV).get("VESSELSTACK_DATA"), env=os.environ)
+            bind, port = endpoint["host"], endpoint["port"]
         admin_code = effective_chat_token("BOAT_CHAT_SETTINGS_TOKEN") if admin else ""
         if admin and not admin_code:
             raise ValueError("Admin pairing needs an admin code: set BOAT_CHAT_SETTINGS_TOKEN in the Boat Chat settings first.")

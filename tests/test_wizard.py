@@ -75,10 +75,10 @@ class WizardTests(unittest.TestCase):
         values = wizard.DEFAULTS.copy()
         self.assertEqual(wizard.normalize(field, "1", values)[0], "127.0.0.1")
         self.assertEqual(wizard.normalize(field, "2", values)[0], "0.0.0.0")
-        for custom in ("192.0.2.10", "2001:db8::25"):
+        for custom in ("192.0.2.10",):
             wizard.apply_settings(values, [f"CONTROL_PANEL_HOST={custom}"])
             self.assertEqual(values["CONTROL_PANEL_HOST"], custom)
-        for invalid in ("hostname", "3", "999"):
+        for invalid in ("hostname", "3", "999", "2001:db8::25"):
             with self.assertRaises(ValueError): wizard.apply_settings(wizard.DEFAULTS.copy(), [f"CONTROL_PANEL_HOST={invalid}"])
 
     def test_component_membership_defaults_empty_and_canonicalizes(self):
@@ -92,10 +92,11 @@ class WizardTests(unittest.TestCase):
                 wizard.render({"VESSELSTACK_DISABLED_COMPONENTS": value})
 
     def test_render_is_complete_and_shell_safe(self):
-        output = wizard.render({"BOAT_NAME": "A Boat (Test)", "SOCKETCAN_ENABLE": "true"})
-        self.assertIn("BOAT_NAME='A Boat (Test)'", output)
+        output = wizard.render({"BOAT_NAME": "A Boat Test", "SOCKETCAN_ENABLE": "true"})
+        self.assertIn("BOAT_NAME='A Boat Test'", output)
         self.assertIn("SOCKETCAN_BITRATE=250000", output)
         self.assertIn("SOCKETCAN_ENABLE=true", output)
+        with self.assertRaises(ValueError): wizard.render({"BOAT_NAME": "A Boat (Test)"})
 
     def test_rejects_unknown_and_multiline_values(self):
         with self.assertRaises(ValueError): wizard.render({"NOT_A_SETTING": "x"})
@@ -411,7 +412,7 @@ class ValidateCliTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=20)
 
     def test_wizard_output_and_example_env_are_valid(self):
-        self.assertEqual(self.check(wizard.render({"BOAT_NAME": "A Boat (Test)"})).returncode, 0)
+        with self.assertRaises(ValueError): wizard.render({"BOAT_NAME": "A Boat (Test)"})
         self.assertEqual(self.check((ROOT / "vesselstack.example.env").read_text()).returncode, 0)
 
     def test_refuses_unknown_key_bad_characters_enums_and_syntax(self):

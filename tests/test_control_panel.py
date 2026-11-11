@@ -26,6 +26,8 @@ SPEC.loader.exec_module(panel)
 # Keep the durable lifecycle lock inside the test fixture rather than the
 # privileged production default. Individual tests still patch their env files.
 panel.ROOT = Path(tempfile.mkdtemp(prefix="vesselstack-panel-test-"))
+panel_system_root = Path(tempfile.mkdtemp(prefix="vesselstack-panel-system-"))
+os.environ["VESSELSTACK_SYSTEM_ROOT"] = str(panel_system_root)
 
 
 sys.path[:0] = [str(ROOT / "displays"), str(ROOT / "tests"), str(ROOT / "tests" / "fixtures")]
@@ -271,7 +273,7 @@ class CommandAllowlistTests(unittest.TestCase):
 
     def test_displays_values_mirror_the_installer_checks(self) -> None:
         user = panel.FIELD_BY_KEY["DISPLAYS_BRIDGE_MQTT_USERNAME"]
-        for good in ("vesselstack-bridge", "a", "A_b.c-9", "x" * 64, ""):
+        for good in ("vesselstack-bridge", "a", "A_b.c-9", "x" * 64):
             self.assertEqual(panel.validate_value(user, good), good)
         for bad in ("bad name", "x" * 65, "bad:name", "bad/name", "b\u00e9", "bad;", "a b"):
             with self.assertRaises(ValueError, msg=repr(bad)):
@@ -316,7 +318,7 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertEqual(panel.parse_env(vessel)["DISPLAYS_ENABLE"], "false")
                 # The default bridge name collides with a MQTT user of the same name.
                 panel.update_configuration({"MQTT_USERNAME": "vesselstack-bridge",
-                                            "DISPLAYS_BRIDGE_MQTT_USERNAME": ""})
+                                            "DISPLAYS_BRIDGE_MQTT_USERNAME": "vesselstack-bridge"})
                 with self.assertRaisesRegex(ValueError, "must differ"):
                     panel.update_configuration({"DISPLAYS_ENABLE": "true"})
                 panel.update_configuration({"DISPLAYS_ENABLE": "true", "MQTT_USERNAME": "homeassistant"})
@@ -617,7 +619,7 @@ class SettingsValidationTests(unittest.TestCase):
         return panel.validate_value(panel.FIELD_BY_KEY[key], value)
 
     def test_timezone_must_exist(self) -> None:
-        for good in ("Europe/Lisbon", "America/Los_Angeles", "UTC", ""):
+        for good in ("Europe/Lisbon", "America/Los_Angeles", "UTC"):
             self.assertEqual(self.check("BOAT_TIMEZONE", good), good)
         for bad in ("Mars/Olympus", "europe/lisbon", "Europe/Lisbn", "../etc/passwd", "Lisbon"):
             with self.assertRaisesRegex(ValueError, "Timezone not recognised"):
@@ -639,7 +641,7 @@ class SettingsValidationTests(unittest.TestCase):
                     self.check(key, value)
 
     def test_can_bitrate_is_a_sensible_whole_number(self) -> None:
-        for good in ("250000", "10000", "1000000", ""):
+        for good in ("250000", "10000", "1000000"):
             self.assertEqual(self.check("SOCKETCAN_BITRATE", good), good)
         for bad in ("0", "9999", "1000001", "250000.5", "-250000", "fast"):
             with self.assertRaises(ValueError):
@@ -1492,11 +1494,11 @@ class SignInApiTests(DisplaysApiBase):
         env.write_text(f'VESSELSTACK_DATA="{data}"\n')
         chat_env = self.root / "boat-chat.env"
         chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\n')
-        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env), mock.patch.dict(os.environ, {"BOAT_CHAT_ENV": str(chat_env)}):
             self.assertEqual(self.make_pairing("chat", admin=True)[0], 400, "admin pairing needs BOAT_CHAT_SETTINGS_TOKEN")
         self.assertFalse((data / "boat-chat" / "auth.json").exists())
         chat_env.write_text('BOAT_CHAT_HOST="198.51.100.9"\nBOAT_CHAT_PORT="8765"\nBOAT_CHAT_SETTINGS_TOKEN="admin-code"\n')
-        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env):
+        with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "CHAT_ENV", chat_env), mock.patch.dict(os.environ, {"BOAT_CHAT_ENV": str(chat_env)}):
             status, link, _ = self.make_pairing("chat", admin=True)
         self.assertEqual(status, 200, link)
         self.assertTrue(link["url"].startswith("http://198.51.100.9:8765/#pair="))

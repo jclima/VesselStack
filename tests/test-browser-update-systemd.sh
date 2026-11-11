@@ -76,6 +76,7 @@ cp -a "$REPO_ROOT/control-panel/app.py" "$REPO_ROOT/control-panel/browser_update
 cp -a "$REPO_ROOT/control-panel/static" "$FIXTURE/control-panel/"
 install -d -m 0755 "$FIXTURE/common"
 cp -a "$REPO_ROOT/common/vesselstack_auth.py" "$FIXTURE/common/"
+cp -a "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/lifecycle_lock.py" "$FIXTURE/common/"
 cp "$REPO_ROOT/VERSION" "$FIXTURE/installer/VERSION"
 cat > "$FIXTURE/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$FIXTURE

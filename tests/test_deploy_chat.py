@@ -34,6 +34,8 @@ class DeploymentTests(unittest.TestCase):
         (self.source/'.mcp.json').write_text('credentials\n')
         (self.source/'BOAT_AGENT.md').write_text('agent\n')
         self.backup=self.root/'backup'
+        (self.target/'common').mkdir()
+        shutil.copy2(ROOT/'common/lifecycle_lock.py', self.target/'common/lifecycle_lock.py')
         self.names=['boat-chat/cruise_efficiency.py','boat-chat/app.py']
 
     def tearDown(self):self.temp.cleanup()
@@ -100,6 +102,7 @@ class DeploymentTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(deploy,'run_unprivileged'))
         stack.enter_context(mock.patch.object(deploy.subprocess,'run'))
         stack.enter_context(mock.patch.object(deploy,'ready',side_effect=list(ready)))
+        stack.enter_context(mock.patch.dict(os.environ, {'VESSELSTACK_SYSTEM_ROOT': str(self.root/'system')}))
         self.unchanged=stack.enter_context(mock.patch.object(deploy,'assert_unchanged',side_effect=unchanged))
         return stack
 

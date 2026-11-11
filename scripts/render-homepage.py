@@ -23,6 +23,10 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
+_repo_root = next((parent for parent in Path(__file__).resolve().parents if (parent / "common").is_dir()), Path(__file__).resolve().parents[1])
+sys.path.insert(0, str(_repo_root))
+from common.config_registry import load_effective_chat_endpoint, effective_chat_port
+
 # Keys read from each env file. Nothing outside these sets is ever kept.
 VESSELSTACK_KEYS = frozenset({
     "BOAT_NAME", "VESSELSTACK_DISABLED_COMPONENTS", "VESSELSTACK_WEB_BIND_ADDRESS",
@@ -218,7 +222,7 @@ def build_tiles(env: dict[str, str], hostname: str) -> list[Tile]:
         monitor = f"http://host.docker.internal:{port}" if kind == "all" and monitor_host else None
         tiles.append(Tile(name, group, description, href, monitor))
 
-    chat_port = port_of(env.get("BOAT_CHAT_PORT"), 8765)
+    chat_port = effective_chat_port(env)
     link("Boat Chat", "Boat", "Ask your boat", chat_port, env.get("BOAT_CHAT_HOST", "0.0.0.0"),
          tunnel="Limited to this device; share it with: sudo vesselstackctl lan dashboards")
 
@@ -433,6 +437,9 @@ def create_once(dir_fd: int, name: str, text: str) -> None:
 def render(root: Path, hostname: str, brand_icon: Path | None) -> list[str]:
     warnings: list[str] = []
     env = read_env(root / "config")
+    endpoint = load_effective_chat_endpoint(root, env=os.environ)
+    env["BOAT_CHAT_HOST"] = endpoint["host"]
+    env["BOAT_CHAT_PORT"] = str(endpoint["port"])
     out_dir = root / "config" / "homepage"
     custom_dir = root / "config" / "homepage-custom"
     icons_dir = root / "config" / "homepage-icons"

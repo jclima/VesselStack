@@ -61,11 +61,12 @@ for required_asset in \
     }
 done
 for required_runtime in \
-    common/vesselstack_auth.py common/vesselstack_authctl.py common/qrcodegen.py \
-    boat-chat/display_units.py boat-chat/telemetry_indexer.py \
+    common/vesselstack_auth.py common/vesselstack_authctl.py common/qrcodegen.py common/config_registry.py common/boat_profile.py common/boat_profile_cli.py common/lifecycle_lock.py \
+    boat-chat/display_units.py boat-chat/profile_runtime.py boat-chat/telemetry_indexer.py \
+    templates/boat-profile.example.json \
     systemd/vesselstack-telemetry-indexer.timer systemd/vesselstack-telemetry-sample.service.in \
     systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml scripts/render-homepage.py \
-    systemd/vesselstack-homepage-refresh.service.in; do
+    systemd/vesselstack-homepage-refresh.service.in scripts/reconcile-lifecycle.sh; do
     [ -s "$STAGE/$PACKAGE_NAME/$required_runtime" ] || {
         echo "Refusing to package without required runtime asset: $required_runtime" >&2
         exit 1

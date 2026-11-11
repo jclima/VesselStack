@@ -2,6 +2,10 @@
 import datetime as dt
 import math
 import re
+try:
+    import profile_runtime
+except ImportError:  # direct module loading in older tests
+    profile_runtime = None
 
 FRESH_SECONDS = 600
 SOURCES = [
@@ -32,7 +36,7 @@ def classify(label, value):
     return 'warning'
 
 
-def normalize(cached):
+def normalize(cached, profile=None):
     cache = cached.get('cache') or {}
     age = number(cache.get('age_seconds'))
     fresh = age is not None and age <= FRESH_SECONDS
@@ -63,22 +67,41 @@ def normalize(cached):
     card('health', 'Boat', state('sensor.boat_health_summary'), alerts[0]['severity'], 'Is the boat OK?')
     watch = state('input_select.boat_watch_mode')
     underway = state('input_boolean.underway_mode')
-    port, starboard = [measured(f'propulsion.{side}.revolutions') for side in ('port', 'starboard')]
+    runtime = profile_runtime.current() if profile is None and profile_runtime else {"profile": profile or {}, "diagnostic": None}
+    equipment = runtime.get("profile", profile or {})
+    engines = equipment.get("engines", [])
+    banks = equipment.get("battery_banks", [])
+    tanks = equipment.get("fuel_tanks", [])
     mode = 'Underway' if underway == 'on' else f'{watch} watch' if watch.lower() in {'dock','away','anchor'} else 'Unavailable'
     card('mode', 'Watch mode', mode, 'normal' if mode != 'Unavailable' else 'unknown', 'Give me a current boat status briefing')
     charging = state('binary_sensor.shore_power_connected')
     card('shore', 'Charging', {'on':'Charging detected','off':'No charging detected'}.get(charging,'Unavailable'), 'normal' if charging in {'on','off'} else 'unknown', 'What is the current shore power status?')
-    soc = measured('electrical.batteries.shunt.capacity.stateOfCharge', True)
-    voltage = measured('electrical.batteries.shunt.voltage')
-    card('battery','Battery',display(soc,'%')+' · '+display(voltage,' V','.2f'), 'unknown' if soc is None or voltage is None else 'warning' if soc < 20 else 'normal', 'Tell me about the battery right now')
-    card('engines','Engine RPM',display(port,'')+' / '+display(starboard,''), 'unknown' if port is None or starboard is None else 'normal', 'Compare both engines right now')
-    fuel = [measured(f'tanks.fuel.{side}.currentLevel',True) for side in (0,1)]
-    card('fuel','Fuel tanks', ' / '.join(display(x,'%') for x in fuel), 'unknown' if None in fuel else 'normal', 'How much fuel is left?')
+    primary = next((b for b in banks if b.get('id') == equipment.get('primary_battery_bank')), None)
+    battery_prefix = primary.get('path') if primary else None
+    soc = measured(f'{battery_prefix}.capacity.stateOfCharge', True) if battery_prefix else None
+    voltage = measured(f'{battery_prefix}.voltage') if battery_prefix else None
+    bank_values = []
+    for bank in banks:
+        prefix = bank['path']
+        bank_soc = measured(f'{prefix}.capacity.stateOfCharge', True)
+        bank_voltage = measured(f'{prefix}.voltage')
+        bank_values.append(f"{bank.get('label', bank.get('id', 'Battery'))}: {display(bank_soc,'%')} · {display(bank_voltage,' V','.2f')}")
+    battery_value = ' | '.join(bank_values) if bank_values else 'Not configured'
+    battery_tone = 'unknown' if banks and any(measured(f"{b['path']}.capacity.stateOfCharge", True) is None or measured(f"{b['path']}.voltage") is None for b in banks) else 'normal'
+    if soc is not None and soc < 20: battery_tone = 'warning'
+    card('battery','Battery',battery_value, battery_tone, 'Tell me about the battery right now')
+    engine_values = [(e, measured(f"{e['path']}.revolutions")) for e in engines]
+    engine_text = ' / '.join(display(v, '') for _e, v in engine_values) if engine_values else 'Not configured'
+    engine_label = 'Engine RPM' if not engines else 'Engine RPM (' + ', '.join(str(e.get('label', e.get('id', 'Engine'))) for e in engines) + ')'
+    card('engines',engine_label,engine_text, 'unknown' if engine_values and any(v is None for _e, v in engine_values) else 'normal', 'Compare the engines right now')
+    fuel = [measured(f"{t['path']}.currentLevel",True) for t in tanks]
+    fuel_label = 'Fuel tanks' if not tanks else 'Fuel tanks (' + ', '.join(str(t.get('label', t.get('id', 'Tank'))) for t in tanks) + ')'
+    card('fuel',fuel_label, ' / '.join(display(x,'%') for x in fuel) if fuel else 'Not configured', 'unknown' if fuel and None in fuel else 'normal', 'How much fuel is left?')
     timestamps = (cached.get('current_telemetry') or {}).get('timestamps') or {}
     measurements = {
-        'battery': ['electrical.batteries.shunt.capacity.stateOfCharge', 'electrical.batteries.shunt.voltage'],
-        'engines': ['propulsion.port.revolutions', 'propulsion.starboard.revolutions'],
-        'fuel': ['tanks.fuel.0.currentLevel', 'tanks.fuel.1.currentLevel'],
+        'battery': [path for b in banks for path in (f"{b['path']}.capacity.stateOfCharge", f"{b['path']}.voltage")],
+        'engines': [f"{e['path']}.revolutions" for e in engines],
+        'fuel': [f"{t['path']}.currentLevel" for t in tanks],
     }
     now = dt.datetime.now(dt.timezone.utc)
     for c in cards:
@@ -96,11 +119,14 @@ def normalize(cached):
                 c['tone'] = 'unknown'
                 c['value'] += ' · source age unverified' if c['source_age_seconds'] is None else ' · older reading'
     attention = [a for a in alerts if a['severity'] != 'ok']
+    if runtime.get('diagnostic'):
+        attention.append(dict(label='Boat profile', value='Unavailable', severity='unknown', reason=runtime['diagnostic'], prompt='How is the boat profile configured?'))
     for c in cards[1:]:
         if c['tone'] == 'unknown':
             attention.append(dict(label=c['label'], value=c['value'], severity='unknown', reason='Measurement missing, outdated, or source age unverified; check its source', prompt=c['prompt']))
         elif c['tone'] == 'warning':
-            attention.append(dict(label=c['label'], value=c['value'], severity='warning', reason='Battery charge is below 20%', prompt=c['prompt']))
+            reason = 'Battery charge is below 20%' if c['id'] == 'battery' else 'Review this boat status'
+            attention.append(dict(label=c['label'], value=c['value'], severity='warning', reason=reason, prompt=c['prompt']))
     warnings = sum(a['severity']=='warning' for a in attention)
     unknown = sum(a['severity']=='unknown' for a in attention)
     return dict(cards=cards, alerts=alerts, attention=attention, warning_count=warnings, unavailable_count=unknown,

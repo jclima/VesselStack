@@ -49,6 +49,13 @@ done
 grep -q "^vesselstack-$VERSION/install.sh$" "$TEST_ROOT/listing"
 grep -q "^vesselstack-$VERSION/boat-chat/app.py$" "$TEST_ROOT/listing"
 grep -q "^vesselstack-$VERSION/boat-chat/boat_facts.example.json$" "$TEST_ROOT/listing"
+for required in common/boat_profile.py common/boat_profile_cli.py common/config_registry.py common/lifecycle_lock.py \
+    boat-chat/profile_runtime.py scripts/reconcile-lifecycle.sh brand/icon.svg; do
+    grep -q "^vesselstack-$VERSION/$required$" "$TEST_ROOT/listing" || {
+        echo "Package is missing required runtime asset: $required" >&2
+        exit 1
+    }
+done
 tar -xzOf "$TARBALL" "vesselstack-$VERSION/README.md" | grep -q 'UNCOMMITTED-EDIT' && {
     echo "Package contains an uncommitted edit" >&2
     exit 1

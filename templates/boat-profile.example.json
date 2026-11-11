@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "engines": [
+    {
+      "id": "port",
+      "label": "Port",
+      "path": "propulsion.port",
+      "kind": "combustion",
+      "fuel_rate_supported": true
+    }
+  ],
+  "battery_banks": [
+    {
+      "id": "house",
+      "label": "House",
+      "path": "electrical.batteries.house",
+      "role": "house"
+    }
+  ],
+  "fuel_tanks": [],
+  "primary_battery_bank": "house"
+}

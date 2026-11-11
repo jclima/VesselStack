@@ -2,8 +2,8 @@
 """Preview or deploy reviewed Git source to a separate live Boat Chat installation."""
 import argparse
 import contextlib
-import datetime as dt
 import fcntl
+import datetime as dt
 import hashlib
 import json
 import os
@@ -25,6 +25,17 @@ GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
 
 def owner_name(source):
     return pwd.getpwuid(source.stat().st_uid)
+
+def lifecycle_lock_type(root: Path):
+    path = root / 'common' / 'lifecycle_lock.py'
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[1] / 'common' / 'lifecycle_lock.py'
+    if not path.is_file(): raise RuntimeError('Missing lifecycle lock helper: ' + str(path))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('vesselstack_lifecycle_lock', path)
+    if not spec or not spec.loader: raise RuntimeError('Cannot load lifecycle lock helper')
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module.LifecycleLock
 
 
 def unprivileged_command(source, command):
@@ -483,11 +494,23 @@ def main():
         # helper that an unprivileged account could have modified.
         try:require_root_controlled(Path(__file__))
         except RuntimeError as error:raise RuntimeError('Refusing to run as root from a location an unprivileged user controls ('+str(error)+'); run the root-owned copy installed by install.sh (/usr/local/libexec/vesselstack/deploy-chat.py)') from None
+        common = target / 'common'
+        if common.exists():
+            try: require_root_controlled(common / 'lifecycle_lock.py')
+            except RuntimeError as error: raise RuntimeError('Refusing to use an untrusted installed common module: ' + str(error)) from None
     if source==target or target.is_relative_to(source):parser.error('Source and live target must be separate; target cannot be inside source')
     if args.apply and not args.restart_chat:parser.error('--apply requires --restart-chat for readiness verification')
     if args.pull and not args.expected_remote:parser.error('--pull requires --expected-remote (or VESSELSTACK_UPDATE_REMOTE_URL)')
-    with (target/'.chat-update.lock').open('a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    # Preview is read-only; apply/rollback serialize on the shared lifecycle
+    # lock plus the historical local chat lock.
+    with contextlib.ExitStack() as locks:
+        if args.apply or args.rollback:
+            lock_cls = lifecycle_lock_type(target)
+            try: locks.enter_context(lock_cls(target, os.environ.get('VESSELSTACK_SYSTEM_ROOT', '')))
+            except Exception as error: raise RuntimeError(str(error)) from None
+            local_lock = locks.enter_context((target/'.chat-update.lock').open('a'))
+            try: fcntl.flock(local_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: raise RuntimeError('Another Boat Chat update is already running')
         if args.rollback:
             if not args.apply:parser.error('Rollback requires --apply --restart-chat')
             receipt=json.loads((args.rollback/'receipt.json').read_text())
