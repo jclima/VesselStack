@@ -191,7 +191,7 @@ sudo vesselstackctl display deploy helm --ota 192.0.2.50   # build if needed and
 
 `display deploy ID (--ota HOST | --serial DEVICE)` builds only when the stored firmware is out of date and uploads it under one lock; it prints `STAGE:` lines with `--progress` and `To fix:` lines for known failures, and hides Wi-Fi and MQTT/OTA/API secrets in everything it prints. After every successful upload `build/displays/ID/last-flash.json` (root-only, never committed) records when, how and which image went to the screen. **Operational impact:** a deploy can take 3-6 minutes (10-15 minutes the first time, about 3 GB free disk). **Wi-Fi (OTA) updates have not been verified on hardware yet**; the first flash of a new display must be over USB, and USB is an equal option. To put the previous firmware back: `display restore-config STAMP` (see `display history`), then `display flash ID --previous --ota HOST` (or `--serial DEVICE`); see [Deploy and rollback](docs/DISPLAYS.md#deploy-and-rollback).
 
-In the Control Panel, **Displays → Edit pages and theme** changes the theme and pages, **Save** stores them (a backup is kept) and **Apply to screen** runs `display deploy` over USB or Wi-Fi with progress and `To fix:` hints; **History → Restore** and **Put previous firmware back on screen** do the rollback (`display restore-config STAMP`, then `display flash ID --previous`). **Operational impact:** while a deploy runs the Control Panel lifecycle slot is busy, so backups, updates and settings changes are refused until it finishes; Wi-Fi (OTA) updates are not yet verified on hardware. To go back to an older VesselStack, run `set-theme ID classic` first. A Wi-Fi upload to an address other than the last successful one needs an explicit tick (the firmware contains the Wi-Fi password; the API needs `confirm_new_target: true`), and **Put previous firmware back** appears only after **History → Restore** of the saved copy that matches the previous firmware (same settings and credentials). A missing builder image does not block Apply: it is a to-do and the deploy shows a `To fix:` hint if it fails offline. **Rollback of this feature:** reinstall the previous release; `last-flash.json` is ignored by older versions. **Verify:** the screen restarts with the new pages and `show ID --json` reports `readiness.last_flash`. See [docs/CONTROL_PANEL.md](docs/CONTROL_PANEL.md#displays).
+In the Control Panel, **Displays → Edit pages and theme** changes the theme and pages, **Save** stores them (a backup is kept) and **Apply to screen** runs `display deploy` over USB or Wi-Fi with progress and `To fix:` hints; **History → Restore** and **Put previous firmware back on screen** do the rollback (`display restore-config STAMP`, then `display flash ID --previous`). While editing, the selected page shows its layout and capacity, and **Find a value to add** searches the catalog without leaving the editor. **Done** exits an unchanged draft; **Cancel** asks before dropping edits. Draft previews use the server's geometry for supported unsaved layouts and item counts when available, otherwise they explain that saving is needed. **Operational impact:** while a deploy runs the Control Panel lifecycle slot is busy, so backups, updates and settings changes are refused until it finishes; Wi-Fi (OTA) updates are not yet verified on hardware. To go back to an older VesselStack, run `set-theme ID classic` first. A Wi-Fi upload to an address other than the last successful one needs an explicit tick (the firmware contains the Wi-Fi password; the API needs `confirm_new_target: true`), and **Put previous firmware back** appears only after **History → Restore** of the saved copy that matches the previous firmware (same settings and credentials). A missing builder image does not block Apply: it is a to-do and the deploy shows a `To fix:` hint if it fails offline. **Rollback of this feature:** reinstall the previous release; `last-flash.json` is ignored by older versions. **Verify:** the screen restarts with the new pages and `show ID --json` reports `readiness.last_flash`. See [docs/CONTROL_PANEL.md](docs/CONTROL_PANEL.md#displays).
 
 `set-theme` writes `ui.theme` in `displays.json`; the change reaches the screen only after you rebuild and reflash that display. Night mode uses the same red palette on every theme and the alarm banner is never themed. `set-theme ID classic` removes the key and returns to the original colours. **Before downgrading VesselStack, run `set-theme ID classic` on every display that has a theme:** older versions reject the unknown `theme` key and the displays bridge then exits. A display left on `classic` generates exactly the firmware it did before, so nothing needs reflashing. The `high-contrast` warning tile is dark amber with white text (the old bright amber made its label unreadable); rebuild and reflash a display on that theme to get it. Details and limits are in [Themes](docs/DISPLAYS.md#themes).
 
@@ -219,18 +219,18 @@ session), run the pinned release installer and answer the questions in the same 
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh | sudo bash
 ```
 
-The same release is also selected by `VESSELSTACK_VERSION=0.7.0` or `--version 0.7.0`:
+The same release is also selected by `VESSELSTACK_VERSION=0.7.1` or `--version 0.7.1`:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.7.0 bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash -s -- --version 0.7.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.7.1 bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh | sudo bash -s -- --version 0.7.1
 ```
 
 > [!NOTE]
-> The pinned URL names the release explicitly, so it installs exactly 0.7.0 whatever
+> The pinned URL names the release explicitly, so it installs exactly 0.7.1 whatever
 > GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a prerelease, so that URL kept serving
@@ -277,10 +277,10 @@ that does not point at the exact commit being built, before building anything. T
 
 ```bash
 # defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 # every question's own default answer, nothing asked
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash -s -- --defaults
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh | sudo bash -s -- --defaults
 # a ready-made vesselstack.env (optionally with --set overrides)
 sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
 ```
@@ -419,8 +419,8 @@ script is wrapped in functions and ends with a single `main "$@"` call, so a
 truncated download cannot half-run. If you prefer to read it first (recommended):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -442,7 +442,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.7.0
+git checkout v0.7.1
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the optional browser wizard
 ```
@@ -486,16 +486,15 @@ Keep the generated credentials per host, schedule backups to a separate device,
 and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
-VesselStack 0.7.0 is currently a pre-release for reliability validation. Physical
-Raspberry Pi acceptance is pending, so it is not the release GitHub marks Latest;
-use the pinned 0.7.0 URL only for a reviewed lab test. Upgrade from 0.6.4 with the
+VesselStack 0.7.1 is the focused Displays editor release following 0.7.0. Upgrade from 0.7.0 with the
 full installer or `vesselstackctl update` so shared modules, configuration and
 services are updated together; the application-only updater is not sufficient for
 this release. The installer takes a verified backup first. If rollback is needed,
 verify and restore that backup rather than downgrading. Database changes are
 additive columns only; historical samples without verified source timestamps remain
-excluded from inferred-energy calculations. For release-history context, 0.6.3 was
-promoted after physical Pi acceptance, while 0.6.2 was marked Latest directly.
+excluded from inferred-energy calculations. The 0.7.0 reliability-validation runbook
+below is retained as historical release context; 0.6.3 was promoted after physical
+Pi acceptance, while 0.6.2 was marked Latest directly.
 
 ## Upgrading to 0.6.0
 
@@ -795,15 +794,14 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-To work from the 0.7.0 release, check out its tag:
+To work from the 0.7.1 release, check out its tag:
 
 ```bash
 git fetch --tags
-git checkout v0.7.0
+git checkout v0.7.1
 ```
 
-`v0.7.0` is intended to be published first as a pre-release and is not Latest while
-physical Raspberry Pi acceptance is pending; see the [CHANGELOG](CHANGELOG.md). Once
+`v0.7.1` is the focused Displays editor release; see the [CHANGELOG](CHANGELOG.md). Once
 the signed release tag exists, verify it yourself (needs `ssh-keygen`, which ships
 with OpenSSH):
 
@@ -1561,7 +1559,7 @@ not mounted (see [Backups](#backups)).
 2. **Re-run the pinned release installer.** On the Pi, over `ssh -t`:
 
    ```bash
-   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.1/get-vesselstack.sh | sudo bash
    ```
 
    The installer finds the installed system, never overwrites it silently, and offers
@@ -1574,7 +1572,7 @@ not mounted (see [Backups](#backups)).
    before anything is stopped, whether to mount it, pick a USB drive, check again, or back up
    to the system disk once (see [Backups](#backups)); `--yes` and `--defaults` never choose and
    the update stops with the reason. Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
-   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.7.0`.
+   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.7.1`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
 
@@ -1592,16 +1590,17 @@ not mounted (see [Backups](#backups)).
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
    backed up; configuration and data are.
 
-| Installed version | Update to 0.7.0 |
+| Installed version | Update to 0.7.1 |
 |---|---|
-| 0.6.0 to 0.6.3 | Control Panel or the pinned installer. While 0.7.0 is a pre-release, enable **Include early test releases** on the Updates tab to see it |
-| 0.5.7 | Control Panel or the pinned installer. 0.7.0 is published first as a pre-release (in the 0.5.x panel, enable **Include lab prereleases** on the update card to see it; the 0.7.0 panel calls it **Include early test releases**) and is marked Latest after the maintainer's physical Raspberry Pi install passes |
+| 0.7.0 | Control Panel or the pinned installer |
+| 0.6.0 to 0.6.3 | Control Panel or the pinned installer |
+| 0.5.7 | Control Panel or the pinned installer |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 
-A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.7.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.7.1` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 
-Updating to 0.7.0 no longer shows the shell error described under [Upgrading to 0.6.0](#upgrading-to-060), even from older versions, because the 0.7.0 installer replaces the `vesselstackctl` command atomically.
+Updating to 0.7.1 uses the full installer and preserves the verified-backup rollback path. The 0.7.0 installer replaced the `vesselstackctl` command atomically; retain that historical note when diagnosing an older upgrade.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:
@@ -1617,7 +1616,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on a connected machine, carry it to the boat, and install with
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.7.0.tar.gz`.
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.7.1.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
 
 ## Stopping or removing services

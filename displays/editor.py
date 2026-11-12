@@ -379,6 +379,11 @@ def show(ctx: lifecycle.Context, display_id: str) -> dict:
     header = schema.ui_header_enabled(ui)
     previews = [render.preview_geometry(board, page["layout"], len(page["items"]), header)
                 for page in display["pages"]]
+    preview_layouts = {
+        layout: [render.preview_geometry(board, layout, count, header)
+                 for count in range(spec["capacity"] + 1)]
+        for layout, spec in layouts.items()
+    }
     used = _used_on(config)
     themes = schema.load_themes()["themes"]
     return {
@@ -392,6 +397,7 @@ def show(ctx: lifecycle.Context, display_id: str) -> dict:
         "board": board_block,
         "layouts": layouts,
         "preview": previews,
+        "preview_layouts": preview_layouts,
         "heartbeat_s": catalog_mod._heartbeat(config),
         "instruments": {iid: dict(inst, used_on=used.get(iid, [])) for iid, inst in config["instruments"].items()},
         "notifications": {nid: dict(note, used_on=used.get(nid, []))
@@ -763,21 +769,47 @@ def restore_config(ctx: lifecycle.Context, stamp: str, if_revision: str | None =
 # --- serial ports ----------------------------------------------------------------------------------
 
 def serial_ports(ctx: lifecycle.Context, by_id: Path = SERIAL_BY_ID, lstat=os.lstat,
-                 realpath=os.path.realpath) -> dict:
-    """The USB serial devices under /dev/serial/by-id that ``flash --serial`` would accept."""
+                 realpath=os.path.realpath, device_dir: Path = Path("/dev"),
+                 listdir=os.listdir) -> dict:
+    """List validated USB serial devices, preferring stable ``by-id`` aliases.
+
+    Some Linux installations do not populate ``/dev/serial/by-id``. In that
+    case validated ``/dev/ttyACM*`` and ``/dev/ttyUSB*`` nodes are still useful.
+    Results are deduplicated by resolved character device, so a by-id alias
+    always wins over its tty name. ``error`` is separate from an empty result.
+    """
+    lookup_error = None
     try:
-        names = sorted(os.listdir(by_id))
-    except OSError:
+        names = sorted(listdir(by_id))
+    except FileNotFoundError:
         names = []
-    ports = []
-    for name in names:
-        path = f"{firmware.SERIAL_BY_ID_PREFIX}{name}"
+    except OSError as exc:
+        names = []
+        lookup_error = f"cannot read USB serial aliases: {exc}"
+    found = {}
+
+    def add(path: str) -> None:
         try:
             device = firmware.validate_serial(path, lstat, realpath)
         except render.RenderError:
-            continue
-        ports.append({"path": path, "device": device})
-    return {"schema": 1, "ports": ports}
+            return
+        found.setdefault(device, {"path": path, "device": device})
+
+    for name in names:
+        add(f"{firmware.SERIAL_BY_ID_PREFIX}{name}")
+    try:
+        device_names = sorted(listdir(device_dir))
+    except FileNotFoundError:
+        device_names = []
+    except OSError as exc:
+        device_names = []
+        if lookup_error is None:
+            lookup_error = f"cannot read USB serial devices: {exc}"
+    for name in device_names:
+        if name.startswith(("ttyACM", "ttyUSB")):
+            add(str(Path(device_dir) / name))
+    ports = sorted(found.values(), key=lambda item: item["path"])
+    return {"schema": 1, "ports": ports, "error": lookup_error}
 
 
 # --- plain-text forms for people ---------------------------------------------------------------------

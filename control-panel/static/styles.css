@@ -381,9 +381,12 @@ dialog .keep{margin:.2rem 0 .5rem}
 /* Displays: editing, saving and applying */
 .swatch:not(:disabled){cursor:pointer}
 .swatch[aria-pressed="true"]:not(:disabled){border-color:var(--sea);background:var(--sea-soft)}
-.savebar{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:1rem 0;padding:.6rem;background:var(--panel-2);border:1px solid var(--line);border-radius:.8rem}
+.dcard .savebar{position:static;z-index:auto;flex-direction:row;justify-content:flex-start;gap:.5rem;align-items:center;margin:1rem 0;padding:.6rem;background:var(--panel-2);border:1px solid var(--line);border-radius:.8rem;box-shadow:none;backdrop-filter:none}
 .dcard.editing .savebar{position:sticky;bottom:.5rem;z-index:2;box-shadow:var(--shadow)}
 .savebar code{flex-basis:100%}
+.display-edit-fields{min-width:0;margin:0;padding:0;border:0}
+@media (min-width:761px){.dcard.editing .dpreview{position:sticky;top:5rem}}
+@media (max-width:760px){.dcard.editing .preview-frame{width:min(100%,180px)}}
 .pedits{display:grid;gap:.75rem}
 .pedit{padding:.6rem;border:1px solid var(--line);border-radius:.8rem}
 .pedit.on{border-color:var(--sea);background:var(--sea-soft)}
@@ -399,7 +402,11 @@ dialog .keep{margin:.2rem 0 .5rem}
 .pitem{display:flex;flex-wrap:wrap;gap:.4rem;justify-content:space-between;align-items:center;padding:.3rem 0;border-top:1px dashed var(--line)}
 .pname{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;min-width:0}.pname .mono{overflow-wrap:anywhere}
 .problems{margin:.4rem 0 0;padding-left:1.2rem;color:var(--red)}
-.addbar{position:sticky;top:3.5rem;z-index:1;padding:.5rem .75rem;margin:.5rem 0;background:var(--sea-soft);border:1px solid var(--sea);border-radius:.6rem}
+.editor-pages{display:flex;flex-wrap:wrap;gap:.4rem}
+.editor-pages button[aria-pressed="true"]{border-color:var(--sea);background:var(--sea-soft);font-weight:650}
+.page-data-picker{display:grid;gap:.5rem;margin-top:.6rem;padding:.65rem;border:1px solid var(--line);border-radius:.6rem;background:var(--panel)}
+#display-picker-results{max-height:19rem;overflow:auto;overscroll-behavior:contain}
+
 .addrow{flex-basis:100%;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
 .optcheck{display:inline-flex;gap:.3rem;align-items:center;min-height:44px}.optcheck input{width:auto;min-height:auto}
 .deploy:empty{display:none}
@@ -415,7 +422,7 @@ dialog .keep{margin:.2rem 0 .5rem}
 .methodrow{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:0 0 .5rem 1.6rem}.methodrow label{font-size:.9rem}.methodrow input,.methodrow select{flex:1 1 12rem;width:auto}
 .applynotes{margin:.4rem 0}
 #apply-dialog{width:min(36rem,calc(100% - 2rem))}
-@media (max-width:760px){.addbar{top:0}.methodrow{margin-left:0}}
+@media (max-width:760px){.methodrow{margin-left:0}}
 
 /* backup choice dialog */
 .choices{display:grid;gap:.4rem;margin:.6rem 0}

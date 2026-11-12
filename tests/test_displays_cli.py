@@ -951,6 +951,9 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(info["preview"]), len(info["display"]["pages"]))
         self.assertEqual(info["preview"][0]["layout"], "grid-2x2")
         self.assertEqual(len(info["preview"][0]["cells"]), 4)
+        self.assertEqual(info["preview_layouts"]["grid-2x2"][4], info["preview"][0])
+        self.assertEqual(info["preview_layouts"]["status-grid"][0]["cells"], [])
+        self.assertEqual(len(info["preview_layouts"]["status-grid"][9]["cells"]), 9)
         self.assertEqual(info["instruments"]["sog"]["used_on"], ["helm"])
         self.assertEqual(info["alarm_sources"], [])
 
@@ -1504,10 +1507,23 @@ class EditorTests(unittest.TestCase):
         def realpath(path):
             return "/dev/ttyACM0" if "Fake_Board" in path else "/dev/sda" if "bad-link" in path else "/dev/ttyUSB0"
 
-        info = editor.serial_ports(self.ctx(), by_id=by_id, lstat=lstat, realpath=realpath)
-        self.assertEqual([p["device"] for p in info["ports"]], ["/dev/ttyACM0", "/dev/ttyUSB0"])
-        self.assertTrue(all(p["path"].startswith("/dev/serial/by-id/") for p in info["ports"]))
-        self.assertEqual(editor.serial_ports(self.ctx(), by_id=Path(self._tmp.name) / "missing")["ports"], [])
+        def listdir(path):
+            return ["ttyACM0", "ttyUSB1", "ttyS0"] if path == Path("/dev") else os.listdir(path)
+
+        info = editor.serial_ports(self.ctx(), by_id=by_id, lstat=lstat, realpath=realpath, listdir=listdir)
+        self.assertEqual(info["ports"], [
+            {"path": "/dev/serial/by-id/usb-Fake_Board_0001-if00", "device": "/dev/ttyACM0"},
+            {"path": "/dev/serial/by-id/usb-Other-if00", "device": "/dev/ttyUSB0"},
+            {"path": "/dev/ttyUSB1", "device": "/dev/ttyUSB1"},
+        ])
+        self.assertIsNone(info["error"])
+
+        def denied(path):
+            raise PermissionError("permission denied")
+
+        info = editor.serial_ports(self.ctx(), listdir=denied)
+        self.assertEqual(info["ports"], [])
+        self.assertIn("permission denied", info["error"])
         code, out, _ = self.run_cli("serial-ports", "--json", "--allow-non-root")
         self.assertEqual(code, 0)
         self.assertIn("ports", json.loads(out))
