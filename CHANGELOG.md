@@ -3,6 +3,25 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.8.0 - planned prerelease - 2026-11-11
+
+### Highlights
+
+- Refresh the Homepage front door with a VesselStack nautical theme, responsive
+  layout, accessible focus states, and a boat-name greeting while preserving the
+  secret-free generated configuration and pinned image policy.
+- Carry forward the Displays editor improvements already present in `main`:
+  searchable value picking, visible layout/capacity context, draft-safe Done and
+  Cancel actions, authoritative unsaved previews, and explicit deploy/rollback
+  guidance.
+
+### Validation and release status
+
+This is a planned prerelease. Focused renderer and distribution validation pass
+locally; physical Raspberry Pi acceptance and hardware display validation remain
+open. Publish it as a prerelease first and do not mark it Latest until the
+documented lab checks pass.
+
 ## 0.7.1 - 2026-11-11
 
 ### Highlights
