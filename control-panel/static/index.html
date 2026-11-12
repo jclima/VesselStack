@@ -137,14 +137,14 @@
         <div class="toolbar dtoolbar"><button type="button" id="displays-refresh">Refresh</button><span id="displays-updated" class="small muted"></span></div>
         <div id="displays-status" role="status" aria-live="polite"></div>
         <div id="displays-root" class="displays"></div>
-        <section class="card flat" aria-labelledby="dh-h">
+        <section id="display-history" class="card flat" aria-labelledby="dh-h">
           <details id="history-panel" class="dgroup">
             <summary><strong id="dh-h">History and restore</strong></summary>
             <p class="small">A copy of the display settings is kept before every save (the newest 20). Restoring brings those settings back; it does not change a screen until you apply it.</p>
             <div id="history-root" aria-live="polite"></div>
           </details>
         </section>
-        <section class="card flat" aria-labelledby="dd-h">
+        <section id="display-data" class="card flat" aria-labelledby="dd-h">
           <div class="sechead"><div><h2 id="dd-h">Available data</h2><p id="catalog-note" class="small"></p></div>
             <div class="toolbar"><div class="search"><label for="catalog-search">Search data</label><input id="catalog-search" type="search" placeholder="Name, group or Signal K path" autocomplete="off"></div></div></div>
           <div id="catalog-root"></div>

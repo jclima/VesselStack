@@ -1408,13 +1408,13 @@ function firmwareChip(readiness) {
   const status = firmware?.status;
   if (flash && flash.ok === false) return { state: "flash-failed", label: "Last flash failed", tone: "bad", hint: "The last attempt to flash this display did not finish. Try again." };
   // The image on the screen was built from today's settings (even when it is the older, rolled-back build).
-  if (flash && flash.matches_settings === true) return { state: "on-screen", label: "On screen", tone: "good", hint: "The firmware that was last sent to the screen matches your settings." };
+  if (flash && flash.matches_settings === true) return { state: "on-screen", label: "Firmware sent", tone: "good", hint: "The last upload matches your saved settings. Check the display for live readings." };
   if (status === "none") return { state: "not-built", label: "Not built", tone: "warn", hint: "No firmware has been built for this display yet." };
   if (status === "outdated") return { state: "outdated", label: "Changes not on screen", tone: "warn", hint: "The settings changed after the firmware was built. Press Apply to screen to show them." };
   if (status === "current") {
     if (!flash) return { state: "never-flashed", label: "Never flashed", tone: "warn", hint: "Firmware is built but has not been sent to the display from this computer." };
     if (flash.matches_settings === false || (flash.matches_settings === undefined && flash.built_at_utc !== firmware.built_at_utc)) return { state: "outdated", label: "Changes not on screen", tone: "warn", hint: "A newer build exists than the one that was sent. Press Apply to screen to show it." };
-    return { state: "on-screen", label: "On screen", tone: "good", hint: "The firmware that was last sent to the screen matches your settings." };
+    return { state: "on-screen", label: "Firmware sent", tone: "good", hint: "The last upload matches your saved settings. Check the display for live readings." };
   }
   return { state: "unknown", label: "Unknown", tone: "plain", hint: "The Control Panel could not tell whether the display is up to date." };
 }
@@ -1430,7 +1430,7 @@ function readinessItems(id, readiness) {
   const r = readiness || {};
   const items = [];
   const add = (key, state, label, hint = "", command = "") => items.push({ key, state, label, hint, command });
-  add("enabled", r.displays_enabled ? "ok" : "todo", r.displays_enabled ? "Displays are switched on" : "Displays are switched off",
+  add("enabled", r.displays_enabled ? "ok" : "todo", r.displays_enabled ? "Display bridge enabled in Settings" : "Boat data is unavailable while the display bridge is off",
     r.displays_enabled ? "" : "Turn on “Enable instrument displays” in Settings, then Save and Apply.");
   if (r.secrets_readable === false) add("secrets", "unknown", "Display passwords could not be checked", "The Control Panel cannot read the displays secrets file, so the password and Wi-Fi checks below are unknown.");
   add("mqtt", r.secrets_readable === false ? "unknown" : r.mqtt_password_stored ? "ok" : "todo",
@@ -1439,9 +1439,9 @@ function readinessItems(id, readiness) {
   add("wifi", r.secrets_readable === false ? "unknown" : r.wifi_stored ? "ok" : "todo",
     r.wifi_stored ? "Wi-Fi details are stored" : "Wi-Fi details are not stored",
     r.wifi_stored ? "" : "The display needs the boat Wi-Fi name and password. They are typed on the boat computer so they never pass through this page.", r.wifi_stored ? "" : "sudo vesselstackctl display wifi");
-  const reachable = r.data_bind_non_loopback === true;
-  add("network", reachable ? "ok" : "todo", reachable ? "The display can reach the boat data over the network" : "The display cannot reach the boat data yet",
-    reachable ? "" : (r.data_bind_hint || "The data service only listens on this computer, so a display on the network cannot connect."), reachable ? "" : "sudo vesselstackctl lan all --yes");
+  const lanBinding = r.data_bind_non_loopback === true;
+  add("network", lanBinding ? "ok" : "todo", lanBinding ? "MQTT is configured to listen on the network" : "MQTT is configured for this computer only",
+    lanBinding ? "Check the screen for live readings after upload." : (r.data_bind_hint || "A display on the network needs access to MQTT."), lanBinding ? "" : "sudo vesselstackctl lan all --yes");
   if (r.docker_available === false) add("docker", "todo", "Docker is not available", "Building firmware on this computer needs Docker. You can instead export the project and build it elsewhere.", `sudo vesselstackctl display export ${id} --output FILE`);
   else if (r.docker_available === true) {
     if (r.esphome_image_present === false) add("image", "todo", "The firmware builder is not downloaded yet", "The first build downloads it, which needs an internet connection and a few minutes.");
@@ -1708,6 +1708,11 @@ function displayCard(entry) {
   const applyBlocked = applyBlock(entry);
   const busy = state.operationRunning || d.saving;
   const rollbackOk = entry.readiness?.firmware?.rollback_possible === true;
+  const dataBlocked = entry.readiness?.displays_enabled === false || entry.readiness?.data_bind_non_loopback === false;
+  const fields = [
+    h("h4", { text: "Colour theme" }), themeSwatches(entry, d.themes, draft),
+    h("h4", { text: "Pages" }), draft ? pageEditor(entry, draft) : pageList(entry),
+  ];
   return h("article", { class: `card dcard${editing ? " editing" : ""}`, "aria-labelledby": `dc-${id}` },
     h("header", { class: "dhead" },
       h("div", {}, h("h3", { id: `dc-${id}`, text: entry.display.name }), h("p", { class: "small muted" }, h("span", { class: "mono", text: id }), ` · ${entry.board?.name || entry.display.board} · ${themeName} theme`)),
@@ -1715,18 +1720,17 @@ function displayCard(entry) {
     h("div", { class: "dbody" },
       h("div", { class: "dpreview" }, previewControls(), previewBlock(entry)),
       h("div", { class: "dinfo" },
-        h("h4", { text: "Colour theme" }), themeSwatches(entry, d.themes, draft),
-        h("h4", { text: "Pages" }), draft ? pageEditor(entry, draft) : pageList(entry),
+        editing ? h("fieldset", { class: "display-edit-fields", disabled: d.saving, "aria-label": "Theme and pages" }, fields) : fields,
         editing ? editNotes(entry) : null,
         editing ? saveBar(entry, draft) : h("div", { class: "savebar" },
-          h("button", { type: "button", "data-act": "edit", "data-display": id, disabled: Boolean(otherEditing), title: otherEditing ? "Save or discard the changes on the other display first." : null, text: "Edit theme and pages" }),
+          h("button", { type: "button", "data-act": "edit", "data-display": id, disabled: Boolean(otherEditing) || d.saving, title: otherEditing ? "Save or discard the changes on the other display first." : null, text: "Edit theme and pages" }),
           h("button", { type: "button", class: chip.state === "on-screen" ? "" : "primary", "data-act": "apply", "data-display": id, disabled: Boolean(applyBlocked) || busy, title: busy ? "Another operation is running." : applyBlocked ? applyBlocked.reason : null, text: "Apply to screen" }),
           rollbackOk ? h("button", { type: "button", "data-act": "rollback", "data-display": id, disabled: busy, text: "Put previous firmware back" }) : null,
           applyBlocked ? h("span", { class: "small muted", text: applyBlocked.reason }) : null,
           applyBlocked?.command ? h("code", { text: applyBlocked.command }) : null),
         !editing && !rollbackOk && entry.readiness?.firmware?.has_previous ? h("p", { class: "small muted", text: "The previous firmware can be put back only when the settings match the ones it was built from: restore that older saved copy under History first, then the button appears here." }) : null,
         deployPanel(entry),
-        h("h4", { text: "Ready to show on the screen?" }), checklist(entry))));
+        editing ? null : h("details", { class: "dgroup", open: dataBlocked }, h("summary", { text: "Upload and live data checks" }), checklist(entry)))));
 }
 
 function renderDisplays() {
@@ -1760,19 +1764,28 @@ function renderDataBrowser() {
   const d = state.displays;
   const root = $("#catalog-root");
   root.textContent = "";
+  $("#display-data").hidden = Boolean(d.editing);
+  $("#display-history").hidden = Boolean(d.editing);
   const catalog = d.catalog;
   const note = $("#catalog-note");
   if (!catalog) { note.textContent = d.loading ? "Loading…" : "The data list is not available yet."; return; }
   const live = catalog.live || {};
   note.textContent = live.requested && live.ok ? "Values marked Live are being received from Signal K right now." : live.requested ? `Live values are unavailable${live.error ? ` (${live.error})` : ""}. The list shows common values without live data.` : "Live values were not requested.";
+  if (!d.editing) renderCatalogRows(root);
+}
+
+function renderCatalogRows(root, addCtl = null) {
+  const d = state.displays;
+  const catalog = d.catalog;
+  root.textContent = "";
+  if (!catalog) { root.append(h("p", { class: "small muted", text: "Available data could not be loaded. Use Refresh to try again." })); return; }
   const names = new Map(d.list.map((entry) => [displayId(entry), displayName(entry)]));
   const nameOf = (id) => names.get(id) || id;
-  const rows = filterCatalogRows(catalog.rows || [], d.query);
-  const addCtl = addTarget();
-  if (addCtl) root.append(addTargetBar(addCtl.entry, addCtl.draft));
-  if (!rows.length) { root.append(h("p", { class: "muted", text: d.query ? "Nothing matches that search." : "No data is listed." })); return; }
+  const query = addCtl ? addCtl.draft.query : d.query;
+  const rows = filterCatalogRows(catalog.rows || [], query);
+  if (!rows.length) { root.append(h("p", { class: "muted", text: query ? "Nothing matches that search." : "No data is listed." })); return; }
   groupCatalogRows(rows, catalog.groups).forEach((group, index) => {
-    const details = h("details", { class: "dgroup", open: Boolean(d.query) || index === 0 }, h("summary", {}, h("strong", { text: group.name }), h("span", { class: "n", text: ` ${group.rows.length}` })));
+    const details = h("details", { class: "dgroup", open: Boolean(query) || index === 0 }, h("summary", {}, h("strong", { text: group.name }), h("span", { class: "n", text: ` ${group.rows.length}` })));
     details.append(h("ul", { class: "drows" }, group.rows.map((row) => {
       const value = rowValueText(row);
       return h("li", { class: "drow" },
@@ -1839,14 +1852,17 @@ const savedPages = (entry) => entry.display.pages.map((page) => ({ title: page.t
 const themeLabel = (id) => (id === "high-contrast" ? "High contrast" : String(id || "classic").replace(/^./, (ch) => ch.toUpperCase()));
 
 function newDraft(entry) {
-  return { theme: entry.theme || "classic", pages: savedPages(entry), newInstruments: {}, newNotifications: {}, selected: 0 };
+  const theme = entry.theme || "classic";
+  const pages = savedPages(entry);
+  return { revision: entry.revision, baseTheme: theme, basePages: JSON.stringify(pages), theme, pages,
+    newInstruments: {}, newNotifications: {}, selected: 0, query: "", pickerOpen: false };
 }
 
 function draftDirty(entry, draft) {
   if (!draft) return false;
-  if (draft.theme !== (entry.theme || "classic")) return true;
+  if (draft.theme !== (draft.baseTheme ?? entry.theme ?? "classic")) return true;
   if (Object.keys(draft.newInstruments).length || Object.keys(draft.newNotifications).length) return true;
-  return JSON.stringify(draft.pages) !== JSON.stringify(savedPages(entry));
+  return JSON.stringify(draft.pages) !== (draft.basePages ?? JSON.stringify(savedPages(entry)));
 }
 
 function displaysDirty() {
@@ -2005,8 +2021,8 @@ function removePage(draft, index) {
 
 // The request body of POST /api/displays/save.
 function savePayload(entry, draft) {
-  const body = { id: displayId(entry), revision: entry.revision, pages: draft.pages.map((page) => ({ title: page.title.trim(), layout: page.layout, items: [...page.items] })) };
-  if (draft.theme !== (entry.theme || "classic")) body.theme = draft.theme;
+  const body = { id: displayId(entry), revision: draft.revision ?? entry.revision, pages: draft.pages.map((page) => ({ title: page.title.trim(), layout: page.layout, items: [...page.items] })) };
+  if (draft.theme !== (draft.baseTheme ?? entry.theme ?? "classic")) body.theme = draft.theme;
   if (Object.keys(draft.newInstruments).length) body.new_instruments = jsonClone(draft.newInstruments);
   if (Object.keys(draft.newNotifications).length) body.new_notifications = jsonClone(draft.newNotifications);
   return body;
@@ -2015,6 +2031,11 @@ function savePayload(entry, draft) {
 // The display as the draft would make it, for the preview. A page whose layout the saved version never showed has no
 // geometry yet (it is computed on the boat computer), so the preview says so until the draft is saved.
 function geometryFor(entry, page, index) {
+  // Newer servers provide geometry for every supported layout and item count,
+  // so an unsaved layout change can still be previewed accurately. Keep the
+  // saved-page fallback below for older panel payloads.
+  const draftGeometry = entry.preview_layouts?.[page.layout]?.[page.items.length];
+  if (draftGeometry) return draftGeometry;
   const saved = entry.display.pages[index];
   const geometry = entry.preview || [];
   if (saved && geometry[index] && saved.layout === page.layout && saved.items.length === page.items.length) return geometry[index];
@@ -2071,8 +2092,6 @@ function applyBlock(entry) {
   if (r.wifi_stored === false) return { reason: "The boat's Wi-Fi name and password are not stored yet.", command: "sudo vesselstackctl display wifi" };
   if (r.mqtt_password_stored === false) return { reason: "This display has no data password yet.", command: `sudo vesselstackctl display rotate ${displayId(entry)}` };
   if (r.docker_available === false) return { reason: "Docker is not available on this computer, so firmware cannot be built here.", command: `sudo vesselstackctl display export ${displayId(entry)} --output FILE` };
-  const need = r.toolchain_cache_present ? r.min_free_bytes_warm_build : r.min_free_bytes_first_build;
-  if (Number.isFinite(r.free_disk_bytes) && Number.isFinite(need) && r.free_disk_bytes < need) return { reason: `Not enough free disk space: ${formatBytes(r.free_disk_bytes)} free, ${formatBytes(need)} needed.`, command: "" };
   return null;
 }
 
@@ -2121,7 +2140,7 @@ function deployPanel(entry) {
       h("span", { class: "mark", "aria-hidden": "true", text: step.status === "done" ? "✓" : step.status === "failed" ? "!" : step.status === "active" ? "…" : "·" }),
       h("span", { text: step.label }), h("span", { class: "sr", text: ` (${step.status === "todo" ? "waiting" : step.status})` })))));
   if (op.state === "running") wrap.append(h("p", { class: "small muted", text: "Keep this page open. Backups, updates and settings changes are paused until this finishes." }));
-  if (op.state === "succeeded") wrap.append(h("div", { class: "banner ok", role: "status" }, h("span", { class: "icon", "aria-hidden": "true", text: "✓" }), h("div", { class: "msg", text: "Sent. The screen restarts by itself and should show the new settings within a minute." })));
+  if (op.state === "succeeded") wrap.append(h("div", { class: "banner ok", role: "status" }, h("span", { class: "icon", "aria-hidden": "true", text: "✓" }), h("div", { class: "msg", text: "Firmware sent. Check the pages and live readings on the screen after it restarts." })));
   if (op.state === "failed") {
     const fix = String(summary.fix || "").trim();
     wrap.append(h("div", { class: "banner fail", role: "alert" }, h("span", { class: "icon", "aria-hidden": "true", text: "!" }),
@@ -2152,6 +2171,7 @@ const entryById = (id) => state.displays.list.find((entry) => displayId(entry) =
 
 function startEditing(id) {
   const d = state.displays;
+  if (d.saving) return;
   if (d.editing && d.editing !== id && displaysDirty()) { toast("Save or discard the changes on the other display first.", true); return; }
   const entry = entryById(id);
   if (!entry || entry.error) return;
@@ -2167,6 +2187,8 @@ function stopEditing(id) {
   const d = state.displays;
   if (d.editing === id) d.editing = null;
   delete d.drafts[id];
+  d.rowOpts = {};
+  d.rowErrors = {};
   d.saveErrors[id] = [];
   d.conflict[id] = false;
 }
@@ -2177,7 +2199,7 @@ function rerenderDisplays(focusKey = "") {
   if (focusKey) $$(`[data-focus="${focusKey}"]`)[0]?.focus?.();
 }
 
-async function saveDraft(entry) {
+async function saveDraft(entry, { forUpload = false } = {}) {
   const d = state.displays;
   const id = displayId(entry);
   const draft = d.drafts[id];
@@ -2193,9 +2215,8 @@ async function saveDraft(entry) {
     await api("/api/displays/save", { method: "POST", body: JSON.stringify(savePayload(entry, draft)) });
     if (session !== state.session) return false;
     stopEditing(id);
-    d.saving = false;
     await loadDisplays(true);
-    toast("Saved. Press Apply to screen to show it on the display.");
+    if (!forUpload) toast("Saved on the boat computer. Use Apply to screen to upload.");
     return true;
   } catch (error) {
     if (session !== state.session) return false;
@@ -2210,33 +2231,46 @@ async function saveDraft(entry) {
 
 async function loadSerialPorts() {
   const d = state.displays;
-  try { d.serialPorts = (await api("/api/displays/serial-ports")).ports || []; } catch { d.serialPorts = []; }
+  d.serialPortError = "";
+  try {
+    const answer = await api("/api/displays/serial-ports");
+    d.serialPorts = Array.isArray(answer.ports) ? answer.ports : [];
+    d.serialPortError = String(answer.error || "");
+  } catch (error) {
+    d.serialPorts = [];
+    d.serialPortError = String(error?.message || "USB port lookup failed. Plug in the display and try Refresh.");
+  }
   return d.serialPorts;
 }
 
 // The Apply dialog. Resolves {method, target} or null.
-async function openApplyDialog(entry, kind = "deploy") {
+async function openApplyDialog(entry, kind = "deploy", saveChanges = false) {
   const dialog = $("#apply-dialog");
-  if (dialog.open) return null;
   const d = state.displays;
+  if (dialog.open || d.serialPortLookup) return null;
   const r = entry.readiness || {};
   const id = displayId(entry);
   const rollback = kind === "rollback";
   $("#apply-title").textContent = rollback ? `Put the previous firmware back on ${displayName(entry)}` : `Apply to screen: ${displayName(entry)}`;
-  $("#apply-ok").textContent = rollback ? "Put it back" : "Start";
+  $("#apply-ok").textContent = rollback ? "Put it back" : saveChanges ? "Save and upload" : "Start";
   const body = $("#apply-body");
   body.textContent = "";
-  const ports = await loadSerialPorts();
+  d.serialPortLookup = true;
+  let ports;
+  try { ports = await loadSerialPorts(); } finally { d.serialPortLookup = false; }
+  if (state.displays !== d || !signedIn()) return null;
   let method = defaultMethod(entry);
   const radio = (value, text, hint) => h("label", { class: "choice" }, h("input", { type: "radio", name: "apply-method", value, "data-apply-method": value, checked: method === value }), h("span", {}, h("strong", { text }), h("span", { class: "small muted", text: ` ${hint}` })));
   const host = h("input", { id: "apply-host", type: "text", value: defaultOtaTarget(entry), autocomplete: "off", spellcheck: "false", "aria-describedby": "apply-error" });
   const port = h("select", { id: "apply-port", "aria-describedby": "apply-error" });
   const fillPorts = (list) => {
     port.textContent = "";
-    if (!list.length) port.append(h("option", { value: "", text: "No USB display found" }));
-    list.forEach((item, index) => port.append(h("option", { value: item.path, selected: index === 0, text: item.path.replace(/^\/dev\/serial\/by-id\//, "") })));
+    if (list.length !== 1) port.append(h("option", { value: "", selected: true, text: list.length ? "Choose a USB port" : d.serialPortError ? "USB lookup failed" : "No USB display found" }));
+    list.forEach((item, index) => port.append(h("option", { value: item.path, selected: list.length === 1 && index === 0, text: item.path.replace(/^\/dev\/serial\/by-id\//, "") })));
   };
   fillPorts(ports);
+  const portHint = h("p", { id: "apply-port-hint", class: "small warn-text", role: "status",
+    text: d.serialPortError || (ports.length ? (ports.length > 1 ? "Several USB ports are connected; choose the display's port." : "") : "Plug the display in, then press Refresh.") });
   const error = h("p", { id: "apply-error", class: "small warn-text", role: "alert" });
   const confirmBox = h("input", { id: "apply-confirm-target", type: "checkbox", "data-apply-confirm": "1" });
   const confirmText = h("span", { id: "apply-confirm-text" });
@@ -2245,6 +2279,7 @@ async function openApplyDialog(entry, kind = "deploy") {
   const notes = [
     rollback ? "This sends the firmware that ran before the last update. It is offered only when the settings match the ones it was built from (restore that older saved copy from History first)."
       : `This builds the firmware if it is out of date and sends it. It takes ${minutes}.`,
+    ...(!rollback && saveChanges ? ["Your settings will be saved before the upload starts."] : []),
     "Wi-Fi updates are not yet verified on hardware. The very first time a new display is set up it must be sent by USB cable, and if Wi-Fi does not work, use USB.",
     ...(!rollback && !r.toolchain_cache_present && Number.isFinite(r.free_disk_bytes) ? [`The first build needs about ${formatBytes(r.min_free_bytes_first_build)} of free space; this computer has ${formatBytes(r.free_disk_bytes)}.`] : []),
     ...(!rollback && r.esphome_image_present === false ? ["The build tools (about 250 MB) are downloaded first, which needs an internet connection."] : []),
@@ -2252,8 +2287,8 @@ async function openApplyDialog(entry, kind = "deploy") {
   ];
   body.append(
     h("fieldset", { class: "methods" }, h("legend", { text: "How should it be sent?" }),
-      radio("serial", "By USB cable", "(always works; needed the first time)"),
-      h("div", { class: "methodrow" }, h("label", { for: "apply-port", text: "USB port" }), port, h("button", { type: "button", id: "apply-refresh-ports", text: "Refresh" })),
+      radio("serial", "By USB cable", "(required for first upload)"),
+      h("div", { class: "methodrow" }, h("label", { for: "apply-port", text: "USB port" }), port, h("button", { type: "button", id: "apply-refresh-ports", text: "Refresh" })), portHint,
       radio("ota", "Over Wi-Fi", "(not yet verified on hardware)"),
       h("div", { class: "methodrow" }, h("label", { for: "apply-host", text: "Display address" }), host),
       h("p", { class: "small muted", text: "An IP address is more reliable than a name ending in .local." })),
@@ -2266,9 +2301,10 @@ async function openApplyDialog(entry, kind = "deploy") {
     confirmRow.hidden = !need;
     confirmText.textContent = need ? `Send firmware, which contains this boat's Wi-Fi password, to ${String(host.value).trim()}` : "";
     if (!need) confirmBox.checked = false;
-    $("#apply-ok").disabled = need && !confirmBox.checked;
+    $("#apply-ok").disabled = method === "serial" ? Boolean(serialProblem(port.value, d.serialPorts)) : need && !confirmBox.checked;
   };
-  host.oninput = syncConfirm; confirmBox.onchange = syncConfirm;
+  host.oninput = () => { confirmBox.checked = false; syncConfirm(); }; confirmBox.onchange = syncConfirm;
+  port.onchange = () => { error.textContent = ""; syncConfirm(); };
   $$("[data-apply-method]").forEach((item) => { item.onchange = syncConfirm; });
   syncConfirm();
   const opener = document.activeElement;
@@ -2280,7 +2316,12 @@ async function openApplyDialog(entry, kind = "deploy") {
       resolve(dialog.returnValue === "ok" ? result : null);
     };
     $("#apply-cancel").onclick = () => dialog.close("cancel");
-    $("#apply-refresh-ports").onclick = async () => { fillPorts(await loadSerialPorts()); };
+    $("#apply-refresh-ports").onclick = async () => {
+      const refreshed = await loadSerialPorts(); fillPorts(refreshed);
+      portHint.textContent = d.serialPortError || (refreshed.length ? (refreshed.length > 1 ? "Several USB ports are connected; choose the display's port." : "") : "Plug the display in, then press Refresh.");
+      error.textContent = "";
+      syncConfirm();
+    };
     d.applyDialog = { entry, kind, get method() { syncMethod(); return method; }, host, port, error, confirmBox, confirmRow, sync: syncConfirm };
     $("#apply-ok").onclick = () => {
       syncMethod();
@@ -2304,19 +2345,18 @@ async function startDisplayUpload(kind, body) {
 }
 
 async function applyToScreen(id) {
-  let entry = entryById(id);
+  const entry = entryById(id);
   const d = state.displays;
   if (!entry) return;
-  const draft = d.drafts[id];
-  if (draft && draftDirty(entry, draft)) {
-    if (!(await saveDraft(entry))) return;
-    entry = entryById(id);
-    if (!entry) return;
-  }
   const block = applyBlock(entry);
   if (block) { toast(block.reason, true); return; }
-  const choice = await openApplyDialog(entry, "deploy");
-  if (choice) await startDisplayUpload("deploy", choice);
+  const session = state.session;
+  const draft = d.drafts[id];
+  const saveChanges = draftDirty(entry, draft);
+  const choice = await openApplyDialog(entry, "deploy", saveChanges);
+  if (!choice || session !== state.session || d.drafts[id] !== draft) return;
+  if (saveChanges && !(await saveDraft(entry, { forUpload: true }))) return;
+  if (session === state.session) await startDisplayUpload("deploy", choice);
 }
 
 async function rollbackScreen(id) {
@@ -2403,9 +2443,20 @@ function pageEditor(entry, draft) {
   const infoShow = draftShow(entry, draft);
   const problems = draftProblems(entry, draft);
   const root = h("div", { class: "pedits" });
+  const pages = h("div", { class: "editor-pages", role: "group", "aria-label": "Choose a page to edit" });
   draft.pages.forEach((page, index) => {
+    const hasProblem = problems.some((item) => item.page === index);
+    pages.append(h("button", { type: "button", "data-act": "select-page", "data-display": id,
+      "data-page": String(index), "data-focus": `select-${index}`, "aria-pressed": String(draft.selected === index),
+      text: `${index + 1}. ${page.title.trim() || "Untitled page"}${hasProblem ? " • Needs attention" : ""}` }));
+  });
+  pages.append(editorButton("Add page", "page-add", { disabled: draft.pages.length >= MAX_PAGES,
+    attrs: { "data-display": id, "data-focus": "page-add" } }));
+  root.append(pages);
+  const index = draft.selected;
+  const page = draft.pages[index];
+  if (page) {
     const spec = entry.layouts?.[page.layout];
-    const selected = draft.selected === index;
     const mine = problems.filter((item) => item.page === index);
     const attrs = (extra) => ({ "data-display": id, "data-page": String(index), ...extra });
     const items = h("ol", { class: "pitems" }, page.items.map((itemId, itemIndex) => {
@@ -2419,8 +2470,8 @@ function pageEditor(entry, draft) {
           editorButton(`Move ${name} down`, "item-down", { attrs: attrs({ "data-item": String(itemIndex), "data-focus": `down-${index}-${itemIndex}` }), disabled: itemIndex === page.items.length - 1 || Boolean(spec?.slots) }, "↓"),
           editorButton(`Remove ${name} from page ${index + 1}`, "item-remove", { attrs: attrs({ "data-item": String(itemIndex), "data-focus": `remove-${index}-${itemIndex}` }) }, "Remove")));
     }));
-    root.append(h("section", { class: `pedit${selected ? " on" : ""}`, "aria-label": `Page ${index + 1}` },
-      h("div", { class: "phead" }, h("button", { type: "button", class: "pagebtn", "data-act": "select-page", ...attrs({}), "aria-pressed": String(selected), "data-focus": `select-${index}` }, h("strong", { text: `Page ${index + 1}` }), h("span", { class: "layout", text: selected ? "Adding from the data list below" : "Select to add values here" })),
+    root.append(h("section", { class: "pedit on", "aria-label": `Page ${index + 1}` },
+      h("div", { class: "phead" }, h("strong", { text: `Page ${index + 1}` }),
         h("span", { class: "pbtns" },
           editorButton(`Move page ${index + 1} up`, "page-up", { attrs: attrs({ "data-focus": `pup-${index}` }), disabled: index === 0 }, "↑"),
           editorButton(`Move page ${index + 1} down`, "page-down", { attrs: attrs({ "data-focus": `pdown-${index}` }), disabled: index === draft.pages.length - 1 }, "↓"),
@@ -2428,12 +2479,14 @@ function pageEditor(entry, draft) {
       h("div", { class: "pfields" },
         h("label", { class: "field" }, h("span", { text: "Page name" }), h("input", { type: "text", value: page.title, maxlength: String(PAGE_TITLE_MAX * 2), autocomplete: "off", "data-page-title": String(index), ...attrs({ "data-focus": `edit-title-${index}` }) })),
         h("label", { class: "field" }, h("span", { text: "Layout" }), h("select", { "data-page-layout": String(index), ...attrs({ "data-focus": `layout-${index}` }) }, layoutChoices(entry).map((name) => h("option", { value: name, selected: name === page.layout, text: LAYOUT_NAMES[name] || name }))))),
-      spec ? h("p", { class: "small muted", text: `Holds ${spec.capacity} value${spec.capacity === 1 ? "" : "s"}${spec.min_items > 1 ? `, at least ${spec.min_items}` : ""}${spec.slots ? ". Each slot has a fixed role, so the order cannot be changed" : ""}.` }) : null,
-      page.items.length ? items : h("p", { class: "small muted", text: "No values yet. Select this page, then use Add to page in the data list below." }),
-      mine.length ? h("ul", { class: "problems", role: "alert" }, mine.map((item) => h("li", { text: item.text }))) : null));
-  });
-  root.append(h("div", {}, editorButton("Add a page", "page-add", { class: "", disabled: draft.pages.length >= MAX_PAGES, attrs: { "data-focus": "page-add" } }, "Add page"),
-    draft.pages.length >= MAX_PAGES ? h("span", { class: "small muted", text: ` A display can have at most ${MAX_PAGES} pages.` }) : null));
+      spec ? h("p", { class: "small muted", text: `${page.items.length} of ${spec.capacity} values${spec.min_items > 1 ? ` · At least ${spec.min_items} required` : ""}${spec.slots ? " · Fixed slot order" : ""}` }) : null,
+      page.items.length ? items : null,
+      mine.length ? h("ul", { class: "problems" }, mine.map((item) => h("li", { text: item.text }))) : null,
+      editorButton(draft.pickerOpen ? "Close data picker" : "Add values", "toggle-picker", {
+        attrs: { "data-display": id, "data-focus": "toggle-picker", "aria-expanded": String(draft.pickerOpen) },
+      }),
+      draft.pickerOpen ? pageDataPicker(entry, draft) : null));
+  }
   return root;
 }
 
@@ -2448,9 +2501,9 @@ function saveBar(entry, draft) {
   const applyWhy = busy ? why : block ? block.reason : problems.length ? why : "";
   return h("div", { class: "savebar", "data-savebar": id, role: "group", "aria-label": `Save changes to ${displayName(entry)}` },
     h("span", { class: "small", "aria-live": "polite", text: dirty ? "Unsaved changes" : "No unsaved changes" }),
-    h("button", { type: "button", "data-act": "discard", "data-display": id, disabled: !dirty || busy, text: "Discard" }),
+    h("button", { type: "button", "data-act": "cancel", "data-display": id, disabled: d.saving, text: dirty ? "Cancel" : "Done" }),
     h("button", { type: "button", class: "primary", "data-act": "save", "data-display": id, disabled: !dirty || Boolean(why), title: why || null, text: "Save" }),
-    h("button", { type: "button", class: "primary", "data-act": "apply", "data-display": id, disabled: Boolean(applyWhy), title: applyWhy || null, text: "Apply to screen" }),
+    h("button", { type: "button", "data-act": "apply", "data-display": id, disabled: Boolean(applyWhy), title: applyWhy || null, text: "Apply to screen" }),
     why && dirty ? h("span", { class: "small muted", text: why }) : null,
     applyWhy && applyWhy !== why ? h("span", { class: "small muted", text: applyWhy }) : null,
     block && !busy ? h("code", { text: block.command }) : null);
@@ -2493,7 +2546,15 @@ function runDisplayAction(ds) {
   const item = Number(ds.item);
   switch (ds.act) {
     case "edit": startEditing(id); return;
-    case "discard": stopEditing(id); rerenderDisplays(); return;
+    case "cancel": {
+      if (!entry || d.saving) return;
+      if (!draft || !draftDirty(entry, draft)) { stopEditing(id); rerenderDisplays(); return; }
+      ask({ title: "Discard display edits?", intro: "Your changes to the theme and pages will be discarded.",
+        ok: "Discard edits", danger: true }).then((ok) => {
+        if (ok && state.displays === d && d.drafts[id] === draft) { stopEditing(id); rerenderDisplays(); }
+      });
+      return;
+    }
     case "save": if (entry) saveDraft(entry); return;
     case "apply": applyToScreen(id); return;
     case "rollback": rollbackScreen(id); return;
@@ -2521,6 +2582,12 @@ function runDisplayAction(ds) {
       rerenderDisplays(draft.pages[page].items.length ? `remove-${page}-${Math.min(item, draft.pages[page].items.length - 1)}` : `select-${page}`);
       return;
     }
+    case "toggle-picker":
+      if (draft) {
+        draft.pickerOpen = !draft.pickerOpen;
+        rerenderDisplays(draft.pickerOpen ? "editor-search" : "toggle-picker");
+      }
+      return;
     case "add-row": addRowFromBrowser(ds.rowId); return;
     default:
   }
@@ -2533,7 +2600,12 @@ function onDisplaysInput(event) {
   const d = state.displays;
   const id = ds.display || d.editing;
   const draft = d.drafts[id];
-  if (ds.pageTitle !== undefined && draft) {
+  if (ds.editorSearch !== undefined && draft) {
+    draft.query = field.value;
+    const results = $("#display-picker-results");
+    const target = addTarget();
+    if (results && target) renderCatalogRows(results, target);
+  } else if (ds.pageTitle !== undefined && draft) {
     draft.pages[Number(ds.pageTitle)].title = field.value;
     const entry = entryById(id);
     const old = $$(`[data-savebar="${id}"]`)[0];
@@ -2558,11 +2630,14 @@ function addTarget() {
   return entry && draft ? { entry, draft } : null;
 }
 
-function addTargetBar(entry, draft) {
-  const page = draft.pages[draft.selected];
-  return h("div", { class: "addbar", role: "status" }, h("strong", { text: `Adding to ${displayName(entry)}` }),
-    h("span", {}, ` › page ${draft.selected + 1}, “${page?.title || ""}” (${LAYOUT_NAMES[page?.layout] || page?.layout || ""}, ${page?.items.length || 0} of ${entry.layouts?.[page?.layout]?.capacity ?? "?"})`),
-    h("span", { class: "small muted", text: " Choose another page in the editor above to add elsewhere." }));
+function pageDataPicker(entry, draft) {
+  const results = h("div", { id: "display-picker-results" });
+  renderCatalogRows(results, { entry, draft });
+  return h("div", { class: "page-data-picker" },
+    h("label", { class: "field" }, h("span", { text: "Find a value to add" }),
+      h("input", { type: "search", value: draft.query, placeholder: "Name, group or Signal K path",
+        autocomplete: "off", "data-editor-search": "true", "data-focus": "editor-search" })),
+    results);
 }
 
 function rowAddControls(entry, draft, row) {
@@ -2595,11 +2670,11 @@ function addRowFromBrowser(rowId) {
   if (!target || !row) return;
   d.rowErrors = d.rowErrors || {};
   const result = addRowToDraft(target.entry, target.draft, row, d.rowOpts[rowId] || {});
-  if (!result.ok) { d.rowErrors[rowId] = result.error; renderDataBrowser(); $$(`[data-focus="add-${rowId}"]`)[0]?.focus?.(); return; }
+  if (!result.ok) { d.rowErrors[rowId] = result.error; const results = $("#display-picker-results"); if (results) renderCatalogRows(results, target); $$(`[data-focus="add-${rowId}"]`)[0]?.focus?.(); return; }
   delete d.rowErrors[rowId];
   delete d.rowOpts[rowId];
-  rerenderDisplays(`add-${rowId}`);
-  toast(`Added “${row.label}” to page ${target.draft.selected + 1}. Press Save to keep it.`);
+  rerenderDisplays("editor-search");
+  toast(`Added “${row.label}” to page ${target.draft.selected + 1}.`);
 }
 
 

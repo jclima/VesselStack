@@ -3,6 +3,26 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.7.1 - 2026-11-11
+
+### Highlights
+
+- Made the Control Panel Displays editor easier to use: the active page and its
+  layout/capacity stay visible while choosing data, the catalog gains an in-editor
+  searchable value picker, and Done/Cancel exits are available even when a draft
+  is unchanged.
+- Draft previews now use authoritative server geometry when available for an
+  unsaved layout and item count, while retaining the older saved-geometry fallback.
+- Draft saves retain the revision captured when editing began, so a refresh cannot
+  silently replace newer settings; conflicts remain explicit and recoverable.
+
+### Upgrade and rollback
+
+This is a focused Control Panel Displays release. Saved display settings and
+backups remain compatible with 0.7.0. If the editor is not suitable for a boat,
+restore the verified pre-update backup or reinstall the previous release; do not
+rely on an application-only update for shared modules or service changes.
+
 ## 0.7.0 - 2026-11-10
 
 ### Highlights
