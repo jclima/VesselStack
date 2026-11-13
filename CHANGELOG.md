@@ -5,6 +5,23 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Configure the Signal K data path automatically in Docker and native modes
+  (`SIGNALK_DATAPATH_AUTOCONFIG`, default `true`; existing mode is never modified): the installer installs
+  `signalk-to-influxdb2` 2.3.0 into the Signal K data directory, adds a `vesselstack-n2k-<interface>` NMEA 2000
+  provider when SocketCAN is enabled (after a `settings.json.vesselstack-<time>.bak` copy) and writes the
+  plugin configuration only when it does not exist. The plugin gets its own `vesselstack-signalk-writer`
+  InfluxDB token: read this organization, read and write the raw bucket only, read DBRP mappings (a missing
+  DBRP mapping is created first). Signal K is stopped and started once on the first run; an npm prune guard
+  (`npm install --dry-run`) skips the install, with a warning, if npm would delete packages that
+  `package.json` does not list; `--offline` installs skip the step. The token can read the raw bucket,
+  including position data, and is stored in the plugin configuration (mode 0600).
+- Add the **VesselStack Boat Overview** Grafana dashboard (batteries, tanks, engine, navigation without
+  position, environment) reading `INFLUXDB_RAW_BUCKET`; the installer rejects a bucket name that is not
+  1 to 64 letters, digits, dots, hyphens or underscores.
+- `vesselstackctl doctor` reports whether Signal K data reaches InfluxDB (warnings only).
+- Rollback: set `SIGNALK_DATAPATH_AUTOCONFIG=false`, delete
+  `signalk/plugin-config-data/signalk-to-influxdb2.json`, restore `settings.json` from its `.bak`, delete the
+  `vesselstack-signalk-writer` token and `npm uninstall signalk-to-influxdb2` (README, "Signal K and InfluxDB").
 - Add unattended-operation settings: a hardware watchdog (`VESSELSTACK_WATCHDOG`, default `auto`,
   enabled only on a Raspberry Pi that has `/dev/watchdog`; `true` enables it on any computer with the
   device) and a journal size cap (`VESSELSTACK_JOURNAL_MAX_USE`, default `200M`, or `off` for no

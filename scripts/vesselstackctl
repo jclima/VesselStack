@@ -1563,6 +1563,77 @@ check_signalk_data_dir() {
     return 1
 }
 
+# Last value of the single data row of `influx query --raw` output (empty when there is none).
+signalk_datapath_value() {
+    local flux=$1 out
+    out=$(INFLUX_TOKEN=$INFLUXDB_TOKEN INFLUX_ORG=${INFLUXDB_ORG:-} timeout 20 docker exec -e INFLUX_TOKEN -e INFLUX_ORG \
+        "${INFLUXDB_CONTAINER_NAME:-vesselstack-influxdb}" influx query --raw "$flux" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | tr -d '\r' | awk -F, '!/^#/ && !/^,result/ && NF { v = $NF } END { print v }'
+}
+
+# Reports whether Signal K data reaches InfluxDB. Everything here is a WARN at worst: a boat
+# at the dock legitimately has no live data, and an owner who manages the plugin by hand is
+# not wrong. Only managed modes are judged.
+check_signalk_datapath() {
+    local mode=${SIGNALK_MODE:-existing} dir="$VESSELSTACK_DATA/signalk" config skip_file bucket newest count now_s then_s age iface rx
+    [ "$mode" != existing ] || return 0
+    if [ "${SIGNALK_DATAPATH_AUTOCONFIG:-true}" != true ]; then
+        printf 'INFO Signal K data path automation is off (SIGNALK_DATAPATH_AUTOCONFIG=false); the plugin, provider and token are yours to manage\n'
+        return 0
+    fi
+    skip_file="$SYSTEM_ROOT/var/lib/vesselstack/signalk-datapath-skipped"
+    if [ -s "$skip_file" ]; then
+        printf 'WARN the signalk-to-influxdb2 plugin was not installed because npm would remove packages that package.json does not list (%s). Fix: add them to the dependencies in %s/package.json or delete them, then rerun the installer\n' \
+            "$(head -c 300 "$skip_file" | tr -d '\r\n')" "$dir" >&2
+        return 0
+    fi
+    config="$dir/plugin-config-data/signalk-to-influxdb2.json"
+    if [ ! -f "$config" ]; then
+        printf 'WARN the Signal K InfluxDB plugin has no configuration (%s), so nothing is recorded in InfluxDB. Fix: rerun the installer (online), or see README "Signal K and InfluxDB"\n' "${config#"$VESSELSTACK_DATA"/}" >&2
+        return 0
+    fi
+    if command -v jq >/dev/null 2>&1 && ! jq -e '.enabled == true' "$config" >/dev/null 2>&1; then
+        printf 'WARN the Signal K InfluxDB plugin is disabled, so nothing is recorded in InfluxDB. Fix: enable signalk-to-influxdb2 under Signal K > Server > Plugin Config\n' >&2
+        return 0
+    fi
+    case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,influxdb,*) return 0 ;; esac
+    bucket=${INFLUXDB_RAW_BUCKET:-}
+    if [ -z "${INFLUXDB_TOKEN:-}" ] || ! [[ $bucket =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+        printf 'WARN cannot check whether Signal K data reaches InfluxDB (INFLUXDB_TOKEN or INFLUXDB_RAW_BUCKET is unusable)\n' >&2
+        return 0
+    fi
+    if ! newest=$(signalk_datapath_value "from(bucket: \"$bucket\") |> range(start: -1h) |> filter(fn: (r) => r.self == \"true\" and r._field == \"value\") |> last() |> map(fn: (r) => ({_time: r._time, _value: 1})) |> group() |> max(column: \"_time\") |> keep(columns: [\"_time\"])") \
+        || ! count=$(signalk_datapath_value "from(bucket: \"$bucket\") |> range(start: -10m) |> filter(fn: (r) => r.self == \"true\" and r._field == \"value\") |> map(fn: (r) => ({_time: r._time, _value: 1})) |> group() |> count()"); then
+        printf 'WARN could not query InfluxDB to check the Signal K data path (is the InfluxDB container running?). Check: vesselstackctl status\n' >&2
+        return 0
+    fi
+    count=${count:-0}
+    now_s=$(date +%s)
+    then_s=
+    [ -z "$newest" ] || then_s=$(date -d "$newest" +%s 2>/dev/null || true)
+    if [ -n "$then_s" ] && [ $((now_s - then_s)) -lt 120 ]; then
+        age=$((now_s - then_s))
+        printf 'OK   Signal K data reaches InfluxDB: newest point %ss ago, %s points in the last 10 minutes\n' "$age" "$count"
+        return 0
+    fi
+    if [ -n "$then_s" ]; then
+        printf 'WARN the newest Signal K point in InfluxDB is %s minutes old (%s points in the last 10 minutes). Check the instruments, Signal K data browser and the plugin status under Signal K > Server > Plugin Config\n' "$(((now_s - then_s) / 60))" "$count" >&2
+    else
+        printf 'WARN no Signal K data in InfluxDB in the last hour. Check that instruments are powered, that Signal K shows live data and the signalk-to-influxdb2 plugin status\n' >&2
+    fi
+    if [ "${SOCKETCAN_ENABLE:-false}" = true ]; then
+        iface=${SOCKETCAN_INTERFACE:-can0}
+        rx=
+        if [[ $iface =~ ^[A-Za-z][A-Za-z0-9_.-]{0,14}$ ]]; then
+            rx=$(cat "${VESSELSTACK_SYS_CLASS_NET:-$SYSTEM_ROOT/sys/class/net}/$iface/statistics/rx_packets" 2>/dev/null || true)
+        fi
+        if [ "$rx" = 0 ]; then
+            printf 'WARN SocketCAN interface %s has received 0 packets: check the NMEA 2000 backbone power, termination and wiring\n' "$iface" >&2
+        fi
+    fi
+    return 0
+}
+
 # HOMEASSISTANT_BIND_ADDRESS only means something when configuration.yaml carries our block.
 check_homeassistant_bind() {
     local want=${HOMEASSISTANT_BIND_ADDRESS:-0.0.0.0} state
@@ -1817,6 +1888,7 @@ doctor_stack() {
     fi
     disk_usage_warning
     check_signalk_data_dir || failed=1
+    check_signalk_datapath
     check_homeassistant_bind
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,prometheus,*) ;; *) check_prometheus_data_dir || failed=1 ;; esac
     check_memory_index || failed=1

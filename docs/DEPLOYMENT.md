@@ -330,6 +330,7 @@ Lab settings worth checking (all defined in `vesselstack.example.env`):
 ```bash
 SIGNALK_MODE="docker"                      # self-contained; "existing" needs a running SignalK
 SIGNALK_VESSELTWIN_PRELOAD="true"           # package preload only; enable/pair/send remain explicit
+SIGNALK_DATAPATH_AUTOCONFIG="true"           # signalk-to-influxdb2, CAN provider and its own InfluxDB token (needs the npm registry)
 SOCKETCAN_ENABLE="true"
 SOCKETCAN_INTERFACE="vcan0"                # bitrate is ignored for vcan*
 VESSELSTACK_CAN_CREATE_VCAN="true"         # modprobe vcan + ip link add at boot
@@ -456,7 +457,9 @@ values, and record the `doctor` result and data-directory size each day.
    `SIGNALK_VESSELTWIN_PRELOAD=true` requires a valid preload plugin install
    prepared while online; for a fresh offline install, set it to `false` or
    deliberately pre-provision the plugin state. Native Signal K installation is
-   not supported offline. `DISPLAYS_ENABLE=true` likewise requires its bridge
+   not supported offline. An offline `--start` skips the Signal K data path
+   (`SIGNALK_DATAPATH_AUTOCONFIG`) with a warning, because it needs the npm
+   registry. `DISPLAYS_ENABLE=true` likewise requires its bridge
    virtualenv to have been provisioned online first; set it to `false` for a
    fresh offline install.
 

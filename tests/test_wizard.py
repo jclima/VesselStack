@@ -63,6 +63,19 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(wizard.DEFAULTS["SIGNALK_VESSELTWIN_PRELOAD"], "true")
         self.assertEqual(wizard.validate({"SIGNALK_VESSELTWIN_PRELOAD": "false"})["SIGNALK_VESSELTWIN_PRELOAD"], "false")
 
+    def test_signalk_datapath_autoconfig_default_validation_and_advanced_field(self):
+        self.assertEqual(wizard.DEFAULTS["SIGNALK_DATAPATH_AUTOCONFIG"], "true")
+        self.assertEqual(wizard.validate({"SIGNALK_DATAPATH_AUTOCONFIG": "false"})["SIGNALK_DATAPATH_AUTOCONFIG"], "false")
+        with self.assertRaises(ValueError):
+            wizard.validate({"SIGNALK_DATAPATH_AUTOCONFIG": "maybe"})
+        field = wizard.FIELD_INDEX["SIGNALK_DATAPATH_AUTOCONFIG"]
+        self.assertTrue(field["advanced"])
+        state = types.SimpleNamespace(values={**wizard.DEFAULTS, "SIGNALK_MODE": "existing"})
+        self.assertFalse(field["when"](state))
+        for mode in ("docker", "native"):
+            state.values["SIGNALK_MODE"] = mode
+            self.assertTrue(field["when"](state), mode)
+
     def test_control_panel_access_defaults_and_lan_independence(self):
         self.assertEqual(wizard.DEFAULTS["CONTROL_PANEL_HOST"], "127.0.0.1")
         for preset in wizard.LAN_PRESETS:

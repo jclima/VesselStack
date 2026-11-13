@@ -87,7 +87,7 @@ def validate(values):
     result["BOAT_UNITS"]=normalize_units(result["BOAT_UNITS"])
     if result["BOAT_UNITS"] not in {"us_customary","metric"}: raise ValueError("Invalid BOAT_UNITS: use us_customary or metric")
     if _any_ip(result["CONTROL_PANEL_HOST"]): raise ValueError("Invalid CONTROL_PANEL_HOST: enter an IP address")
-    for key in ("SIGNALK_VESSELTWIN_PRELOAD","SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","NODE_EXPORTER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT","VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK"):
+    for key in ("SIGNALK_VESSELTWIN_PRELOAD","SIGNALK_DATAPATH_AUTOCONFIG","SOCKETCAN_ENABLE","VESSELSTACK_CAN_CREATE_VCAN","AIS_ENABLE","TELEGRAM_ENABLE","TELEMETRY_INDEXER_ENABLE","NODE_EXPORTER_ENABLE","DISPLAYS_ENABLE","VESSELSTACK_FIREWALL_ENABLE","VESSELSTACK_FIREWALL_STRICT","VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK"):
         if result[key] not in {"true","false"}: raise ValueError(f"Invalid boolean for {key}")
     for key in ("VESSELSTACK_FIREWALL_ALLOW_TCP","VESSELSTACK_FIREWALL_ALLOW_UDP"):
         if result[key] and not re.fullmatch(r"[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*",result[key]): raise ValueError(f"Invalid port list for {key}")
@@ -332,6 +332,7 @@ SECTIONS=[
   F("SIGNALK_MODE","How should Signal K run?","docker: VesselStack installs and manages Signal K in a container (recommended) and preloads the pinned VesselTwin plugin by default. existing: you already run Signal K elsewhere and VesselStack does not modify its plugins. native: installed directly on the Pi (not in a container).","choice",
     choices=[("docker","VesselStack runs Signal K for you (recommended)"),("existing","use a Signal K server you already have"),("native","install Signal K directly on this Pi")]),
   F("SIGNALK_VESSELTWIN_PRELOAD","Preload VesselTwin plugin","Managed Docker/native modes install pinned signalk-vesseltwin 0.2.3. Existing mode is never modified; this does not enable, pair, or send readings.","bool",advanced=True,when=lambda s:s.values["SIGNALK_MODE"]!="existing"),
+  F("SIGNALK_DATAPATH_AUTOCONFIG","Configure the Signal K data path","Managed Docker/native modes install the pinned signalk-to-influxdb2 plugin, add the CAN provider when SocketCAN is on, and give the plugin its own InfluxDB token (read and write on the raw bucket only). Existing mode is never modified.","bool",advanced=True,when=lambda s:s.values["SIGNALK_MODE"]!="existing"),
   F("SIGNALK_URL","Address of your Signal K server","For example http://127.0.0.1:3000 (or another computer on the boat network).",required=True,check=URL,when=lambda s:s.values["SIGNALK_MODE"]=="existing"),
   F("SIGNALK_VERSION","Signal K version","Release tag of the Signal K container image.",advanced=True,required=True,check=_re(r"v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?","A version such as v2.27.0."))]},
  {"title":"NMEA 2000 (CAN bus)","intro":"Reads your boat's NMEA 2000 network through a CAN interface (isolated is preferred, safest; a non-isolated one such as the PiCAN-M works with caveats, see docs/BOM.md). Skip this until the hardware is installed and bench-tested; you can enable it later by running the installer again.","fields":[

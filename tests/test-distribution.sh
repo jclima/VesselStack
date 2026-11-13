@@ -81,6 +81,11 @@ test -s "$ROOT/docs/images/wizard-preflight.png"
 test -s "$ROOT/docs/images/wizard-nmea.png"
 grep -q 'VesselStack InfluxDB' "$ROOT/templates/grafana/provisioning/datasources/vesselstack.yml"
 python3 -m json.tool "$ROOT/templates/grafana/dashboards/system-health.json" >/dev/null
+python3 -m json.tool "$ROOT/templates/grafana/dashboards/boat-overview.json" >/dev/null
+# The Signal K data path needs the npm registry: an offline install must skip it, and a failure of it
+# must never fail the installation.
+grep -qF "offline install: the Signal K data path" "$ROOT/install.sh"
+grep -qF 'configure-signalk-datapath.py' "$ROOT/install.sh"
 grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}' "$ROOT/templates/compose.yml"
 grep -q 'ghcr.io/jvde-github/ais-catcher:v0.70' "$ROOT/vesselstack.example.env"
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3

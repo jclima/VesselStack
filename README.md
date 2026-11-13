@@ -717,7 +717,7 @@ The restore keeps the previous trees as `*.pre-restore-STAMP` until you delete t
 The installer generates credentials, renders a pinned Docker Compose stack,
 creates a confined systemd service for Boat Chat, creates configurable InfluxDB
 buckets, provisions the one-minute downsample task expected by Boat Chat,
-provisions Grafana datasources and a system-health dashboard, and installs the
+provisions Grafana datasources and the system-health and boat-overview dashboards, and installs the
 `vesselstackctl` lifecycle command. It also installs a local-first, token-
 authenticated Control Panel that can inspect and operate every managed
 container and host service, edit redacted configuration, check the setup, save and apply
@@ -858,6 +858,7 @@ nano vesselstack.env
 | `SIGNALK_VERSION` | Pinned Signal K release used by managed modes |
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
+| `SIGNALK_DATAPATH_AUTOCONFIG` | Managed Docker/native modes install `signalk-to-influxdb2` 2.3.0, add the NMEA 2000 provider and write the plugin's InfluxDB configuration (default `true`, see [Signal K and InfluxDB](#signal-k-and-influxdb)); existing mode ignores it, and `false` skips without removing anything |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
 | `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
@@ -1044,16 +1045,111 @@ either a preload or an App Store install).
 When AIS is enabled, AIS-catcher exposes its viewer on port `8100` and an NMEA
 TCP feed on port `5011`. Add a Signal K NMEA 0183 TCP client connection to
 `127.0.0.1:5011`. When SocketCAN is enabled, VesselStack validates the named
-interface and installs a 250-kbit/s-by-default systemd unit; configure the
-matching Signal K NMEA 2000 connection in Signal K's admin UI.
+interface and installs a 250-kbit/s-by-default systemd unit; the matching
+Signal K NMEA 2000 connection is added for you (below).
 
-Configure a Signal K InfluxDB 2-compatible output plugin with values from
-`/opt/vesselstack/config/vesselstack.env`:
+#### The data path is configured automatically
 
-- URL: `http://127.0.0.1:8086`
-- organization: `INFLUXDB_ORG`
-- token: `INFLUXDB_TOKEN`
-- full-resolution bucket: `INFLUXDB_RAW_BUCKET` (default `signalk`)
+With `SIGNALK_MODE=docker` or `native`, `SIGNALK_DATAPATH_AUTOCONFIG=true` (the
+default) makes the installer do the following once InfluxDB is up
+(`scripts/configure-signalk-datapath.py`). Every step is skipped when it is
+already done, so a re-run changes nothing:
+
+1. **Plugin.** Installs `signalk-to-influxdb2` 2.3.0 (exact version,
+   `--ignore-scripts`, no lock file) into `<data>/signalk`. Docker mode runs
+   `npm` from the pinned Signal K image as uid/gid 1000; native mode runs it as
+   the VesselStack user. A plugin that is already installed at that version or
+   newer is left alone.
+2. **NMEA 2000 provider.** With `SOCKETCAN_ENABLE=true`, adds a provider
+   `vesselstack-n2k-<interface>` (`canbus-canboatjs`) to Signal K's
+   `settings.json`, unless some provider already uses that interface. The file
+   is first copied to `settings.json.vesselstack-<UTC time>.bak` (mode 0600,
+   same folder), written atomically, and no other entry is touched. A
+   `settings.json` that is not valid JSON is never replaced.
+3. **Plugin configuration.** Writes
+   `<data>/signalk/plugin-config-data/signalk-to-influxdb2.json` (mode 0600,
+   owned by the Signal K account) only when that file does not exist: your own
+   configuration is never overwritten. It records only your own vessel
+   (`onlySelf`) into `INFLUXDB_RAW_BUCKET` at 1-second resolution. A missing
+   DBRP (v1 database/retention-policy) mapping for the bucket is created first;
+   InfluxDB 2.9 normally has a virtual one already.
+
+The plugin gets its own token, `vesselstack-signalk-writer`, never the admin
+token. Its scope is exactly: read this organization, **read and write the raw
+bucket only** and read DBRP mappings (the plugin checks all three when it
+starts, and a write-only token silently records nothing). Be aware of what that
+means: the token can read the raw bucket back, which includes position data, and
+it sits in plain text in the plugin configuration file, which Signal K
+administrators can also see under **Server > Plugin Config**. Signal K already
+holds the live position, so this adds a readable history only through that one
+bucket. The file and the `.bak` copies are in the data tree, so
+`vesselstackctl backup` includes them (backup archives are mode 0600). A re-run
+that finds the configuration file missing creates a new token and deletes the
+previous `vesselstack-signalk-writer` one.
+
+**npm prune guard.** `npm install` deletes anything in `node_modules` that
+`package.json` does not list. Before installing, the helper runs the same
+command with `--dry-run --json`; if it would remove any package (typically a
+plugin installed by hand instead of from the App Store), the install is
+skipped, with a `WARN` naming the packages. Nothing else is changed, Signal K is
+not stopped, the installation still succeeds and `vesselstackctl doctor` keeps
+warning (the reason is kept in `/var/lib/vesselstack/signalk-datapath-skipped`).
+Fix it by adding those packages to `dependencies` in
+`<data>/signalk/package.json` (or deleting them if unused) and rerunning the
+installer. The VesselTwin preload does this for its own plugin.
+
+**Operational impact.**
+
+- The first run stops Signal K while the plugin is installed and starts it once
+  afterwards (a brief gap in data); later runs do not touch it.
+- The plugin is about 49 MB (108 packages) in `node_modules`, downloaded from the
+  npm registry. Its direct dependencies are version ranges, not pins, so the
+  sub-dependencies npm resolves can differ between boats and over time.
+- InfluxDB receives continuous writes (every Signal K path of your vessel, at most
+  once a second) and the raw bucket grows according to `INFLUXDB_RAW_RETENTION`
+  (30 days at first creation), so plan SD-card or SSD space.
+- `--offline` installs skip this step with a warning because it needs the npm
+  registry. If InfluxDB or the npm step fails, the installer warns and carries
+  on; rerun it when the network is back. The helper's exit status is 0 (nothing
+  to do), 10 (changed) or 11 (skipped by the prune guard).
+- Existing mode is never modified: configure an output plugin yourself using
+  the values in `/opt/vesselstack/config/vesselstack.env` (URL
+  `http://127.0.0.1:8086`, `INFLUXDB_ORG`, `INFLUXDB_RAW_BUCKET`, and a token you
+  create).
+
+**Verify.** `sudo vesselstackctl doctor` prints, for managed modes only (always
+`OK`, `INFO` or `WARN`, never `FAIL`):
+
+- `OK   Signal K data reaches InfluxDB: newest point Ns ago ...` when the newest
+  point of your vessel is under 2 minutes old;
+- `WARN` when it is older (or there is none in the last hour), when the plugin
+  configuration is missing or disabled, when InfluxDB cannot be queried, when
+  the install was skipped by the prune guard, and, with SocketCAN enabled, when
+  the interface has received 0 packets (check the NMEA 2000 power, termination
+  and wiring). A boat at the dock with the instruments off will rightly warn.
+
+The **VesselStack Boat Overview** Grafana dashboard (below) fills as soon as
+data arrives.
+
+**Roll back.** Set `SIGNALK_DATAPATH_AUTOCONFIG="false"` and rerun the installer
+(this stops future runs only), then, as you need:
+
+```bash
+sudo vesselstackctl stop
+# Stop recording: delete the plugin configuration (or disable the plugin in Signal K)
+sudo rm /opt/vesselstack-data/signalk/plugin-config-data/signalk-to-influxdb2.json
+# Undo the provider: restore the copy made before it was added
+sudo ls /opt/vesselstack-data/signalk/settings.json.vesselstack-*.bak
+sudo cp -p /opt/vesselstack-data/signalk/settings.json.vesselstack-<time>.bak /opt/vesselstack-data/signalk/settings.json
+# Remove the plugin (Docker mode shown; native: npm uninstall --prefix <data>/signalk as the VesselStack user)
+sudo docker run --rm --user 1000:1000 --cap-drop ALL -e HOME=/tmp -v /opt/vesselstack-data/signalk:/home/node/.signalk \
+  -w /home/node/.signalk --entrypoint npm cr.signalk.io/signalk/signalk-server:<SIGNALK_VERSION> \
+  uninstall --no-audit --no-fund --no-package-lock signalk-to-influxdb2
+sudo vesselstackctl start
+```
+
+Then revoke the token: in the InfluxDB UI (**Load Data > API Tokens**) delete
+`vesselstack-signalk-writer`. Recorded data stays in the bucket.
 
 The installer provisions a one-minute mean downsample task into
 `INFLUXDB_HISTORY_BUCKET`. Confirm it is running before depending on Boat
@@ -1163,10 +1259,19 @@ sudo grep '^GRAFANA_ADMIN_PASSWORD=' \
   /opt/vesselstack/config/vesselstack.env
 ```
 
-The installer provisions `VesselStack InfluxDB`, `VesselStack Prometheus`, and
-the **VesselStack / VesselStack System Health** starter dashboard. Use that as
-the operational baseline, then add vessel dashboards for the Signal K paths
-available on the boat. Provisioned dashboards are editable in Grafana; keep
+The installer provisions `VesselStack InfluxDB`, `VesselStack Prometheus`, the
+**VesselStack / VesselStack System Health** starter dashboard and the
+**VesselStack / VesselStack Boat Overview** dashboard. The Boat Overview reads
+the raw bucket (`INFLUXDB_RAW_BUCKET`, validated as 1 to 64 letters, digits,
+dots, hyphens or underscores because the name is written into its Flux queries)
+and shows batteries (voltage, current, state of charge), tank levels, engine
+(speed, temperature, oil pressure), navigation (speed and course over ground,
+depth) and environment (apparent wind, outside temperature, pressure), converted
+from Signal K's SI units to knots, degrees, degrees Celsius, bar and hectopascal.
+Panels read "No data yet" until the matching instrument reports. It
+deliberately has no position or map panel. Use these as the operational
+baseline, then add vessel dashboards for the Signal K paths available on the
+boat. Provisioned dashboards are editable in Grafana; keep
 reusable versions in the repository so reinstallations remain reproducible.
 
 ### Boat Chat

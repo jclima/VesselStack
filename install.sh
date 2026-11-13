@@ -119,6 +119,7 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${SIGNALK_MODE:=existing}"
 : "${SIGNALK_VERSION:=v2.27.0}"
 : "${SIGNALK_VESSELTWIN_PRELOAD:=true}"
+: "${SIGNALK_DATAPATH_AUTOCONFIG:=true}"
 : "${SOCKETCAN_ENABLE:=false}"
 : "${SOCKETCAN_INTERFACE:=can0}"
 : "${SOCKETCAN_BITRATE:=250000}"
@@ -270,12 +271,17 @@ if [ "$VESSELSTACK_JOURNAL_MAX_USE" != off ] && ! [[ "$VESSELSTACK_JOURNAL_MAX_U
     echo "VESSELSTACK_JOURNAL_MAX_USE must be a size such as 200M or 1G, or off" >&2
     exit 1
 fi
+# The raw bucket name is written into the Boat overview dashboard's Flux queries.
+if ! [[ "$INFLUXDB_RAW_BUCKET" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    echo "INFLUXDB_RAW_BUCKET must be 1 to 64 letters, digits, dots, hyphens or underscores" >&2
+    exit 1
+fi
 if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BACKUP_KEEP" -gt 365 ]; then
     echo "VESSELSTACK_BACKUP_KEEP must be a whole number from 1 to 365" >&2
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -543,6 +549,7 @@ SIGNALK_MODE
 SIGNALK_VERSION
 SIGNALK_URL
 SIGNALK_VESSELTWIN_PRELOAD
+SIGNALK_DATAPATH_AUTOCONFIG
 SOCKETCAN_ENABLE
 SOCKETCAN_INTERFACE
 SOCKETCAN_BITRATE
@@ -1417,6 +1424,10 @@ install -m 0644 "$SCRIPT_DIR/templates/grafana/provisioning/dashboards/vesselsta
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards/vesselstack.yml"
 install -m 0644 "$SCRIPT_DIR/templates/grafana/dashboards/system-health.json" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards/system-health.json"
+# The Boat overview reads the raw bucket; its name was validated at the start of the run.
+sed "s/__VESSELSTACK_RAW_BUCKET__/$INFLUXDB_RAW_BUCKET/g" "$SCRIPT_DIR/templates/grafana/dashboards/boat-overview.json" \
+    > "$VESSELSTACK_ROOT/config/grafana/dashboards/boat-overview.json"
+chmod 0644 "$VESSELSTACK_ROOT/config/grafana/dashboards/boat-overview.json"
 safe_data_path "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
 safe_data_path "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml" leaf
 install -d -m 0755 "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
@@ -1799,6 +1810,41 @@ if [ "$SIGNALK_MODE" = native ]; then
     SIGNALK_CONTAINER_UID=$VESSELSTACK_UID
     SIGNALK_CONTAINER_GID=$VESSELSTACK_GID
 fi
+# Zero-touch Signal K -> InfluxDB path (scripts/configure-signalk-datapath.py). It runs once
+# InfluxDB is up (it needs an API token), so the call is in the start phase below. Exit 10
+# means it changed something (Signal K is stopped for the change and started once after);
+# 11 means the npm prune guard skipped the plugin install; anything else is a warning, never
+# an installation failure.
+configure_signalk_datapath() {
+    local rc=0 skip_file="$SYSTEM_ROOT/var/lib/vesselstack/signalk-datapath-skipped"
+    local -a args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env"
+        --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID" --status-file "$skip_file")
+    install -d -m 0755 "$SYSTEM_ROOT/var/lib/vesselstack"
+    python3 "$SCRIPT_DIR/scripts/configure-signalk-datapath.py" "${args[@]}" --check || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        10) ;;
+        11) echo "WARN: the Signal K data path was not configured (see above); 'vesselstackctl doctor' reports it until it is fixed." >&2; return 0 ;;
+        *) echo "WARN: could not check the Signal K data path; see above, then rerun the installer or follow README 'Signal K and InfluxDB'." >&2; return 0 ;;
+    esac
+    if [ "$SIGNALK_MODE" = docker ]; then
+        compose stop signalk || true
+    else
+        systemctl stop vesselstack-signalk.service 2>/dev/null || true
+    fi
+    rc=0
+    python3 "$SCRIPT_DIR/scripts/configure-signalk-datapath.py" "${args[@]}" || rc=$?
+    if [ "$SIGNALK_MODE" = docker ]; then
+        "${compose_up[@]}" signalk
+    fi
+    case "$rc" in
+        0|10) ;;
+        11) echo "WARN: the Signal K data path was not configured (see above); 'vesselstackctl doctor' reports it until it is fixed." >&2 ;;
+        *) echo "WARN: the Signal K data path step failed (see above); Signal K was started again unchanged. Rerun the installer or follow README 'Signal K and InfluxDB'." >&2 ;;
+    esac
+    return 0
+}
+
 SIGNALK_PLUGIN_INSTALLED=0
 if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ]; then
     preload_args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID")
@@ -1895,6 +1941,13 @@ if [ "$START" -eq 1 ]; then
     fi
     if ! component_disabled influxdb; then
         "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+        if [ "$SIGNALK_MODE" != existing ] && [ "$SIGNALK_DATAPATH_AUTOCONFIG" = true ]; then
+            if [ "$OFFLINE" = true ]; then
+                echo "WARN: offline install: the Signal K data path (signalk-to-influxdb2 plugin, CAN provider, InfluxDB token) was not configured because it needs the npm registry. Rerun online or follow README 'Signal K and InfluxDB'." >&2
+            else
+                configure_signalk_datapath
+            fi
+        fi
     fi
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then

@@ -1738,6 +1738,96 @@ if [ "$(id -u)" -eq 0 ]; then
     fi
 fi
 
+# Signal K data path in doctor: managed modes only, always a WARN (never a FAIL), and the
+# InfluxDB token reaches docker through the environment, never an argument.
+DP_BIN="$TEST_ROOT/datapath-bin"
+install -d "$DP_BIN"
+cat > "$DP_BIN/docker" <<'EOF2'
+#!/bin/bash
+if [ "${1:-}" = exec ] && [[ " $* " == *" influx query --raw "* ]]; then
+    printf '%s\n' "$*" >> "$DP_BIN_LOG"
+    [ -z "${FAKE_INFLUX_FAIL:-}" ] || exit 1
+    [ -n "${INFLUX_TOKEN:-}" ] || exit 1
+    if [[ "$*" == *"-1h"* ]]; then
+        [ -z "${FAKE_INFLUX_NEWEST:-}" ] || printf '#datatype,string,long,dateTime:RFC3339\r\n,result,table,_time\r\n,,0,%s\r\n\r\n' "$FAKE_INFLUX_NEWEST"
+    else
+        [ -z "${FAKE_INFLUX_COUNT:-}" ] || printf '#datatype,string,long,long\r\n,result,table,_value\r\n,,0,%s\r\n\r\n' "$FAKE_INFLUX_COUNT"
+    fi
+    exit 0
+fi
+if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --services "* ]]; then
+    "$FAKE_BIN/docker" "$@"
+    echo signalk
+    exit 0
+fi
+exec "$FAKE_BIN/docker" "$@"
+EOF2
+chmod +x "$DP_BIN/docker"
+DP_DATA="$TEST_ROOT/datapath-data"
+DP_ENV="$TEST_ROOT/datapath.env"
+install -d "$DP_DATA/signalk/plugin-config-data"
+if [ "$(id -u)" -eq 0 ]; then chown 1000:1000 "$DP_DATA/signalk"; fi  # doctor expects the container uid to own it
+sed -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=$DP_DATA|" "$APP_ROOT/config/vesselstack.env" \
+    | grep -vE '^(SIGNALK_MODE|SIGNALK_DATAPATH_AUTOCONFIG|SOCKETCAN_ENABLE|SOCKETCAN_INTERFACE|INFLUXDB_TOKEN|INFLUXDB_ORG|INFLUXDB_RAW_BUCKET|VESSELSTACK_DISABLED_COMPONENTS)=' > "$DP_ENV.base"
+printf 'SIGNALK_MODE=docker\nINFLUXDB_TOKEN=test-token-not-secret\nINFLUXDB_ORG=vessel\nINFLUXDB_RAW_BUCKET=boatraw\n' >> "$DP_ENV.base"
+dp_doctor() {  # extra env lines for the settings file; VAR=value arguments for the process
+    local lines=() assigns=() item
+    for item in "$@"; do case "$item" in FAKE_*) assigns+=("$item") ;; *) lines+=("$item") ;; esac; done
+    { cat "$DP_ENV.base"; [ "${#lines[@]}" -eq 0 ] || printf '%s\n' "${lines[@]}"; } > "$DP_ENV"
+    env "${assigns[@]}" DP_BIN_LOG="$TEST_ROOT/datapath-docker.log" FAKE_BIN="$FAKE_BIN" PATH="$DP_BIN:$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+        VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$DP_ENV" \
+        VESSELSTACK_SYS_CLASS_NET="$TEST_ROOT/datapath-net" \
+        "$REPO_ROOT/scripts/vesselstackctl" doctor 2>&1 || true
+}
+: > "$TEST_ROOT/datapath-docker.log"
+DP_CONFIG="$DP_DATA/signalk/plugin-config-data/signalk-to-influxdb2.json"
+DP_SKIP="$SYSTEM_ROOT/var/lib/vesselstack/signalk-datapath-skipped"
+install -d "$SYSTEM_ROOT/var/lib/vesselstack"
+rm -f -- "$DP_CONFIG" "$DP_SKIP"
+out=$(dp_doctor)
+grep -q 'WARN the Signal K InfluxDB plugin has no configuration' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+printf '{"enabled": false, "configuration": {}}\n' > "$DP_CONFIG"
+out=$(dp_doctor)
+grep -q 'WARN the Signal K InfluxDB plugin is disabled' <<<"$out"
+printf '{"enabled": true, "configuration": {}}\n' > "$DP_CONFIG"
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-20 seconds' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=412)
+grep -Eq 'OK   Signal K data reaches InfluxDB: newest point [0-9]+s ago, 412 points in the last 10 minutes' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+# The token is in the environment of the docker client, not in any argument.
+if grep -q 'test-token-not-secret' "$TEST_ROOT/datapath-docker.log"; then echo 'doctor put the InfluxDB token on a command line' >&2; exit 1; fi
+grep -q -- 'exec -e INFLUX_TOKEN -e INFLUX_ORG vesselstack-influxdb influx query --raw' "$TEST_ROOT/datapath-docker.log"
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-30 minutes' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=0)
+grep -Eq 'WARN the newest Signal K point in InfluxDB is 3[01] minutes old' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+out=$(dp_doctor)
+grep -q 'WARN no Signal K data in InfluxDB in the last hour' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+out=$(dp_doctor FAKE_INFLUX_FAIL=1)
+grep -q 'WARN could not query InfluxDB to check the Signal K data path' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+# SocketCAN with no frames received is called out; frames received are not.
+install -d "$TEST_ROOT/datapath-net/can0/statistics"
+printf '0\n' > "$TEST_ROOT/datapath-net/can0/statistics/rx_packets"
+out=$(dp_doctor SOCKETCAN_ENABLE=true SOCKETCAN_INTERFACE=can0)
+grep -q 'WARN SocketCAN interface can0 has received 0 packets' <<<"$out"
+printf '9120\n' > "$TEST_ROOT/datapath-net/can0/statistics/rx_packets"
+out=$(dp_doctor SOCKETCAN_ENABLE=true SOCKETCAN_INTERFACE=can0)
+if grep -q 'received 0 packets' <<<"$out"; then echo 'doctor flagged a CAN interface that receives frames' >&2; exit 1; fi
+# A skipped install (npm prune guard) is reported and takes precedence.
+printf '2026-11-13T10:00:00Z their-plugin\n' > "$DP_SKIP"
+out=$(dp_doctor)
+grep -q 'WARN the signalk-to-influxdb2 plugin was not installed because npm would remove packages' <<<"$out"
+grep -q 'their-plugin' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+rm -f -- "$DP_SKIP"
+out=$(dp_doctor SIGNALK_DATAPATH_AUTOCONFIG=false)
+grep -q 'INFO Signal K data path automation is off' <<<"$out"
+# Existing mode is not judged at all.
+sed -i 's|^SIGNALK_MODE=docker$|SIGNALK_MODE=existing|' "$DP_ENV.base"
+out=$(dp_doctor)
+if grep -qE 'Signal K (InfluxDB|data reaches)|signalk-to-influxdb2|no Signal K data' <<<"$out"; then echo 'doctor judged the data path of an existing Signal K' >&2; exit 1; fi
+
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"
 python3 - "$unsafe" "${APP_ROOT#/}" <<'PY'
 import io

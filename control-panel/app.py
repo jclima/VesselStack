@@ -264,6 +264,7 @@ FIELDS = [
     field("SIGNALK_VERSION", "Signal K version", SEC_SIGNALK, description="Release tag of the Signal K container image, for example v2.27.0."),
     field("SIGNALK_URL", "Signal K address", SEC_SIGNALK, kind="url", description="Where VesselStack reaches Signal K. Needed when the mode is Existing."),
     field("SIGNALK_VESSELTWIN_PRELOAD", "Preload the VesselTwin plugin", SEC_SIGNALK, kind="boolean", description="Installs the pinned signalk-vesseltwin plugin before Signal K starts (Docker and Native modes). Existing mode is never modified; turning this off skips installation and never uninstalls."),
+    field("SIGNALK_DATAPATH_AUTOCONFIG", "Configure the Signal K data path", SEC_SIGNALK, kind="boolean", description="Docker and Native modes: installs the pinned signalk-to-influxdb2 plugin, adds the NMEA 2000 provider and gives the plugin its own InfluxDB token on the next install or update. Existing mode is never modified; turning this off skips the step and never uninstalls anything."),
     field("SOCKETCAN_ENABLE", "Read the NMEA 2000 network (SocketCAN)", SEC_SIGNALK, kind="boolean", description="Turn on only after the CAN adapter is installed and tested."),
     field("SOCKETCAN_INTERFACE", "CAN interface", SEC_SIGNALK, description="Name of the CAN interface on this Pi, usually can0."),
     field("SOCKETCAN_BITRATE", "CAN speed (bits per second)", SEC_SIGNALK, kind="number", description="NMEA 2000 always uses 250000. Change it only for a non-marine CAN network. Whole number from 10000 to 1000000."),

@@ -68,6 +68,7 @@ for required_runtime in \
     systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml scripts/render-homepage.py \
     systemd/vesselstack-homepage-refresh.service.in scripts/reconcile-lifecycle.sh \
     scripts/lib/record-backup-result scripts/lib/remediate.sh \
+    scripts/configure-signalk-datapath.py templates/grafana/dashboards/boat-overview.json \
     systemd/vesselstack-backup.service.in systemd/vesselstack-backup.timer.in; do
     [ -s "$STAGE/$PACKAGE_NAME/$required_runtime" ] || {
         echo "Refusing to package without required runtime asset: $required_runtime" >&2

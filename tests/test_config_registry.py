@@ -34,6 +34,25 @@ class ConfigRegistryTests(unittest.TestCase):
                     with self.assertRaises(ValueError): panel.validate_value(spec, bad)
                 with self.assertRaises(ValueError): wizard.validate({key: bad})
 
+    def test_signalk_datapath_autoconfig_key_is_a_managed_boolean_on_every_surface(self):
+        key = "SIGNALK_DATAPATH_AUTOCONFIG"
+        self.assertEqual(registry.DEFAULTS[key], "true")
+        self.assertEqual(registry.SETTINGS[key].component, "signalk")
+        self.assertEqual(wizard.DEFAULTS[key], "true")
+        self.assertEqual(wizard.validate({key: "false"})[key], "false")
+        self.assertEqual(panel.FIELD_BY_KEY[key]["kind"], "boolean")
+        self.assertEqual(panel.validate_value(panel.FIELD_BY_KEY[key], "false"), "false")
+        for bad in ("yes", "1", "TRUE"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError): registry.validate_value(key, bad)
+                with self.assertRaises(ValueError): wizard.validate({key: bad})
+        installer = (ROOT / "install.sh").read_text()
+        self.assertIn(f': "${{{key}:=true}}"', installer)
+        self.assertIn(f"{key} NODE_EXPORTER_ENABLE", installer)
+        self.assertIn(f"\n{key}\nSOCKETCAN_ENABLE\n", installer)
+        self.assertIn(f'{key}="true"', (ROOT / "vesselstack.example.env").read_text())
+        self.assertIn(key, (ROOT / "wizard/app.js").read_text())
+
     def test_legacy_units_normalize_before_enum_validation(self):
         self.assertEqual(wizard.validate({"BOAT_UNITS": " Nautical "})["BOAT_UNITS"], "metric")
 

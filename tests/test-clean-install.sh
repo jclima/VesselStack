@@ -1404,4 +1404,147 @@ env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$LEGACY_CONFIG" >/dev/null 2>&1
 grep -q '^HOMEPAGE_PORT=8090$' "$APP_ROOT/config/vesselstack.env"
 
+# ---- Boat overview dashboard: the raw bucket name is validated, then substituted.
+dashboard_json="$APP_ROOT/config/grafana/dashboards/boat-overview.json"
+test -s "$dashboard_json"
+python3 -m json.tool "$dashboard_json" >/dev/null
+test "$(stat -c '%a' "$dashboard_json")" = 644
+if grep -q '__VESSELSTACK_RAW_BUCKET__' "$dashboard_json"; then
+    echo 'the dashboard still has the bucket placeholder' >&2; exit 1
+fi
+grep -q 'from(bucket: \\"signalk\\")' "$dashboard_json"
+if grep -q 'navigation.position' "$dashboard_json"; then echo 'the dashboard shows position' >&2; exit 1; fi
+BUCKET_CONFIG="$TEST_ROOT/bucket.env"
+{ grep -v '^INFLUXDB_RAW_BUCKET=' "$CONFIG"; printf 'INFLUXDB_RAW_BUCKET="my.raw-1_x"\n'; } > "$BUCKET_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$BUCKET_CONFIG" >/dev/null
+grep -q 'from(bucket: \\"my.raw-1_x\\")' "$dashboard_json"
+python3 -m json.tool "$dashboard_json" >/dev/null
+for hostile in 'a"b' 'a b' 'a/b' 'a&b' "$(printf 'x%.0s' $(seq 1 65))"; do
+    { grep -v '^INFLUXDB_RAW_BUCKET=' "$CONFIG"; printf 'INFLUXDB_RAW_BUCKET="%s"\n' "$hostile"; } > "$BUCKET_CONFIG"
+    if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$BUCKET_CONFIG" >/dev/null 2>"$TEST_ROOT/bucket.stderr"; then
+        echo "a bucket name of '$hostile' was accepted" >&2; exit 1
+    fi
+    # Characters the env-file writer cannot store safely are refused even earlier, with a different message.
+    grep -q 'INFLUXDB_RAW_BUCKET' "$TEST_ROOT/bucket.stderr"
+done
+grep -q 'from(bucket: \\"my.raw-1_x\\")' "$dashboard_json"   # the refused runs changed nothing
+
+# ---- Zero-touch Signal K data path through the installer (docker mode, --start). A fake
+# Docker plays npm and a tiny fake InfluxDB answers the API calls; the helper itself is real.
+DP_REL="$TEST_ROOT/dp-release"
+cp -a "$REPO_ROOT" "$DP_REL"
+rm -rf "$DP_REL/.git" "$DP_REL/generated"
+printf '#!/bin/bash\nexit 0\n' > "$DP_REL/scripts/bootstrap-influx.sh"
+DP_BIN="$TEST_ROOT/dp-bin"
+install -d "$DP_BIN"
+cat > "$DP_BIN/docker" <<'EOF2'
+#!/bin/bash
+# Fake npm container: --dry-run reports FAKE_NPM_REMOVE (a package name) or nothing.
+if [ "${1:-}" = run ] && [[ " $* " == *" --entrypoint npm "* ]]; then
+    printf '%s\n' "$*" >> "$(dirname "$0")/../bin/docker.log"
+    source_dir=
+    for argument in "$@"; do case "$argument" in *:/home/node/.signalk) source_dir=${argument%:/home/node/.signalk} ;; esac; done
+    if [[ " $* " == *" --dry-run "* ]]; then
+        if [ -n "${FAKE_NPM_REMOVE:-}" ]; then
+            printf 'remove %s 1.0.0\n{\n  "added": 1,\n  "removed": 1,\n  "remove": [{"name": "%s"}]\n}\n' "$FAKE_NPM_REMOVE" "$FAKE_NPM_REMOVE"
+        else
+            printf '{\n  "added": 1,\n  "removed": 0,\n  "remove": []\n}\n'
+        fi
+        exit 0
+    fi
+    install -d "$source_dir/node_modules/signalk-to-influxdb2"
+    printf '{"name":"signalk-to-influxdb2","version":"2.3.0"}\n' > "$source_dir/node_modules/signalk-to-influxdb2/package.json"
+    printf '{"dependencies":{"signalk-to-influxdb2":"2.3.0"}}\n' > "$source_dir/package.json"
+    exit 0
+fi
+exec "$(dirname "$0")/../bin/docker" "$@"
+EOF2
+chmod +x "$DP_BIN/docker"
+cat > "$TEST_ROOT/fake-influx.py" <<'EOF2'
+import http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, body):
+        data = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def do_GET(self):
+        if "/api/v2/buckets" in self.path: self.reply({"buckets": [{"id": "b1", "orgID": "o1", "name": "vesselstack_raw"}]})
+        elif "/api/v2/dbrps" in self.path: self.reply({"content": [{"id": "m1"}]})
+        else: self.reply({"authorizations": []})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.reply({"token": "fake-writer-token", "id": "a1"})
+server = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(server.server_port))
+server.serve_forever()
+EOF2
+python3 "$TEST_ROOT/fake-influx.py" "$TEST_ROOT/fake-influx.port" &
+FAKE_INFLUX_PID=$!
+trap 'kill "$FAKE_INFLUX_PID" 2>/dev/null || true; rm -rf -- "$TEST_ROOT"' EXIT
+for _ in $(seq 1 50); do [ -s "$TEST_ROOT/fake-influx.port" ] && break; sleep 0.1; done
+APP4="$TEST_ROOT/opt4/vesselstack"
+DATA4="$TEST_ROOT/opt4/vesselstack-data"
+DPCONFIG="$TEST_ROOT/datapath.env"
+{
+    grep -vE '^(VESSELSTACK_DISABLED_COMPONENTS|VESSELSTACK_ROOT|VESSELSTACK_DATA|SIGNALK_MODE|INFLUXDB_RAW_BUCKET|INFLUXDB_PORT)=' "$CONFIG"
+    printf 'VESSELSTACK_ROOT="%s"\nVESSELSTACK_DATA="%s"\nSIGNALK_MODE="docker"\nINFLUXDB_RAW_BUCKET="vesselstack_raw"\nINFLUXDB_PORT="%s"\n' \
+        "$APP4" "$DATA4" "$(<"$TEST_ROOT/fake-influx.port")"
+} > "$DPCONFIG"
+SYSTEM4="$TEST_ROOT/system-root4"
+dp_install() {
+    : > "$FAKE_BIN/docker.log"
+    env PATH="$DP_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM4" "$@" "$DP_REL/install.sh" --config "$DPCONFIG" --start 2>&1
+}
+SK_PLUGIN_CONFIG="$DATA4/signalk/plugin-config-data/signalk-to-influxdb2.json"
+SKIP_FILE="$SYSTEM4/var/lib/vesselstack/signalk-datapath-skipped"
+
+# Skipped by the prune guard: the installation still succeeds, warns, and Signal K is not stopped.
+dp_output=$(dp_install FAKE_NPM_REMOVE=their-plugin)
+grep -q 'WARN: skipped installing signalk-to-influxdb2: npm would remove their-plugin' <<<"$dp_output"
+grep -q "the Signal K data path was not configured" <<<"$dp_output"
+test ! -e "$SK_PLUGIN_CONFIG"
+grep -q 'their-plugin' "$SKIP_FILE"
+if grep -Eq 'compose .* stop signalk' "$FAKE_BIN/docker.log"; then echo 'Signal K was stopped for a skipped run' >&2; exit 1; fi
+
+# Normal run: stopped once, the plugin and its configuration appear, started again.
+dp_output=$(dp_install)
+test -s "$SK_PLUGIN_CONFIG"
+test "$(stat -c '%a' "$SK_PLUGIN_CONFIG")" = 600
+grep -q 'fake-writer-token' "$SK_PLUGIN_CONFIG"
+test -s "$DATA4/signalk/node_modules/signalk-to-influxdb2/package.json"
+test ! -e "$SKIP_FILE"
+if grep -q 'fake-writer-token' <<<"$dp_output"; then echo 'the installer printed the writer token' >&2; exit 1; fi
+stop_line=$(grep -nE 'compose .* stop signalk' "$FAKE_BIN/docker.log" | head -n 1 | cut -d: -f1)
+npm_line=$(grep -n -- '--entrypoint npm' "$FAKE_BIN/docker.log" | tail -n 1 | cut -d: -f1)
+start_line=$(grep -nE 'compose .* up -d signalk$' "$FAKE_BIN/docker.log" | tail -n 1 | cut -d: -f1)
+test -n "$stop_line" && test -n "$npm_line" && test -n "$start_line"
+test "$stop_line" -lt "$npm_line" && test "$npm_line" -lt "$start_line"
+test "$(grep -cE 'compose .* stop signalk' "$FAKE_BIN/docker.log")" = 1
+
+# Idempotent: a second run neither stops Signal K nor runs the real install.
+dp_output=$(dp_install)
+if grep -Eq 'compose .* stop signalk' "$FAKE_BIN/docker.log"; then echo 'a settled data path stopped Signal K again' >&2; exit 1; fi
+if grep -q -- '--entrypoint npm.* install ' "$FAKE_BIN/docker.log"; then echo 'a settled data path reinstalled the plugin' >&2; exit 1; fi
+
+# The owner's own configuration is never replaced, even when it is not ours.
+printf '{"enabled":false}\n' > "$SK_PLUGIN_CONFIG"
+dp_install >/dev/null
+test "$(<"$SK_PLUGIN_CONFIG")" = '{"enabled":false}'
+
+# Opt-out: nothing is run at all.
+rm -rf "$DATA4/signalk/plugin-config-data" "$DATA4/signalk/node_modules"
+printf 'SIGNALK_DATAPATH_AUTOCONFIG="false"\n' >> "$DPCONFIG"
+dp_output=$(dp_install)
+if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'SIGNALK_DATAPATH_AUTOCONFIG=false still ran npm' >&2; exit 1; fi
+test ! -e "$SK_PLUGIN_CONFIG"
+grep -q '^SIGNALK_DATAPATH_AUTOCONFIG=false$' "$APP4/config/vesselstack.env"
+
+# Existing mode never touches the owner's Signal K.
+sed -i -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="existing"|' -e 's|^SIGNALK_DATAPATH_AUTOCONFIG=.*|SIGNALK_DATAPATH_AUTOCONFIG="true"|' "$DPCONFIG"
+rm -rf "$DATA4/signalk"
+dp_output=$(dp_install)
+if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'existing mode ran npm' >&2; exit 1; fi
+if grep -q 'Signal K data path' <<<"$dp_output"; then echo 'existing mode reported on the data path' >&2; exit 1; fi
+test ! -e "$DATA4/signalk/plugin-config-data"
+
 echo "clean installation checks passed"
