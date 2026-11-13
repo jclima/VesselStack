@@ -1481,6 +1481,11 @@ install -d "$DP_BIN"
 cat > "$DP_BIN/docker" <<'EOF2'
 #!/bin/bash
 # Fake npm container: --dry-run reports FAKE_NPM_REMOVE (a package name) or nothing.
+# The real npm runs as the Signal K user under the container's umask 022; install.sh itself runs
+# under umask 077, which would leave node_modules root-only (uutils "install -d", the default on
+# Ubuntu 26.04, honours the umask for the directories it creates; GNU does not) and unreadable to
+# the unprivileged helper.
+umask 022
 if [ "${1:-}" = run ] && [[ " $* " == *" --entrypoint npm "* ]]; then
     printf '%s\n' "$*" >> "$(dirname "$0")/../bin/docker.log"
     source_dir=

@@ -5,6 +5,7 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Fix CI: the fake npm container in `tests/test-clean-install.sh` now runs under `umask 022`, so the marine bundle check passes on Ubuntu 26.04 runners (uutils `install -d` honours `install.sh`'s umask 077 and left `node_modules` unreadable to the unprivileged helper). Test-only change; no runtime impact or rollback needed.
 - Fix CI: `tests/test-distribution.sh` now expects the `--scheduled` option in the `vesselstackctl backup` usage line. Test-only change; no runtime impact or rollback needed.
 - Add optional marine essentials bundle, off by default (`SIGNALK_MARINE_BUNDLE`, managed Docker/native modes only):
   NMEA 0183 on TCP 10110 (the converter, KIP 4.8.0 and Freeboard-SK 2.22.1 ship inside Signal K v2.27.0), pinned
