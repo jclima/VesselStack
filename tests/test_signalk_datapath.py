@@ -634,6 +634,27 @@ class DatapathTests(unittest.TestCase):
         self.assertEqual((self.signalk / "settings.json").read_text(), "{not json")
         self.assertIn("NMEA 0183 TCP server setting was not checked", self.err)
 
+    def test_unreadable_plugin_is_skipped_with_a_warning_naming_package_path_and_error(self):
+        err = io.StringIO()
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch.object(dp, "read_file_at", side_effect=denied), contextlib.redirect_stderr(err):
+            self.assertFalse(dp.plugin_needed(-1, "anchoralarm", "2.0.1", root=Path("/data/signalk")))
+        text = err.getvalue()
+        self.assertEqual(text.count("\n"), 1)
+        self.assertIn("WARN: skipped anchoralarm", text)
+        self.assertIn("/data/signalk/node_modules/anchoralarm/package.json", text)
+        self.assertIn("permission denied", text)
+        self.assertIn("ownership of Signal K's node_modules", text)
+
+    def test_missing_plugin_is_needed_and_readable_one_is_silent(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with mock.patch.object(dp, "read_file_at", side_effect=FileNotFoundError()):
+                self.assertTrue(dp.plugin_needed(-1))
+            with mock.patch.object(dp, "read_file_at", return_value=json.dumps({"version": dp.PLUGIN_VERSION}).encode()):
+                self.assertFalse(dp.plugin_needed(-1))
+        self.assertEqual(err.getvalue(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

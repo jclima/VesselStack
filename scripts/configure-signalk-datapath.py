@@ -277,13 +277,22 @@ def version_tuple(text: str):
     return tuple(int(p) for p in parts.groups()) if parts else None
 
 
-def plugin_needed(dir_fd: int, name: str = PLUGIN, pinned: str = PLUGIN_VERSION) -> bool:
+def plugin_needed(dir_fd: int, name: str = PLUGIN, pinned: str = PLUGIN_VERSION, root: Path | None = None) -> bool:
+    parts = ["node_modules", *name.split("/"), "package.json"]
     try:
-        raw = read_file_at(dir_fd, ["node_modules", *name.split("/"), "package.json"])
+        raw = read_file_at(dir_fd, parts)
     except FileNotFoundError:
         return True
-    except OSError:
-        return False  # a link or odd file: leave the owner's copy alone
+    except OSError as exc:
+        # Conservative: never install over a copy that cannot be read. Say so, because the feature
+        # would otherwise just be missing. This runs in the unprivileged helper, which shares the
+        # installer's stderr, so the message reaches the installer output.
+        where = "/".join(parts) if root is None else str(root.joinpath(*parts))
+        reason = (exc.strerror or str(exc) or type(exc).__name__).lower()
+        print(f"Signal K data path: WARN: skipped {name}: could not read {where} ({reason}). It is not installed "
+              f"or updated while that file cannot be read. Check the ownership of Signal K's node_modules "
+              f"(it should belong to the Signal K user), then rerun the installer.", file=sys.stderr)
+        return False
     try:
         installed = version_tuple(str(json.loads(raw).get("version", "")))
     except (ValueError, AttributeError):
@@ -660,12 +669,12 @@ def plugin_config(env: dict[str, str], token: str) -> dict:
 def inspect_work(args, request: dict, dir_fd: int) -> dict:
     """Unprivileged: what is there and what is missing. Changes nothing."""
     datapath = request.get("datapath", True)
-    state = {"need_plugin": datapath and plugin_needed(dir_fd), "provider": "none", "need_config": False,
+    state = {"need_plugin": datapath and plugin_needed(dir_fd, root=args.data / "signalk"), "provider": "none", "need_config": False,
              "bundle_packages": [], "bundle_configs": [], "tcp": "ok"}
     if request.get("interface"):
         state["provider"] = provider_state(dir_fd, request["interface"])
     if request.get("bundle"):
-        state["bundle_packages"] = [f"{n}@{v}" for n, v in BUNDLE_PACKAGES if plugin_needed(dir_fd, n, v)]
+        state["bundle_packages"] = [f"{n}@{v}" for n, v in BUNDLE_PACKAGES if plugin_needed(dir_fd, n, v, root=args.data / "signalk")]
         state["tcp"] = tcp_state(dir_fd)
         for plugin_id in BUNDLE_CONFIGS:
             try:

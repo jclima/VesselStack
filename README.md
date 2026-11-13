@@ -2486,6 +2486,22 @@ the indicated cause, then rerun the supported installer repair. Do not
 blanket-chown the Signal K tree or restart the container while ownership and
 symlink state are still unknown.
 
+### Signal K plugin skipped (WARN: skipped ...)
+
+Symptom: the installer prints `Signal K data path: WARN: skipped <package>: could
+not read <data>/signalk/node_modules/<package>/package.json (permission denied)`
+and the feature (the InfluxDB writer plugin `signalk-to-influxdb2`, or a marine
+essentials plugin: `signalk-anchoralarm-plugin`, `@meri-imperiumi/signalk-logbook`,
+`@meri-imperiumi/signalk-autostate`) is missing in Signal K. The unprivileged
+Signal K data path helper could not read that plugin's `package.json`, so it
+does not install or overwrite anything there. The cause is usually wrong ownership
+or permissions of Signal K's `node_modules`, or a link or unusual file in its
+place. Check with `ls -ld` on the path in the message; the directory tree should
+belong to the Signal K user (uid/gid 1000 in Docker mode). Fix the ownership
+(or remove the odd entry if it is yours), then rerun the installer. The warning
+does not change the installer's exit status or any other step. Rollback of the
+warning itself: revert the change; the plugin is skipped as before, silently.
+
 ### Container mount permissions fail
 
 Inspect the affected container log and mount. Do not recursively change all
