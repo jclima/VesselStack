@@ -2504,6 +2504,7 @@ bytecode in the source or bundled runtime tree.
 Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
 Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order. `tests/test-clean-install.sh` does the same for the installer's `--dry-run` output (written to a file, then searched).
 `tests/test-remote.sh` covers the Tailscale remote-access commands with fake `tailscale`, `apt-get` and `curl` binaries (run it with `sudo`, like the lifecycle test).
+`tests/test-distribution.sh` asserts the `vesselstackctl --help` backup usage line verbatim, including `[--scheduled]`; update it together with the usage text.
 To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
 
 ## Documentation policy
