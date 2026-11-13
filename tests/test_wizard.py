@@ -776,6 +776,23 @@ class CliCommandTests(unittest.TestCase):
             bad = self.run_wizard("--defaults", "--set", "ALERT_HEARTBEAT_URL=http://x.example", "--output", str(Path(directory) / "bad.env"))
             self.assertNotEqual(bad.returncode, 0)
 
+    def test_remote_access_only_records_the_choice(self):
+        self.assertEqual((wizard.DEFAULTS["REMOTE_ACCESS"], wizard.DEFAULTS["REMOTE_PANEL_SERVE"]), ("off", "true"))
+        field = wizard.FIELD_INDEX["REMOTE_ACCESS"]
+        self.assertTrue(field["advanced"])
+        self.assertIn("sudo vesselstackctl remote enable", field["help"])
+        self.assertIn("never installs", field["help"])
+        serve = wizard.FIELD_INDEX["REMOTE_PANEL_SERVE"]
+        self.assertFalse(serve["when"](types.SimpleNamespace(values=dict(wizard.DEFAULTS), flags={})))
+        self.assertTrue(serve["when"](types.SimpleNamespace(values=dict(wizard.DEFAULTS, REMOTE_ACCESS="tailscale"), flags={})))
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = self.run_wizard("--defaults", "--set", "REMOTE_ACCESS=tailscale", "--output", str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(wizard.load_env(out)["REMOTE_ACCESS"], "tailscale")
+            bad = self.run_wizard("--defaults", "--set", "REMOTE_ACCESS=vpn", "--output", str(Path(directory) / "bad.env"))
+            self.assertNotEqual(bad.returncode, 0)
+
     def test_displays_ha_token_is_a_hidden_optional_secret_set_with_set(self):
         field = wizard.FIELD_INDEX["DISPLAYS_HA_TOKEN"]
         self.assertEqual((field["kind"], bool(field.get("advanced")), wizard.DEFAULTS["DISPLAYS_HA_TOKEN"]),

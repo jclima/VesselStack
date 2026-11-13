@@ -723,10 +723,16 @@ changed by this command.
 
 ## 8. Remote access, secrets, and known gaps
 
-**Remote access (later, optional).** Nothing here assumes it. If you add a
-Tailscale or other VPN, bind/allow services on that interface deliberately and
-update the firewall policy; keep the control panel on loopback plus tunnel. The
-repository ships no Tailscale integration.
+**Remote access (later, optional).** Nothing here assumes it. VesselStack has
+an optional, off-by-default Tailscale integration (`sudo vesselstackctl remote
+enable|status|disable`; README "Remote access with Tailscale"): it installs
+Tailscale from Tailscale's own apt repository (internet needed, not in the
+offline bundle), publishes only the Control Panel to your tailnet with
+`tailscale serve` (the panel stays on loopback) and opens no inbound ports. It
+does not restrict other services bound to `0.0.0.0`, which the tailnet can then
+reach: use Tailscale ACLs. For any other VPN, bind/allow services on that
+interface deliberately and update the firewall policy; keep the control panel
+on loopback plus tunnel. Rollback: `sudo vesselstackctl remote disable --purge`.
 
 **Secrets.** Secrets live in `/opt/vesselstack/config/*.env` (mode 600) and in
 backups (`chmod 0600` archives, which therefore contain them: store them

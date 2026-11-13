@@ -257,6 +257,8 @@ FIELDS = [
     field("GOOGLE_API_KEY", "Google API key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only when Google is a provider."),
     field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", SEC_CHAT, source="chat", description="The project name, if your Google setup needs one."),
     field("TELEGRAM_ENABLE", "Send alerts to Telegram", SEC_CHAT, kind="boolean", description="Runs the Telegram alerts component. It also needs the bot token below."),
+    field("REMOTE_ACCESS", "Remote access (Tailscale)", SEC_NETWORK, kind="select", choices=list(CONFIG_SETTINGS["REMOTE_ACCESS"].enum), description="Off by default. This only records the choice; Tailscale is installed and joined with 'sudo vesselstackctl remote enable' on the boat computer (needs internet). Applying settings never installs it."),
+    field("REMOTE_PANEL_SERVE", "Publish this panel on the tailnet", SEC_NETWORK, kind="boolean", description="With Tailscale remote access on, publish this panel to your tailnet only (https, port 8780) through tailscale serve. The panel itself stays on this device's loopback address."),
     field("ALERTS_ENABLE", "Boat alerts to Telegram (opt-in)", SEC_CHAT, kind="boolean", description="Off by default. Sends Telegram messages for the alerts you configure below, using the bot token. A convenience, not a sole alarm system. Applies on the next apply."),
     field("ALERT_TELEGRAM_CHAT_IDS", "Alert chat ids", SEC_CHAT, kind="secret", description="Numeric Telegram chat ids, comma separated. Alerts go only to these chats. Kept private."),
     field("ALERT_BATTERY_LOW_V", "Low battery alert voltage", SEC_CHAT, description="Volts, for example 12.0 (12 V bank) or 24.0 (24 V bank). Alert after 2 minutes below it. Blank = no battery alert; no limit is assumed."),
@@ -1251,6 +1253,47 @@ def scheduled_backup_status(settings: dict[str, str]) -> dict[str, Any]:
     return {"schedule": schedule, "last_scheduled": last, "next_run": next_run}
 
 
+def remote_status() -> dict[str, Any] | None:
+    """Read-only Tailscale view for the Home tab: None when Tailscale is not installed or unreadable.
+
+    ``tailscale status --json`` is the only call (2 second limit). Nothing is changed, no key is read or shown.
+    """
+    binary = shutil.which("tailscale")
+    if not binary:
+        return None
+    try:
+        done = subprocess.run([binary, "status", "--json"], capture_output=True, text=True, timeout=2, check=False)
+        data = json.loads(done.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    me = data.get("Self") if isinstance(data.get("Self"), dict) else {}
+    name = str(me.get("DNSName") or "").rstrip(".")
+    online = data.get("BackendState") == "Running" and bool(me.get("Online", True))
+    port = str(parse_env(VESSEL_ENV).get("CONTROL_PANEL_PORT") or "8780")
+    serve = parse_env(VESSEL_ENV).get("REMOTE_PANEL_SERVE", "true") == "true"
+    return {"enabled": data.get("BackendState") not in {None, "NoState", "Stopped"},
+            "online": online, "name": name,
+            "panel_url": f"https://{name}:{port}" if name and online and serve else ""}
+
+
+def origin_matches_forwarded_host(origin_host: str, origin_port: int | None, headers: Any, peer: str, server_address: Any) -> bool:
+    """Origin check for a reverse proxy that rewrites Host to the loopback target (tailscale serve may).
+
+    Accepted only when the TCP peer is loopback and X-Forwarded-Host names the same host and port as the
+    Origin and that name passes the Host allowlist (CONTROL_PANEL_ALLOWED_HOSTS). Anything else keeps the
+    strict Host == Origin comparison.
+    """
+    if not (peer.startswith("127.") or peer in {"::1", "::ffff:127.0.0.1"}):
+        return False
+    forwarded = (headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+    if not forwarded or not host_allowlist(server_address).allowed(forwarded):
+        return False
+    expected = urllib.parse.urlsplit(f"//{forwarded}")
+    return (expected.hostname or "").lower() == origin_host.lower() and expected.port == origin_port
+
+
 def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
     """Read-only view of the backup destination, derived the way vesselstackctl backup does.
 
@@ -1859,7 +1902,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 memory = OPERATIONS.public()
                 operation = memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))
                 vessel = parse_env(VESSEL_ENV)
-                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
+                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "remote": remote_status(), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
             elif path == "/api/backup-preflight":
                 self.send_json(200, backup_preflight())
             elif path == "/api/operation":
@@ -1898,7 +1941,10 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             try:
                 parsed = urllib.parse.urlsplit(origin)
                 expected = urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}")
-                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port:
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                    raise ValueError
+                if (parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port) \
+                        and not origin_matches_forwarded_host(parsed.hostname, parsed.port, self.headers, self.client_ip(), self.server.server_address):
                     raise ValueError
             except (ValueError, UnicodeError):
                 self.send_json(403, {"error": "request origin is not allowed"})

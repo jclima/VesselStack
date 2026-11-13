@@ -138,7 +138,12 @@ Assistant reaches MQTT on loopback. AIS ports are unchanged. At minimum:
   protected by an authenticated reverse proxy;
 - keep the root-privileged Control Panel loopback-only or behind a trusted VPN
   and authenticated proxy;
-- use ZeroTier, Tailscale, or WireGuard for remote access; and
+- use ZeroTier, Tailscale, or WireGuard for remote access (VesselStack has optional Tailscale support,
+  off by default: `sudo vesselstackctl remote enable`, see
+  [Remote access with Tailscale](../README.md#remote-access-with-tailscale)). Tailscale reaches every service
+  bound to `0.0.0.0` on the boat, not only the Control Panel, so restrict it with Tailscale ACLs. The firewall
+  rules match only the untrusted interface and never mention `tailscale0`; under strict mode UDP `41641` may be
+  added to `VESSELSTACK_FIREWALL_ALLOW_UDP` for direct connections; and
 - keep `/opt/vesselstack/config/*.env` readable only by root or the required
   service account.
 

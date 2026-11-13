@@ -1167,6 +1167,11 @@ helper_empty_output=$(doctor_with)
 grep -q 'FAIL Boat Chat memory index is empty (0 chunks)' <<<"$helper_empty_output"
 rm -rf -- "$DATA_ROOT/boat-chat/memory"
 mv "$DATA_ROOT/boat-chat/memory.away" "$DATA_ROOT/boat-chat/memory"
+# Remote access: silent while off; a WARN (never a FAIL) when requested but Tailscale is not installed.
+if grep -q 'Tailscale' <<<"$(doctor_with)"; then echo 'doctor mentioned Tailscale while REMOTE_ACCESS is off' >&2; exit 1; fi
+remote_output=$(doctor_with REMOTE_ACCESS=tailscale FAKE_MEMORY_CHUNKS=7)
+grep -Fq 'WARN REMOTE_ACCESS=tailscale but Tailscale is not installed' <<<"$remote_output"
+if grep -q 'FAIL.*Tailscale' <<<"$remote_output"; then echo 'doctor failed on a missing Tailscale' >&2; exit 1; fi
 mv "$APP_ROOT/boat-chat/.venv/bin/python" "$APP_ROOT/boat-chat/.venv/bin/python.away"
 unknown_output=$(doctor_with)
 grep -q 'WARN could not determine the Boat Chat memory index state' <<<"$unknown_output"

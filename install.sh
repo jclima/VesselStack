@@ -156,6 +156,8 @@ fi
 : "${TELEGRAM_ENABLE:=false}"
 # Opt-in Telegram alerts (README "Alerts"): off by default, every threshold blank (= that alert off).
 : "${ALERTS_ENABLE:=false}"
+: "${REMOTE_ACCESS:=off}"
+: "${REMOTE_PANEL_SERVE:=true}"
 : "${ALERT_TELEGRAM_CHAT_IDS:=}"
 : "${ALERT_BATTERY_LOW_V:=}"
 : "${ALERT_BILGE_ENTITY:=}"
@@ -301,6 +303,7 @@ if [ -n "$ALERT_HEARTBEAT_URL" ] && ! [[ "$ALERT_HEARTBEAT_URL" =~ ^https://[^[:
     echo "ALERT_HEARTBEAT_URL must be an https:// address, or blank (its value is not shown)" >&2
     exit 1
 fi
+case "$REMOTE_ACCESS" in off|tailscale) ;; *) echo "REMOTE_ACCESS must be off or tailscale" >&2; exit 1 ;; esac
 case "$VESSELSTACK_BACKUP_SCHEDULE" in off|daily|weekly) ;; *) echo "VESSELSTACK_BACKUP_SCHEDULE must be off, daily or weekly" >&2; exit 1 ;; esac
 if [ "$VESSELSTACK_JOURNAL_MAX_USE" != off ] && ! [[ "$VESSELSTACK_JOURNAL_MAX_USE" =~ ^[1-9][0-9]*[KMG]$ ]]; then
     echo "VESSELSTACK_JOURNAL_MAX_USE must be a size such as 200M or 1G, or off" >&2
@@ -316,7 +319,7 @@ if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BA
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE REMOTE_PANEL_SERVE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -605,6 +608,8 @@ CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
 ALERTS_ENABLE
+REMOTE_ACCESS
+REMOTE_PANEL_SERVE
 ALERT_TELEGRAM_CHAT_IDS
 ALERT_BATTERY_LOW_V
 ALERT_BILGE_ENTITY
@@ -1551,6 +1556,7 @@ previous_env_value() {
     value=${value#[\'\"]}; value=${value%[\'\"]}
     printf '%s' "$value"
 }
+PREVIOUS_CONTROL_PANEL_ALLOWED_HOSTS=$(previous_env_value "$VESSELSTACK_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)
 PREVIOUS_CONTROL_PANEL_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/control-panel.env" CONTROL_PANEL_TOKEN)
 PREVIOUS_BOAT_CHAT_ACCESS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_ACCESS_TOKEN)
 PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_SETTINGS_TOKEN)
@@ -1631,6 +1637,8 @@ new_env_temp control-panel.env; control_panel_temp=$NEW_ENV_TEMP
     env_line CONTROL_PANEL_HOST "$CONTROL_PANEL_HOST"
     env_line CONTROL_PANEL_PORT "$CONTROL_PANEL_PORT"
     env_line CONTROL_PANEL_TOKEN "$CONTROL_PANEL_TOKEN"
+    # Written by `vesselstackctl remote enable` (the tailnet name); kept across reinstalls and updates.
+    [ -z "$PREVIOUS_CONTROL_PANEL_ALLOWED_HOSTS" ] || env_line CONTROL_PANEL_ALLOWED_HOSTS "$PREVIOUS_CONTROL_PANEL_ALLOWED_HOSTS"
 } >> "$control_panel_temp"
 mv -f -- "$control_panel_temp" "$VESSELSTACK_ROOT/config/control-panel.env"
 

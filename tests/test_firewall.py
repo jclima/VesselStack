@@ -22,6 +22,15 @@ class FirewallRenderTests(unittest.TestCase):
         self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090 -j DROP", out)
         self.assertNotIn("ESTABLISHED", out)
 
+    def test_tailscale_interface_is_never_mentioned(self):
+        # Rules match only the untrusted interface, so tailnet traffic needs no allowance (README "Remote access with Tailscale").
+        for environment in ({}, {"VESSELSTACK_FIREWALL_STRICT": "true"},
+                            {"VESSELSTACK_FIREWALL_STRICT": "true", "VESSELSTACK_FIREWALL_ALLOW_UDP": "41641"}):
+            out = render(**environment).stdout
+            self.assertNotIn("tailscale0", out)
+            self.assertNotIn("tailscale", out)
+        self.assertIn("-p udp --dport 41641 -j RETURN", render(VESSELSTACK_FIREWALL_STRICT="true", VESSELSTACK_FIREWALL_ALLOW_UDP="41641").stdout)
+
     def test_homepage_is_covered_by_the_container_port_rule_and_no_published_port_rule(self):
         for port in ("80", "8088"):
             out = render(HOMEPAGE_PORT=port).stdout

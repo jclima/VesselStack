@@ -62,6 +62,8 @@ SETTINGS: dict[str, Setting] = {
     "VESSELSTACK_BACKUP_SCHEDULE": _s("off", enum=("off", "daily", "weekly")), "VESSELSTACK_BACKUP_KEEP": _s("8", kind="number", minimum=1, maximum=365, required=True), "VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK": _s("false", kind="boolean"),
     # Opt-in Telegram alerts (README "Alerts"). Blank thresholds and entities leave that alert off.
     "ALERTS_ENABLE": _s("false", kind="boolean", component="alerts"), "ALERT_TELEGRAM_CHAT_IDS": _s(component="alerts"), "ALERT_BATTERY_LOW_V": _s(component="alerts"), "ALERT_BILGE_ENTITY": _s(component="alerts"), "ALERT_SHORE_POWER_ENTITY": _s(component="alerts"),
+    # Optional Tailscale remote access (README "Remote access with Tailscale"). Off by default; enabled only by `vesselstackctl remote enable`.
+    "REMOTE_ACCESS": _s("off", enum=("off", "tailscale"), component="remote"), "REMOTE_PANEL_SERVE": _s("true", kind="boolean", component="remote"),
     "ALERT_HEARTBEAT_URL": _s(component="alerts"), "ALERT_REPEAT_MINUTES": _s("60", kind="number", minimum=5, maximum=10080, required=True, component="alerts"), "ALERT_STALE_DATA_MINUTES": _s("15", kind="number", minimum=2, maximum=10080, required=True, component="alerts"),
 }
 

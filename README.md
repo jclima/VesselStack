@@ -880,6 +880,7 @@ nano vesselstack.env
 | `ALERTS_ENABLE` and `ALERT_*` | Opt-in Telegram alerts, off by default; see [Alerts](#alerts) |
 | `TELEMETRY_INDEXER_ENABLE` | Enable five-minute current/power sampling and thirty-minute history refreshes |
 | `NODE_EXPORTER_ENABLE` | Optional private host metrics exporter; disabled by default; available in the wizard's advanced settings |
+| `REMOTE_ACCESS`, `REMOTE_PANEL_SERVE` | `off` (default) or `tailscale`, and whether to publish the Control Panel on the tailnet (`true` by default); only record the choice, Tailscale is installed by `sudo vesselstackctl remote enable`; see [Remote access with Tailscale](#remote-access-with-tailscale) |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
 | `CONTROL_PANEL_ALLOWED_HOSTS` | Extra `Host` names the panel accepts (comma separated `name` or `name:port`); loopback and, in LAN mode, the machine's own names and addresses are always allowed |
 | `MQTT_USERNAME`, `MQTT_PASSWORD` | Mosquitto administrator account; the username may contain letters, numbers, `.`, `_` and `-` (1-64), and a custom password must not contain `:` or leading/trailing whitespace |
@@ -1535,6 +1536,79 @@ The installer asks who should reach the dashboards (`local`, `dashboards` (defau
 change it later with `sudo vesselstackctl lan`. The Control Panel is independent and stays on
 loopback unless you run `sudo vesselstackctl panel-access lan`. The full preset table and the
 limits for host-networked containers are in [Network access and security](docs/NETWORK.md).
+For access from anywhere without opening router ports, see [Remote access with Tailscale](#remote-access-with-tailscale)
+(optional, off by default).
+
+### Remote access with Tailscale
+
+Optional and **off by default** (`REMOTE_ACCESS=off`). It lets you reach the boat from anywhere over your
+own [Tailscale](https://tailscale.com) network (tailnet) with **no inbound ports opened** on the boat's
+router or firewall. Nothing is installed unless you run the command below; the installer, the wizard
+and the Control Panel settings only record the choice.
+
+**What it does.** `sudo vesselstackctl remote enable`:
+
+1. installs the `tailscale` package from Tailscale's own apt repository if it is not installed (a
+   signed-by keyring in `/usr/share/keyrings/tailscale-archive-keyring.gpg`, a source file
+   `/etc/apt/sources.list.d/tailscale.list` for your Debian, Raspberry Pi OS or Ubuntu release, and the
+   marker `/var/lib/vesselstack/tailscale-installed-by-vesselstack`; no `curl | sh`);
+2. joins your tailnet with `tailscale up --hostname=<boat name as a host name>` and prints a sign-in link
+   to open on any device;
+3. with `REMOTE_PANEL_SERVE=true` (the default) publishes the Control Panel with
+   `tailscale serve --bg --https=8780 http://127.0.0.1:8780`, adds `<name>.<tailnet>.ts.net:8780` to
+   `CONTROL_PANEL_ALLOWED_HOSTS` in `config/control-panel.env` (kept across reinstalls and updates), and
+   restarts the panel. The panel itself stays bound to `127.0.0.1`.
+
+**Set it up.**
+
+1. Create a free Tailscale account, and in its admin console enable MagicDNS and HTTPS certificates.
+2. Check what will happen: `sudo vesselstackctl remote enable --dry-run`.
+3. Run `sudo vesselstackctl remote enable` (the boat needs internet), open the printed link, and approve
+   the boat. Optionally set `REMOTE_ACCESS=tailscale` in the wizard or in Control Panel settings first; it
+   only records the choice and never installs anything.
+4. Install Tailscale on your phone or laptop, sign in to the same account, and open
+   `https://<name>.<tailnet>.ts.net:8780` (the exact URL is printed and shown on the Control Panel Home
+   tab). Sign in with the panel token or passphrase as usual.
+
+`--auth-key-stdin` (for an unattended join) is accepted only if the installed Tailscale can read the key from a
+file (`tailscale up --auth-key=file:`); the key is read from one line of standard input, written to a
+private temporary file that is deleted at once, and is never placed on a command line, in an environment
+file, a log or a backup. Otherwise the command refuses and you use the sign-in link.
+
+**What it does not do, and what to know.**
+
+- **Tailnet-wide exposure.** Tailscale gives every device in your tailnet a route to the boat computer, and
+  services bound to all interfaces (`0.0.0.0`: Grafana, the home page, Boat Chat, Home Assistant and Signal K
+  in the default `dashboards` preset) become reachable over the tailnet on their normal ports, not only the
+  panel. The firewall rules match only the untrusted interface and do not mention `tailscale0`. Limit who can
+  reach the boat with [Tailscale ACLs](https://tailscale.com/kb/1018/acls) (or use `lan local`).
+- **Shared sign-in throttle.** Behind `tailscale serve` every client appears to the panel as `127.0.0.1`, so
+  failed sign-ins from the tailnet share one lockout bucket with SSH-tunnel users: someone guessing wrongly
+  from the tailnet also locks you out of the tunnel for the lockout period.
+- **Needs internet.** Enabling downloads Tailscale from `pkgs.tailscale.com` and joins the control plane;
+  it refuses cleanly when offline or when `VESSELSTACK_OFFLINE=true`. Tailscale is **not** part of the
+  [offline bundle](#offline-install-no-internet-on-the-boat); install it before you leave the dock.
+- **Supply chain.** Adding the apt source trusts Tailscale's signing key for that repository, and the
+  package runs as root. `remote disable --purge` removes the package, the source and the keyring again.
+- **Direct connections.** Tailscale works through NAT with no inbound rule. With
+  `VESSELSTACK_FIREWALL_STRICT=true` you may allow UDP `41641` in `VESSELSTACK_FIREWALL_ALLOW_UDP` for faster
+  direct connections; otherwise traffic uses Tailscale's relays.
+- No enable or disable buttons exist in the Control Panel; its Home tab only shows the read-only state
+  (`remote` in `/api/status`).
+
+**Verify.** `sudo vesselstackctl remote status` (or `--json`) shows whether Tailscale is online, the tailnet
+name and addresses, the published serve configuration and the panel URL. `sudo vesselstackctl doctor`
+adds `INFO`/`WARN` lines when `REMOTE_ACCESS=tailscale` but Tailscale is missing, signed out, or not
+serving the panel (never a `FAIL`). `sudo ss -ltn` still shows the panel only on `127.0.0.1:8780`.
+
+**Roll back.** `sudo vesselstackctl remote disable` runs `tailscale serve reset` and `tailscale down`,
+removes the tailnet name from `CONTROL_PANEL_ALLOWED_HOSTS`, sets `REMOTE_ACCESS=off` and restarts the panel.
+Add `--purge` to also log out and remove the Tailscale package, source and keyring, but only when the
+marker file shows VesselStack installed it (otherwise your own Tailscale is left in place). Remove the boat
+from your Tailscale admin console too. `vesselstackctl uninstall` does this automatically. By hand:
+`sudo tailscale serve reset && sudo tailscale down`, delete the `CONTROL_PANEL_ALLOWED_HOSTS` line or the
+`.ts.net:8780` entry from `/opt/vesselstack/config/control-panel.env`, set `REMOTE_ACCESS=off` in
+`/opt/vesselstack/config/vesselstack.env`, and `sudo systemctl restart vesselstack-control-panel.service`.
 
 ## Network security
 
@@ -2076,6 +2150,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 Prepare a bundle on a connected machine, carry it to the boat, and install with
 `sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.8.0.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
+The bundle does not include Tailscale: [remote access](#remote-access-with-tailscale) needs internet to install, so run `sudo vesselstackctl remote enable` before going offline.
 
 ## Stopping or removing services
 
@@ -2240,6 +2315,7 @@ bytecode in the source or bundled runtime tree.
 
 Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
 Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order. `tests/test-clean-install.sh` does the same for the installer's `--dry-run` output (written to a file, then searched).
+`tests/test-remote.sh` covers the Tailscale remote-access commands with fake `tailscale`, `apt-get` and `curl` binaries (run it with `sudo`, like the lifecycle test).
 To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
 
 ## Documentation policy

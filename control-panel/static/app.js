@@ -1041,6 +1041,7 @@ async function refreshStatus() {
     $("#version-chip").hidden = state.installedVersion === "unknown";
     $("#boat-name").textContent = data.boat_name || "";
     setNotice("restart-needed", data.restart_needed ? "A newer Control Panel is installed than the one running. Restart it from the Maintenance tab to use the new version." : "");
+    renderRemote(data.remote);
     renderUpdates();
     renderComponents(data.components);
     setConnection("connected");
@@ -1057,6 +1058,17 @@ async function refreshStatus() {
     clearTimeout(state.reconnectTimer);
     if (state.reconnectAttempts <= 5) state.reconnectTimer = setTimeout(refreshStatus, Math.min(2000 * state.reconnectAttempts, 8000));
   }
+}
+
+function renderRemote(remote) {
+  const note = $("#remote-note");
+  if (!note) return;
+  if (!remote || !remote.enabled) { note.hidden = true; note.textContent = ""; return; }
+  const where = remote.panel_url ? ` Reach this panel at ${remote.panel_url} from your own devices.` : "";
+  note.textContent = remote.online
+    ? `Remote access over Tailscale is on (${remote.name || "this boat"}).${where}`
+    : "Tailscale is installed but this boat is not connected to your tailnet. Check it with: sudo vesselstackctl remote status";
+  note.hidden = false;
 }
 
 // ---------------------------------------------------------------- updates

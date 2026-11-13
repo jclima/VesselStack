@@ -119,7 +119,14 @@ port). Other names get `421 Misdirected request`; this blocks DNS-rebinding
 attacks from web pages. If you reach the panel through another name (a reverse
 proxy or a custom DNS name), add it to `CONTROL_PANEL_ALLOWED_HOSTS` in
 `config/control-panel.env` (comma separated, `name` or `name:port`; names
-without a port get the panel port), then restart the panel.
+without a port get the panel port), then restart the panel. `sudo vesselstackctl
+remote enable` adds `<name>.<tailnet>.ts.net:8780` here for you (optional Tailscale
+remote access, README "Remote access with Tailscale"); whether `tailscale serve`
+keeps the original `Host` or rewrites it to the loopback address, the panel accepts
+the request and the same-origin check on sign-in (a rewritten `Host` is matched through
+`X-Forwarded-Host`, only from a loopback peer and only for an allowed name).
+`GET /api/status` includes a read-only `remote` object (`enabled`, `online`, `name`,
+`panel_url`; `null` when Tailscale is not installed) that the Home tab shows.
 
 > **Plain HTTP on the boat network.** If you opened the panel with
 > `panel-access lan`, the passphrase and device token cross the network

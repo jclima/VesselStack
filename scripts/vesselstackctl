@@ -31,6 +31,11 @@ command_needs_lifecycle_lock() {
         backup-drive) [ "${2:-}" = list ] && return 1 ;;
         display)
             case "${2:-}" in list|status|render|export|themes|catalog|show|serial-ports|validate) return 1 ;; esac ;;
+        remote)
+            case "${2:-}" in
+                status) return 1 ;;
+                enable) for arg in "${@:3}"; do [ "$arg" = --dry-run ] || continue; return 1; done ;;
+            esac ;;
         passphrase) [ "${2:-}" = status ] && return 1 ;;
         devices) [ "${2:-}" = list ] && return 1 ;;
         lan) for arg in "${@:2}"; do [ "$arg" = --dry-run ] || continue; return 1; done ;;
@@ -59,6 +64,12 @@ Commands:
                                Show, validate, or install the shared boat profile
   alerts test|status           Send one Telegram test alert, or show the active alerts and the
                                last send result (opt-in alerts, ALERTS_ENABLE; no secrets shown)
+  remote enable [--dry-run] [--auth-key-stdin] | status [--json] | disable [--purge]
+                               Optional Tailscale remote access (off by default; enable needs
+                               internet). enable installs Tailscale if absent, joins your tailnet
+                               (sign in with the printed link) and, with REMOTE_PANEL_SERVE=true,
+                               publishes the Control Panel to the tailnet only. disable undoes it;
+                               --purge also removes a Tailscale package VesselStack installed
   doctor                       Validate config, dependencies, disk, and health (also
                                hardware watchdog, journal cap, scheduled backups and
                                power/under-voltage warnings)
@@ -1918,6 +1929,286 @@ alerts_command() {
     esac
 }
 
+# --- Optional Tailscale remote access -----------------------------------------------------------
+# `remote enable|status|disable`. Off by default. Tailscale is a host package from Tailscale's own apt
+# repository (signed-by keyring); the Control Panel stays on loopback and is published to the tailnet
+# only with `tailscale serve`. No auth key is ever written to argv, env files, logs or backups.
+REMOTE_MARKER="$SYSTEM_ROOT/var/lib/vesselstack/tailscale-installed-by-vesselstack"
+REMOTE_APT_LIST="$SYSTEM_ROOT/etc/apt/sources.list.d/tailscale.list"
+REMOTE_KEYRING="$SYSTEM_ROOT/usr/share/keyrings/tailscale-archive-keyring.gpg"
+REMOTE_SERVE_PORT=8780
+
+# Prints "name|state|ips" from `tailscale status --json` text on stdin (name has no trailing dot).
+# shellcheck disable=SC2016
+REMOTE_PARSE='
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+me = data.get("Self") if isinstance(data.get("Self"), dict) else {}
+name = str(me.get("DNSName") or "").rstrip(".")
+print("%s|%s|%s" % (name, data.get("BackendState") or "", ",".join(str(i) for i in (data.get("TailscaleIPs") or []))))
+'
+
+remote_slug() {
+    local slug
+    slug=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-63)
+    slug=${slug%-}
+    [ -n "$slug" ] || slug=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//')
+    printf '%s' "${slug:-vesselstack}"
+}
+
+# remote_status_line: "name|state|ips"; empty fields when tailscale is absent or silent.
+remote_status_line() {
+    command -v tailscale >/dev/null 2>&1 || { printf '||\n'; return 0; }
+    local json
+    json=$(timeout 5 tailscale status --json 2>/dev/null) || json='{}'
+    printf '%s' "$json" | python3 -I -c "$REMOTE_PARSE" 2>/dev/null || printf '||\n'
+}
+
+# remote_hosts_edit add|remove HOST: change CONTROL_PANEL_ALLOWED_HOSTS in control-panel.env with the same
+# atomic writer panel-access uses. "remove" with the pattern "*.ts.net:PORT" drops every tailnet entry of ours.
+remote_hosts_edit() {
+    local action=$1 host=$2 panel_file="$ROOT/config/control-panel.env" current updated temp
+    if [ ! -f "$panel_file" ] || [ -L "$panel_file" ]; then echo "Refusing to edit $panel_file (missing or a symlink)" >&2; return 1; fi
+    current=$(env_file_value "$panel_file" CONTROL_PANEL_ALLOWED_HOSTS)
+    updated=$(python3 -I -c '
+import sys
+action, host, current = sys.argv[1:4]
+items = [i.strip() for i in current.split(",") if i.strip()]
+if action == "add":
+    if host.lower() not in [i.lower() for i in items]:
+        items.append(host)
+elif host.startswith("*"):
+    items = [i for i in items if not i.lower().endswith(host[1:].lower())]
+else:
+    items = [i for i in items if i.lower() != host.lower()]
+print(",".join(items))
+' "$action" "$host" "$current")
+    [ "$updated" != "$current" ] || return 0
+    if [ -n "$updated" ]; then
+        set_env_key "$panel_file" CONTROL_PANEL_ALLOWED_HOSTS "$updated"
+        return
+    fi
+    temp=$(mktemp "$(dirname "$panel_file")/.control-panel.env.XXXXXX")
+    grep -v '^CONTROL_PANEL_ALLOWED_HOSTS=' "$panel_file" > "$temp" || true
+    if ! chown --reference="$panel_file" "$temp" || ! chmod --reference="$panel_file" "$temp" || ! mv -f -- "$temp" "$panel_file"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+
+remote_restart_panel() {
+    systemctl restart vesselstack-control-panel.service 2>/dev/null \
+        || echo "WARN could not restart the Control Panel; run: sudo systemctl restart vesselstack-control-panel.service" >&2
+}
+
+remote_install_package() {
+    local id codename repo url key_temp
+    [ "${VESSELSTACK_OFFLINE:-false}" != true ] || { echo "Refusing: Tailscale must be downloaded from Tailscale's own package repository, which needs internet (VESSELSTACK_OFFLINE=true is set)." >&2; return 1; }
+    command -v apt-get >/dev/null 2>&1 || { echo "Refusing: this computer has no apt-get. Install Tailscale yourself from https://tailscale.com/download, then rerun: sudo vesselstackctl remote enable" >&2; return 1; }
+    id=$(sed -n 's/^ID=//p' "$SYSTEM_ROOT/etc/os-release" 2>/dev/null | head -n 1 | tr -d "\"'") || id=''
+    codename=$(sed -n 's/^VERSION_CODENAME=//p' "$SYSTEM_ROOT/etc/os-release" 2>/dev/null | head -n 1 | tr -d "\"'") || codename=''
+    case "$id" in
+        debian|ubuntu|raspbian) repo=$id ;;
+        *) echo "Refusing: unsupported operating system '${id:-unknown}'. Install Tailscale from https://tailscale.com/download, then rerun: sudo vesselstackctl remote enable" >&2; return 1 ;;
+    esac
+    [[ "$codename" =~ ^[a-z]+$ ]] || { echo "Refusing: cannot detect the operating system release name (VERSION_CODENAME). Install Tailscale from https://tailscale.com/download, then rerun this command." >&2; return 1; }
+    url="https://pkgs.tailscale.com/stable/$repo/$codename"
+    if ! curl -fsS --max-time 10 -o /dev/null "https://pkgs.tailscale.com/" 2>/dev/null; then
+        echo "Refusing: cannot reach pkgs.tailscale.com. Remote access needs internet to install Tailscale; connect and rerun: sudo vesselstackctl remote enable" >&2
+        return 1
+    fi
+    key_temp=$(mktemp)
+    if ! curl -fsSL --max-time 60 -o "$key_temp" "$url.noarmor.gpg" || [ ! -s "$key_temp" ]; then
+        rm -f -- "$key_temp"
+        echo "Could not download Tailscale's signing key from $url.noarmor.gpg" >&2
+        return 1
+    fi
+    install -d -m 0755 "$(dirname "$REMOTE_KEYRING")" "$(dirname "$REMOTE_APT_LIST")" "$(dirname "$REMOTE_MARKER")"
+    install -m 0644 "$key_temp" "$REMOTE_KEYRING"
+    rm -f -- "$key_temp"
+    printf 'deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/%s %s main\n' "$repo" "$codename" > "$REMOTE_APT_LIST"
+    chmod 0644 "$REMOTE_APT_LIST"
+    # Mark first: a half-finished install is still ours to clean up.
+    : > "$REMOTE_MARKER"
+    chmod 0600 "$REMOTE_MARKER"
+    apt-get update -o Dir::Etc::sourcelist="$REMOTE_APT_LIST" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 >/dev/null \
+        && apt-get install -y tailscale
+}
+
+remote_enable() {
+    local dry_run=0 key_stdin=0 argument name_slug boat serve key_dir='' key_file='' state line name ips
+    for argument in "$@"; do
+        case "$argument" in
+            --dry-run) dry_run=1 ;;
+            --auth-key-stdin) key_stdin=1 ;;
+            *) echo "Unknown remote enable option: $argument" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+    boat=${BOAT_NAME:-$(env_file_value "$ENV_FILE" BOAT_NAME)}
+    name_slug=$(remote_slug "$boat")
+    serve=${REMOTE_PANEL_SERVE:-true}
+    if [ "$dry_run" -eq 1 ]; then
+        echo "Remote access (Tailscale): dry run, nothing will be changed."
+        if command -v tailscale >/dev/null 2>&1; then echo "  Tailscale is installed."; else echo "  Install Tailscale from pkgs.tailscale.com with a signed apt source (needs internet)."; fi
+        echo "  Join the tailnet as host name: $name_slug (tailscale up --hostname=$name_slug)"
+        if [ "$serve" = true ]; then
+            echo "  Publish the Control Panel to the tailnet only: tailscale serve --bg --https=$REMOTE_SERVE_PORT http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}"
+            echo "  Add <tailnet name>:$REMOTE_SERVE_PORT to CONTROL_PANEL_ALLOWED_HOSTS and restart the Control Panel."
+        fi
+        echo "  Set REMOTE_ACCESS=tailscale in $ENV_FILE."
+        return 0
+    fi
+    command -v tailscale >/dev/null 2>&1 || remote_install_package || return 1
+    command -v tailscale >/dev/null 2>&1 || { echo "Tailscale is still not installed; see the messages above." >&2; return 1; }
+    if [ "$key_stdin" -eq 1 ]; then
+        if ! tailscale up --help 2>&1 | grep -A3 -- '--auth-key' | grep -q 'file:'; then
+            echo "Refusing --auth-key-stdin: the installed Tailscale cannot read an auth key from a file, and a key on the command line would be visible in the process list. Run without the flag and sign in with the link it prints." >&2
+            return 1
+        fi
+        key_dir=$(mktemp -d)
+        key_file="$key_dir/authkey"
+        IFS= read -r line || true
+        [ -n "$line" ] || { rm -rf -- "$key_dir"; echo "--auth-key-stdin needs the auth key as one line on standard input." >&2; return 1; }
+        (umask 077; printf '%s' "$line" > "$key_file")
+        line=''
+    fi
+    IFS='|' read -r name state ips <<<"$(remote_status_line)"
+    if [ "$state" = Running ]; then
+        echo "Tailscale is already connected as ${name:-this device}."
+        [ -z "$key_dir" ] || rm -rf -- "$key_dir"
+    elif [ -n "$key_file" ]; then
+        tailscale up "--hostname=$name_slug" "--auth-key=file:$key_file" || { rm -rf -- "$key_dir"; return 1; }
+        rm -rf -- "$key_dir"
+    else
+        echo "Open the sign-in link below on any device, then approve this boat in your Tailscale account."
+        tailscale up "--hostname=$name_slug" || return 1
+    fi
+    set_env_key "$ENV_FILE" REMOTE_ACCESS tailscale
+    if [ "$serve" = true ]; then
+        IFS='|' read -r name state ips <<<"$(remote_status_line)"
+        if ! [[ "$name" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+            echo "Could not read this device's tailnet name from tailscale status; the Control Panel was not published. Rerun: sudo vesselstackctl remote enable" >&2
+            return 1
+        fi
+        if ! tailscale serve --bg "--https=$REMOTE_SERVE_PORT" "http://127.0.0.1:${CONTROL_PANEL_PORT:-8780}"; then
+            echo "tailscale serve failed. In the Tailscale admin console, make sure HTTPS Certificates are enabled for your tailnet, then rerun: sudo vesselstackctl remote enable" >&2
+            return 1
+        fi
+        remote_hosts_edit add "$name:$REMOTE_SERVE_PORT" || return 1
+        remote_restart_panel
+        echo "Control Panel on your tailnet: https://$name:$REMOTE_SERVE_PORT"
+    fi
+    echo "Remote access enabled. Check it with: sudo vesselstackctl remote status"
+}
+
+# remote_disable [--purge] [--no-restart]
+remote_disable() {
+    local purge=0 restart=1 argument
+    for argument in "$@"; do
+        case "$argument" in
+            --purge) purge=1 ;;
+            --no-restart) restart=0 ;;
+            *) echo "Unknown remote disable option: $argument" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+    if command -v tailscale >/dev/null 2>&1; then
+        tailscale serve reset || echo "WARN tailscale serve reset failed" >&2
+        tailscale down || echo "WARN tailscale down failed" >&2
+    fi
+    remote_hosts_edit remove "*.ts.net:$REMOTE_SERVE_PORT" || echo "WARN could not update CONTROL_PANEL_ALLOWED_HOSTS" >&2
+    [ ! -f "$ENV_FILE" ] || set_env_key "$ENV_FILE" REMOTE_ACCESS off || true
+    [ "$restart" -eq 0 ] || remote_restart_panel
+    if [ "$purge" -eq 1 ]; then
+        if [ -e "$REMOTE_MARKER" ]; then
+            if command -v tailscale >/dev/null 2>&1; then tailscale logout || true; fi
+            apt-get purge -y tailscale || echo "WARN could not remove the tailscale package" >&2
+            # Tailscale's repository also ships its keyring as a package that owns the keyring file.
+            if dpkg -s tailscale-archive-keyring >/dev/null 2>&1; then apt-get purge -y tailscale-archive-keyring || true; fi
+            rm -f -- "$REMOTE_APT_LIST" "$REMOTE_KEYRING" "$REMOTE_MARKER"
+            echo "Removed Tailscale and its apt source. Delete this machine from your Tailscale admin console if it is still listed."
+        else
+            echo "Tailscale was not installed by VesselStack, so it was left in place (the boat is disconnected from the tailnet)."
+        fi
+    fi
+    echo "Remote access disabled."
+}
+
+remote_status() {
+    local json=0 argument name='' state='' ips='' serve_text='' installed=false enabled=false online=false configured url=''
+    for argument in "$@"; do
+        case "$argument" in
+            --json) json=1 ;;
+            *) echo "Unknown remote status option: $argument" >&2; usage >&2; exit 2 ;;
+        esac
+    done
+    configured=${REMOTE_ACCESS:-off}
+    if command -v tailscale >/dev/null 2>&1; then
+        installed=true
+        IFS='|' read -r name state ips <<<"$(remote_status_line)"
+        if [ -n "$state" ] && [ "$state" != NoState ] && [ "$state" != Stopped ]; then enabled=true; fi
+        if [ "$state" = Running ]; then online=true; fi
+        serve_text=$(timeout 5 tailscale serve status 2>/dev/null | head -n 20 || true)
+        if [ "$online" = true ] && [ -n "$name" ] && [ "${REMOTE_PANEL_SERVE:-true}" = true ] && grep -q ":$REMOTE_SERVE_PORT" <<<"$serve_text"; then
+            url="https://$name:$REMOTE_SERVE_PORT"
+        fi
+    fi
+    if [ "$json" -eq 1 ]; then
+        python3 -I -c '
+import json, sys
+cfg, inst, en, on, name, state, ips, serve, url = sys.argv[1:10]
+print(json.dumps({"remote_access": cfg, "installed": inst == "true", "enabled": en == "true", "online": on == "true",
+                  "state": state, "name": name, "tailnet_ips": [i for i in ips.split(",") if i],
+                  "serve": serve, "panel_url": url}, indent=2))
+' "$configured" "$installed" "$enabled" "$online" "$name" "$state" "$ips" "$serve_text" "$url"
+        return 0
+    fi
+    printf 'Remote access setting: %s\n' "$configured"
+    if [ "$installed" != true ]; then
+        echo "Tailscale: not installed. Enable it with: sudo vesselstackctl remote enable"
+        return 0
+    fi
+    printf 'Tailscale: %s (state: %s)\n' "$([ "$online" = true ] && echo online || echo offline)" "${state:-unknown}"
+    printf 'Tailnet name: %s\n' "${name:-unknown}"
+    printf 'Tailnet addresses: %s\n' "${ips:-none}"
+    if [ -n "$serve_text" ]; then printf 'Serve:\n%s\n' "$serve_text"; else echo 'Serve: nothing published'; fi
+    if [ -n "$url" ]; then printf 'Control Panel URL: %s\n' "$url"; fi
+}
+
+remote_command() {
+    local action=${1:-}
+    [ $# -eq 0 ] || shift
+    case "$action" in
+        enable) remote_enable "$@" ;;
+        status) remote_status "$@" ;;
+        disable) remote_disable "$@" ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+check_remote() {
+    [ "${REMOTE_ACCESS:-off}" = tailscale ] || return 0
+    local name state ips
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo 'WARN REMOTE_ACCESS=tailscale but Tailscale is not installed. Fix: sudo vesselstackctl remote enable' >&2
+        return 0
+    fi
+    IFS='|' read -r name state ips <<<"$(remote_status_line)"
+    if [ "$state" != Running ]; then
+        echo "WARN Tailscale is not connected (state: ${state:-unknown}). Fix: sudo vesselstackctl remote enable" >&2
+        return 0
+    fi
+    printf 'INFO Tailscale connected as %s\n' "${name:-this device}"
+    if [ "${REMOTE_PANEL_SERVE:-true}" = true ] && ! timeout 5 tailscale serve status 2>/dev/null | grep -q ":$REMOTE_SERVE_PORT"; then
+        echo 'WARN the Control Panel is not published on the tailnet (tailscale serve is empty). Fix: sudo vesselstackctl remote enable' >&2
+    fi
+    return 0
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -1952,6 +2243,7 @@ doctor_stack() {
     check_journald
     check_backup_schedule || failed=1
     check_alerts
+    check_remote
     check_power
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
@@ -2959,6 +3251,9 @@ uninstall_stack() {
             *) echo "Refusing to purge non-default paths automatically" >&2; exit 1 ;;
         esac
     fi
+    if [ -e "$REMOTE_MARKER" ] || [ "${REMOTE_ACCESS:-off}" = tailscale ]; then
+        if [ -e "$REMOTE_MARKER" ]; then remote_disable --purge --no-restart || true; else remote_disable --no-restart || true; fi
+    fi
     stop_stack
     systemctl disable vesselstack-chat.service || true
     systemctl disable --now vesselstack-chat-telegram.service || true
@@ -3046,6 +3341,7 @@ case "$command" in
     status) [ $# -eq 0 ] || { usage; exit 2; }; status_stack ;;
     doctor) [ $# -eq 0 ] || { usage; exit 2; }; doctor_stack ;;
     alerts) alerts_command "$@" ;;
+    remote) remote_command "$@" ;;
     urls) [ $# -eq 0 ] || { usage; exit 2; }; show_urls ;;
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;

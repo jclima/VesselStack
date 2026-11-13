@@ -5,6 +5,17 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Add optional Tailscale remote access, off by default (`REMOTE_ACCESS=off|tailscale`, `REMOTE_PANEL_SERVE=true`):
+  `sudo vesselstackctl remote enable [--dry-run] [--auth-key-stdin] | status [--json] | disable [--purge]`
+  installs Tailscale from Tailscale's signed apt repository (internet needed; not in the offline bundle), joins the
+  tailnet with the printed sign-in link, and publishes the Control Panel (still on `127.0.0.1`) to the tailnet only
+  with `tailscale serve --https=8780`, adding its name to `CONTROL_PANEL_ALLOWED_HOSTS` (now preserved across
+  reinstalls). No inbound ports are opened; no auth key is stored or logged (`--auth-key-stdin` works only when the
+  installed Tailscale reads keys from a file). The panel's Origin check also accepts a loopback-rewritten `Host` via
+  `X-Forwarded-Host` for allowed names. `/api/status` gains read-only `remote`, shown on the Home tab; `doctor` warns
+  (never fails) on a missing or signed-out Tailscale; `uninstall` disables it. Operational impact: every tailnet device
+  can reach services bound to `0.0.0.0` (use Tailscale ACLs) and tailnet sign-in failures share the panel's 127.0.0.1
+  lockout bucket. Rollback: `sudo vesselstackctl remote disable --purge`.
 - Make alerts safer: an offline bilge or shore sensor is never an all-clear (separate "sensor not reporting" alerts after 5 minutes), bilge alerts on the first poll, the heartbeat pings `/fail` only for a real problem (also when Telegram delivery fails), per-run 90 s deadline, clock-backwards and reboot handling, orphaned entries pruned, dispatcher health in `doctor`, the script refuses to run as root, and more unit hardening. Rollback: set `ALERTS_ENABLE=false`.
 - Add opt-in Telegram alerts (`ALERTS_ENABLE`, default `false`; `ALERT_TELEGRAM_CHAT_IDS`,
   `ALERT_BATTERY_LOW_V`, `ALERT_BILGE_ENTITY`, `ALERT_SHORE_POWER_ENTITY`, `ALERT_HEARTBEAT_URL`,

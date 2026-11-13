@@ -1891,6 +1891,84 @@ class HostAllowlistApiTests(SignInApiTests):
         panel._HOST_ALLOWLISTS.clear()
 
 
+class TailnetHostApiTests(HostAllowlistApiTests):
+    """Host and Origin acceptance for https://<tailnet name>:8780 published by tailscale serve."""
+
+    NAME = "boat.example-tailnet.ts.net"
+
+    def login_status(self, host, origin, extra=None):
+        headers = {"Origin": origin, **(extra or {})}
+        return self.raw("POST", "/api/auth/login", host, headers, {"passphrase": "wrong passphrase", "remember": False})[0]
+
+    def with_allowed(self, value):
+        panel._HOST_ALLOWLISTS.clear()
+        return mock.patch.dict(panel.os.environ, {"CONTROL_PANEL_ALLOWED_HOSTS": value})
+
+    def test_host_preserved_by_serve_is_accepted_and_others_are_not(self) -> None:
+        with self.with_allowed(f"{self.NAME}:8780"):
+            self.assertEqual(self.raw("GET", "/health", f"{self.NAME}:8780")[0], 200)
+            self.assertEqual(self.raw("GET", "/health", f"{self.NAME.upper()}:8780")[0], 200)
+            self.assertEqual(self.raw("GET", "/health", self.NAME)[0], 421, "no port, not 80")
+            self.assertEqual(self.raw("GET", "/health", f"other.example-tailnet.ts.net:8780")[0], 421)
+            self.assertEqual(self.raw("GET", "/health", f"{self.NAME}:8781")[0], 421)
+        panel._HOST_ALLOWLISTS.clear()
+
+    def test_origin_matches_when_serve_preserves_the_host(self) -> None:
+        self.set_passphrase()
+        with self.with_allowed(f"{self.NAME}:8780"):
+            host = f"{self.NAME}:8780"
+            self.assertNotEqual(self.login_status(host, f"https://{self.NAME}:8780"), 403)
+            self.assertEqual(self.login_status(host, "https://evil.example:8780"), 403)
+            self.assertEqual(self.login_status(host, f"https://{self.NAME}:9999"), 403)
+        panel._HOST_ALLOWLISTS.clear()
+
+    def test_origin_matches_when_serve_rewrites_the_host_to_loopback(self) -> None:
+        self.set_passphrase()
+        port = self.server.server_address[1]
+        loopback = f"127.0.0.1:{port}"
+        with self.with_allowed(f"{self.NAME}:8780"):
+            origin = f"https://{self.NAME}:8780"
+            # serve forwards the original host in X-Forwarded-Host
+            self.assertNotEqual(self.login_status(loopback, origin, {"X-Forwarded-Host": f"{self.NAME}:8780"}), 403)
+            # without it, or with a name that is not on the allowlist, the strict comparison still applies
+            self.assertEqual(self.login_status(loopback, origin), 403)
+            self.assertEqual(self.login_status(loopback, "https://evil.example:8780", {"X-Forwarded-Host": "evil.example:8780"}), 403)
+            self.assertEqual(self.login_status(loopback, origin, {"X-Forwarded-Host": f"{self.NAME}:8781"}), 403)
+        panel._HOST_ALLOWLISTS.clear()
+
+
+class RemoteStatusTests(unittest.TestCase):
+    def fake_tailscale(self, payload, directory):
+        script = Path(directory) / "tailscale"
+        script.write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(payload) + "\nEOF\n")
+        script.chmod(0o755)
+        return mock.patch.object(panel.shutil, "which", lambda name: str(script) if name == "tailscale" else None)
+
+    def test_remote_is_none_when_tailscale_is_absent(self) -> None:
+        with mock.patch.object(panel.shutil, "which", lambda name: None):
+            self.assertIsNone(panel.remote_status())
+
+    def test_remote_reports_name_and_panel_url_without_secrets(self) -> None:
+        running = {"BackendState": "Running", "AuthURL": "", "Self": {"DNSName": "boat.example-tailnet.ts.net.", "Online": True}}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.fake_tailscale(running, directory), mock.patch.object(panel, "parse_env", return_value={"CONTROL_PANEL_PORT": "8780"}):
+                remote = panel.remote_status()
+            self.assertEqual(remote, {"enabled": True, "online": True, "name": "boat.example-tailnet.ts.net", "panel_url": "https://boat.example-tailnet.ts.net:8780"})
+            login = {"BackendState": "NeedsLogin", "AuthURL": "https://login.tailscale.com/a/secret", "Self": {}}
+            with self.fake_tailscale(login, directory), mock.patch.object(panel, "parse_env", return_value={}):
+                remote = panel.remote_status()
+            self.assertEqual((remote["enabled"], remote["online"], remote["panel_url"]), (True, False, ""))
+            self.assertNotIn("secret", json.dumps(remote))
+
+    def test_remote_survives_a_failing_or_garbled_tailscale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "tailscale"
+            script.write_text("#!/bin/sh\necho not json\n")
+            script.chmod(0o755)
+            with mock.patch.object(panel.shutil, "which", lambda name: str(script)):
+                self.assertIsNone(panel.remote_status())
+
+
 class HostAllowlistUnitTests(unittest.TestCase):
     def test_lan_mode_adds_machine_names_and_refreshes(self) -> None:
         clock = [0.0]

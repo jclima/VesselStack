@@ -49,6 +49,8 @@ jobs:
           TMPDIR="$trusted_test_tmp" tests/test-distribution.sh
       - name: Lifecycle backup and restore checks
         run: sudo tests/test-lifecycle.sh
+      - name: Remote access checks
+        run: sudo tests/test-remote.sh
       - name: Versioned migration checks
         run: tests/test-migrations.sh
       - name: Clean installation checks

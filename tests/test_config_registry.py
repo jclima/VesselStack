@@ -66,6 +66,27 @@ class ConfigRegistryTests(unittest.TestCase):
         self.assertIn("ALERT_HEARTBEAT_URL)", install.split("config_key_is_secret()")[1].split("}")[0])
         self.assertEqual(panel.FIELD_BY_KEY["ALERT_HEARTBEAT_URL"]["kind"], "secret")
 
+    def test_remote_access_keys_are_off_by_default_on_every_surface_and_the_installer(self):
+        self.assertEqual((registry.DEFAULTS["REMOTE_ACCESS"], registry.DEFAULTS["REMOTE_PANEL_SERVE"]), ("off", "true"))
+        self.assertEqual(registry.SETTINGS["REMOTE_ACCESS"].component, "remote")
+        install = (ROOT / "install.sh").read_text()
+        example = (ROOT / "vesselstack.example.env").read_text()
+        for key in ("REMOTE_ACCESS", "REMOTE_PANEL_SERVE"):
+            with self.subTest(key=key):
+                self.assertIn(key, panel.FIELD_BY_KEY)
+                self.assertIn(f'{key}="', example)
+                self.assertIn(f"\n{key}\n", install)
+                self.assertEqual(wizard.DEFAULTS[key], registry.DEFAULTS[key])
+        self.assertEqual(panel.FIELD_BY_KEY["REMOTE_ACCESS"]["kind"], "select")
+        self.assertIn(': "${REMOTE_ACCESS:=off}"', install)
+        self.assertIn(': "${REMOTE_PANEL_SERVE:=true}"', install)
+        self.assertEqual(registry.validate_value("REMOTE_ACCESS", "tailscale"), "tailscale")
+        for key, bad in (("REMOTE_ACCESS", "wireguard"), ("REMOTE_ACCESS", "TAILSCALE"), ("REMOTE_PANEL_SERVE", "yes")):
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(ValueError): registry.validate_value(key, bad)
+                with self.assertRaises(ValueError): wizard.validate({key: bad})
+                with self.assertRaises(ValueError): panel.validate_value(panel.FIELD_BY_KEY[key], bad)
+
     def test_signalk_datapath_autoconfig_key_is_a_managed_boolean_on_every_surface(self):
         key = "SIGNALK_DATAPATH_AUTOCONFIG"
         self.assertEqual(registry.DEFAULTS[key], "true")
