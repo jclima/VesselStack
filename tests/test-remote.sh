@@ -69,7 +69,11 @@ case "${1:-}" in
         case "${2:-}" in
             reset) rm -f "$state/serve" ;;
             --https=8780) [ "${3:-}" != off ] || rm -f "$state/serve" ;;
-            status) [ ! -e "$state/serve" ] || echo 'https://boat.example-tailnet.ts.net:8780 (tailnet only)|-- / proxy http://127.0.0.1:8780' ;;
+            --https=1880) [ "${3:-}" != off ] || rm -f "$state/serve-nr" ;;
+            --bg) if [ "${3:-}" = --https=1880 ]; then touch "$state/serve-nr"; else touch "$state/serve"; fi ;;
+            status)
+                [ ! -e "$state/serve" ] || echo 'https://boat.example-tailnet.ts.net:8780 (tailnet only)|-- / proxy http://127.0.0.1:8780'
+                [ ! -e "$state/serve-nr" ] || echo 'https://boat.example-tailnet.ts.net:1880 (tailnet only)|-- / proxy http://127.0.0.1:1881' ;;
             *) touch "$state/serve" ;;
         esac ;;
     down) rm -f "$state/up" ;;
@@ -172,6 +176,16 @@ assert d["tailnet_ips"] == ["100.64.0.1", "fd7a:115c:a1e0::1"], d
 assert d["panel_url"] == "https://boat.example-tailnet.ts.net:8780", d
 ' "$status_json"
 
+# Node-RED enabled: its own tailnet-only handler on 1880 is added and shown; nothing is published while it is off.
+if grep -q '^tailscale serve --bg --https=1880' "$LOG"; then fail "Node-RED was published while disabled"; fi
+printf 'NODERED_ENABLE=true\nNODERED_PORT=1881\n' >> "$APP_ROOT/config/vesselstack.env"
+run_ctl remote enable --dry-run | grep -q 'tailscale serve --bg --https=1880 http://127.0.0.1:1881' || fail "dry run omits the Node-RED handler"
+run_ctl remote enable >/dev/null
+grep -q '^tailscale serve --bg --https=1880 http://127.0.0.1:1881$' "$LOG" || fail "Node-RED serve not configured"
+human=$(run_ctl remote status)
+grep -q 'Node-RED URL: https://boat.example-tailnet.ts.net:1880' <<<"$human" || fail "status lacks the Node-RED URL: $human"
+python3 -I -c 'import json,sys; assert json.loads(sys.argv[1])["nodered_url"]=="https://boat.example-tailnet.ts.net:1880"' "$(run_ctl remote status --json)"
+
 # Disable without --purge: only our serve handler off, host removed by exact name (the owner's own entries stay),
 # panel restarted before tailscale goes down, package kept.
 set_hosts() { sed -i "s|^CONTROL_PANEL_ALLOWED_HOSTS=.*|CONTROL_PANEL_ALLOWED_HOSTS=$1|" "$APP_ROOT/config/control-panel.env"; }
@@ -180,6 +194,8 @@ set_hosts 'other.example,mine.example-tailnet.ts.net:8780,boat.example-tailnet.t
 disable_out=$(run_ctl remote disable 2>&1)
 if grep -q '^tailscale serve reset' "$LOG"; then fail "disable used serve reset"; fi
 grep -q '^tailscale serve --https=8780 off$' "$LOG" || fail "disable did not remove only our serve handler"
+grep -q '^tailscale serve --https=1880 off$' "$LOG" || fail "disable did not remove the Node-RED handler"
+sed -i 's/^NODERED_ENABLE=true$/NODERED_ENABLE=false/' "$APP_ROOT/config/vesselstack.env"
 grep -q '^tailscale down$' "$LOG" || fail "disable did not go down for a VesselStack-installed Tailscale"
 grep -q 'SSH session' <<<"$disable_out" || fail "no SSH warning before tailscale down"
 [ "$(env_value "$APP_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)" = 'other.example,mine.example-tailnet.ts.net:8780' ] || fail "allowed host not removed by exact name"

@@ -60,7 +60,7 @@ check_manifest() {
 image_list() {
     # The Mosquitto image that hashes the broker passwords is the compose one.
     docker compose --profile signalk --profile ais --profile metrics --profile nodered --env-file "$ROOT/vesselstack.example.env" \
-        -f "$ROOT/templates/compose.yml" config --images | sort -u
+        -f "$ROOT/templates/compose.yml" config --no-env-resolution --images | sort -u
 }
 
 sha256_only() { sha256_of "$1" | cut -d' ' -f1; }

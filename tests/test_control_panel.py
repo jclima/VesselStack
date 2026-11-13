@@ -263,6 +263,32 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertIn("node-exporter", panel.component_command("node-exporter", "start"))
                 self.assertEqual(panel.component_command("telemetry-sample", "restart"), ["systemctl", "restart", "vesselstack-telemetry-sample.timer"])
 
+    def test_nodered_starts_only_when_enabled_and_prepared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = root / "vessel.env"
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "ROOT", root):
+                env.write_text("NODERED_ENABLE=false\n")
+                with self.assertRaisesRegex(ValueError, "disabled"):
+                    panel.component_command("nodered", "start")
+                env.write_text("NODERED_ENABLE=true\n")
+                for verb in ("start", "restart"):
+                    with self.assertRaisesRegex(ValueError, "not prepared"):
+                        panel.component_command("nodered", verb)
+                self.assertNotIn("nodered", panel.compose_base())  # an unprepared profile would break every compose call
+                (root / "config" / "node-red").mkdir(parents=True)
+                (root / "config" / "nodered.env").write_text("")
+                (root / "config" / "node-red" / "settings.js").write_text("module.exports={}\n")
+                with self.assertRaisesRegex(ValueError, "not prepared"):  # empty nodered.env
+                    panel.component_command("nodered", "start")
+                (root / "config" / "nodered.env").write_text("A='1'\n")
+                self.assertIn("nodered", panel.component_command("nodered", "start"))
+                self.assertIn("nodered", panel.compose_base())
+                (root / "config" / "node-red" / "settings.js").unlink()
+                with self.assertRaisesRegex(ValueError, "not prepared"):
+                    panel.component_command("nodered", "restart")
+                self.assertEqual(panel.component_command("nodered", "stop")[-2:], ["stop", "nodered"])
+
     def test_displays_bridge_is_opt_in_and_token_is_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             vessel = Path(directory) / "vessel.env"

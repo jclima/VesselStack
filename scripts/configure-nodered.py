@@ -5,10 +5,11 @@ Subcommands (all run as root by install.sh; none prints a secret):
   hash      read "PASSPHRASE\\n[EXISTING_HASH]" on stdin, print a bcrypt hash. An existing hash
             that still matches the passphrase is returned unchanged. bcrypt runs inside the
             pinned Node-RED image (bcryptjs), so the passphrase never reaches a command line.
-  render    NODERED_ENABLE=true: create <data>/node-red (owner 1000:1000), seed settings.js
-            only when it does not exist (the owner's edits are never overwritten) and write
-            <root>/config/nodered.env (root:root 0600) with the pre-wired MQTT, InfluxDB,
-            Signal K and Home Assistant values. NODERED_ENABLE=false: remove nodered.env.
+  render    NODERED_ENABLE=true: create <data>/node-red (owner 1000:1000), seed the root-owned
+            <root>/config/node-red/settings.js (0644 root:root) only when it does not exist (the
+            owner's edits are never overwritten) and write <root>/config/nodered.env (root:root
+            0600) with the pre-wired MQTT, InfluxDB, Signal K and Home Assistant values.
+            NODERED_ENABLE=false: remove nodered.env.
   token     create (or keep) the read-only InfluxDB token scoped to the raw and history
             buckets and store it in nodered.env. NODERED_ENABLE=false: revoke it.
             Exit 10 when nodered.env changed.
@@ -42,6 +43,7 @@ HASH_RE = re.compile(r"^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$")
 BUCKET_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 PALETTE = ("node-red-contrib-home-assistant-websocket@0.83.0", "@flowfuse/node-red-dashboard@1.36.1")
 EXIT_CHANGED = 10
+MAX_PACKAGE_JSON = 1024 * 1024
 HASH_JS = (
     "const bc=require('bcryptjs');let d='';process.stdin.setEncoding('utf8');"
     "process.stdin.on('data',c=>d+=c).on('end',()=>{const a=d.split('\\n');const p=a[0]||'';const h=(a[1]||'').trim();"
@@ -157,8 +159,9 @@ def build_env(root: Path, env: dict[str, str], previous: dict[str, str]) -> dict
         if not BUCKET_RE.fullmatch(env.get(key, "")):
             raise Failure(f"{key} is not a valid bucket name")
     hash_value = env.get("NODERED_ADMIN_PASSWORD_HASH", "")
-    if not HASH_RE.fullmatch(hash_value):
-        raise Failure("NODERED_ADMIN_PASSWORD_HASH is not a bcrypt hash")
+    dash_hash = env.get("NODERED_DASHBOARD_PASSWORD_HASH", "")
+    if not HASH_RE.fullmatch(hash_value) or not HASH_RE.fullmatch(dash_hash):
+        raise Failure("NODERED_ADMIN_PASSWORD_HASH or NODERED_DASHBOARD_PASSWORD_HASH is not a bcrypt hash")
     if not env.get("NODERED_CREDENTIAL_SECRET"):
         raise Failure("NODERED_CREDENTIAL_SECRET is empty")
     return {
@@ -168,7 +171,8 @@ def build_env(root: Path, env: dict[str, str], previous: dict[str, str]) -> dict
         "INFLUX_TOKEN": previous.get("INFLUX_TOKEN", ""),
         "INFLUX_RAW_BUCKET": env["INFLUXDB_RAW_BUCKET"], "INFLUX_HISTORY_BUCKET": env["INFLUXDB_HISTORY_BUCKET"],
         "SIGNALK_WS_URL": ws, "HOMEASSISTANT_URL": ha,
-        "NODERED_ADMIN_PASSWORD_HASH": hash_value, "NODERED_CREDENTIAL_SECRET": env["NODERED_CREDENTIAL_SECRET"],
+        "NODERED_ADMIN_PASSWORD_HASH": hash_value, "NODERED_DASHBOARD_PASSWORD_HASH": dash_hash,
+        "NODERED_CREDENTIAL_SECRET": env["NODERED_CREDENTIAL_SECRET"],
     }
 
 
@@ -237,19 +241,44 @@ def ensure_data_dir(data: Path) -> int:
         st = os.lstat(path)
     except FileNotFoundError:
         os.mkdir(path, 0o750)
-        os.chown(path, NODERED_UID, NODERED_GID)
-        st = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        os.fchown(fd, NODERED_UID, NODERED_GID)  # through the descriptor, never a path that could be swapped
+        return fd
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise Failure(f"{path} is not a plain directory")
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 
 
+def settings_dir_fd(root: Path) -> int:
+    """Open <root>/config/node-red (root:root 0755, created if absent); never through a symlink."""
+    cfd = config_dir_fd(root)
+    try:
+        try:
+            st = os.lstat("node-red", dir_fd=cfd)
+        except FileNotFoundError:
+            os.mkdir("node-red", 0o755, dir_fd=cfd)
+            st = os.lstat("node-red", dir_fd=cfd)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise Failure("config/node-red is not a plain directory")
+        fd = os.open("node-red", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=cfd)
+    finally:
+        os.close(cfd)
+    try:
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o755)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def seed_settings(dir_fd: int, template: Path) -> bool:
-    """settings.js is created only when absent: the owner's edits survive every installer run."""
+    """settings.js is created only when absent (root:root 0644): the owner's edits survive every installer run."""
     try:
         existing = os.lstat("settings.js", dir_fd=dir_fd)
-        if stat.S_ISLNK(existing.st_mode):
-            raise Failure("settings.js in the Node-RED data directory is a symbolic link")
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+            raise Failure("config/node-red/settings.js is not a regular file")
         return False
     except FileNotFoundError:
         pass
@@ -257,11 +286,21 @@ def seed_settings(dir_fd: int, template: Path) -> bool:
     fd = os.open("settings.js", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dir_fd)
     try:
         os.write(fd, body)
-        os.fchown(fd, NODERED_UID, NODERED_GID)
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
         os.fchmod(fd, 0o644)
     finally:
         os.close(fd)
     return True
+
+
+def legacy_settings_present(dir_fd: int) -> bool:
+    """A settings.js from the first Node-RED release sits in the data directory; it is no longer used."""
+    try:
+        os.lstat("settings.js", dir_fd=dir_fd)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def cmd_render(args) -> int:
@@ -273,12 +312,20 @@ def cmd_render(args) -> int:
         return 0
     dir_fd = ensure_data_dir(data)
     try:
-        created = seed_settings(dir_fd, Path(args.settings_template))
+        legacy = legacy_settings_present(dir_fd)
     finally:
         os.close(dir_fd)
+    sfd = settings_dir_fd(root)
+    try:
+        created = seed_settings(sfd, Path(args.settings_template))
+    finally:
+        os.close(sfd)
+    if legacy:
+        print(f"Node-RED: note: {data / 'node-red' / 'settings.js'} is no longer used; settings now live in "
+              f"{root / 'config' / 'node-red' / 'settings.js'} (root-owned). Move any custom edits there, then delete the old file")
     previous = read_env_file(root / "config" / "nodered.env")
     changed = write_env_file(root, build_env(root, env, previous))
-    print("Node-RED: " + ("seeded settings.js; " if created else "kept your settings.js; ")
+    print("Node-RED: " + ("seeded config/node-red/settings.js; " if created else "kept config/node-red/settings.js; ")
           + ("wrote nodered.env" if changed else "nodered.env unchanged"))
     return 0
 
@@ -343,14 +390,36 @@ def cmd_token(args) -> int:
     return EXIT_CHANGED if changed else 0
 
 
+def read_package_deps(data: Path) -> dict:
+    """Read package.json from the Node-RED data directory (owned by uid 1000, so untrusted by root):
+    through the directory descriptor, no symlinks, regular file only, never blocking on a FIFO, 1 MiB cap."""
+    try:
+        dir_fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return {}
+    try:
+        fd = os.open("package.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return {}
+            raw = os.read(fd, MAX_PACKAGE_JSON + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > MAX_PACKAGE_JSON:
+            return {}
+        package = json.loads(raw.decode("utf-8"))
+        deps = package.get("dependencies", {}) if isinstance(package, dict) else {}
+        return deps if isinstance(deps, dict) else {}
+    except (OSError, ValueError):
+        return {}
+    finally:
+        os.close(dir_fd)
+
+
 def cmd_palette(args) -> int:
     data = Path(args.data) / "node-red"
     image = find_image(args.compose and Path(args.compose))
-    try:
-        package = json.loads((data / "package.json").read_text())
-        deps = package.get("dependencies", {}) if isinstance(package, dict) else {}
-    except (OSError, ValueError):
-        deps = {}
+    deps = read_package_deps(data)
     missing = [p for p in PALETTE if p.rsplit("@", 1)[0] not in deps]
     if not missing:
         print("Node-RED: palette packages already installed")

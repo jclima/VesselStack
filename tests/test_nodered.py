@@ -24,6 +24,7 @@ from common import config_registry as registry  # noqa: E402
 from test_displays_mqtt_auth import FakeRunner  # noqa: E402
 
 HASH = "$2b$10$" + "a" * 53
+HASH2 = "$2b$10$" + "b" * 53
 COMPOSE = (ROOT / "templates" / "compose.yml").read_text()
 
 
@@ -50,10 +51,17 @@ class ComposeTests(unittest.TestCase):
         self.assertIn('user: "1000:1000"', block)
         self.assertIn("mem_limit: 384m", block)
         self.assertIn("restart: unless-stopped", block)
-        self.assertIn('"${NODERED_BIND_ADDRESS:-0.0.0.0}:${NODERED_PORT:-1880}:1880"', block)
+        self.assertIn('"${NODERED_BIND_ADDRESS:-127.0.0.1}:${NODERED_PORT:-1880}:1880"', block)
         self.assertIn('"host.docker.internal:host-gateway"', block)
         self.assertIn("${VESSELSTACK_DATA}/node-red:/data", block)
-        self.assertIn("required: false", block)  # a disabled install has no nodered.env
+        self.assertIn("required: true", block)  # compose refuses to start it unprepared
+        self.assertNotIn("required: false", block)
+        # Fail closed: root-owned settings mounted read-only and passed explicitly.
+        self.assertIn('command: ["--settings", "/vesselstack/settings.js"]', block)
+        self.assertIn("source: ${VESSELSTACK_ROOT}/config/node-red/settings.js", block)
+        self.assertIn("target: /vesselstack/settings.js", block)
+        self.assertIn("read_only: true", block)
+        self.assertIn("create_host_path: false", block)
         self.assertIn('cap_drop: ["ALL"]', block)
         self.assertNotIn("docker.sock", block)
         self.assertNotIn("privileged", block)
@@ -63,7 +71,7 @@ class ComposeTests(unittest.TestCase):
         env = ROOT / "vesselstack.example.env"
         base = ["docker", "compose", "--env-file", str(env), "-f", str(ROOT / "templates" / "compose.yml")]
         off = subprocess.run(base + ["config", "--services"], capture_output=True, text=True)
-        on = subprocess.run(base + ["--profile", "nodered", "config", "--services"], capture_output=True, text=True)
+        on = subprocess.run(base + ["--profile", "nodered", "config", "--no-env-resolution", "--services"], capture_output=True, text=True)
         if off.returncode != 0:
             self.skipTest("docker compose is not usable here: " + off.stderr[:80])
         self.assertNotIn("nodered", off.stdout.split())
@@ -78,8 +86,9 @@ class RegistryTests(unittest.TestCase):
         self.assertNotIn("nodered", registry.CORE_COMPONENTS)
         self.assertEqual(registry.DEFAULTS["NODERED_ENABLE"], "false")
         self.assertEqual(registry.DEFAULTS["NODERED_PORT"], "1880")
-        self.assertEqual(registry.DEFAULTS["NODERED_BIND_ADDRESS"], "")
-        for key in ("NODERED_ADMIN_PASSWORD", "NODERED_ADMIN_PASSWORD_HASH", "NODERED_CREDENTIAL_SECRET"):
+        self.assertEqual(registry.DEFAULTS["NODERED_BIND_ADDRESS"], "127.0.0.1")
+        for key in ("NODERED_ADMIN_PASSWORD", "NODERED_ADMIN_PASSWORD_HASH", "NODERED_DASHBOARD_PASSWORD",
+                    "NODERED_DASHBOARD_PASSWORD_HASH", "NODERED_CREDENTIAL_SECRET"):
             self.assertEqual(registry.SETTINGS[key].owner, "installer")
             self.assertEqual(registry.SETTINGS[key].component, "nodered")
 
@@ -95,11 +104,14 @@ class RegistryTests(unittest.TestCase):
         installer = (ROOT / "install.sh").read_text()
         example = (ROOT / "vesselstack.example.env").read_text()
         for key in ("NODERED_ENABLE", "NODERED_PORT", "NODERED_BIND_ADDRESS", "NODERED_ADMIN_PASSWORD",
-                    "NODERED_ADMIN_PASSWORD_HASH", "NODERED_CREDENTIAL_SECRET"):
+                    "NODERED_ADMIN_PASSWORD_HASH", "NODERED_DASHBOARD_PASSWORD", "NODERED_DASHBOARD_PASSWORD_HASH",
+                    "NODERED_CREDENTIAL_SECRET"):
             self.assertRegex(installer, rf"(?m)^{key}$")
             self.assertRegex(example, rf"(?m)^{key}=")
         self.assertIn('NODERED_ENABLE="false"', example)
-        self.assertIn(': "${NODERED_BIND_ADDRESS:=$VESSELSTACK_WEB_BIND_ADDRESS}"', installer)
+        self.assertIn(': "${NODERED_BIND_ADDRESS:=127.0.0.1}"', installer)
+        self.assertIn('NODERED_BIND_ADDRESS="127.0.0.1"', example)
+        self.assertIn("--https=$REMOTE_NODERED_SERVE_PORT", (ROOT / "scripts" / "vesselstackctl").read_text())
 
 
 class MqttAccountTests(unittest.TestCase):
@@ -140,10 +152,18 @@ class MqttAccountTests(unittest.TestCase):
         self.sync(NODERED_ENABLE="false")
         self.assertNotIn("nodered", (self.mdir / "acl").read_text())
 
-    def test_callers_that_do_not_know_the_setting_keep_the_account(self):
+    def test_callers_that_do_not_know_the_setting_read_it_from_vesselstack_env(self):
         self.sync(NODERED_ENABLE="true")
+        env_file = self.root / "config" / "vesselstack.env"
+        env_file.write_text("NODERED_ENABLE='true'\n")
         self.sync()  # e.g. an older vesselstackctl display command
         self.assertIn("user vesselstack-nodered", (self.mdir / "acl").read_text())
+        env_file.write_text("NODERED_ENABLE=false\n")
+        self.sync()  # the stored password alone no longer keeps the account
+        self.assertNotIn("user vesselstack-nodered", (self.mdir / "acl").read_text())
+        env_file.unlink()
+        self.sync()
+        self.assertNotIn("user vesselstack-nodered", (self.mdir / "acl").read_text())
 
     def test_invalid_setting_is_refused(self):
         with self.assertRaises(mqtt_auth.MqttAuthError):
@@ -173,7 +193,7 @@ class RenderTests(unittest.TestCase):
         nr.os.fchown = self._fchown
 
     def write_env(self, **values):
-        base = {"NODERED_ADMIN_PASSWORD_HASH": f"'{HASH}'", "NODERED_CREDENTIAL_SECRET": "s" * 64,
+        base = {"NODERED_ADMIN_PASSWORD_HASH": f"'{HASH}'", "NODERED_DASHBOARD_PASSWORD_HASH": f"'{HASH2}'", "NODERED_CREDENTIAL_SECRET": "s" * 64,
                 "INFLUXDB_ORG": "vesselstack", "INFLUXDB_RAW_BUCKET": "signalk", "INFLUXDB_HISTORY_BUCKET": "signalk_1m",
                 "SIGNALK_URL": "http://127.0.0.1:3000", "HOME_ASSISTANT_URL": "http://127.0.0.1:8123"}
         base.update(values)
@@ -196,13 +216,29 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(values["SIGNALK_WS_URL"], "ws://host.docker.internal:3000/signalk/v1/stream?subscribe=self")
         self.assertEqual(values["HOMEASSISTANT_URL"], "http://host.docker.internal:8123")
         self.assertEqual(values["NODERED_ADMIN_PASSWORD_HASH"], HASH)
+        self.assertEqual(values["NODERED_DASHBOARD_PASSWORD_HASH"], HASH2)
+        self.assertNotIn("NODERED_DASHBOARD_PASSWORD", values)
         self.assertNotIn("NODERED_ADMIN_PASSWORD", values)  # the plaintext never reaches the container
         self.assertEqual(values["INFLUX_TOKEN"], "")
-        settings = self.data / "node-red" / "settings.js"
+        settings = self.root / "config" / "node-red" / "settings.js"
         self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(settings.parent.stat().st_mode), 0o755)
+        self.assertFalse((self.data / "node-red" / "settings.js").exists())  # nothing in the container-writable dir
         settings.write_text("// owner edit\n")
         self.assertEqual(self.render(), 0)
         self.assertEqual(settings.read_text(), "// owner edit\n")
+
+    def test_legacy_data_dir_settings_is_left_alone_and_noted(self):
+        (self.data / "node-red").mkdir()
+        legacy = self.data / "node-red" / "settings.js"
+        legacy.write_text("// old\n")
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.render(), 0)
+        self.assertEqual(legacy.read_text(), "// old\n")
+        self.assertIn("is no longer used", out.getvalue())
+        self.assertTrue((self.root / "config" / "node-red" / "settings.js").exists())
 
     def test_external_signalk_host_is_kept(self):
         self.write_env(NODERED_ENABLE="true", SIGNALK_URL="http://192.0.2.5:3000/signalk")
@@ -222,16 +258,32 @@ class RenderTests(unittest.TestCase):
         self.write_env(NODERED_ENABLE="false")
         self.assertEqual(self.render(), 0)
         self.assertFalse((self.root / "config" / "nodered.env").exists())
-        self.assertTrue((self.data / "node-red" / "settings.js").exists())
+        self.assertTrue((self.root / "config" / "node-red" / "settings.js").exists())
 
     def test_refuses_symlinked_settings_and_bad_hash(self):
-        (self.data / "node-red").mkdir()
-        (self.data / "node-red" / "settings.js").symlink_to("/etc/passwd")
+        (self.root / "config" / "node-red").mkdir()
+        (self.root / "config" / "node-red" / "settings.js").symlink_to("/etc/passwd")
         self.assertEqual(self.render(), 1)
-        (self.data / "node-red" / "settings.js").unlink()
+        (self.root / "config" / "node-red" / "settings.js").unlink()
         self.write_env(NODERED_ENABLE="true", NODERED_ADMIN_PASSWORD_HASH="'plain'")
         self.assertEqual(self.render(), 1)
         self.assertFalse((self.root / "config" / "nodered.env").exists())
+
+    def test_package_json_is_read_safely(self):
+        data = self.data / "node-red"
+        data.mkdir()
+        pkg = data / "package.json"
+        pkg.write_text(json.dumps({"dependencies": {"a": "1"}}))
+        self.assertEqual(nr.read_package_deps(data), {"a": "1"})
+        pkg.unlink()
+        pkg.symlink_to("/etc/passwd")
+        self.assertEqual(nr.read_package_deps(data), {})
+        pkg.unlink()
+        pkg.write_text(" " * (nr.MAX_PACKAGE_JSON + 10) + "{}")
+        self.assertEqual(nr.read_package_deps(data), {})
+        pkg.unlink()
+        os.mkfifo(pkg)  # must not block
+        self.assertEqual(nr.read_package_deps(data), {})
 
     def test_values_that_cannot_be_quoted_are_refused(self):
         with self.assertRaises(nr.Failure):
@@ -241,6 +293,9 @@ class RenderTests(unittest.TestCase):
 class TemplateTests(unittest.TestCase):
     def test_settings_template_is_secure_by_default(self):
         text = (ROOT / "templates" / "node-red" / "settings.js").read_text()
+        self.assertIn("user: 'crew', pass: dashboardHash", text)
+        self.assertIn("delete process.env.NODERED_CREDENTIAL_SECRET", text)
+        self.assertIn("delete process.env.NODERED_ADMIN_PASSWORD_HASH", text)
         for needle in ("adminAuth", "httpNodeAuth", "process.env.NODERED_ADMIN_PASSWORD_HASH", "process.env.NODERED_CREDENTIAL_SECRET",
                        "functionExternalModules: false", "projects: { enabled: false }",
                        "telemetry: { enabled: false", "diagnostics: { enabled: false", "allowInstall: true"):
@@ -253,8 +308,9 @@ class TemplateTests(unittest.TestCase):
         script = ROOT / "templates" / "node-red" / "settings.js"
         run = lambda env: subprocess.run(["node", "-e", f"console.log(Object.keys(require({json.dumps(str(script))})).length)"],
                                          env={**os.environ, **env}, capture_output=True, text=True)
-        self.assertNotEqual(run({"NODERED_ADMIN_PASSWORD_HASH": "", "NODERED_CREDENTIAL_SECRET": ""}).returncode, 0)
-        self.assertEqual(run({"NODERED_ADMIN_PASSWORD_HASH": HASH, "NODERED_CREDENTIAL_SECRET": "x"}).returncode, 0)
+        self.assertNotEqual(run({"NODERED_ADMIN_PASSWORD_HASH": "", "NODERED_DASHBOARD_PASSWORD_HASH": "", "NODERED_CREDENTIAL_SECRET": ""}).returncode, 0)
+        self.assertNotEqual(run({"NODERED_ADMIN_PASSWORD_HASH": HASH, "NODERED_DASHBOARD_PASSWORD_HASH": "", "NODERED_CREDENTIAL_SECRET": "x"}).returncode, 0)
+        self.assertEqual(run({"NODERED_ADMIN_PASSWORD_HASH": HASH, "NODERED_DASHBOARD_PASSWORD_HASH": HASH2, "NODERED_CREDENTIAL_SECRET": "x"}).returncode, 0)
 
     def test_example_flows_use_environment_variables_only(self):
         text = (ROOT / "templates" / "node-red" / "vesselstack-example-flows.json").read_text()

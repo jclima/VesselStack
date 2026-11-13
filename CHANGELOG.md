@@ -12,6 +12,15 @@ Semantic Versioning.
   drop on the untrusted interface and backup coverage. Operational impact: one more container (384 MB limit); the editor
   can run code, so keep it on a trusted LAN or Tailscale. Rollback: `NODERED_ENABLE=false` and rerun the installer
   (data in `${VESSELSTACK_DATA}/node-red` is kept).
+- Harden Node-RED: `settings.js` is now root-owned at `config/node-red/settings.js`, mounted read-only and passed with
+  `--settings`, so a missing file stops the container instead of starting unauthenticated defaults (an old
+  `${VESSELSTACK_DATA}/node-red/settings.js` is kept but unused); it starts only when enabled, `nodered.env` is non-empty
+  and `settings.js` exists; `NODERED_BIND_ADDRESS` now defaults to `127.0.0.1` and no longer follows the dashboards; a
+  separate generated dashboard passphrase (`NODERED_DASHBOARD_PASSWORD`, user `crew`) and a 16-character minimum for
+  owner-set passphrases; `remote enable|disable|status` also manage a tailnet-only Node-RED handler on 1880; the firewall
+  always drops the Node-RED port and is restarted on install; `doctor` requires 401 from `/flows`. Known limitation:
+  the Dashboard 2.0 socket.io endpoint is not covered by `httpNodeAuth`; keep the default bind. Rollback: set
+  `NODERED_BIND_ADDRESS` explicitly to restore the previous exposure.
 - Add optional Tailscale remote access, off by default (`REMOTE_ACCESS=off|tailscale`, `REMOTE_PANEL_SERVE=true`):
   `sudo vesselstackctl remote enable [--dry-run] [--auth-key-stdin] | status [--json] | disable [--purge]`
   installs Tailscale from Tailscale's signed apt repository (internet needed; not in the offline bundle), joins the

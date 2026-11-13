@@ -1534,22 +1534,40 @@ are not available here; rebuild such flows with the MQTT, Signal K and Home Assi
 **Enable.** Set `NODERED_ENABLE=true` (Control Panel Settings or `vesselstack.env`) and rerun the
 installer or choose **Reinstall & start**. The pinned `nodered/node-red:5.0.9-debian` image
 (uid 1000, 384 MB memory limit, about 150 to 250 MB of RAM in use) listens on `NODERED_PORT`
-(default `1880`) on `NODERED_BIND_ADDRESS`, which follows `VESSELSTACK_WEB_BIND_ADDRESS`
-(`sudo vesselstackctl lan` updates both). Open `http://HOST:1880` and sign in as `admin`. Retrieve
-the generated passphrase with `sudo grep '^NODERED_ADMIN_PASSWORD=' /opt/vesselstack/config/vesselstack.env`
-(adjust the root path if you changed it). To rotate it, edit `NODERED_ADMIN_PASSWORD` and rerun the
-installer; only the bcrypt hash reaches `settings.js`.
+(default `1880`) on `NODERED_BIND_ADDRESS`, which defaults to `127.0.0.1` and no longer follows
+`VESSELSTACK_WEB_BIND_ADDRESS` (`sudo vesselstackctl lan` does not change it). `127.0.0.1` = only this
+computer (recommended; reach it with an SSH tunnel, `ssh -L 1880:127.0.0.1:1880 user@boat`, or Tailscale);
+`0.0.0.0` = the whole boat network over plain HTTP, protected by the passwords only. There are two separate
+generated passphrases: the **editor** (`http://HOST:1880`, user `admin`, `NODERED_ADMIN_PASSWORD`) and the
+**dashboards** (`/dashboard`, user `crew`, `NODERED_DASHBOARD_PASSWORD`). Retrieve them with
+`sudo grep '^NODERED_.*_PASSWORD=' /opt/vesselstack/config/vesselstack.env` (adjust the root path if you changed it).
+To rotate one, edit it and rerun the installer; only the bcrypt hash reaches the container. If you set your own,
+each must be at least 16 characters and the two must differ (the installer refuses otherwise). The plaintext
+passphrases live in `vesselstack.env` and therefore in backups, like the other generated secrets.
 
-**What is pre-configured.** `settings.js` is written once, only if absent (your edits are kept) with
-`adminAuth`, `httpNodeAuth`, an encrypted credential store (`NODERED_CREDENTIAL_SECRET`), projects
-off, `functionExternalModules` off and telemetry off. Connection values arrive as environment
-variables from the root-only `config/nodered.env` (mode 0600): `MQTT_HOST`/`MQTT_PORT`/`MQTT_USERNAME`/`MQTT_PASSWORD`
-for the dedicated Mosquitto account `vesselstack-nodered` (read `vesselstack/#`, read-write
-`vesselstack/nodered/#`; see [MQTT access control](docs/MQTT.md)), and a read-only InfluxDB token limited
-to the raw and history buckets. Read them in a flow with `env.get("NAME")`. No Home Assistant token is
-preconfigured. The palette packages `node-red-contrib-home-assistant-websocket@0.83.0` and
-`@flowfuse/node-red-dashboard@1.36.1` are preinstalled with `--ignore-scripts` when the Pi is online
-(skipped with a warning offline); installing other palette packages runs third-party code on the Pi.
+**Fail closed.** `settings.js` is seeded once, only if absent, to the root-owned
+`config/node-red/settings.js` (mode 0644, `root:root`, directory 0755) and bind-mounted read-only at
+`/vesselstack/settings.js`; Node-RED is started with `--settings /vesselstack/settings.js`. Code running inside
+the container cannot rewrite the sign-in, and if the file is missing the container refuses to start instead of
+booting Node-RED's unauthenticated defaults. Edit it as root (the installer never overwrites it). A `settings.js`
+left in `${VESSELSTACK_DATA}/node-red` by the first release is kept but no longer used; the installer prints a
+note, so move any custom edits to the new file and delete the old one. Node-RED is started (installer,
+`vesselstackctl start|restart`, the Control Panel) only when `NODERED_ENABLE=true`, `config/nodered.env` exists
+and is not empty, and the root-owned `settings.js` exists; otherwise it is skipped with a message, and the
+compose `env_file` is required.
+
+**What is pre-configured.** `settings.js` sets `adminAuth` (editor), `httpNodeAuth` (dashboards), an encrypted
+credential store (`NODERED_CREDENTIAL_SECRET`), projects off, `functionExternalModules` off and telemetry off.
+Connection values arrive as environment variables from the root-only `config/nodered.env` (mode 0600):
+`MQTT_HOST`/`MQTT_PORT`/`MQTT_USER`/`MQTT_PASSWORD` for the dedicated Mosquitto account `vesselstack-nodered`
+(read `vesselstack/#`, read-write `vesselstack/nodered/#`; see [MQTT access control](docs/MQTT.md)), and a read-only
+InfluxDB token limited to the raw and history buckets. Read them in a flow with `env.get("NAME")`. The two
+bcrypt hashes and the credential secret are in the same file; `settings.js` reads them through `process.env` and
+then deletes them from `process.env`, so flows, the Exec node and palette nodes cannot read them. No Home
+Assistant token is preconfigured. The palette packages `node-red-contrib-home-assistant-websocket@0.83.0` and
+`@flowfuse/node-red-dashboard@1.36.1` are preinstalled with `--ignore-scripts` when the Pi is online (skipped with
+a warning offline); their own dependencies are not pinned, and installing other palette packages runs third-party
+code on the Pi.
 
 **Example flows.** Import `templates/node-red/vesselstack-example-flows.json` through the editor menu
 (Import, Clipboard or file). It is never deployed automatically.
@@ -1559,21 +1577,45 @@ Home Assistant server node (`http://host.docker.internal:8123`). **Signal K.** U
 `ws://host.docker.internal:3000/signalk/v1/stream`; if Signal K security is on, create a read-only device token
 and supply it in the node.
 
-**Security.** The editor can run arbitrary code as the container user and publish to MQTT: treat the sign-in
-as administrator access to the Pi's data. Expose it only on a trusted LAN or Tailscale. With the firewall
-enabled in its default mode, `NODERED_PORT` is dropped on the untrusted interface. Use `local` to bind it to
-loopback only.
+**Tailscale.** With `NODERED_ENABLE=true`, `sudo vesselstackctl remote enable` also runs
+`tailscale serve --bg --https=1880 http://127.0.0.1:${NODERED_PORT}` (tailnet only; the sign-in is still required)
+and `remote status` shows the Node-RED tailnet URL. `remote disable` turns off only that handler
+(`tailscale serve --https=1880 off`) after the Control Panel one, following the ordering in
+[Remote access with Tailscale](#remote-access-with-tailscale). Keep the default `127.0.0.1` bind when using it.
 
-**Operational impact.** One more container, a data directory `${VESSELSTACK_DATA}/node-red` and
-`config/nodered.env`, both included in backups. `sudo vesselstackctl doctor` adds a WARN-only Node-RED
-check. A homepage tile appears when enabled.
+**Security.** The editor can run arbitrary code as the container user and publish to MQTT: treat the sign-in
+as administrator access to the Pi's data. Recommended: keep `NODERED_BIND_ADDRESS=127.0.0.1` and reach it
+through Tailscale or an SSH tunnel. Limits to know about:
+
+- The firewall always drops `NODERED_PORT` and container port 1880 on the untrusted interface (default mode), whether or not
+  Node-RED is enabled; the installer restarts the firewall unit so rule changes apply.
+- Values in `nodered.env` (MQTT password, InfluxDB token, hashes, credential secret) are visible with
+  `docker inspect` to anyone in the `docker` group (equivalent to root), and the MQTT/InfluxDB values are
+  readable by flows and palette nodes through the environment.
+- `host.docker.internal` lets flows reach listeners on the host (Signal K, Home Assistant, SSH): turn on Signal K
+  security so a flow cannot read or write it unauthenticated.
+- Node-RED shares the default compose network with Mosquitto, InfluxDB, Prometheus and the other containers.
+- Dashboard 2.0 socket.io: the pinned `@flowfuse/node-red-dashboard@1.36.1` serves
+  `/dashboard/socket.io/` without applying `httpNodeAuth` (an unauthenticated polling request answered HTTP 200
+  in a test with the rendered settings). The dashboard page and the editor API return 401, but live widget data
+  can be reachable without a password by anyone who can reach the port. This is a known limitation; the default
+  `127.0.0.1` bind (plus Tailscale or an SSH tunnel) is the mitigation, so do not publish the port on `0.0.0.0`
+  with sensitive dashboards.
+
+**Operational impact.** One more container, a data directory `${VESSELSTACK_DATA}/node-red`,
+`config/nodered.env` and `config/node-red/settings.js`, all included in backups. `sudo vesselstackctl doctor`
+adds a WARN-only Node-RED check. A homepage tile appears when enabled.
 
 **Verify.** `sudo docker ps --filter name=vesselstack-nodered`, then
-`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:1880/` should print `200` or `401`; the editor must ask for a sign-in.
+`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:1880/flows` must print `401` (and, once a dashboard
+is deployed, `.../dashboard/` must also print `401`); anything else means the editor is not protected. `sudo
+vesselstackctl doctor` runs the same probes and WARNs otherwise.
 
 **Roll back.** Set `NODERED_ENABLE=false` and rerun the installer: the container, the MQTT account, the
-InfluxDB token and `nodered.env` are removed. `${VESSELSTACK_DATA}/node-red` and the generated secrets are kept so
-re-enabling restores your flows; delete the directory yourself to discard them.
+InfluxDB token (revoked; the installer warns if InfluxDB is unreachable) and `nodered.env` are removed.
+`${VESSELSTACK_DATA}/node-red`, `config/node-red/settings.js` and the generated secrets are kept so re-enabling
+restores your flows; delete them yourself to discard them. To go back to the previous behavior of following the
+dashboards' address, set `NODERED_BIND_ADDRESS` explicitly.
 
 ## MQTT access control
 
@@ -1613,6 +1655,7 @@ and the Control Panel settings only record the choice.
    `CONTROL_PANEL_ALLOWED_HOSTS` in `config/control-panel.env` (kept across reinstalls and updates), and
    restarts the panel. The panel itself stays bound to `127.0.0.1`. The exact name added is recorded in
    `/var/lib/vesselstack/tailscale-panel-host`, so `disable` removes only that entry.
+   When `NODERED_ENABLE=true` it also publishes Node-RED with `tailscale serve --bg --https=1880 http://127.0.0.1:${NODERED_PORT}`.
    `tailscale serve` must pass the original `Host` header to the panel (it does by design). The panel compares
    `Host` and `Origin` strictly and does not trust `X-Forwarded-Host`; if a future Tailscale version rewrote
    `Host`, writes from the tailnet would fail with `403` (fail safe, nothing is weakened) until fixed.
@@ -1642,7 +1685,7 @@ command is interrupted, and is never placed on a command line, in an environment
   everything listening on a non-loopback address is reachable over the tailnet, not only the panel:
   SSH (port 22); the services bound to all interfaces (`0.0.0.0`: Grafana, the home page, Boat Chat, Home
   Assistant and Signal K in the default `dashboards` preset); the data services (InfluxDB, Prometheus, MQTT)
-  when `VESSELSTACK_DATA_BIND_ADDRESS=0.0.0.0`; the Node-RED editor when its bind address is `0.0.0.0`; and the
+  when `VESSELSTACK_DATA_BIND_ADDRESS=0.0.0.0`; the Node-RED editor when its own `NODERED_BIND_ADDRESS` is `0.0.0.0` (default `127.0.0.1`); and the
   Control Panel itself in `panel-access lan` mode (then it is reachable on its normal port too). The firewall
   rules match only the untrusted interface and do not mention `tailscale0`. Limit who can reach the boat with
   [Tailscale ACLs](https://tailscale.com/kb/1018/acls) (or use `lan local`). Example policy that lets only
@@ -1680,7 +1723,7 @@ serving the panel (never a `FAIL`). `sudo ss -ltn` still shows the panel only on
 **Roll back.** `sudo vesselstackctl remote disable`, in this order: removes the recorded tailnet name from
 `CONTROL_PANEL_ALLOWED_HOSTS` (your own entries stay; if the record is missing it warns and removes
 `*.ts.net:8780` entries), sets `REMOTE_ACCESS=off`, restarts the panel, runs `tailscale serve --https=8780 off`
-(only VesselStack's handler, never `serve reset`), and last runs `tailscale down` **only when VesselStack
+(only VesselStack's handlers, never `serve reset`; plus `tailscale serve --https=1880 off` for Node-RED when it is enabled or still published), and last runs `tailscale down` **only when VesselStack
 installed Tailscale** (the marker file exists), after warning that an SSH session over the tailnet will drop.
 If you installed Tailscale yourself, it is left connected and its other settings, serve rules and
 login are untouched; only the panel handler and VesselStack's own allowlist entry go. Add `--purge` to also log

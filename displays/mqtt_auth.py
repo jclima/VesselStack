@@ -519,6 +519,28 @@ def ensure_image(image: str, runner=default_runner) -> None:
             " No MQTT access files were changed")
 
 
+def _stack_env_value(root: Path, key: str) -> str | None:
+    """Read one KEY from <root>/config/vesselstack.env (no symlinks, regular file only); None when absent."""
+    try:
+        cfd = os.open(root / "config", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        raw = _read_regular("vesselstack.env", cfd)
+    except (OSError, MqttAuthError):
+        return None
+    finally:
+        os.close(cfd)
+    value = None
+    for line in (raw or b"").decode("utf-8", "replace").splitlines():
+        match = re.fullmatch(r"\s*(?:export\s+)?" + re.escape(key) + r"=(.*)", line)
+        if match:
+            value = match.group(1).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+    return value
+
+
 def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | None = None,
          image: str | None = None, runner=default_runner,
          dir_owner=DIR_OWNER, file_owner=FILE_OWNER, container: str = CONTAINER,
@@ -545,8 +567,12 @@ def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | N
     nodered_text = env.get("NODERED_ENABLE")
     if nodered_text not in (None, "true", "false"):
         raise MqttAuthError("NODERED_ENABLE must be true or false")
-    if nodered_text is None:  # a caller that does not know the setting must not drop the account
-        nodered = bool((load_secrets(secret_path).get("nodered") or {}).get("mqtt_password"))
+    if nodered_text is None:  # a caller that does not know the setting reads it from the stack's env file
+        nodered_text = _stack_env_value(root, "NODERED_ENABLE")
+        if nodered_text not in (None, "true", "false"):
+            raise MqttAuthError("NODERED_ENABLE must be true or false")
+    if nodered_text is None:
+        nodered = False
     else:
         nodered = nodered_text == "true"
     secret_data = ensure_secrets(secret_path, display_ids, enabled, nodered) if (enabled or nodered) else \

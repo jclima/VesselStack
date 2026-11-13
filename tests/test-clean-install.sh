@@ -1620,13 +1620,23 @@ grep -q "^SIGNALK_WS_URL='ws://host.docker.internal:3000/signalk/v1/stream?subsc
 grep -qF "NODERED_ADMIN_PASSWORD_HASH='\$2b\$10\$" "$NR_ENV"
 grep -q "^NODERED_CREDENTIAL_SECRET='[0-9a-f]\{64\}'$" "$NR_ENV"
 grep -qx 'NODERED_ENABLE=true' "$APP5/config/vesselstack.env"
-grep -qx 'NODERED_BIND_ADDRESS=127.0.0.1' "$APP5/config/vesselstack.env"   # follows the dashboards by default
+grep -qx 'NODERED_BIND_ADDRESS=127.0.0.1' "$APP5/config/vesselstack.env"   # local-only by default, independent of the dashboards
 NR_PASS=$(sed -n 's/^NODERED_ADMIN_PASSWORD=//p' "$APP5/config/vesselstack.env")
 test "${#NR_PASS}" = 32
 NR_SECRET=$(sed -n 's/^NODERED_CREDENTIAL_SECRET=//p' "$APP5/config/vesselstack.env")
 # The passphrase is stored only in the root-only configuration: not in the output, a log, a command line or the data tree.
 if grep -qF -- "$NR_PASS" <<<"$nr_output"; then echo 'the installer printed the Node-RED passphrase' >&2; exit 1; fi
-grep -q "grep '^NODERED_ADMIN_PASSWORD='" <<<"$nr_output"
+grep -q "grep '^NODERED_.\*_PASSWORD='" <<<"$nr_output"
+# A separate dashboard passphrase (user crew), generated, different from the editor's, hash only in nodered.env.
+NR_DASH=$(sed -n 's/^NODERED_DASHBOARD_PASSWORD=//p' "$APP5/config/vesselstack.env")
+[[ "$NR_DASH" =~ ^[0-9a-f]{32}$ ]]
+[ "$NR_DASH" != "$NR_PASS" ]
+grep -qF "NODERED_DASHBOARD_PASSWORD_HASH='\$2b\$10\$" "$NR_ENV"
+if grep -qF -- "$NR_DASH" "$NR_ENV" "$FAKE_BIN/docker.log"; then echo 'the Node-RED dashboard passphrase leaked' >&2; exit 1; fi
+# The firewall is restarted (not just started) so rule changes apply on every install.
+# (the fake host has no iptables, so this is checked on the installer itself)
+grep -q '^        systemctl restart vesselstack-firewall.service$' "$DP_REL/install.sh"
+if grep -q 'enable --now vesselstack-firewall' "$DP_REL/install.sh"; then echo 'the firewall unit is only started, never restarted' >&2; exit 1; fi
 if grep -qF -- "$NR_PASS" "$FAKE_BIN/docker.log" "$FAKE_BIN/systemctl.log" "$TEST_ROOT/runuser.log"; then echo 'the Node-RED passphrase reached a command line' >&2; exit 1; fi
 if grep -rqF -- "$NR_PASS" "$DATA5"; then echo 'the Node-RED passphrase is in the data tree' >&2; exit 1; fi
 if grep -qF -- "$NR_PASS" "$NR_ENV"; then echo 'nodered.env holds the plaintext passphrase' >&2; exit 1; fi
@@ -1635,10 +1645,27 @@ grep -q -- 'npm_config_cache' "$FAKE_BIN/docker.log"
 grep -q -- 'node-red-contrib-home-assistant-websocket@0.83.0' "$FAKE_BIN/docker.log"
 grep -q -- '@flowfuse/node-red-dashboard@1.36.1' "$FAKE_BIN/docker.log"
 grep -q -- '--ignore-scripts' "$FAKE_BIN/docker.log"
-# settings.js: seeded once, owned by the container user, never overwritten.
-NR_SETTINGS="$DATA5/node-red/settings.js"
+# settings.js: root-owned outside the container-writable data directory, seeded once, never overwritten.
+NR_SETTINGS="$APP5/config/node-red/settings.js"
 test -f "$NR_SETTINGS"
-test "$(stat -c '%u:%g' "$DATA5/node-red" "$NR_SETTINGS" | sort -u)" = '1000:1000'
+test ! -e "$DATA5/node-red/settings.js"
+test "$(stat -c '%u:%g %a' "$NR_SETTINGS")" = '0:0 644'
+test "$(stat -c '%u:%g %a' "$APP5/config/node-red")" = '0:0 755'
+test "$(stat -c '%u:%g' "$DATA5/node-red")" = '1000:1000'
+# The installed compose file mounts it read-only and starts Node-RED with it explicitly (fail closed).
+grep -q 'command: \["--settings", "/vesselstack/settings.js"\]' "$APP5/compose.yml"
+# shellcheck disable=SC2016  # literal compose text
+grep -q 'source: ${VESSELSTACK_ROOT}/config/node-red/settings.js' "$APP5/compose.yml"
+grep -q 'read_only: true' "$APP5/compose.yml"
+# A short owner-set passphrase is refused before anything changes; a long, different pair is accepted elsewhere.
+{ grep -vE '^NODERED_ADMIN_PASSWORD=' "$NRCONFIG"; printf 'NODERED_ADMIN_PASSWORD=short\n'; } > "$TEST_ROOT/nodered.bad.env"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+    echo 'a short Node-RED passphrase was accepted' >&2; exit 1
+fi
+{ grep -vE '^NODERED_DASHBOARD_PASSWORD=' "$NRCONFIG"; printf 'NODERED_DASHBOARD_PASSWORD=short\n'; } > "$TEST_ROOT/nodered.bad.env"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+    echo 'a short Node-RED dashboard passphrase was accepted' >&2; exit 1
+fi
 printf '// my own edit\n' >> "$NR_SETTINGS"
 # MQTT: a dedicated account with its own prefix and read access to vesselstack/#.
 grep -qx 'user vesselstack-nodered' "$APP5/config/mosquitto-auth/acl"
@@ -1650,13 +1677,19 @@ nr_output=$(nr_install)
 test "$(sed -n 's/^NODERED_ADMIN_PASSWORD=//p' "$APP5/config/vesselstack.env")" = "$NR_PASS"
 test "$(sed -n 's/^NODERED_CREDENTIAL_SECRET=//p' "$APP5/config/vesselstack.env")" = "$NR_SECRET"
 grep -qx '// my own edit' "$NR_SETTINGS"
-grep -q 'Node-RED: kept your settings.js' <<<"$nr_output" || true
-# A symlinked settings.js or data directory is refused.
+grep -q 'Node-RED: kept config/node-red/settings.js' <<<"$nr_output" || true
+# A symlinked settings.js is refused.
 rm -f "$NR_SETTINGS"; ln -s /etc/passwd "$NR_SETTINGS"
 if nr_install >/dev/null 2>&1; then echo 'a symlinked settings.js was accepted' >&2; exit 1; fi
 rm -f "$NR_SETTINGS"
 nr_install >/dev/null
 grep -q 'NODERED_ADMIN_PASSWORD_HASH' "$NR_SETTINGS" && grep -q 'functionExternalModules: false' "$NR_SETTINGS"
+# A settings.js left in the data directory by the first Node-RED release is kept, unused, with a note.
+printf '// legacy\n' > "$DATA5/node-red/settings.js"
+nr_output=$(nr_install)
+grep -q 'is no longer used' <<<"$nr_output"
+grep -qx '// legacy' "$DATA5/node-red/settings.js"
+rm -f "$DATA5/node-red/settings.js"
 # Disabled again: container removed, environment file and MQTT account gone, data and settings.js kept.
 sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="false"/' "$NRCONFIG"
 nr_install >/dev/null

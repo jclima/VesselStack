@@ -490,7 +490,7 @@ def build_tiles(env: dict[str, str], hostname: str) -> list[Tile]:
 
     if env.get("NODERED_ENABLE", "false") == "true":
         link("Node-RED", "Data", "Flow editor (sign-in required)", port_of(env.get("NODERED_PORT"), 1880),
-             env.get("NODERED_BIND_ADDRESS") or web_bind,
+             env.get("NODERED_BIND_ADDRESS") or "127.0.0.1",
              tunnel="Limited to this device; reach it with an SSH tunnel to the Node-RED port")
 
     if "grafana" not in disabled:

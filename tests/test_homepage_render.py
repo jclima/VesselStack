@@ -95,10 +95,13 @@ class TilesTests(unittest.TestCase):
         self.assertNotIn("InfluxDB", services)
         self.assertNotIn("Prometheus", services)
 
-    def test_nodered_tile_only_when_enabled_and_follows_its_bind_address(self):
+    def test_nodered_tile_only_when_enabled_and_follows_its_own_bind_address(self):
         _, services = self.tiles()
         self.assertNotIn("Node-RED", services)
-        _, services = self.tiles(vs={"NODERED_ENABLE": "true", "NODERED_PORT": "1881"})
+        _, services = self.tiles(vs={"NODERED_ENABLE": "true", "NODERED_PORT": "1881"})  # local-only by default
+        tile = services.split('- "Node-RED":')[1].split("- \"")[0]
+        self.assertNotIn("href", tile)
+        _, services = self.tiles(vs={"NODERED_ENABLE": "true", "NODERED_PORT": "1881", "NODERED_BIND_ADDRESS": "0.0.0.0"})
         tile = services.split('- "Node-RED":')[1].split("- \"")[0]
         self.assertIn('href: "http://boat.local:1881"', tile)
         self.assertIn("sign-in required", tile.lower())

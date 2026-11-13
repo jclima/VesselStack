@@ -180,12 +180,14 @@ if [ "$BOAT_UNITS" = nautical ]; then
     BOAT_UNITS=metric
 fi
 : "${NODE_EXPORTER_ENABLE:=false}"
-# Optional Node-RED (README "Node-RED (optional)"). The bind address follows the dashboards' by default.
+# Optional Node-RED (README "Node-RED (optional)"). Local-only by default: it does not follow the dashboards' address.
 : "${NODERED_ENABLE:=false}"
 : "${NODERED_PORT:=1880}"
-: "${NODERED_BIND_ADDRESS:=$VESSELSTACK_WEB_BIND_ADDRESS}"
+: "${NODERED_BIND_ADDRESS:=127.0.0.1}"
 : "${NODERED_ADMIN_PASSWORD:=}"
 : "${NODERED_ADMIN_PASSWORD_HASH:=}"
+: "${NODERED_DASHBOARD_PASSWORD:=}"
+: "${NODERED_DASHBOARD_PASSWORD_HASH:=}"
 : "${NODERED_CREDENTIAL_SECRET:=}"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
@@ -520,7 +522,7 @@ compose_template() {
         docker compose "${COMPOSE_PROFILES[@]}" --env-file "$CONFIG_FILE" \
         -f "$SCRIPT_DIR/templates/compose.yml" "$@"
 }
-compose_template config --quiet 2>/dev/null || {
+compose_template config --no-env-resolution --quiet 2>/dev/null || {
     echo "Compose template validation failed for this configuration:" >&2
     compose_template config --quiet >&2 || true
     exit 1
@@ -556,7 +558,7 @@ if [ "$OFFLINE" = true ]; then
         exit 1
     }
     mapfile -t required_images < <(
-        compose_template config --images | sort -u
+        compose_template config --no-env-resolution --images | sort -u
     )
     missing_images=()
     for image in "${required_images[@]}"; do
@@ -635,6 +637,8 @@ NODERED_PORT
 NODERED_BIND_ADDRESS
 NODERED_ADMIN_PASSWORD
 NODERED_ADMIN_PASSWORD_HASH
+NODERED_DASHBOARD_PASSWORD
+NODERED_DASHBOARD_PASSWORD_HASH
 NODERED_CREDENTIAL_SECRET
 DISPLAYS_ENABLE
 DISPLAYS_BRIDGE_MQTT_USERNAME
@@ -729,7 +733,7 @@ env_line() {
 config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
-        NODERED_ADMIN_PASSWORD|NODERED_ADMIN_PASSWORD_HASH|NODERED_CREDENTIAL_SECRET|\
+        NODERED_ADMIN_PASSWORD|NODERED_ADMIN_PASSWORD_HASH|NODERED_DASHBOARD_PASSWORD|NODERED_DASHBOARD_PASSWORD_HASH|NODERED_CREDENTIAL_SECRET|\
         BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN|\
         CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH|ALERT_HEARTBEAT_URL) return 0 ;;
     esac
@@ -1002,6 +1006,8 @@ preserve_secret GRAFANA_ADMIN_PASSWORD
 preserve_secret MQTT_PASSWORD
 preserve_secret NODERED_ADMIN_PASSWORD
 preserve_secret NODERED_ADMIN_PASSWORD_HASH
+preserve_secret NODERED_DASHBOARD_PASSWORD
+preserve_secret NODERED_DASHBOARD_PASSWORD_HASH
 preserve_secret NODERED_CREDENTIAL_SECRET
 preserve_secret BOAT_CHAT_SETTINGS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
 preserve_secret BOAT_CHAT_ACCESS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
@@ -1020,14 +1026,33 @@ MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
 # passphrase is: edit NODERED_ADMIN_PASSWORD, rerun the installer.
 [ "$NODERED_ADMIN_PASSWORD" != GENERATE ] || NODERED_ADMIN_PASSWORD=
 [ "$NODERED_ADMIN_PASSWORD_HASH" != GENERATE ] || NODERED_ADMIN_PASSWORD_HASH=
+[ "$NODERED_DASHBOARD_PASSWORD" != GENERATE ] || NODERED_DASHBOARD_PASSWORD=
+[ "$NODERED_DASHBOARD_PASSWORD_HASH" != GENERATE ] || NODERED_DASHBOARD_PASSWORD_HASH=
 [ "$NODERED_CREDENTIAL_SECRET" != GENERATE ] || NODERED_CREDENTIAL_SECRET=
 if [ "$NODERED_ENABLE" = true ]; then
     [ -n "$NODERED_ADMIN_PASSWORD" ] || [ -n "$NODERED_ADMIN_PASSWORD_HASH" ] || NODERED_ADMIN_PASSWORD=$(openssl rand -hex 16)
+    [ -n "$NODERED_DASHBOARD_PASSWORD" ] || [ -n "$NODERED_DASHBOARD_PASSWORD_HASH" ] || NODERED_DASHBOARD_PASSWORD=$(openssl rand -hex 16)
     [ -n "$NODERED_CREDENTIAL_SECRET" ] || NODERED_CREDENTIAL_SECRET=$(openssl rand -hex 32)
 fi
-if [ -n "$NODERED_ADMIN_PASSWORD_HASH" ] && ! [[ "$NODERED_ADMIN_PASSWORD_HASH" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]]; then
-    echo "NODERED_ADMIN_PASSWORD_HASH is not a bcrypt hash (its value is not shown); remove it to have one generated" >&2
-    exit 1
+for nodered_hash_key in NODERED_ADMIN_PASSWORD_HASH NODERED_DASHBOARD_PASSWORD_HASH; do
+    if [ -n "${!nodered_hash_key}" ] && ! [[ "${!nodered_hash_key}" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]]; then
+        echo "$nodered_hash_key is not a bcrypt hash (its value is not shown); remove it to have one generated" >&2
+        exit 1
+    fi
+done
+if [ "$NODERED_ENABLE" = true ]; then
+    # An owner-set passphrase protects code execution on the boat computer: at least 16 characters, and the
+    # editor and dashboard passphrases must differ (values are never printed).
+    for nodered_pw_key in NODERED_ADMIN_PASSWORD NODERED_DASHBOARD_PASSWORD; do
+        if [ -n "${!nodered_pw_key}" ] && [ "$(printf %s "${!nodered_pw_key}" | wc -m)" -lt 16 ]; then
+            echo "$nodered_pw_key must be at least 16 characters (leave it as GENERATE to have one generated)" >&2
+            exit 1
+        fi
+    done
+    if [ -n "$NODERED_ADMIN_PASSWORD" ] && [ "$NODERED_ADMIN_PASSWORD" = "$NODERED_DASHBOARD_PASSWORD" ]; then
+        echo "NODERED_ADMIN_PASSWORD and NODERED_DASHBOARD_PASSWORD must be different" >&2
+        exit 1
+    fi
 fi
 
 # Secrets are resolved (preserved or generated) before the preflight so the
@@ -1089,14 +1114,23 @@ fi
 # Node-RED sign-in: bcrypt runs inside the pinned Node-RED image (the passphrase goes in on stdin,
 # never on a command line). A hash that still matches the passphrase is kept, so a re-run does not
 # change it; editing NODERED_ADMIN_PASSWORD and rerunning the installer rotates the passphrase.
-if [ "$NODERED_ENABLE" = true ] && [ -n "$NODERED_ADMIN_PASSWORD" ]; then
+if [ "$NODERED_ENABLE" = true ]; then
     nodered_hash_args=(hash --compose "$SCRIPT_DIR/templates/compose.yml")
     [ "$OFFLINE" != true ] || nodered_hash_args+=(--offline)
-    NODERED_ADMIN_PASSWORD_HASH=$(printf '%s\n%s\n' "$NODERED_ADMIN_PASSWORD" "$NODERED_ADMIN_PASSWORD_HASH" \
-        | python3 "$SCRIPT_DIR/scripts/configure-nodered.py" "${nodered_hash_args[@]}") || {
-        echo "Could not prepare the Node-RED sign-in (see above). Nothing else was changed." >&2
-        exit 1
-    }
+    if [ -n "$NODERED_ADMIN_PASSWORD" ]; then
+        NODERED_ADMIN_PASSWORD_HASH=$(printf '%s\n%s\n' "$NODERED_ADMIN_PASSWORD" "$NODERED_ADMIN_PASSWORD_HASH" \
+            | python3 "$SCRIPT_DIR/scripts/configure-nodered.py" "${nodered_hash_args[@]}") || {
+            echo "Could not prepare the Node-RED sign-in (see above). Nothing else was changed." >&2
+            exit 1
+        }
+    fi
+    if [ -n "$NODERED_DASHBOARD_PASSWORD" ]; then
+        NODERED_DASHBOARD_PASSWORD_HASH=$(printf '%s\n%s\n' "$NODERED_DASHBOARD_PASSWORD" "$NODERED_DASHBOARD_PASSWORD_HASH" \
+            | python3 "$SCRIPT_DIR/scripts/configure-nodered.py" "${nodered_hash_args[@]}") || {
+            echo "Could not prepare the Node-RED dashboard sign-in (see above). Nothing else was changed." >&2
+            exit 1
+        }
+    fi
 fi
 
 # Remove temp files left in config/ by an earlier run that was killed between
@@ -2041,7 +2075,9 @@ fi
 if [ "$START" -eq 1 ]; then
     "$SCRIPT_DIR/scripts/configure-hardware.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     if [ "$VESSELSTACK_FIREWALL_ENABLE" = true ]; then
-        systemctl enable --now vesselstack-firewall.service
+        systemctl enable vesselstack-firewall.service
+        # restart, not just start: rule changes (for example a new Node-RED port) apply on every install
+        systemctl restart vesselstack-firewall.service
     else
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
@@ -2119,7 +2155,8 @@ if [ "$START" -eq 1 ]; then
     else
         compose rm --stop --force nodered 2>/dev/null || true
         if ! component_disabled influxdb; then
-            python3 "$SCRIPT_DIR/scripts/configure-nodered.py" token "${nodered_args[@]}" >/dev/null 2>&1 || true
+            python3 "$SCRIPT_DIR/scripts/configure-nodered.py" token "${nodered_args[@]}" >/dev/null 2>&1 \
+                || echo "WARN: could not revoke Node-RED's InfluxDB token (is InfluxDB running?); rerun the installer once it is." >&2
         fi
     fi
     systemctl restart vesselstack-chat.service
@@ -2178,6 +2215,6 @@ fi
 echo "VesselStack rendered successfully at $VESSELSTACK_ROOT"
 echo "Secrets are stored in mode-600 config files and were not printed."
 if [ "$NODERED_ENABLE" = true ]; then
-    echo "Node-RED editor: http://<this device>:$NODERED_PORT, user admin. Passphrase: sudo grep '^NODERED_ADMIN_PASSWORD=' $VESSELSTACK_ROOT/config/vesselstack.env"
+    echo "Node-RED editor: http://$NODERED_BIND_ADDRESS:$NODERED_PORT (user admin), dashboards under /dashboard (user crew). Passphrases: sudo grep '^NODERED_.*_PASSWORD=' $VESSELSTACK_ROOT/config/vesselstack.env"
 fi
 echo "Control panel: http://$CONTROL_PANEL_HOST:$CONTROL_PANEL_PORT"

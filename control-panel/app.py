@@ -312,9 +312,9 @@ FIELDS = [
     field("MQTT_PASSWORD", "MQTT password", SEC_SERVICES, kind="secret", description="Applied to the Mosquitto password file on the next apply or start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "MQTT port", SEC_SERVICES, kind="port", description="The port Mosquitto is published on."),
     field("NODE_EXPORTER_ENABLE", "Report Pi health numbers (Node Exporter)", SEC_SERVICES, kind="boolean", description="Runs the optional hardened host metrics exporter so Prometheus can record Pi temperature and disk use."),
-    field("NODERED_ENABLE", "Run Node-RED (flow editor)", SEC_SERVICES, kind="boolean", description="Optional. Adds a password-protected Node-RED editor wired to MQTT, InfluxDB (read-only) and Home Assistant. The editor can run code on the Pi: keep it on a trusted network. Save and Apply installs it; the sign-in passphrase is NODERED_ADMIN_PASSWORD in the stack's vesselstack.env."),
+    field("NODERED_ENABLE", "Run Node-RED (flow editor)", SEC_SERVICES, kind="boolean", description="Optional. Adds a password-protected Node-RED editor wired to MQTT, InfluxDB (read-only) and Home Assistant. The editor can run code on the Pi: keep it on a trusted network. Save and Apply installs it; the editor passphrase (user admin) is NODERED_ADMIN_PASSWORD and the dashboard passphrase (user crew) is NODERED_DASHBOARD_PASSWORD in the stack's vesselstack.env."),
     field("NODERED_PORT", "Node-RED port", SEC_SERVICES, kind="port", description="The port the Node-RED editor is published on."),
-    field("NODERED_BIND_ADDRESS", "Node-RED visible to", SEC_SERVICES, description="Leave empty to follow Web pages visible to. 127.0.0.1 means this device only."),
+    field("NODERED_BIND_ADDRESS", "Node-RED visible to", SEC_SERVICES, description="127.0.0.1 = only this computer (recommended; use an SSH tunnel or Tailscale); 0.0.0.0 = whole boat network, plain HTTP, password only."),
     # Advanced: AIS receiver
     field("AIS_ENABLE", "Enable AIS-catcher", SEC_AIS, kind="boolean", description="Shows nearby ships from a USB AIS receiver. Turn on only when a receiver is plugged in."),
     field("AIS_IMAGE", "AIS-catcher image", SEC_AIS, description="The Docker image to run. Change only if you were told to."),
@@ -784,11 +784,24 @@ def _update_configuration(updates: dict[str, Any], notes: list[str] | None = Non
     return str(backup)
 
 
+def nodered_prepared(settings: dict[str, str] | None = None) -> bool:
+    """Node-RED may start only when enabled AND the installer rendered nodered.env and the root-owned settings.js."""
+    settings = parse_env(VESSEL_ENV) if settings is None else settings
+    if settings.get("NODERED_ENABLE", "false") != "true":
+        return False
+    try:
+        return (ROOT / "config" / "nodered.env").stat().st_size > 0 and (ROOT / "config" / "node-red" / "settings.js").is_file()
+    except OSError:
+        return False
+
+
 def compose_base() -> list[str]:
-    return [
-        "docker", "compose", "--profile", "signalk", "--profile", "ais", "--profile", "metrics", "--profile", "nodered",
-        "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml"),
-    ]
+    # The nodered profile is added only when prepared: its env_file is required, and an unprepared profile
+    # would make every other compose command fail.
+    profiles = ["--profile", "signalk", "--profile", "ais", "--profile", "metrics"]
+    if nodered_prepared():
+        profiles += ["--profile", "nodered"]
+    return ["docker", "compose", *profiles, "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml")]
 
 
 def component_command(component: str, verb: str) -> list[str]:
@@ -808,6 +821,8 @@ def component_command(component: str, verb: str) -> list[str]:
             raise ValueError("AIS-catcher is disabled by configuration")
         if component == "nodered" and settings.get("NODERED_ENABLE", "false") != "true" and verb in {"start", "restart"}:
             raise ValueError("Node-RED is disabled by configuration")
+        if component == "nodered" and verb in {"start", "restart"} and not nodered_prepared(settings):
+            raise ValueError("Node-RED is not prepared (missing config/nodered.env or config/node-red/settings.js); run Save and Apply or rerun the installer")
         if component == "node-exporter" and settings.get("NODE_EXPORTER_ENABLE", "false") != "true" and verb in {"start", "restart"}:
             raise ValueError("node-exporter is disabled by configuration")
         service = COMPOSE_COMPONENTS[component]

@@ -87,7 +87,7 @@ case "${1:-}" in
     load)
         cat "$3" >> "$IMAGES_PRESENT"; exit 0 ;;
     compose)
-        if [[ " $* " == *" config --images "* ]]; then
+        if [[ " $* " == *" --images "* ]]; then
             envf=; composef=; args=("$@")
             for ((i = 0; i < ${#args[@]}; i++)); do
                 case "${args[$i]}" in
