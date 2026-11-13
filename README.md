@@ -16,6 +16,7 @@ the boat's local network when the internet is unavailable.
 - [First-run setup](#9-complete-first-run-setup): Home Assistant, Signal K, InfluxDB, Grafana, Boat Chat, Control Panel
 - [MQTT access control](#mqtt-access-control), [network access](#reaching-vesselstack-from-other-devices) and [network security](#network-security)
 - [Unattended operation and power](#unattended-operation-and-power): hardware watchdog, journal size cap, under-voltage warnings
+- [Alerts](#alerts): opt-in Telegram push for battery, stale data, stack failures, restarts and backups; Home Assistant blueprints
 - [Backups](#backups) (including [scheduled backups](#scheduled-backups)), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
 - [Boat profile](docs/BOAT_PROFILE.md) for shared engine, battery, and tank configuration
 - [Troubleshooting](#troubleshooting)
@@ -876,6 +877,7 @@ nano vesselstack.env
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
 | `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
+| `ALERTS_ENABLE` and `ALERT_*` | Opt-in Telegram alerts, off by default; see [Alerts](#alerts) |
 | `TELEMETRY_INDEXER_ENABLE` | Enable five-minute current/power sampling and thirty-minute history refreshes |
 | `NODE_EXPORTER_ENABLE` | Optional private host metrics exporter; disabled by default; available in the wizard's advanced settings |
 | `CONTROL_PANEL_HOST`, `CONTROL_PANEL_PORT` | Administration listener; defaults to loopback on `8780` |
@@ -1017,7 +1019,11 @@ The installer also places
 `/opt/vesselstack-data/homeassistant/vesselstack-dashboard.example.yaml` as a
 starter Lovelace view. Copy it into a dashboard only after replacing every
 `sensor.vesselstack_*` example with a real entity from the vessel. VesselStack
-does not silently enable safety alerts or assume thresholds.
+does not silently enable safety alerts or assume thresholds: Telegram alerts
+are [opt-in](#alerts) (`ALERTS_ENABLE=false` by default) and every threshold is asked
+explicitly, with a blank value leaving that alert off. The three Home Assistant
+blueprints work as installed (their default action is a persistent notification in
+Home Assistant) and can be switched to a phone push; see [Alerts](#alerts).
 
 ### Signal K and InfluxDB
 
@@ -1583,6 +1589,127 @@ sudo systemctl disable --now vesselstack-backup.timer
 
 `vesselstackctl uninstall` removes the backup timer, its service and the result helper but leaves the two
 drop-ins above in place; remove them with the commands shown.
+
+## Alerts
+
+VesselStack can push Telegram messages for important boat and stack events. **It is
+off by default and nothing is assumed:** you switch it on (`ALERTS_ENABLE=true`, one
+yes/no question in the setup wizard next to the Telegram questions, or the Control
+Panel Settings page) and you choose every threshold yourself. A blank threshold or
+entity leaves that alert off. **VesselStack alerts are a convenience, not a sole
+alarm system:** a flat phone, no mobile signal, a stopped boat computer or a Telegram
+outage all stop messages. Keep real alarms (bilge alarms, smoke and CO detectors) that
+work without this software.
+
+### What it does and what it costs
+
+`vesselstack-alerts.timer` runs the one-shot `vesselstack-alerts.service` every 60
+seconds (first run 2 minutes after boot) as the VesselStack service user. The script
+(`/usr/local/libexec/vesselstack/vesselstack-alerts.py`, Python standard library only)
+makes a few local HTTP requests and `systemctl is-active` checks, then sends
+messages with the Telegram Bot API `sendMessage` call only. It never calls
+`getUpdates`, so it does not conflict with the Boat Chat Telegram bot that already
+polls the same bot token. The unit is sandboxed like the other VesselStack services
+(`ProtectSystem=strict`, no capabilities, read-write access only to
+`$VESSELSTACK_DATA/alerts`). The timer is installed and enabled only while
+`ALERTS_ENABLE=true`. Sending messages requires internet access to
+`api.telegram.org`; the boat otherwise stays offline-capable.
+
+### Telegram setup
+
+1. In Telegram, message `@BotFather`, create a bot and copy its token.
+2. Paste the token into **Boat Chat Settings** (Telegram bot token). Alerts reuse that
+   token; it is never stored in `vesselstack.env`, put on a command line or printed.
+3. Find your numeric chat id (message your bot, then ask Boat Chat's Telegram bot
+   `/id`, or use a bot such as `@userinfobot`) and put it in `ALERT_TELEGRAM_CHAT_IDS`
+   (comma separated; a group chat id is negative). Alerts go only to those chats. Send
+   your bot one message first so it is allowed to message you.
+4. Set `ALERTS_ENABLE=true`, rerun the installer (or **Apply** in the Control Panel) and run
+   `sudo vesselstackctl alerts test`.
+
+### Settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ALERTS_ENABLE` | `false` | Opt in to alerts and enable the timer |
+| `ALERT_TELEGRAM_CHAT_IDS` | blank | Numeric chat ids that receive alerts; blank = nothing is sent |
+| `ALERT_BATTERY_LOW_V` | blank | Volts below which a battery alert is sent; blank = off. Use for example `12.0` for a 12 V bank or `24.0` for a 24 V bank (a rested, full 12 V lead-acid bank reads about 12.6 V, so `12.0` is nearly empty); choose for your battery chemistry |
+| `ALERT_BILGE_ENTITY` | blank | Home Assistant entity id (for example `binary_sensor.bilge_pump`); alert while its state is `on`; blank = off. Set it in the Control Panel because the wizard cannot know your entity ids |
+| `ALERT_SHORE_POWER_ENTITY` | blank | Home Assistant entity id; alert while its state is `off` or `unavailable`; blank = off |
+| `ALERT_HEARTBEAT_URL` | blank | Optional external heartbeat, `https://` only. A **secret**: it is stored with owner-only access in the service environment file, never printed, and never shown in the Control Panel after saving |
+| `ALERT_REPEAT_MINUTES` | `60` | Repeat an active alert this often (5 to 10080) |
+| `ALERT_STALE_DATA_MINUTES` | `15` | Stale-data limit (2 to 10080) |
+
+### Events
+
+- **Low battery** (needs `ALERT_BATTERY_LOW_V`): the newest `electrical.batteries.*.voltage`
+  point of the own vessel (`self="true"`, `_field="value"`, measurement named by the Signal K
+  path) in `INFLUXDB_RAW_BUCKET`, seen below the limit on consecutive runs for at least 2 minutes.
+- **Signal K data stale**: no own-vessel point newer than `ALERT_STALE_DATA_MINUTES`. Checked only
+  when the managed Signal K data path is in use (`SIGNALK_MODE` docker or native with
+  `SIGNALK_DATAPATH_AUTOCONFIG=true`).
+- **Bilge** and **shore power** (need the entity keys): polls the Home Assistant REST API
+  with the `HOME_ASSISTANT_TOKEN` already used by Boat Chat; 60 second hold-down. An entity
+  that does not exist counts as `unavailable`; if Home Assistant cannot be reached the
+  check is skipped (the stack check reports Home Assistant itself).
+- **Stack component down** (3 minute hold-down): HTTP probes of InfluxDB (`/health`), Home
+  Assistant and Signal K (managed modes), and `systemctl is-active` for the enabled
+  VesselStack units. These checks are paused while a backup is running, because a backup stops the stack.
+- **Boat computer restarted**: `/proc/sys/kernel/random/boot_id` changed. The message says whether
+  the previous shutdown looked clean from the journal tail (needs journal read access for the
+  service user, for example membership of the `adm` or `systemd-journal` group; otherwise it says "unknown").
+- **Backup failure or stale**: from `/var/lib/vesselstack/backup-last.json`. A `failed` result is
+  announced once per `finished_at`; with scheduled backups on, no success within twice the
+  interval raises a repeating alert.
+- **External heartbeat** (optional): after each run with no stack-component problem the script
+  sends a GET to `ALERT_HEARTBEAT_URL`, and to `<url>/fail` when there is a problem (healthchecks.io style),
+  so a dead or offline boat is noticed from outside. Runs during a backup send nothing.
+
+Every message ends with "VesselStack alerts are a convenience, not a sole alarm system." Active alerts
+repeat every `ALERT_REPEAT_MINUTES` and a single "cleared" message is sent on recovery. State (first seen,
+last sent) is in `$VESSELSTACK_DATA/alerts/state.json` (mode 0600, written atomically). If Telegram or the
+network fails, the failure is logged as one line, the state is kept and the run exits 0, so the timer keeps going and
+the message is retried on the next run.
+
+### Credentials the alerts use
+
+The Telegram bot token (Boat Chat Settings), `HOME_ASSISTANT_TOKEN` (Home Assistant) and `INFLUXDB_TOKEN`.
+Boat Chat itself uses the InfluxDB **admin** token and there is no separate read token yet, so the alerts service
+reads InfluxDB with that token (read queries only; it can be read by anyone who can read the service environment file,
+which is owned by the service user and `0600`/`0640`). The chat ids, bot token and heartbeat URL are
+removed from anything the script prints.
+
+### Home Assistant alternative: companion-app notifications
+
+The blueprints under `/opt/vesselstack-data/homeassistant/blueprints/automation/vesselstack/` (low battery, bilge
+activity, shore power lost) now work as installed: their **Notification actions** default to a Home Assistant
+persistent notification. To get a phone push without Telegram, install the Home Assistant companion app,
+and in the blueprint's automation replace the action with `notify.mobile_app_<your phone>` (an example is
+commented in each blueprint). This path needs Home Assistant to be running and the phone to reach it.
+
+### Heartbeat setup
+
+Create a check at a service such as healthchecks.io with a one-minute period and a few minutes of grace,
+paste its ping address into `ALERT_HEARTBEAT_URL`, rerun the installer. The service sends the address
+to the provider; treat it as a secret.
+
+### Verify
+
+```bash
+sudo vesselstackctl alerts test      # sends one test message, prints success or failure only
+sudo vesselstackctl alerts status    # active alerts and the last send result
+sudo vesselstackctl doctor           # WARNs if alerts are on but the timer is inactive, no chat id or token, or the last send failed
+systemctl list-timers vesselstack-alerts.timer
+```
+
+`doctor` only warns for alerts; it never fails because of them.
+
+### Rollback
+
+Set `ALERTS_ENABLE=false` and rerun the installer, or run
+`sudo systemctl disable --now vesselstack-alerts.timer`. The state file in `$VESSELSTACK_DATA/alerts` can be
+deleted; nothing else is changed. Blank `ALERT_HEARTBEAT_URL` stops the heartbeat; revoke the check at the provider if
+the address leaked.
 
 ## Backups
 

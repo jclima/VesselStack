@@ -1,0 +1,31 @@
+[Unit]
+Description=VesselStack opt-in alerts (Telegram push; one pass)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@VESSELSTACK_USER@
+Group=@VESSELSTACK_USER@
+WorkingDirectory=@VESSELSTACK_DATA@/alerts
+EnvironmentFile=@VESSELSTACK_ROOT@/config/boat-chat.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=VESSELSTACK_DATA=@VESSELSTACK_DATA@
+# The Telegram bot token is saved by Boat Chat Settings in this file; it wins over the env file above.
+Environment=BOAT_CHAT_ENV=@VESSELSTACK_DATA@/boat-chat/boat-chat.env
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/vesselstack/vesselstack-alerts.py run
+TimeoutStartSec=120s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@VESSELSTACK_DATA@/alerts
+CapabilityBoundingSet=
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+SystemCallArchitectures=native

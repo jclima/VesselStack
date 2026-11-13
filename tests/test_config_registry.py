@@ -34,6 +34,38 @@ class ConfigRegistryTests(unittest.TestCase):
                     with self.assertRaises(ValueError): panel.validate_value(spec, bad)
                 with self.assertRaises(ValueError): wizard.validate({key: bad})
 
+    def test_alert_settings_are_opt_in_with_no_assumed_thresholds(self):
+        d = registry.DEFAULTS
+        self.assertEqual((d["ALERTS_ENABLE"], d["ALERT_TELEGRAM_CHAT_IDS"], d["ALERT_BATTERY_LOW_V"], d["ALERT_BILGE_ENTITY"],
+                          d["ALERT_SHORE_POWER_ENTITY"], d["ALERT_HEARTBEAT_URL"]), ("false", "", "", "", "", ""))
+        self.assertEqual((d["ALERT_REPEAT_MINUTES"], d["ALERT_STALE_DATA_MINUTES"]), ("60", "15"))
+        self.assertEqual(registry.SYSTEMD_COMPONENTS["alerts"], "vesselstack-alerts.timer")
+        for key in ("ALERT_BATTERY_LOW_V", "ALERT_HEARTBEAT_URL", "ALERT_TELEGRAM_CHAT_IDS"):
+            self.assertEqual(registry.validate_value(key, ""), "")
+        for key, good in (("ALERT_BATTERY_LOW_V", "12.2"), ("ALERT_HEARTBEAT_URL", "https://hc-ping.com/abc"), ("ALERT_TELEGRAM_CHAT_IDS", "1, -22"),
+                          ("ALERT_BILGE_ENTITY", "binary_sensor.bilge"), ("ALERT_REPEAT_MINUTES", "30")):
+            self.assertEqual(registry.validate_value(key, good), good)
+        for key, bad in (("ALERT_BATTERY_LOW_V", "twelve"), ("ALERT_BATTERY_LOW_V", "0"), ("ALERT_HEARTBEAT_URL", "http://insecure.example"),
+                         ("ALERT_TELEGRAM_CHAT_IDS", "@name"), ("ALERT_BILGE_ENTITY", "bilge"), ("ALERT_REPEAT_MINUTES", "1"), ("ALERT_STALE_DATA_MINUTES", "x")):
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(ValueError): registry.validate_value(key, bad)
+                with self.assertRaises(ValueError): wizard.validate({key: bad})
+                spec = panel.FIELD_BY_KEY[key]
+                with self.assertRaises(ValueError): panel.validate_value(spec, bad)
+
+    def test_alert_keys_exist_on_every_surface_and_the_installer(self):
+        install = (ROOT / "install.sh").read_text()
+        example = (ROOT / "vesselstack.example.env").read_text()
+        for key in ("ALERTS_ENABLE", "ALERT_TELEGRAM_CHAT_IDS", "ALERT_BATTERY_LOW_V", "ALERT_BILGE_ENTITY", "ALERT_SHORE_POWER_ENTITY",
+                    "ALERT_HEARTBEAT_URL", "ALERT_REPEAT_MINUTES", "ALERT_STALE_DATA_MINUTES"):
+            with self.subTest(key=key):
+                self.assertIn(key, panel.FIELD_BY_KEY)
+                self.assertIn(f'{key}=', example)
+                self.assertIn(f'env_line {key} ', install)
+                self.assertEqual(wizard.DEFAULTS[key], registry.DEFAULTS[key])
+        self.assertIn("ALERT_HEARTBEAT_URL)", install.split("config_key_is_secret()")[1].split("}")[0])
+        self.assertEqual(panel.FIELD_BY_KEY["ALERT_HEARTBEAT_URL"]["kind"], "secret")
+
     def test_signalk_datapath_autoconfig_key_is_a_managed_boolean_on_every_surface(self):
         key = "SIGNALK_DATAPATH_AUTOCONFIG"
         self.assertEqual(registry.DEFAULTS[key], "true")

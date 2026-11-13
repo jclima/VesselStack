@@ -242,6 +242,25 @@ if grep -qx 'enable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"; then
     echo "The backup timer was enabled with VESSELSTACK_BACKUP_SCHEDULE=off" >&2
     exit 1
 fi
+# Alerts are opt-in: with ALERTS_ENABLE unset the units exist (sandboxed, as the service user) but the timer is not enabled.
+ALERTS_UNIT="$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service"
+ALERTS_TIMER="$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.timer"
+grep -qx 'Type=oneshot' "$ALERTS_UNIT"
+grep -qx "User=$(id -un)" "$ALERTS_UNIT" || grep -q '^User=.\+' "$ALERTS_UNIT"
+grep -qx 'ProtectSystem=strict' "$ALERTS_UNIT"
+grep -qx "ReadWritePaths=$DATA_ROOT/alerts" "$ALERTS_UNIT"
+grep -qx 'ExecStart=/usr/bin/python3 -I /usr/local/libexec/vesselstack/vesselstack-alerts.py run' "$ALERTS_UNIT"
+grep -qx 'OnBootSec=2min' "$ALERTS_TIMER"
+grep -qx 'OnUnitInactiveSec=60s' "$ALERTS_TIMER"
+if grep -q '@[A-Z_]*@' "$ALERTS_UNIT" "$ALERTS_TIMER"; then echo "Unrendered placeholder in the alerts units" >&2; exit 1; fi
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/vesselstack-alerts.py")" = "0:755"
+test -d "$DATA_ROOT/alerts"
+grep -qx 'ALERTS_ENABLE=false' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'disable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"
+if grep -qx 'enable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"; then
+    echo "The alerts timer was enabled with ALERTS_ENABLE=false" >&2
+    exit 1
+fi
 # Weekly schedule + a watchdog device on a Raspberry Pi: both drop-ins, the timer, and daemon-reexec.
 UNATTENDED_CONFIG="$TEST_ROOT/unattended.env"
 cp "$CONFIG" "$UNATTENDED_CONFIG"
@@ -274,6 +293,16 @@ grep -qx 'OnCalendar=Sun \*-\*-\* 03:30' "$SYSTEM_ROOT/etc/systemd/system/vessel
 grep -qx 'RandomizedDelaySec=15min' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
 grep -qx 'Persistent=false' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
 grep -qx 'enable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"
+# Alerts on: the timer is enabled and the (secret) heartbeat URL is only in the service-user env file, never echoed.
+printf '\nALERTS_ENABLE="true"\nALERT_TELEGRAM_CHAT_IDS="12345"\nALERT_BATTERY_LOW_V="12.1"\nALERT_HEARTBEAT_URL="https://hc.example.org/ping/test-uuid"\n' >> "$UNATTENDED_CONFIG"
+: > "$FAKE_BIN/systemctl.log"
+alerts_output=$(run_unattended 2>&1)
+if printf '%s' "$alerts_output" | grep -q 'test-uuid'; then echo "The installer printed the heartbeat URL" >&2; exit 1; fi
+grep -qx 'enable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"
+grep -qx 'ALERTS_ENABLE=true' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'ALERT_BATTERY_LOW_V=12.1' "$APP_ROOT/config/boat-chat.env"
+grep -q '^ALERT_HEARTBEAT_URL=' "$APP_ROOT/config/boat-chat.env"
+sed -i '/^ALERT/d' "$UNATTENDED_CONFIG"
 grep -qx 'TimeoutStopSec=15min' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
 grep -qx "Documentation=file://$APP_ROOT/README.md" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
 # A second identical run changes nothing, so it neither re-execs systemd nor restarts journald.

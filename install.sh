@@ -154,6 +154,15 @@ if [ -z "${BOAT_CHAT_PORT_FROM_CONFIG:-}" ] && [ -r "$SOURCE_ROOT/common/config_
 fi
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
+# Opt-in Telegram alerts (README "Alerts"): off by default, every threshold blank (= that alert off).
+: "${ALERTS_ENABLE:=false}"
+: "${ALERT_TELEGRAM_CHAT_IDS:=}"
+: "${ALERT_BATTERY_LOW_V:=}"
+: "${ALERT_BILGE_ENTITY:=}"
+: "${ALERT_SHORE_POWER_ENTITY:=}"
+: "${ALERT_HEARTBEAT_URL:=}"
+: "${ALERT_REPEAT_MINUTES:=60}"
+: "${ALERT_STALE_DATA_MINUTES:=15}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
 : "${BOAT_UNITS:=us_customary}"
 # Older setup wizards offered "nautical" and installers before 0.5.7 did not check it, so
@@ -266,6 +275,32 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     exit 1
 fi
 case "$VESSELSTACK_WATCHDOG" in auto|true|false) ;; *) echo "VESSELSTACK_WATCHDOG must be auto, true or false" >&2; exit 1 ;; esac
+if ! [[ "$ALERT_REPEAT_MINUTES" =~ ^[0-9]{1,5}$ ]] || [ "$ALERT_REPEAT_MINUTES" -lt 5 ] || [ "$ALERT_REPEAT_MINUTES" -gt 10080 ]; then
+    echo "ALERT_REPEAT_MINUTES must be a whole number from 5 to 10080" >&2
+    exit 1
+fi
+if ! [[ "$ALERT_STALE_DATA_MINUTES" =~ ^[0-9]{1,5}$ ]] || [ "$ALERT_STALE_DATA_MINUTES" -lt 2 ] || [ "$ALERT_STALE_DATA_MINUTES" -gt 10080 ]; then
+    echo "ALERT_STALE_DATA_MINUTES must be a whole number from 2 to 10080" >&2
+    exit 1
+fi
+if [ -n "$ALERT_BATTERY_LOW_V" ] && ! [[ "$ALERT_BATTERY_LOW_V" =~ ^[0-9]{1,2}(\.[0-9]{1,2})?$ ]]; then
+    echo "ALERT_BATTERY_LOW_V must be a voltage such as 12.0 or 24.0, or blank to turn the alert off" >&2
+    exit 1
+fi
+if ! [[ "$ALERT_TELEGRAM_CHAT_IDS" =~ ^(-?[0-9]{1,20}([[:space:]]*,[[:space:]]*-?[0-9]{1,20})*)?$ ]]; then
+    echo "ALERT_TELEGRAM_CHAT_IDS must be comma-separated numeric Telegram chat ids" >&2
+    exit 1
+fi
+for key in ALERT_BILGE_ENTITY ALERT_SHORE_POWER_ENTITY; do
+    if [ -n "${!key}" ] && ! [[ "${!key}" =~ ^[a-z_]+\.[A-Za-z0-9_]+$ ]]; then
+        echo "$key must be a Home Assistant entity id such as binary_sensor.bilge_pump, or blank" >&2
+        exit 1
+    fi
+done
+if [ -n "$ALERT_HEARTBEAT_URL" ] && ! [[ "$ALERT_HEARTBEAT_URL" =~ ^https://[^[:space:]\'\"\$\`\\]+$ ]]; then
+    echo "ALERT_HEARTBEAT_URL must be an https:// address, or blank (its value is not shown)" >&2
+    exit 1
+fi
 case "$VESSELSTACK_BACKUP_SCHEDULE" in off|daily|weekly) ;; *) echo "VESSELSTACK_BACKUP_SCHEDULE must be off, daily or weekly" >&2; exit 1 ;; esac
 if [ "$VESSELSTACK_JOURNAL_MAX_USE" != off ] && ! [[ "$VESSELSTACK_JOURNAL_MAX_USE" =~ ^[1-9][0-9]*[KMG]$ ]]; then
     echo "VESSELSTACK_JOURNAL_MAX_USE must be a size such as 200M or 1G, or off" >&2
@@ -281,7 +316,7 @@ if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BA
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -569,6 +604,14 @@ VESSELSTACK_FIREWALL_ALLOW_UDP
 CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
+ALERTS_ENABLE
+ALERT_TELEGRAM_CHAT_IDS
+ALERT_BATTERY_LOW_V
+ALERT_BILGE_ENTITY
+ALERT_SHORE_POWER_ENTITY
+ALERT_HEARTBEAT_URL
+ALERT_REPEAT_MINUTES
+ALERT_STALE_DATA_MINUTES
 TELEMETRY_INDEXER_ENABLE
 NODE_EXPORTER_ENABLE
 DISPLAYS_ENABLE
@@ -663,7 +706,7 @@ config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
         BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN|\
-        CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH) return 0 ;;
+        CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH|ALERT_HEARTBEAT_URL) return 0 ;;
     esac
     return 1
 }
@@ -1181,6 +1224,7 @@ ensure_container_data_dir "$VESSELSTACK_DATA/prometheus" "$PROMETHEUS_CONTAINER_
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
+install -d -m 0700 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA/alerts"
 # Quarantined legacy state lives OUTSIDE every service-writable tree.
 QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
 ensure_quarantine_root() {
@@ -1474,6 +1518,7 @@ fi
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/record-backup-result" "$LIBEXEC_DIR/record-backup-result"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-alerts.py" "$LIBEXEC_DIR/vesselstack-alerts.py"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"
@@ -1519,7 +1564,10 @@ for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN 
     SIGNALK_URL HOME_ASSISTANT_URL \
     HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
     INFLUXDB_RAW_BUCKET INFLUXDB_HISTORY_BUCKET \
-    INFLUXDB_HOME_ASSISTANT_BUCKET INFLUXDB_AIS_BUCKET; do
+    INFLUXDB_HOME_ASSISTANT_BUCKET INFLUXDB_AIS_BUCKET \
+    ALERTS_ENABLE ALERT_TELEGRAM_CHAT_IDS ALERT_BATTERY_LOW_V ALERT_BILGE_ENTITY ALERT_SHORE_POWER_ENTITY \
+    ALERT_HEARTBEAT_URL ALERT_REPEAT_MINUTES ALERT_STALE_DATA_MINUTES VESSELSTACK_BACKUP_SCHEDULE \
+    SIGNALK_MODE SIGNALK_DATAPATH_AUTOCONFIG VESSELSTACK_DISABLED_COMPONENTS SOCKETCAN_ENABLE DISPLAYS_ENABLE; do
     sed -i "/^${key}=/d" "$boat_chat_temp"
 done
 for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
@@ -1557,6 +1605,21 @@ done
     env_line INFLUXDB_HISTORY_BUCKET "$INFLUXDB_HISTORY_BUCKET"
     env_line INFLUXDB_HOME_ASSISTANT_BUCKET "$INFLUXDB_HOME_ASSISTANT_BUCKET"
     env_line INFLUXDB_AIS_BUCKET "$INFLUXDB_AIS_BUCKET"
+    # Read by the alerts one-shot (vesselstack-alerts.service); inert while ALERTS_ENABLE=false.
+    env_line ALERTS_ENABLE "$ALERTS_ENABLE"
+    env_line ALERT_TELEGRAM_CHAT_IDS "$ALERT_TELEGRAM_CHAT_IDS"
+    env_line ALERT_BATTERY_LOW_V "$ALERT_BATTERY_LOW_V"
+    env_line ALERT_BILGE_ENTITY "$ALERT_BILGE_ENTITY"
+    env_line ALERT_SHORE_POWER_ENTITY "$ALERT_SHORE_POWER_ENTITY"
+    env_line ALERT_HEARTBEAT_URL "$ALERT_HEARTBEAT_URL"
+    env_line ALERT_REPEAT_MINUTES "$ALERT_REPEAT_MINUTES"
+    env_line ALERT_STALE_DATA_MINUTES "$ALERT_STALE_DATA_MINUTES"
+    env_line VESSELSTACK_BACKUP_SCHEDULE "$VESSELSTACK_BACKUP_SCHEDULE"
+    env_line SIGNALK_MODE "$SIGNALK_MODE"
+    env_line SIGNALK_DATAPATH_AUTOCONFIG "$SIGNALK_DATAPATH_AUTOCONFIG"
+    env_line VESSELSTACK_DISABLED_COMPONENTS "$VESSELSTACK_DISABLED_COMPONENTS"
+    env_line SOCKETCAN_ENABLE "$SOCKETCAN_ENABLE"
+    env_line DISPLAYS_ENABLE "$DISPLAYS_ENABLE"
 } >> "$boat_chat_temp"
 chown "$VESSELSTACK_USER:$VESSELSTACK_USER" "$boat_chat_temp"
 mv -f -- "$boat_chat_temp" "$VESSELSTACK_ROOT/config/boat-chat.env"
@@ -1668,6 +1731,15 @@ else
     systemctl disable --now vesselstack-backup.timer 2>/dev/null || true
     rm -f -- "$SYSTEMD_DIR/vesselstack-backup.timer"
 fi
+# Opt-in alerts: the units are always rendered (the service is what "systemctl start" runs);
+# the timer is enabled only while ALERTS_ENABLE=true.
+for unit in vesselstack-alerts.service vesselstack-alerts.timer; do
+    sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
+        -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+        -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
+        "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
+    chmod 0644 "$SYSTEMD_DIR/$unit"
+done
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-control-panel.service.in" \
     > "$SYSTEMD_DIR/vesselstack-control-panel.service"
@@ -1690,6 +1762,11 @@ if [ -n "$backup_oncalendar" ]; then
     systemctl enable vesselstack-backup.timer
 else
     systemctl disable vesselstack-backup.timer 2>/dev/null || true
+fi
+if [ "$ALERTS_ENABLE" = true ]; then
+    systemctl enable vesselstack-alerts.timer
+else
+    systemctl disable vesselstack-alerts.timer 2>/dev/null || true
 fi
 
 # --- Unattended operation: hardware watchdog and journal cap ----------------------------------
@@ -1962,6 +2039,11 @@ if [ "$START" -eq 1 ]; then
     fi
     if [ -n "$backup_oncalendar" ]; then
         systemctl start vesselstack-backup.timer
+    fi
+    if [ "$ALERTS_ENABLE" = true ]; then
+        systemctl start vesselstack-alerts.timer
+    else
+        systemctl stop vesselstack-alerts.timer 2>/dev/null || true
     fi
     if [ "$DISPLAYS_ENABLE" = true ]; then
         systemctl restart vesselstack-displays-bridge.service

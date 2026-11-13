@@ -5,6 +5,19 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Add opt-in Telegram alerts (`ALERTS_ENABLE`, default `false`; `ALERT_TELEGRAM_CHAT_IDS`,
+  `ALERT_BATTERY_LOW_V`, `ALERT_BILGE_ENTITY`, `ALERT_SHORE_POWER_ENTITY`, `ALERT_HEARTBEAT_URL`,
+  `ALERT_REPEAT_MINUTES`, `ALERT_STALE_DATA_MINUTES`): a one-minute systemd timer runs a sandboxed
+  one-shot dispatcher that uses the Boat Chat bot token with `sendMessage` only and alerts on low
+  battery, stale Signal K data, bilge and shore-power entities, stack components down, boat computer
+  restarts and failed or stale backups, with an optional healthchecks.io-style heartbeat. No threshold is
+  assumed (blank = off). New `vesselstackctl alerts test|status`; `doctor` warns only. Operational
+  impact: one small process per minute and outbound HTTPS to `api.telegram.org`; reads InfluxDB with the
+  existing admin token. Rollback: `ALERTS_ENABLE=false` and rerun the installer, or
+  `systemctl disable --now vesselstack-alerts.timer`.
+- The Home Assistant blueprints now default `notification_actions` to a persistent notification so they
+  work without choosing a notify action (a `notify.mobile_app_*` example is included as a comment).
+
 - Configure the Signal K data path automatically in Docker and native modes
   (`SIGNALK_DATAPATH_AUTOCONFIG`, default `true`; existing mode is never modified): the installer installs
   `signalk-to-influxdb2` 2.3.0 into the Signal K data directory, adds a `vesselstack-n2k-<interface>` NMEA 2000

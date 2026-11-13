@@ -25,7 +25,7 @@ BACKUP_LAST_ARCHIVE_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last-archive"
 
 command_needs_lifecycle_lock() {
     case "${1:-}" in
-        status|doctor|urls|version|logs|verify-backup) return 1 ;;
+        status|doctor|urls|version|logs|verify-backup|alerts) return 1 ;;
         profile) case "${2:-}" in show|validate) return 1 ;; esac ;;
         ha-http) [ "${2:-}" = status ] && return 1 ;;
         backup-drive) [ "${2:-}" = list ] && return 1 ;;
@@ -57,6 +57,8 @@ Commands:
   status                       Show a concise service and endpoint summary
   profile show|validate FILE|set FILE
                                Show, validate, or install the shared boat profile
+  alerts test|status           Send one Telegram test alert, or show the active alerts and the
+                               last send result (opt-in alerts, ALERTS_ENABLE; no secrets shown)
   doctor                       Validate config, dependencies, disk, and health (also
                                hardware watchdog, journal cap, scheduled backups and
                                power/under-voltage warnings)
@@ -572,6 +574,8 @@ status_stack() {
         "$([ "${SIGNALK_MODE:-existing}" = native ] && echo true || echo false)" || failed=1
     status_unit 'SocketCAN' vesselstack-socketcan.service \
         "${SOCKETCAN_ENABLE:-false}" || failed=1
+    status_unit 'Alerts' vesselstack-alerts.timer \
+        "${ALERTS_ENABLE:-false}" || failed=1
     status_unit 'Control Panel' vesselstack-control-panel.service || failed=1
     if ! running_services=$("${COMPOSE[@]}" ps --status running --services); then
         printf '%-20s %s\n' 'Compose state' unavailable
@@ -1862,6 +1866,37 @@ check_power() {
     fi
 }
 
+# Alerts are opt-in; every problem here is a WARN, never a failure.
+check_alerts() {
+    [ "${ALERTS_ENABLE:-false}" = true ] || return 0
+    if ! systemctl is-active --quiet vesselstack-alerts.timer 2>/dev/null; then
+        printf 'WARN ALERTS_ENABLE=true but vesselstack-alerts.timer is not active. Fix: rerun the installer, or sudo systemctl enable --now vesselstack-alerts.timer\n' >&2
+    fi
+    run_alerts_script doctor >&2 || true
+    return 0
+}
+
+# run_alerts_script SUBCOMMAND: runs the dispatcher as the service user so the state file it
+# writes stays owned by that user. The bot token and chat ids are read there and never printed.
+run_alerts_script() {
+    local script="$LIBEXEC_DIR/vesselstack-alerts.py" user=${VESSELSTACK_USER:-boat}
+    [ -r "$script" ] || { echo "Missing $script (rerun the installer)" >&2; return 1; }
+    local -a cmd=(env "VESSELSTACK_DATA=$VESSELSTACK_DATA" "BOAT_CHAT_ENV=$VESSELSTACK_DATA/boat-chat/boat-chat.env" \
+        python3 -I "$script" --env-file "$VESSELSTACK_ROOT/config/boat-chat.env" "$@")
+    if [ "$(id -u)" -eq 0 ] && command -v runuser >/dev/null 2>&1; then
+        runuser -u "$user" -- "${cmd[@]}"
+    else
+        "${cmd[@]}"
+    fi
+}
+
+alerts_command() {
+    case "${1:-}" in
+        test|status) [ $# -eq 1 ] || { usage; exit 2; }; run_alerts_script "$1" ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -1895,6 +1930,7 @@ doctor_stack() {
     check_watchdog
     check_journald
     check_backup_schedule || failed=1
+    check_alerts
     check_power
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
@@ -2407,10 +2443,11 @@ restore_external_candidates() {
         vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
         vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.service vesselstack-telemetry-sample.timer \
         vesselstack-signalk.service vesselstack-socketcan.service vesselstack-displays-bridge.service \
-        vesselstack-control-panel.service vesselstack-backup.service vesselstack-backup.timer; do
+        vesselstack-control-panel.service vesselstack-backup.service vesselstack-backup.timer \
+        vesselstack-alerts.service vesselstack-alerts.timer; do
         printf '%s\n' "$SYSTEMD_DIR/$unit"
     done
-    printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/vesselstack-backup.timer"
+    printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/vesselstack-backup.timer" "$SYSTEMD_DIR/timers.target.wants/vesselstack-alerts.timer"
     for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.timer \
         vesselstack-telemetry-sample.timer vesselstack-signalk.service vesselstack-socketcan.service \
         vesselstack-displays-bridge.service vesselstack-control-panel.service; do
@@ -2418,7 +2455,7 @@ restore_external_candidates() {
         printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/$unit"
     done
     for p in "$SBIN_DIR/vesselstackctl" "$SBIN_DIR/vesselstack-firewall" "$SBIN_DIR/vesselstack-update" \
-        "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" \
+        "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" "$LIBEXEC_DIR/vesselstack-alerts.py" \
         "$LIBEXEC_DIR/reconcile-lifecycle.sh" "$SYSTEM_ROOT/etc/vesselstack/update.env"; do
         printf '%s\n' "$p"
     done
@@ -2906,6 +2943,7 @@ uninstall_stack() {
     systemctl disable --now vesselstack-chat-telegram.service || true
     systemctl disable --now vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer || true
     systemctl disable --now vesselstack-backup.timer || true
+    systemctl disable --now vesselstack-alerts.timer || true
     systemctl disable --now vesselstack-signalk.service || true
     systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
@@ -2922,12 +2960,13 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-telemetry-sample.service" \
         "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer" \
         "$SYSTEMD_DIR/vesselstack-backup.timer" "$SYSTEMD_DIR/vesselstack-backup.service" \
+        "$SYSTEMD_DIR/vesselstack-alerts.timer" "$SYSTEMD_DIR/vesselstack-alerts.service" \
         "$SYSTEMD_DIR/vesselstack-signalk.service" \
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SYSTEMD_DIR/vesselstack-homepage-refresh.service" "$SBIN_DIR/vesselstack-firewall" \
-        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result"
+        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" "$LIBEXEC_DIR/vesselstack-alerts.py"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
@@ -2985,6 +3024,7 @@ load_config
 case "$command" in
     status) [ $# -eq 0 ] || { usage; exit 2; }; status_stack ;;
     doctor) [ $# -eq 0 ] || { usage; exit 2; }; doctor_stack ;;
+    alerts) alerts_command "$@" ;;
     urls) [ $# -eq 0 ] || { usage; exit 2; }; show_urls ;;
     version) [ $# -eq 0 ] || { usage; exit 2; }; show_version ;;
     logs) [ $# -le 1 ] || { usage; exit 2; }; show_logs "${1:-all}" ;;

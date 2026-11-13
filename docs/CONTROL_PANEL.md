@@ -219,6 +219,9 @@ Nothing changes on the boat until you press **Save** and then **Apply**.
 - The Telegram and telemetry-indexer switches take effect when settings are
   applied. Configure the Telegram bot token and allowed chat IDs before enabling
   the worker. Disabled workers cannot be started from the component cards.
+- The opt-in alert settings (**Boat alerts to Telegram** and the `ALERT_*` fields in the Boat Chat section) also apply
+  when settings are applied. Blank thresholds and entities leave those alerts off; the chat ids and heartbeat URL are
+  write-only. See the README section Alerts.
 - Changing the panel's own listener or port takes effect when the panel
   restarts: use **Maintenance → Restart Control Panel**.
 

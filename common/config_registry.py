@@ -60,13 +60,16 @@ SETTINGS: dict[str, Setting] = {
     "DISPLAYS_ENABLE": _s("false", kind="boolean", component="displays-bridge"), "DISPLAYS_BRIDGE_MQTT_USERNAME": _s("vesselstack-bridge", required=True, component="displays-bridge"), "DISPLAYS_SIGNALK_TOKEN": _s(), "DISPLAYS_HA_TOKEN": _s(), "VESSELSTACK_DISABLED_COMPONENTS": _s(), "HOMEPAGE_ALLOWED_HOSTS": _s(), "HOMEPAGE_ALLOWED_HOSTS_EXTRA": _s(), "CONTROL_PANEL_PASSPHRASE_HASH": _s(owner="panel"), "BOAT_CHAT_PASSPHRASE_HASH": _s(owner="chat"),
     "VESSELSTACK_WATCHDOG": _s("auto", enum=("auto", "true", "false")), "VESSELSTACK_JOURNAL_MAX_USE": _s("200M", required=True),
     "VESSELSTACK_BACKUP_SCHEDULE": _s("off", enum=("off", "daily", "weekly")), "VESSELSTACK_BACKUP_KEEP": _s("8", kind="number", minimum=1, maximum=365, required=True), "VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK": _s("false", kind="boolean"),
+    # Opt-in Telegram alerts (README "Alerts"). Blank thresholds and entities leave that alert off.
+    "ALERTS_ENABLE": _s("false", kind="boolean", component="alerts"), "ALERT_TELEGRAM_CHAT_IDS": _s(component="alerts"), "ALERT_BATTERY_LOW_V": _s(component="alerts"), "ALERT_BILGE_ENTITY": _s(component="alerts"), "ALERT_SHORE_POWER_ENTITY": _s(component="alerts"),
+    "ALERT_HEARTBEAT_URL": _s(component="alerts"), "ALERT_REPEAT_MINUTES": _s("60", kind="number", minimum=5, maximum=10080, required=True, component="alerts"), "ALERT_STALE_DATA_MINUTES": _s("15", kind="number", minimum=2, maximum=10080, required=True, component="alerts"),
 }
 
 DEFAULTS = {key: spec.default for key, spec in SETTINGS.items()}
 LEGACY_DEFAULTS = {"SIGNALK_MODE": "existing", "INFLUXDB_RAW_BUCKET": "vesselstack_raw", "INFLUXDB_HISTORY_BUCKET": "vesselstack_1m", "VESSELSTACK_BACKUP": "/var/backups/vesselstack"}
 CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "homepage")
 COMPOSE_COMPONENTS = {name: name for name in (*CORE_COMPONENTS, "signalk", "ais-catcher", "node-exporter")}
-SYSTEMD_COMPONENTS = {"boat-chat": "vesselstack-chat.service", "telegram": "vesselstack-chat-telegram.service", "telemetry-indexer": "vesselstack-telemetry-indexer.timer", "telemetry-sample": "vesselstack-telemetry-sample.timer", "displays-bridge": "vesselstack-displays-bridge.service", "signalk-native": "vesselstack-signalk.service", "socketcan": "vesselstack-socketcan.service", "firewall": "vesselstack-firewall.service", "control-panel": "vesselstack-control-panel.service"}
+SYSTEMD_COMPONENTS = {"boat-chat": "vesselstack-chat.service", "telegram": "vesselstack-chat-telegram.service", "telemetry-indexer": "vesselstack-telemetry-indexer.timer", "telemetry-sample": "vesselstack-telemetry-sample.timer", "displays-bridge": "vesselstack-displays-bridge.service", "signalk-native": "vesselstack-signalk.service", "socketcan": "vesselstack-socketcan.service", "firewall": "vesselstack-firewall.service", "control-panel": "vesselstack-control-panel.service", "alerts": "vesselstack-alerts.timer"}
 
 def validate_value(key: str, value: Any, *, allow_blank: bool = True) -> str:
     if key not in SETTINGS:
@@ -95,6 +98,10 @@ def validate_value(key: str, value: Any, *, allow_blank: bool = True) -> str:
     if key in {"MQTT_USERNAME", "DISPLAYS_BRIDGE_MQTT_USERNAME"} and text and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", text): raise ValueError(f"Invalid MQTT name for {key}")
     if key == "VESSELSTACK_JOURNAL_MAX_USE" and text and text != "off" and not re.fullmatch(r"[1-9][0-9]*[KMG]", text): raise ValueError("Invalid VESSELSTACK_JOURNAL_MAX_USE: use a size such as 200M or 1G, or off")
     if key == "VESSELSTACK_BACKUP_KEEP" and text and not (re.fullmatch(r"[1-9][0-9]*", text) and int(text) <= 365): raise ValueError("Invalid VESSELSTACK_BACKUP_KEEP: use a whole number from 1 to 365")
+    if key == "ALERT_BATTERY_LOW_V" and text and not (re.fullmatch(r"[0-9]{1,2}(?:\.[0-9]{1,2})?", text) and 0 < float(text) <= 60): raise ValueError("Invalid ALERT_BATTERY_LOW_V: use a voltage such as 12.0 (12 V bank) or 24.0 (24 V bank), or leave it blank to turn the alert off")
+    if key in {"ALERT_BILGE_ENTITY", "ALERT_SHORE_POWER_ENTITY"} and text and not re.fullmatch(r"[a-z_]+\.[A-Za-z0-9_]+", text): raise ValueError(f"Invalid {key}: use a Home Assistant entity id such as binary_sensor.bilge_pump")
+    if key == "ALERT_TELEGRAM_CHAT_IDS" and text and not re.fullmatch(r"-?[0-9]{1,20}(?:\s*,\s*-?[0-9]{1,20})*", text): raise ValueError("Invalid ALERT_TELEGRAM_CHAT_IDS: use comma-separated numeric Telegram chat ids")
+    if key == "ALERT_HEARTBEAT_URL" and text and not (re.fullmatch(r"https://[^\s'\"$`\\]+", text) and urllib.parse.urlparse(text).netloc): raise ValueError("Invalid ALERT_HEARTBEAT_URL: use an https:// address")
     if key == "BOAT_NAME" and text and not re.fullmatch(r"[A-Za-z0-9_. -]{1,60}", text): raise ValueError("Invalid BOAT_NAME")
     if key in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
         if not re.fullmatch(r"[0-9]{1,5}(?::[0-9]{1,5})?(?:,[0-9]{1,5}(?::[0-9]{1,5})?)*", text): raise ValueError(f"Invalid port list for {key}")
