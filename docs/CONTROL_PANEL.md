@@ -237,6 +237,9 @@ the command to run if that failed). To do it by hand: `sudo vesselstackctl devic
 `sudo vesselstackctl devices revoke-all chat`. Admin pairing for Boat Chat uses the admin code Boat Chat
 actually enforces (its Settings-page value first, then `config/boat-chat.env`).
 
+In **Settings → Homepage**, select a VesselStack palette, heading, tile layout, and clock. **Save**
+and **Apply**, then reload Homepage to see the changes.
+
 ### Displays
 
 The Displays tab shows your ESP32 instrument displays and the data they can show, and lets you change
@@ -261,8 +264,9 @@ links to it.
 - **Editing**: **Edit theme and pages** opens a private draft. Choose a page by name or select
   **Add page**. Set its name and layout, then use **Add values** to search within that page. You can
   reorder pages or values, remove them, and preview layout and item changes before saving. The editor
-  shows capacity, required items, and fixed slot roles. For values that need an instance or range, the
-  picker provides fields alongside the value. **Count in alarm banner** is optional. **Done** closes an
+  shows capacity, required items, and fixed slot roles. Values from a detected or configured source can be added directly. When no source
+  is detected for a catalog value, select the suggested source from the dropdown. Gauges and tank
+  bars show the range defined for the value. **Count in alarm banner** is optional. **Done** closes an
   unchanged draft. **Cancel** asks before discarding edits. **Save** keeps the settings on the boat
   computer. If the saved settings changed elsewhere, the panel keeps your draft and offers a reload.
 - **Apply to screen** opens the upload dialog. Choose **By USB cable** (the first upload) or

@@ -1089,7 +1089,8 @@ run_wizard() {
     describe_ssh_access
     info "the wizard runs as user '$user' (not root); it cannot write anywhere but its private directory"
     if ! runuser -u "$user" -- env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$WIZARD_DIR" LANG=C.UTF-8 \
-            python3 -I "$RELEASE_DIR/vesselstack-wizard.py" --port "$port" --output "$WIZARD_DIR/vesselstack.env" --exit-after-save </dev/null; then
+            VESSELSTACK_WIZARD_FROM_INSTALLER=1 python3 -I "$RELEASE_DIR/vesselstack-wizard.py" \
+            --port "$port" --output "$WIZARD_DIR/vesselstack.env" --exit-after-save </dev/null; then
         die "The wizard could not run. Is port $port already in use? Try --wizard-port 8089."
     fi
 }

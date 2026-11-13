@@ -74,6 +74,25 @@ class EnvironmentFileTests(unittest.TestCase):
             self.assertEqual(result["OPENAI_API_KEY"], {"configured": True})
             self.assertNotIn("secret", str(result))
 
+    def test_homepage_settings_have_defaults_and_persist_valid_choices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vessel = root / "vessel.env"
+            panel.write_env(vessel, {"BOAT_NAME": "Test Boat"}, [])
+            with mock.patch.multiple(panel, VESSEL_ENV=vessel, CHAT_ENV=root / "chat.env",
+                                     PANEL_ENV=root / "control.env", CONFIG_BACKUP_ROOT=root / "backups"):
+                defaults = panel.public_configuration()["values"]
+                self.assertEqual(defaults["HOMEPAGE_THEME"], "dark")
+                self.assertEqual(defaults["HOMEPAGE_CLOCK"], "24h")
+                choices = {"HOMEPAGE_THEME": "light", "HOMEPAGE_HEADING": "brand",
+                           "HOMEPAGE_COLUMNS": "wide", "HOMEPAGE_CLOCK": "hidden"}
+                panel.update_configuration(choices)
+                values = panel.parse_env(vessel)
+                self.assertEqual({key: values[key] for key in choices}, choices)
+                with self.assertRaises(ValueError):
+                    panel.update_configuration({"HOMEPAGE_THEME": "custom"})
+                self.assertEqual(panel.parse_env(vessel), values)
+
     def test_blank_secret_update_preserves_existing_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1148,6 +1167,20 @@ class DisplaysApiTests(DisplaysApiBase):
 
 
 REV = "a" * 64
+
+
+class DisplaysLifecycleTests(unittest.TestCase):
+    def test_save_and_restore_pass_the_shared_lock_to_the_cli(self) -> None:
+        # Use the same lock entry point as vesselstackctl, with a stub only
+        # for the command that would write to the display configuration.
+        command = [
+            sys.executable, "-I", str(ROOT / "common/lifecycle_lock.py"), "run",
+            "--root", str(panel.ROOT), "--system-root", str(panel_system_root), "--",
+            sys.executable, "-c", 'print(\'{"ok": true}\')',
+        ]
+        with mock.patch.object(panel, "display_argv", return_value=command):
+            self.assertEqual(panel.display_save({"id": "helm", "revision": REV, "pages": []}), {"ok": True})
+            self.assertEqual(panel.display_restore({"stamp": "20260101T120000Z", "revision": REV}), {"ok": True})
 
 
 class DisplaysWriteApiTests(DisplaysApiBase):

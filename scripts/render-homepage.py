@@ -6,7 +6,7 @@ Run with ``python3 -I``. Standard library only. Two sub-commands:
   render         write the Homepage configuration directory
   allowed-hosts  print the value for HOMEPAGE_ALLOWED_HOSTS
 
-Only an allow-list of host, port, bind and enable keys is read from
+Only an allow-list of appearance, host, port, bind and enable keys is read from
 vesselstack.env, control-panel.env and boat-chat.env. Tokens, passwords and every
 other key are never read into the renderer, so they cannot reach a rendered file.
 """
@@ -25,12 +25,13 @@ from urllib.parse import urlsplit
 
 _repo_root = next((parent for parent in Path(__file__).resolve().parents if (parent / "common").is_dir()), Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(_repo_root))
-from common.config_registry import load_effective_chat_endpoint, effective_chat_port
+from common.config_registry import SETTINGS, effective_chat_port, load_effective_chat_endpoint
 
 # Keys read from each env file. Nothing outside these sets is ever kept.
 VESSELSTACK_KEYS = frozenset({
     "BOAT_NAME", "VESSELSTACK_DISABLED_COMPONENTS", "VESSELSTACK_WEB_BIND_ADDRESS",
     "VESSELSTACK_DATA_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS", "HOMEPAGE_PORT",
+    "HOMEPAGE_THEME", "HOMEPAGE_COLUMNS", "HOMEPAGE_HEADING", "HOMEPAGE_CLOCK",
     "HOMEPAGE_ALLOWED_HOSTS_EXTRA", "GRAFANA_PORT", "INFLUXDB_PORT", "PROMETHEUS_PORT",
     "AIS_ENABLE", "AIS_WEB_PORT", "SIGNALK_MODE", "SIGNALK_URL", "HOME_ASSISTANT_URL",
     "CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT", "BOAT_CHAT_HOST", "BOAT_CHAT_PORT",
@@ -136,8 +137,7 @@ body {
 }
 
 #widgets-wrap {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr) auto;
+  display: flex;
   gap: 1rem;
   align-items: center;
   padding: 1.4rem 1.5rem;
@@ -155,6 +155,7 @@ body {
 }
 
 .information-widget-greeting {
+  flex: 1;
   min-width: 0;
   color: var(--vs-teal-bright);
   font-weight: 700;
@@ -168,7 +169,8 @@ body {
 }
 
 #information-widgets-right {
-  justify-self: end;
+  flex: 0 0 auto;
+  margin: 0 0 0 auto;
   color: var(--vs-muted);
   text-align: right;
 }
@@ -260,14 +262,12 @@ button:focus-visible,
 
 @media (max-width: 700px) {
   #widgets-wrap {
-    grid-template-columns: max-content minmax(0, 1fr);
     gap: 0.8rem;
   }
 
   #information-widgets-right {
-    grid-column: 1 / -1;
-    justify-self: stretch;
     width: 100%;
+    margin: 0;
     text-align: left;
   }
 
@@ -284,6 +284,22 @@ button:focus-visible,
   .service-card { transition: none; }
   .service-card:hover { transform: none; }
 }
+"""
+
+LIGHT_CSS = """
+:root {
+  --vs-ink: #102b3b;
+  --vs-muted: #3c5d69;
+  --vs-panel: #f5fbfc;
+  --vs-panel-strong: #e8f7f6;
+  --vs-border: #9bc7c8;
+  --vs-teal: #0b6a64;
+  --vs-teal-bright: #075b56;
+  --vs-navy: #e9f5f7;
+}
+#page_wrapper { background: linear-gradient(145deg, #f6fbfc, #e1f2f2); }
+#widgets-wrap { background: #eef9f9; box-shadow: 0 0.75rem 2rem rgba(16, 43, 59, 0.12); }
+.services-group { background: rgba(255, 255, 255, 0.48); border-color: var(--vs-border); }
 """
 
 CUSTOM_JS_TEMPLATE = """\
@@ -470,7 +486,7 @@ def build_tiles(env: dict[str, str], hostname: str) -> list[Tile]:
         panel_port = port_of(env.get("CONTROL_PANEL_PORT"), 8780)
         link("Displays", "Boat", "Open the Displays tab of the Control Panel", panel_port, panel_bind,
              tunnel="Open the Control Panel through an SSH tunnel, then its Displays tab",
-             monitor_host=False)
+             path="/?tab=displays", monitor_host=False)
 
     if "grafana" not in disabled:
         link("Grafana", "Data", "Dashboards", port_of(env.get("GRAFANA_PORT"), 43000), web_bind)
@@ -512,12 +528,18 @@ def services_yaml(tiles: list[Tile]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def settings_yaml(boat_name: str) -> str:
+def homepage_option(env: dict[str, str], key: str) -> str:
+    setting = SETTINGS[key]
+    value = env.get(key, setting.default)
+    return value if value in setting.enum else setting.default
+
+
+def settings_yaml(heading: str, theme: str, columns: int, logo: bool) -> str:
     return (
-        f"title: {q(boat_name or 'VesselStack')}\n"
+        f"title: {q(heading)}\n"
         f"description: {q('Your boat, one page')}\n"
-        f"favicon: {q('/icons/vesselstack.png')}\n"
-        "theme: dark\n"
+        + (f"favicon: {q('/icons/vesselstack.png')}\n" if logo else "")
+        + f"theme: {theme}\n"
         "color: slate\n"
         "headerStyle: clean\n"
         "hideVersion: true\n"
@@ -527,26 +549,29 @@ def settings_yaml(boat_name: str) -> str:
         "useEqualHeights: true\n"
         "showStats: false\n"
         "layout:\n"
-        "  Boat:\n    style: row\n    columns: 3\n"
-        "  Data:\n    style: row\n    columns: 3\n"
-        "  System:\n    style: row\n    columns: 3\n"
+        f"  Boat:\n    style: row\n    columns: {columns}\n"
+        f"  Data:\n    style: row\n    columns: {columns}\n"
+        f"  System:\n    style: row\n    columns: {columns}\n"
     )
 
 
-def widgets_yaml(boat_name: str) -> str:
-    return (
-        "- logo:\n"
-        f"    icon: {q('/icons/vesselstack.png')}\n"
+def widgets_yaml(heading: str, clock: str, logo: bool) -> str:
+    widgets = "- logo:\n    icon: /icons/vesselstack.png\n" if logo else ""
+    widgets += (
         "- greeting:\n"
-        f"    text: {q(boat_name or 'VesselStack')}\n"
+        f"    text: {q(heading)}\n"
         "    text_size: xl\n"
-        "- datetime:\n"
-        "    text_size: xl\n"
-        "    format:\n"
-        "      dateStyle: medium\n"
-        "      timeStyle: short\n"
-        "      hour12: false\n"
     )
+    if clock != "hidden":
+        widgets += (
+            "- datetime:\n"
+            "    text_size: xl\n"
+            "    format:\n"
+            "      dateStyle: medium\n"
+            "      timeStyle: short\n"
+            f"      hour12: {'true' if clock == '12h' else 'false'}\n"
+        )
+    return widgets
 
 
 def valid_custom_list(text: str) -> str | None:
@@ -681,15 +706,30 @@ def render(root: Path, hostname: str, brand_icon: Path | None) -> list[str]:
     elif any(l.strip() and not l.lstrip().startswith("#") for l in custom_bookmarks.splitlines()):
         bookmarks = custom_bookmarks.rstrip("\n") + "\n"
 
+    icons_fd = open_dir(icons_dir)
+    try:
+        has_logo = brand_icon is not None and brand_icon.is_file()
+        if has_logo:
+            atomic_write(icons_fd, "vesselstack.png", brand_icon.read_bytes())
+        else:
+            warnings.append("Brand icon not found; using a text heading")
+    finally:
+        os.close(icons_fd)
+
+    theme = homepage_option(env, "HOMEPAGE_THEME")
+    columns = {"compact": 2, "standard": 3, "wide": 4}[homepage_option(env, "HOMEPAGE_COLUMNS")]
+    heading = env.get("BOAT_NAME", "").strip() if homepage_option(env, "HOMEPAGE_HEADING") == "boat" else ""
+    heading = heading or "VesselStack"
+    clock = homepage_option(env, "HOMEPAGE_CLOCK")
     files = {
-        "settings.yaml": settings_yaml(env.get("BOAT_NAME", "")),
+        "settings.yaml": settings_yaml(heading, theme, columns, has_logo),
         "services.yaml": services,
-        "widgets.yaml": widgets_yaml(env.get("BOAT_NAME", "").strip()),
+        "widgets.yaml": widgets_yaml(heading, clock, has_logo),
         "bookmarks.yaml": bookmarks,
         "docker.yaml": DOCKER_YAML,
         "kubernetes.yaml": KUBERNETES_YAML,
         "proxmox.yaml": PROXMOX_YAML,
-        "custom.css": CUSTOM_CSS,
+        "custom.css": CUSTOM_CSS + (LIGHT_CSS if theme == "light" else ""),
         "custom.js": CUSTOM_JS_TEMPLATE.replace("__HOSTNAME__", json.dumps(f"{hostname}.local")),
     }
     out_fd = open_dir(out_dir)
@@ -699,14 +739,6 @@ def render(root: Path, hostname: str, brand_icon: Path | None) -> list[str]:
     finally:
         os.close(out_fd)
 
-    icons_fd = open_dir(icons_dir)
-    try:
-        if brand_icon is not None and brand_icon.is_file():
-            atomic_write(icons_fd, "vesselstack.png", brand_icon.read_bytes())
-        else:
-            warnings.append("Brand icon not found; the home page shows no logo")
-    finally:
-        os.close(icons_fd)
     return warnings
 
 

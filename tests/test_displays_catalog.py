@@ -556,6 +556,22 @@ class MergedCatalogTests(ServerCase):
         ids = [r["proposed_id"] for r in self.rows]
         self.assertEqual(len(ids), len(set(ids)))
 
+    def test_configured_values_stay_selectable_offline_with_their_saved_ranges(self):
+        config = base_config(instruments={
+            "port_engine": {"path": "propulsion.port.revolutions", "label": "Port engine", "convert": "Hz->rpm",
+                            "unit": "rpm", "min": 0, "max": 2700, "precision": 0, "stale_after_s": 30},
+            "depth": {"path": "environment.depth.belowTransducer", "label": "Depth", "convert": "none",
+                      "unit": "m", "precision": 1, "stale_after_s": 30},
+            "private": {"path": "navigation.position.latitude", "label": "Position", "convert": "none",
+                        "unit": "", "precision": 0, "stale_after_s": 30},
+        })
+        rows = {row["row_id"]: row for row in catalog.merged_catalog(CATALOG, None, "metric", config, REGISTRY)}
+        engine = rows["configured:port_engine"]
+        self.assertEqual((engine["label"], engine["configured_as"], engine["max"]), ("Port engine", "port_engine", 2700))
+        self.assertIn("gauge-arc", engine["layouts"])
+        self.assertNotIn("gauge-arc", rows["depth"]["layouts"])
+        self.assertNotIn("configured:private", rows)
+
     def test_live_failure_leaves_rows_unknown(self):
         rows = catalog.merged_catalog(CATALOG, catalog.live_error("down"), "metric", base_config())
         self.assertTrue(all(r["live_state"] == "unknown" for r in rows))

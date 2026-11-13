@@ -182,6 +182,7 @@ INIT_ONLY_NOTE = (
 )
 
 SEC_VESSEL = "Vessel"
+SEC_HOMEPAGE = "Homepage"
 SEC_NETWORK = "Network & access"
 SEC_CHAT = "Boat Chat"
 SEC_SIGNALK = "Signal K & NMEA 2000"
@@ -195,6 +196,7 @@ SEC_INSTALL = "Installation"
 # Settings sections in display order. Advanced sections start collapsed in the UI.
 SECTIONS = [
     {"name": SEC_VESSEL, "lead": "Who the boat is and how numbers are shown.", "advanced": False},
+    {"name": SEC_HOMEPAGE, "lead": "Choose how the boat’s start page looks. Save and Apply to update it.", "advanced": False},
     {"name": SEC_NETWORK, "lead": "Who can reach the boat computer and its web pages.", "advanced": False},
     {"name": SEC_CHAT, "lead": "The assistant you can ask about your boat, and Telegram alerts.", "advanced": False},
     {"name": SEC_SIGNALK, "lead": "How boat data gets in.", "advanced": False},
@@ -216,6 +218,14 @@ FIELDS = [
     field("BOAT_BEAM_M", "Beam (m)", SEC_VESSEL, kind="number", description="Width at the widest point of the hull. A number above 0, up to 100."),
     field("BOAT_MMSI", "MMSI", SEC_VESSEL, kind="secret", description="Optional. Your vessel's radio identity number. Kept private on this boat computer; never commit it."),
     field("BOAT_CALLSIGN", "Call sign", SEC_VESSEL, kind="secret", description="Optional. Kept private on this boat computer; never commit it."),
+    field("HOMEPAGE_THEME", "Appearance", SEC_HOMEPAGE, kind="select",
+          choices=list(CONFIG_SETTINGS["HOMEPAGE_THEME"].enum), description="The palette for Homepage on every device."),
+    field("HOMEPAGE_HEADING", "Heading", SEC_HOMEPAGE, kind="select",
+          choices=list(CONFIG_SETTINGS["HOMEPAGE_HEADING"].enum), description="Shown beside the logo and in the browser tab."),
+    field("HOMEPAGE_COLUMNS", "Tiles per row on wide screens", SEC_HOMEPAGE, kind="select",
+          choices=list(CONFIG_SETTINGS["HOMEPAGE_COLUMNS"].enum), description="Tiles wrap into fewer columns on narrower screens."),
+    field("HOMEPAGE_CLOCK", "Clock", SEC_HOMEPAGE, kind="select",
+          choices=list(CONFIG_SETTINGS["HOMEPAGE_CLOCK"].enum), description="Show the date and time in the header or hide the clock."),
     # Network & access
     field("VESSELSTACK_WEB_BIND_ADDRESS", "Web pages visible to", SEC_NETWORK, description="Grafana and the home page listen on this address. 127.0.0.1 means this device only; 0.0.0.0 means every device on the boat network."),
     field("VESSELSTACK_DATA_BIND_ADDRESS", "Data services visible to", SEC_NETWORK, description="InfluxDB, Prometheus and MQTT listen on this address. Keep 127.0.0.1 unless another device must connect over a network you trust."),
@@ -313,7 +323,7 @@ COMPONENT_INFO = {
     "grafana": ("Grafana", "Charts of your history: trips, batteries, temperatures.", SEC_SERVICES),
     "prometheus": ("Prometheus", "Collects Pi and service health numbers.", SEC_STORAGE),
     "mosquitto": ("Mosquitto", "Passes messages between devices (MQTT).", SEC_SERVICES),
-    "homepage": ("Home page", "The boat's start page, with a tile for every boat web page.", SEC_SERVICES),
+    "homepage": ("Home page", "The boat's start page, with a tile for every boat web page.", SEC_HOMEPAGE),
     "signalk": ("Signal K", "Reads boat data and shares it with everything else.", SEC_SIGNALK),
     "ais-catcher": ("AIS-catcher", "Shows nearby ships from your AIS receiver.", SEC_AIS),
     "node-exporter": ("Node Exporter", "Reports Pi health (temperature, disk) for Prometheus.", SEC_SERVICES),
@@ -617,6 +627,8 @@ def public_configuration() -> dict[str, Any]:
         value = source.get(spec["key"], "")
         if spec["key"] == "BOAT_UNITS" and value.strip().lower() == "nautical":
             value = "metric"  # legacy value from older setup wizards: show Metric, not an unknown choice
+        if spec["section"] == SEC_HOMEPAGE and value not in spec["choices"]:
+            value = CONFIG_SETTINGS[spec["key"]].default
         if spec["key"] in {"CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT"}:
             value = panel.get(spec["key"], value)
         result[spec["key"]] = {"configured": bool(value)} if spec["kind"] == "secret" else value
@@ -894,7 +906,8 @@ def valid_display_id(value: Any) -> str:
     return value
 
 
-def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S, input_text: str | None = None) -> dict[str, Any]:
+def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S,
+                     input_text: str | None = None, slot: LifecycleSlot | None = None) -> dict[str, Any]:
     """Run one display command and return its JSON object.
 
     stdout is parsed and stderr is dropped, so nothing but the tool's own structured error message
@@ -902,9 +915,11 @@ def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S, i
     """
     # A request body goes to the tool's standard input, never to its argument list.
     stdin = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
+    # Mutating CLI commands reuse the reservation already held by the panel.
+    lock_args = {"env": slot.child_env(), "pass_fds": slot.pass_fds()} if isinstance(slot, LifecycleSlot) else {}
     try:
         result = subprocess.run(display_argv(*args), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=timeout, check=False, **stdin)
+                                timeout=timeout, check=False, **stdin, **lock_args)
     except subprocess.TimeoutExpired as exc:
         raise DisplayToolError(504, "The display tool took too long to answer. Try again in a moment.") from exc
     except OSError as exc:
@@ -915,7 +930,7 @@ def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S, i
         payload = None
     if not isinstance(payload, dict):
         raise DisplayToolError(502, "The display tool gave an answer the Control Panel could not read."
-                               if result.returncode == 0 else "The display tool failed. See the displays bridge log for details.",
+                               if result.returncode == 0 else "The display tool failed before returning a result.",
                                code=result.returncode or None)
     if result.returncode != 0 or payload.get("ok") is False:
         errors = [str(item)[:300] for item in payload.get("errors", []) if isinstance(item, str)][:5] if isinstance(payload.get("errors"), list) else []
@@ -1034,7 +1049,7 @@ def display_save(payload: dict[str, Any]) -> dict[str, Any]:
     slot = display_busy_guard()
     try:
         result = run_display_tool(["set-pages", display_id, "--if-revision", revision, "--stdin"],
-                                  timeout=DISPLAY_SAVE_TIMEOUT_S, input_text=text)
+                                  timeout=DISPLAY_SAVE_TIMEOUT_S, input_text=text, slot=slot)
     finally:
         release_lifecycle_slot(slot)
         invalidate_display_caches()
@@ -1049,7 +1064,8 @@ def display_restore(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("revision is required (reload the displays)")
     slot = display_busy_guard()
     try:
-        result = run_display_tool(["restore-config", stamp, "--if-revision", revision], timeout=DISPLAY_SAVE_TIMEOUT_S)
+        result = run_display_tool(["restore-config", stamp, "--if-revision", revision],
+                                  timeout=DISPLAY_SAVE_TIMEOUT_S, slot=slot)
     finally:
         release_lifecycle_slot(slot)
         invalidate_display_caches()

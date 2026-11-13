@@ -88,6 +88,10 @@ function normalizeToken(value) {
 
 const OPTION_LABELS = {
   BOAT_UNITS: { us_customary: "US customary", metric: "Metric" },
+  HOMEPAGE_THEME: { dark: "VesselStack dark (default)", light: "VesselStack light" },
+  HOMEPAGE_HEADING: { boat: "Boat name", brand: "VesselStack" },
+  HOMEPAGE_COLUMNS: { compact: "2", standard: "3 (default)", wide: "4" },
+  HOMEPAGE_CLOCK: { "24h": "24-hour", "12h": "12-hour", hidden: "Hidden" },
   SIGNALK_MODE: { docker: "Docker (recommended)", existing: "Existing server", native: "Native (on this Pi)" },
   PROVIDER: { "": "None", local: "Local (built-in)", codex_cli: "Codex CLI", claude_cli: "Claude CLI", openai: "OpenAI", vercel: "Vercel AI Gateway", bedrock: "Amazon Bedrock", google: "Google Gemini", ollama: "Ollama", openai_compatible: "OpenAI-compatible API" },
 };
@@ -422,6 +426,7 @@ async function unlock() {
     } else {
       renderConfiguration(config);
     }
+    if (new URLSearchParams(location.search).get("tab") === "displays") selectTab("displays");
     loadSignIn();
     await refreshStatus();
   } catch (error) {
@@ -1462,16 +1467,23 @@ function itemInfo(show, id) {
   return { id, kind: "missing", label: id, unit: "", path: "" };
 }
 
+const liveValueKey = (path, convert) => `${path}\u0000${convert}`;
+
 const liveRowsByPath = (catalog) => {
   const map = new Map();
-  (catalog?.rows || []).forEach((row) => { if (row.live_state === "live" && row.path && !map.has(row.path)) map.set(row.path, row); });
+  for (const row of catalog?.rows || []) {
+    if (row.live_state === "live" && row.path) {
+      const key = liveValueKey(row.path, row.convert);
+      if (!map.has(key)) map.set(key, row);
+    }
+  }
   return map;
 };
 
 // A live number is shown only when the catalog converted it the same way this item does.
 function liveValue(info, live) {
-  const row = info.kind === "instrument" && live ? live.get(info.path) : null;
-  if (!row || row.value === undefined || row.value === null || !Number.isFinite(Number(row.value)) || row.convert !== info.convert) return "—";
+  const row = info.kind === "instrument" ? live?.get(liveValueKey(info.path, info.convert)) : null;
+  if (!row || row.value === undefined || row.value === null || !Number.isFinite(Number(row.value))) return "—";
   return Number(row.value).toFixed(info.precision);
 }
 
@@ -1735,6 +1747,7 @@ function displayCard(entry) {
 
 function renderDisplays() {
   const d = state.displays;
+  $("#displays-refresh").disabled = d.loading;
   const root = $("#displays-root");
   root.textContent = "";
   if (d.error) {
@@ -1799,7 +1812,7 @@ function renderCatalogRows(root, addCtl = null) {
 
 async function loadDisplays(force = false) {
   const d = state.displays;
-  if (!signedIn() || d.loading) return;
+  if (!signedIn() || (d.loading && !force)) return;
   if (!force && d.loaded && Date.now() - d.loadedAt < DISPLAYS_STALE_MS) return;
   const session = state.session;
   const epoch = ++d.epoch;
@@ -1826,6 +1839,7 @@ async function loadDisplays(force = false) {
 
 function resetDisplays() {
   state.displays = freshDisplays();
+  $("#displays-refresh").disabled = false;
   $("#displays-root").textContent = "";
   $("#displays-status").textContent = "";
   $("#catalog-root").textContent = "";
@@ -1840,7 +1854,6 @@ function resetDisplays() {
 
 const MAX_PAGES = 8;
 const PAGE_TITLE_MAX = 16;
-const INSTANCE_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const HOST_LABEL_RE = /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
 const RESERVED_HOSTS = ["bootsel", "mqtt", "mqttip"];
 const FIXED_GEOMETRY_LAYOUTS = ["single", "grid-2x2", "gauge-arc", "electrical"];
@@ -1906,8 +1919,6 @@ function draftProblems(entry, draft) {
   return problems;
 }
 
-const slugInstance = (text) => String(text).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-
 function takenIds(entry, draft) {
   return new Set([...Object.keys(entry.instruments || {}), ...Object.keys(entry.notifications || {}), ...Object.keys(entry.ha || {}),
     ...Object.keys(draft.newInstruments), ...Object.keys(draft.newNotifications)]);
@@ -1929,7 +1940,7 @@ function existingItemFor(entry, draft, row) {
 }
 
 // Can this catalog row go on the selected page of the draft? {ok, reason}; the reason is shown next to the disabled button.
-function addCheck(entry, draft, row, opts = {}) {
+function addCheck(entry, draft, row) {
   const page = draft?.pages[draft.selected];
   if (!page) return { ok: false, reason: "Choose a page first." };
   const spec = entry.layouts?.[page.layout];
@@ -1955,31 +1966,21 @@ function addCheck(entry, draft, row, opts = {}) {
 
 // Add a catalog row to the selected page. {ok:true, id} or {ok:false, error}. Thresholds and alarms are added only when opts.alarm is set.
 function addRowToDraft(entry, draft, row, opts = {}) {
-  const check = addCheck(entry, draft, row, opts);
+  const check = addCheck(entry, draft, row);
   if (!check.ok) return { ok: false, error: check.reason };
   const page = draft.pages[draft.selected];
+  if (row.template && !row.configured_as && (!row.instance || opts.instance !== row.instance)) {
+    return { ok: false, error: "Choose the suggested Signal K source." };
+  }
   let id = existingItemFor(entry, draft, row);
   if (!id) {
     if (!row.definition) return { ok: false, error: "This value cannot be added." };
     const def = jsonClone(row.definition);
-    let stem = row.proposed_id || row.id_stem || "item";
-    if (row.template) {
-      const instance = String(opts.instance ?? "").trim();
-      if (!INSTANCE_RE.test(instance)) return { ok: false, error: "Type which one it is, using letters, numbers, dashes or underscores (for example: port)." };
-      def.path = String(row.path_template || row.path).split("*").join(instance);
-      def.label = String(row.label_template || row.label).split("*").join(instance).slice(0, 24);
-      stem = `${row.id_stem}_${slugInstance(instance)}`;
-    }
-    if (row.kind !== "notification" && opts.min !== undefined && opts.min !== "" && opts.max !== undefined && opts.max !== "") {
-      const min = Number(opts.min); const max = Number(opts.max);
-      if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max) return { ok: false, error: "The minimum must be a number lower than the maximum." };
-      def.min = min; def.max = max;
-    }
+    const stem = row.proposed_id || row.id_stem || "item";
     // Counting in the alarm banner is opt-in: never inherit it from the catalog definition.
     if (row.kind === "notification") def.alarm = Boolean(opts.alarm);
     else if (opts.alarm && row.suggested_thresholds) def.thresholds = jsonClone(row.suggested_thresholds);
     id = uniqueId(stem, takenIds(entry, draft));
-    if (row.template && page.items.includes(id)) return { ok: false, error: "Already on this page." };
     (row.kind === "notification" ? draft.newNotifications : draft.newInstruments)[id] = def;
   }
   page.items.push(id);
@@ -2644,14 +2645,25 @@ function rowAddControls(entry, draft, row) {
   const d = state.displays;
   const rowId = row.row_id || row.path;
   const opts = d.rowOpts[rowId] || {};
-  const check = addCheck(entry, draft, row, opts);
+  const check = addCheck(entry, draft, row);
   const page = draft.pages[draft.selected];
   const spec = page ? entry.layouts?.[page.layout] : null;
   const wrap = h("div", { class: "addrow" });
-  if (row.template) wrap.append(h("label", { class: "field inline" }, h("span", { text: "Which one" }), h("input", { type: "text", value: opts.instance ?? "", placeholder: "for example port", maxlength: "32", autocomplete: "off", spellcheck: "false", "data-row-opt": "instance", "data-row-id": rowId })));
-  if (check.ok && spec?.needs_range && row.kind === "instrument" && Number.isFinite(row.min) && Number.isFinite(row.max)) {
-    wrap.append(h("label", { class: "field inline" }, h("span", { text: "Minimum" }), h("input", { type: "number", step: "any", value: opts.min ?? row.min, "data-row-opt": "min", "data-row-id": rowId })),
-      h("label", { class: "field inline" }, h("span", { text: "Maximum" }), h("input", { type: "number", step: "any", value: opts.max ?? row.max, "data-row-opt": "max", "data-row-id": rowId })));
+  if (row.template && !row.configured_as && row.instance) {
+    const hintId = `source-${rowId}`.replace(/[^A-Za-z0-9_-]/g, "_");
+    wrap.append(h("label", { class: "field inline" },
+      h("span", { text: "Signal K source" }),
+      h("select", { "aria-describedby": hintId, "data-row-opt": "instance", "data-row-id": rowId },
+        h("option", { value: "", text: "Choose a source", selected: opts.instance !== row.instance }),
+        h("option", { value: row.instance, text: `${row.instance} (suggested)`, selected: opts.instance === row.instance }))),
+    h("p", { id: hintId, class: "small muted", text: "Live sources appear in the list after you refresh while Signal K is receiving their data." }));
+  }
+  if (check.ok && spec?.needs_range && row.kind === "instrument") {
+    const configured = entry.instruments?.[row.configured_as];
+    const range = configured || row.definition;
+    if (Number.isFinite(range?.min) && Number.isFinite(range?.max)) {
+      wrap.append(h("span", { class: "small muted", text: `Range ${range.min} to ${range.max} ${range.unit || row.unit || ""}`.trim() }));
+    }
   }
   const canAlarm = !row.configured_as && (row.kind === "notification" || row.suggested_thresholds);
   if (canAlarm) wrap.append(h("label", { class: "optcheck" }, h("input", { type: "checkbox", checked: Boolean(opts.alarm), "data-row-opt": "alarm", "data-row-id": rowId }),

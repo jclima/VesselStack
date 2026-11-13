@@ -191,9 +191,9 @@ sudo vesselstackctl display deploy helm --ota 192.0.2.50   # build if needed and
 
 `display deploy ID (--ota HOST | --serial DEVICE)` builds only when the stored firmware is out of date and uploads it under one lock; it prints `STAGE:` lines with `--progress` and `To fix:` lines for known failures, and hides Wi-Fi and MQTT/OTA/API secrets in everything it prints. After every successful upload `build/displays/ID/last-flash.json` (root-only, never committed) records when, how and which image went to the screen. **Operational impact:** a deploy can take 3-6 minutes (10-15 minutes the first time, about 3 GB free disk). **Wi-Fi (OTA) updates have not been verified on hardware yet**; the first flash of a new display must be over USB, and USB is an equal option. To put the previous firmware back: `display restore-config STAMP` (see `display history`), then `display flash ID --previous --ota HOST` (or `--serial DEVICE`); see [Deploy and rollback](docs/DISPLAYS.md#deploy-and-rollback).
 
-In the Control Panel, open **Displays → Edit theme and pages**, choose a page, and use its data picker to add instruments. The preview follows the draft as you change the layout or items. **Save** stores settings on the boat computer and keeps a backup. **Apply to screen** opens the upload dialog. If you have unsaved edits, **Save and upload** commits them before uploading, and cancelling keeps the draft open. For a first upload, connect the screen to the boat computer with a USB data cable. The picker prefers stable device names and can list validated USB serial devices without one. Wi-Fi updates remain unverified on hardware and sending firmware to a new address requires explicit confirmation.
+In the Control Panel, open **Displays → Edit theme and pages**, choose a page, and use its data picker to add instruments. Pick a source from the values Signal K is sending or select the catalog’s suggested source when no live reading is available. Gauges and tank bars use the range defined for the value. Previously configured values remain selectable when Signal K is offline. The editor reloads saved settings after a save, including when an earlier refresh is still running. The preview follows the draft as you change the layout or items. **Save** stores settings on the boat computer and keeps a backup. **Apply to screen** opens the upload dialog. If you have unsaved edits, **Save and upload** commits them before uploading, and cancelling keeps the draft open. For a first upload, connect the screen to the boat computer with a USB data cable. The picker prefers stable device names and can list validated USB serial devices without one. Wi-Fi updates remain unverified on hardware and sending firmware to a new address requires explicit confirmation.
 
-**Verify** the updated pages and live readings on the physical screen. **Firmware sent** records the successful upload of the saved settings. Live readings also require the display bridge, a LAN-accessible MQTT broker, and a working connection from the screen. Backups, updates, and settings changes wait while the upload holds the lifecycle slot. A first build may need internet access and additional disk space.
+**Verify** that **Save** keeps an edited page after refreshing the Displays tab. **Save** and **History → Restore** share the lifecycle lock with the display command, so either can finish when the boat computer is idle and both are refused during another lifecycle operation. After uploading, verify the updated pages and live readings on the physical screen. **Firmware sent** records the successful upload of the saved settings. Live readings also require the display bridge, a LAN-accessible MQTT broker, and a working connection from the screen. Backups, updates, and settings changes wait while the upload holds the lifecycle slot. A first build may need internet access and additional disk space.
 
 **Rollback** through **History → Restore** and **Put previous firmware back** once the settings and credentials match the previous image. Before reverting to an older VesselStack version without theme support, run `set-theme ID classic`. See the [Control Panel Displays guide](docs/CONTROL_PANEL.md#displays).
 
@@ -296,6 +296,8 @@ and VesselStack on a fresh Pi, but leaves an installed system alone (the upgrade
 defaults to no) and never removes conflicting Docker packages. With neither, and no
 terminal to ask on (for example `curl | sudo bash` over `ssh` without `-t`), the installer
 stops before changing anything and lists these options.
+
+If you run the guided installer with `--web-wizard`, return to its terminal after saving in the browser. The installer picks up the configuration and continues there.
 
 ### Headless Raspberry Pi: open the panel from your laptop
 
@@ -490,7 +492,7 @@ Keep the generated credentials per host, schedule backups to a separate device,
 and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
-VesselStack 0.8.0 is the planned prerelease combining the Homepage refresh with the Displays editor already present in main. Upgrade from 0.7.0 or 0.7.1 with the
+VesselStack 0.8.0 includes configurable Homepage branding and fixes for the Displays editor. Upgrade from 0.7.0 or 0.7.1 with the
 full installer or `vesselstackctl update` so shared modules, configuration and
 services are updated together; the application-only updater is not sufficient for
 this release. The installer takes a verified backup first. If rollback is needed,
@@ -805,7 +807,7 @@ git fetch --tags
 git checkout v0.8.0
 ```
 
-`v0.8.0` is the planned prerelease; see the [CHANGELOG](CHANGELOG.md). Once
+`v0.8.0` includes the Homepage and Displays updates; see the [CHANGELOG](CHANGELOG.md). Once
 the signed release tag exists, verify it yourself (needs `ssh-keygen`, which ships
 with OpenSSH):
 
@@ -1330,15 +1332,17 @@ computer, the Signal K tile links to that server (scheme, host and port only; no
 are plain links: each opens its own sign-in screen (passphrase or pairing link, see the sign-in sections
 below); the home page itself holds no sign-in and no secrets.
 
-The front door uses a dark marine navy/teal theme with a compact masthead: the local VesselStack logo,
-the configured boat name (or `VesselStack` when no name is set), and the native date/time widget remain
-visible above the service groups. Subtle CSS chart/radar lines, responsive tiles, hover states, and a
-high-contrast keyboard focus ring are generated locally in `config/homepage/custom.css`; no remote assets
-or additional dependencies are used. Verify the renderer with
-`python3 -m unittest discover -s tests -p test_homepage_render.py` and `git diff --check`, then open the
-LAN page at both a desktop and narrow viewport to check the masthead and focus states. To roll back the
-visual refresh, restore the previous `scripts/render-homepage.py` and run `sudo vesselstackctl homepage sync`;
-service links, monitors, and custom service files are otherwise unchanged.
+The default Homepage uses VesselStack’s navy and teal palette, the bundled logo, your boat name,
+three tiles per row on wide screens, and a 24-hour clock. In **Control Panel → Settings → Homepage**,
+choose the light or dark palette, the boat name or VesselStack heading, the number of tiles per row,
+and a 24-hour, 12-hour, or hidden clock. **Save**, then **Apply**, and reload Homepage to see the result.
+The **Displays** tile opens that tab when the Control Panel is reachable on the boat network.
+
+For a manual configuration, the equivalent keys in `config/vesselstack.env` are `HOMEPAGE_THEME`
+(`dark` or `light`), `HOMEPAGE_COLUMNS` (`compact`, `standard`, or `wide`),
+`HOMEPAGE_HEADING` (`boat` or `brand`), and `HOMEPAGE_CLOCK` (`24h`, `12h`, or `hidden`).
+Run `sudo vesselstackctl homepage sync` after changing them manually. Restore the defaults by choosing
+dark, three tiles, the boat name, and the 24-hour clock in Settings.
 
 Tiles update automatically: `vesselstackctl homepage sync` runs at every start, on component
 add/remove, `lan` and `panel-access` changes, display enable and install/update. The rendered files in

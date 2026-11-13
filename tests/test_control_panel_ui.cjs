@@ -66,7 +66,7 @@ const context = {
     querySelector: (selector) => node(selector),
     querySelectorAll: (selector) => selector.includes('#config-form') ? formControls : selector.includes('data-clear-secret') ? clearBoxes : [],
   },
-  URL, Date,
+  URL, URLSearchParams, Date,
   fetch: (...args) => fetchImpl(...args),
 };
 vm.createContext(context);
@@ -706,16 +706,20 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
     // Ranges for bars and arcs.
     const d4 = ui.newDraft(e1); d4.selected = 2; ui.removeItem(d4, 2, 2);
     const tank = row({ row_id: 'oil', label: 'Oil', layouts: ['tank-bars'], min: 0, max: 100, definition: { path: 'tanks.oil', label: 'Oil', min: 0, max: 100 }, proposed_id: 'oil' });
-    assert.match(ui.addRowToDraft(e1, d4, tank, { min: '10', max: '5' }).error, /minimum must be/);
-    assert.match(ui.addRowToDraft(e1, d4, tank, { min: 'x', max: '5' }).error, /minimum must be/);
-    const ranged = ui.addRowToDraft(e1, d4, tank, { min: '0', max: '250' });
-    assert.equal(d4.newInstruments[ranged.id].max, 250); assert.equal(d4.newInstruments[ranged.id].min, 0);
-    // Template rows: the user names the instance; the id and path follow.
-    const tpl = row({ row_id: 'eng', label: 'Engine temp', template: true, path: 'propulsion.*.temperature', path_template: 'propulsion.*.temperature', label_template: 'Engine * temp', id_stem: 'engine_temp', proposed_id: 'engine_temp', layouts: ['grid-2x2'], definition: { path: 'propulsion.*.temperature', label: 'Engine temp', convert: 'K->C', unit: '°C', precision: 0, stale_after_s: 30 } });
+    const ranged = ui.addRowToDraft(e1, d4, tank);
+    assert.equal(d4.newInstruments[ranged.id].max, 100);
+    assert.equal(d4.newInstruments[ranged.id].min, 0);
+    ui.removeItem(d4, 2, 2);
+    const rangeControls = ui.rowAddControls(e1, d4, tank);
+    assert.match(allText(rangeControls), /Range 0 to 100/);
+    assert.equal(rangeControls.find((el) => el.tagName === 'input' && el.attrs.type === 'number').length, 0);
+    // Suggested sources use the concrete definition supplied by the catalog.
+    const tpl = row({ row_id: 'eng', label: 'Engine Port temp', template: true, instance: 'port', path: 'propulsion.port.temperature', id_stem: 'engine_temp_port', proposed_id: 'engine_temp_port', layouts: ['grid-2x2'], definition: { path: 'propulsion.port.temperature', label: 'Engine Port temp', convert: 'K->C', unit: '°C', precision: 0, stale_after_s: 30 } });
     const d5 = ui.newDraft(e1); d5.selected = 0; ui.removeItem(d5, 0, 3);
-    assert.match(ui.addRowToDraft(e1, d5, tpl, {}).error, /Type which one/); assert.match(ui.addRowToDraft(e1, d5, tpl, { instance: 'a.b' }).error, /Type which one/); assert.match(ui.addRowToDraft(e1, d5, tpl, { instance: '../x' }).error, /Type which one/);
+    assert.match(ui.addRowToDraft(e1, d5, tpl, {}).error, /Choose the suggested Signal K source/);
+    assert.match(ui.addRowToDraft(e1, d5, tpl, { instance: 'starboard' }).error, /Choose the suggested Signal K source/);
     const port = ui.addRowToDraft(e1, d5, tpl, { instance: 'port' });
-    assert.equal(port.id, 'engine_temp_port'); assert.equal(d5.newInstruments.engine_temp_port.path, 'propulsion.port.temperature'); assert.equal(d5.newInstruments.engine_temp_port.label, 'Engine port temp');
+    assert.equal(port.id, 'engine_temp_port'); assert.equal(d5.newInstruments.engine_temp_port.path, 'propulsion.port.temperature'); assert.equal(d5.newInstruments.engine_temp_port.label, 'Engine Port temp');
 
     // Page operations.
     const d6 = ui.newDraft(e1);
@@ -776,7 +780,7 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
     const base = { ...entry(), id: 'helm' };
     const st = ui.state.displays;
     st.mode = 'day'; st.severity = 'plain'; st.list = [base]; st.themes = themesJson; st.loaded = true; st.editing = null; st.drafts = {}; st.page = {}; st.saveErrors = {}; st.conflict = {}; st.rowOpts = {}; st.rowErrors = {}; st.query = '';
-    st.catalog = { schema: 1, live: { requested: true, ok: true }, groups: ['Navigation'], rows: [row({ layouts: ['grid-2x2', 'status-grid', 'single'] }), note(), row({ row_id: 'tpl', label: 'Engine temp', template: true, path: 'propulsion.*.temperature', path_template: 'propulsion.*.temperature', label_template: 'Engine * temp', id_stem: 'engine_temp', proposed_id: 'engine_temp', layouts: ['grid-2x2'], suggested_thresholds: { warn_above: 90 } })] };
+    st.catalog = { schema: 1, live: { requested: true, ok: true }, groups: ['Navigation'], rows: [row({ layouts: ['grid-2x2', 'status-grid', 'single'] }), note(), row({ row_id: 'tpl', label: 'Engine temp', template: true, instance: 'port', path: 'propulsion.port.temperature', id_stem: 'engine_temp_port', proposed_id: 'engine_temp_port', definition: { path: 'propulsion.port.temperature', label: 'Engine Port temp', convert: 'K->C' }, layouts: ['grid-2x2'], suggested_thresholds: { warn_above: 90 } })] };
     ui.state.operationRunning = false; ui.state.operation = null;
     const readOnly = allText(ui.displayCard(base));
     assert.match(readOnly, /Edit theme and pages/); assert.doesNotMatch(readOnly, /Discard/);
@@ -821,7 +825,8 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
     assert.ok(!('disabled' in addButtons()[0].attrs), 'room for the first row');
     assert.match(picker().find((el) => el.tagName === 'button' && el.attrs['data-row-id'] === 'smoke')[0].attrs['aria-label'], /^Add Smoke to page 1$/);
     assert.ok('disabled' in addButtons().find((b) => b.attrs['data-row-id'] === 'smoke').attrs && /Cannot be shown on a 2 × 2 grid page/.test(allText(picker())), 'a notification cannot go on a grid');
-    assert.equal(picker().find((el) => el.tagName === 'input' && el.attrs['data-row-opt'] === 'instance').length, 1, 'a template row asks which one');
+    assert.equal(picker().find((el) => el.tagName === 'select' && el.attrs['data-row-opt'] === 'instance').length, 1, 'a template row offers a source dropdown');
+    assert.match(allText(picker()), /port \(suggested\)/);
     assert.equal(picker().find((el) => el.tagName === 'input' && el.attrs['data-row-opt'] === 'alarm').length, 2, 'the alarm opt-in is offered for a row with suggested limits and for a notification');
     assert.match(allText(picker()), /Count in alarm banner \(uses the suggested limits\)/);
     // Searching updates the picker results in place.
@@ -830,14 +835,15 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
     assert.equal(addButtons().length, 1);
     ui.onDisplaysInput({ target: { dataset: { editorSearch: 'true' }, value: '' } });
     assert.equal(addButtons().length, 3);
-    // Add a template row without naming it, then with.
+    // Add a template row without selecting the source, then with a catalog choice.
     ui.runDisplayAction({ act: 'add-row', rowId: 'tpl' });
-    assert.match(st.rowErrors.tpl, /Type which one/); assert.match(allText(picker()), /Type which one/);
-    ui.onDisplaysInput({ target: { dataset: { rowOpt: 'instance', rowId: 'tpl' }, value: 'port', type: 'text' } });
+    assert.match(st.rowErrors.tpl, /Choose the suggested Signal K source/); assert.match(allText(picker()), /Choose the suggested Signal K source/);
+    ui.onDisplaysInput({ target: { dataset: { rowOpt: 'instance', rowId: 'tpl' }, value: 'port', type: 'select-one' } });
     ui.onDisplaysInput({ target: { dataset: { rowOpt: 'alarm', rowId: 'tpl' }, checked: true, type: 'checkbox' } });
     ui.runDisplayAction({ act: 'add-row', rowId: 'tpl' });
     deq(st.drafts.helm.pages[0].items, ['sog', 'depth', 'house_v', 'engine_temp_port']);
     deq(st.drafts.helm.newInstruments.engine_temp_port.thresholds, { warn_above: 90 });
+    assert.equal(st.drafts.helm.newInstruments.engine_temp_port.label, 'Engine Port temp');
     assert.equal(st.rowOpts.tpl, undefined, 'the options are used up');
     // Save: success path posts exactly the payload, leaves edit mode and reloads.
     ui.state.token = 'tok-save';
@@ -1029,6 +1035,18 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   }
 
   routes['/api/displays'] = { schema: 1, displays: [shown, { id: 'aux', name: 'Aux', board: 'b', error: 'could not be read' }] };
+  // A refresh started before a save must not replace the reloaded display with its old revision.
+  let finishOldList;
+  fetchImpl = async (path) => path === '/api/displays'
+    ? new Promise((resolve) => { finishOldList = resolve; }) : ok(routes[path]);
+  const oldRefresh = ui.loadDisplays(true);
+  fetchImpl = async (path) => path === '/api/displays'
+    ? ok({ displays: [{ ...shown, revision: 'new-revision' }] }) : ok(routes[path]);
+  await ui.loadDisplays(true);
+  finishOldList(ok({ displays: [{ ...shown, revision: 'old-revision' }] }));
+  await oldRefresh;
+  assert.equal(ui.state.displays.list[0].revision, 'new-revision');
+
   // A failing catalog does not hide the displays; a failing list shows one plain message.
   fetchImpl = async (path) => path === '/api/displays/catalog?live=1' ? ({ ok: false, status: 504, statusText: 'x', json: async () => ({ error: 'too long' }) }) : ok(routes[path]);
   await ui.loadDisplays(true); assert.equal(ui.state.displays.list.length, 2); assert.match(ui.state.displays.error, /data list could not be loaded: too long/);
