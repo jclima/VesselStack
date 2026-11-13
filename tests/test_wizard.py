@@ -279,8 +279,12 @@ class WizardHttpTests(unittest.TestCase):
     def test_exit_after_save_stops_the_server(self):
         wizard.Handler.exit_after_save = True
         self.addCleanup(setattr, wizard.Handler, "exit_after_save", False)
-        status, _ = self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Test"}}, self.good())
+        wizard.Handler.launched_by_installer = True
+        self.addCleanup(setattr, wizard.Handler, "launched_by_installer", False)
+        status, body = self.request("POST", "/api/save", {"values": {"BOAT_NAME": "Test"}}, self.good())
         self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["finished"])
+        self.assertTrue(json.loads(body)["installer"])
         for _ in range(50):
             try:
                 self.request("GET", "/api/system", None, self.good())

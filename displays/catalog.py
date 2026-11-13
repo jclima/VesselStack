@@ -687,12 +687,21 @@ def merged_catalog(catalog: dict, live: dict | None, units: str, config: dict, r
     rank = lambda group: len(order) + 1 if group == UNCATALOGUED else order.get(group, len(order))   # noqa: E731
     rows = [row for _, row in sorted(enumerate(rows), key=lambda pair: (rank(pair[1]["group"]), pair[0]))]
     used = _used_ids(config)
+    represented = set()
     for row in rows:
         existing = _configured(config, row)
         if existing:
+            represented.add(existing)
             row["configured_as"] = existing
             row["used_on"] = _used_on(config, existing)
             row["proposed_id"] = existing
+            if row["kind"] == "instrument":
+                definition = config["instruments"][existing]
+                for key in ("min", "max"):
+                    row.pop(key, None)
+                    if key in definition:
+                        row[key] = definition[key]
+                row["layouts"] = layouts_for("instrument", "min" in row and "max" in row, row["roles"], registry)
             continue
         row["configured_as"] = None
         row["used_on"] = []
@@ -700,6 +709,28 @@ def merged_catalog(catalog: dict, live: dict | None, units: str, config: dict, r
         used.add(item_id)
         row["proposed_id"] = item_id
         row["definition"] = definition
+
+    # A source can stop reporting without ceasing to be a configured value.
+    for section, kind in (("instruments", "instrument"), ("notifications", "notification")):
+        for item_id, definition in (config.get(section) or {}).items():
+            if item_id in represented or denied_path(definition["path"]):
+                continue
+            path = definition["path"]
+            has_range = "min" in definition and "max" in definition
+            is_live = path in (leaves if kind == "instrument" else active_notes)
+            row = {
+                **{key: definition[key] for key in ("label", "unit", "min", "max", "convert") if key in definition},
+                "row_id": f"configured:{item_id}", "group": "Configured values", "kind": kind,
+                "path": path, "template": False, "roles": [],
+                "live_state": ("live" if is_live else "no_live_data") if asked else "unknown",
+                "configured_as": item_id, "proposed_id": item_id, "used_on": _used_on(config, item_id),
+                "layouts": layouts_for(kind, has_range, [], registry),
+            }
+            if kind == "instrument" and is_live:
+                value = conversions.convert_and_round(definition["convert"], leaves[path]["value"], definition["precision"])
+                if value is not None:
+                    row["value"] = value
+            rows.append(row)
     return rows
 
 

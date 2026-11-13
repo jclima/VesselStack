@@ -3,24 +3,19 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## 0.8.0 - planned prerelease - 2026-11-11
+## 0.8.0 - 2026-11-12
 
-### Highlights
+- Configure the VesselStack Homepage from Control Panel Settings. Choose its palette, heading,
+  tile columns and clock. Applying settings refreshes the running Homepage cache, and the Displays
+  tile opens the Displays tab directly when the panel is reachable over the boat network.
+- Fix display saves and history restores by sharing the Control Panel's existing lifecycle lock
+  with the display command.
+- Use validated source choices and predefined gauge ranges in the display editor. Configured
+  sources stay available offline, and a late refresh can no longer replace a newer revision.
+- Tell browser wizard users to return to the installer terminal after saving.
 
-- Refresh the Homepage front door with a VesselStack nautical theme, responsive
-  layout, accessible focus states, and a boat-name greeting while preserving the
-  secret-free generated configuration and pinned image policy.
-- Carry forward the Displays editor improvements already present in `main`:
-  searchable value picking, visible layout/capacity context, draft-safe Done and
-  Cancel actions, authoritative unsaved previews, and explicit deploy/rollback
-  guidance.
-
-### Validation and release status
-
-This is a planned prerelease. Focused renderer and distribution validation pass
-locally; physical Raspberry Pi acceptance and hardware display validation remain
-open. Publish it as a prerelease first and do not mark it Latest until the
-documented lab checks pass.
+Automated and browser checks cover the main workflows. Physical Raspberry Pi and display
+acceptance remains pending.
 
 ## 0.7.1 - 2026-11-11
 

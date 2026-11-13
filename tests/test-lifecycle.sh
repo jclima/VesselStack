@@ -335,7 +335,7 @@ fi
 export FAKE_CALL_LOG="$TEST_ROOT/panel-calls.log"
 run_ctl panel-access lan >/dev/null
 grep -qx 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"
-if grep -qv 'systemctl restart vesselstack-control-panel.service' "$TEST_ROOT/panel-calls.log"; then
+if grep -Eqv '^systemctl restart vesselstack-control-panel.service$|^docker compose .* (ps --status running --quiet homepage$|exec -T homepage node -e )' "$TEST_ROOT/panel-calls.log"; then
     echo 'panel-access made an unexpected service call' >&2
     exit 1
 fi
@@ -1608,6 +1608,7 @@ grep -q '^HOMEPAGE_ALLOWED_HOSTS=.*localhost' "$APP_ROOT/config/vesselstack.env"
 printf -- '- Mine:\n    - Marina:\n        href: http://192.0.2.50/\n' > "$APP_ROOT/config/homepage-custom/services.yaml"
 run_ctl homepage sync
 grep -q 'Marina' "$APP_ROOT/config/homepage/services.yaml"
+grep -q 'docker compose.*exec -T homepage node' "$FAKE_BIN/calls.log"
 run_ctl homepage sync
 grep -q 'Marina' "$APP_ROOT/config/homepage-custom/services.yaml"
 # "refresh" (run at boot) re-renders and lets Compose recreate the container if the hosts changed.

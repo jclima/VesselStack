@@ -121,6 +121,8 @@ class TilesTests(unittest.TestCase):
         displays = services.split('- "Displays":')[1].split("- \"")[0]
         self.assertNotIn("href", displays)
         self.assertIn("SSH tunnel", displays)
+        _, services = self.tiles(vs={"DISPLAYS_ENABLE": "true"}, panel={"CONTROL_PANEL_HOST": "0.0.0.0"})
+        self.assertIn('href: "http://boat.local:8780/?tab=displays"', services)
 
     def test_data_tiles_only_when_the_data_bind_is_not_loopback(self):
         _, services = self.tiles(vs={"VESSELSTACK_DATA_BIND_ADDRESS": "0.0.0.0"})
@@ -174,6 +176,22 @@ class TilesTests(unittest.TestCase):
         self.assertIn('"boat.local"', fixture.read("custom.js"))
         # The Docker integration is empty: the socket is never offered to Homepage.
         self.assertNotRegex(fixture.read("docker.yaml"), r"(?m)^[^#\s-]")
+
+    def test_appearance_preferences_render_with_defaults_for_invalid_values(self):
+        fixture, _ = self.tiles(vs={"HOMEPAGE_THEME": "light", "HOMEPAGE_COLUMNS": "wide",
+                                     "HOMEPAGE_HEADING": "brand", "HOMEPAGE_CLOCK": "hidden"})
+        settings = fixture.read("settings.yaml")
+        self.assertIn('title: "VesselStack"', settings)
+        self.assertIn("theme: light", settings)
+        self.assertEqual(settings.count("columns: 4"), 3)
+        self.assertNotIn("datetime:", fixture.read("widgets.yaml"))
+        self.assertIn(render_homepage.LIGHT_CSS, fixture.read("custom.css"))
+
+        fixture, _ = self.tiles(vs={"HOMEPAGE_THEME": "unknown", "HOMEPAGE_COLUMNS": "5",
+                                     "HOMEPAGE_CLOCK": "12h"})
+        self.assertIn("theme: dark", fixture.read("settings.yaml"))
+        self.assertIn("columns: 3", fixture.read("settings.yaml"))
+        self.assertIn("hour12: true", fixture.read("widgets.yaml"))
 
 
 class SecretsTests(unittest.TestCase):

@@ -142,6 +142,7 @@ class Handler(SimpleHTTPRequestHandler):
     # When true (--exit-after-save) the server stops after the first successful save,
     # so a calling installer knows the wizard is finished.
     exit_after_save = False
+    launched_by_installer = False
     def __init__(self,*args,**kwargs): super().__init__(*args,directory=str(WIZARD),**kwargs)
     def log_message(self,fmt,*args): pass
     def end_headers(self):
@@ -165,7 +166,7 @@ class Handler(SimpleHTTPRequestHandler):
         route=self.path.split("?",1)[0]
         if route=="/api/system":
             if not self.token_ok(): return self.reply(403,{"error":"Missing or invalid wizard token"})
-            return self.reply(200,system_report())
+            return self.reply(200,{**system_report(),"installer":type(self).launched_by_installer})
         return super().do_GET()
     def do_POST(self):
         if not self.host_ok(): return self.reply(403,{"error":"Forbidden host or origin"})
@@ -177,7 +178,8 @@ class Handler(SimpleHTTPRequestHandler):
             if size>65536: raise ValueError("Request too large")
             values=json.loads(self.rfile.read(size)).get("values",{})
             save_env(OUTPUT,render(expand_signin(expand_lan_access(values))))
-            self.reply(200,{"saved":str(OUTPUT),"next":f"sudo ./install.sh --config {OUTPUT.name} --dry-run"})
+            self.reply(200,{"saved":str(OUTPUT),"next":f"sudo ./install.sh --config {OUTPUT.name} --dry-run",
+                            "finished":type(self).exit_after_save,"installer":type(self).launched_by_installer})
             if type(self).exit_after_save: threading.Thread(target=self.server.shutdown,daemon=True).start()
         except (ValueError,json.JSONDecodeError,OSError,AttributeError) as exc: self.reply(400,{"error":str(exc)})
 
@@ -380,6 +382,10 @@ SECTIONS=[
   F("CONTROL_PANEL_PORT","Control panel port","TCP port of the control panel.",advanced=True,required=True,check=PORT),
   F("GRAFANA_PORT","Grafana port","TCP port of Grafana.",advanced=True,required=True,check=PORT),
   F("HOMEPAGE_PORT","Home page port","TCP port of the home page (Homepage, HTTP).",advanced=True,required=True,check=PORT),
+  F("HOMEPAGE_THEME","Homepage appearance","Choose the VesselStack palette.","choice",advanced=True,choices=[("dark","VesselStack dark"),("light","VesselStack light")]),
+  F("HOMEPAGE_COLUMNS","Homepage tiles per row","Applies on wide screens.","choice",advanced=True,choices=[("compact","two"),("standard","three"),("wide","four")]),
+  F("HOMEPAGE_HEADING","Homepage heading","Choose what appears next to the VesselStack logo.","choice",advanced=True,choices=[("boat","boat name"),("brand","VesselStack")]),
+  F("HOMEPAGE_CLOCK","Homepage clock","Choose how time appears in the header.","choice",advanced=True,choices=[("24h","24-hour"),("12h","12-hour"),("hidden","hidden")]),
   F("HOMEPAGE_ALLOWED_HOSTS_EXTRA","Extra home page host names","Optional comma-separated host names (HOST or HOST:PORT) the home page should also answer to, for example a reverse proxy name. This Pi's names and addresses are added automatically.",advanced=True,check=_host_list),
   F("HOMEPAGE_ALLOWED_HOSTS","Home page allowed hosts","Generated at every start; not edited by hand.",advanced=True,when=lambda s:False),
   F("PROMETHEUS_PORT","Prometheus port","TCP port of Prometheus.",advanced=True,required=True,check=PORT),
@@ -725,6 +731,7 @@ def main():
     if args.output: OUTPUT=Path(args.output).resolve()
     if args.cli: sys.exit(cli_main(args))
     Handler.exit_after_save=args.exit_after_save
+    Handler.launched_by_installer=args.exit_after_save and os.environ.get("VESSELSTACK_WIZARD_FROM_INSTALLER")=="1"
     Handler.token=secrets.token_urlsafe(32)
     server=ThreadingHTTPServer((args.host,args.port),Handler); shown=f"[{args.host}]" if ":" in args.host else args.host
     port=server.server_address[1]; print(f"VesselStack wizard: http://{shown}:{port}",flush=True)

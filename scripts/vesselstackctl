@@ -226,9 +226,9 @@ persist_disabled_components() {
 
 # Render the Homepage configuration (tiles follow the enabled components and the
 # configured addresses) and refresh HOMEPAGE_ALLOWED_HOSTS, which changes with DHCP
-# addresses. Reads only host, port, bind and enable settings (see
+# addresses. Reads allow-listed appearance, host, port, bind and enable settings (see
 # scripts/render-homepage.py). A changed allowed-hosts value recreates the container
-# at the next "compose up"; the rendered files are picked up without a restart.
+# at the next "compose up".
 homepage_sync() {
     local renderer=${VESSELSTACK_HOMEPAGE_RENDERER:-$VESSELSTACK_ROOT/installer/scripts/render-homepage.py} hosts
     local -a render_args=()
@@ -241,6 +241,18 @@ homepage_sync() {
         set_env_key "$ENV_FILE" HOMEPAGE_ALLOWED_HOSTS "$hosts" || return 1
     fi
     export HOMEPAGE_ALLOWED_HOSTS=$hosts
+    local running
+    running=$("${COMPOSE[@]}" ps --status running --quiet homepage 2>/dev/null) || return 0
+    if [ -n "$running" ]; then
+        # The pinned Homepage caches settings in memory. Use the running
+        # container's own Host allow-list even when the host IP just changed.
+        local cache_request
+        cache_request='const host = process.env.HOMEPAGE_ALLOWED_HOSTS?.split(",")[0]?.trim(); '
+        cache_request+='fetch("http://127.0.0.1:3000/api/revalidate", {headers: host ? {Host: host} : {}, signal: AbortSignal.timeout(3000)})'
+        cache_request+='.then(result => { if (!result.ok) process.exitCode = 1; }).catch(() => { process.exitCode = 1; });'
+        "${COMPOSE[@]}" exec -T homepage node -e "$cache_request" >/dev/null ||
+            echo "WARN: Homepage settings were written, but the page cache could not be refreshed." >&2
+    fi
 }
 
 # Heimdall (the previous start page) is no longer part of the stack: remove its

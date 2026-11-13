@@ -564,8 +564,8 @@ expect_log "^userdel vesselstack-wizard$"
 expect_no_wizard_user
 refuse_log "runuser -u nobody"
 refuse_out "uid=65534 "
-expect_log "^runuser -u vesselstack-wizard -- env -i PATH=[^ ]+ HOME=/[^ ]+ LANG=C.UTF-8 python3 -I $RELEASE_BASE/$VER/vesselstack-wizard.py --port 8123 --output /[^ ]+/vesselstack.env --exit-after-save"
-expect_out "uid=[1-9][0-9]* env=HOME,LANG,PATH$"
+expect_log "^runuser -u vesselstack-wizard -- env -i PATH=[^ ]+ HOME=/[^ ]+ LANG=C.UTF-8 VESSELSTACK_WIZARD_FROM_INSTALLER=1 python3 -I $RELEASE_BASE/$VER/vesselstack-wizard.py --port 8123 --output /[^ ]+/vesselstack.env --exit-after-save"
+expect_out "uid=[1-9][0-9]* env=HOME,LANG,PATH,VESSELSTACK_WIZARD_FROM_INSTALLER$"
 refuse_out "uid=0 "
 wiz=$(grep -n "^runuser" "$LOG" | head -n1 | cut -d: -f1)
 dry=$(grep -n -- "^install .*--dry-run" "$LOG" | head -n1 | cut -d: -f1)
