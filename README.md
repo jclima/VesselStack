@@ -1071,7 +1071,9 @@ already done, so a re-run changes nothing:
    `settings.json`, unless some provider already uses that interface. The file
    is first copied to `settings.json.vesselstack-<UTC time>.bak` (mode 0600,
    same folder), written atomically, and no other entry is touched. A
-   `settings.json` that is not valid JSON is never replaced.
+   `settings.json` that is not valid JSON, is a symbolic link or has an
+   unexpected structure is never replaced: only this provider step is skipped,
+   with a `WARN`, and the plugin and its configuration are still handled.
 3. **Plugin configuration.** Writes
    `<data>/signalk/plugin-config-data/signalk-to-influxdb2.json` (mode 0600,
    owned by the Signal K account) only when that file does not exist: your own
@@ -1093,6 +1095,24 @@ bucket. The file and the `.bak` copies are in the data tree, so
 that finds the configuration file missing creates a new token and deletes the
 previous `vesselstack-signalk-writer` one.
 
+**Privilege model.** The installer runs as root, but the folder
+`<data>/signalk` belongs to the Signal K account (and in native mode that
+account also runs the chat, Telegram and alert services while the installer
+runs). So root only reads the environment file, calls the InfluxDB API and
+starts `npm` through its unprivileged paths (`docker run --user`, or a child
+started as the Signal K account). Every file operation inside that folder
+(reading and backing up `settings.json`, creating `plugin-config-data`, writing
+the plugin configuration) happens in a child process that first drops to the
+Signal K uid/gid (supplementary groups cleared, then gid, then uid, then
+checked) and works only relative to that folder, which root opened beforehand
+without following a link (the data folder above it is not open to the Signal K
+account in Docker mode), and creates its files as that account, so there is no `chown` and no root-owned follow-a-link step. The
+new writer token reaches that child over a pipe, never a command line or the
+environment. Every refusal that can be known in advance (an unwritable folder,
+`plugin-config-data` being a link or a file) is detected before the token is
+created, and a token whose configuration could not be written is deleted again.
+Requests to InfluxDB never follow a redirect, so a token is not forwarded.
+
 **npm prune guard.** `npm install` deletes anything in `node_modules` that
 `package.json` does not list. Before installing, the helper runs the same
 command with `--dry-run --json`; if it would remove any package (typically a
@@ -1100,6 +1120,10 @@ plugin installed by hand instead of from the App Store), the install is
 skipped, with a `WARN` naming the packages. Nothing else is changed, Signal K is
 not stopped, the installation still succeeds and `vesselstackctl doctor` keeps
 warning (the reason is kept in `/var/lib/vesselstack/signalk-datapath-skipped`).
+The guard cannot protect against `npm` being killed part-way (a power cut, or
+the 10-minute timeout) in **native** mode, which can leave a partial
+`node_modules`; rerunning the installer repairs it. In Docker mode a timed-out
+`npm` container (`vesselstack-npm-<pid>`) is force-removed.
 Fix it by adding those packages to `dependencies` in
 `<data>/signalk/package.json` (or deleting them if unused) and rerunning the
 installer. The VesselTwin preload does this for its own plugin.
@@ -1107,7 +1131,10 @@ installer. The VesselTwin preload does this for its own plugin.
 **Operational impact.**
 
 - The first run stops Signal K while the plugin is installed and starts it once
-  afterwards (a brief gap in data); later runs do not touch it.
+  afterwards (a brief gap in data); later runs do not touch it. Signal K is
+  started again in both modes (Docker: `compose up`; native: `systemctl start
+  vesselstack-signalk.service`) even when the helper failed, and a failure to
+  start it is only a warning: this step never fails the installation.
 - The plugin is about 49 MB (108 packages) in `node_modules`, downloaded from the
   npm registry. Its direct dependencies are version ranges, not pins, so the
   sub-dependencies npm resolves can differ between boats and over time.
@@ -1128,6 +1155,12 @@ installer. The VesselTwin preload does this for its own plugin.
 
 - `OK   Signal K data reaches InfluxDB: newest point Ns ago ...` when the newest
   point of your vessel is under 2 minutes old;
+- `WARN the Signal K InfluxDB writer token was rejected` when InfluxDB no longer
+  accepts the token in the plugin configuration (after InfluxDB's data was wiped
+  or restored from another install, or the token was deleted). Fix: delete
+  `<data>/signalk/plugin-config-data/signalk-to-influxdb2.json` and rerun the
+  installer, which creates a new token and configuration. The check sends the
+  token to InfluxDB through the environment of `docker exec`, never an argument;
 - `WARN` when it is older (or there is none in the last hour), when the plugin
   configuration is missing or disabled, when InfluxDB cannot be queried, when
   the install was skipped by the prune guard, and, with SocketCAN enabled, when
@@ -1146,16 +1179,27 @@ sudo vesselstackctl stop
 sudo rm /opt/vesselstack-data/signalk/plugin-config-data/signalk-to-influxdb2.json
 # Undo the provider: restore the copy made before it was added
 sudo ls /opt/vesselstack-data/signalk/settings.json.vesselstack-*.bak
-sudo cp -p /opt/vesselstack-data/signalk/settings.json.vesselstack-<time>.bak /opt/vesselstack-data/signalk/settings.json
-# Remove the plugin (Docker mode shown; native: npm uninstall --prefix <data>/signalk as the VesselStack user)
+# (copy it as the Signal K account, so ownership stays right: use its uid, 1000 in Docker mode)
+sudo -u '#1000' cp /opt/vesselstack-data/signalk/settings.json.vesselstack-<time>.bak /opt/vesselstack-data/signalk/settings.json
+# Remove the plugin (Docker mode shown; native: npm uninstall --ignore-scripts --prefix <data>/signalk as the VesselStack user).
+# Look at what npm would remove first, and stop if it lists anything but signalk-to-influxdb2 and its own dependencies:
 sudo docker run --rm --user 1000:1000 --cap-drop ALL -e HOME=/tmp -v /opt/vesselstack-data/signalk:/home/node/.signalk \
   -w /home/node/.signalk --entrypoint npm cr.signalk.io/signalk/signalk-server:<SIGNALK_VERSION> \
-  uninstall --no-audit --no-fund --no-package-lock signalk-to-influxdb2
+  uninstall --ignore-scripts --dry-run --no-audit --no-fund --no-package-lock signalk-to-influxdb2
+sudo docker run --rm --user 1000:1000 --cap-drop ALL -e HOME=/tmp -v /opt/vesselstack-data/signalk:/home/node/.signalk \
+  -w /home/node/.signalk --entrypoint npm cr.signalk.io/signalk/signalk-server:<SIGNALK_VERSION> \
+  uninstall --ignore-scripts --no-audit --no-fund --no-package-lock signalk-to-influxdb2
 sudo vesselstackctl start
 ```
 
 Then revoke the token: in the InfluxDB UI (**Load Data > API Tokens**) delete
 `vesselstack-signalk-writer`. Recorded data stays in the bucket.
+
+**If the token is rejected** (doctor says so, or the Signal K log shows
+`signalk-to-influxdb2 unauthorized access`): delete
+`<data>/signalk/plugin-config-data/signalk-to-influxdb2.json`, rerun
+`sudo ./install.sh` and restart Signal K; the previous
+`vesselstack-signalk-writer` token, if InfluxDB still has it, is replaced.
 
 The installer provisions a one-minute mean downsample task into
 `INFLUXDB_HISTORY_BUCKET`. Confirm it is running before depending on Boat

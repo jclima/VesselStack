@@ -1568,9 +1568,11 @@ check_signalk_data_dir() {
 }
 
 # Last value of the single data row of `influx query --raw` output (empty when there is none).
+# The token (the admin token unless a second argument gives another) travels in the environment
+# of the docker client and is forwarded by name, never as an argument.
 signalk_datapath_value() {
     local flux=$1 out
-    out=$(INFLUX_TOKEN=$INFLUXDB_TOKEN INFLUX_ORG=${INFLUXDB_ORG:-} timeout 20 docker exec -e INFLUX_TOKEN -e INFLUX_ORG \
+    out=$(INFLUX_TOKEN=${2:-$INFLUXDB_TOKEN} INFLUX_ORG=${INFLUXDB_ORG:-} timeout 20 docker exec -e INFLUX_TOKEN -e INFLUX_ORG \
         "${INFLUXDB_CONTAINER_NAME:-vesselstack-influxdb}" influx query --raw "$flux" 2>/dev/null) || return 1
     printf '%s\n' "$out" | tr -d '\r' | awk -F, '!/^#/ && !/^,result/ && NF { v = $NF } END { print v }'
 }
@@ -1579,7 +1581,7 @@ signalk_datapath_value() {
 # at the dock legitimately has no live data, and an owner who manages the plugin by hand is
 # not wrong. Only managed modes are judged.
 check_signalk_datapath() {
-    local mode=${SIGNALK_MODE:-existing} dir="$VESSELSTACK_DATA/signalk" config skip_file bucket newest count now_s then_s age iface rx
+    local mode=${SIGNALK_MODE:-existing} dir="$VESSELSTACK_DATA/signalk" config skip_file bucket newest count now_s then_s age iface rx writer
     [ "$mode" != existing ] || return 0
     if [ "${SIGNALK_DATAPATH_AUTOCONFIG:-true}" != true ]; then
         printf 'INFO Signal K data path automation is off (SIGNALK_DATAPATH_AUTOCONFIG=false); the plugin, provider and token are yours to manage\n'
@@ -1606,12 +1608,23 @@ check_signalk_datapath() {
         printf 'WARN cannot check whether Signal K data reaches InfluxDB (INFLUXDB_TOKEN or INFLUXDB_RAW_BUCKET is unusable)\n' >&2
         return 0
     fi
-    if ! newest=$(signalk_datapath_value "from(bucket: \"$bucket\") |> range(start: -1h) |> filter(fn: (r) => r.self == \"true\" and r._field == \"value\") |> last() |> map(fn: (r) => ({_time: r._time, _value: 1})) |> group() |> max(column: \"_time\") |> keep(columns: [\"_time\"])") \
+    if ! newest=$(signalk_datapath_value "from(bucket: \"$bucket\") |> range(start: -1h) |> filter(fn: (r) => r.self == \"true\" and r._field == \"value\") |> keep(columns: [\"_time\"]) |> group() |> sort(columns: [\"_time\"], desc: true) |> limit(n: 1)") \
         || ! count=$(signalk_datapath_value "from(bucket: \"$bucket\") |> range(start: -10m) |> filter(fn: (r) => r.self == \"true\" and r._field == \"value\") |> map(fn: (r) => ({_time: r._time, _value: 1})) |> group() |> count()"); then
         printf 'WARN could not query InfluxDB to check the Signal K data path (is the InfluxDB container running?). Check: vesselstackctl status\n' >&2
         return 0
     fi
     count=${count:-0}
+    # The writer token the plugin holds is useless after an InfluxDB wipe or restore (or a deleted
+    # token): the plugin then logs "unauthorized" and records nothing. Probe it with a cheap read.
+    writer=
+    if command -v jq >/dev/null 2>&1; then
+        writer=$(jq -r '.configuration.influxes[0].token // empty' "$config" 2>/dev/null || true)
+    fi
+    if [ -n "$writer" ] && ! signalk_datapath_value "from(bucket: \"$bucket\") |> range(start: -1m) |> limit(n: 1)" "$writer" >/dev/null; then
+        printf 'WARN the Signal K InfluxDB writer token was rejected, so nothing is recorded. Fix: delete %s and rerun the installer (it creates a new token)\n' "${config#"$VESSELSTACK_DATA"/}" >&2
+        return 0
+    fi
+    writer=
     now_s=$(date +%s)
     then_s=
     [ -z "$newest" ] || then_s=$(date -d "$newest" +%s 2>/dev/null || true)

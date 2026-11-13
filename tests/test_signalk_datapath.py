@@ -5,9 +5,12 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -65,13 +68,21 @@ class DatapathTests(unittest.TestCase):
         self.npm_calls = []
         self.dry_run_output = '{\n  "added": 3,\n  "removed": 0,\n  "remove": []\n}\n'
         self.influx = FakeInflux()
-        for target, value in (("chown", lambda *a: None), ("http_json", self.influx), ("now", dp.now)):
+        self.real_http_json = dp.http_json
+        self.dropped = self.root / "dropped.log"  # written by the forked child, outside the Signal K tree
+        for target, value in (("fchown", lambda *a: None), ("http_json", self.influx), ("now", dp.now),
+                              ("drop_privileges", self.fake_drop)):
             patcher = mock.patch.object(dp, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         patcher = mock.patch.object(dp.subprocess, "run", self.fake_run)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def fake_drop(self, uid, gid):
+        # Unprivileged stand-in for dropping to the Signal K account: record that it ran in the child.
+        with open(self.dropped, "a") as log:
+            log.write(f"{os.getpid()} {uid} {gid}\n")
 
     def write_env(self, **overrides):
         values = {
@@ -84,6 +95,8 @@ class DatapathTests(unittest.TestCase):
 
     def fake_run(self, cmd, **kwargs):
         self.npm_calls.append((list(cmd), kwargs))
+        if cmd[:3] == ["docker", "rm", "-f"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"")
         dry = "--dry-run" in cmd
         if dry:
             return subprocess.CompletedProcess(cmd, 0, stdout=self.dry_run_output.encode())
@@ -260,18 +273,35 @@ class DatapathTests(unittest.TestCase):
         self.assertFalse((self.signalk / "settings.json").exists())
         self.assertTrue(self.config_file().exists())
 
-    def test_unparsable_or_linked_settings_are_never_replaced(self):
+    def test_unparsable_or_linked_settings_skip_only_the_provider_step(self):
         self.install_plugin()
         path = self.signalk / "settings.json"
         path.write_text("{not json")
-        self.assertEqual(self.run_main(), 1)
+        self.assertEqual(self.run_main(), dp.EXIT_CHANGED)  # the plugin configuration was still written
         self.assertEqual(path.read_text(), "{not json")
+        self.assertIn("WARN", self.err)
+        self.assertIn("settings.json", self.err)
+        self.assertTrue(self.config_file().exists())
+        self.assertEqual(list(self.signalk.glob("settings.json.vesselstack-*.bak")), [])
+        self.config_file().unlink()
         path.unlink()
         target = self.root / "elsewhere.json"
         target.write_text("{}")
         path.symlink_to(target)
-        self.assertEqual(self.run_main(), 1)
+        self.assertEqual(self.run_main(), dp.EXIT_CHANGED)
         self.assertEqual(target.read_text(), "{}")
+        self.assertTrue(path.is_symlink())
+        self.assertIn("WARN", self.err)
+        self.assertTrue(self.config_file().exists())
+
+    def test_non_ascii_settings_are_kept_readable(self):
+        self.install_plugin()
+        path = self.signalk / "settings.json"
+        path.write_text(json.dumps({"vessel": "S\u00fcdwind \u2693"}, ensure_ascii=False), encoding="utf-8")
+        self.run_main()
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("S\u00fcdwind \u2693", text)
+        self.assertNotIn("\\u00fc", text)
 
     def test_bad_interface_name_is_rejected(self):
         self.install_plugin()
@@ -379,6 +409,124 @@ class DatapathTests(unittest.TestCase):
         self.assertEqual(entry["url"], "http://192.0.2.10:18086")
         self.write_env(VESSELSTACK_DATA_BIND_ADDRESS="0.0.0.0")
         self.assertEqual(dp.influx_base(dp.read_env(self.env_file)), "http://127.0.0.1:8086")
+
+    # --- privilege drop, ordering, redirects, cleanup -------------------------------
+
+    def test_file_work_runs_in_a_child_that_dropped_privileges_and_the_token_stays_off_argv_and_env(self):
+        seen = []
+        original = dp.as_service_user
+
+        def spy(args, work, payload):
+            seen.append((work.__name__, json.dumps(payload), WRITER in " ".join(sys.argv), any(WRITER in v for v in os.environ.values())))
+            return original(args, work, payload)
+
+        with mock.patch.object(dp, "as_service_user", spy):
+            self.assertEqual(self.run_main(), dp.EXIT_CHANGED)
+        self.assertEqual([name for name, *_ in seen], ["inspect_work", "apply_work"])
+        self.assertIn(WRITER, seen[1][1])  # it travels in the payload (a pipe) ...
+        self.assertFalse(any(argv or environ for _, _, argv, environ in seen))  # ... never argv or the environment
+        self.assertNotIn(ADMIN, json.dumps([payload for _, payload, *_ in seen]))
+        lines = [line.split() for line in self.dropped.read_text().splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(pid != str(os.getpid()) and (uid, gid) == ("1000", "1000") for pid, uid, gid in lines))
+
+    def test_drop_order_is_groups_then_gid_then_uid_and_is_verified(self):
+        manager = mock.Mock()
+        with mock.patch.object(dp.os, "setgroups", manager.setgroups), mock.patch.object(dp.os, "setgid", manager.setgid), \
+                mock.patch.object(dp.os, "setuid", manager.setuid), mock.patch.object(dp.os, "getuid", return_value=1000), \
+                mock.patch.object(dp.os, "geteuid", return_value=1000), mock.patch.object(dp.os, "getgid", return_value=1000), \
+                mock.patch.object(dp.os, "getegid", return_value=1000):
+            manager.setuid.side_effect = [None, PermissionError()]  # the attempt to regain root must fail
+            dp._drop_privileges(1000, 1000)
+        self.assertEqual([c[0] for c in manager.mock_calls], ["setgroups", "setgid", "setuid", "setuid"])
+        self.assertEqual(manager.setgroups.call_args.args, ([],))
+        with mock.patch.object(dp.os, "setgroups"), mock.patch.object(dp.os, "setgid"), mock.patch.object(dp.os, "setuid"), \
+                mock.patch.object(dp.os, "getuid", return_value=0):
+            with self.assertRaises(RuntimeError):
+                dp._drop_privileges(1000, 1000)
+
+    def test_refusals_are_found_before_a_token_is_created(self):
+        self.install_plugin()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.signalk / "plugin-config-data").symlink_to(elsewhere)
+        self.assertEqual(self.run_main(), 1)
+        self.assertEqual(self.influx.calls, [])
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        (self.signalk / "plugin-config-data").unlink()
+        (self.signalk / "plugin-config-data").write_text("a file, not a directory")
+        self.assertEqual(self.run_main(), 1)
+        self.assertEqual(self.influx.calls, [])
+
+    def test_a_token_whose_configuration_cannot_be_written_is_revoked(self):
+        self.install_plugin()
+        real = dp.write_atomic_at
+
+        def broken(dir_fd, name, *rest, **kwargs):
+            if name == "signalk-to-influxdb2.json":
+                raise OSError("disk full")
+            return real(dir_fd, name, *rest, **kwargs)
+
+        with mock.patch.object(dp, "write_atomic_at", broken):
+            self.assertEqual(self.run_main(), 1)
+        self.assertIn("writing the plugin configuration failed", self.err)
+        self.assertEqual([p.rsplit("/", 1)[1] for p in self.influx.paths("DELETE")][-1], "newauth")
+        self.assertNotIn(WRITER, self.err)
+
+    def test_redirects_are_refused_and_the_token_is_not_forwarded(self):
+        hits = []
+
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            log_message = lambda *a: None
+
+        target = HTTPServer(("127.0.0.1", 0), Target)
+
+        class Redirector(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(307)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/stolen")
+                self.end_headers()
+
+            log_message = lambda *a: None
+
+        redirector = HTTPServer(("127.0.0.1", 0), Redirector)
+        for server in (target, redirector):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+        with self.assertRaises(urllib.error.URLError):
+            self.real_http_json("GET", f"http://127.0.0.1:{redirector.server_port}/api/v2/buckets", ADMIN)
+        self.assertEqual(hits, [])
+
+    def test_docker_npm_is_named_and_removed_when_it_times_out(self):
+        def timing_out(cmd, **kwargs):
+            self.npm_calls.append((list(cmd), kwargs))
+            if cmd[:3] == ["docker", "rm", "-f"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"")
+            if "--dry-run" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=self.dry_run_output.encode())
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+        with mock.patch.object(dp.subprocess, "run", timing_out):
+            self.assertEqual(self.run_main(), 1)
+        install = [cmd for cmd, _ in self.npm_calls if cmd[0] == "docker" and cmd[1] == "run" and "--dry-run" not in cmd][0]
+        name = install[install.index("--name") + 1]
+        self.assertEqual(name, f"vesselstack-npm-{os.getpid()}")
+        self.assertEqual(self.npm_calls[-1][0], ["docker", "rm", "-f", name])
+        self.assertEqual(self.influx.calls, [])
+
+    def test_an_unexpected_error_names_only_the_step(self):
+        with mock.patch.object(dp, "prune_guard", side_effect=ValueError("/secret/path " + ADMIN)):
+            self.assertEqual(self.run_main(), 1)
+        self.assertIn("checking what npm would remove failed", self.err)
+        self.assertNotIn("/secret/path", self.err + self.out)
+        self.assertNotIn(ADMIN, self.err + self.out)
 
 
 if __name__ == "__main__":

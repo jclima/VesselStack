@@ -1748,6 +1748,7 @@ if [ "${1:-}" = exec ] && [[ " $* " == *" influx query --raw "* ]]; then
     printf '%s\n' "$*" >> "$DP_BIN_LOG"
     [ -z "${FAKE_INFLUX_FAIL:-}" ] || exit 1
     [ -n "${INFLUX_TOKEN:-}" ] || exit 1
+    [ -z "${FAKE_INFLUX_REJECT:-}" ] || [ "$INFLUX_TOKEN" != "$FAKE_INFLUX_REJECT" ] || { echo "401 Unauthorized: unauthorized access" >&2; exit 1; }
     if [[ "$*" == *"-1h"* ]]; then
         [ -z "${FAKE_INFLUX_NEWEST:-}" ] || printf '#datatype,string,long,dateTime:RFC3339\r\n,result,table,_time\r\n,,0,%s\r\n\r\n' "$FAKE_INFLUX_NEWEST"
     else
@@ -1797,6 +1798,18 @@ grep -q 'RESULT healthy' <<<"$out"
 # The token is in the environment of the docker client, not in any argument.
 if grep -q 'test-token-not-secret' "$TEST_ROOT/datapath-docker.log"; then echo 'doctor put the InfluxDB token on a command line' >&2; exit 1; fi
 grep -q -- 'exec -e INFLUX_TOKEN -e INFLUX_ORG vesselstack-influxdb influx query --raw' "$TEST_ROOT/datapath-docker.log"
+# A writer token InfluxDB no longer knows (after a wipe or restore) is called out, and neither
+# token ever appears in an argument. A valid one passes.
+printf '{"enabled": true, "configuration": {"influxes": [{"token": "stale-writer-token-not-secret"}]}}\n' > "$DP_CONFIG"
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-20 seconds' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=412 FAKE_INFLUX_REJECT=stale-writer-token-not-secret)
+grep -q 'WARN the Signal K InfluxDB writer token was rejected' <<<"$out"
+grep -q 'plugin-config-data/signalk-to-influxdb2.json' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+if grep -q 'Signal K data reaches InfluxDB' <<<"$out"; then echo 'doctor called a rejected writer token healthy' >&2; exit 1; fi
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-20 seconds' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=412 FAKE_INFLUX_REJECT=some-other-token)
+grep -q 'OK   Signal K data reaches InfluxDB' <<<"$out"
+if grep -q 'stale-writer-token-not-secret' "$TEST_ROOT/datapath-docker.log"; then echo 'doctor put the writer token on a command line' >&2; exit 1; fi
+printf '{"enabled": true, "configuration": {}}\n' > "$DP_CONFIG"
 out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-30 minutes' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=0)
 grep -Eq 'WARN the newest Signal K point in InfluxDB is 3[01] minutes old' <<<"$out"
 grep -q 'RESULT healthy' <<<"$out"

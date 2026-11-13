@@ -1911,8 +1911,12 @@ configure_signalk_datapath() {
     fi
     rc=0
     python3 "$SCRIPT_DIR/scripts/configure-signalk-datapath.py" "${args[@]}" || rc=$?
+    # Signal K comes back whatever the helper did; a failure to start it is a warning, never an
+    # installation failure (this hook is documented as such).
     if [ "$SIGNALK_MODE" = docker ]; then
-        "${compose_up[@]}" signalk
+        "${compose_up[@]}" signalk || echo "WARN: could not start Signal K again; run: sudo vesselstackctl start" >&2
+    else
+        systemctl start vesselstack-signalk.service || echo "WARN: could not start vesselstack-signalk.service; run: sudo systemctl start vesselstack-signalk.service" >&2
     fi
     case "$rc" in
         0|10) ;;

@@ -28,6 +28,11 @@ Semantic Versioning.
   (`npm install --dry-run`) skips the install, with a warning, if npm would delete packages that
   `package.json` does not list; `--offline` installs skip the step. The token can read the raw bucket,
   including position data, and is stored in the plugin configuration (mode 0600).
+  All file work inside the Signal K data directory runs in a child that has dropped to the Signal K
+  uid/gid (no root `chown` or link-following there; the token travels over a pipe), refusals are found
+  before a token is created, InfluxDB requests never follow redirects, a timed-out Docker `npm` container
+  is removed, Signal K is restarted in native mode too without ever failing the installation, a malformed
+  `settings.json` skips only the provider step, and `vesselstackctl doctor` reports a rejected writer token.
 - Add the **VesselStack Boat Overview** Grafana dashboard (batteries, tanks, engine, navigation without
   position, environment) reading `INFLUXDB_RAW_BUCKET`; the installer rejects a bucket name that is not
   1 to 64 letters, digits, dots, hyphens or underscores.

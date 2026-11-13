@@ -12,6 +12,14 @@ Three idempotent steps, each skipped when it is already done:
      but only when that file does not exist (the owner's file is never overwritten).
      The DBRP mapping the plugin needs is created first when it is missing.
 
+Privilege model: this runs as root, but root only reads the environment file, calls the
+InfluxDB API and starts npm through its existing unprivileged paths (docker --user, or a
+child that drops to the Signal K account). Everything inside <data>/signalk, a directory the
+Signal K account owns and can write, happens in a forked child that has first dropped to that
+uid/gid (setgroups, setgid, setuid) and uses O_NOFOLLOW / dir_fd-relative operations. The
+writer token reaches that child over a pipe, never argv or the environment. No path-based
+chown or other symlink-following root operation touches that tree.
+
 Exit status: 0 nothing (more) to do, 10 something changed (or would change under
 --check), 11 the plugin install was skipped by the npm prune guard (nothing was
 changed), anything else is an error. The admin token is read from the environment
@@ -24,9 +32,13 @@ import datetime
 import json
 import os
 import re
+import select
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,8 +57,40 @@ TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 NPM_ARGS = ["install", "--save-exact", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock"]
 NPM_TIMEOUT = 600
 
+CHILD_TIMEOUT = 120
+CONFIG_DIR = "plugin-config-data"
+
 # Seams for the tests.
-chown = os.chown
+fchown = os.fchown
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    """Become uid:gid for good (supplementary groups first, then gid, then uid) and prove it."""
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+    if (os.getuid(), os.geteuid(), os.getgid(), os.getegid()) != (uid, uid, gid, gid):
+        raise RuntimeError("privileges were not dropped")
+    if uid != 0:
+        try:
+            os.setuid(0)
+        except PermissionError:
+            return
+        raise RuntimeError("privileges can be regained")
+
+
+drop_privileges = _drop_privileges
+_phase = ["starting"]
+
+
+class StepFailed(Exception):
+    def __init__(self, step: str):
+        super().__init__(step)
+        self.step = step
+
+
+class SettingsUnusable(Exception):
+    pass
 
 
 def now() -> datetime.datetime:
@@ -55,8 +99,7 @@ def now() -> datetime.datetime:
 
 def fail(step: str) -> "NoReturn":
     # Only the failing step is named: nothing here may carry a secret.
-    print(f"Signal K data path: {step} failed", file=sys.stderr)
-    raise SystemExit(1)
+    raise StepFailed(step)
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -76,9 +119,130 @@ def read_env(path: Path) -> dict[str, str]:
     return values
 
 
-def refuse_symlink(path: Path, step: str) -> None:
-    if path.is_symlink():
-        fail(f"{step} (refusing a symbolic link)")
+# --- File access relative to an open directory (the Signal K data directory) ----
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def open_dir(name, dir_fd=None) -> int:
+    return os.open(name, DIR_FLAGS, dir_fd=dir_fd)
+
+
+def read_file_at(dir_fd: int, parts: list[str], limit: int = 1 << 24) -> bytes:
+    """Read a regular file below dir_fd, refusing symbolic links at every component."""
+    fds = []
+    try:
+        current = dir_fd
+        for part in parts[:-1]:
+            current = open_dir(part, current)
+            fds.append(current)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=current)
+        fds.append(fd)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        return os.read(fd, limit)
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def write_atomic_at(dir_fd: int, name: str, data: bytes, mode: int, noreplace: bool = False) -> None:
+    """Create name below dir_fd (owned by whoever runs this) via a temporary file."""
+    tmp = f".{name}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=dir_fd)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if noreplace:
+            os.link(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)  # fails when it appeared meanwhile
+        else:
+            os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    finally:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+    os.fsync(dir_fd)
+
+
+def write_atomic_path(path: Path, data: bytes, mode: int) -> None:
+    """For root-controlled folders only (the doctor status file)."""
+    dir_fd = open_dir(str(path.parent))
+    try:
+        write_atomic_at(dir_fd, path.name, data, mode)
+    finally:
+        os.close(dir_fd)
+
+
+def as_service_user(args, work, payload: dict) -> dict:
+    """Run work(args, payload, dir_fd) in a forked child that has dropped to the Signal K uid/gid.
+
+    dir_fd is <data>/signalk, opened here (as root, without following a link in the last
+    component) because the data folder above it is typically not traversable by the Signal K
+    account; the child then works only relative to that descriptor.
+
+    The payload (which may hold the writer token) goes in over a pipe; the result comes
+    back as JSON over another. StepFailed in the child becomes StepFailed here.
+    """
+    try:
+        dir_fd = open_dir(str(args.data / "signalk"))
+    except OSError:
+        fail("locating the Signal K data directory")
+    in_r, in_w = os.pipe()
+    out_r, out_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child: never returns into the caller's code
+        status = 70
+        try:
+            os.close(in_w)
+            os.close(out_r)
+            drop_privileges(args.uid, args.gid)
+            with os.fdopen(in_r, "rb") as source:
+                request = json.loads(source.read() or b"{}")
+            try:
+                result = {"ok": work(args, request, dir_fd)}
+            except StepFailed as exc:
+                result = {"fail": exc.step}
+            with os.fdopen(out_w, "wb") as sink:
+                sink.write(json.dumps(result).encode())
+            status = 0
+        except BaseException:
+            pass
+        finally:
+            os._exit(status)
+    os.close(in_r)
+    os.close(out_w)
+    chunks = []
+    try:
+        with os.fdopen(in_w, "wb") as sink:
+            sink.write(json.dumps(payload).encode())
+        deadline = time.monotonic() + CHILD_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([out_r], [], [], remaining)[0]:
+                os.kill(pid, signal.SIGKILL)
+                break
+            chunk = os.read(out_r, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(out_r)
+        os.close(dir_fd)
+        os.waitpid(pid, 0)
+    try:
+        result = json.loads(b"".join(chunks))
+    except ValueError:
+        fail(_phase[0] + " (the unprivileged helper did not finish)")
+    if "fail" in result:
+        fail(result["fail"])
+    return result["ok"]
 
 
 # --- Step 1: the plugin --------------------------------------------------------
@@ -88,20 +252,23 @@ def version_tuple(text: str):
     return tuple(int(p) for p in parts.groups()) if parts else None
 
 
-def plugin_needed(signalk: Path) -> bool:
-    manifest = signalk / "node_modules" / PLUGIN / "package.json"
-    if not manifest.is_file():
-        return True
+def plugin_needed(dir_fd: int) -> bool:
     try:
-        installed = version_tuple(str(json.loads(manifest.read_text()).get("version", "")))
-    except (OSError, ValueError):
+        raw = read_file_at(dir_fd, ["node_modules", PLUGIN, "package.json"])
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False  # a link or odd file: leave the owner's copy alone
+    try:
+        installed = version_tuple(str(json.loads(raw).get("version", "")))
+    except (ValueError, AttributeError):
         return False  # unreadable: leave the owner's copy alone
     if installed is None:
         return False
     return installed < version_tuple(PLUGIN_VERSION)
 
 
-def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cache: str | None):
+def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cache: str | None, name: str | None = None):
     """Return (argv, subprocess kwargs) for npm in the Signal K data directory."""
     spec = f"{PLUGIN}@{PLUGIN_VERSION}"
     if args.mode == "docker":
@@ -110,7 +277,7 @@ def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cach
             fail("reading SIGNALK_VERSION")
         if ":" in str(signalk) or "," in str(signalk):
             fail("validating the Signal K data directory (unsupported characters)")
-        cmd = ["docker", "run", "--rm", "--pull", "never", "--cap-drop", "ALL", "--user", f"{args.uid}:{args.gid}",
+        cmd = ["docker", "run", "--rm", "--name", name or f"vesselstack-npm-{os.getpid()}", "--pull", "never", "--cap-drop", "ALL", "--user", f"{args.uid}:{args.gid}",
                "-e", "HOME=/tmp", "-e", "npm_config_cache=/tmp/.npm",
                "-v", f"{signalk}:{IMAGE_CONFIG_DIR}", "-w", IMAGE_CONFIG_DIR, "--entrypoint", "npm",
                f"{IMAGE_REPOSITORY}:{tag}", *NPM_ARGS, *extra, spec]
@@ -120,10 +287,17 @@ def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cach
     return cmd, {"cwd": signalk, "env": environment, "user": args.uid, "group": args.gid, "extra_groups": []}
 
 
-def run_npm(cmd: list[str], **kwargs) -> str:
+def run_npm(cmd: list[str], container: str | None = None, **kwargs) -> str:
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=NPM_TIMEOUT, **kwargs)
     except (OSError, subprocess.TimeoutExpired):
+        if container:
+            # Killing the docker client leaves the container running; remove it.
+            try:
+                subprocess.run(["docker", "rm", "-f", container], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                pass
         fail("installing the plugin")
     output = result.stdout.decode("utf-8", "replace")
     if result.returncode != 0:
@@ -135,11 +309,16 @@ def run_npm(cmd: list[str], **kwargs) -> str:
 
 def npm_runner(args, env: dict[str, str], signalk: Path, extra: list[str]) -> str:
     if args.mode == "docker":
-        cmd, kwargs = npm_command(args, env, signalk, extra, None)
-        return run_npm(cmd, **kwargs)
+        name = f"vesselstack-npm-{os.getpid()}"
+        cmd, kwargs = npm_command(args, env, signalk, extra, None, name)
+        return run_npm(cmd, container=name, **kwargs)
     with tempfile.TemporaryDirectory(prefix="vesselstack-npm-") as cache:
-        chown(cache, args.uid, args.gid)
-        os.chmod(cache, 0o700)
+        cache_fd = open_dir(cache)  # created by us, 0700: hand it to the service account by descriptor
+        try:
+            fchown(cache_fd, args.uid, args.gid)
+            os.fchmod(cache_fd, 0o700)
+        finally:
+            os.close(cache_fd)
         cmd, kwargs = npm_command(args, env, signalk, extra, cache)
         return run_npm(cmd, **kwargs)
 
@@ -187,7 +366,7 @@ def record_skip(args, packages: list[str]) -> None:
     if args.status_file:
         stamp = now().strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
-            write_atomic(args.status_file, f"{stamp} {','.join(packages)}\n".encode(), 0o644, 0, 0)
+            write_atomic_path(args.status_file, f"{stamp} {','.join(packages)}\n".encode(), 0o644)
         except OSError:
             pass
 
@@ -230,82 +409,69 @@ def uses_interface(provider, interface: str) -> bool:
     return False
 
 
-def load_settings(path: Path):
-    """Return (document, existed). A document that cannot be parsed is never replaced."""
-    if not path.exists():
-        return {}, False
-    refuse_symlink(path, "reading settings.json")
+def read_settings(dir_fd: int):
+    """Return (document, raw bytes, mode), or None when there is no settings.json.
+
+    One read through one descriptor: the bytes parsed are the bytes backed up and the mode
+    is that of the same open file. Raises SettingsUnusable for anything that must not be replaced.
+    """
     try:
-        document = json.loads(path.read_text())
-    except (OSError, ValueError):
-        fail("reading settings.json (it is not valid JSON; leaving it unchanged)")
-    if not isinstance(document, dict) or not isinstance(document.get("pipedProviders", []), list):
-        fail("reading settings.json (unexpected structure; leaving it unchanged)")
-    return document, True
-
-
-def provider_needed(signalk: Path, env: dict[str, str]) -> bool:
-    if env.get("SOCKETCAN_ENABLE") != "true":
-        return False
-    interface = env.get("SOCKETCAN_INTERFACE", "")
-    if not IFACE_RE.fullmatch(interface):
-        fail("reading SOCKETCAN_INTERFACE")
-    document, _ = load_settings(signalk / "settings.json")
-    return not any(uses_interface(p, interface) for p in document.get("pipedProviders", []))
-
-
-def write_atomic(path: Path, data: bytes, mode: int, uid: int, gid: int, noreplace: bool = False) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        fd = os.open("settings.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SettingsUnusable("a link or unreadable file")
     try:
-        try:
-            os.write(fd, data)
-            os.fchmod(fd, mode)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        chown(tmp, uid, gid)
-        if noreplace:
-            os.link(tmp, path)  # fails when the file appeared meanwhile
-        else:
-            os.replace(tmp, path)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SettingsUnusable("not a regular file")
+        raw = os.read(fd, 1 << 24)
     finally:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
+        os.close(fd)
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise SettingsUnusable("not valid JSON")
+    if not isinstance(document, dict) or not isinstance(document.get("pipedProviders", []), list):
+        raise SettingsUnusable("unexpected structure")
+    return document, raw, stat.S_IMODE(info.st_mode)
 
 
-def add_provider(args, env: dict[str, str], signalk: Path) -> bool:
-    interface = env["SOCKETCAN_INTERFACE"]
-    path = signalk / "settings.json"
-    document, existed = load_settings(path)
+def provider_state(dir_fd: int, interface: str) -> str:
+    """needed | present | unusable"""
+    try:
+        loaded = read_settings(dir_fd)
+    except SettingsUnusable:
+        return "unusable"
+    providers = loaded[0].get("pipedProviders", []) if loaded else []
+    return "present" if any(uses_interface(p, interface) for p in providers) else "needed"
+
+
+def add_provider(args, dir_fd: int, interface: str):
+    """Returns True when added, False when not needed, None when settings.json is unusable."""
+    try:
+        loaded = read_settings(dir_fd)
+    except SettingsUnusable:
+        return None
+    document, raw, mode = loaded if loaded else ({}, None, 0o644)
     providers = document.setdefault("pipedProviders", [])
     if any(uses_interface(p, interface) for p in providers):
         return False
-    mode = 0o644
-    if existed:
-        mode = path.stat().st_mode & 0o777
+    if raw is not None:
         stamp = now().strftime("%Y%m%dT%H%M%SZ")
-        backup = path.with_name(f"settings.json.vesselstack-{stamp}.bak")
         try:
-            write_atomic(backup, path.read_bytes(), 0o600, args.uid, args.gid, noreplace=True)
+            write_atomic_at(dir_fd, f"settings.json.vesselstack-{stamp}.bak", raw, 0o600, noreplace=True)
         except OSError:
             fail("backing up settings.json")
     providers.append(provider_for(interface))
     try:
-        write_atomic(path, (json.dumps(document, indent=2) + "\n").encode(), mode, args.uid, args.gid)
+        write_atomic_at(dir_fd, "settings.json", (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), mode)
     except OSError:
         fail("writing settings.json")
-    print(f"Signal K data path: added NMEA 2000 provider vesselstack-n2k-{interface}")
     return True
 
 
 # --- Step 3: the plugin configuration -----------------------------------------
-
-def config_path(signalk: Path) -> Path:
-    return signalk / "plugin-config-data" / f"{PLUGIN}.json"
-
 
 def influx_base(env: dict[str, str]) -> str:
     port = env.get("INFLUXDB_PORT", "8086")
@@ -318,7 +484,14 @@ def influx_base(env: dict[str, str]) -> str:
     return f"http://{host}:{port}"
 
 
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Every request here carries an InfluxDB token: never follow it to another place."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError(f"redirect refused ({code})")
+
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 def http_json(method: str, url: str, token: str, body=None, timeout: float = 15):
@@ -362,7 +535,8 @@ def ensure_dbrp(base: str, admin: str, org_id: str, bucket_id: str, bucket: str)
         fail("creating the DBRP mapping")
 
 
-def create_writer_token(env: dict[str, str]) -> str:
+def create_writer_token(env: dict[str, str]):
+    """Returns (token, authorization id)."""
     base = influx_base(env)
     admin, org, bucket = env.get("INFLUXDB_TOKEN", ""), env.get("INFLUXDB_ORG", ""), env.get("INFLUXDB_RAW_BUCKET", "")
     if not admin or not org:
@@ -397,7 +571,18 @@ def create_writer_token(env: dict[str, str]) -> str:
     token = created.get("token") if isinstance(created, dict) else None
     if not isinstance(token, str) or not token:
         fail("creating the writer token (no token returned)")
-    return token
+    return token, created.get("id")
+
+
+def revoke_writer_token(env: dict[str, str], auth_id) -> None:
+    """Best effort: a token whose configuration could not be written helps nobody."""
+    if not auth_id:
+        return
+    try:
+        http_json("DELETE", f"{influx_base(env)}/api/v2/authorizations/{urllib.parse.quote(str(auth_id))}",
+                  env.get("INFLUXDB_TOKEN", ""))
+    except (urllib.error.URLError, OSError, ValueError, StepFailed):
+        pass
 
 
 def plugin_config(env: dict[str, str], token: str) -> dict:
@@ -417,28 +602,70 @@ def plugin_config(env: dict[str, str], token: str) -> dict:
     }
 
 
-def write_plugin_config(args, env: dict[str, str], signalk: Path) -> bool:
-    path = config_path(signalk)
-    if path.exists() or path.is_symlink():
-        return False
-    token = create_writer_token(env)
-    directory = path.parent
-    refuse_symlink(directory, "writing the plugin configuration")
+def inspect_work(args, request: dict, dir_fd: int) -> dict:
+    """Unprivileged: what is there and what is missing. Changes nothing."""
+    state = {"need_plugin": plugin_needed(dir_fd), "provider": "none", "need_config": False}
+    if request.get("interface"):
+        state["provider"] = provider_state(dir_fd, request["interface"])
     try:
-        if not directory.exists():
-            directory.mkdir(mode=0o755)
-            chown(directory, args.uid, args.gid)
-        data = (json.dumps(plugin_config(env, token), indent=2) + "\n").encode()
-        write_atomic(path, data, 0o600, args.uid, args.gid, noreplace=True)
-    except FileExistsError:
-        return False
+        os.lstat(f"{CONFIG_DIR}/{PLUGIN}.json", dir_fd=dir_fd)
+    except FileNotFoundError:
+        state["need_config"] = True
     except OSError:
-        fail("writing the plugin configuration")
-    print(f"Signal K data path: wrote the {PLUGIN} configuration (scoped token for bucket {env['INFLUXDB_RAW_BUCKET']})")
-    return True
+        fail("checking the plugin configuration")
+    if state["need_config"]:
+        # Everything a refusal would be based on, before a token is created.
+        try:
+            info = os.lstat(CONFIG_DIR, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if not os.access(".", os.W_OK | os.X_OK, dir_fd=dir_fd):
+                fail("writing the plugin configuration (the directory is not writable)")
+        except OSError:
+            fail("writing the plugin configuration")
+        else:
+            if not stat.S_ISDIR(info.st_mode):
+                fail("writing the plugin configuration (refusing a symbolic link or file)")
+    return state
 
 
-def main(argv=None) -> int:
+def apply_work(args, request: dict, dir_fd: int) -> dict:
+    """Unprivileged: the plugin configuration (with the token from the pipe) and the provider."""
+    result = {"config_written": False, "provider": "none"}
+    if request.get("config") is not None:
+        _phase[0] = "writing the plugin configuration"
+        created = False
+        try:
+            os.mkdir(CONFIG_DIR, 0o755, dir_fd=dir_fd)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError:
+            fail("writing the plugin configuration")
+        try:
+            config_fd = open_dir(CONFIG_DIR, dir_fd)
+        except OSError:
+            fail("writing the plugin configuration (refusing a symbolic link or file)")
+        try:
+            if created:
+                os.fchmod(config_fd, 0o755)
+                os.fsync(dir_fd)
+            data = (json.dumps(request["config"], indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            write_atomic_at(config_fd, f"{PLUGIN}.json", data, 0o600, noreplace=True)
+            result["config_written"] = True
+        except FileExistsError:
+            pass
+        except OSError:
+            fail("writing the plugin configuration")
+        finally:
+            os.close(config_fd)
+    if request.get("interface"):
+        _phase[0] = "adding the NMEA 2000 provider"
+        added = add_provider(args, dir_fd, request["interface"])
+        result["provider"] = "unusable" if added is None else ("added" if added else "present")
+    return result
+
+
+def run(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--mode", choices=("existing", "docker", "native"), required=True)
     parser.add_argument("--data", required=True, type=Path)
@@ -452,17 +679,26 @@ def main(argv=None) -> int:
         return 0
     if args.uid <= 0 or args.gid <= 0:
         fail("validating the service uid/gid")
+    _phase[0] = "reading the environment file"
     env = read_env(args.env_file)
     signalk = args.data / "signalk"
-    if not signalk.is_dir() or signalk.is_symlink():
-        fail("locating the Signal K data directory")
+    interface = None
+    if env.get("SOCKETCAN_ENABLE") == "true":
+        interface = env.get("SOCKETCAN_INTERFACE", "")
+        if not IFACE_RE.fullmatch(interface):
+            fail("reading SOCKETCAN_INTERFACE")
 
-    need_plugin = plugin_needed(signalk)
-    need_provider = provider_needed(signalk, env)
-    need_config = not (config_path(signalk).exists() or config_path(signalk).is_symlink())
+    # Unprivileged look at what is there; every refusal that can be known happens here,
+    # before an InfluxDB token exists.
+    _phase[0] = "inspecting the Signal K data directory"
+    state = as_service_user(args, inspect_work, {"interface": interface})
+    need_plugin = state["need_plugin"]
+    need_provider = state["provider"] == "needed"
+    need_config = state["need_config"]
     if need_plugin:
         # Checked before anything is changed, also under --check, so the installer
         # does not stop Signal K for a run that would only be skipped.
+        _phase[0] = "checking what npm would remove"
         skipped = prune_guard(args, env, signalk)
         if skipped:
             record_skip(args, skipped)
@@ -472,15 +708,48 @@ def main(argv=None) -> int:
 
     changed = False
     if need_plugin:
+        _phase[0] = "installing the plugin"
         npm_runner(args, env, signalk, [])
         print(f"Signal K data path: installed {PLUGIN}@{PLUGIN_VERSION}")
         changed = True
     clear_skip(args)
-    if need_provider:
-        changed = add_provider(args, env, signalk) or changed
+    token = auth_id = None
     if need_config:
-        changed = write_plugin_config(args, env, signalk) or changed
+        _phase[0] = "creating the InfluxDB writer token"
+        token, auth_id = create_writer_token(env)
+    request = {"interface": interface if need_provider else None,
+               "config": plugin_config(env, token) if token else None}
+    if token or need_provider:
+        _phase[0] = "writing the Signal K configuration"
+        try:
+            result = as_service_user(args, apply_work, request)
+        except StepFailed:
+            revoke_writer_token(env, auth_id)
+            raise
+        if token and not result["config_written"]:
+            revoke_writer_token(env, auth_id)  # the file appeared meanwhile: this token is unused
+        if result["config_written"]:
+            print(f"Signal K data path: wrote the {PLUGIN} configuration (scoped token for bucket {env['INFLUXDB_RAW_BUCKET']})")
+            changed = True
+        if result["provider"] == "added":
+            print(f"Signal K data path: added NMEA 2000 provider vesselstack-n2k-{interface}")
+            changed = True
+    if state["provider"] == "unusable" or (need_provider and result["provider"] == "unusable"):
+        print("Signal K data path: WARN: settings.json is not valid JSON (or is a link or unexpected structure), "
+              f"so the NMEA 2000 provider for {interface} was not added and the file was left unchanged. "
+              "Fix it or add the provider under Signal K > Server > Connections.", file=sys.stderr)
     return EXIT_CHANGED if changed else 0
+
+
+def main(argv=None) -> int:
+    try:
+        return run(argv)
+    except StepFailed as exc:
+        print(f"Signal K data path: {exc.step} failed", file=sys.stderr)
+    except Exception:
+        # Only the step: no exception text, which could carry a path or a value.
+        print(f"Signal K data path: {_phase[0]} failed (unexpected error)", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
