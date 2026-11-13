@@ -276,6 +276,11 @@ FIELDS = [
     field("INFLUXDB_RAW_RETENTION", "Keep raw data for", SEC_STORAGE, description="A duration such as 720h, 30d or 8w, or 0 to keep forever. Empty means 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply or start and permanently deletes raw data older than the window."),
     field("PROMETHEUS_RETENTION", "Keep health numbers for", SEC_STORAGE, description="How long Prometheus keeps Pi and service health history: a duration such as 720h, 30d or 8w. Empty means 30d. Older metrics are deleted."),
     field("VESSELSTACK_BACKUP", "Backup folder", SEC_STORAGE, kind="path", description="Where backups are saved. Use a mounted external drive under /media or /mnt so a failed SD card does not take the backups with it."),
+    field("VESSELSTACK_BACKUP_SCHEDULE", "Scheduled backups", SEC_STORAGE, kind="select", choices=list(CONFIG_SETTINGS["VESSELSTACK_BACKUP_SCHEDULE"].enum), description="off, daily or weekly at about 03:30. Each backup stops the whole stack for several minutes, so the boat has no dashboards or logging meanwhile. Needs the backup drive mounted. Applied when you reinstall (Maintenance)."),
+    field("VESSELSTACK_BACKUP_KEEP", "Scheduled backups to keep", SEC_STORAGE, kind="number", description="A whole number from 1 to 365. After a verified scheduled backup, older scheduled archives (vesselstack-scheduled-*) beyond this many are deleted; manual and pre-update backups are never deleted."),
+    field("VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK", "Allow scheduled backups on the system disk", SEC_STORAGE, kind="boolean", description="Normally a scheduled backup is refused unless the backup folder is on a mounted external drive. Turn this on only if the folder is on this computer's own disk on purpose."),
+    field("VESSELSTACK_WATCHDOG", "Hardware watchdog", SEC_STORAGE, kind="select", choices=list(CONFIG_SETTINGS["VESSELSTACK_WATCHDOG"].enum), description="Reboots the boat computer automatically if it hangs. auto turns it on only on a Raspberry Pi that has a watchdog device; true turns it on for any computer with one. Applied when you reinstall."),
+    field("VESSELSTACK_JOURNAL_MAX_USE", "System log size limit", SEC_STORAGE, description="Caps the disk space used by the persistent system journal, for example 200M or 1G, or off to leave the system journal settings alone. Applied when you reinstall."),
     field("INFLUXDB_URL", "InfluxDB address", SEC_STORAGE, kind="url", description="Where VesselStack reaches InfluxDB."),
     field("INFLUXDB_ORG", "InfluxDB organization", SEC_STORAGE, description="The InfluxDB organization name."),
     field("INFLUXDB_USERNAME", "InfluxDB admin username", SEC_STORAGE, description="The InfluxDB administrator account name."),
@@ -1210,7 +1215,31 @@ def component_status() -> list[dict[str, Any]]:
 
 
 DEFAULT_BACKUP_DIR = "/var/backups/vesselstack"
+# Written by libexec/record-backup-result after every scheduled backup.
+BACKUP_LAST_FILE = Path(os.environ.get("VESSELSTACK_SYSTEM_ROOT", "")) / "var/lib/vesselstack/backup-last.json"
 BACKUP_ARCHIVE = re.compile(r"vesselstack-[0-9A-Za-z._-]+\.tar\.gz")
+
+
+def scheduled_backup_status(settings: dict[str, str]) -> dict[str, Any]:
+    """Read-only: the configured schedule, the last scheduled run and the timer's next run."""
+    schedule = settings.get("VESSELSTACK_BACKUP_SCHEDULE") or "off"
+    if schedule not in {"off", "daily", "weekly"}:
+        schedule = "off"
+    last: dict[str, Any] | None = None
+    try:
+        data = json.loads(BACKUP_LAST_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("result") in {"success", "failed", "skipped_busy"}:
+            last = {"result": data["result"], "exit_status": data.get("exit_status"), "finished_at": str(data.get("finished_at") or "")[:32]}
+            if isinstance(data.get("archive"), str) and BACKUP_ARCHIVE.fullmatch(data["archive"]):
+                last["archive"] = data["archive"]
+    except (OSError, ValueError):
+        last = None
+    next_run = None
+    if schedule != "off":
+        code, output = command_output(["systemctl", "show", "vesselstack-backup.timer", "-p", "NextElapseUSecRealtime", "--value"], timeout=3)
+        if code == 0 and output and output != "n/a":
+            next_run = output[:48]
+    return {"schedule": schedule, "last_scheduled": last, "next_run": next_run}
 
 
 def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1221,9 +1250,11 @@ def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
     that has its .sha256 manifest next to it is reported by modification time; nothing is hashed
     or written. Any problem reading the folder yields "unknown" and never an error.
     """
-    result: dict[str, Any] = {"path": "", "mount": "unknown", "writable": None, "last_backup_at": None, "state": "unknown", "message": ""}
+    result: dict[str, Any] = {"path": "", "mount": "unknown", "writable": None, "last_backup_at": None, "state": "unknown", "message": "",
+                              "schedule": "off", "last_scheduled": None, "next_run": None}
     try:
         settings = vessel if vessel is not None else parse_env(VESSEL_ENV)
+        result.update(scheduled_backup_status(settings))
         destination = os.path.realpath(settings.get("VESSELSTACK_BACKUP") or os.environ.get("VESSELSTACK_BACKUP") or DEFAULT_BACKUP_DIR)
         result["path"] = destination
         parts = Path(destination).parts

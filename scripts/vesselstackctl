@@ -19,6 +19,9 @@ SBIN_DIR="$SYSTEM_ROOT/usr/local/sbin"
 # Where "back up to the system disk this once" writes, so an unmounted /media or /mnt folder stays empty.
 SYSTEM_BACKUP_DIR="$SYSTEM_ROOT/var/backups/vesselstack"
 LIBEXEC_DIR="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
+# Written by libexec/record-backup-result after every scheduled backup run.
+BACKUP_LAST_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last.json"
+BACKUP_LAST_ARCHIVE_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last-archive"
 
 command_needs_lifecycle_lock() {
     case "${1:-}" in
@@ -54,7 +57,9 @@ Commands:
   status                       Show a concise service and endpoint summary
   profile show|validate FILE|set FILE
                                Show, validate, or install the shared boat profile
-  doctor                       Validate config, dependencies, disk, and health
+  doctor                       Validate config, dependencies, disk, and health (also
+                               hardware watchdog, journal cap, scheduled backups and
+                               power/under-voltage warnings)
   urls                         Show who can reach each service (real listening state) and the
                                addresses to use from other devices
   version                      Print installed and command versions
@@ -100,11 +105,20 @@ Commands:
   restart                      Restart the stack
   component add ID             Enable one core component and start it
   component remove ID          Disable one core component and remove its container (data preserved)
-  backup [--require-mounted] [--allow-unmounted] [DIRECTORY]
+  backup [--require-mounted] [--allow-unmounted] [--scheduled] [DIRECTORY]
                                Create a checksummed, consistent backup (stops the
                                whole stack briefly). Refuses /media and /mnt
                                destinations that are not mounted unless
                                --allow-unmounted is given
+  backup --scheduled           Unattended mode used by vesselstack-backup.timer: the
+                               configured folder must be on a mounted /media or /mnt
+                               drive (the system disk only with
+                               VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK=true); after a
+                               verified archive it keeps the newest
+                               VESSELSTACK_BACKUP_KEEP and removes older scheduled ones (manual and
+                               pre-update backups are never removed). It stops
+                               the whole stack while it runs. Not combinable with
+                               --allow-unmounted, --system-disk-once or a directory
   backup --system-disk-once    Back up to the system disk (not the unmounted drive's
                                folder) this once; refused when the system disk is too
                                small or VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false
@@ -1612,6 +1626,171 @@ except (ValueError, TypeError, KeyError):
     esac
 }
 
+# Prints a duration in seconds as a short human string.
+human_age() {
+    local seconds=$1
+    if [ "$seconds" -ge 172800 ]; then printf '%s days' $((seconds / 86400))
+    elif [ "$seconds" -ge 7200 ]; then printf '%s hours' $((seconds / 3600))
+    else printf '%s minutes' $((seconds / 60)); fi
+}
+
+check_watchdog() {
+    local want=${VESSELSTACK_WATCHDOG:-auto} dropin="$SYSTEM_ROOT/etc/systemd/system.conf.d/60-vesselstack-watchdog.conf" device="$SYSTEM_ROOT/dev/watchdog"
+    local state_file="$SYSTEM_ROOT/sys/class/watchdog/watchdog0/state" model_file="$SYSTEM_ROOT/proc/device-tree/model" seconds active state=''
+    if [ -f "$dropin" ]; then
+        seconds=$(sed -n 's/^RuntimeWatchdogSec=\([0-9]*\)s*$/\1/p' "$dropin" | head -n 1)
+        # The kernel's own view is preferred; it does not depend on how systemd reports the setting.
+        if [ -r "$state_file" ]; then
+            state=$(head -c 32 "$state_file" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ "$state" = active ]; then
+                printf 'OK   hardware watchdog configured: systemd reboots the system if it stops responding for %ss\n' "${seconds:-?}"
+            else
+                printf 'WARN hardware watchdog is configured (%ss) but the kernel reports it as "%s", not active. Fix: sudo systemctl daemon-reexec (or reboot)\n' "${seconds:-?}" "${state:-unknown}" >&2
+            fi
+        else
+            active=$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null || true)
+            if [ -z "$active" ]; then
+                printf 'WARN hardware watchdog is configured (%ss) but whether systemd is using it is unknown (systemctl show gave no answer)\n' "${seconds:-?}" >&2
+            elif [ "$active" = 0 ]; then
+                printf 'WARN hardware watchdog is configured (%ss) but systemd is not using it yet. Fix: sudo systemctl daemon-reexec (or reboot)\n' "${seconds:-?}" >&2
+            else
+                printf 'OK   hardware watchdog configured: systemd reboots the system if it stops responding for %ss\n' "${seconds:-?}"
+            fi
+        fi
+    elif [ "$want" = false ]; then
+        printf 'INFO hardware watchdog is turned off (VESSELSTACK_WATCHDOG=false)\n'
+    elif systemctl is-active --quiet watchdog.service 2>/dev/null || systemctl is-enabled --quiet watchdog.service 2>/dev/null; then
+        printf 'INFO watchdog.service owns the hardware watchdog\n'
+    elif [ -e "$device" ]; then
+        if [ "$want" = true ] || grep -qa 'Raspberry Pi' "$model_file" 2>/dev/null; then
+            printf 'WARN a hardware watchdog device exists but VesselStack has not enabled it, so a hung system will not reboot itself. Fix: rerun the installer (VESSELSTACK_WATCHDOG=%s)\n' "$want" >&2
+        else
+            printf 'INFO a hardware watchdog device exists, but VESSELSTACK_WATCHDOG=auto only enables it on a Raspberry Pi (set it to true to enable it here)\n'
+        fi
+    else
+        printf 'INFO no hardware watchdog device found; a hung system will not reboot itself\n'
+    fi
+}
+
+check_journald() {
+    local cap dropin="$SYSTEM_ROOT/etc/systemd/journald.conf.d/60-vesselstack.conf" boots tail_text unknown='INFO previous boot shutdown state unknown (journal not readable or not persistent)'
+    if [ -f "$dropin" ]; then
+        cap=$(sed -n 's/^SystemMaxUse=//p' "$dropin" | head -n 1)
+        printf 'OK   journal size capped at %s (SystemMaxUse)\n' "${cap:-?}"
+    elif [ "${VESSELSTACK_JOURNAL_MAX_USE:-200M}" = off ]; then
+        printf 'INFO the journal size cap is turned off (VESSELSTACK_JOURNAL_MAX_USE=off)\n'
+    else
+        printf 'WARN the system journal has no VesselStack size cap and can grow large. Fix: rerun the installer (VESSELSTACK_JOURNAL_MAX_USE)\n' >&2
+    fi
+    command -v journalctl >/dev/null 2>&1 || return 0
+    boots=$(timeout 10 journalctl --list-boots --no-pager 2>/dev/null || true)
+    if printf '%s\n' "$boots" | grep -Eq '^[[:space:]]*-1[[:space:]]'; then
+        tail_text=$(timeout 10 journalctl -b -1 -n 80 --no-pager -o cat 2>/dev/null || true)
+        if [ -z "$tail_text" ]; then
+            printf '%s\n' "$unknown"
+        elif printf '%s\n' "$tail_text" | grep -Eiq 'Reached target (Shutdown|Final Step|System (Power Off|Reboot|Halt))|Shutting down\.|systemd-shutdown|System Shutdown|Late Shutdown Services|Journal stopped'; then
+            printf 'OK   previous boot ended with a clean shutdown\n'
+        else
+            printf 'INFO previous boot ended without a clean shutdown (power loss, crash or watchdog reset)\n'
+        fi
+    else
+        printf '%s\n' "$unknown"
+    fi
+}
+
+# Returns 1 only when the last scheduled backup is recorded as failed.
+check_backup_schedule() {
+    local schedule=${VESSELSTACK_BACKUP_SCHEDULE:-off} interval record result status finished age archive now success sage
+    if [ "$schedule" = off ]; then
+        printf 'WARN scheduled backups are off (VESSELSTACK_BACKUP_SCHEDULE=off). Back up by hand with: sudo vesselstackctl backup, or turn them on (daily or weekly) and rerun the installer\n' >&2
+        return 0
+    fi
+    case "$schedule" in daily) interval=86400 ;; weekly) interval=604800 ;; *) printf 'WARN VESSELSTACK_BACKUP_SCHEDULE=%s is not off, daily or weekly\n' "$schedule" >&2; return 0 ;; esac
+    if ! systemctl is-enabled --quiet vesselstack-backup.timer 2>/dev/null; then
+        printf 'WARN VESSELSTACK_BACKUP_SCHEDULE=%s but vesselstack-backup.timer is not enabled. Fix: rerun the installer\n' "$schedule" >&2
+    fi
+    if [ ! -f "$BACKUP_LAST_FILE" ]; then
+        printf 'INFO scheduled backups (%s, keep %s) have not run yet\n' "$schedule" "${VESSELSTACK_BACKUP_KEEP:-8}"
+        return 0
+    fi
+    record=$(python3 -I - "$BACKUP_LAST_FILE" <<'PY' 2>/dev/null || true
+import calendar, json, re, sys, time
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    result = re.sub(r"[^a-z_]", "", str(data.get("result", "")))
+    status = re.sub(r"[^0-9A-Za-z_-]", "", str(data.get("exit_status", "")))
+    finished = calendar.timegm(time.strptime(str(data.get("finished_at", "")), "%Y-%m-%dT%H:%M:%SZ"))
+    archive = re.sub(r"[^0-9A-Za-z._-]", "", str(data.get("archive", "")))
+    success = 0
+    for key in ("last_success_at", "finished_at" if result == "success" else None):
+        if key and data.get(key):
+            try:
+                success = calendar.timegm(time.strptime(str(data[key]), "%Y-%m-%dT%H:%M:%SZ"))
+                break
+            except ValueError:
+                pass
+    print(result or "unknown", status or "-", finished, archive or "-", success)
+except Exception:
+    print("unreadable - 0 - 0")
+PY
+)
+    read -r result status finished archive success <<<"$record"
+    now=$(date +%s)
+    case "$result" in
+        success)
+            age=$((now - finished))
+            if [ "$finished" -le 0 ]; then
+                printf 'WARN the last scheduled backup result has no usable time\n' >&2
+            elif [ "$age" -gt $((interval * 2)) ]; then
+                printf 'WARN the last successful scheduled backup was %s ago (expected %s); check: systemctl list-timers vesselstack-backup.timer\n' "$(human_age "$age")" "$schedule" >&2
+            else
+                printf 'OK   scheduled backups (%s): last success %s ago\n' "$schedule" "$(human_age "$age")"
+            fi
+            ;;
+        failed)
+            printf 'FAIL the last scheduled backup failed (exit status %s). See: journalctl -u vesselstack-backup.service\n' "$status" >&2
+            return 1 ;;
+        skipped_busy)
+            printf 'WARN the last scheduled backup was skipped because another VesselStack operation held the lifecycle lock; it will try again at the next scheduled time\n' >&2 ;;
+        *)
+            printf 'WARN the last scheduled backup result could not be read from %s\n' "$BACKUP_LAST_FILE" >&2 ;;
+    esac
+    # A run that did not succeed keeps the time of the last real success, so repeated skips or
+    # failures still escalate once that success is older than two schedule intervals.
+    if [ "$result" != success ] && [ "${success:-0}" -gt 0 ]; then
+        sage=$((now - success))
+        if [ "$sage" -gt $((interval * 2)) ]; then
+            printf 'WARN no scheduled backup has succeeded for %s (expected %s); check: systemctl list-timers vesselstack-backup.timer\n' "$(human_age "$sage")" "$schedule" >&2
+        fi
+    fi
+}
+
+check_power() {
+    local raw value gpio_config="$SYSTEM_ROOT/boot/firmware/config.txt"
+    if command -v vcgencmd >/dev/null 2>&1; then
+        raw=$(timeout 5 vcgencmd get_throttled 2>/dev/null || true)
+        raw=${raw#throttled=}
+        if [[ $raw =~ ^0x[0-9A-Fa-f]+$ ]]; then
+            value=$((raw))
+            if [ "$value" -eq 0 ]; then
+                printf 'OK   no power or temperature throttling recorded since boot\n'
+            else
+                [ $((value & 0x1)) -eq 0 ] || printf 'WARN UNDER-VOLTAGE RIGHT NOW: the power supply cannot keep up, so the system may crash or corrupt data. Use a better supply or cable and check the boat supply\n' >&2
+                [ $((value & 0x2)) -eq 0 ] || printf 'WARN ARM frequency is capped right now (usually under-voltage or heat)\n' >&2
+                [ $((value & 0x4)) -eq 0 ] || printf 'WARN the CPU is throttled right now (usually under-voltage or heat)\n' >&2
+                [ $((value & 0x8)) -eq 0 ] || printf 'WARN the soft temperature limit is active right now; improve cooling\n' >&2
+                [ $((value & 0x10000)) -eq 0 ] || printf 'WARN under-voltage has occurred since boot; check the power supply and wiring\n' >&2
+                [ $((value & 0x20000)) -eq 0 ] || printf 'WARN ARM frequency was capped since boot\n' >&2
+                [ $((value & 0x40000)) -eq 0 ] || printf 'WARN throttling has occurred since boot\n' >&2
+                [ $((value & 0x80000)) -eq 0 ] || printf 'WARN the soft temperature limit has been reached since boot\n' >&2
+            fi
+        fi
+    fi
+    if [ -r "$gpio_config" ] && grep -Eq '^[[:space:]]*dtoverlay=gpio-shutdown' "$gpio_config"; then
+        printf 'INFO a GPIO shutdown button/UPS signal (dtoverlay=gpio-shutdown) is configured in %s\n' "${gpio_config#"$SYSTEM_ROOT"}"
+    fi
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -1641,6 +1820,10 @@ doctor_stack() {
     check_homeassistant_bind
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,prometheus,*) ;; *) check_prometheus_data_dir || failed=1 ;; esac
     check_memory_index || failed=1
+    check_watchdog
+    check_journald
+    check_backup_schedule || failed=1
+    check_power
     status_stack || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
@@ -1851,9 +2034,10 @@ PY
 }
 
 backup_stack() {
-    local allow_unmounted=0 require_mounted=0 system_once=0 destination='' mount_dir
+    local allow_unmounted=0 require_mounted=0 system_once=0 scheduled=0 destination='' mount_dir
     while [ $# -gt 0 ]; do
         case "$1" in
+            --scheduled) scheduled=1 ;;
             --require-mounted) require_mounted=1 ;;
             --allow-unmounted) allow_unmounted=1 ;;
             --system-disk-once) system_once=1 ;;
@@ -1870,12 +2054,22 @@ backup_stack() {
         fi
         destination=$(system_disk_once_target) || exit 1
     fi
+    if [ "$scheduled" -eq 1 ]; then
+        if [ "$system_once" -eq 1 ] || [ "$allow_unmounted" -eq 1 ] || [ -n "$destination" ]; then
+            echo "--scheduled cannot be combined with --system-disk-once, --allow-unmounted or a directory" >&2
+            exit 2
+        fi
+    fi
     destination=${destination:-${VESSELSTACK_BACKUP:-/var/backups/vesselstack}}
     destination=$(python3 - "$destination" <<'PY'
 import os, sys
 print(os.path.realpath(sys.argv[1]))
 PY
 )
+    if [ "$scheduled" -eq 1 ]; then
+        check_scheduled_destination "$destination" || exit 1
+        rm -f -- "$BACKUP_LAST_ARCHIVE_FILE"
+    fi
     if [ "$require_mounted" -eq 1 ]; then
         allow_unmounted=0
         case "$destination" in
@@ -1889,8 +2083,13 @@ PY
             *) echo "Refusing backup: --require-mounted requires a /media or /mnt destination" >&2; exit 1 ;;
         esac
     fi
-    local stamp archive manifest sample_timer_active=0 indexer_timer_active=0 chat_active=0 telegram_active=0 displays_active=0 signalk_active=0 socketcan_active=0
-    local -a extras was_compose_services=()
+    # The state that cleanup_backup reads is global on purpose: when errexit ends the shell inside this
+    # function, bash runs the EXIT trap without the function's locals, and the stack must still restart.
+    archive_created=0 archive_verified=0 BK_ARCHIVE='' BK_MANIFEST=''
+    sample_timer_active=0 indexer_timer_active=0 chat_active=0 telegram_active=0 displays_active=0 signalk_active=0 socketcan_active=0
+    declare -ga was_compose_services=()
+    local stamp archive manifest
+    local -a extras
     check_backup_tree_overlap "$destination"
     check_backup_destination "$destination" "$allow_unmounted"
     if [ -n "$BACKUP_REDIRECT" ]; then
@@ -1904,8 +2103,14 @@ PY
           [ -e "$ROOT.failed-restore-$stamp" ] || [ -e "$VESSELSTACK_DATA.failed-restore-$stamp" ]; do
         stamp=$(date -u +%Y%m%dT%H%M%S%NZ)-$$-$RANDOM
     done
-    archive="$destination/vesselstack-$stamp.tar.gz"
+    # Scheduled archives carry their own name so retention can never touch manual or pre-update backups.
+    if [ "$scheduled" -eq 1 ]; then
+        archive="$destination/vesselstack-scheduled-$stamp.tar.gz"
+    else
+        archive="$destination/vesselstack-$stamp.tar.gz"
+    fi
     manifest="$archive.sha256"
+    BK_ARCHIVE=$archive BK_MANIFEST=$manifest
     install -d -m 0700 "$destination"
     mapfile -t was_compose_services < <("${COMPOSE[@]}" ps --status running --services 2>/dev/null || true)
     if systemctl is-active --quiet vesselstack-chat.service; then chat_active=1; fi
@@ -1928,6 +2133,11 @@ PY
         if [ "$sample_timer_active" -eq 1 ]; then systemctl start vesselstack-telemetry-sample.timer || recovery_failed=1; fi
         if [ "$indexer_timer_active" -eq 1 ]; then systemctl start vesselstack-telemetry-indexer.timer || recovery_failed=1; fi
         [ "$recovery_failed" -eq 1 ] && echo "Backup recovery failed; inspect service state" >&2
+        # A failed run must not leave a partial archive behind (a drive sized for KEEP archives would
+        # otherwise fill up). Only files this invocation created and has not yet verified are removed.
+        if [ "$rc" -ne 0 ] && [ "$archive_created" -eq 1 ] && [ "$archive_verified" -eq 0 ]; then
+            rm -f -- "$BK_ARCHIVE" "$BK_MANIFEST"
+        fi
         [ "$recovery_failed" -eq 0 ] || rc=1
         return "$rc"
     }
@@ -1936,6 +2146,11 @@ PY
     # Grafana and Boat Chat all keep SQLite/WAL state in the data tree, and a
     # file-level copy of a running database is not crash-consistent.
     stop_stack
+    if [ -e "$archive" ] || [ -L "$archive" ] || [ -e "$manifest" ] || [ -L "$manifest" ]; then
+        echo "Refusing to overwrite an existing backup: $archive" >&2
+        exit 1
+    fi
+    archive_created=1
     tar --numeric-owner -czf "$archive" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/.venv" \
         --exclude="${VESSELSTACK_ROOT#/}/boat-chat/__pycache__" \
@@ -1947,10 +2162,83 @@ PY
         "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "${extras[@]}"
     sha256sum "$archive" > "$manifest"
     verify_backup "$archive" >/dev/null
+    archive_verified=1
     chmod 0600 "$archive" "$manifest"
     trap - EXIT
     cleanup_backup
+    if [ "$scheduled" -eq 1 ]; then
+        # The stack is running again; retention is housekeeping and never fails a verified backup.
+        prune_scheduled_backups "$destination" "${VESSELSTACK_BACKUP_KEEP:-8}" "$archive" || \
+            echo "WARNING: could not prune old scheduled backups in $destination" >&2
+        record_last_archive "$archive" || true
+    fi
     printf '%s\n' "$archive"
+}
+
+# A scheduled run has nobody to answer prompts, so it never offers the "this once" menu: a
+# /media or /mnt destination must already be mounted and safe, and the system disk is used
+# only when the owner opted in.
+check_scheduled_destination() {
+    local destination=$1 mount_dir
+    case "$destination" in
+        /media/*|/mnt/*)
+            mount_dir=$(printf '%s' "$destination" | cut -d/ -f1-3)
+            if ! mountpoint -q "$mount_dir"; then
+                echo "Refusing scheduled backup: ${mount_dir//[![:print:]]/?} is not mounted, so the archive would land on the system disk. Nothing was changed." >&2
+                echo "To fix: connect and mount the backup drive (sudo vesselstackctl backup-drive mount --fstab)." >&2
+                return 1
+            fi
+            verify_mounted_destination "$destination" "$mount_dir" || return 1
+            ;;
+        *)
+            if [ "${VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK:-false}" != true ]; then
+                echo "Refusing scheduled backup: ${destination//[![:print:]]/?} is on the system disk. Use a mounted external drive, or set VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK=true to accept this. Nothing was changed." >&2
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Remembers the name (not the path) of the archive a scheduled run produced, for libexec/record-backup-result.
+record_last_archive() {
+    local tmp="$BACKUP_LAST_ARCHIVE_FILE.tmp.$$"
+    install -d -m 0755 -- "$(dirname -- "$BACKUP_LAST_ARCHIVE_FILE")"
+    printf '%s\n' "$(basename -- "$1")" > "$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$BACKUP_LAST_ARCHIVE_FILE"
+}
+
+# prune_scheduled_backups DIRECTORY KEEP JUST_WRITTEN: removes the oldest scheduled archives (with
+# their .sha256) beyond KEEP. Only regular files named exactly like a scheduled archive
+# (vesselstack-scheduled-<UTC stamp>[-suffix].tar.gz) with an adjacent regular .sha256 in DIRECTORY
+# itself are considered; manual and pre-update backups, other files and the archive just written
+# are never touched. The stamp is fixed-width, so name order is age order.
+prune_scheduled_backups() {
+    local directory=$1 keep=$2 current=$3 file name total excess removed=0 errfile
+    local -a candidates=()
+    if ! [[ $keep =~ ^[1-9][0-9]{0,2}$ ]] || ! [ "$keep" -le 365 ]; then
+        echo "WARNING: VESSELSTACK_BACKUP_KEEP is not a whole number from 1 to 365; no old backups were pruned" >&2
+        return 0
+    fi
+    errfile=$(mktemp) || return 1
+    while IFS= read -r -d '' file; do
+        name=${file##*/}
+        [[ $name =~ ^vesselstack-scheduled-[0-9]{8}T[0-9]{6}([0-9]{9})?Z(-[0-9]+){1,2}\.tar\.gz$ ]] || continue
+        if [ ! -f "$file" ] || [ -L "$file" ] || [ ! -f "$file.sha256" ] || [ -L "$file.sha256" ]; then continue; fi
+        candidates+=("$file")
+    done < <(find "$directory" -maxdepth 1 -type f -name 'vesselstack-scheduled-*.tar.gz' -print0 2>"$errfile" | LC_ALL=C sort -z)
+    if [ -s "$errfile" ]; then
+        echo "WARNING: listing $directory for old scheduled backups reported errors: $(head -c 300 "$errfile" | tr -c '[:print:]' '?')" >&2
+    fi
+    rm -f -- "$errfile"
+    total=${#candidates[@]}
+    excess=$((total - keep))
+    [ "$excess" -gt 0 ] || return 0
+    for file in "${candidates[@]}"; do
+        [ "$removed" -lt "$excess" ] || break
+        [ "$file" != "$current" ] || continue
+        rm -f -- "$file" "$file.sha256"
+        echo "Removed old scheduled backup ${file##*/}" >&2
+        removed=$((removed + 1))
+    done
 }
 
 verify_backup() {
@@ -2047,9 +2335,10 @@ restore_external_candidates() {
         vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
         vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.service vesselstack-telemetry-sample.timer \
         vesselstack-signalk.service vesselstack-socketcan.service vesselstack-displays-bridge.service \
-        vesselstack-control-panel.service; do
+        vesselstack-control-panel.service vesselstack-backup.service vesselstack-backup.timer; do
         printf '%s\n' "$SYSTEMD_DIR/$unit"
     done
+    printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/vesselstack-backup.timer"
     for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.timer \
         vesselstack-telemetry-sample.timer vesselstack-signalk.service vesselstack-socketcan.service \
         vesselstack-displays-bridge.service vesselstack-control-panel.service; do
@@ -2057,7 +2346,7 @@ restore_external_candidates() {
         printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/$unit"
     done
     for p in "$SBIN_DIR/vesselstackctl" "$SBIN_DIR/vesselstack-firewall" "$SBIN_DIR/vesselstack-update" \
-        "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" \
+        "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" \
         "$LIBEXEC_DIR/reconcile-lifecycle.sh" "$SYSTEM_ROOT/etc/vesselstack/update.env"; do
         printf '%s\n' "$p"
     done
@@ -2544,6 +2833,7 @@ uninstall_stack() {
     systemctl disable vesselstack-chat.service || true
     systemctl disable --now vesselstack-chat-telegram.service || true
     systemctl disable --now vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer || true
+    systemctl disable --now vesselstack-backup.timer || true
     systemctl disable --now vesselstack-signalk.service || true
     systemctl disable --now vesselstack-socketcan.service || true
     systemctl disable --now vesselstack-control-panel.service || true
@@ -2559,12 +2849,13 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer" \
         "$SYSTEMD_DIR/vesselstack-telemetry-sample.service" \
         "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer" \
+        "$SYSTEMD_DIR/vesselstack-backup.timer" "$SYSTEMD_DIR/vesselstack-backup.service" \
         "$SYSTEMD_DIR/vesselstack-signalk.service" \
         "$SYSTEMD_DIR/vesselstack-socketcan.service" \
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SYSTEMD_DIR/vesselstack-homepage-refresh.service" "$SBIN_DIR/vesselstack-firewall" \
-        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh"
+        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then

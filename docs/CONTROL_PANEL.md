@@ -166,7 +166,11 @@ Home is for looking, not for changing.
 - **Backup** shows when the last backup was made and whether the backup drive is
   mounted. It warns when there is no backup yet, when the drive is not mounted,
   when the folder is not writable, or when backups sit on the computer's own
-  disk instead of an external drive.
+  disk instead of an external drive. When scheduled backups are on
+  (`VESSELSTACK_BACKUP_SCHEDULE`) it also shows the schedule, whether the last scheduled run
+  succeeded, failed or was skipped because another operation was running, and when the timer runs
+  next. This is read-only; the schedule is changed under Settings, Storage & history (applied by a
+  reinstall). A scheduled backup stops the whole stack while it runs.
 - **Software** shows the installed version, or the newer version found by the
   last update check, with a link to the Updates tab. It never checks by itself.
 - **Back up now** is the one action on this page. It runs `vesselstackctl backup`.

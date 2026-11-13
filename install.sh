@@ -178,6 +178,12 @@ fi
 # Prometheus TSDB retention (time only; never 0, which Prometheus would treat as the default).
 : "${PROMETHEUS_RETENTION:=30d}"
 : "${VESSELSTACK_DISABLED_COMPONENTS:=}"
+# Unattended operation (README "Unattended operation and power"). Upgrades keep scheduled backups off.
+: "${VESSELSTACK_WATCHDOG:=auto}"
+: "${VESSELSTACK_JOURNAL_MAX_USE:=200M}"
+: "${VESSELSTACK_BACKUP_SCHEDULE:=off}"
+: "${VESSELSTACK_BACKUP_KEEP:=8}"
+: "${VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK:=false}"
 
 if [ -r "$SOURCE_ROOT/common/config_registry.py" ]; then
     CORE_COMPONENTS=()
@@ -258,8 +264,18 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     echo "PROMETHEUS_RETENTION must be a duration such as 720h, 30d or 8w" >&2
     exit 1
 fi
+case "$VESSELSTACK_WATCHDOG" in auto|true|false) ;; *) echo "VESSELSTACK_WATCHDOG must be auto, true or false" >&2; exit 1 ;; esac
+case "$VESSELSTACK_BACKUP_SCHEDULE" in off|daily|weekly) ;; *) echo "VESSELSTACK_BACKUP_SCHEDULE must be off, daily or weekly" >&2; exit 1 ;; esac
+if [ "$VESSELSTACK_JOURNAL_MAX_USE" != off ] && ! [[ "$VESSELSTACK_JOURNAL_MAX_USE" =~ ^[1-9][0-9]*[KMG]$ ]]; then
+    echo "VESSELSTACK_JOURNAL_MAX_USE must be a size such as 200M or 1G, or off" >&2
+    exit 1
+fi
+if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BACKUP_KEEP" -gt 365 ]; then
+    echo "VESSELSTACK_BACKUP_KEEP must be a whole number from 1 to 365" >&2
+    exit 1
+fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD NODE_EXPORTER_ENABLE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -583,6 +599,11 @@ MQTT_PORT
 VESSELSTACK_DATA_BIND_ADDRESS
 VESSELSTACK_WEB_BIND_ADDRESS
 HOMEASSISTANT_BIND_ADDRESS
+VESSELSTACK_WATCHDOG
+VESSELSTACK_JOURNAL_MAX_USE
+VESSELSTACK_BACKUP_SCHEDULE
+VESSELSTACK_BACKUP_KEEP
+VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK
 EOF
 }
 # Keys written to boat-chat.env and control-panel.env beyond the list above.
@@ -1441,6 +1462,7 @@ if [ "$SCRIPT_DIR/scripts/reconcile-lifecycle.sh" != "$VESSELSTACK_ROOT/installe
 fi
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/record-backup-result" "$LIBEXEC_DIR/record-backup-result"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"
@@ -1617,6 +1639,24 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
 chmod 0644 "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer"
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-telemetry-indexer.timer" \
     "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer"
+# Scheduled backups: the service always exists (it is also what "systemctl start" runs); the
+# timer exists only while a schedule is set. Both are rendered before the daemon-reload below.
+sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    "$SCRIPT_DIR/systemd/vesselstack-backup.service.in" > "$SYSTEMD_DIR/vesselstack-backup.service"
+chmod 0644 "$SYSTEMD_DIR/vesselstack-backup.service"
+case "$VESSELSTACK_BACKUP_SCHEDULE" in
+    daily) backup_oncalendar='*-*-* 03:30' ;;
+    weekly) backup_oncalendar='Sun *-*-* 03:30' ;;
+    *) backup_oncalendar='' ;;
+esac
+if [ -n "$backup_oncalendar" ]; then
+    sed "s|@BACKUP_ONCALENDAR@|$backup_oncalendar|g" \
+        "$SCRIPT_DIR/systemd/vesselstack-backup.timer.in" > "$SYSTEMD_DIR/vesselstack-backup.timer"
+    chmod 0644 "$SYSTEMD_DIR/vesselstack-backup.timer"
+else
+    systemctl disable --now vesselstack-backup.timer 2>/dev/null || true
+    rm -f -- "$SYSTEMD_DIR/vesselstack-backup.timer"
+fi
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-control-panel.service.in" \
     > "$SYSTEMD_DIR/vesselstack-control-panel.service"
@@ -1635,6 +1675,109 @@ else
     systemctl disable vesselstack-telemetry-indexer.timer 2>/dev/null || true
     systemctl disable vesselstack-telemetry-sample.timer 2>/dev/null || true
 fi
+if [ -n "$backup_oncalendar" ]; then
+    systemctl enable vesselstack-backup.timer
+else
+    systemctl disable vesselstack-backup.timer 2>/dev/null || true
+fi
+
+# --- Unattended operation: hardware watchdog and journal cap ----------------------------------
+# install_dropin DESTINATION: reads the new content on standard input and replaces DESTINATION
+# only when it differs. Returns 0 when the file changed, 1 when it was already identical and
+# 2 on any error (callers must treat 2 as a failure, never as "unchanged").
+install_dropin() {
+    local destination=$1 tmp
+    install -d -m 0755 -o root -g root "$(dirname -- "$destination")" || return 2
+    tmp=$(mktemp "$destination.XXXXXX") || return 2
+    if ! cat > "$tmp" || ! chmod 0644 "$tmp"; then
+        rm -f -- "$tmp"
+        return 2
+    fi
+    if [ -f "$destination" ] && cmp -s -- "$tmp" "$destination"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$destination"; then
+        rm -f -- "$tmp"
+        return 2
+    fi
+}
+# remove_dropin DESTINATION: returns 0 when a file was removed, 1 when there was none.
+remove_dropin() {
+    [ -e "$1" ] || [ -L "$1" ] || return 1
+    rm -f -- "$1"
+}
+WATCHDOG_DROPIN="$SYSTEM_ROOT/etc/systemd/system.conf.d/60-vesselstack-watchdog.conf"
+watchdog_arm=0
+case "$VESSELSTACK_WATCHDOG" in
+    true)
+        if [ -e "$SYSTEM_ROOT/dev/watchdog" ]; then
+            watchdog_arm=1
+        else
+            echo "WARNING: VESSELSTACK_WATCHDOG=true but $SYSTEM_ROOT/dev/watchdog does not exist; no hardware watchdog was configured." >&2
+        fi
+        ;;
+    auto)
+        # auto is limited to Raspberry Pi hardware, where the watchdog driver is known to be safe.
+        if [ -e "$SYSTEM_ROOT/dev/watchdog" ] && grep -qa 'Raspberry Pi' "$SYSTEM_ROOT/proc/device-tree/model" 2>/dev/null; then
+            watchdog_arm=1
+        fi
+        ;;
+esac
+if [ "$watchdog_arm" -eq 1 ]; then
+    if systemctl is-active --quiet watchdog.service 2>/dev/null || systemctl is-enabled --quiet watchdog.service 2>/dev/null; then
+        echo "WARNING: watchdog.service is installed and active or enabled, so it owns the hardware watchdog; VesselStack did not configure systemd's watchdog." >&2
+        watchdog_arm=0
+    else
+        # systemd pings at half the timeout. Stay below the hardware maximum (Raspberry Pi: 15 s):
+        # N = min(10, max_timeout - 1), and skip when that leaves fewer than 5 seconds.
+        watchdog_seconds=10
+        watchdog_max=$(cat "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout" 2>/dev/null || true)
+        if [[ $watchdog_max =~ ^[0-9]+$ ]]; then
+            watchdog_seconds=$((watchdog_max - 1))
+            [ "$watchdog_seconds" -le 10 ] || watchdog_seconds=10
+            if [ "$watchdog_seconds" -lt 5 ]; then
+                echo "WARNING: the hardware watchdog maximum timeout is ${watchdog_max}s, too short to use safely; VesselStack did not configure the hardware watchdog." >&2
+                watchdog_arm=0
+            fi
+        else
+            echo "WARNING: could not read the hardware watchdog's maximum timeout; assuming 10 seconds is safe." >&2
+        fi
+    fi
+fi
+if [ "$watchdog_arm" -eq 1 ]; then
+    watchdog_rc=0
+    # A here-string (not a pipe) keeps install_dropin and the exit below in this shell.
+    install_dropin "$WATCHDOG_DROPIN" <<<"$(printf '[Manager]\nRuntimeWatchdogSec=%ss\nRebootWatchdogSec=2min' "$watchdog_seconds")" || watchdog_rc=$?
+    if [ "$watchdog_rc" -eq 2 ]; then
+        echo "ERROR: could not write $WATCHDOG_DROPIN" >&2
+        exit 1
+    fi
+    if [ "$watchdog_rc" -eq 0 ]; then
+        systemctl daemon-reexec
+    fi
+elif remove_dropin "$WATCHDOG_DROPIN"; then
+    systemctl daemon-reexec
+fi
+# SystemMaxUse only limits the persistent journal (/var/log/journal); Storage= is left to the system.
+# VESSELSTACK_JOURNAL_MAX_USE=off removes VesselStack's drop-in and leaves journald as the system has it.
+JOURNAL_DROPIN="$SYSTEM_ROOT/etc/systemd/journald.conf.d/60-vesselstack.conf"
+if [ "$VESSELSTACK_JOURNAL_MAX_USE" = off ]; then
+    if remove_dropin "$JOURNAL_DROPIN"; then
+        systemctl restart systemd-journald
+    fi
+else
+    journal_rc=0
+    install_dropin "$JOURNAL_DROPIN" <<<"$(printf '[Journal]\nSystemMaxUse=%s\nSystemKeepFree=1G\nMaxFileSec=1week' "$VESSELSTACK_JOURNAL_MAX_USE")" || journal_rc=$?
+    if [ "$journal_rc" -eq 2 ]; then
+        echo "ERROR: could not write $JOURNAL_DROPIN" >&2
+        exit 1
+    fi
+    if [ "$journal_rc" -eq 0 ]; then
+        systemctl restart systemd-journald
+    fi
+fi
+
 if [ "$DISPLAYS_ENABLE" = true ]; then
     systemctl enable vesselstack-displays-bridge.service
     # The environment file was just rewritten; restart a running bridge so it
@@ -1763,6 +1906,9 @@ if [ "$START" -eq 1 ]; then
         systemctl start vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer
     else
         systemctl stop vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer 2>/dev/null || true
+    fi
+    if [ -n "$backup_oncalendar" ]; then
+        systemctl start vesselstack-backup.timer
     fi
     if [ "$DISPLAYS_ENABLE" = true ]; then
         systemctl restart vesselstack-displays-bridge.service

@@ -130,7 +130,7 @@ class LifecycleLockTests(unittest.TestCase):
                                      str(self.install), "--system-root", str(self.system),
                                      "--", sys.executable, "-c", "raise SystemExit(9)"],
                                     cwd=ROOT, text=True, capture_output=True)
-            self.assertNotEqual(result.returncode, 9)
+            self.assertEqual(result.returncode, 75)
             self.assertIn("busy", result.stderr)
         finally:
             held.wait(timeout=5)

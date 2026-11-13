@@ -729,6 +729,40 @@ class StatusFieldTests(unittest.TestCase):
             self.assertEqual(status["state"], "ok")
             self.assertEqual({path.name for path in backup.iterdir()}, {old.name, new.name, orphan.name, old.name + ".sha256", new.name + ".sha256"})
 
+    def test_backup_status_reports_schedule_and_last_scheduled_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / "backups"
+            backup.mkdir()
+            record = Path(directory) / "backup-last.json"
+            settings = {"VESSELSTACK_BACKUP": str(backup), "VESSELSTACK_BACKUP_SCHEDULE": "weekly"}
+            with mock.patch.object(panel, "BACKUP_LAST_FILE", record), \
+                 mock.patch.object(panel, "command_output", return_value=(0, "Sun 2026-11-15 03:34:12 UTC")) as shown:
+                missing = panel.backup_status(settings)
+                self.assertEqual((missing["schedule"], missing["last_scheduled"], missing["next_run"]), ("weekly", None, "Sun 2026-11-15 03:34:12 UTC"))
+                self.assertEqual(shown.call_args.args[0], ["systemctl", "show", "vesselstack-backup.timer", "-p", "NextElapseUSecRealtime", "--value"])
+                record.write_text(json.dumps({"result": "success", "exit_status": 0, "finished_at": "2026-11-08T03:41:09Z", "archive": "vesselstack-20261108T033000Z-1.tar.gz"}))
+                present = panel.backup_status(settings)
+                self.assertEqual(present["last_scheduled"], {"result": "success", "exit_status": 0, "finished_at": "2026-11-08T03:41:09Z", "archive": "vesselstack-20261108T033000Z-1.tar.gz"})
+                record.write_text(json.dumps({"result": "failed", "exit_status": 1, "finished_at": "2026-11-09T03:41:09Z", "archive": "../../etc/passwd"}))
+                self.assertEqual(panel.backup_status(settings)["last_scheduled"], {"result": "failed", "exit_status": 1, "finished_at": "2026-11-09T03:41:09Z"})
+                record.write_text("not json")
+                self.assertIsNone(panel.backup_status(settings)["last_scheduled"])
+            with mock.patch.object(panel, "BACKUP_LAST_FILE", record), mock.patch.object(panel, "command_output") as shown:
+                off = panel.backup_status({"VESSELSTACK_BACKUP": str(backup)})
+                self.assertEqual((off["schedule"], off["next_run"]), ("off", None))
+                shown.assert_not_called()
+
+    def test_backup_status_lists_scheduled_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / "backups"
+            backup.mkdir()
+            scheduled = backup / "vesselstack-scheduled-20261108T033000123456789Z-4242.tar.gz"
+            scheduled.write_bytes(b"x")
+            (backup / (scheduled.name + ".sha256")).write_text("sum\n")
+            status = panel.backup_status({"VESSELSTACK_BACKUP": str(backup)})
+            self.assertEqual(status["state"], "ok")
+            self.assertEqual(status["last_backup_at"], int(scheduled.stat().st_mtime))
+
     def test_backup_status_unknown_or_missing_cases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(panel.backup_status({"VESSELSTACK_BACKUP": str(Path(directory) / "none")})["state"], "none")

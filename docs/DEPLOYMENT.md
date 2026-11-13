@@ -334,6 +334,8 @@ SOCKETCAN_ENABLE="true"
 SOCKETCAN_INTERFACE="vcan0"                # bitrate is ignored for vcan*
 VESSELSTACK_CAN_CREATE_VCAN="true"         # modprobe vcan + ip link add at boot
 VESSELSTACK_BACKUP="/media/vesselstack-backup/backups"   # must be a mounted device or backup refuses
+VESSELSTACK_BACKUP_SCHEDULE="off"          # off|daily|weekly; a scheduled backup STOPS the stack while it runs
+VESSELSTACK_WATCHDOG="auto"                # hardware watchdog on a Raspberry Pi with /dev/watchdog (true: any host; false: off)
 INFLUXDB_RAW_RETENTION="30d"               # see 3.6
 BOAT_CHAT_ACCESS_TOKEN="GENERATE"          # default; generated per host
 ```
@@ -586,6 +588,10 @@ backup, the recorded sha256 and a console/Ethernet path ready.
 
    Keep one copy off the Pi. `vesselstackctl update` also takes its own backup
    into `VESSELSTACK_BACKUP`, but that is not a substitute for this one.
+   Optional scheduled backups (`VESSELSTACK_BACKUP_SCHEDULE`, keep count
+   `VESSELSTACK_BACKUP_KEEP`) need the drive permanently mounted and each run stops the
+   whole stack; see the README sections "Scheduled backups" and "Unattended operation and power"
+   (hardware watchdog, journal cap, under-voltage warnings in `vesselstackctl doctor`).
 
 2. **Verify the tarball against the value recorded at build time** (compare with
    your notes, not with the `.sha256` file that travelled with it):

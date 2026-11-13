@@ -1,0 +1,11 @@
+[Unit]
+Description=Scheduled VesselStack backup (stops the stack while it runs)
+
+[Timer]
+OnCalendar=@BACKUP_ONCALENDAR@
+RandomizedDelaySec=15min
+Persistent=false
+Unit=vesselstack-backup.service
+
+[Install]
+WantedBy=timers.target

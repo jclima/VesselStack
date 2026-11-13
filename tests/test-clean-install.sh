@@ -54,6 +54,13 @@ EOF
 cat > "$FAKE_BIN/systemctl" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$(dirname "$0")/systemctl.log"
+# Another watchdog daemon is only running when a test says so.
+if { [ "${1:-}" = is-active ] || [ "${1:-}" = is-enabled ]; } && [[ " $* " == *" watchdog.service "* ]]; then
+    case "${1:-}" in
+        is-active) [ -n "${FAKE_WATCHDOG_SERVICE_ACTIVE:-}" ] || exit 3 ;;
+        is-enabled) [ -n "${FAKE_WATCHDOG_SERVICE_ENABLED:-}" ] || exit 3 ;;
+    esac
+fi
 exit 0
 EOF
 cat > "$FAKE_BIN/curl" <<'EOF'
@@ -214,6 +221,137 @@ if grep -qx 'enable vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.lo
     echo "Displays bridge was enabled with DISPLAYS_ENABLE=false" >&2
     exit 1
 fi
+# Unattended operation defaults: no watchdog device in the test root, so no watchdog drop-in; the
+# journal is capped; scheduled backups are off (service and helper exist, the timer does not).
+WATCHDOG_DROPIN="$SYSTEM_ROOT/etc/systemd/system.conf.d/60-vesselstack-watchdog.conf"
+JOURNAL_DROPIN="$SYSTEM_ROOT/etc/systemd/journald.conf.d/60-vesselstack.conf"
+test ! -e "$WATCHDOG_DROPIN"
+grep -qx 'SystemMaxUse=200M' "$JOURNAL_DROPIN"
+grep -qx 'SystemKeepFree=1G' "$JOURNAL_DROPIN"
+grep -qx 'MaxFileSec=1week' "$JOURNAL_DROPIN"
+if grep -q '^Storage=' "$JOURNAL_DROPIN"; then echo "The journald drop-in must not set Storage=" >&2; exit 1; fi
+grep -qx 'restart systemd-journald' "$FAKE_BIN/systemctl.log"
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx 'ExecStart=/usr/local/sbin/vesselstackctl backup --scheduled' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx 'Environment=VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx 'ExecStopPost=/usr/local/libexec/vesselstack/record-backup-result' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/record-backup-result")" = "0:755"
+grep -qx 'disable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"
+if grep -qx 'enable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"; then
+    echo "The backup timer was enabled with VESSELSTACK_BACKUP_SCHEDULE=off" >&2
+    exit 1
+fi
+# Weekly schedule + a watchdog device on a Raspberry Pi: both drop-ins, the timer, and daemon-reexec.
+UNATTENDED_CONFIG="$TEST_ROOT/unattended.env"
+cp "$CONFIG" "$UNATTENDED_CONFIG"
+printf '\nVESSELSTACK_BACKUP_SCHEDULE="weekly"\nVESSELSTACK_JOURNAL_MAX_USE="64M"\n' >> "$UNATTENDED_CONFIG"
+install -d "$SYSTEM_ROOT/sys/class/watchdog/watchdog0" "$SYSTEM_ROOT/dev" "$SYSTEM_ROOT/proc/device-tree"
+printf '15\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+: > "$SYSTEM_ROOT/dev/watchdog"
+run_unattended() {  # [env assignments...]
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$@" "$REPO_ROOT/install.sh" --config "$UNATTENDED_CONFIG"
+}
+# auto without a Raspberry Pi model: a watchdog device alone does not arm anything.
+printf 'Generic x86 board\0' > "$SYSTEM_ROOT/proc/device-tree/model"
+run_unattended >/dev/null
+test ! -e "$WATCHDOG_DROPIN"
+# true arms on any host that has the device.
+printf '\nVESSELSTACK_WATCHDOG="true"\n' >> "$UNATTENDED_CONFIG"
+run_unattended >/dev/null
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+sed -i '/^VESSELSTACK_WATCHDOG=/d' "$UNATTENDED_CONFIG"
+rm -f -- "$WATCHDOG_DROPIN"
+printf 'Raspberry Pi 4 Model B Rev 1.5\0' > "$SYSTEM_ROOT/proc/device-tree/model"
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+grep -qx '\[Manager\]' "$WATCHDOG_DROPIN"
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+grep -qx 'RebootWatchdogSec=2min' "$WATCHDOG_DROPIN"
+grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+grep -qx 'SystemMaxUse=64M' "$JOURNAL_DROPIN"
+grep -qx 'OnCalendar=Sun \*-\*-\* 03:30' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+grep -qx 'RandomizedDelaySec=15min' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+grep -qx 'Persistent=false' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+grep -qx 'enable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"
+grep -qx 'TimeoutStopSec=15min' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx "Documentation=file://$APP_ROOT/README.md" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+# A second identical run changes nothing, so it neither re-execs systemd nor restarts journald.
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+if grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log" || grep -qx 'restart systemd-journald' "$FAKE_BIN/systemctl.log"; then
+    echo "An unchanged rerun re-executed systemd or restarted journald" >&2
+    exit 1
+fi
+# N = min(10, max_timeout - 1): 8 gives 7, 11 gives 10.
+printf '8\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+run_unattended >/dev/null
+grep -qx 'RuntimeWatchdogSec=7s' "$WATCHDOG_DROPIN"
+printf '11\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+run_unattended >/dev/null
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+# A maximum that leaves fewer than 5 seconds skips the watchdog with a warning and removes the drop-in.
+printf '5\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+: > "$FAKE_BIN/systemctl.log"
+warn_output=$(run_unattended 2>&1 >/dev/null)
+grep -q 'too short to use safely' <<<"$warn_output"
+test ! -e "$WATCHDOG_DROPIN"
+grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+# An unreadable maximum assumes 10 seconds and warns.
+rm -f -- "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+warn_output=$(run_unattended 2>&1 >/dev/null)
+grep -q 'could not read the hardware watchdog' <<<"$warn_output"
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+# watchdog.service active, or enabled: our drop-in is removed (systemd re-executed) and the installer warns.
+for owner_env in FAKE_WATCHDOG_SERVICE_ACTIVE=1 FAKE_WATCHDOG_SERVICE_ENABLED=1; do
+    run_unattended >/dev/null
+    test -e "$WATCHDOG_DROPIN"
+    : > "$FAKE_BIN/systemctl.log"
+    warn_output=$(run_unattended "$owner_env" 2>&1 >/dev/null)
+    grep -q 'watchdog.service is installed and active or enabled' <<<"$warn_output"
+    test ! -e "$WATCHDOG_DROPIN"
+    grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+done
+# Device gone: the drop-in is removed and systemd re-executed. VESSELSTACK_WATCHDOG=false also removes it.
+run_unattended >/dev/null
+test -e "$WATCHDOG_DROPIN"
+rm -f -- "$SYSTEM_ROOT/dev/watchdog"
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+test ! -e "$WATCHDOG_DROPIN"
+grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+: > "$SYSTEM_ROOT/dev/watchdog"
+run_unattended >/dev/null
+test -e "$WATCHDOG_DROPIN"
+printf 'VESSELSTACK_WATCHDOG="false"\n' >> "$UNATTENDED_CONFIG"
+run_unattended >/dev/null
+test ! -e "$WATCHDOG_DROPIN"
+# VESSELSTACK_JOURNAL_MAX_USE=off removes VesselStack's journald drop-in and restarts journald once.
+test -e "$JOURNAL_DROPIN"
+printf 'VESSELSTACK_JOURNAL_MAX_USE="off"\n' >> "$UNATTENDED_CONFIG"
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+test ! -e "$JOURNAL_DROPIN"
+grep -qx 'restart systemd-journald' "$FAKE_BIN/systemctl.log"
+# A drop-in that cannot be written is an error, not "unchanged".
+printf 'VESSELSTACK_JOURNAL_MAX_USE="64M"\n' >> "$UNATTENDED_CONFIG"
+rm -rf -- "$SYSTEM_ROOT/etc/systemd/journald.conf.d"
+: > "$SYSTEM_ROOT/etc/systemd/journald.conf.d"   # a file where the directory belongs: nothing can be written
+rc=0
+run_unattended >/dev/null 2>&1 || rc=$?
+test "$rc" -ne 0
+rm -f -- "$SYSTEM_ROOT/etc/systemd/journald.conf.d"
+run_unattended >/dev/null
+test -e "$JOURNAL_DROPIN"
+# Back to schedule off: the timer is removed again.
+printf 'VESSELSTACK_BACKUP_SCHEDULE="off"\n' >> "$UNATTENDED_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$UNATTENDED_CONFIG" >/dev/null
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+rm -f -- "$SYSTEM_ROOT/dev/watchdog"
+# Restore the default installed state for the checks below.
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 test ! -e "$APP_ROOT/config/displays-bridge.env"
 test ! -e "$APP_ROOT/config/displays.json"
 test ! -e "$APP_ROOT/displays/.venv"

@@ -57,6 +57,8 @@ SETTINGS: dict[str, Setting] = {
     "VESSELSTACK_DATA_BIND_ADDRESS": _s("127.0.0.1"), "VESSELSTACK_WEB_BIND_ADDRESS": _s("0.0.0.0"), "HOMEASSISTANT_BIND_ADDRESS": _s("0.0.0.0"), "TELEGRAM_ENABLE": _s("false", kind="boolean", owner="vessel", component="telegram"), "TELEMETRY_INDEXER_ENABLE": _s("true", kind="boolean", owner="vessel", component="telemetry-indexer"), "NODE_EXPORTER_ENABLE": _s("false", kind="boolean", component="node-exporter"),
     "GRAFANA_PORT": _s("43000", kind="port", minimum=1, maximum=65535, required=True, component="grafana"), "HOMEPAGE_PORT": _s("80", kind="port", minimum=1, maximum=65535, required=True, component="homepage"), "PROMETHEUS_PORT": _s("9090", kind="port", minimum=1, maximum=65535, required=True, component="prometheus"), "PROMETHEUS_RETENTION": _s("30d", required=True), "VESSELSTACK_UNTRUSTED_INTERFACE": _s("wlan0"), "VESSELSTACK_FIREWALL_ENABLE": _s("false", kind="boolean", component="firewall"), "VESSELSTACK_FIREWALL_STRICT": _s("false", kind="boolean", component="firewall"), "VESSELSTACK_FIREWALL_ALLOW_TCP": _s("22", component="firewall"), "VESSELSTACK_FIREWALL_ALLOW_UDP": _s("", component="firewall"), "CONTROL_PANEL_HOST": _s("127.0.0.1", required=True, component="control-panel"), "CONTROL_PANEL_PORT": _s("8780", kind="port", minimum=1, maximum=65535, required=True, component="control-panel"),
     "DISPLAYS_ENABLE": _s("false", kind="boolean", component="displays-bridge"), "DISPLAYS_BRIDGE_MQTT_USERNAME": _s("vesselstack-bridge", required=True, component="displays-bridge"), "DISPLAYS_SIGNALK_TOKEN": _s(), "DISPLAYS_HA_TOKEN": _s(), "VESSELSTACK_DISABLED_COMPONENTS": _s(), "HOMEPAGE_ALLOWED_HOSTS": _s(), "HOMEPAGE_ALLOWED_HOSTS_EXTRA": _s(), "CONTROL_PANEL_PASSPHRASE_HASH": _s(owner="panel"), "BOAT_CHAT_PASSPHRASE_HASH": _s(owner="chat"),
+    "VESSELSTACK_WATCHDOG": _s("auto", enum=("auto", "true", "false")), "VESSELSTACK_JOURNAL_MAX_USE": _s("200M", required=True),
+    "VESSELSTACK_BACKUP_SCHEDULE": _s("off", enum=("off", "daily", "weekly")), "VESSELSTACK_BACKUP_KEEP": _s("8", kind="number", minimum=1, maximum=365, required=True), "VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK": _s("false", kind="boolean"),
 }
 
 DEFAULTS = {key: spec.default for key, spec in SETTINGS.items()}
@@ -90,6 +92,8 @@ def validate_value(key: str, value: Any, *, allow_blank: bool = True) -> str:
             if ipaddress.ip_address(text).version != 4: raise ValueError
         except ValueError: raise ValueError(f"Invalid IPv4 address for {key}") from None
     if key in {"MQTT_USERNAME", "DISPLAYS_BRIDGE_MQTT_USERNAME"} and text and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", text): raise ValueError(f"Invalid MQTT name for {key}")
+    if key == "VESSELSTACK_JOURNAL_MAX_USE" and text and text != "off" and not re.fullmatch(r"[1-9][0-9]*[KMG]", text): raise ValueError("Invalid VESSELSTACK_JOURNAL_MAX_USE: use a size such as 200M or 1G, or off")
+    if key == "VESSELSTACK_BACKUP_KEEP" and text and not (re.fullmatch(r"[1-9][0-9]*", text) and int(text) <= 365): raise ValueError("Invalid VESSELSTACK_BACKUP_KEEP: use a whole number from 1 to 365")
     if key == "BOAT_NAME" and text and not re.fullmatch(r"[A-Za-z0-9_. -]{1,60}", text): raise ValueError("Invalid BOAT_NAME")
     if key in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
         if not re.fullmatch(r"[0-9]{1,5}(?::[0-9]{1,5})?(?:,[0-9]{1,5}(?::[0-9]{1,5})?)*", text): raise ValueError(f"Invalid port list for {key}")

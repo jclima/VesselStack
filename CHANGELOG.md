@@ -3,6 +3,30 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+- Add unattended-operation settings: a hardware watchdog (`VESSELSTACK_WATCHDOG`, default `auto`,
+  enabled only on a Raspberry Pi that has `/dev/watchdog`; `true` enables it on any computer with the
+  device) and a journal size cap (`VESSELSTACK_JOURNAL_MAX_USE`, default `200M`, or `off` for no
+  VesselStack drop-in), both applied by the installer through systemd drop-ins. The watchdog timeout
+  is `min(10, max_timeout - 1)` seconds and is skipped below 5; it is also skipped (and VesselStack's
+  drop-in removed) when `watchdog.service` is active or enabled.
+- Upgrading on a Raspberry Pi arms the hardware watchdog by default (`auto`). Opt out with
+  `VESSELSTACK_WATCHDOG="false"` and rerun the installer.
+- Add opt-in scheduled backups (`VESSELSTACK_BACKUP_SCHEDULE` off/daily/weekly, default off) with
+  retention (`VESSELSTACK_BACKUP_KEEP`, default 8, whole number 1 to 365) and `vesselstackctl backup --scheduled`, which
+  needs a mounted backup drive. Scheduled archives are named `vesselstack-scheduled-<stamp>.tar.gz`
+  and only those are pruned; manual and pre-update backups never are. The drive needs room for
+  `KEEP`+1 archives. A failed run removes its partial archive. A scheduled backup stops the whole stack while it runs. The last result is
+  recorded in `/var/lib/vesselstack/backup-last.json` and shown in `doctor` and the Control Panel.
+- `vesselstackctl doctor` reports the watchdog, journal cap, scheduled backups, Raspberry Pi
+  under-voltage/throttling (`vcgencmd get_throttled`), a configured GPIO shutdown overlay and whether
+  the previous boot ended cleanly. Only a failed scheduled backup makes `doctor` fail.
+- The lifecycle lock helper now exits with status 75 (instead of 1) when the lock is busy
+  (`run` only); a busy scheduled backup leaves its unit in the failed state until the next success.
+- Rollback: set `VESSELSTACK_WATCHDOG=false`, `VESSELSTACK_JOURNAL_MAX_USE=off` and
+  `VESSELSTACK_BACKUP_SCHEDULE=off` and rerun the installer (README, "Unattended operation and power").
+
 ## 0.8.0 - 2026-11-12
 
 - Configure the VesselStack Homepage from Control Panel Settings. Choose its palette, heading,

@@ -15,7 +15,8 @@ the boat's local network when the internet is unavailable.
 - [Upgrading to 0.6.0](#upgrading-to-060)
 - [First-run setup](#9-complete-first-run-setup): Home Assistant, Signal K, InfluxDB, Grafana, Boat Chat, Control Panel
 - [MQTT access control](#mqtt-access-control), [network access](#reaching-vesselstack-from-other-devices) and [network security](#network-security)
-- [Backups](#backups), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
+- [Unattended operation and power](#unattended-operation-and-power): hardware watchdog, journal size cap, under-voltage warnings
+- [Backups](#backups) (including [scheduled backups](#scheduled-backups)), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
 - [Boat profile](docs/BOAT_PROFILE.md) for shared engine, battery, and tank configuration
 - [Troubleshooting](#troubleshooting)
 - [Developer validation](#developer-validation), [Documentation policy](#documentation-policy), [License and security](#license-and-security), [Moved sections](#moved-sections)
@@ -488,8 +489,9 @@ PiCAN-M works with caveats, see docs/BOM.md). Commission on the bench first.
 
 After installation, use the printed URLs from a trusted local device, run
 `sudo vesselstackctl doctor`, and confirm the dashboards show the signals you expect.
-Keep the generated credentials per host, schedule backups to a separate device,
-and test restoring one before relying on the system. Read the deployment guide
+Keep the generated credentials per host, back up to a separate device (turn on scheduled
+backups with `VESSELSTACK_BACKUP_SCHEDULE`, see [Scheduled backups](#scheduled-backups), or run
+`sudo vesselstackctl backup` yourself), and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
 VesselStack 0.8.0 includes configurable Homepage branding and fixes for the Displays editor. Upgrade from 0.7.0 or 0.7.1 with the
@@ -1385,6 +1387,98 @@ InfluxDB, Prometheus and MQTT bind to `127.0.0.1` by default; Grafana and Homepa
 Keep Home Assistant, Signal K and Boat Chat off the public internet. The minimum checklist is in
 [Network access and security](docs/NETWORK.md#network-security).
 
+## Unattended operation and power
+
+A boat computer is often left alone for weeks. These settings (all in `vesselstack.env`, the
+wizard's advanced questions and the Control Panel Settings page) help it recover from a hang, keep
+its logs from filling the disk and warn about a weak power supply. They are applied by the
+installer; run `sudo vesselstackctl doctor` afterwards to see each one.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `VESSELSTACK_WATCHDOG` | `auto` | `auto` enables the hardware watchdog only on a Raspberry Pi (`/proc/device-tree/model` contains "Raspberry Pi") that has `/dev/watchdog`; `true` enables it on any computer that has `/dev/watchdog` and warns when the device is missing; `false` removes the VesselStack drop-in. |
+| `VESSELSTACK_JOURNAL_MAX_USE` | `200M` | Cap for the persistent system journal (`SystemMaxUse`), a size such as `200M` or `1G`; `off` writes no VesselStack journald drop-in and removes an existing one. |
+| `VESSELSTACK_BACKUP_SCHEDULE` | `off` | `off`, `daily` or `weekly` (about 03:30). Stays `off` on upgrade. See [Scheduled backups](#scheduled-backups). |
+| `VESSELSTACK_BACKUP_KEEP` | `8` | Scheduled archives to keep (a whole number from 1 to 365, no leading zero). The backup drive needs room for `KEEP`+1 archives. |
+| `VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK` | `false` | Allow scheduled backups to a folder on the system disk (not recommended). |
+
+**Hardware watchdog.** The installer writes
+`/etc/systemd/system.conf.d/60-vesselstack-watchdog.conf` with `RuntimeWatchdogSec=<N>s` and
+`RebootWatchdogSec=2min`, then runs `systemctl daemon-reexec`. `N` is `min(10, max_timeout - 1)`,
+where `max_timeout` is read from `/sys/class/watchdog/watchdog0/max_timeout` (a Raspberry Pi reports
+15, so `N` is 10). When that leaves fewer than 5 seconds the installer prints a warning, does not
+configure the watchdog and removes an existing VesselStack drop-in. When `max_timeout` cannot be read
+it assumes 10 seconds and prints a warning. systemd feeds the watchdog; if the whole system stops
+responding the hardware resets the board. This recovers a hung boat computer on its own. It does not
+detect a stopped container (Docker restarts those) or a misbehaving single service.
+
+**Upgrading on a Raspberry Pi arms the watchdog.** `auto` is the default, so rerunning the installer
+on a Raspberry Pi that has `/dev/watchdog` turns the hardware watchdog on without further questions.
+To opt out, set `VESSELSTACK_WATCHDOG="false"` in `vesselstack.env` before (or after) the upgrade and
+rerun the installer; this removes the drop-in and re-executes systemd. Other computers are left
+alone under `auto`; `true` arms them when `/dev/watchdog` exists. If `watchdog.service` is active or
+enabled (it owns the device), the installer warns, removes its own drop-in if one exists and
+does not configure systemd's watchdog; `doctor` then prints `INFO watchdog.service owns the hardware watchdog`.
+The drop-in is also removed when the setting is `false` or the device is missing.
+
+**Journal size.** The installer writes `/etc/systemd/journald.conf.d/60-vesselstack.conf` with
+`SystemMaxUse=<VESSELSTACK_JOURNAL_MAX_USE>`, `SystemKeepFree=1G` and `MaxFileSec=1week` and restarts
+`systemd-journald`. With `VESSELSTACK_JOURNAL_MAX_USE="off"` no drop-in is written and an existing one is removed (journald restarts once), leaving the system's own journal settings in place. It does not set `Storage=`: the caps matter when the journal is persistent
+(`/var/log/journal` exists). Raspberry Pi OS often keeps the journal in memory, in which case there
+is also no log from before a reboot. To keep logs across reboots, which also makes the
+previous-boot check below meaningful, run `sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald`.
+Restarting journald is brief; the services keep running.
+
+**Power and under-voltage.** `vesselstackctl doctor` runs `vcgencmd get_throttled` when it exists
+(Raspberry Pi OS) and warns about: under-voltage now (bit `0x1`, worded emphatically because the
+board can crash or corrupt data), ARM frequency capped (`0x2`), throttled (`0x4`), soft temperature
+limit (`0x8`) and, for each, that it happened since boot (`0x10000`, `0x20000`, `0x40000`,
+`0x80000`). All are warnings; they never turn `RESULT healthy` into a failure. The usual fix is a
+better power supply, a shorter or thicker cable, or a regulated 12/24 V to 5 V converter with enough
+current. Without `vcgencmd` the throttling check prints nothing; the GPIO shutdown `INFO` line below is independent of it and still prints. `vcgencmd` runs under a 5-second timeout.
+
+**Safe shutdown on power loss (documentation only).** VesselStack does not edit
+`/boot/firmware/config.txt`. For a shutdown button or a UPS signal you can add, yourself, an overlay
+such as `dtoverlay=gpio-shutdown,gpio_pin=3,active_low=1,gpio_pull=up` (GPIO 3 is the pin the Raspberry
+Pi uses for wake-up too), or follow your UPS HAT vendor's own daemon. `doctor` prints an `INFO` line
+when it finds the `gpio-shutdown` overlay there. Test any shutdown path on the bench first.
+
+**Previous boot.** When the journal is persistent, `doctor` looks at the end of the previous boot and
+prints `INFO previous boot ended without a clean shutdown` if no shutdown target was reached
+(power loss, crash or a watchdog reset; it cannot tell these apart). Otherwise, including when a
+non-root user cannot read the system journal, it prints
+`previous boot shutdown state unknown (journal not readable or not persistent)`. The journal queries run under a
+10-second timeout.
+
+**Operational impact.** A watchdog reset reboots the whole boat computer: dashboards, logging and
+Signal K stop for the reboot time. The installer restarts `systemd-journald` once when its drop-in
+changes and re-executes systemd (`daemon-reexec`) when the watchdog drop-in changes; neither stops
+the VesselStack services. A scheduled backup stops the whole stack (see [Scheduled backups](#scheduled-backups)).
+
+**Verification.**
+
+```bash
+sudo vesselstackctl doctor                                 # OK/WARN/INFO lines for each item above
+cat /sys/class/watchdog/watchdog0/state                    # "active" once systemd is feeding the watchdog
+systemctl show -p RuntimeWatchdogUSec -p RebootWatchdogUSec   # the configured values (10s and 2min); not proof by themselves
+journalctl --disk-usage
+```
+
+**Rollback.** Set `VESSELSTACK_WATCHDOG="false"`, `VESSELSTACK_JOURNAL_MAX_USE="off"` and `VESSELSTACK_BACKUP_SCHEDULE="off"` in
+`/opt/vesselstack/config/vesselstack.env` and rerun the installer
+(`sudo /opt/vesselstack/installer/install.sh --config /opt/vesselstack/config/vesselstack.env`, or **Reinstall**
+in the Control Panel). Or by hand:
+
+```bash
+sudo rm -f /etc/systemd/system.conf.d/60-vesselstack-watchdog.conf /etc/systemd/journald.conf.d/60-vesselstack.conf
+sudo systemctl daemon-reexec
+sudo systemctl restart systemd-journald
+sudo systemctl disable --now vesselstack-backup.timer
+```
+
+`vesselstackctl uninstall` removes the backup timer, its service and the result helper but leaves the two
+drop-ins above in place; remove them with the commands shown.
+
 ## Backups
 
 Create a consistent backup. The stack is stopped briefly to avoid copying live
@@ -1560,6 +1654,52 @@ Keep an encrypted copy off the boat and test restoration. InfluxDB needs an
 application-consistent backup or a snapshot made while stopped; blindly copying
 live database files is insufficient.
 
+### Scheduled backups
+
+Scheduled backups are **off by default** (and stay off when you upgrade). Set
+`VESSELSTACK_BACKUP_SCHEDULE="daily"` or `"weekly"` (the wizard offers this under advanced
+settings) and rerun the installer to create and enable `vesselstack-backup.timer`. It runs at about
+03:30 (daily, or Sundays) with up to 15 minutes of random delay. The timer uses `Persistent=false`,
+so a Raspberry Pi that is switched off at 03:30 skips that run and does not make it up when it
+boots; `doctor` warns once the last success is older than twice the interval.
+
+> **A scheduled backup is an outage.** Like every backup it stops the whole stack (Signal K,
+> InfluxDB, Home Assistant, Grafana, Boat Chat and the rest) while it copies the data, then starts it again.
+> Expect no dashboards and no data logging for as long as the backup takes (several minutes, longer
+> on a large database). Choose a time when you are not underway, or keep it off and back up by hand.
+
+What a scheduled run does (`vesselstackctl backup --scheduled`, run by `vesselstack-backup.service`):
+
+- It never asks questions. The backup folder must be on a **mounted** `/media` or `/mnt` drive that
+  passes the usual safety check (root-owned, no symbolic links); otherwise it refuses without stopping
+  anything and the run is recorded as failed. A folder on the system disk is refused unless you set
+  `VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK="true"`. `--scheduled` cannot be combined with
+  `--allow-unmounted`, `--system-disk-once` or a directory.
+- After the new archive has been written and verified it keeps the newest `VESSELSTACK_BACKUP_KEEP`
+  (default 8) and deletes older ones, each with its `.sha256`. Only files named
+  `vesselstack-scheduled-<UTC stamp>-<pid>.tar.gz` (regular files, no symbolic links) that have a
+  regular `.sha256` beside them, directly in the configured folder, are considered, and the archive
+  just written is never removed. Scheduled archives carry that own name on purpose: manual backups
+  (`vesselstack-<stamp>.tar.gz`), pre-update backups and every other file in the folder are **never**
+  pruned. An invalid `VESSELSTACK_BACKUP_KEEP` (including `08` or `010`) prints a warning and prunes nothing.
+  Because the new archive is written before old ones are removed, the drive needs room for `KEEP`+1
+  archives. A run that fails removes the partial archive it was writing.
+- If another VesselStack lifecycle operation (an update, a restore) holds the lifecycle lock, the run
+  exits with status 75 and is recorded as `skipped_busy`. Exit 75 leaves `vesselstack-backup.service`
+  in the failed state, so it shows up in `systemctl --failed` until the next successful run.
+
+The result of the last scheduled run is in `/var/lib/vesselstack/backup-last.json`
+(`{"result": "success" | "failed" | "skipped_busy", "exit_status", "finished_at", "last_success_at", "archive"}`;
+`archive` is a file name only; `last_success_at` is carried forward across failed and skipped runs). `vesselstackctl doctor` reports it: it warns when scheduled backups are
+off, when the last success is older than twice the interval (also after repeated skipped or failed runs), and when the last run was skipped, and it
+reports a failed last run as a failure. The Control Panel Home page shows the schedule, the last scheduled result and the
+timer's next run (read-only). See the logs with `journalctl -u vesselstack-backup.service`, the next
+run with `systemctl list-timers vesselstack-backup.timer`, and run one now with
+`sudo systemctl start vesselstack-backup.service`.
+
+Rollback: set `VESSELSTACK_BACKUP_SCHEDULE="off"` and rerun the installer, or
+`sudo systemctl disable --now vesselstack-backup.timer`. Backups already made are not deleted.
+
 ## Updating
 
 This is the one place in the README that describes updating and rolling back.
@@ -1678,6 +1818,17 @@ prints how to remove it (`docker volume rm vesselstack-esphome-cache`);
 
 Install the reported command and rerun `--dry-run`. Confirm `docker compose`
 works; the deprecated standalone `docker-compose` command is insufficient.
+
+### `doctor` shows power, watchdog, journal or scheduled-backup lines
+
+See [Unattended operation and power](#unattended-operation-and-power) and
+[Scheduled backups](#scheduled-backups). `WARN UNDER-VOLTAGE RIGHT NOW` means the power supply or
+cable is inadequate: fix it before trusting anything else. `FAIL the last scheduled backup failed`
+means the last timer run did not complete (usually the backup drive was not mounted):
+`journalctl -u vesselstack-backup.service`, mount the drive, then run
+`sudo systemctl start vesselstack-backup.service`. `WARN a hardware watchdog device exists but VesselStack
+has not enabled it` (Raspberry Pi only; `INFO watchdog.service owns the hardware watchdog` needs no action) and `WARN the system journal has no VesselStack size cap` are fixed by rerunning the
+installer.
 
 ### "Refusing to back up: ... is not mounted"
 

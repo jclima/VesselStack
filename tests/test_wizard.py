@@ -725,6 +725,21 @@ class CliCommandTests(unittest.TestCase):
             values = wizard.load_env(out2)
             self.assertEqual((values["BOAT_NAME"], values["VESSELSTACK_USER"], values["BOAT_TYPE"]), ("From Base", "daemon", "Yacht"))
 
+    def test_backup_schedule_is_set_with_set_and_defaults_to_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = self.run_wizard("--defaults", "--output", str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(wizard.load_env(out)["VESSELSTACK_BACKUP_SCHEDULE"], "off")
+            out2 = Path(directory) / "weekly.env"
+            result = self.run_wizard("--defaults", "--set", "VESSELSTACK_BACKUP_SCHEDULE=weekly", "--set", "VESSELSTACK_BACKUP_KEEP=4", "--output", str(out2))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            values = wizard.load_env(out2)
+            self.assertEqual((values["VESSELSTACK_BACKUP_SCHEDULE"], values["VESSELSTACK_BACKUP_KEEP"], values["VESSELSTACK_WATCHDOG"]), ("weekly", "4", "auto"))
+            self.assertEqual(self.run_wizard("--validate", str(out2)).returncode, 0)
+            bad = self.run_wizard("--defaults", "--set", "VESSELSTACK_BACKUP_SCHEDULE=hourly", "--output", str(Path(directory) / "bad.env"))
+            self.assertNotEqual(bad.returncode, 0)
+
     def test_displays_ha_token_is_a_hidden_optional_secret_set_with_set(self):
         field = wizard.FIELD_INDEX["DISPLAYS_HA_TOKEN"]
         self.assertEqual((field["kind"], bool(field.get("advanced")), wizard.DEFAULTS["DISPLAYS_HA_TOKEN"]),

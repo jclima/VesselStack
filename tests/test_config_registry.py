@@ -45,6 +45,39 @@ class ConfigRegistryTests(unittest.TestCase):
         self.assertEqual(panel.COMPOSE_COMPONENTS, registry.COMPOSE_COMPONENTS)
         self.assertEqual(panel.SYSTEMD_COMPONENTS, registry.SYSTEMD_COMPONENTS)
 
+    def test_unattended_operation_settings(self):
+        expected = {"VESSELSTACK_WATCHDOG": "auto", "VESSELSTACK_JOURNAL_MAX_USE": "200M", "VESSELSTACK_BACKUP_SCHEDULE": "off",
+                    "VESSELSTACK_BACKUP_KEEP": "8", "VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK": "false"}
+        for key, default in expected.items():
+            self.assertEqual(registry.DEFAULTS[key], default)
+            self.assertEqual(wizard.DEFAULTS[key], default)
+            self.assertIn(key, wizard.FIELD_INDEX)
+        for key, good in (("VESSELSTACK_WATCHDOG", "true"), ("VESSELSTACK_BACKUP_SCHEDULE", "weekly"), ("VESSELSTACK_BACKUP_SCHEDULE", "daily"),
+                          ("VESSELSTACK_JOURNAL_MAX_USE", "1G"), ("VESSELSTACK_JOURNAL_MAX_USE", "512K"), ("VESSELSTACK_JOURNAL_MAX_USE", "off"), ("VESSELSTACK_BACKUP_KEEP", "365"),
+                          ("VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK", "true")):
+            with self.subTest(key=key, good=good):
+                self.assertEqual(registry.validate_value(key, good), good)
+                self.assertEqual(wizard.validate({key: good})[key], good)
+        for key, bad in (("VESSELSTACK_WATCHDOG", "yes"), ("VESSELSTACK_BACKUP_SCHEDULE", "hourly"), ("VESSELSTACK_JOURNAL_MAX_USE", "200"),
+                         ("VESSELSTACK_JOURNAL_MAX_USE", "0M"), ("VESSELSTACK_JOURNAL_MAX_USE", "1.5G"), ("VESSELSTACK_JOURNAL_MAX_USE", "200MB"),
+                         ("VESSELSTACK_BACKUP_KEEP", "0"), ("VESSELSTACK_BACKUP_KEEP", "00"), ("VESSELSTACK_BACKUP_KEEP", "08"), ("VESSELSTACK_BACKUP_KEEP", "010"), ("VESSELSTACK_BACKUP_KEEP", "366"), ("VESSELSTACK_BACKUP_KEEP", "2.5"),
+                         ("VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK", "maybe")):
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(ValueError): registry.validate_value(key, bad)
+                with self.assertRaises(ValueError): wizard.validate({key: bad})
+                spec = panel.FIELD_BY_KEY[key]
+                with self.assertRaises(ValueError): panel.validate_value(spec, bad)
+
+    def test_installer_and_example_env_carry_the_unattended_keys(self):
+        installer = (ROOT / "install.sh").read_text()
+        example = (ROOT / "vesselstack.example.env").read_text()
+        for key, default in (("VESSELSTACK_WATCHDOG", "auto"), ("VESSELSTACK_JOURNAL_MAX_USE", "200M"), ("VESSELSTACK_BACKUP_SCHEDULE", "off"),
+                             ("VESSELSTACK_BACKUP_KEEP", "8"), ("VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK", "false")):
+            with self.subTest(key=key):
+                self.assertIn(f': "${{{key}:={default}}}"', installer)
+                self.assertRegex(installer, rf"(?m)^{key}$")
+                self.assertIn(f'{key}="{default}"', example)
+
     def test_chat_port_override_is_preferred_and_invalid_is_not_hidden(self):
         self.assertEqual(registry.effective_chat_port({"BOAT_CHAT_PORT": "8000"}, {"BOAT_CHAT_PORT": "9000"}), 9000)
         self.assertEqual(registry.effective_chat_port({"BOAT_CHAT_PORT": "8000"}, {"BOAT_CHAT_PORT": ""}), 8765)
