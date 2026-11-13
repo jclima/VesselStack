@@ -59,13 +59,16 @@ case "${1:-}" in
         fi
         for argument in "$@"; do
             case "$argument" in
-                --auth-key=file:*) wc -c < "${argument#--auth-key=file:}" > "$state/key-length" ;;
+                --auth-key=file:*) wc -c < "${argument#--auth-key=file:}" > "$state/key-length"; dirname "${argument#--auth-key=file:}" > "$state/key-dir" ;;
             esac
         done
+        [ -z "${FAKE_TS_KILL_PARENT:-}" ] || kill -TERM "$PPID"
+        [ -z "${FAKE_TS_UP_FAIL:-}" ] || exit 1
         touch "$state/up" ;;
     serve)
         case "${2:-}" in
             reset) rm -f "$state/serve" ;;
+            --https=8780) [ "${3:-}" != off ] || rm -f "$state/serve" ;;
             status) [ ! -e "$state/serve" ] || echo 'https://boat.example-tailnet.ts.net:8780 (tailnet only)|-- / proxy http://127.0.0.1:8780' ;;
             *) touch "$state/serve" ;;
         esac ;;
@@ -121,7 +124,7 @@ grep -q 'not installed' <<<"$(run_ctl remote status)"
 # A dry run changes nothing.
 dry=$(run_ctl remote enable --dry-run)
 grep -q 'dry run' <<<"$dry"
-grep -q 'hostname=my-boat' <<<"$dry"
+grep -q 'hostname=vesselstack --accept-dns=false' <<<"$dry"
 [ ! -e "$MARKER" ] || fail "dry run wrote the marker"
 [ "$(count_calls '^apt-get')" -eq 0 ] || fail "dry run called apt-get"
 [ "$(env_value "$APP_ROOT/config/vesselstack.env" REMOTE_ACCESS)" = off ] || fail "dry run changed REMOTE_ACCESS"
@@ -139,7 +142,11 @@ run_ctl remote enable >/dev/null
 [ -s "$KEYRING" ] || fail "keyring missing"
 grep -Fxq 'deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian bookworm main' "$LIST" || fail "apt source wrong"
 grep -q '^apt-get install -y tailscale' "$LOG" || fail "package not installed"
-grep -q '^tailscale up --hostname=my-boat$' "$LOG" || fail "tailscale up not called with the boat host name"
+grep -q '^tailscale up --hostname=vesselstack --accept-dns=false$' "$LOG" || fail "tailscale up not called with the neutral default host name and --accept-dns=false"
+if grep -q 'my-boat' "$LOG"; then fail "boat name leaked into the tailnet host name"; fi
+grep -q '^curl --proto =https --proto-redir =https ' "$LOG" || fail "curl did not restrict protocols"
+if grep '^curl' "$LOG" | grep -vq -- '--proto =https --proto-redir =https'; then fail "a curl call lacks the https-only flags"; fi
+[ "$(cat "$SYSTEM_ROOT/var/lib/vesselstack/tailscale-panel-host")" = boat.example-tailnet.ts.net:8780 ] || fail "added panel host not recorded"
 grep -q '^tailscale serve --bg --https=8780 http://127.0.0.1:8780$' "$LOG" || fail "serve not configured"
 [ "$(env_value "$APP_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)" = 'other.example,boat.example-tailnet.ts.net:8780' ] || fail "allowed host not added"
 [ "$(env_value "$APP_ROOT/config/vesselstack.env" REMOTE_ACCESS)" = tailscale ] || fail "REMOTE_ACCESS not recorded"
@@ -165,11 +172,23 @@ assert d["tailnet_ips"] == ["100.64.0.1", "fd7a:115c:a1e0::1"], d
 assert d["panel_url"] == "https://boat.example-tailnet.ts.net:8780", d
 ' "$status_json"
 
-# Disable without --purge: serve reset, down, host removed (the owner's own entry stays), package kept.
-run_ctl remote disable >/dev/null
-grep -q '^tailscale serve reset$' "$LOG" || fail "disable did not reset serve"
-grep -q '^tailscale down$' "$LOG" || fail "disable did not go down"
-[ "$(env_value "$APP_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)" = other.example ] || fail "allowed host not removed cleanly"
+# Disable without --purge: only our serve handler off, host removed by exact name (the owner's own entries stay),
+# panel restarted before tailscale goes down, package kept.
+set_hosts() { sed -i "s|^CONTROL_PANEL_ALLOWED_HOSTS=.*|CONTROL_PANEL_ALLOWED_HOSTS=$1|" "$APP_ROOT/config/control-panel.env"; }
+set_hosts 'other.example,mine.example-tailnet.ts.net:8780,boat.example-tailnet.ts.net:8780'
+: > "$LOG"
+disable_out=$(run_ctl remote disable 2>&1)
+if grep -q '^tailscale serve reset' "$LOG"; then fail "disable used serve reset"; fi
+grep -q '^tailscale serve --https=8780 off$' "$LOG" || fail "disable did not remove only our serve handler"
+grep -q '^tailscale down$' "$LOG" || fail "disable did not go down for a VesselStack-installed Tailscale"
+grep -q 'SSH session' <<<"$disable_out" || fail "no SSH warning before tailscale down"
+[ "$(env_value "$APP_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)" = 'other.example,mine.example-tailnet.ts.net:8780' ] || fail "allowed host not removed by exact name"
+[ ! -e "$SYSTEM_ROOT/var/lib/vesselstack/tailscale-panel-host" ] || fail "host record not removed"
+restart_line=$(grep -n 'systemctl restart vesselstack-control-panel' "$LOG" | head -n 1 | cut -d: -f1)
+off_line=$(grep -n '^tailscale serve --https=8780 off$' "$LOG" | head -n 1 | cut -d: -f1)
+down_line=$(grep -n '^tailscale down$' "$LOG" | head -n 1 | cut -d: -f1)
+if ! { [ "$restart_line" -lt "$off_line" ] && [ "$off_line" -lt "$down_line" ]; }; then fail "order must be restart, serve off, down ($restart_line $off_line $down_line)"; fi
+set_hosts other.example
 [ "$(env_value "$APP_ROOT/config/vesselstack.env" REMOTE_ACCESS)" = off ] || fail "REMOTE_ACCESS not reset"
 [ -e "$MARKER" ] || fail "disable without --purge removed the marker"
 [ "$(count_calls '^apt-get purge')" -eq 0 ] || fail "disable without --purge removed the package"
@@ -183,10 +202,33 @@ if grep -rq "SECRETVALUE123" "$TEST_ROOT"; then fail "auth key found on disk or 
 [ "$(cat "$TS_STATE/key-length")" -eq "${#KEY}" ] || fail "tailscale did not read the key file"
 run_ctl remote disable >/dev/null
 
+# Hostname: --hostname overrides the default and is validated; a bad name changes nothing.
+for bad in 'My Boat' '-boat' 'boat-' 'UPPER' 'a_b' '' "$(printf 'a%.0s' $(seq 64))"; do
+    if run_ctl remote enable --dry-run --hostname "$bad" >/dev/null 2>&1; then fail "accepted invalid --hostname '$bad'"; fi
+done
+grep -q 'hostname=sea-1 ' <<<"$(run_ctl remote enable --dry-run --hostname sea-1)" || fail "--hostname not honoured"
+
+key_dir_gone() { [ -s "$TS_STATE/key-dir" ] || return 1; [ ! -e "$(cat "$TS_STATE/key-dir")" ]; }
+# A failed or interrupted join removes the key file (the EXIT/TERM trap, not only the success path).
+rm -f "$TS_STATE/key-dir"
+if printf '%s\n' "$KEY" | FAKE_TS_FILE_KEY=1 FAKE_TS_UP_FAIL=1 run_ctl remote enable --auth-key-stdin >/dev/null 2>&1; then fail "enable succeeded though tailscale up failed"; fi
+key_dir_gone || fail "key directory left behind after a failed join"
+rm -f "$TS_STATE/key-dir"
+printf '%s\n' "$KEY" | FAKE_TS_FILE_KEY=1 FAKE_TS_KILL_PARENT=1 run_ctl remote enable --auth-key-stdin >/dev/null 2>&1 || true
+key_dir_gone || fail "key directory left behind after the command was terminated"
+if grep -rq "SECRETVALUE123" "$TEST_ROOT"; then fail "auth key found on disk after failures"; fi
+rm -f "$TS_STATE/up"
+
 # Purge is gated by the marker: a Tailscale VesselStack did not install stays.
 mv "$MARKER" "$MARKER.away"
-purge_out=$(run_ctl remote disable --purge)
+set_hosts 'other.example,boat.example-tailnet.ts.net:8780'
+: > "$LOG"
+purge_out=$(run_ctl remote disable --purge 2>&1)
 grep -q 'not installed by VesselStack' <<<"$purge_out" || fail "purge without marker said: $purge_out"
+grep -q 'WARN no record' <<<"$purge_out" || fail "missing host record gave no WARN: $purge_out"
+[ "$(env_value "$APP_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)" = other.example ] || fail "fallback pattern did not remove the tailnet entry"
+grep -q '^tailscale serve --https=8780 off$' "$LOG" || fail "owner-installed disable skipped serve off"
+if grep -q '^tailscale down' "$LOG"; then fail "disable took down a Tailscale the owner installed"; fi
 [ "$(count_calls '^apt-get purge')" -eq 0 ] || fail "purge removed a package VesselStack did not install"
 mv "$MARKER.away" "$MARKER"
 run_ctl remote disable --purge >/dev/null

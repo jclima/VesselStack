@@ -1603,12 +1603,22 @@ and the Control Panel settings only record the choice.
    signed-by keyring in `/usr/share/keyrings/tailscale-archive-keyring.gpg`, a source file
    `/etc/apt/sources.list.d/tailscale.list` for your Debian, Raspberry Pi OS or Ubuntu release, and the
    marker `/var/lib/vesselstack/tailscale-installed-by-vesselstack`; no `curl | sh`);
-2. joins your tailnet with `tailscale up --hostname=<boat name as a host name>` and prints a sign-in link
-   to open on any device;
+2. joins your tailnet with `tailscale up --hostname=vesselstack --accept-dns=false` and prints a sign-in link
+   to open on any device. The default host name is neutral on purpose; choose another with
+   `remote enable --hostname NAME` (lowercase letters, digits, hyphens; 1-63 characters). `--accept-dns=false`
+   keeps the boat's own DNS resolver, so name lookups keep working offline and are not sent through Tailscale;
+   you reach the boat by its `*.ts.net` name from other devices as usual;
 3. with `REMOTE_PANEL_SERVE=true` (the default) publishes the Control Panel with
    `tailscale serve --bg --https=8780 http://127.0.0.1:8780`, adds `<name>.<tailnet>.ts.net:8780` to
    `CONTROL_PANEL_ALLOWED_HOSTS` in `config/control-panel.env` (kept across reinstalls and updates), and
-   restarts the panel. The panel itself stays bound to `127.0.0.1`.
+   restarts the panel. The panel itself stays bound to `127.0.0.1`. The exact name added is recorded in
+   `/var/lib/vesselstack/tailscale-panel-host`, so `disable` removes only that entry.
+   `tailscale serve` must pass the original `Host` header to the panel (it does by design). The panel compares
+   `Host` and `Origin` strictly and does not trust `X-Forwarded-Host`; if a future Tailscale version rewrote
+   `Host`, writes from the tailnet would fail with `403` (fail safe, nothing is weakened) until fixed.
+   **Public name warning:** with HTTPS enabled, Tailscale obtains a certificate for
+   `<hostname>.<tailnet>.ts.net`, and that name is published in public Certificate Transparency logs. Do not
+   use your boat name as `--hostname` if you do not want it public (the default does not contain it).
 
 **Set it up.**
 
@@ -1622,17 +1632,32 @@ and the Control Panel settings only record the choice.
    tab). Sign in with the panel token or passphrase as usual.
 
 `--auth-key-stdin` (for an unattended join) is accepted only if the installed Tailscale can read the key from a
-file (`tailscale up --auth-key=file:`); the key is read from one line of standard input, written to a
-private temporary file that is deleted at once, and is never placed on a command line, in an environment
-file, a log or a backup. Otherwise the command refuses and you use the sign-in link.
+file (`tailscale up --auth-key=file:`); the key is read from one line of standard input (hidden when typed
+at a terminal), written to a private temporary file that is deleted when `tailscale up` returns or the
+command is interrupted, and is never placed on a command line, in an environment file, a log or a backup. Otherwise the command refuses and you use the sign-in link.
 
 **What it does not do, and what to know.**
 
-- **Tailnet-wide exposure.** Tailscale gives every device in your tailnet a route to the boat computer, and
-  services bound to all interfaces (`0.0.0.0`: Grafana, the home page, Boat Chat, Home Assistant and Signal K
-  in the default `dashboards` preset) become reachable over the tailnet on their normal ports, not only the
-  panel. The firewall rules match only the untrusted interface and do not mention `tailscale0`. Limit who can
-  reach the boat with [Tailscale ACLs](https://tailscale.com/kb/1018/acls) (or use `lan local`).
+- **Tailnet-wide exposure.** Tailscale gives every device in your tailnet a route to the boat computer, so
+  everything listening on a non-loopback address is reachable over the tailnet, not only the panel:
+  SSH (port 22); the services bound to all interfaces (`0.0.0.0`: Grafana, the home page, Boat Chat, Home
+  Assistant and Signal K in the default `dashboards` preset); the data services (InfluxDB, Prometheus, MQTT)
+  when `VESSELSTACK_DATA_BIND_ADDRESS=0.0.0.0`; the Node-RED editor when its bind address is `0.0.0.0`; and the
+  Control Panel itself in `panel-access lan` mode (then it is reachable on its normal port too). The firewall
+  rules match only the untrusted interface and do not mention `tailscale0`. Limit who can reach the boat with
+  [Tailscale ACLs](https://tailscale.com/kb/1018/acls) (or use `lan local`). Example policy that lets only
+  you reach the panel and SSH on the boat (tag the boat `tag:boat` and give your address in `src`):
+
+  ```json
+  {
+    "tagOwners": { "tag:boat": ["owner@example.com"] },
+    "acls": [
+      { "action": "accept", "src": ["owner@example.com"], "dst": ["tag:boat:8780", "tag:boat:22"] }
+    ]
+  }
+  ```
+
+  Replace the sample address with your own; with no other `accept` rule, nothing else reaches the boat.
 - **Shared sign-in throttle.** Behind `tailscale serve` every client appears to the panel as `127.0.0.1`, so
   failed sign-ins from the tailnet share one lockout bucket with SSH-tunnel users: someone guessing wrongly
   from the tailnet also locks you out of the tunnel for the lockout period.
@@ -1652,14 +1677,19 @@ name and addresses, the published serve configuration and the panel URL. `sudo v
 adds `INFO`/`WARN` lines when `REMOTE_ACCESS=tailscale` but Tailscale is missing, signed out, or not
 serving the panel (never a `FAIL`). `sudo ss -ltn` still shows the panel only on `127.0.0.1:8780`.
 
-**Roll back.** `sudo vesselstackctl remote disable` runs `tailscale serve reset` and `tailscale down`,
-removes the tailnet name from `CONTROL_PANEL_ALLOWED_HOSTS`, sets `REMOTE_ACCESS=off` and restarts the panel.
-Add `--purge` to also log out and remove the Tailscale package, source and keyring, but only when the
-marker file shows VesselStack installed it (otherwise your own Tailscale is left in place). Remove the boat
-from your Tailscale admin console too. `vesselstackctl uninstall` does this automatically. By hand:
-`sudo tailscale serve reset && sudo tailscale down`, delete the `CONTROL_PANEL_ALLOWED_HOSTS` line or the
-`.ts.net:8780` entry from `/opt/vesselstack/config/control-panel.env`, set `REMOTE_ACCESS=off` in
-`/opt/vesselstack/config/vesselstack.env`, and `sudo systemctl restart vesselstack-control-panel.service`.
+**Roll back.** `sudo vesselstackctl remote disable`, in this order: removes the recorded tailnet name from
+`CONTROL_PANEL_ALLOWED_HOSTS` (your own entries stay; if the record is missing it warns and removes
+`*.ts.net:8780` entries), sets `REMOTE_ACCESS=off`, restarts the panel, runs `tailscale serve --https=8780 off`
+(only VesselStack's handler, never `serve reset`), and last runs `tailscale down` **only when VesselStack
+installed Tailscale** (the marker file exists), after warning that an SSH session over the tailnet will drop.
+If you installed Tailscale yourself, it is left connected and its other settings, serve rules and
+login are untouched; only the panel handler and VesselStack's own allowlist entry go. Add `--purge` to also log
+out and remove the Tailscale package, source and keyring, again only when the marker shows VesselStack
+installed it. Remove the boat from your Tailscale admin console too. `vesselstackctl uninstall` does the same
+automatically. By hand: `sudo tailscale serve --https=8780 off`, delete the `CONTROL_PANEL_ALLOWED_HOSTS` line
+or the `.ts.net:8780` entry from `/opt/vesselstack/config/control-panel.env`, set `REMOTE_ACCESS=off` in
+`/opt/vesselstack/config/vesselstack.env`, `sudo systemctl restart vesselstack-control-panel.service`, and
+(if you want the boat off the tailnet) `sudo tailscale down`.
 
 ## Network security
 

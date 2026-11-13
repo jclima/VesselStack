@@ -18,8 +18,11 @@ Semantic Versioning.
   tailnet with the printed sign-in link, and publishes the Control Panel (still on `127.0.0.1`) to the tailnet only
   with `tailscale serve --https=8780`, adding its name to `CONTROL_PANEL_ALLOWED_HOSTS` (now preserved across
   reinstalls). No inbound ports are opened; no auth key is stored or logged (`--auth-key-stdin` works only when the
-  installed Tailscale reads keys from a file). The panel's Origin check also accepts a loopback-rewritten `Host` via
-  `X-Forwarded-Host` for allowed names. `/api/status` gains read-only `remote`, shown on the Home tab; `doctor` warns
+  installed Tailscale reads keys from a file). The panel's Origin check stays strict (`Host` must equal `Origin`; `tailscale serve` passes the original
+  `Host`, otherwise tailnet writes fail with 403). Default tailnet host name is `vesselstack` (`--hostname NAME` to change;
+  HTTPS publishes it in Certificate Transparency logs), `--accept-dns=false`, curl limited to https; `disable` runs only
+  `tailscale serve --https=8780 off`, removes only the recorded allowlist entry and runs `tailscale down` last, only for a
+  Tailscale VesselStack installed. `/api/status` gains read-only `remote`, shown on the Home tab; `doctor` warns
   (never fails) on a missing or signed-out Tailscale; `uninstall` disables it. Operational impact: every tailnet device
   can reach services bound to `0.0.0.0` (use Tailscale ACLs) and tailnet sign-in failures share the panel's 127.0.0.1
   lockout bucket. Rollback: `sudo vesselstackctl remote disable --purge`.

@@ -121,10 +121,8 @@ proxy or a custom DNS name), add it to `CONTROL_PANEL_ALLOWED_HOSTS` in
 `config/control-panel.env` (comma separated, `name` or `name:port`; names
 without a port get the panel port), then restart the panel. `sudo vesselstackctl
 remote enable` adds `<name>.<tailnet>.ts.net:8780` here for you (optional Tailscale
-remote access, README "Remote access with Tailscale"); whether `tailscale serve`
-keeps the original `Host` or rewrites it to the loopback address, the panel accepts
-the request and the same-origin check on sign-in (a rewritten `Host` is matched through
-`X-Forwarded-Host`, only from a loopback peer and only for an allowed name).
+remote access, README "Remote access with Tailscale"); `tailscale serve` passes the original `Host`, which the panel's strict same-origin check on
+sign-in requires (it never trusts `X-Forwarded-Host`; a rewritten `Host` makes writes fail with 403).
 `GET /api/status` includes a read-only `remote` object (`enabled`, `online`, `name`,
 `panel_url`; `null` when Tailscale is not installed) that the Home tab shows.
 

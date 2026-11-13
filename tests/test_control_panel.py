@@ -1922,27 +1922,31 @@ class TailnetHostApiTests(HostAllowlistApiTests):
             self.assertEqual(self.login_status(host, f"https://{self.NAME}:9999"), 403)
         panel._HOST_ALLOWLISTS.clear()
 
-    def test_origin_matches_when_serve_rewrites_the_host_to_loopback(self) -> None:
+    def test_forwarded_host_header_never_relaxes_the_origin_check(self) -> None:
         self.set_passphrase()
         port = self.server.server_address[1]
         loopback = f"127.0.0.1:{port}"
         with self.with_allowed(f"{self.NAME}:8780"):
             origin = f"https://{self.NAME}:8780"
-            # serve forwards the original host in X-Forwarded-Host
-            self.assertNotEqual(self.login_status(loopback, origin, {"X-Forwarded-Host": f"{self.NAME}:8780"}), 403)
-            # without it, or with a name that is not on the allowlist, the strict comparison still applies
+            # a rewritten Host (loopback) is not rescued by X-Forwarded-Host: fail safe with 403
+            self.assertEqual(self.login_status(loopback, origin, {"X-Forwarded-Host": f"{self.NAME}:8780"}), 403)
             self.assertEqual(self.login_status(loopback, origin), 403)
-            self.assertEqual(self.login_status(loopback, "https://evil.example:8780", {"X-Forwarded-Host": "evil.example:8780"}), 403)
-            self.assertEqual(self.login_status(loopback, origin, {"X-Forwarded-Host": f"{self.NAME}:8781"}), 403)
+            self.assertEqual(self.login_status(f"{self.NAME}:8780", "https://evil.example:8780", {"X-Forwarded-Host": f"{self.NAME}:8780"}), 403)
         panel._HOST_ALLOWLISTS.clear()
 
 
 class RemoteStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        panel._REMOTE_CACHE.update(at=None, data=None)
+
     def fake_tailscale(self, payload, directory):
         script = Path(directory) / "tailscale"
         script.write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(payload) + "\nEOF\n")
         script.chmod(0o755)
         return mock.patch.object(panel.shutil, "which", lambda name: str(script) if name == "tailscale" else None)
+
+    def clear_cache(self):
+        panel._REMOTE_CACHE.update(at=None, data=None)
 
     def test_remote_is_none_when_tailscale_is_absent(self) -> None:
         with mock.patch.object(panel.shutil, "which", lambda name: None):
@@ -1951,14 +1955,26 @@ class RemoteStatusTests(unittest.TestCase):
     def test_remote_reports_name_and_panel_url_without_secrets(self) -> None:
         running = {"BackendState": "Running", "AuthURL": "", "Self": {"DNSName": "boat.example-tailnet.ts.net.", "Online": True}}
         with tempfile.TemporaryDirectory() as directory:
-            with self.fake_tailscale(running, directory), mock.patch.object(panel, "parse_env", return_value={"CONTROL_PANEL_PORT": "8780"}):
+            with self.fake_tailscale(running, directory), mock.patch.object(panel, "parse_env", return_value={"CONTROL_PANEL_PORT": "9999"}):
                 remote = panel.remote_status()
             self.assertEqual(remote, {"enabled": True, "online": True, "name": "boat.example-tailnet.ts.net", "panel_url": "https://boat.example-tailnet.ts.net:8780"})
+            self.clear_cache()
             login = {"BackendState": "NeedsLogin", "AuthURL": "https://login.tailscale.com/a/secret", "Self": {}}
             with self.fake_tailscale(login, directory), mock.patch.object(panel, "parse_env", return_value={}):
                 remote = panel.remote_status()
             self.assertEqual((remote["enabled"], remote["online"], remote["panel_url"]), (True, False, ""))
             self.assertNotIn("secret", json.dumps(remote))
+
+    def test_remote_status_is_cached_for_thirty_seconds(self) -> None:
+        running = {"BackendState": "Running", "Self": {"DNSName": "boat.example-tailnet.ts.net.", "Online": True}}
+        with tempfile.TemporaryDirectory() as directory, self.fake_tailscale(running, directory):
+            with mock.patch.object(panel.subprocess, "run", wraps=panel.subprocess.run) as run:
+                panel.remote_status()
+                panel.remote_status()
+                self.assertEqual(run.call_count, 1)
+                panel._REMOTE_CACHE["at"] -= 31
+                panel.remote_status()
+                self.assertEqual(run.call_count, 2)
 
     def test_remote_survives_a_failing_or_garbled_tailscale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

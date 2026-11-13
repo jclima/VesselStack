@@ -1261,7 +1261,23 @@ def scheduled_backup_status(settings: dict[str, str]) -> dict[str, Any]:
     return {"schedule": schedule, "last_scheduled": last, "next_run": next_run}
 
 
+REMOTE_SERVE_PORT = 8780  # fixed https port of `tailscale serve` (vesselstackctl REMOTE_SERVE_PORT)
+REMOTE_CACHE_SECONDS = 30.0
+_REMOTE_CACHE: dict[str, Any] = {"at": None, "data": None}
+
+
 def remote_status() -> dict[str, Any] | None:
+    """Cached (30 s) wrapper so /api/status polling never spawns tailscale more than twice a minute."""
+    now = time.monotonic()
+    cached_at = _REMOTE_CACHE["at"]
+    if cached_at is not None and 0 <= now - cached_at < REMOTE_CACHE_SECONDS:
+        return _REMOTE_CACHE["data"]
+    data = remote_status_uncached()
+    _REMOTE_CACHE.update(at=now, data=data)
+    return data
+
+
+def remote_status_uncached() -> dict[str, Any] | None:
     """Read-only Tailscale view for the Home tab: None when Tailscale is not installed or unreadable.
 
     ``tailscale status --json`` is the only call (2 second limit). Nothing is changed, no key is read or shown.
@@ -1279,27 +1295,10 @@ def remote_status() -> dict[str, Any] | None:
     me = data.get("Self") if isinstance(data.get("Self"), dict) else {}
     name = str(me.get("DNSName") or "").rstrip(".")
     online = data.get("BackendState") == "Running" and bool(me.get("Online", True))
-    port = str(parse_env(VESSEL_ENV).get("CONTROL_PANEL_PORT") or "8780")
     serve = parse_env(VESSEL_ENV).get("REMOTE_PANEL_SERVE", "true") == "true"
     return {"enabled": data.get("BackendState") not in {None, "NoState", "Stopped"},
             "online": online, "name": name,
-            "panel_url": f"https://{name}:{port}" if name and online and serve else ""}
-
-
-def origin_matches_forwarded_host(origin_host: str, origin_port: int | None, headers: Any, peer: str, server_address: Any) -> bool:
-    """Origin check for a reverse proxy that rewrites Host to the loopback target (tailscale serve may).
-
-    Accepted only when the TCP peer is loopback and X-Forwarded-Host names the same host and port as the
-    Origin and that name passes the Host allowlist (CONTROL_PANEL_ALLOWED_HOSTS). Anything else keeps the
-    strict Host == Origin comparison.
-    """
-    if not (peer.startswith("127.") or peer in {"::1", "::ffff:127.0.0.1"}):
-        return False
-    forwarded = (headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
-    if not forwarded or not host_allowlist(server_address).allowed(forwarded):
-        return False
-    expected = urllib.parse.urlsplit(f"//{forwarded}")
-    return (expected.hostname or "").lower() == origin_host.lower() and expected.port == origin_port
+            "panel_url": f"https://{name}:{REMOTE_SERVE_PORT}" if name and online and serve else ""}
 
 
 def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1951,8 +1950,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 expected = urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}")
                 if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
                     raise ValueError
-                if (parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port) \
-                        and not origin_matches_forwarded_host(parsed.hostname, parsed.port, self.headers, self.client_ip(), self.server.server_address):
+                if parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port:
                     raise ValueError
             except (ValueError, UnicodeError):
                 self.send_json(403, {"error": "request origin is not allowed"})
