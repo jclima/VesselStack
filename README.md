@@ -16,6 +16,7 @@ the boat's local network when the internet is unavailable.
 - [First-run setup](#9-complete-first-run-setup): Home Assistant, Signal K, InfluxDB, Grafana, Boat Chat, Control Panel
 - [MQTT access control](#mqtt-access-control), [network access](#reaching-vesselstack-from-other-devices) and [network security](#network-security)
 - [Unattended operation and power](#unattended-operation-and-power): hardware watchdog, journal size cap, under-voltage warnings
+- [Marine essentials](#marine-essentials-optional): optional NMEA 0183 on port 10110, anchor alarm, logbook, KIP and Freeboard
 - [Alerts](#alerts): opt-in Telegram push for battery, stale data, stack failures, restarts and backups; Home Assistant blueprints
 - [Backups](#backups) (including [scheduled backups](#scheduled-backups)), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
 - [Boat profile](docs/BOAT_PROFILE.md) for shared engine, battery, and tank configuration
@@ -861,6 +862,7 @@ nano vesselstack.env
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `SIGNALK_DATAPATH_AUTOCONFIG` | Managed Docker/native modes install `signalk-to-influxdb2` 2.3.0, add the NMEA 2000 provider and write the plugin's InfluxDB configuration (default `true`, see [Signal K and InfluxDB](#signal-k-and-influxdb)); existing mode ignores it, and `false` skips without removing anything |
+| `SIGNALK_MARINE_BUNDLE` | Managed Docker/native modes only: NMEA 0183 on TCP 10110, anchor alarm, automatic logbook, KIP and Freeboard-SK tiles (default `false`, see [Marine essentials](#marine-essentials-optional)); existing mode ignores it, and `false` never uninstalls anything. |
 | `HOME_ASSISTANT_TOKEN` | Optional long-lived token used by Boat Chat |
 | `SOCKETCAN_ENABLE` | Opt in only after the CAN interface is present |
 | `SOCKETCAN_INTERFACE`, `SOCKETCAN_BITRATE` | CAN device and NMEA 2000 bitrate (`vcan*` interfaces ignore the bitrate) |
@@ -1524,6 +1526,68 @@ except `CHOWN`, `SETUID` and `SETGID`.
 `HEIMDALL_PORT` becomes `HOMEPAGE_PORT` when that is unset, and `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT`
 are no longer kept; `/opt/vesselstack-data/heimdall` is left untouched and can be deleted
 by hand. Rollback: restore the previous release from a backup. Homepage uses no data directory.
+
+## Marine essentials (optional)
+
+Off by default (`SIGNALK_MARINE_BUNDLE="false"`). With `SIGNALK_MARINE_BUNDLE="true"` in a **managed** Signal K mode
+(`docker` or `native`; `existing` mode is never modified) the installer gives you what Venus OS Large advertises for
+the same job:
+
+| What | Where it comes from | Result |
+| --- | --- | --- |
+| NMEA 0183 for chartplotter apps | `@signalk/signalk-to-nmea0183` 1.16.2, **bundled with Signal K v2.27.0** | RMC, GGA, GLL, VTG, ZDA, DBT, DPT, MWV (apparent), HDM, HDT, MTW and barometer XDR sentences on **TCP 10110** |
+| Anchor alarm | `signalk-anchoralarm-plugin` 2.0.1, installed | Web app at `/signalk-anchoralarm-plugin/` on the Signal K address |
+| Automatic logbook | `@meri-imperiumi/signalk-logbook` 0.15.1 and `@meri-imperiumi/signalk-autostate` 0.6.4, installed | Web app at `/@meri-imperiumi/signalk-logbook/`; autostate records the moored, anchored, sailing and motoring changes |
+| Instruments | `@mxtommy/kip` 4.8.0, **bundled with Signal K** | Web app at `/@mxtommy/kip/` |
+| Charts | `@signalk/freeboard-sk` 2.22.1, **bundled with Signal K** | Web app at `/@signalk/freeboard-sk/` |
+
+The Homepage gets KIP, Freeboard, Logbook and Anchor alarm tiles that open these on the Signal K address.
+
+Native mode gets the three bundled packages from the same `npm install signalk-server` that installs Signal K itself. The data directory is part of every VesselStack backup.
+
+**What the installer does** (the same helper as [Signal K and InfluxDB](#signal-k-and-influxdb), with the same rules:
+npm runs as the Signal K user with `--ignore-scripts --save-exact`, a dry run first refuses to install when npm would
+remove packages that `package.json` does not list, and Signal K is stopped once and started again only when something
+changed): it installs the three pinned packages into the Signal K data directory and writes
+`plugin-config-data/sk-to-nmea0183.json`, `anchoralarm.json`, `signalk-logbook.json` and `signalk-autostate.json`
+**only when the file does not exist**, so your own settings are never overwritten. Signal K's NMEA 0183 TCP server
+(interface `nmea-tcp`) is on by default; the installer edits `settings.json` only if you had set that interface
+explicitly to `false` (a `.bak` copy is made first and no other key is touched). It needs the npm registry, so an
+offline install skips it with a warning; rerun online. Without `SIGNALK_DATAPATH_AUTOCONFIG` the bundle still runs on
+its own.
+
+**Connect a navigation app** (Navionics, iSailor, Aqua Map and similar): add a TCP connection to the boat computer's
+address, port **10110**. The port is read-only for nav apps in practice and has **no password**, so it is dropped by
+the firewall on the untrusted interface (`VESSELSTACK_UNTRUSTED_INTERFACE`), like the other administrative ports. If
+your phone or tablet reaches the boat through that interface, allow it in strict mode with
+`VESSELSTACK_FIREWALL_ALLOW_TCP="22,10110"` (keep the `22`) and rerun the installer; in the default mode, join the
+trusted network instead.
+
+**Anchor alarm.** Open the Anchor alarm tile, drop the anchor at the boat's position and set the radius. Alarms are
+Signal K notifications, so they reach a Signal K notification client; VesselStack's own Telegram alerts are not wired
+to them. Check the alarm sound works on your display before relying on it.
+
+**Logbook.** Entries (which contain **positions**) are stored in the Signal K data directory
+(`${VESSELSTACK_DATA}/signalk`), so they are in VesselStack backups and in the Signal K directory you copy elsewhere;
+treat both as private. Manual entries are made in the Logbook app.
+
+**Operational impact.** About 64 MB of extra npm packages under `${VESSELSTACK_DATA}/signalk/node_modules` (the three
+pinned packages pull 40 packages in total; their sub-dependencies are **not pinned**, and `--no-package-lock` is used,
+as for the InfluxDB plugin), a few more Signal K plugins running, and one more listening port (10110). Venus OS
+comparison: Venus OS Large ships these as modules on a Cerbo GX; here they are the equivalent Signal K plugins.
+
+**Verify.**
+
+```bash
+nc BOAT_ADDRESS 10110          # sentences such as $GPRMC,... appear once Signal K has a position
+sudo vesselstackctl doctor     # WARN (never FAIL) if 10110 is not listening or a plugin configuration is missing
+```
+
+**Roll back.** Set `SIGNALK_MARINE_BUNDLE="false"` and rerun the installer (nothing is removed). To remove it fully:
+delete `${VESSELSTACK_DATA}/signalk/plugin-config-data/{sk-to-nmea0183,anchoralarm,signalk-logbook,signalk-autostate}.json`,
+restore `settings.json` from its `settings.json.vesselstack-*.bak` if the installer changed it, then run
+`npm uninstall --ignore-scripts --prefix ${VESSELSTACK_DATA}/signalk signalk-anchoralarm-plugin @meri-imperiumi/signalk-logbook @meri-imperiumi/signalk-autostate`
+as the Signal K user (add `--dry-run` first) and restart Signal K. The logbook entries are kept.
 
 ## Node-RED (optional)
 

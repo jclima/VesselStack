@@ -1493,9 +1493,18 @@ if [ "${1:-}" = run ] && [[ " $* " == *" --entrypoint npm "* ]]; then
         fi
         exit 0
     fi
-    install -d "$source_dir/node_modules/signalk-to-influxdb2"
-    printf '{"name":"signalk-to-influxdb2","version":"2.3.0"}\n' > "$source_dir/node_modules/signalk-to-influxdb2/package.json"
-    printf '{"dependencies":{"signalk-to-influxdb2":"2.3.0"}}\n' > "$source_dir/package.json"
+    deps=
+    for argument in "$@"; do
+        case "$argument" in
+            -*|*:*) ;;
+            *@[0-9]*.[0-9]*.[0-9]*)
+                package=${argument%@*}
+                install -d "$source_dir/node_modules/$package"
+                printf '{"name":"%s","version":"%s"}\n' "$package" "${argument##*@}" > "$source_dir/node_modules/$package/package.json"
+                deps="$deps${deps:+,}\"$package\":\"${argument##*@}\"" ;;
+        esac
+    done
+    printf '{"dependencies":{%s}}\n' "$deps" > "$source_dir/package.json"
     exit 0
 fi
 exec "$(dirname "$0")/../bin/docker" "$@"
@@ -1589,6 +1598,39 @@ rm -rf "$DATA4/signalk"
 dp_output=$(dp_install)
 if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'existing mode ran npm' >&2; exit 1; fi
 if grep -q 'Signal K data path' <<<"$dp_output"; then echo 'existing mode reported on the data path' >&2; exit 1; fi
+test ! -e "$DATA4/signalk/plugin-config-data"
+
+# ---- Optional marine essentials bundle (README "Marine essentials (optional)"): off by default,
+# rides on the data path run when that runs, runs alone (--bundle-only) when it does not, and
+# never touches existing mode.
+sed -i -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="docker"|' "$DPCONFIG"
+rm -rf "$DATA4/signalk"
+dp_install >/dev/null
+grep -q '^SIGNALK_MARINE_BUNDLE=false$' "$APP4/config/vesselstack.env"
+test ! -e "$DATA4/signalk/plugin-config-data/anchoralarm.json"
+test ! -e "$DATA4/signalk/node_modules/signalk-anchoralarm-plugin"
+printf 'SIGNALK_MARINE_BUNDLE="true"\n' >> "$DPCONFIG"
+dp_output=$(dp_install)
+grep -q '^SIGNALK_MARINE_BUNDLE=true$' "$APP4/config/vesselstack.env"
+for plugin_id in sk-to-nmea0183 anchoralarm signalk-logbook signalk-autostate; do test -s "$DATA4/signalk/plugin-config-data/$plugin_id.json"; done
+grep -q '"RMC": true' "$DATA4/signalk/plugin-config-data/sk-to-nmea0183.json"
+test -s "$DATA4/signalk/node_modules/@meri-imperiumi/signalk-logbook/package.json"
+grep -q -- 'signalk-anchoralarm-plugin@2.0.1' "$FAKE_BIN/docker.log"
+test "$(grep -cE 'compose .* stop signalk' "$FAKE_BIN/docker.log")" = 1
+dp_output=$(dp_install)   # settled: nothing stops Signal K again
+if grep -Eq 'compose .* stop signalk' "$FAKE_BIN/docker.log"; then echo 'a settled marine bundle stopped Signal K again' >&2; exit 1; fi
+# Without the data path the bundle runs alone, and no InfluxDB plugin or token is involved.
+rm -rf "$DATA4/signalk"
+printf 'SIGNALK_DATAPATH_AUTOCONFIG="false"\n' >> "$DPCONFIG"
+dp_output=$(dp_install)
+test -s "$DATA4/signalk/plugin-config-data/anchoralarm.json"
+test ! -e "$SK_PLUGIN_CONFIG"
+test ! -e "$DATA4/signalk/node_modules/signalk-to-influxdb2"
+# Existing mode ignores the bundle completely.
+sed -i -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="existing"|' -e 's|^SIGNALK_DATAPATH_AUTOCONFIG=.*|SIGNALK_DATAPATH_AUTOCONFIG="true"|' "$DPCONFIG"
+rm -rf "$DATA4/signalk"
+dp_output=$(dp_install)
+if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'existing mode ran npm for the marine bundle' >&2; exit 1; fi
 test ! -e "$DATA4/signalk/plugin-config-data"
 
 # ---- Optional Node-RED (README "Node-RED (optional)"): rendering on and off, settings.js only when

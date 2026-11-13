@@ -5,6 +5,13 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Add optional marine essentials bundle, off by default (`SIGNALK_MARINE_BUNDLE`, managed Docker/native modes only):
+  NMEA 0183 on TCP 10110 (the converter, KIP 4.8.0 and Freeboard-SK 2.22.1 ship inside Signal K v2.27.0), pinned
+  `signalk-anchoralarm-plugin` 2.0.1, `@meri-imperiumi/signalk-logbook` 0.15.1 and `@meri-imperiumi/signalk-autostate`
+  0.6.4 installed with the data path helper (`--ignore-scripts`, prune guard), plugin configurations written only when
+  absent, KIP/Freeboard/Logbook/Anchor alarm Homepage tiles, port 10110 dropped on the untrusted interface, WARN-only
+  `doctor` check. Operational impact: about 64 MB of npm packages with unpinned sub-dependencies; needs internet.
+  Rollback: `SIGNALK_MARINE_BUNDLE=false`, see README "Marine essentials (optional)".
 - Add optional Node-RED, off by default (`NODERED_ENABLE`, `NODERED_PORT`, `NODERED_BIND_ADDRESS`): pinned
   `nodered/node-red:5.0.9-debian` with a bcrypt-protected editor (`admin`, generated passphrase in `vesselstack.env`),
   encrypted credential store, a dedicated Mosquitto account `vesselstack-nodered`, a read-only InfluxDB token, pinned

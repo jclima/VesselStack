@@ -1602,6 +1602,23 @@ signalk_datapath_value() {
     printf '%s\n' "$out" | tr -d '\r' | awk -F, '!/^#/ && !/^,result/ && NF { v = $NF } END { print v }'
 }
 
+# Optional marine essentials bundle (SIGNALK_MARINE_BUNDLE=true, managed modes only): WARN, never FAIL.
+check_marine_bundle() {
+    local mode=${SIGNALK_MODE:-existing} dir="$VESSELSTACK_DATA/signalk/plugin-config-data" id missing=""
+    [ "$mode" != existing ] && [ "${SIGNALK_MARINE_BUNDLE:-false}" = true ] || return 0
+    for id in sk-to-nmea0183 anchoralarm signalk-logbook signalk-autostate; do
+        [ -f "$dir/$id.json" ] || missing="$missing $id"
+    done
+    if [ -n "$missing" ]; then
+        printf 'WARN the marine essentials bundle is on but these Signal K plugins have no configuration:%s. Fix: rerun the installer (online), or see README "Marine essentials (optional)"\n' "$missing" >&2
+    fi
+    if ! timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/10110' 2>/dev/null; then
+        printf 'WARN nothing is listening on TCP 10110 (NMEA 0183 for chartplotter apps). Fix: is Signal K running (vesselstackctl status)? Is the nmea-tcp interface off in Signal K settings.json? Rerun the installer to repair\n' >&2
+    else
+        printf 'OK   NMEA 0183 is served on TCP 10110\n'
+    fi
+}
+
 # Reports whether Signal K data reaches InfluxDB. Everything here is a WARN at worst: a boat
 # at the dock legitimately has no live data, and an owner who manages the plugin by hand is
 # not wrong. Only managed modes are judged.
@@ -2323,6 +2340,7 @@ doctor_stack() {
     disk_usage_warning
     check_signalk_data_dir || failed=1
     check_signalk_datapath
+    check_marine_bundle
     check_homeassistant_bind
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,prometheus,*) ;; *) check_prometheus_data_dir || failed=1 ;; esac
     check_memory_index || failed=1

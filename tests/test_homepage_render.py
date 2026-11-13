@@ -110,6 +110,17 @@ class TilesTests(unittest.TestCase):
         self.assertNotIn("href", tile)
         self.assertIn("SSH tunnel", tile)
 
+    def test_marine_bundle_tiles_only_in_managed_modes_with_the_bundle_on(self):
+        for vs in ({}, {"SIGNALK_MARINE_BUNDLE": "false"}, {"SIGNALK_MODE": "existing", "SIGNALK_MARINE_BUNDLE": "true"}):
+            _, services = self.tiles(vs=vs)
+            for name in ("KIP", "Freeboard", "Logbook", "Anchor alarm"):
+                self.assertNotIn(f'- "{name}":', services)
+        _, services = self.tiles(vs={"SIGNALK_MODE": "docker", "SIGNALK_MARINE_BUNDLE": "true"})
+        for href in ("http://boat.local:3000/@mxtommy/kip/", "http://boat.local:3000/@signalk/freeboard-sk/",
+                     "http://boat.local:3000/@meri-imperiumi/signalk-logbook/",
+                     "http://boat.local:3000/signalk-anchoralarm-plugin/"):
+            self.assertIn(f'href: "{href}"', services)
+
     def test_removed_and_unmanaged_components_have_no_tile(self):
         _, services = self.tiles(vs={"VESSELSTACK_DISABLED_COMPONENTS": "grafana,homeassistant",
                                      "SIGNALK_MODE": "existing"})

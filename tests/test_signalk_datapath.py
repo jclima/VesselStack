@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import os
 import stat
 import subprocess
@@ -101,10 +102,12 @@ class DatapathTests(unittest.TestCase):
         if dry:
             return subprocess.CompletedProcess(cmd, 0, stdout=self.dry_run_output.encode())
         target = Path(cmd[cmd.index("-v") + 1].split(":")[0]) if "-v" in cmd else Path(cmd[cmd.index("--prefix") + 1])
-        plugin = target / "node_modules" / dp.PLUGIN
-        plugin.mkdir(parents=True)
-        (plugin / "package.json").write_text(json.dumps({"name": dp.PLUGIN, "version": dp.PLUGIN_VERSION}))
-        (target / "package.json").write_text(json.dumps({"dependencies": {dp.PLUGIN: dp.PLUGIN_VERSION}}))
+        specs = [a.rsplit("@", 1) for a in cmd if re.fullmatch(r"@?[a-z0-9][a-z0-9/._-]*@\d+\.\d+\.\d+", a)]
+        for name, version in specs:
+            plugin = target / "node_modules" / name
+            plugin.mkdir(parents=True)
+            (plugin / "package.json").write_text(json.dumps({"name": name, "version": version}))
+        (target / "package.json").write_text(json.dumps({"dependencies": dict(specs)}))
         return subprocess.CompletedProcess(cmd, 0, stdout=b"added 108 packages\n")
 
     def run_main(self, *extra, mode="docker"):
@@ -527,6 +530,109 @@ class DatapathTests(unittest.TestCase):
         self.assertIn("checking what npm would remove failed", self.err)
         self.assertNotIn("/secret/path", self.err + self.out)
         self.assertNotIn(ADMIN, self.err + self.out)
+
+    # --- the optional marine essentials bundle --------------------------------------
+
+    def real_specs(self):
+        real = [cmd for cmd, _ in self.npm_calls if "--dry-run" not in cmd][0]
+        return [a for a in real if re.fullmatch(r"@?[a-z0-9][a-z0-9/._-]*@\d+\.\d+\.\d+", a)]
+
+    def bundle_config(self, plugin_id):
+        return self.signalk / "plugin-config-data" / f"{plugin_id}.json"
+
+    def test_bundle_off_installs_and_writes_nothing_extra(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="false")
+        self.run_main()
+        self.assertEqual(self.real_specs(), ["signalk-to-influxdb2@2.3.0"])
+        self.assertEqual(sorted(p.name for p in (self.signalk / "plugin-config-data").iterdir()), ["signalk-to-influxdb2.json"])
+        self.assertNotIn("interfaces", self.settings())
+
+    def test_bundle_on_installs_pinned_packages_and_writes_missing_configs_once(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true")
+        (self.signalk / "plugin-config-data").mkdir()
+        owner = '{"enabled": false, "configuration": {"mine": 1}}\n'
+        self.bundle_config("anchoralarm").write_text(owner)
+        self.assertEqual(self.run_main(), dp.EXIT_CHANGED)
+        self.assertEqual(self.real_specs(), ["signalk-to-influxdb2@2.3.0", "signalk-anchoralarm-plugin@2.0.1",
+                                             "@meri-imperiumi/signalk-logbook@0.15.1", "@meri-imperiumi/signalk-autostate@0.6.4"])
+        for flag in ("--ignore-scripts", "--save-exact"):
+            self.assertIn(flag, [c for c, _ in self.npm_calls if "--dry-run" not in c][0])
+        self.assertEqual(self.bundle_config("anchoralarm").read_text(), owner)  # never overwritten
+        nmea = json.loads(self.bundle_config("sk-to-nmea0183").read_text())
+        self.assertTrue(nmea["enabled"])
+        for sentence in ("RMC", "VTG", "DBT", "MWVR", "HDM", "XDRBaro"):
+            self.assertIs(nmea["configuration"][sentence], True)
+        for plugin_id in ("signalk-logbook", "signalk-autostate"):
+            self.assertTrue(json.loads(self.bundle_config(plugin_id).read_text())["enabled"])
+        self.assertEqual(self.bundle_config("sk-to-nmea0183").stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("interfaces", self.settings())  # the TCP server is on by default: no edit
+        calls, before = len(self.npm_calls), {p: p.read_bytes() for p in self.signalk.rglob("*") if p.is_file() and "node_modules" not in p.parts}
+        self.assertEqual(self.run_main(), 0)
+        self.assertEqual(len(self.npm_calls), calls)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.signalk.rglob("*") if p.is_file() and "node_modules" not in p.parts})
+
+    def test_bundle_check_reports_pending_work_and_changes_nothing(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true")
+        self.assertEqual(self.run_main("--check"), dp.EXIT_CHANGED)
+        self.assertFalse(self.bundle_config("anchoralarm").exists())
+        self.assertTrue(all("--dry-run" in cmd for cmd, _ in self.npm_calls))
+
+    def test_bundle_is_ignored_in_existing_mode(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true")
+        self.assertEqual(self.run_main(mode="existing"), 0)
+        self.assertEqual(self.npm_calls, [])
+        self.assertEqual(list(self.signalk.iterdir()), [])
+
+    def test_bundle_only_skips_the_influxdb_steps(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true")
+        status = self.root / "datapath-skipped"
+        self.assertEqual(self.run_main("--bundle-only", "--status-file", str(status)), dp.EXIT_CHANGED)
+        self.assertEqual(self.influx.calls, [])
+        self.assertEqual(self.real_specs(), ["signalk-anchoralarm-plugin@2.0.1", "@meri-imperiumi/signalk-logbook@0.15.1",
+                                             "@meri-imperiumi/signalk-autostate@0.6.4"])
+        self.assertFalse(self.config_file().exists())
+        self.assertFalse((self.signalk / "settings.json").exists())  # no CAN provider either
+        self.write_env(SIGNALK_MARINE_BUNDLE="false")
+        self.assertEqual(self.run_main("--bundle-only"), 0)
+
+    def test_bundle_packages_are_covered_by_the_prune_guard(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true")
+        self.dry_run_output = '{"added": 1, "removed": 1, "remove": [{"name": "their-plugin"}]}\n'
+        status = self.root / "datapath-skipped"
+        self.assertEqual(self.run_main("--bundle-only", "--status-file", str(status)), dp.EXIT_SKIPPED)
+        self.assertEqual(len(self.npm_calls), 1)
+        self.assertIn("signalk-anchoralarm-plugin@2.0.1", self.npm_calls[0][0]); self.assertIn("skipped installing signalk-anchoralarm-plugin", self.err)
+        self.assertIn("their-plugin", self.err)
+        self.assertFalse(status.exists())
+        self.assertFalse(self.bundle_config("anchoralarm").exists())
+
+    def test_tcp_server_setting_is_touched_only_when_explicitly_off_and_only_its_key(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true", SOCKETCAN_ENABLE="false")
+        original = {"interfaces": {"nmea-tcp": False, "plugins": True}, "ssl": False, "pipedProviders": []}
+        (self.signalk / "settings.json").write_text(json.dumps(original))
+        self.assertEqual(self.run_main(), dp.EXIT_CHANGED)
+        expected = json.loads(json.dumps(original))
+        expected["interfaces"]["nmea-tcp"] = True
+        self.assertEqual(self.settings(), expected)
+        backups = list(self.signalk.glob("settings.json.vesselstack-*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text()), original)
+        # Explicitly on, or absent: left byte for byte alone.
+        for document in ({"interfaces": {"nmea-tcp": True}}, {"interfaces": {"plugins": True}}, {"ssl": False}):
+            for bak in self.signalk.glob("settings.json.vesselstack-*.bak"):
+                bak.unlink()
+            raw = json.dumps(document)
+            (self.signalk / "settings.json").write_text(raw)
+            self.run_main()
+            self.assertEqual((self.signalk / "settings.json").read_text(), raw)
+            self.assertEqual(list(self.signalk.glob("settings.json.vesselstack-*.bak")), [])
+
+    def test_unusable_settings_are_left_alone_with_a_warning(self):
+        self.write_env(SIGNALK_MARINE_BUNDLE="true", SOCKETCAN_ENABLE="false")
+        (self.signalk / "settings.json").write_text("{not json")
+        self.run_main()
+        self.assertEqual((self.signalk / "settings.json").read_text(), "{not json")
+        self.assertIn("NMEA 0183 TCP server setting was not checked", self.err)
 
 
 if __name__ == "__main__":

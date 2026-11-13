@@ -87,6 +87,25 @@ class ConfigRegistryTests(unittest.TestCase):
                 with self.assertRaises(ValueError): wizard.validate({key: bad})
                 with self.assertRaises(ValueError): panel.validate_value(panel.FIELD_BY_KEY[key], bad)
 
+    def test_signalk_marine_bundle_key_is_an_off_by_default_boolean_on_every_surface(self):
+        key = "SIGNALK_MARINE_BUNDLE"
+        self.assertEqual(registry.DEFAULTS[key], "false")
+        self.assertEqual(registry.SETTINGS[key].component, "signalk")
+        self.assertEqual(wizard.DEFAULTS[key], "false")
+        self.assertEqual(wizard.validate({key: "true"})[key], "true")
+        self.assertEqual(panel.FIELD_BY_KEY[key]["kind"], "boolean")
+        self.assertEqual(panel.validate_value(panel.FIELD_BY_KEY[key], "true"), "true")
+        for bad in ("yes", "1", "TRUE"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError): registry.validate_value(key, bad)
+                with self.assertRaises(ValueError): wizard.validate({key: bad})
+        field = wizard.FIELD_INDEX[key]
+        self.assertTrue(field["advanced"])
+        class State:  # the wizard shows the question only for managed modes
+            def __init__(self, mode): self.values = {"SIGNALK_MODE": mode}
+        self.assertTrue(field["when"](State("docker")) and field["when"](State("native")))
+        self.assertFalse(field["when"](State("existing")))
+
     def test_signalk_datapath_autoconfig_key_is_a_managed_boolean_on_every_surface(self):
         key = "SIGNALK_DATAPATH_AUTOCONFIG"
         self.assertEqual(registry.DEFAULTS[key], "true")

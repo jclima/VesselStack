@@ -120,6 +120,7 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${SIGNALK_VERSION:=v2.27.0}"
 : "${SIGNALK_VESSELTWIN_PRELOAD:=true}"
 : "${SIGNALK_DATAPATH_AUTOCONFIG:=true}"
+: "${SIGNALK_MARINE_BUNDLE:=false}"
 : "${SOCKETCAN_ENABLE:=false}"
 : "${SOCKETCAN_INTERFACE:=can0}"
 : "${SOCKETCAN_BITRATE:=250000}"
@@ -328,7 +329,7 @@ if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BA
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE NODERED_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE REMOTE_PANEL_SERVE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE NODERED_ENABLE SIGNALK_MARINE_BUNDLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE REMOTE_PANEL_SERVE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -602,6 +603,7 @@ SIGNALK_URL
 SIGNALK_VESSELTWIN_PRELOAD
 SIGNALK_DATAPATH_AUTOCONFIG
 SOCKETCAN_ENABLE
+SIGNALK_MARINE_BUNDLE
 SOCKETCAN_INTERFACE
 SOCKETCAN_BITRATE
 VESSELSTACK_CAN_CREATE_VCAN
@@ -1667,7 +1669,7 @@ for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN 
     INFLUXDB_HOME_ASSISTANT_BUCKET INFLUXDB_AIS_BUCKET \
     ALERTS_ENABLE ALERT_TELEGRAM_CHAT_IDS ALERT_BATTERY_LOW_V ALERT_BILGE_ENTITY ALERT_SHORE_POWER_ENTITY \
     ALERT_HEARTBEAT_URL ALERT_REPEAT_MINUTES ALERT_STALE_DATA_MINUTES VESSELSTACK_BACKUP_SCHEDULE \
-    SIGNALK_MODE SIGNALK_DATAPATH_AUTOCONFIG VESSELSTACK_DISABLED_COMPONENTS SOCKETCAN_ENABLE DISPLAYS_ENABLE; do
+    SIGNALK_MODE SIGNALK_DATAPATH_AUTOCONFIG SIGNALK_MARINE_BUNDLE VESSELSTACK_DISABLED_COMPONENTS SOCKETCAN_ENABLE DISPLAYS_ENABLE; do
     sed -i "/^${key}=/d" "$boat_chat_temp"
 done
 for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
@@ -1717,6 +1719,7 @@ done
     env_line VESSELSTACK_BACKUP_SCHEDULE "$VESSELSTACK_BACKUP_SCHEDULE"
     env_line SIGNALK_MODE "$SIGNALK_MODE"
     env_line SIGNALK_DATAPATH_AUTOCONFIG "$SIGNALK_DATAPATH_AUTOCONFIG"
+    env_line SIGNALK_MARINE_BUNDLE "$SIGNALK_MARINE_BUNDLE"
     env_line VESSELSTACK_DISABLED_COMPONENTS "$VESSELSTACK_DISABLED_COMPONENTS"
     env_line SOCKETCAN_ENABLE "$SOCKETCAN_ENABLE"
     env_line DISPLAYS_ENABLE "$DISPLAYS_ENABLE"
@@ -1993,11 +1996,12 @@ fi
 # InfluxDB is up (it needs an API token), so the call is in the start phase below. Exit 10
 # means it changed something (Signal K is stopped for the change and started once after);
 # 11 means the npm prune guard skipped the plugin install; anything else is a warning, never
-# an installation failure.
+# an installation failure. "--bundle-only" (extra argument) runs just the optional marine
+# essentials bundle (SIGNALK_MARINE_BUNDLE=true) when the InfluxDB data path is not in use.
 configure_signalk_datapath() {
     local rc=0 skip_file="$SYSTEM_ROOT/var/lib/vesselstack/signalk-datapath-skipped"
     local -a args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env"
-        --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID" --status-file "$skip_file")
+        --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID" --status-file "$skip_file" "$@")
     install -d -m 0755 "$SYSTEM_ROOT/var/lib/vesselstack"
     python3 "$SCRIPT_DIR/scripts/configure-signalk-datapath.py" "${args[@]}" --check || rc=$?
     case "$rc" in
@@ -2132,6 +2136,15 @@ if [ "$START" -eq 1 ]; then
             else
                 configure_signalk_datapath
             fi
+        fi
+    fi
+    # Optional marine essentials bundle (the helper reads SIGNALK_MARINE_BUNDLE from the env file). It rides
+    # on the data path run above when that ran; otherwise it runs alone.
+    if [ "$SIGNALK_MODE" != existing ] && [ "$SIGNALK_MARINE_BUNDLE" = true ]; then
+        if [ "$OFFLINE" = true ]; then
+            echo "WARN: offline install: the marine essentials bundle (anchor alarm, logbook, NMEA 0183 setup) was not configured because it needs the npm registry. Rerun online or follow README 'Marine essentials (optional)'." >&2
+        elif component_disabled influxdb || [ "$SIGNALK_DATAPATH_AUTOCONFIG" != true ]; then
+            configure_signalk_datapath --bundle-only
         fi
     fi
     # Optional Node-RED: read-only InfluxDB token, palette packages, then the container. Failures here are

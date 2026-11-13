@@ -18,19 +18,19 @@ class FirewallRenderTests(unittest.TestCase):
         result = render()
         self.assertEqual(result.returncode, 0, result.stderr)
         out = result.stdout
-        self.assertIn("-A VESSELSTACK-INPUT -i wlan0 -p tcp -m multiport --dports 1883,8086,9090,43000,1880 -j DROP", out)
+        self.assertIn("-A VESSELSTACK-INPUT -i wlan0 -p tcp -m multiport --dports 1883,8086,9090,43000,1880,10110 -j DROP", out)
         self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090,1880 -j DROP", out)
         self.assertNotIn("ESTABLISHED", out)
 
     def test_nodered_port_is_dropped_unconditionally(self):
         out = render(NODERED_ENABLE="true").stdout
-        self.assertIn("--dports 1883,8086,9090,43000,1880 -j DROP", out)
+        self.assertIn("--dports 1883,8086,9090,43000,1880,10110 -j DROP", out)
         self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090,1880 -j DROP", out)
         out = render(NODERED_ENABLE="true", NODERED_PORT="1881").stdout
-        self.assertIn("--dports 1883,8086,9090,43000,1881 -j DROP", out)
+        self.assertIn("--dports 1883,8086,9090,43000,1881,10110 -j DROP", out)
         self.assertIn("--dports 1883,3000,8086,9090,1880 -j DROP", out)  # the container port is fixed
         # Not gated on NODERED_ENABLE: a stale container or a later enable is never exposed.
-        self.assertIn("--dports 1883,8086,9090,43000,1880 -j DROP", render(NODERED_ENABLE="false").stdout)
+        self.assertIn("--dports 1883,8086,9090,43000,1880,10110 -j DROP", render(NODERED_ENABLE="false").stdout)
         self.assertIn("--dports 1883,3000,8086,9090,1880 -j DROP", render().stdout)
 
     def test_tailscale_interface_is_never_mentioned(self):

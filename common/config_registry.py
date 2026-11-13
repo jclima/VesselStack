@@ -44,6 +44,7 @@ SETTINGS: dict[str, Setting] = {
     "HOMEPAGE_CLOCK": _s("24h", enum=("24h", "12h", "hidden"), component="homepage"),
     "SIGNALK_VESSELTWIN_PRELOAD": _s("true", kind="boolean", component="signalk"),
     "SIGNALK_DATAPATH_AUTOCONFIG": _s("true", kind="boolean", component="signalk"),
+    "SIGNALK_MARINE_BUNDLE": _s("false", kind="boolean", component="signalk"),
     "BOAT_NAME": _s("My Boat", required=True), "BOAT_TYPE": _s("Motor vessel"),
     "BOAT_MMSI": _s(), "BOAT_CALLSIGN": _s(), "BOAT_LOA_M": _s(kind="number", minimum=0.01, maximum=500), "BOAT_BEAM_M": _s(kind="number", minimum=0.01, maximum=100),
     "BOAT_TIMEZONE": _s("UTC", required=True), "BOAT_UNITS": _s("us_customary", enum=("us_customary", "metric")),

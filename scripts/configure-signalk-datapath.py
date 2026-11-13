@@ -20,6 +20,15 @@ uid/gid (setgroups, setgid, setuid) and uses O_NOFOLLOW / dir_fd-relative operat
 writer token reaches that child over a pipe, never argv or the environment. No path-based
 chown or other symlink-following root operation touches that tree.
 
+Optional marine essentials bundle (SIGNALK_MARINE_BUNDLE=true, README "Marine essentials"):
+  4. install the pinned anchor alarm, logbook and autostate plugins with the same npm rules;
+  5. write a plugin configuration for the NMEA 0183 converter (a few basic sentences), the
+     anchor alarm, the logbook and autostate, each ONLY when its file does not exist;
+  6. make sure Signal K's NMEA 0183 TCP server (interface "nmea-tcp", port 10110, on by default)
+     is not switched off in settings.json: only that one key is touched, and only when it is
+     explicitly false. KIP, Freeboard-SK and the converter ship inside the Signal K server.
+With --bundle-only only steps 4 to 6 run (the Signal K -> InfluxDB steps are skipped).
+
 Exit status: 0 nothing (more) to do, 10 something changed (or would change under
 --check), 11 the plugin install was skipped by the npm prune guard (nothing was
 changed), anything else is an error. The admin token is read from the environment
@@ -46,6 +55,22 @@ from pathlib import Path
 
 PLUGIN = "signalk-to-influxdb2"
 PLUGIN_VERSION = "2.3.0"
+BUNDLE_PACKAGES = (
+    ("signalk-anchoralarm-plugin", "2.0.1"),
+    ("@meri-imperiumi/signalk-logbook", "0.15.1"),
+    ("@meri-imperiumi/signalk-autostate", "0.6.4"),  # the logbook "requires" it for automatic entries
+)
+# Plugin ids (read from the packages) -> configuration. The NMEA 0183 converter ships with the
+# Signal K server and is not enabled by default; the others are, but an explicit file is visible
+# in the admin UI and lets 'vesselstackctl doctor' tell "configured" from "never set up".
+NMEA0183_SENTENCES = ("RMC", "GGA", "GLL", "VTG", "ZDA", "DBT", "DPT", "MWVR", "HDM", "HDT", "MTW", "XDRBaro")
+BUNDLE_CONFIGS = {
+    "sk-to-nmea0183": {"enabled": True, "configuration": {name: True for name in NMEA0183_SENTENCES}},
+    "anchoralarm": {"enabled": True, "configuration": {}},
+    "signalk-logbook": {"enabled": True, "configuration": {}},
+    "signalk-autostate": {"enabled": True, "configuration": {}},
+}
+TCP_INTERFACE = "nmea-tcp"
 WRITER_DESCRIPTION = "vesselstack-signalk-writer"
 IMAGE_REPOSITORY = "cr.signalk.io/signalk/signalk-server"
 IMAGE_CONFIG_DIR = "/home/node/.signalk"
@@ -252,9 +277,9 @@ def version_tuple(text: str):
     return tuple(int(p) for p in parts.groups()) if parts else None
 
 
-def plugin_needed(dir_fd: int) -> bool:
+def plugin_needed(dir_fd: int, name: str = PLUGIN, pinned: str = PLUGIN_VERSION) -> bool:
     try:
-        raw = read_file_at(dir_fd, ["node_modules", PLUGIN, "package.json"])
+        raw = read_file_at(dir_fd, ["node_modules", *name.split("/"), "package.json"])
     except FileNotFoundError:
         return True
     except OSError:
@@ -265,12 +290,13 @@ def plugin_needed(dir_fd: int) -> bool:
         return False  # unreadable: leave the owner's copy alone
     if installed is None:
         return False
-    return installed < version_tuple(PLUGIN_VERSION)
+    return installed < version_tuple(pinned)
 
 
-def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cache: str | None, name: str | None = None):
+def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cache: str | None, name: str | None = None,
+                specs: list[str] | None = None):
     """Return (argv, subprocess kwargs) for npm in the Signal K data directory."""
-    spec = f"{PLUGIN}@{PLUGIN_VERSION}"
+    specs = specs or [f"{PLUGIN}@{PLUGIN_VERSION}"]
     if args.mode == "docker":
         tag = env.get("SIGNALK_VERSION", "")
         if not TAG_RE.fullmatch(tag):
@@ -280,9 +306,9 @@ def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cach
         cmd = ["docker", "run", "--rm", "--name", name or f"vesselstack-npm-{os.getpid()}", "--pull", "never", "--cap-drop", "ALL", "--user", f"{args.uid}:{args.gid}",
                "-e", "HOME=/tmp", "-e", "npm_config_cache=/tmp/.npm",
                "-v", f"{signalk}:{IMAGE_CONFIG_DIR}", "-w", IMAGE_CONFIG_DIR, "--entrypoint", "npm",
-               f"{IMAGE_REPOSITORY}:{tag}", *NPM_ARGS, *extra, spec]
+               f"{IMAGE_REPOSITORY}:{tag}", *NPM_ARGS, *extra, *specs]
         return cmd, {}
-    cmd = ["npm", *NPM_ARGS, *extra, "--prefix", str(signalk), "--cache", cache, spec]
+    cmd = ["npm", *NPM_ARGS, *extra, "--prefix", str(signalk), "--cache", cache, *specs]
     environment = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": cache}
     return cmd, {"cwd": signalk, "env": environment, "user": args.uid, "group": args.gid, "extra_groups": []}
 
@@ -307,10 +333,10 @@ def run_npm(cmd: list[str], container: str | None = None, **kwargs) -> str:
     return output
 
 
-def npm_runner(args, env: dict[str, str], signalk: Path, extra: list[str]) -> str:
+def npm_runner(args, env: dict[str, str], signalk: Path, extra: list[str], specs: list[str] | None = None) -> str:
     if args.mode == "docker":
         name = f"vesselstack-npm-{os.getpid()}"
-        cmd, kwargs = npm_command(args, env, signalk, extra, None, name)
+        cmd, kwargs = npm_command(args, env, signalk, extra, None, name, specs)
         return run_npm(cmd, container=name, **kwargs)
     with tempfile.TemporaryDirectory(prefix="vesselstack-npm-") as cache:
         cache_fd = open_dir(cache)  # created by us, 0700: hand it to the service account by descriptor
@@ -319,7 +345,7 @@ def npm_runner(args, env: dict[str, str], signalk: Path, extra: list[str]) -> st
             os.fchmod(cache_fd, 0o700)
         finally:
             os.close(cache_fd)
-        cmd, kwargs = npm_command(args, env, signalk, extra, cache)
+        cmd, kwargs = npm_command(args, env, signalk, extra, cache, specs=specs)
         return run_npm(cmd, **kwargs)
 
 
@@ -352,14 +378,14 @@ def removals_from(output: str):
     return sorted(names)
 
 
-def prune_guard(args, env: dict[str, str], signalk: Path) -> list[str]:
+def prune_guard(args, env: dict[str, str], signalk: Path, specs: list[str] | None = None) -> list[str]:
     """Packages a real install would remove; an empty list means it is safe to install."""
-    removals = removals_from(npm_runner(args, env, signalk, ["--dry-run", "--json"]))
+    removals = removals_from(npm_runner(args, env, signalk, ["--dry-run", "--json"], specs))
     return ["(the npm report could not be read)"] if removals is None else removals
 
 
-def record_skip(args, packages: list[str]) -> None:
-    print(f"Signal K data path: WARN: skipped installing {PLUGIN}: npm would remove {', '.join(packages)} "
+def record_skip(args, packages: list[str], names: str = PLUGIN) -> None:
+    print(f"Signal K data path: WARN: skipped installing {names}: npm would remove {', '.join(packages)} "
           f"from {args.data / 'signalk' / 'node_modules'} because package.json does not list them.", file=sys.stderr)
     print("Signal K data path: WARN: add those packages to the dependencies in that package.json (or delete "
           "them if unused), then rerun the installer.", file=sys.stderr)
@@ -457,17 +483,46 @@ def add_provider(args, dir_fd: int, interface: str):
     providers = document.setdefault("pipedProviders", [])
     if any(uses_interface(p, interface) for p in providers):
         return False
+    providers.append(provider_for(interface))
+    backup_and_write_settings(dir_fd, document, raw, mode)
+    return True
+
+
+def backup_and_write_settings(dir_fd: int, document: dict, raw, mode: int) -> None:
     if raw is not None:
         stamp = now().strftime("%Y%m%dT%H%M%SZ")
         try:
             write_atomic_at(dir_fd, f"settings.json.vesselstack-{stamp}.bak", raw, 0o600, noreplace=True)
         except OSError:
             fail("backing up settings.json")
-    providers.append(provider_for(interface))
     try:
         write_atomic_at(dir_fd, "settings.json", (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), mode)
     except OSError:
         fail("writing settings.json")
+
+
+def tcp_state(dir_fd: int) -> str:
+    """ok (on by default or on) | needed (explicitly off) | unusable"""
+    try:
+        loaded = read_settings(dir_fd)
+    except SettingsUnusable:
+        return "unusable"
+    interfaces = loaded[0].get("interfaces") if loaded else None
+    if interfaces is None:
+        return "ok"
+    if not isinstance(interfaces, dict):
+        return "unusable"
+    return "needed" if interfaces.get(TCP_INTERFACE) is False else "ok"
+
+
+def enable_tcp(args, dir_fd: int):
+    """Set interfaces["nmea-tcp"] to true only when it is explicitly false; True when changed, None when unusable."""
+    state = tcp_state(dir_fd)
+    if state != "needed":
+        return None if state == "unusable" else False
+    document, raw, mode = read_settings(dir_fd)
+    document["interfaces"][TCP_INTERFACE] = True
+    backup_and_write_settings(dir_fd, document, raw, mode)
     return True
 
 
@@ -604,16 +659,29 @@ def plugin_config(env: dict[str, str], token: str) -> dict:
 
 def inspect_work(args, request: dict, dir_fd: int) -> dict:
     """Unprivileged: what is there and what is missing. Changes nothing."""
-    state = {"need_plugin": plugin_needed(dir_fd), "provider": "none", "need_config": False}
+    datapath = request.get("datapath", True)
+    state = {"need_plugin": datapath and plugin_needed(dir_fd), "provider": "none", "need_config": False,
+             "bundle_packages": [], "bundle_configs": [], "tcp": "ok"}
     if request.get("interface"):
         state["provider"] = provider_state(dir_fd, request["interface"])
-    try:
-        os.lstat(f"{CONFIG_DIR}/{PLUGIN}.json", dir_fd=dir_fd)
-    except FileNotFoundError:
-        state["need_config"] = True
-    except OSError:
-        fail("checking the plugin configuration")
-    if state["need_config"]:
+    if request.get("bundle"):
+        state["bundle_packages"] = [f"{n}@{v}" for n, v in BUNDLE_PACKAGES if plugin_needed(dir_fd, n, v)]
+        state["tcp"] = tcp_state(dir_fd)
+        for plugin_id in BUNDLE_CONFIGS:
+            try:
+                os.lstat(f"{CONFIG_DIR}/{plugin_id}.json", dir_fd=dir_fd)
+            except FileNotFoundError:
+                state["bundle_configs"].append(plugin_id)
+            except OSError:
+                fail("checking the plugin configuration")
+    if datapath:
+        try:
+            os.lstat(f"{CONFIG_DIR}/{PLUGIN}.json", dir_fd=dir_fd)
+        except FileNotFoundError:
+            state["need_config"] = True
+        except OSError:
+            fail("checking the plugin configuration")
+    if state["need_config"] or state["bundle_configs"]:
         # Everything a refusal would be based on, before a token is created.
         try:
             info = os.lstat(CONFIG_DIR, dir_fd=dir_fd)
@@ -630,8 +698,13 @@ def inspect_work(args, request: dict, dir_fd: int) -> dict:
 
 def apply_work(args, request: dict, dir_fd: int) -> dict:
     """Unprivileged: the plugin configuration (with the token from the pipe) and the provider."""
-    result = {"config_written": False, "provider": "none"}
+    result = {"config_written": False, "provider": "none", "bundle_written": [], "tcp": "ok"}
+    configs = {}
     if request.get("config") is not None:
+        configs[PLUGIN] = request["config"]
+    for plugin_id in request.get("bundle_configs") or []:
+        configs[plugin_id] = BUNDLE_CONFIGS[plugin_id]
+    if configs:
         _phase[0] = "writing the plugin configuration"
         created = False
         try:
@@ -649,15 +722,24 @@ def apply_work(args, request: dict, dir_fd: int) -> dict:
             if created:
                 os.fchmod(config_fd, 0o755)
                 os.fsync(dir_fd)
-            data = (json.dumps(request["config"], indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-            write_atomic_at(config_fd, f"{PLUGIN}.json", data, 0o600, noreplace=True)
-            result["config_written"] = True
-        except FileExistsError:
-            pass
-        except OSError:
-            fail("writing the plugin configuration")
+            for plugin_id, config in configs.items():
+                data = (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+                try:
+                    write_atomic_at(config_fd, f"{plugin_id}.json", data, 0o600, noreplace=True)
+                except FileExistsError:
+                    continue
+                except OSError:
+                    fail("writing the plugin configuration")
+                if plugin_id == PLUGIN:
+                    result["config_written"] = True
+                else:
+                    result["bundle_written"].append(plugin_id)
         finally:
             os.close(config_fd)
+    if request.get("tcp"):
+        _phase[0] = "enabling the NMEA 0183 TCP server"
+        enabled = enable_tcp(args, dir_fd)
+        result["tcp"] = "unusable" if enabled is None else ("enabled" if enabled else "ok")
     if request.get("interface"):
         _phase[0] = "adding the NMEA 2000 provider"
         added = add_provider(args, dir_fd, request["interface"])
@@ -674,6 +756,7 @@ def run(argv=None) -> int:
     parser.add_argument("--gid", required=True, type=int)
     parser.add_argument("--status-file", type=Path, help="records a skipped plugin install for 'vesselstackctl doctor'")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--bundle-only", action="store_true", help="only the marine essentials bundle (no InfluxDB steps)")
     args = parser.parse_args(argv)
     if args.mode == "existing":
         return 0
@@ -682,8 +765,14 @@ def run(argv=None) -> int:
     _phase[0] = "reading the environment file"
     env = read_env(args.env_file)
     signalk = args.data / "signalk"
+    bundle = env.get("SIGNALK_MARINE_BUNDLE") == "true"
+    datapath = not args.bundle_only
+    if not datapath:
+        args.status_file = None  # the doctor's skip record belongs to the data path
+        if not bundle:
+            return 0
     interface = None
-    if env.get("SOCKETCAN_ENABLE") == "true":
+    if datapath and env.get("SOCKETCAN_ENABLE") == "true":
         interface = env.get("SOCKETCAN_INTERFACE", "")
         if not IFACE_RE.fullmatch(interface):
             fail("reading SOCKETCAN_INTERFACE")
@@ -691,26 +780,29 @@ def run(argv=None) -> int:
     # Unprivileged look at what is there; every refusal that can be known happens here,
     # before an InfluxDB token exists.
     _phase[0] = "inspecting the Signal K data directory"
-    state = as_service_user(args, inspect_work, {"interface": interface})
+    state = as_service_user(args, inspect_work, {"interface": interface, "datapath": datapath, "bundle": bundle})
     need_plugin = state["need_plugin"]
     need_provider = state["provider"] == "needed"
     need_config = state["need_config"]
-    if need_plugin:
+    bundle_configs = state["bundle_configs"]
+    need_tcp = state["tcp"] == "needed"
+    specs = ([f"{PLUGIN}@{PLUGIN_VERSION}"] if need_plugin else []) + state["bundle_packages"]
+    if specs:
         # Checked before anything is changed, also under --check, so the installer
         # does not stop Signal K for a run that would only be skipped.
         _phase[0] = "checking what npm would remove"
-        skipped = prune_guard(args, env, signalk)
+        skipped = prune_guard(args, env, signalk, specs)
         if skipped:
-            record_skip(args, skipped)
+            record_skip(args, skipped, ", ".join(spec.rsplit("@", 1)[0] for spec in specs))
             return EXIT_SKIPPED
     if args.check:
-        return EXIT_CHANGED if (need_plugin or need_provider or need_config) else 0
+        return EXIT_CHANGED if (specs or need_provider or need_config or bundle_configs or need_tcp) else 0
 
     changed = False
-    if need_plugin:
+    if specs:
         _phase[0] = "installing the plugin"
-        npm_runner(args, env, signalk, [])
-        print(f"Signal K data path: installed {PLUGIN}@{PLUGIN_VERSION}")
+        npm_runner(args, env, signalk, [], specs)
+        print(f"Signal K data path: installed {', '.join(specs)}")
         changed = True
     clear_skip(args)
     token = auth_id = None
@@ -718,8 +810,10 @@ def run(argv=None) -> int:
         _phase[0] = "creating the InfluxDB writer token"
         token, auth_id = create_writer_token(env)
     request = {"interface": interface if need_provider else None,
-               "config": plugin_config(env, token) if token else None}
-    if token or need_provider:
+               "config": plugin_config(env, token) if token else None,
+               "bundle_configs": bundle_configs, "tcp": need_tcp}
+    result = {"config_written": False, "provider": "none", "bundle_written": [], "tcp": "ok"}
+    if token or need_provider or bundle_configs or need_tcp:
         _phase[0] = "writing the Signal K configuration"
         try:
             result = as_service_user(args, apply_work, request)
@@ -731,9 +825,18 @@ def run(argv=None) -> int:
         if result["config_written"]:
             print(f"Signal K data path: wrote the {PLUGIN} configuration (scoped token for bucket {env['INFLUXDB_RAW_BUCKET']})")
             changed = True
+        for plugin_id in result["bundle_written"]:
+            print(f"Signal K data path: wrote the {plugin_id} plugin configuration (marine essentials)")
+            changed = True
+        if result["tcp"] == "enabled":
+            print(f"Signal K data path: switched the NMEA 0183 TCP server ({TCP_INTERFACE}) on in settings.json")
+            changed = True
         if result["provider"] == "added":
             print(f"Signal K data path: added NMEA 2000 provider vesselstack-n2k-{interface}")
             changed = True
+    if state["tcp"] == "unusable" or result["tcp"] == "unusable":
+        print("Signal K data path: WARN: settings.json is not valid JSON (or is a link or unexpected structure), "
+              "so the NMEA 0183 TCP server setting was not checked and the file was left unchanged.", file=sys.stderr)
     if state["provider"] == "unusable" or (need_provider and result["provider"] == "unusable"):
         print("Signal K data path: WARN: settings.json is not valid JSON (or is a link or unexpected structure), "
               f"so the NMEA 2000 provider for {interface} was not added and the file was left unchanged. "

@@ -35,7 +35,7 @@ VESSELSTACK_KEYS = frozenset({
     "HOMEPAGE_ALLOWED_HOSTS_EXTRA", "GRAFANA_PORT", "INFLUXDB_PORT", "PROMETHEUS_PORT",
     "AIS_ENABLE", "AIS_WEB_PORT", "SIGNALK_MODE", "SIGNALK_URL", "HOME_ASSISTANT_URL",
     "CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT", "BOAT_CHAT_HOST", "BOAT_CHAT_PORT",
-    "DISPLAYS_ENABLE", "NODERED_ENABLE", "NODERED_PORT", "NODERED_BIND_ADDRESS",
+    "DISPLAYS_ENABLE", "NODERED_ENABLE", "NODERED_PORT", "NODERED_BIND_ADDRESS", "SIGNALK_MARINE_BUNDLE",
 })
 ENV_FILES = ("vesselstack.env", "control-panel.env", "boat-chat.env")
 MAX_CUSTOM_BYTES = 256 * 1024
@@ -464,6 +464,14 @@ def build_tiles(env: dict[str, str], hostname: str) -> list[Tile]:
     if env.get("SIGNALK_MODE", "existing") in ("docker", "native"):
         _, sk_port = url_parts(env.get("SIGNALK_URL"), 3000)
         link("Signal K", "Boat", "Boat data server", sk_port, "0.0.0.0")
+        if env.get("SIGNALK_MARINE_BUNDLE", "false") == "true":
+            # Web apps served by Signal K itself (optional marine essentials bundle).
+            for name, description, path in (
+                    ("KIP", "Instrument panels", "/@mxtommy/kip/"),
+                    ("Freeboard", "Chart plotter", "/@signalk/freeboard-sk/"),
+                    ("Logbook", "Automatic logbook", "/@meri-imperiumi/signalk-logbook/"),
+                    ("Anchor alarm", "Set and watch the anchor", "/signalk-anchoralarm-plugin/")):
+                link(name, "Boat", description, sk_port, "0.0.0.0", path=path)
     else:
         # An existing Signal K server elsewhere on the network: link it (no monitoring).
         # Only scheme, host and port are used, so credentials or paths in the URL never appear.
