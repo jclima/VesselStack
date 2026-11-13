@@ -2506,6 +2506,7 @@ Archive-listing assertions read `tar -t` into a variable instead of piping it in
 `tests/test-remote.sh` covers the Tailscale remote-access commands with fake `tailscale`, `apt-get` and `curl` binaries (run it with `sudo`, like the lifecycle test).
 `tests/test-distribution.sh` asserts the `vesselstackctl --help` backup usage line verbatim, including `[--scheduled]`; update it together with the usage text.
 The fake npm container in `tests/test-clean-install.sh` sets `umask 022`, as the real npm does when it runs as the Signal K user. Without it, `install.sh`'s umask 077 left `node_modules` root-only wherever `install -d` honours the umask (uutils coreutils, the default on Ubuntu 26.04 and so on the newer GitHub runner image), the unprivileged data path helper hit `Permission denied` and silently skipped the marine bundle packages. Test-only change; the product is unchanged. CI uses the newest Ubuntu, so also try `ubuntu:26.04` when reproducing.
+`tests/test-get-vesselstack.sh` feeds the terminal wizard scripted answers on stdin, one per prompt in wizard order (the "Send boat alerts to Telegram?" prompt follows "Run the Telegram bot worker?"); when you add a wizard prompt, add an answer there and bump the blank-answer counts, or later answers shift onto the wrong questions. Test-only change; the product is unchanged.
 To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
 
 ## Documentation policy

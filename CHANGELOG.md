@@ -5,6 +5,7 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Fix CI: `tests/test-get-vesselstack.sh` scripted wizard answers now include the new "Send boat alerts to Telegram?" prompt (and assert `ALERTS_ENABLE=false`), so later answers no longer shift onto the wrong questions. Test-only change; no runtime impact or rollback needed.
 - Fix CI: the fake npm container in `tests/test-clean-install.sh` now runs under `umask 022`, so the marine bundle check passes on Ubuntu 26.04 runners (uutils `install -d` honours `install.sh`'s umask 077 and left `node_modules` unreadable to the unprivileged helper). Test-only change; no runtime impact or rollback needed.
 - Fix CI: `tests/test-distribution.sh` now expects the `--scheduled` option in the `vesselstackctl backup` usage line. Test-only change; no runtime impact or rollback needed.
 - Add optional marine essentials bundle, off by default (`SIGNALK_MARINE_BUNDLE`, managed Docker/native modes only):
