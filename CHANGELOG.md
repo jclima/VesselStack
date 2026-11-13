@@ -5,6 +5,7 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Make alerts safer: an offline bilge or shore sensor is never an all-clear (separate "sensor not reporting" alerts after 5 minutes), bilge alerts on the first poll, the heartbeat pings `/fail` only for a real problem (also when Telegram delivery fails), per-run 90 s deadline, clock-backwards and reboot handling, orphaned entries pruned, dispatcher health in `doctor`, the script refuses to run as root, and more unit hardening. Rollback: set `ALERTS_ENABLE=false`.
 - Add opt-in Telegram alerts (`ALERTS_ENABLE`, default `false`; `ALERT_TELEGRAM_CHAT_IDS`,
   `ALERT_BATTERY_LOW_V`, `ALERT_BILGE_ENTITY`, `ALERT_SHORE_POWER_ENTITY`, `ALERT_HEARTBEAT_URL`,
   `ALERT_REPEAT_MINUTES`, `ALERT_STALE_DATA_MINUTES`): a one-minute systemd timer runs a sandboxed

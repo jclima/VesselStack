@@ -701,7 +701,9 @@ env_line() {
 # trap, so a Cancel (or a fix that cannot be applied safely) changes nothing else.
 
 # config_key_is_secret KEY: generated or preserved secrets. Replacing one here would
-# desynchronise a running service (see preserve_secret), so it is never offered.
+# desynchronise a running service (see preserve_secret), so it is never offered. Secrets
+# the user supplies (ALERT_HEARTBEAT_URL, a capability URL) are listed too: they are not
+# generated, but a fix must never print or auto-replace them.
 config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\

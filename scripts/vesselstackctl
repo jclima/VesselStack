@@ -1896,8 +1896,16 @@ run_alerts_script() {
     [ -r "$script" ] || { echo "Missing $script (rerun the installer)" >&2; return 1; }
     local -a cmd=(env "VESSELSTACK_DATA=$VESSELSTACK_DATA" "BOAT_CHAT_ENV=$VESSELSTACK_DATA/boat-chat/boat-chat.env" \
         python3 -I "$script" --env-file "$VESSELSTACK_ROOT/config/boat-chat.env" "$@")
-    if [ "$(id -u)" -eq 0 ] && command -v runuser >/dev/null 2>&1; then
-        runuser -u "$user" -- "${cmd[@]}"
+    # Never run the dispatcher as root: it would own the state file and the script refuses uid 0 anyway.
+    if [ "$(id -u)" -eq 0 ]; then
+        if command -v runuser >/dev/null 2>&1; then
+            runuser -u "$user" -- "${cmd[@]}"
+        elif command -v setpriv >/dev/null 2>&1; then
+            setpriv --reuid="$user" --regid="$user" --init-groups -- "${cmd[@]}"
+        else
+            echo "Cannot drop root privileges (neither runuser nor setpriv found); run this as the $user user instead." >&2
+            return 1
+        fi
     else
         "${cmd[@]}"
     fi
