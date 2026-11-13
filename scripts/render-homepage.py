@@ -35,7 +35,7 @@ VESSELSTACK_KEYS = frozenset({
     "HOMEPAGE_ALLOWED_HOSTS_EXTRA", "GRAFANA_PORT", "INFLUXDB_PORT", "PROMETHEUS_PORT",
     "AIS_ENABLE", "AIS_WEB_PORT", "SIGNALK_MODE", "SIGNALK_URL", "HOME_ASSISTANT_URL",
     "CONTROL_PANEL_HOST", "CONTROL_PANEL_PORT", "BOAT_CHAT_HOST", "BOAT_CHAT_PORT",
-    "DISPLAYS_ENABLE",
+    "DISPLAYS_ENABLE", "NODERED_ENABLE", "NODERED_PORT", "NODERED_BIND_ADDRESS",
 })
 ENV_FILES = ("vesselstack.env", "control-panel.env", "boat-chat.env")
 MAX_CUSTOM_BYTES = 256 * 1024
@@ -487,6 +487,11 @@ def build_tiles(env: dict[str, str], hostname: str) -> list[Tile]:
         link("Displays", "Boat", "Open the Displays tab of the Control Panel", panel_port, panel_bind,
              tunnel="Open the Control Panel through an SSH tunnel, then its Displays tab",
              path="/?tab=displays", monitor_host=False)
+
+    if env.get("NODERED_ENABLE", "false") == "true":
+        link("Node-RED", "Data", "Flow editor (sign-in required)", port_of(env.get("NODERED_PORT"), 1880),
+             env.get("NODERED_BIND_ADDRESS") or web_bind,
+             tunnel="Limited to this device; reach it with an SSH tunnel to the Node-RED port")
 
     if "grafana" not in disabled:
         link("Grafana", "Data", "Dashboards", port_of(env.get("GRAFANA_PORT"), 43000), web_bind)

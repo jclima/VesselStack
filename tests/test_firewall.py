@@ -22,6 +22,15 @@ class FirewallRenderTests(unittest.TestCase):
         self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090 -j DROP", out)
         self.assertNotIn("ESTABLISHED", out)
 
+    def test_nodered_port_is_dropped_only_when_enabled(self):
+        out = render(NODERED_ENABLE="true").stdout
+        self.assertIn("--dports 1883,8086,9090,43000,1880 -j DROP", out)
+        self.assertIn("-A VESSELSTACK-DOCKER -i wlan0 -p tcp -m multiport --dports 1883,3000,8086,9090,1880 -j DROP", out)
+        out = render(NODERED_ENABLE="true", NODERED_PORT="1881").stdout
+        self.assertIn("--dports 1883,8086,9090,43000,1881 -j DROP", out)
+        self.assertIn("--dports 1883,3000,8086,9090,1880 -j DROP", out)  # the container port is fixed
+        self.assertNotIn("1880", render(NODERED_ENABLE="false").stdout)
+
     def test_tailscale_interface_is_never_mentioned(self):
         # Rules match only the untrusted interface, so tailnet traffic needs no allowance (README "Remote access with Tailscale").
         for environment in ({}, {"VESSELSTACK_FIREWALL_STRICT": "true"},

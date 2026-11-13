@@ -42,6 +42,8 @@ FILE_MODE = 0o600
 AUTH_DIR_NAME = "mosquitto-auth"
 CONTAINER = "vesselstack-mosquitto"
 DEFAULT_BRIDGE_USERNAME = "vesselstack-bridge"
+NODERED_USERNAME = "vesselstack-nodered"  # fixed: the optional Node-RED component (NODERED_ENABLE)
+NODERED_TOPIC = "vesselstack/nodered"
 DISPLAY_USER_PREFIX = "vsdisp-"
 USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")  # always used with fullmatch
 IMAGE_RE = re.compile(r"^\s*image:\s*(eclipse-mosquitto:\S+)\s*$", re.M)
@@ -189,10 +191,13 @@ def write_atomic(path: Path, text: str, mode: int = 0o600) -> None:
         raise
 
 
-def ensure_secrets(path: Path, display_ids: list[str], enabled: bool) -> dict:
+def ensure_secrets(path: Path, display_ids: list[str], enabled: bool, nodered: bool = False) -> dict:
     """Create missing passwords once; never regenerate or drop existing ones."""
     data = load_secrets(path)
     changed = not path.exists()
+    if nodered and not (isinstance(data.get("nodered"), dict) and data["nodered"].get("mqtt_password")):
+        data["nodered"] = {"mqtt_password": secrets.token_urlsafe(32)}
+        changed = True
     if enabled:
         if not data["bridge"].get("mqtt_password"):
             data["bridge"] = {"mqtt_password": secrets.token_urlsafe(32)}
@@ -211,7 +216,7 @@ def ensure_secrets(path: Path, display_ids: list[str], enabled: bool) -> dict:
 # --- rendering ------------------------------------------------------------
 
 def build_accounts(admin_user, admin_password, enabled, bridge_user, display_ids,
-                   secret_data) -> list[dict]:
+                   secret_data, nodered: bool = False) -> list[dict]:
     """Ordered account list: admin, bridge, then displays sorted by id."""
     admin_user = _check_username("MQTT_USERNAME", admin_user)
     admin_password = _check_password("MQTT_PASSWORD", admin_password)
@@ -227,6 +232,10 @@ def build_accounts(admin_user, admin_password, enabled, bridge_user, display_ids
                 "password": _check_password(f"display {display_id} password",
                                             secret_data["displays"][display_id].get("mqtt_password")),
             })
+    if nodered:
+        accounts.append({"role": "nodered", "user": NODERED_USERNAME,
+                         "password": _check_password("Node-RED password",
+                                                     (secret_data.get("nodered") or {}).get("mqtt_password"))})
     names = [account["user"] for account in accounts]
     for name in names:
         if names.count(name) > 1:
@@ -241,6 +250,9 @@ def render_acl(accounts: list[dict]) -> str:
         lines.append(f"user {user}")
         if account["role"] == "admin":
             lines += ["topic readwrite #", "topic read $SYS/#"]
+        elif account["role"] == "nodered":
+            # Node-RED reads every VesselStack topic but writes only under its own prefix.
+            lines += [f"topic readwrite {NODERED_TOPIC}/#", "topic read vesselstack/#"]
         elif account["role"] == "bridge":
             lines += [f"topic write {ROOT_TOPIC}/instruments/#",
                       f"topic write {ROOT_TOPIC}/notifications/#",
@@ -530,14 +542,21 @@ def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | N
     image = image or find_image(root, compose)
     ensure_image(image, runner)
     secret_path = root / "config" / SECRETS_NAME
-    secret_data = ensure_secrets(secret_path, display_ids, enabled) if enabled else \
+    nodered_text = env.get("NODERED_ENABLE")
+    if nodered_text not in (None, "true", "false"):
+        raise MqttAuthError("NODERED_ENABLE must be true or false")
+    if nodered_text is None:  # a caller that does not know the setting must not drop the account
+        nodered = bool((load_secrets(secret_path).get("nodered") or {}).get("mqtt_password"))
+    else:
+        nodered = nodered_text == "true"
+    secret_data = ensure_secrets(secret_path, display_ids, enabled, nodered) if (enabled or nodered) else \
         load_secrets(secret_path)
     accounts = build_accounts(admin_user, env["MQTT_PASSWORD"], enabled, bridge_user,
-                              display_ids, secret_data)
+                              display_ids, secret_data, nodered)
     write_broker_files(root, accounts, image, runner, dir_owner, file_owner)
     reloaded = reload_broker(runner, container)
     return {"enabled": enabled, "accounts": len(accounts), "displays": len(display_ids),
-            "reloaded": reloaded}
+            "reloaded": reloaded, "nodered": nodered}
 
 
 # --- configuration lock ------------------------------------------------------
@@ -673,9 +692,12 @@ def preflight(root: Path, env: dict, compose: Path | None = None,
         displays_config = root / "config" / "displays.json"
     display_ids = load_display_ids(displays_config, enabled)
     warnings.extend(ha_warnings(displays_config, enabled, env))
-    placeholder = {"bridge": {"mqtt_password": "x"},
+    nodered_text = env.get("NODERED_ENABLE", "false")
+    if nodered_text not in ("true", "false"):
+        raise MqttAuthError("NODERED_ENABLE must be true or false")
+    placeholder = {"nodered": {"mqtt_password": "x"}, "bridge": {"mqtt_password": "x"},
                    "displays": {i: {"mqtt_password": "x"} for i in display_ids}}
-    build_accounts(admin_user, "x", enabled, bridge_user, display_ids, placeholder)
+    build_accounts(admin_user, "x", enabled, bridge_user, display_ids, placeholder, nodered_text == "true")
     if image_mode != "none":
         image = image or find_image(root, compose)
         if image_mode == "pull":

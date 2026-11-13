@@ -104,6 +104,7 @@ case "${1:-}" in
                     *signalk-server*) [[ " $* " == *" signalk "* ]] || continue ;;
                     *'${AIS_IMAGE}'*) [[ " $* " == *" ais "* ]] || continue ;;
                     *node-exporter*) [[ " $* " == *" metrics "* ]] || continue ;;
+                    *node-red*) [[ " $* " == *" nodered "* ]] || continue ;;
                 esac
                 eval "echo $line"
             done < <(sed -n 's/^ *image: *//p' "$composef")
@@ -437,7 +438,7 @@ if tail -n 1 "$TEST_ROOT/pip.log" | grep -q -- '--no-index'; then fail "online i
 BUNDLE="$TEST_ROOT/bundle"
 env PATH="$FAKE_BIN:$PATH" "$RELEASE/scripts/prepare-offline-bundle.sh" --output "$BUNDLE" >/dev/null
 ls "$BUNDLE"/wheelhouse/*.whl >/dev/null
-test "$(find "$BUNDLE/images" -type f | wc -l)" -eq 9 || fail "expected one tarball per image (9)"
+test "$(find "$BUNDLE/images" -type f | wc -l)" -eq 10 || fail "expected one tarball per image (10)"
 grep -qx "release=$VERSION" "$BUNDLE/BUNDLE_INFO"
 grep -qx 'image=eclipse-mosquitto:2.1.2-alpine' "$BUNDLE/BUNDLE_INFO"
 grep -qx 'image=cr.signalk.io/signalk/signalk-server:v2.27.0' "$BUNDLE/BUNDLE_INFO"

@@ -5,6 +5,13 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Add optional Node-RED, off by default (`NODERED_ENABLE`, `NODERED_PORT`, `NODERED_BIND_ADDRESS`): pinned
+  `nodered/node-red:5.0.9-debian` with a bcrypt-protected editor (`admin`, generated passphrase in `vesselstack.env`),
+  encrypted credential store, a dedicated Mosquitto account `vesselstack-nodered`, a read-only InfluxDB token, pinned
+  palette preinstall (skipped offline), importable example flows, a homepage tile, a WARN-only `doctor` check, firewall
+  drop on the untrusted interface and backup coverage. Operational impact: one more container (384 MB limit); the editor
+  can run code, so keep it on a trusted LAN or Tailscale. Rollback: `NODERED_ENABLE=false` and rerun the installer
+  (data in `${VESSELSTACK_DATA}/node-red` is kept).
 - Add optional Tailscale remote access, off by default (`REMOTE_ACCESS=off|tailscale`, `REMOTE_PANEL_SERVE=true`):
   `sudo vesselstackctl remote enable [--dry-run] [--auth-key-stdin] | status [--json] | disable [--purge]`
   installs Tailscale from Tailscale's signed apt repository (internet needed; not in the offline bundle), joins the

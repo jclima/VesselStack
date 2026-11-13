@@ -178,6 +178,7 @@ load_config() {
     [ "${SIGNALK_MODE:-existing}" = docker ] && COMPOSE+=(--profile signalk)
     [ "${AIS_ENABLE:-false}" = true ] && COMPOSE+=(--profile ais)
     [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && COMPOSE+=(--profile metrics)
+    [ "${NODERED_ENABLE:-false}" = true ] && COMPOSE+=(--profile nodered)
     COMPOSE+=(--env-file "$ENV_FILE" -f "$VESSELSTACK_ROOT/compose.yml")
 }
 
@@ -210,6 +211,7 @@ selected_services() {
     [ "${SIGNALK_MODE:-existing}" = docker ] && printf '%s\n' signalk
     [ "${AIS_ENABLE:-false}" = true ] && printf '%s\n' ais-catcher
     [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && printf '%s\n' node-exporter
+    [ "${NODERED_ENABLE:-false}" = true ] && printf '%s\n' nodered
 }
 
 write_prometheus_stamp() {
@@ -363,7 +365,7 @@ sync_mqtt_access() {
     [ -r "$displayctl" ] || { echo "Missing displays tool: $displayctl" >&2; return 1; }
     PYTHONDONTWRITEBYTECODE=1 \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
-        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
+        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" NODERED_ENABLE="${NODERED_ENABLE:-false}" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
         python3 "$displayctl" sync-mqtt --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA"
 }
@@ -379,7 +381,7 @@ display_command() {
     PYTHONDONTWRITEBYTECODE=1 \
         VESSELSTACK_ROOT="$VESSELSTACK_ROOT" VESSELSTACK_DATA="$VESSELSTACK_DATA" \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
-        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" \
+        DISPLAYS_ENABLE="${DISPLAYS_ENABLE:-false}" NODERED_ENABLE="${NODERED_ENABLE:-false}" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="${DISPLAYS_BRIDGE_MQTT_USERNAME:-vesselstack-bridge}" \
         SIGNALK_URL="${SIGNALK_URL:-}" DISPLAYS_SIGNALK_TOKEN="${DISPLAYS_SIGNALK_TOKEN:-}" \
         BOAT_UNITS="${BOAT_UNITS:-}" \
@@ -570,6 +572,7 @@ status_stack() {
     [ "${SIGNALK_MODE:-existing}" = docker ] && services+=(signalk)
     [ "${AIS_ENABLE:-false}" = true ] && services+=(ais-catcher)
     [ "${NODE_EXPORTER_ENABLE:-false}" = true ] && services+=(node-exporter)
+    [ "${NODERED_ENABLE:-false}" = true ] && services+=(nodered)
     printf '%-20s %s\n' COMPONENT STATE
     printf '%-20s %s\n' -------------------- --------------------
     status_unit 'Boat Chat service' vesselstack-chat.service || failed=1
@@ -808,6 +811,7 @@ show_urls() {
         *) printf '%-20s %s\n' 'Home Assistant' "external server, not managed here: $HOME_ASSISTANT_URL" ;;
     esac
     show_service Grafana "${GRAFANA_PORT:-43000}" http "$web_bind" no '' 'to change: sudo vesselstackctl lan dashboards'
+    [ "${NODERED_ENABLE:-false}" != true ] || show_service Node-RED "${NODERED_PORT:-1880}" http "${NODERED_BIND_ADDRESS:-$web_bind}" no 'sign-in required; the editor can run code' 'to change: sudo vesselstackctl lan dashboards'
     show_service InfluxDB "${INFLUXDB_PORT:-8086}" http "$data_bind" no 'API token required' 'to change: sudo vesselstackctl lan all'
     show_service Prometheus "${PROMETHEUS_PORT:-9090}" http "$data_bind" no 'NO login' 'to change: sudo vesselstackctl lan all'
     show_service MQTT "${MQTT_PORT:-1883}" mqtt "$data_bind" no 'password required' 'to change: sudo vesselstackctl lan all'
@@ -1373,6 +1377,7 @@ EOF
     if ! { set_env_key "$ENV_FILE" VESSELSTACK_WEB_BIND_ADDRESS "$web" \
             && set_env_key "$ENV_FILE" VESSELSTACK_DATA_BIND_ADDRESS "$data" \
             && set_env_key "$ENV_FILE" HOMEASSISTANT_BIND_ADDRESS "$ha" \
+            && { [ "${NODERED_BIND_ADDRESS:-$cur_web}" != "$cur_web" ] || set_env_key "$ENV_FILE" NODERED_BIND_ADDRESS "$web"; } \
             && set_env_key "$chat_file" BOAT_CHAT_HOST "$chat"; }; then
         cp -p -- "$backup/vesselstack.env" "$ENV_FILE"
         cp -p -- "$backup/boat-chat.env" "$chat_file"
@@ -2209,6 +2214,24 @@ check_remote() {
     return 0
 }
 
+# Optional Node-RED (README "Node-RED (optional)"): WARN only, nothing else depends on it.
+check_nodered() {
+    local code bind=${NODERED_BIND_ADDRESS:-${VESSELSTACK_WEB_BIND_ADDRESS:-0.0.0.0}} host=127.0.0.1
+    [ "${NODERED_ENABLE:-false}" = true ] || return 0
+    [ "$bind" = 0.0.0.0 ] || host=$bind
+    if ! docker inspect -f '{{.State.Running}}' vesselstack-nodered 2>/dev/null | grep -qx true; then
+        printf 'WARN Node-RED is enabled but its container is not running. Fix: sudo vesselstackctl start; logs: sudo docker logs vesselstack-nodered\n'
+        return 0
+    fi
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${host}:${NODERED_PORT:-1880}/" 2>/dev/null) || code=000
+    case "$code" in
+        200|401) printf 'OK   Node-RED editor answers on port %s (HTTP %s)\n' "${NODERED_PORT:-1880}" "$code" ;;
+        *) printf 'WARN Node-RED is running but port %s did not answer with HTTP 200 or 401 (got %s). Check: sudo docker logs vesselstack-nodered\n' "${NODERED_PORT:-1880}" "$code" ;;
+    esac
+    [ -f "$ROOT/config/nodered.env" ] || printf 'WARN Node-RED is enabled but config/nodered.env is missing. Fix: sudo vesselstackctl update, or rerun the installer\n'
+    return 0
+}
+
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
@@ -2243,6 +2266,7 @@ doctor_stack() {
     check_journald
     check_backup_schedule || failed=1
     check_alerts
+    check_nodered
     check_remote
     check_power
     status_stack || failed=1

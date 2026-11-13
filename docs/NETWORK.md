@@ -17,6 +17,8 @@ a preset that sets the real bind settings; `LAN_ACCESS` itself is never written 
 | `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` | `0.0.0.0` |
 | `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
 
+Optional Node-RED (`NODERED_BIND_ADDRESS`, port `NODERED_PORT`) follows the Grafana/Homepage column (`VESSELSTACK_WEB_BIND_ADDRESS`) unless set explicitly, and is dropped on the untrusted interface by the firewall. Its editor can run code: keep it to a trusted LAN or Tailscale.
+
 The Control Panel (`CONTROL_PANEL_HOST`) defaults to `127.0.0.1` and is independent
 of every preset. Choose network access during setup or run
 `sudo vesselstackctl panel-access lan` to share only its administration listener;

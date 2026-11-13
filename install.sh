@@ -180,6 +180,13 @@ if [ "$BOAT_UNITS" = nautical ]; then
     BOAT_UNITS=metric
 fi
 : "${NODE_EXPORTER_ENABLE:=false}"
+# Optional Node-RED (README "Node-RED (optional)"). The bind address follows the dashboards' by default.
+: "${NODERED_ENABLE:=false}"
+: "${NODERED_PORT:=1880}"
+: "${NODERED_BIND_ADDRESS:=$VESSELSTACK_WEB_BIND_ADDRESS}"
+: "${NODERED_ADMIN_PASSWORD:=}"
+: "${NODERED_ADMIN_PASSWORD_HASH:=}"
+: "${NODERED_CREDENTIAL_SECRET:=}"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
 : "${DISPLAYS_SIGNALK_TOKEN:=}"
@@ -319,7 +326,7 @@ if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BA
     exit 1
 fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE REMOTE_PANEL_SERVE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE NODERED_ENABLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE REMOTE_PANEL_SERVE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -363,7 +370,7 @@ for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
 done
 for key in GRAFANA_PORT HOMEPAGE_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
-    CONTROL_PANEL_PORT; do
+    CONTROL_PANEL_PORT NODERED_PORT; do
     port_value=${!key}
     case "$port_value" in
         ''|*[!0-9]*) echo "$key must be a numeric TCP port" >&2; exit 1 ;;
@@ -378,7 +385,7 @@ done
     exit 1
 }
 for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST VESSELSTACK_DATA_BIND_ADDRESS \
-    VESSELSTACK_WEB_BIND_ADDRESS HOMEASSISTANT_BIND_ADDRESS; do
+    VESSELSTACK_WEB_BIND_ADDRESS HOMEASSISTANT_BIND_ADDRESS NODERED_BIND_ADDRESS; do
     python3 - "${!key}" <<'PY' || { echo "$key must be an IPv4 address" >&2; exit 1; }
 import ipaddress
 import sys
@@ -414,11 +421,15 @@ fi
 if [ "$SIGNALK_MODE" != existing ]; then
     register_port SignalK 3000
 fi
+if [ "$NODERED_ENABLE" = true ]; then
+    register_port NodeRED "$NODERED_PORT"
+fi
 
 COMPOSE_PROFILES=()
 [ "$SIGNALK_MODE" = docker ] && COMPOSE_PROFILES+=(--profile signalk)
 [ "$AIS_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile ais)
 [ "$NODE_EXPORTER_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile metrics)
+[ "$NODERED_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile nodered)
 
 compose() {
     docker compose "${COMPOSE_PROFILES[@]}" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env" \
@@ -619,6 +630,12 @@ ALERT_REPEAT_MINUTES
 ALERT_STALE_DATA_MINUTES
 TELEMETRY_INDEXER_ENABLE
 NODE_EXPORTER_ENABLE
+NODERED_ENABLE
+NODERED_PORT
+NODERED_BIND_ADDRESS
+NODERED_ADMIN_PASSWORD
+NODERED_ADMIN_PASSWORD_HASH
+NODERED_CREDENTIAL_SECRET
 DISPLAYS_ENABLE
 DISPLAYS_BRIDGE_MQTT_USERNAME
 DISPLAYS_SIGNALK_TOKEN
@@ -712,6 +729,7 @@ env_line() {
 config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
+        NODERED_ADMIN_PASSWORD|NODERED_ADMIN_PASSWORD_HASH|NODERED_CREDENTIAL_SECRET|\
         BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN|\
         CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH|ALERT_HEARTBEAT_URL) return 0 ;;
     esac
@@ -982,6 +1000,9 @@ preserve_secret INFLUXDB_PASSWORD
 preserve_secret INFLUXDB_TOKEN
 preserve_secret GRAFANA_ADMIN_PASSWORD
 preserve_secret MQTT_PASSWORD
+preserve_secret NODERED_ADMIN_PASSWORD
+preserve_secret NODERED_ADMIN_PASSWORD_HASH
+preserve_secret NODERED_CREDENTIAL_SECRET
 preserve_secret BOAT_CHAT_SETTINGS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
 preserve_secret BOAT_CHAT_ACCESS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
 preserve_secret CONTROL_PANEL_TOKEN "$VESSELSTACK_ROOT/config/control-panel.env"
@@ -993,6 +1014,21 @@ BOAT_CHAT_SETTINGS_TOKEN=$(generate_secret "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE
 BOAT_CHAT_ACCESS_TOKEN=$(generate_secret "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}")
 CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
+# Node-RED secrets exist only while it is enabled; they are kept (never regenerated) once created.
+# GENERATE in the input config means "make one"; a stale hash would lock the owner out, so a
+# changed NODERED_ADMIN_PASSWORD is re-hashed after the dry run (see below), so rotating the
+# passphrase is: edit NODERED_ADMIN_PASSWORD, rerun the installer.
+[ "$NODERED_ADMIN_PASSWORD" != GENERATE ] || NODERED_ADMIN_PASSWORD=
+[ "$NODERED_ADMIN_PASSWORD_HASH" != GENERATE ] || NODERED_ADMIN_PASSWORD_HASH=
+[ "$NODERED_CREDENTIAL_SECRET" != GENERATE ] || NODERED_CREDENTIAL_SECRET=
+if [ "$NODERED_ENABLE" = true ]; then
+    [ -n "$NODERED_ADMIN_PASSWORD" ] || [ -n "$NODERED_ADMIN_PASSWORD_HASH" ] || NODERED_ADMIN_PASSWORD=$(openssl rand -hex 16)
+    [ -n "$NODERED_CREDENTIAL_SECRET" ] || NODERED_CREDENTIAL_SECRET=$(openssl rand -hex 32)
+fi
+if [ -n "$NODERED_ADMIN_PASSWORD_HASH" ] && ! [[ "$NODERED_ADMIN_PASSWORD_HASH" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]]; then
+    echo "NODERED_ADMIN_PASSWORD_HASH is not a bcrypt hash (its value is not shown); remove it to have one generated" >&2
+    exit 1
+fi
 
 # Secrets are resolved (preserved or generated) before the preflight so the
 # check covers the values that will actually be written; read-only, so it is
@@ -1031,7 +1067,7 @@ MOSQUITTO_COMPOSE="$SCRIPT_DIR/templates/compose.yml"
 displays_preflight() {
     PYTHONDONTWRITEBYTECODE=1 \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="${MQTT_PASSWORD:-}" \
-        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" NODERED_ENABLE="$NODERED_ENABLE" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
         DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
         python3 "$SCRIPT_DIR/displays/displayctl.py" preflight \
@@ -1049,6 +1085,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+
+# Node-RED sign-in: bcrypt runs inside the pinned Node-RED image (the passphrase goes in on stdin,
+# never on a command line). A hash that still matches the passphrase is kept, so a re-run does not
+# change it; editing NODERED_ADMIN_PASSWORD and rerunning the installer rotates the passphrase.
+if [ "$NODERED_ENABLE" = true ] && [ -n "$NODERED_ADMIN_PASSWORD" ]; then
+    nodered_hash_args=(hash --compose "$SCRIPT_DIR/templates/compose.yml")
+    [ "$OFFLINE" != true ] || nodered_hash_args+=(--offline)
+    NODERED_ADMIN_PASSWORD_HASH=$(printf '%s\n%s\n' "$NODERED_ADMIN_PASSWORD" "$NODERED_ADMIN_PASSWORD_HASH" \
+        | python3 "$SCRIPT_DIR/scripts/configure-nodered.py" "${nodered_hash_args[@]}") || {
+        echo "Could not prepare the Node-RED sign-in (see above). Nothing else was changed." >&2
+        exit 1
+    }
+fi
 
 # Remove temp files left in config/ by an earlier run that was killed between
 # creating and renaming an env file. Only the exact names new_env_temp creates
@@ -1387,7 +1436,7 @@ sed -i "s/VesselStack/$BOAT_NAME/g" \
 sync_mqtt_access() {
     PYTHONDONTWRITEBYTECODE=1 \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
-        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" NODERED_ENABLE="$NODERED_ENABLE" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
         python3 "$VESSELSTACK_ROOT/displays/displayctl.py" sync-mqtt \
         --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" \
@@ -1544,6 +1593,15 @@ while IFS= read -r key; do
     env_line "$key" "${!key:-}" >> "$vs_env_tmp"
 done < <(vesselstack_env_keys)
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
+# Optional Node-RED: data directory, settings.js (only when absent) and the root-only nodered.env
+# (MQTT and sign-in values; the InfluxDB token is added once InfluxDB is up). Removes nodered.env when disabled.
+safe_data_path "$VESSELSTACK_DATA/node-red" leaf
+python3 "$SCRIPT_DIR/scripts/configure-nodered.py" render --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" \
+    --env-file "$VESSELSTACK_ROOT/config/vesselstack.env" \
+    --settings-template "$SCRIPT_DIR/templates/node-red/settings.js" || {
+    echo "Could not prepare Node-RED (see above)." >&2
+    exit 1
+}
 if [ ! -e "$VESSELSTACK_ROOT/config/boat-profile.json" ] && [ ! -L "$VESSELSTACK_ROOT/config/boat-profile.json" ]; then
     python3 -I "$VESSELSTACK_ROOT/common/boat_profile_cli.py" init --root "$VESSELSTACK_ROOT" >/dev/null
 fi
@@ -2040,6 +2098,30 @@ if [ "$START" -eq 1 ]; then
             fi
         fi
     fi
+    # Optional Node-RED: read-only InfluxDB token, palette packages, then the container. Failures here are
+    # warnings; nothing else depends on Node-RED.
+    nodered_args=(--root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env"
+        --compose "$SCRIPT_DIR/templates/compose.yml")
+    [ "$OFFLINE" != true ] || nodered_args+=(--offline)
+    if [ "$NODERED_ENABLE" = true ]; then
+        if component_disabled influxdb; then
+            echo "WARN: InfluxDB is disabled, so Node-RED gets no InfluxDB token." >&2
+        else
+            nodered_rc=0
+            python3 "$SCRIPT_DIR/scripts/configure-nodered.py" token "${nodered_args[@]}" || nodered_rc=$?
+            case "$nodered_rc" in
+                0|10) ;;
+                *) echo "WARN: Node-RED has no InfluxDB token yet; rerun the installer once InfluxDB is running." >&2 ;;
+            esac
+        fi
+        python3 "$SCRIPT_DIR/scripts/configure-nodered.py" palette "${nodered_args[@]}" || true
+        "${compose_up[@]}" nodered || echo "WARN: could not start Node-RED; run: sudo vesselstackctl start" >&2
+    else
+        compose rm --stop --force nodered 2>/dev/null || true
+        if ! component_disabled influxdb; then
+            python3 "$SCRIPT_DIR/scripts/configure-nodered.py" token "${nodered_args[@]}" >/dev/null 2>&1 || true
+        fi
+    fi
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then
         systemctl restart vesselstack-chat-telegram.service
@@ -2095,4 +2177,7 @@ fi
 
 echo "VesselStack rendered successfully at $VESSELSTACK_ROOT"
 echo "Secrets are stored in mode-600 config files and were not printed."
+if [ "$NODERED_ENABLE" = true ]; then
+    echo "Node-RED editor: http://<this device>:$NODERED_PORT, user admin. Passphrase: sudo grep '^NODERED_ADMIN_PASSWORD=' $VESSELSTACK_ROOT/config/vesselstack.env"
+fi
 echo "Control panel: http://$CONTROL_PANEL_HOST:$CONTROL_PANEL_PORT"

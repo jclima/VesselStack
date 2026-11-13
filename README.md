@@ -714,6 +714,7 @@ The restore keeps the previous trees as `*.pre-restore-STAMP` until you delete t
 | Boat Chat | Telemetry-backed diagnostic assistant | `http://HOST:8765` |
 | Control Panel | Component installation, configuration, and lifecycle | `http://127.0.0.1:8780` |
 | Displays bridge (opt-in, `DISPLAYS_ENABLE=true`) | Publishes configured Signal K instruments to MQTT for instrument displays | systemd service `vesselstack-displays-bridge`; no listener |
+| Node-RED (opt-in, `NODERED_ENABLE=true`) | Visual flow automation with the editor behind a sign-in; pre-wired to MQTT and read-only InfluxDB; see [Node-RED (optional)](#node-red-optional) | `http://HOST:1880` |
 
 The installer generates credentials, renders a pinned Docker Compose stack,
 creates a confined systemd service for Boat Chat, creates configurable InfluxDB
@@ -1523,6 +1524,56 @@ except `CHOWN`, `SETUID` and `SETGID`.
 `HEIMDALL_PORT` becomes `HOMEPAGE_PORT` when that is unset, and `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT`
 are no longer kept; `/opt/vesselstack-data/heimdall` is left untouched and can be deleted
 by hand. Rollback: restore the previous release from a backup. Homepage uses no data directory.
+
+## Node-RED (optional)
+
+Node-RED is off by default. It adds a flow editor for custom automations, for example a
+replacement for Victron Venus OS Node-RED flows. The Victron-specific nodes need a GX device and
+are not available here; rebuild such flows with the MQTT, Signal K and Home Assistant nodes.
+
+**Enable.** Set `NODERED_ENABLE=true` (Control Panel Settings or `vesselstack.env`) and rerun the
+installer or choose **Reinstall & start**. The pinned `nodered/node-red:5.0.9-debian` image
+(uid 1000, 384 MB memory limit, about 150 to 250 MB of RAM in use) listens on `NODERED_PORT`
+(default `1880`) on `NODERED_BIND_ADDRESS`, which follows `VESSELSTACK_WEB_BIND_ADDRESS`
+(`sudo vesselstackctl lan` updates both). Open `http://HOST:1880` and sign in as `admin`. Retrieve
+the generated passphrase with `sudo grep '^NODERED_ADMIN_PASSWORD=' /opt/vesselstack/config/vesselstack.env`
+(adjust the root path if you changed it). To rotate it, edit `NODERED_ADMIN_PASSWORD` and rerun the
+installer; only the bcrypt hash reaches `settings.js`.
+
+**What is pre-configured.** `settings.js` is written once, only if absent (your edits are kept) with
+`adminAuth`, `httpNodeAuth`, an encrypted credential store (`NODERED_CREDENTIAL_SECRET`), projects
+off, `functionExternalModules` off and telemetry off. Connection values arrive as environment
+variables from the root-only `config/nodered.env` (mode 0600): `MQTT_HOST`/`MQTT_PORT`/`MQTT_USERNAME`/`MQTT_PASSWORD`
+for the dedicated Mosquitto account `vesselstack-nodered` (read `vesselstack/#`, read-write
+`vesselstack/nodered/#`; see [MQTT access control](docs/MQTT.md)), and a read-only InfluxDB token limited
+to the raw and history buckets. Read them in a flow with `env.get("NAME")`. No Home Assistant token is
+preconfigured. The palette packages `node-red-contrib-home-assistant-websocket@0.83.0` and
+`@flowfuse/node-red-dashboard@1.36.1` are preinstalled with `--ignore-scripts` when the Pi is online
+(skipped with a warning offline); installing other palette packages runs third-party code on the Pi.
+
+**Example flows.** Import `templates/node-red/vesselstack-example-flows.json` through the editor menu
+(Import, Clipboard or file). It is never deployed automatically.
+
+**Home Assistant.** Create a long-lived access token in your Home Assistant profile and enter it in the
+Home Assistant server node (`http://host.docker.internal:8123`). **Signal K.** Use a websocket node to
+`ws://host.docker.internal:3000/signalk/v1/stream`; if Signal K security is on, create a read-only device token
+and supply it in the node.
+
+**Security.** The editor can run arbitrary code as the container user and publish to MQTT: treat the sign-in
+as administrator access to the Pi's data. Expose it only on a trusted LAN or Tailscale. With the firewall
+enabled in its default mode, `NODERED_PORT` is dropped on the untrusted interface. Use `local` to bind it to
+loopback only.
+
+**Operational impact.** One more container, a data directory `${VESSELSTACK_DATA}/node-red` and
+`config/nodered.env`, both included in backups. `sudo vesselstackctl doctor` adds a WARN-only Node-RED
+check. A homepage tile appears when enabled.
+
+**Verify.** `sudo docker ps --filter name=vesselstack-nodered`, then
+`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:1880/` should print `200` or `401`; the editor must ask for a sign-in.
+
+**Roll back.** Set `NODERED_ENABLE=false` and rerun the installer: the container, the MQTT account, the
+InfluxDB token and `nodered.env` are removed. `${VESSELSTACK_DATA}/node-red` and the generated secrets are kept so
+re-enabling restores your flows; delete the directory yourself to discard them.
 
 ## MQTT access control
 

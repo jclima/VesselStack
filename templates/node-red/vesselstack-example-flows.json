@@ -1,0 +1,363 @@
+[
+  {
+    "id": "vs_flow_tab",
+    "type": "tab",
+    "label": "VesselStack examples",
+    "disabled": false,
+    "info": "Imported by hand from templates/node-red/vesselstack-example-flows.json. Connection details come from the container environment (MQTT_*, INFLUX_*, SIGNALK_WS_URL); nothing here is a secret."
+  },
+  {
+    "id": "vs_c1",
+    "type": "comment",
+    "z": "vs_flow_tab",
+    "name": "1. MQTT: everything under vesselstack/ (read-only account vesselstack-nodered)",
+    "info": "",
+    "x": 330,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "vs_mqtt_broker",
+    "type": "mqtt-broker",
+    "name": "VesselStack Mosquitto",
+    "broker": "${MQTT_HOST}",
+    "port": "${MQTT_PORT}",
+    "clientid": "",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true,
+    "autoUnsubscribe": true,
+    "birthTopic": "",
+    "birthQos": "0",
+    "birthPayload": "",
+    "birthMsg": {},
+    "closeTopic": "",
+    "closeQos": "0",
+    "closePayload": "",
+    "closeMsg": {},
+    "willTopic": "",
+    "willQos": "0",
+    "willPayload": "",
+    "willMsg": {},
+    "userProps": "",
+    "sessionExpiry": "",
+    "credentials": {
+      "user": "${MQTT_USER}",
+      "password": "${MQTT_PASSWORD}"
+    }
+  },
+  {
+    "id": "vs_mqtt_in",
+    "type": "mqtt in",
+    "z": "vs_flow_tab",
+    "name": "",
+    "topic": "vesselstack/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "vs_mqtt_broker",
+    "nl": false,
+    "rap": true,
+    "rh": 0,
+    "inputs": 0,
+    "x": 150,
+    "y": 100,
+    "wires": [
+      [
+        "vs_mqtt_debug"
+      ]
+    ]
+  },
+  {
+    "id": "vs_mqtt_debug",
+    "type": "debug",
+    "z": "vs_flow_tab",
+    "name": "MQTT vesselstack/#",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 390,
+    "y": 100,
+    "wires": []
+  },
+  {
+    "id": "vs_c2",
+    "type": "comment",
+    "z": "vs_flow_tab",
+    "name": "2. InfluxDB: read the raw bucket once a minute (read-only token)",
+    "info": "",
+    "x": 320,
+    "y": 180,
+    "wires": []
+  },
+  {
+    "id": "vs_inject",
+    "type": "inject",
+    "z": "vs_flow_tab",
+    "name": "every minute",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "60",
+    "crontab": "",
+    "once": false,
+    "onceDelay": "1",
+    "topic": "",
+    "payload": "",
+    "payloadType": "date",
+    "x": 150,
+    "y": 240,
+    "wires": [
+      [
+        "vs_flux"
+      ]
+    ]
+  },
+  {
+    "id": "vs_flux",
+    "type": "function",
+    "z": "vs_flow_tab",
+    "name": "Flux query",
+    "func": "// The token and bucket come from the container environment; they never appear in this flow.\nconst org = env.get('INFLUX_ORG');\nmsg.url = env.get('INFLUX_URL') + '/api/v2/query?org=' + encodeURIComponent(org);\nmsg.headers = {\n    'Authorization': 'Token ' + env.get('INFLUX_TOKEN'),\n    'Content-Type': 'application/vnd.flux',\n    'Accept': 'application/csv'\n};\nmsg.payload = 'from(bucket: \"' + env.get('INFLUX_RAW_BUCKET') + '\")\\n' +\n    '  |> range(start: -15m)\\n' +\n    '  |> last()\\n' +\n    '  |> limit(n: 20)';\nreturn msg;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 330,
+    "y": 240,
+    "wires": [
+      [
+        "vs_http"
+      ]
+    ]
+  },
+  {
+    "id": "vs_http",
+    "type": "http request",
+    "z": "vs_flow_tab",
+    "name": "InfluxDB",
+    "method": "POST",
+    "ret": "txt",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 510,
+    "y": 240,
+    "wires": [
+      [
+        "vs_influx_debug"
+      ]
+    ]
+  },
+  {
+    "id": "vs_influx_debug",
+    "type": "debug",
+    "z": "vs_flow_tab",
+    "name": "InfluxDB result (CSV)",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 710,
+    "y": 240,
+    "wires": []
+  },
+  {
+    "id": "vs_c3",
+    "type": "comment",
+    "z": "vs_flow_tab",
+    "name": "3. Signal K stream -> Dashboard 2.0 gauge (house battery voltage)",
+    "info": "If Signal K security is on, add ?token=YOUR_TOKEN to the URL of the websocket node (a read-only device token).",
+    "x": 330,
+    "y": 320,
+    "wires": []
+  },
+  {
+    "id": "vs_ws_cfg",
+    "type": "websocket-client",
+    "path": "ws://host.docker.internal:3000/signalk/v1/stream?subscribe=self",
+    "tls": "",
+    "wholemsg": "true",
+    "hb": "0"
+  },
+  {
+    "id": "vs_ws_in",
+    "type": "websocket in",
+    "z": "vs_flow_tab",
+    "name": "Signal K",
+    "server": "",
+    "client": "vs_ws_cfg",
+    "x": 140,
+    "y": 380,
+    "wires": [
+      [
+        "vs_pick"
+      ]
+    ]
+  },
+  {
+    "id": "vs_pick",
+    "type": "function",
+    "z": "vs_flow_tab",
+    "name": "battery voltage",
+    "func": "let delta;\ntry { delta = JSON.parse(msg.payload); } catch (e) { return null; }\nif (!delta || !Array.isArray(delta.updates)) { return null; }\nfor (const update of delta.updates) {\n    for (const item of (update.values || [])) {\n        if (/^electrical\\.batteries\\.[^.]+\\.voltage$/.test(item.path) && typeof item.value === 'number') {\n            return { payload: Math.round(item.value * 100) / 100, topic: item.path };\n        }\n    }\n}\nreturn null;",
+    "outputs": 1,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 330,
+    "y": 380,
+    "wires": [
+      [
+        "vs_gauge"
+      ]
+    ]
+  },
+  {
+    "id": "vs_ui_base",
+    "type": "ui-base",
+    "name": "VesselStack",
+    "path": "/dashboard",
+    "includeClientData": true,
+    "acceptsClientConfig": [
+      "ui-notification",
+      "ui-control"
+    ],
+    "showPathInSidebar": false,
+    "showPageTitle": true,
+    "navigationStyle": "default",
+    "titleBarStyle": "default"
+  },
+  {
+    "id": "vs_ui_theme",
+    "type": "ui-theme",
+    "name": "VesselStack",
+    "colors": {
+      "surface": "#0d3b66",
+      "primary": "#1b85b8",
+      "bgPage": "#eeeeee",
+      "groupBg": "#ffffff",
+      "groupOutline": "#cccccc"
+    },
+    "sizes": {
+      "pagePadding": "12px",
+      "groupGap": "12px",
+      "groupBorderRadius": "4px",
+      "widgetGap": "12px"
+    }
+  },
+  {
+    "id": "vs_ui_page",
+    "type": "ui-page",
+    "name": "Boat",
+    "ui": "vs_ui_base",
+    "path": "/boat",
+    "icon": "anchor",
+    "layout": "grid",
+    "theme": "vs_ui_theme",
+    "breakpoints": [
+      {
+        "name": "Default",
+        "px": "0",
+        "cols": "3"
+      },
+      {
+        "name": "Tablet",
+        "px": "576",
+        "cols": "6"
+      },
+      {
+        "name": "Small Desktop",
+        "px": "768",
+        "cols": "9"
+      },
+      {
+        "name": "Desktop",
+        "px": "1024",
+        "cols": "12"
+      }
+    ],
+    "order": 1,
+    "className": "",
+    "visible": "true",
+    "disabled": "false"
+  },
+  {
+    "id": "vs_ui_group",
+    "type": "ui-group",
+    "name": "Electrical",
+    "page": "vs_ui_page",
+    "width": "6",
+    "height": "1",
+    "order": 1,
+    "showTitle": true,
+    "className": "",
+    "visible": "true",
+    "disabled": "false",
+    "groupType": "default"
+  },
+  {
+    "id": "vs_gauge",
+    "type": "ui-gauge",
+    "z": "vs_flow_tab",
+    "name": "House battery",
+    "group": "vs_ui_group",
+    "order": 1,
+    "width": 6,
+    "height": 4,
+    "gtype": "gauge-half",
+    "gstyle": "needle",
+    "title": "House battery",
+    "units": "V",
+    "icon": "",
+    "prefix": "",
+    "suffix": "V",
+    "segments": [
+      {
+        "from": "10",
+        "color": "#ea5353"
+      },
+      {
+        "from": "12",
+        "color": "#e6e600"
+      },
+      {
+        "from": "12.5",
+        "color": "#5cd65c"
+      }
+    ],
+    "min": 10,
+    "max": 15,
+    "sizeThickness": 16,
+    "sizeGap": 4,
+    "sizeKeyThickness": 8,
+    "styleRounded": true,
+    "styleGlow": false,
+    "className": "",
+    "x": 530,
+    "y": 380,
+    "wires": []
+  }
+]

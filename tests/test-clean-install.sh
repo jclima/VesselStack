@@ -35,6 +35,12 @@ if [ "${1:-}" = inspect ] && [[ "$*" == *Mounts* ]]; then
     [ -n "${FAKE_MOSQ_MOUNTS:-}" ] && printf '%b' "$FAKE_MOSQ_MOUNTS"
     exit 0
 fi
+# Emulate the bcrypt hashing container used for the optional Node-RED sign-in (stdin: passphrase, hash).
+if [ "${1:-}" = run ] && [[ "$*" == *bcryptjs* ]]; then
+    cat > /dev/null
+    printf '$2b$10$%s' "$(printf 'a%.0s' $(seq 1 53))"
+    exit 0
+fi
 # Emulate the Mosquitto hashing container used by displayctl sync-mqtt.
 if [ "${1:-}" = run ]; then
     for argument in "$@"; do
@@ -182,6 +188,12 @@ old_inode=$(stat -c %i "$SBIN/vesselstackctl")
 exec 9< "$SBIN/vesselstackctl"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+# Node-RED is optional and off by default: no environment file, no data directory, no secrets.
+grep -qx 'NODERED_ENABLE=false' "$APP_ROOT/config/vesselstack.env"
+test ! -e "$APP_ROOT/config/nodered.env"
+test ! -e "$DATA_ROOT/node-red"
+if grep -qE "^NODERED_ADMIN_PASSWORD=[^']" "$APP_ROOT/config/vesselstack.env"; then echo 'a Node-RED passphrase was generated while Node-RED is disabled' >&2; exit 1; fi
+if grep -q 'vesselstack-nodered' "$APP_ROOT/config/mosquitto-auth/acl"; then echo 'the Node-RED MQTT account exists while Node-RED is disabled' >&2; exit 1; fi
 cat <&9 > "$TEST_ROOT/old-vesselstackctl.read"
 exec 9<&-
 cmp "$TEST_ROOT/old-vesselstackctl.expected" "$TEST_ROOT/old-vesselstackctl.read"
@@ -1497,7 +1509,10 @@ class H(http.server.BaseHTTPRequestHandler):
         data = json.dumps(body).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
-        if "/api/v2/buckets" in self.path: self.reply({"buckets": [{"id": "b1", "orgID": "o1", "name": "vesselstack_raw"}]})
+        if "/api/v2/buckets" in self.path:
+            import urllib.parse
+            name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("name", ["vesselstack_raw"])[0]
+            self.reply({"buckets": [{"id": "b-" + name, "orgID": "o1", "name": name}]})
         elif "/api/v2/dbrps" in self.path: self.reply({"content": [{"id": "m1"}]})
         else: self.reply({"authorizations": []})
     def do_POST(self):
@@ -1575,5 +1590,91 @@ dp_output=$(dp_install)
 if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'existing mode ran npm' >&2; exit 1; fi
 if grep -q 'Signal K data path' <<<"$dp_output"; then echo 'existing mode reported on the data path' >&2; exit 1; fi
 test ! -e "$DATA4/signalk/plugin-config-data"
+
+# ---- Optional Node-RED (README "Node-RED (optional)"): rendering on and off, settings.js only when
+# absent, nodered.env mode 0600, the passphrase never printed or put on a command line.
+APP5="$TEST_ROOT/opt5/vesselstack"
+DATA5="$TEST_ROOT/opt5/vesselstack-data"
+SYSTEM5="$TEST_ROOT/system-root5"
+NRCONFIG="$TEST_ROOT/nodered.install.env"
+{
+    grep -vE '^(VESSELSTACK_DISABLED_COMPONENTS|VESSELSTACK_ROOT|VESSELSTACK_DATA|INFLUXDB_RAW_BUCKET|INFLUXDB_PORT|NODERED_[A-Z_]+)=' "$CONFIG"
+    printf 'VESSELSTACK_ROOT="%s"\nVESSELSTACK_DATA="%s"\nINFLUXDB_RAW_BUCKET="vesselstack_raw"\nINFLUXDB_PORT="%s"\n' \
+        "$APP5" "$DATA5" "$(<"$TEST_ROOT/fake-influx.port")"
+    printf 'NODERED_ENABLE="true"\nNODERED_PORT="1881"\nVESSELSTACK_WEB_BIND_ADDRESS="127.0.0.1"\n'
+} > "$NRCONFIG"
+# shellcheck disable=SC2119,SC2120
+nr_install() {
+    : > "$FAKE_BIN/docker.log"
+    env PATH="$DP_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$@" "$DP_REL/install.sh" --config "$NRCONFIG" --start 2>&1
+}
+nr_output=$(nr_install)
+NR_ENV="$APP5/config/nodered.env"
+test -f "$NR_ENV"
+test "$(stat -c '%a %U' "$NR_ENV")" = '600 root'
+grep -q "^MQTT_USER='vesselstack-nodered'$" "$NR_ENV"
+grep -q "^MQTT_HOST='mosquitto'$" "$NR_ENV"
+grep -q "^INFLUX_TOKEN='fake-writer-token'$" "$NR_ENV"
+grep -q "^INFLUX_RAW_BUCKET='vesselstack_raw'$" "$NR_ENV"
+grep -q "^SIGNALK_WS_URL='ws://host.docker.internal:3000/signalk/v1/stream?subscribe=self'$" "$NR_ENV"
+grep -qF "NODERED_ADMIN_PASSWORD_HASH='\$2b\$10\$" "$NR_ENV"
+grep -q "^NODERED_CREDENTIAL_SECRET='[0-9a-f]\{64\}'$" "$NR_ENV"
+grep -qx 'NODERED_ENABLE=true' "$APP5/config/vesselstack.env"
+grep -qx 'NODERED_BIND_ADDRESS=127.0.0.1' "$APP5/config/vesselstack.env"   # follows the dashboards by default
+NR_PASS=$(sed -n 's/^NODERED_ADMIN_PASSWORD=//p' "$APP5/config/vesselstack.env")
+test "${#NR_PASS}" = 32
+NR_SECRET=$(sed -n 's/^NODERED_CREDENTIAL_SECRET=//p' "$APP5/config/vesselstack.env")
+# The passphrase is stored only in the root-only configuration: not in the output, a log, a command line or the data tree.
+if grep -qF -- "$NR_PASS" <<<"$nr_output"; then echo 'the installer printed the Node-RED passphrase' >&2; exit 1; fi
+grep -q "grep '^NODERED_ADMIN_PASSWORD='" <<<"$nr_output"
+if grep -qF -- "$NR_PASS" "$FAKE_BIN/docker.log" "$FAKE_BIN/systemctl.log" "$TEST_ROOT/runuser.log"; then echo 'the Node-RED passphrase reached a command line' >&2; exit 1; fi
+if grep -rqF -- "$NR_PASS" "$DATA5"; then echo 'the Node-RED passphrase is in the data tree' >&2; exit 1; fi
+if grep -qF -- "$NR_PASS" "$NR_ENV"; then echo 'nodered.env holds the plaintext passphrase' >&2; exit 1; fi
+grep -qE 'compose .*--profile nodered .*up -d nodered$' "$FAKE_BIN/docker.log"
+grep -q -- 'npm_config_cache' "$FAKE_BIN/docker.log"
+grep -q -- 'node-red-contrib-home-assistant-websocket@0.83.0' "$FAKE_BIN/docker.log"
+grep -q -- '@flowfuse/node-red-dashboard@1.36.1' "$FAKE_BIN/docker.log"
+grep -q -- '--ignore-scripts' "$FAKE_BIN/docker.log"
+# settings.js: seeded once, owned by the container user, never overwritten.
+NR_SETTINGS="$DATA5/node-red/settings.js"
+test -f "$NR_SETTINGS"
+test "$(stat -c '%u:%g' "$DATA5/node-red" "$NR_SETTINGS" | sort -u)" = '1000:1000'
+printf '// my own edit\n' >> "$NR_SETTINGS"
+# MQTT: a dedicated account with its own prefix and read access to vesselstack/#.
+grep -qx 'user vesselstack-nodered' "$APP5/config/mosquitto-auth/acl"
+sed -n '/^user vesselstack-nodered$/,/^$/p' "$APP5/config/mosquitto-auth/acl" | grep -qx 'topic readwrite vesselstack/nodered/#'
+sed -n '/^user vesselstack-nodered$/,/^$/p' "$APP5/config/mosquitto-auth/acl" | grep -qx 'topic read vesselstack/#'
+grep -q '^vesselstack-nodered:' "$APP5/config/mosquitto-auth/passwords"
+# A re-run keeps the passphrase, the credential secret and the owner's settings.js.
+nr_output=$(nr_install)
+test "$(sed -n 's/^NODERED_ADMIN_PASSWORD=//p' "$APP5/config/vesselstack.env")" = "$NR_PASS"
+test "$(sed -n 's/^NODERED_CREDENTIAL_SECRET=//p' "$APP5/config/vesselstack.env")" = "$NR_SECRET"
+grep -qx '// my own edit' "$NR_SETTINGS"
+grep -q 'Node-RED: kept your settings.js' <<<"$nr_output" || true
+# A symlinked settings.js or data directory is refused.
+rm -f "$NR_SETTINGS"; ln -s /etc/passwd "$NR_SETTINGS"
+if nr_install >/dev/null 2>&1; then echo 'a symlinked settings.js was accepted' >&2; exit 1; fi
+rm -f "$NR_SETTINGS"
+nr_install >/dev/null
+grep -q 'NODERED_ADMIN_PASSWORD_HASH' "$NR_SETTINGS" && grep -q 'functionExternalModules: false' "$NR_SETTINGS"
+# Disabled again: container removed, environment file and MQTT account gone, data and settings.js kept.
+sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="false"/' "$NRCONFIG"
+nr_install >/dev/null
+grep -qE 'compose .*rm --stop --force nodered' "$FAKE_BIN/docker.log"
+test ! -e "$NR_ENV"
+test -f "$NR_SETTINGS"
+if grep -q 'vesselstack-nodered' "$APP5/config/mosquitto-auth/acl"; then echo 'the Node-RED MQTT account survived disabling' >&2; exit 1; fi
+# Bad values are refused before anything changes.
+for bad in 'NODERED_PORT=0' 'NODERED_PORT=abc' 'NODERED_ENABLE=maybe' 'NODERED_BIND_ADDRESS=not-an-ip' 'NODERED_ADMIN_PASSWORD_HASH=plain'; do
+    { grep -vE "^${bad%%=*}=" "$NRCONFIG"; printf '%s\n' "$bad"; } > "$TEST_ROOT/nodered.bad.env"
+    if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+        echo "$bad was accepted" >&2; exit 1
+    fi
+done
+# A port clash with another enabled component is refused.
+{ grep -vE '^(NODERED_ENABLE|NODERED_PORT)=' "$NRCONFIG"; printf 'NODERED_ENABLE=true\nNODERED_PORT=43000\n'; } > "$TEST_ROOT/nodered.bad.env"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+    echo 'a Node-RED port clash was accepted' >&2; exit 1
+fi
 
 echo "clean installation checks passed"

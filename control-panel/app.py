@@ -312,6 +312,9 @@ FIELDS = [
     field("MQTT_PASSWORD", "MQTT password", SEC_SERVICES, kind="secret", description="Applied to the Mosquitto password file on the next apply or start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "MQTT port", SEC_SERVICES, kind="port", description="The port Mosquitto is published on."),
     field("NODE_EXPORTER_ENABLE", "Report Pi health numbers (Node Exporter)", SEC_SERVICES, kind="boolean", description="Runs the optional hardened host metrics exporter so Prometheus can record Pi temperature and disk use."),
+    field("NODERED_ENABLE", "Run Node-RED (flow editor)", SEC_SERVICES, kind="boolean", description="Optional. Adds a password-protected Node-RED editor wired to MQTT, InfluxDB (read-only) and Home Assistant. The editor can run code on the Pi: keep it on a trusted network. Save and Apply installs it; the sign-in passphrase is NODERED_ADMIN_PASSWORD in the stack's vesselstack.env."),
+    field("NODERED_PORT", "Node-RED port", SEC_SERVICES, kind="port", description="The port the Node-RED editor is published on."),
+    field("NODERED_BIND_ADDRESS", "Node-RED visible to", SEC_SERVICES, description="Leave empty to follow Web pages visible to. 127.0.0.1 means this device only."),
     # Advanced: AIS receiver
     field("AIS_ENABLE", "Enable AIS-catcher", SEC_AIS, kind="boolean", description="Shows nearby ships from a USB AIS receiver. Turn on only when a receiver is plugged in."),
     field("AIS_IMAGE", "AIS-catcher image", SEC_AIS, description="The Docker image to run. Change only if you were told to."),
@@ -343,6 +346,7 @@ COMPONENT_INFO = {
     "signalk": ("Signal K", "Reads boat data and shares it with everything else.", SEC_SIGNALK),
     "ais-catcher": ("AIS-catcher", "Shows nearby ships from your AIS receiver.", SEC_AIS),
     "node-exporter": ("Node Exporter", "Reports Pi health (temperature, disk) for Prometheus.", SEC_SERVICES),
+    "nodered": ("Node-RED", "Optional flow editor wired to MQTT, InfluxDB and Home Assistant.", SEC_SERVICES),
     "boat-chat": ("Boat Chat", "Ask questions about your boat in plain language.", SEC_CHAT),
     "telegram": ("Telegram alerts", "Sends boat alerts to your phone through Telegram.", SEC_CHAT),
     "telemetry-indexer": ("Telemetry memory", "Keeps Boat Chat's memory of your boat data up to date.", SEC_CHAT),
@@ -502,7 +506,7 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         validate_number(spec, text)
     if spec["key"] == "BOAT_TIMEZONE" and text and not timezone_exists(text):
         raise ValueError("Timezone not recognised. Use a name like Europe/Lisbon")
-    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS"} and text:
+    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS", "NODERED_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
         except ValueError as exc:
@@ -782,7 +786,7 @@ def _update_configuration(updates: dict[str, Any], notes: list[str] | None = Non
 
 def compose_base() -> list[str]:
     return [
-        "docker", "compose", "--profile", "signalk", "--profile", "ais", "--profile", "metrics",
+        "docker", "compose", "--profile", "signalk", "--profile", "ais", "--profile", "metrics", "--profile", "nodered",
         "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml"),
     ]
 
@@ -802,6 +806,8 @@ def component_command(component: str, verb: str) -> list[str]:
             raise ValueError("Docker SignalK is disabled by configuration")
         if component == "ais-catcher" and settings.get("AIS_ENABLE", "false") != "true":
             raise ValueError("AIS-catcher is disabled by configuration")
+        if component == "nodered" and settings.get("NODERED_ENABLE", "false") != "true" and verb in {"start", "restart"}:
+            raise ValueError("Node-RED is disabled by configuration")
         if component == "node-exporter" and settings.get("NODE_EXPORTER_ENABLE", "false") != "true" and verb in {"start", "restart"}:
             raise ValueError("node-exporter is disabled by configuration")
         service = COMPOSE_COMPONENTS[component]
@@ -1202,6 +1208,8 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("AIS_ENABLE", "false") == "true"
         elif name == "node-exporter":
             enabled = vessel.get("NODE_EXPORTER_ENABLE", "false") == "true"
+        elif name == "nodered":
+            enabled = vessel.get("NODERED_ENABLE", "false") == "true"
         state = compose_state.get(service, "unknown" if compose_parse_failed else "stopped")
         components.append(describe_component(name, "container", enabled, state))
     for name, unit in SYSTEMD_COMPONENTS.items():
