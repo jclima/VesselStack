@@ -5,6 +5,7 @@ Semantic Versioning.
 
 ## Unreleased
 
+- Fix CI: the "Validate optional Compose profiles" step now passes `--no-env-resolution` to `docker compose config`, so it no longer fails on the installed-only `config/nodered.env` (the Node-RED `env_file` stays `required: true`). CI-only change; no runtime impact or rollback needed.
 - Warn instead of silently skipping when the Signal K data path helper cannot read an installed plugin's `package.json` (for example `permission denied` on `node_modules`): the InfluxDB writer plugin or a marine essentials plugin is still left alone, but the installer output now names the package, the path and the error. No change to exit codes or other behaviour. Rollback: revert the commit; see README "Signal K plugin skipped (WARN: skipped ...)".
 - Fix CI: `tests/test-get-vesselstack.sh` scripted wizard answers now include the new "Send boat alerts to Telegram?" prompt (and assert `ALERTS_ENABLE=false`), so later answers no longer shift onto the wrong questions. Test-only change; no runtime impact or rollback needed.
 - Fix CI: the fake npm container in `tests/test-clean-install.sh` now runs under `umask 022`, so the marine bundle check passes on Ubuntu 26.04 runners (uutils `install -d` honours `install.sh`'s umask 077 and left `node_modules` unreadable to the unprivileged helper). Test-only change; no runtime impact or rollback needed.

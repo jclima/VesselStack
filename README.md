@@ -2525,6 +2525,8 @@ The fake npm container in `tests/test-clean-install.sh` sets `umask 022`, as the
 `tests/test-get-vesselstack.sh` feeds the terminal wizard scripted answers on stdin, one per prompt in wizard order (the "Send boat alerts to Telegram?" prompt follows "Run the Telegram bot worker?"); when you add a wizard prompt, add an answer there and bump the blank-answer counts, or later answers shift onto the wrong questions. Test-only change; the product is unchanged.
 To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
 
+The CI step "Validate optional Compose profiles" runs `docker compose config --quiet --no-env-resolution` with the signalk, ais, metrics and nodered profiles. The flag skips the installed-only `config/nodered.env` (required by the Node-RED service, which still refuses to start without it) so Compose syntax and interpolation are validated on a runner with no installed system. CI-only change; no runtime impact or rollback needed.
+
 ## Documentation policy
 
 Every repository change must update this README in the same pull request. CI
