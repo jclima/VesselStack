@@ -77,6 +77,16 @@ globals:
   - {id: ins_solar_a_ok, type: bool, initial_value: "false"}
   - {id: ins_solar_a_seen, type: uint32_t, initial_value: "0"}
   - {id: ins_solar_a_val, type: std::string, initial_value: '"--"'}
+  - {id: summary_max, type: uint8_t, initial_value: "0"}
+  - {id: summary_na, type: int, initial_value: "0"}
+  - {id: summary_seen, type: uint32_t, initial_value: "0"}
+  - {id: summary_valid, type: bool, initial_value: "false"}
+  - {id: summary_first, type: int, initial_value: "-1"}
+  - {id: alarm_rising, type: bool, initial_value: "false"}
+  - {id: alarm_dismissed, type: bool, initial_value: "false"}
+  - {id: alarm_idx, type: int, initial_value: "-1"}
+  - {id: alarm_drawn_idx, type: int, initial_value: "-2"}
+  - {id: alarm_flash, type: bool, initial_value: "false"}
   - {id: touch_ignore, type: bool, initial_value: "false"}
   - {id: bl_drawn, type: int, initial_value: "-1"}
   - {id: night_override, type: int, initial_value: "-1"}
@@ -119,6 +129,16 @@ font:
   - file: fonts/RobotoCondensed-Regular.ttf
     id: font_small
     size: 20
+    bpp: 4
+    glyphs: !literal " %-.0123456789:ABCDFGHKLMNOPRSTVWacefghiklnoprstuvwy\u00B0"
+  - file: fonts/RobotoCondensed-Bold.ttf
+    id: font_banner
+    size: 48
+    bpp: 4
+    glyphs: !literal "0123456789+ ALRMS"
+  - file: fonts/RobotoCondensed-Bold.ttf
+    id: font_banner_name
+    size: 28
     bpp: 4
     glyphs: !literal " %-.0123456789:ABCDFGHKLMNOPRSTVWacefghiklnoprstuvwy\u00B0"
   - file: fonts/MaterialSymbols-subset.ttf
@@ -334,6 +354,52 @@ mqtt:
               id(ins_solar_a_val) = buf;
             }
         - script.execute: render_tiles
+    - topic: vesselstack/v1/alarms/summary
+      then:
+        - lambda: |-
+            const char *mx = x["max"] | "unknown";
+            uint8_t m = strcmp(mx, "ok") == 0 ? 1 : strcmp(mx, "warn") == 0 ? 2 : strcmp(mx, "alarm") == 0 ? 3 : 0;
+            int na = x["na"] | 0;
+            const char *id0 = x["ids"][0] | "";
+            int first = -1;
+            if (strcmp(id0, "sog") == 0) first = 0;
+            else if (strcmp(id0, "depth") == 0) first = 1;
+            else if (strcmp(id0, "house_v") == 0) first = 2;
+            else if (strcmp(id0, "awa") == 0) first = 3;
+            else if (strcmp(id0, "anchor") == 0) first = 4;
+            else if (strcmp(id0, "fuel") == 0) first = 5;
+            else if (strcmp(id0, "water") == 0) first = 6;
+            else if (strcmp(id0, "lpg") == 0) first = 7;
+            else if (strcmp(id0, "waste") == 0) first = 8;
+            else if (strcmp(id0, "batt_v") == 0) first = 9;
+            else if (strcmp(id0, "batt_soc") == 0) first = 10;
+            else if (strcmp(id0, "batt_a") == 0) first = 11;
+            else if (strcmp(id0, "shore") == 0) first = 12;
+            else if (strcmp(id0, "solar_a") == 0) first = 13;
+            bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));
+            id(summary_max) = m;
+            id(summary_na) = na;
+            id(summary_first) = first;
+            id(summary_seen) = millis();
+            id(summary_valid) = true;
+            if (rising) {
+              id(alarm_rising) = true;
+              id(alarm_dismissed) = false;
+            }
+        - if:
+            condition:
+              lambda: 'return id(alarm_rising);'
+            then:
+              - lambda: 'id(alarm_rising) = false;'
+              - lvgl.page.show:
+                  id: page_0
+                  animation: NONE
+                  time: 0ms
+              - light.turn_on:
+                  id: board_backlight
+                  brightness: 100%
+              - lambda: 'id(bl_drawn) = 100;'
+        - script.execute: render_alarm
     - topic: vesselstack/v1/bridge/clock
       then:
         - lambda: |-
@@ -782,6 +848,147 @@ script:
             lv_obj_set_style_bg_color(id(p6_shore_tile), lv_color_hex(bg), LV_PART_MAIN);
             lv_obj_set_style_text_color(id(p6_shore_value), lv_color_hex(fg), LV_PART_MAIN);
           }
+  - id: render_alarm
+    mode: restart
+    then:
+      - lambda: |-
+          bool seen = id(summary_valid) && (millis() - id(summary_seen)) < 15000UL;
+          if (!seen) {
+            id(summary_max) = 0;
+            id(summary_na) = 0;
+          }
+          bool show = seen && id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(summary_max) == 3 && id(summary_na) > 0 && !id(alarm_dismissed);
+          id(alarm_idx) = show ? id(summary_first) : -1;
+          if (show) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d%s %s", id(summary_na) > 99 ? 99 : id(summary_na), id(summary_na) > 99 ? "+" : "", id(summary_na) == 1 ? "ALARM" : "ALARMS");
+            if (strcmp(lv_label_get_text(id(alarm_banner_count)), buf) != 0) lv_label_set_text(id(alarm_banner_count), buf);
+            lv_obj_clear_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_opa(id(alarm_banner), LV_OPA_COVER, LV_PART_MAIN);
+            id(alarm_flash) = false;
+          }
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == -1 && id(alarm_drawn_idx) != -1;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: ""
+            - lambda: 'id(alarm_drawn_idx) = -1;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 0 && id(alarm_drawn_idx) != 0;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "SOG"
+            - lambda: 'id(alarm_drawn_idx) = 0;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 1 && id(alarm_drawn_idx) != 1;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Depth"
+            - lambda: 'id(alarm_drawn_idx) = 1;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 2 && id(alarm_drawn_idx) != 2;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "House"
+            - lambda: 'id(alarm_drawn_idx) = 2;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 3 && id(alarm_drawn_idx) != 3;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "AWA"
+            - lambda: 'id(alarm_drawn_idx) = 3;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 4 && id(alarm_drawn_idx) != 4;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Anchor"
+            - lambda: 'id(alarm_drawn_idx) = 4;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 5 && id(alarm_drawn_idx) != 5;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Fuel"
+            - lambda: 'id(alarm_drawn_idx) = 5;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 6 && id(alarm_drawn_idx) != 6;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Water"
+            - lambda: 'id(alarm_drawn_idx) = 6;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 7 && id(alarm_drawn_idx) != 7;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "LPG"
+            - lambda: 'id(alarm_drawn_idx) = 7;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 8 && id(alarm_drawn_idx) != 8;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Waste"
+            - lambda: 'id(alarm_drawn_idx) = 8;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 9 && id(alarm_drawn_idx) != 9;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "House"
+            - lambda: 'id(alarm_drawn_idx) = 9;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 10 && id(alarm_drawn_idx) != 10;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "SoC"
+            - lambda: 'id(alarm_drawn_idx) = 10;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 11 && id(alarm_drawn_idx) != 11;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Current"
+            - lambda: 'id(alarm_drawn_idx) = 11;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 12 && id(alarm_drawn_idx) != 12;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Shore"
+            - lambda: 'id(alarm_drawn_idx) = 12;'
+      - if:
+          condition:
+            lambda: 'return id(alarm_idx) == 13 && id(alarm_drawn_idx) != 13;'
+          then:
+            - lvgl.label.update:
+                id: alarm_banner_name
+                text: !literal "Solar"
+            - lambda: 'id(alarm_drawn_idx) = 13;'
   - id: render_header
     mode: restart
     then:
@@ -1046,6 +1253,7 @@ script:
       - lambda: |-
           int target = 100;
           if (id(night_active)) target = 20;
+          if (!lv_obj_has_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN)) target = 100;
           if (target != id(bl_drawn)) {
             id(bl_drawn) = target;
             auto call = id(board_backlight).turn_on();
@@ -1057,9 +1265,16 @@ interval:
   - interval: 1s
     then:
       - script.execute: render_tiles
+      - script.execute: render_alarm
       - script.execute: apply_night
       - script.execute: render_header
       - script.execute: apply_power
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (lv_obj_has_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN)) return;
+          id(alarm_flash) = !id(alarm_flash);
+          lv_obj_set_style_bg_opa(id(alarm_banner), id(alarm_flash) ? LV_OPA_40 : LV_OPA_COVER, LV_PART_MAIN);
 
 lvgl:
   displays: [board_display]
@@ -2691,3 +2906,24 @@ lvgl:
                     - script.execute: apply_night
                     - script.execute: apply_power
               - lambda: 'id(touch_ignore) = true;'
+  top_layer:
+    widgets:
+      - obj:
+          id: alarm_banner
+          align: CENTER
+          width: 340
+          height: 96
+          bg_color: 0xC62828
+          bg_opa: COVER
+          border_width: 0
+          radius: 14
+          pad_all: 4
+          hidden: true
+          scrollable: false
+          layout: {type: FLEX, flex_flow: COLUMN, flex_align_main: CENTER, flex_align_cross: CENTER}
+          on_click:
+            - lambda: 'id(alarm_dismissed) = true;'
+            - script.execute: render_alarm
+          widgets:
+            - label: {id: alarm_banner_count, text: "", text_font: font_banner, text_color: 0xFFFFFF, width: 100%, text_align: CENTER, long_mode: DOT}
+            - label: {id: alarm_banner_name, text: "", text_font: font_banner_name, text_color: 0xFFFFFF, width: 100%, text_align: CENTER, long_mode: DOT}

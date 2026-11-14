@@ -40,6 +40,7 @@ DOWN_HOLD_S = 180
 RUN_DEADLINE_S = 90
 STALE_RANGE_CAP_MIN = 60
 ENTITY_RE = re.compile(r"[a-z_]+\.[A-Za-z0-9_]+")
+HA_UNAUTHORIZED = object()   # ha_state(): token missing or rejected (401/403); an object, so it can never equal a real HA state string
 BACKUP_LAST_FILE = "/var/lib/vesselstack/backup-last.json"
 OVERRIDE_KEYS = {
     "TELEGRAM_BOT_TOKEN", "HOME_ASSISTANT_TOKEN", "HOME_ASSISTANT_URL", "INFLUXDB_URL",
@@ -334,6 +335,7 @@ def flux_rows(text: str) -> list[dict[str, str]]:
 class Probes:
     def __init__(self, io: Io, settings: dict[str, str], deadline: float | None = None):
         self.io, self.s, self.deadline, self.skipped = io, settings, deadline, 0
+        self.influx_auth: bool | None = None   # True: InfluxDB answered 401/403; False: answered 200; None: not tried or no usable answer
         self.influx_url = (settings.get("INFLUXDB_URL") or "http://127.0.0.1:8086").rstrip("/")
         self.bucket = settings.get("INFLUXDB_RAW_BUCKET") or "signalk"
 
@@ -352,6 +354,10 @@ class Probes:
                                         json.dumps({"query": query, "type": "flux"}).encode(), 25)
         except OSError:
             return None
+        if status in (401, 403):
+            self.influx_auth = True
+        elif status == 200 and self.influx_auth is None:
+            self.influx_auth = False
         return flux_rows(body.decode("utf-8", "ignore")) if status == 200 else None
 
     def battery_voltages(self) -> dict[str, float] | None:
@@ -386,11 +392,14 @@ class Probes:
             newest = stamp if newest is None else max(newest, stamp)
         return True, newest
 
-    def ha_state(self, entity: str) -> str | None:
-        """Lower-case state; 'missing' for HTTP 404; None when it cannot be read (no token, HA down, other error)."""
+    def ha_state(self, entity: str) -> Any:
+        """Lower-case state; 'missing' for HTTP 404; HA_UNAUTHORIZED when there is no token or HA answers 401/403;
+        None when it cannot be read for any other reason (HA down, 5xx, bad entity id, unparseable answer)."""
         token = self.s.get("HOME_ASSISTANT_TOKEN", "")
-        if not token or not ENTITY_RE.fullmatch(entity):
+        if not ENTITY_RE.fullmatch(entity):
             return None
+        if not token:
+            return HA_UNAUTHORIZED
         base = (self.s.get("HOME_ASSISTANT_URL") or "http://127.0.0.1:8123").rstrip("/")
         try:
             status, body = self.io.http("GET", f"{base}/api/states/{urllib.parse.quote(entity, safe='')}", {"Authorization": f"Bearer {token}"}, None, 10)
@@ -398,6 +407,8 @@ class Probes:
             return None
         if status == 404:
             return "missing"
+        if status in (401, 403):
+            return HA_UNAUTHORIZED
         if status != 200:
             return None
         try:
@@ -536,17 +547,24 @@ def evaluate(io: Io, settings: dict[str, str], probes: Probes, state: dict[str, 
         entity = settings.get(setting, "").strip()
         if not entity or not ENTITY_RE.fullmatch(entity):
             continue
-        nr = f"{key}-nr"
-        families |= {key, nr}
+        nr, auth = f"{key}-nr", f"{key}-auth"
+        families |= {key, nr, auth}
         if probes.expired():
-            keep(key), keep(nr)
+            keep(key), keep(nr), keep(auth)
             continue
         current = probes.ha_state(entity)
         label = "Bilge" if key == "bilge" else "Shore power"
+        if current is HA_UNAUTHORIZED:     # no token, or HA rejected it: this alert cannot work, so say so (active alert untouched)
+            keep(key)
+            conds[auth] = Cond(True, f"{label} alert is not working: Home Assistant token is missing or was rejected, so {entity} cannot be checked. "
+                                     "Set a new long-lived access token in Control Panel settings.",
+                               f"{label} alert is working again: {entity} can be read.", NOT_REPORTING_HOLD_S)
+            continue
         nr_text = f"{label} sensor not reporting: {entity} is {current if current not in (None, 'missing') else 'not found in Home Assistant'}."
         if current is None:
-            keep(key), keep(nr)          # Home Assistant unreachable or no token: cannot tell
+            keep(key), keep(nr), keep(auth)   # Home Assistant unreachable or unreadable answer: cannot tell
             continue
+        conds[auth] = Cond(False, "", f"{label} alert is working again: {entity} can be read.")
         entity_404[key] = current == "missing"
         if current == bad:
             conds[key] = Cond(True, bad_text.format(e=entity), bad_clear.format(e=entity), bad_hold)
@@ -557,6 +575,16 @@ def evaluate(io: Io, settings: dict[str, str], probes: Probes, state: dict[str, 
         else:                              # unavailable, unknown, empty, missing: this is NOT an all-clear
             keep(key)
             conds[nr] = Cond(True, nr_text, f"{label} sensor {entity} is reporting again.", NOT_REPORTING_HOLD_S)
+
+    if low is not None or datapath:      # the battery and stale-data checks share one InfluxDB read token
+        families.add("influx-auth")
+        if probes.influx_auth is True:
+            conds["influx-auth"] = Cond(True, "Battery and stale-data alerts are not working: InfluxDB rejected the read token.",
+                                        "Battery and stale-data alerts are working again: InfluxDB accepted the read token.", NOT_REPORTING_HOLD_S)
+        elif probes.influx_auth is False:
+            conds["influx-auth"] = Cond(False, "", "Battery and stale-data alerts are working again: InfluxDB accepted the read token.")
+        else:
+            keep("influx-auth")
 
     # Boot change
     boot = io.boot_id()
@@ -607,7 +635,7 @@ def run(settings: dict[str, str], io: Io, state_path: Path, log, out) -> int:
     conds, events, families, known_down = evaluate(io, settings, probes, state, now)
     prune_orphans(state, families, known_down)
     sends = failures = skipped_sends = 0
-    held_down = False
+    held_down = held_auth = False
 
     def deliver(text: str) -> bool:
         nonlocal sends, failures, skipped_sends
@@ -652,6 +680,8 @@ def run(settings: dict[str, str], io: Io, state_path: Path, log, out) -> int:
             last = parse_iso(entry.get("last_sent"))
             if key.startswith("down:") and now - first >= cond.hold:
                 held_down = True
+            if key.endswith("-auth") and now - first >= cond.hold:
+                held_auth = True     # a held "cannot read the sensor / InfluxDB" credentials alert
             if now - first >= cond.hold and (last is None or now - last >= repeat):
                 if deliver(cond.text):
                     entry["last_sent"] = iso(now)
@@ -679,9 +709,9 @@ def run(settings: dict[str, str], io: Io, state_path: Path, log, out) -> int:
 
     url = settings.get("ALERT_HEARTBEAT_URL", "").strip()
     if url.startswith("https://"):
-        # /fail only for a real problem: a held component-down alert, a failed Telegram delivery this run, or
+        # /fail only for a real problem: a held component-down or credentials-rejected alert, a failed Telegram delivery this run, or
         # alerts switched on with nowhere to send them.  A running backup is not a problem.
-        problem = held_down or failures > 0 or bool(telegram.ready())
+        problem = held_down or held_auth or failures > 0 or bool(telegram.ready())
         parts = urllib.parse.urlsplit(url)
         path = parts.path.rstrip("/") + ("/fail" if problem else "")
         target = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
