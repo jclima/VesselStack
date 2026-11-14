@@ -860,27 +860,58 @@ The bridge condenses all alarm-relevant items into one retained message,
 screen with a flashing banner.
 
 ```json
-{"max":"alarm","na":1,"nw":1,"nu":0,"ids":["anchor","depth"],"ts":"2026-01-01T00:00:00Z"}
+{"max":"alarm","na":1,"nw":1,"nu":0,"nl":0,"ids":["anchor","depth"],"lost":[],"seq":3141592653,"ts":"2026-01-01T00:00:00Z"}
 ```
 
 - **What counts:** only items with `alarm: true`. Instruments default to true
   when they have `thresholds` and to false otherwise; notifications default to
-  true. A stale or never-heard item counts as `unknown`.
+  true. A stale or never-heard item counts as `unknown`, unless it was in
+  alarm when its data stopped (see "Lost alarms" below).
 - `na`, `nw`, `nu` are the numbers of items that are `alarm`, `warn` and
   `unknown`. `max` is the highest of `alarm` > `warn` > `unknown` > `ok`:
   `unknown` ranks **above** `ok`, so a dead Signal K feed or stale sensor is never
   reported as all clear. With no counted item at all the topic is not
   published.
-- `ids` lists the alarm ids first, then the warn ids, each group in
-  `displays.json` order (instruments, then notifications), at most 16. Only
-  ids are published: never labels, units, values or notification messages.
-  `ts` is the bridge's UTC time.
+- `ids` lists the alarm ids first, then the lost ids, then the warn ids, each
+  group in `displays.json` order (instruments, then notifications, then Home
+  Assistant items), at most 16. Only ids are published: never labels, units,
+  values or notification messages. `ts` is the bridge's UTC time.
+- **Lost alarms.** An alarm never clears because its data stopped. An item that
+  was in alarm when its data stopped (stale, a null or invalid value, a Signal K
+  or Home Assistant disconnect, an unavailable Home Assistant entity, or a clean
+  bridge stop) is *lost*: it is counted in `max` (`alarm`), `na` and `ids` as if
+  it were still in alarm, and also in `nl` and listed in `lost` (at most 16).
+  Lost items are not counted in `nu`. Its own topic is unchanged
+  (`st` `stale` or `missing`, `sev` `unknown`). Current display firmware ignores
+  `nl` and `lost`, so the banner now stays up showing the alarm when its data
+  stops; it does not yet say that the data is missing (that wording comes with a
+  later firmware change).
+- **When the latch is set and cleared.** It is set when an item whose severity is
+  `alarm` loses its data, and only then: an item that was `ok` or `warn` when
+  its data stopped is `unknown`, as before. It is cleared only by positive
+  evidence: a fresh reading that is `ok` or `warn` (a fresh reading that is
+  still `alarm` is a live alarm again), for a notification an explicit delta for
+  its path (a null value, or a recognised state such as `normal`) while Signal K
+  is connected, or the item being removed from `displays.json`. The settle
+  timeout after a Signal K reconnect never clears it (a lost notification keeps
+  `sev` `unknown` on its own topic until a delta arrives), reconnecting does not
+  clear it, and there is no time limit. The latch is held in the bridge's memory
+  only: restarting the bridge while an alarmed sensor is silent forgets it until
+  a later change persists it.
+- `seq` is an unsigned 32-bit counter (wrapping at 2^32), starting from a random
+  value each time the bridge starts. It rises by one for every item that is a
+  live alarm now and was neither a live alarm nor lost at the previous
+  evaluation. An alarm turning into a lost one, or back, does not change it, but
+  one alarm clearing while another raises does, even though `na` stays the
+  same, so it can be used to re-arm a dismissed banner. Current firmware ignores
+  it.
 - Published (retained, QoS 1) on every change and every `heartbeat_s`. On a
-  clean stop (SIGTERM) the bridge publishes a last summary with every counted
-  item `unknown` (`max` `unknown`, `na` 0), so a stopped bridge never leaves a
-  retained `ok` or `alarm`. After a crash or power loss the retained message
-  stays, which is why displays also require `bridge/status` `online` and a
-  summary newer than 3 x `heartbeat_s`.
+  clean stop (SIGTERM) the bridge publishes a last summary as if every counted
+  item had just gone stale: items in alarm are lost (`max` stays `alarm`),
+  everything else is `unknown`, so a stopped bridge never leaves a retained
+  `ok` and never turns an alarm into a clear. After a crash or power loss the
+  retained message stays, which is why displays also require `bridge/status`
+  `online` and a summary newer than 3 x `heartbeat_s`.
 - Needs the `alarms/#` ACL rule (see [MQTT access control](MQTT.md)).
 
 Per-display option in `displays.json` (on by default when anything in the

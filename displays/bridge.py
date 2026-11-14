@@ -206,6 +206,8 @@ class Bridge:
         self._clock_wanted = topics.clock_wanted(config)
         self._clock_sent = None     # (state, clock time) of the last bridge clock published
         self._summary_sent = None   # (content, clock time) of the last summary published
+        self._alarm_seq = random.getrandbits(31)   # new-alarm counter (uint32, wraps); in memory only
+        self._alarm_prev = frozenset()             # ids in alarm (live or lost) at the previous evaluation
         self.self_urn = None
         self.signalk_state = SIGNALK_DISCONNECTED
         self._next_tick = 0.0
@@ -294,7 +296,12 @@ class Bridge:
         """Publish the retained alarm summary on change and every heartbeat; none when nothing counts."""
         if items is None:
             items = self.engine.summary_items() + self.events.summary_items(now) + self.has.summary_items()
-        payload = topics.alarm_summary(items, self._summary_ts())
+        # seq counts alarms that are new since the previous evaluation (evaluated before the retained
+        # message is coalesced, so "A clears, B raises" still moves it); alarm <-> lost does not.
+        live = {iid for iid, sev in items if sev == "alarm"}
+        self._alarm_seq = (self._alarm_seq + len(live - self._alarm_prev)) % 2 ** 32
+        self._alarm_prev = frozenset(live | {iid for iid, sev in items if sev == "lost"})
+        payload = topics.alarm_summary(items, self._summary_ts(), self._alarm_seq)
         if payload is None:
             return
         content = json.loads(payload)
@@ -449,10 +456,11 @@ class Bridge:
             self._set_ha(HA_DISCONNECTED)
         if self.signalk_state != SIGNALK_DISCONNECTED:
             self._set_signalk(SIGNALK_DISCONNECTED)
-        # A clean stop must not leave a retained "ok" (or a stale "alarm"): publish every counted
-        # item as unknown. A crash cannot do this; displays then rely on the summary going stale.
+        # A clean stop must not leave a retained "ok" (or a stale "alarm"): publish the summary as if
+        # every counted item had just gone stale. An item in alarm stays an alarm (lost), the rest is
+        # unknown. A crash cannot do this; displays then rely on the summary going stale.
         now = self.clock()
-        self._publish_summary(now, [(i, "unknown") for i, _ in
+        self._publish_summary(now, [(i, "lost" if sev in ("alarm", "lost") else "unknown") for i, sev in
                                     self.engine.summary_items() + self.events.summary_items(now)
                                     + self.has.summary_items()], force=True)
         self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, True, qos=1)

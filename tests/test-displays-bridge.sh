@@ -211,7 +211,7 @@ wait_for vesselstack/v1/bridge/signalk '^disconnected$' 10
 wait_for vesselstack/v1/instruments/sog '"st":"missing"' 10
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"missing","sev":"unknown"' 10
 # Alarm summary: the one counted item (the notification) is unknown, retained, ids only.
-wait_for vesselstack/v1/alarms/summary '^\{"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\],"ts":"[0-9TZ:-]+"\}$' 10
+wait_for vesselstack/v1/alarms/summary '^\{"max":"unknown","na":0,"nw":0,"nu":1,"nl":0,"ids":\[\],"lost":\[\],"seq":[0-9]+,"ts":"[0-9TZ:-]+"\}$' 10
 # Bridge clock (a header display and a schedule are configured): retained, exact shape, the
 # bridge's local wall clock (UTC+05:30 here) and the night flag of the active window.
 wait_for vesselstack/v1/bridge/clock '^\{"hm":"[0-2][0-9]:[0-5][0-9]","night":true,"ts":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"\}$' 10
@@ -242,13 +242,13 @@ wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 15
 # The notification is "not raised" (ok) once SignalK is connected, then follows the fake's
 # alarm and clear; the message text never reaches MQTT.
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 15
-wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"ids":\[\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"nl":0,"ids":\[\]' 15
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"alarm"' 15
-wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"ids":\["anchor"\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"nl":0,"ids":\["anchor"\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor | grep -c 'Anchor alarm')" = 0 ] \
     || fail "the notification message text was published"
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 25
-wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"ids":\[\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"nl":0,"ids":\[\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary | grep -c 'Anchor')" = 0 ] \
     || fail "the alarm summary carried a label or message text"
 pass
@@ -272,7 +272,7 @@ pass
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 30
 wait_for vesselstack/v1/instruments/sog '"v":null,"u":"kn","st":"stale"' 15
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"stale","sev":"unknown"' 15
-wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1,"nl":0,"ids":\[\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status)" = online ] \
     || fail "bridge status should stay online while only SignalK is down"
 pass
@@ -394,13 +394,13 @@ wait_for vesselstack/v1/ha/high_water '"k":1,"u":"","st":"ok","sev":"ok"' 20
 wait_for vesselstack/v1/ha/bilge '"k":1,"u":"","st":"ok","sev":"ok"' 30
 wait_for vesselstack/v1/ha/high_water '"k":0,"u":"","st":"ok","sev":"alarm"' 30
 # (d) the alarm summary includes the Home Assistant alarm
-wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"ids":\["high_water"\]' 15
-# (c) Home Assistant stops: its items are stale, SignalK is untouched
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"nl":0,"ids":\["high_water"\]' 15
+# (c) Home Assistant stops: its items are stale, SignalK is untouched; an alarm whose source stops is kept as a lost alarm
 wait_for vesselstack/v1/bridge/homeassistant '^disconnected$' 40
 wait_for vesselstack/v1/ha/bilge '"v":null,"k":null,"u":"","st":"stale","sev":"unknown"' 15
 wait_for vesselstack/v1/ha/high_water '"st":"stale","sev":"unknown"' 15
 wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 10
-wait_for vesselstack/v1/alarms/summary '"max":"unknown"' 15
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":1,"nl":1,"ids":\["high_water"\],"lost":\["high_water"\]' 15
 logs=$(docker logs "$BRIDGE" 2>&1)
 for secret in "$HA_TOKEN" "$SK_TOKEN" "$BRIDGE_PASS"; do
     ! grep -Fq "$secret" <<<"$logs" || fail "a secret appeared in the bridge log (good token)"

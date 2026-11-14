@@ -114,7 +114,7 @@ that every provider works offline. The optional [instrument displays preview](do
 is another separately enabled local feature. Displays show a full-screen alarm banner by default when anything
 counts towards the alarm summary; set `"ui": {"alarm_takeover": false}` in `displays.json` to turn it off, then
 rebuild and reflash (`vesselstackctl display build ID`, `display flash ID`).
-A null or invalid Signal K value, or a lost Signal K connection, turns the tile to a grey `--` at once, and warning and alarm colours are judged on the reading before it is rounded for display.
+A null or invalid Signal K value, or a lost Signal K connection, turns the tile to a grey `--` at once, and warning and alarm colours are judged on the reading before it is rounded for display. An alarm never clears because its data stopped: the bridge keeps counting an item that was in alarm when its sensor went silent as a lost alarm in the alarm summary, so the banner stays up until a fresh reading or an explicit all-clear says otherwise.
 
 ### Component lifecycle
 

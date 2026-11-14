@@ -125,7 +125,7 @@ class EngineTests(unittest.TestCase):
         engine.update(HOUSE, 10.9, TS, 100.0)                      # alarm
         msg = decode(engine.update(HOUSE, float("nan"), TS, 100.1))[0][1]
         self.assertEqual((msg["st"], msg["v"], msg["sev"]), ("missing", None, "unknown"))
-        self.assertEqual(engine.summary_items()[0], ("house", "unknown"))
+        self.assertEqual(engine.summary_items()[0], ("house", "lost"))     # the alarm is latched, not cleared
         # 11.3 sits inside the alarm hold zone, but there is no memory left: warn, not alarm.
         self.assertEqual(decode(engine.update(HOUSE, 11.3, TS, 101.0))[0][1]["sev"], "warn")
 
@@ -158,7 +158,7 @@ class EngineTests(unittest.TestCase):
         engine.update(HOUSE, 10.9, TS, 100.0)                               # alarm
         msg = decode(engine.source_state(False, 101.0))[0][1]
         self.assertEqual((msg["st"], msg["sev"]), ("stale", "unknown"))
-        self.assertEqual(engine.summary_items()[0], ("house", "unknown"))
+        self.assertEqual(engine.summary_items()[0], ("house", "lost"))     # the alarm is latched, not cleared
         engine.source_state(True, 102.0)
         self.assertEqual(decode(engine.update(HOUSE, 11.3, TS, 103.0))[0][1]["sev"], "warn")
 
@@ -357,8 +357,8 @@ class AlarmSummaryTests(unittest.TestCase):
     def test_counts_and_id_order(self) -> None:
         got = self.summary([("w1", "warn"), ("a1", "alarm"), ("u", "unknown"), ("ok", "ok"),
                             ("a2", "alarm"), ("w2", "warn")])
-        self.assertEqual(got, {"max": "alarm", "na": 2, "nw": 2, "nu": 1,
-                               "ids": ["a1", "a2", "w1", "w2"], "ts": "T"})
+        self.assertEqual(got, {"max": "alarm", "na": 2, "nw": 2, "nu": 1, "nl": 0,
+                               "ids": ["a1", "a2", "w1", "w2"], "lost": [], "ts": "T"})
 
     def test_unrecognised_severity_is_unknown_and_ids_are_capped(self) -> None:
         self.assertEqual(self.summary([("a", None)])["nu"], 1)
@@ -368,8 +368,11 @@ class AlarmSummaryTests(unittest.TestCase):
 
     def test_payload_is_compact_and_id_only(self) -> None:
         payload = topics.alarm_summary([("a", "alarm")], "2026-01-01T00:00:00Z")
-        self.assertEqual(payload, '{"max":"alarm","na":1,"nw":0,"nu":0,"ids":["a"],'
+        self.assertEqual(payload, '{"max":"alarm","na":1,"nw":0,"nu":0,"nl":0,"ids":["a"],"lost":[],'
                                   '"ts":"2026-01-01T00:00:00Z"}')
+        with_seq = topics.alarm_summary([("a", "alarm")], "2026-01-01T00:00:00Z", 7)
+        self.assertEqual(with_seq, '{"max":"alarm","na":1,"nw":0,"nu":0,"nl":0,"ids":["a"],"lost":[],'
+                                   '"seq":7,"ts":"2026-01-01T00:00:00Z"}')
 
     def test_instrument_items_follow_alarm_flag_and_freshness(self) -> None:
         cfg = {"heartbeat_s": 5, "instruments": {
@@ -386,7 +389,8 @@ class AlarmSummaryTests(unittest.TestCase):
             engine.update(path, 2.0, TS, 0.0)
         self.assertEqual(engine.summary_items(), [("depth", "alarm"), ("forced", "ok")])
         engine.tick(11.0)
-        self.assertEqual(engine.summary_items(), [("depth", "unknown"), ("forced", "unknown")])
+        # depth was in alarm when its data stopped: lost (still an alarm); forced was ok: unknown
+        self.assertEqual(engine.summary_items(), [("depth", "lost"), ("forced", "unknown")])
 
     def test_notification_items_default_to_counted(self) -> None:
         cfg = {"notifications": {"a": {"path": "notifications.a", "label": "A"},
@@ -502,9 +506,10 @@ class HaEngineTests(unittest.TestCase):
         self.engine.set_state("sensor.temp", "41", "t", 0.0)
         self.assertEqual(self.engine.summary_items(), [("bilge", "warn"), ("temp", "alarm")])
         self.engine.source_state(False, 1.0)
-        self.assertEqual(self.engine.summary_items(), [("bilge", "unknown"), ("temp", "unknown")])
+        # temp was in alarm when the connection dropped: lost; bilge was only warn: unknown
+        self.assertEqual(self.engine.summary_items(), [("bilge", "unknown"), ("temp", "lost")])
         summary = json.loads(topics.alarm_summary(self.engine.summary_items(), "t"))
-        self.assertEqual(summary["max"], "unknown")             # a dead feed is never all clear
+        self.assertEqual((summary["max"], summary["nl"], summary["nu"]), ("alarm", 1, 1))   # never all clear
 
     def test_websocket_url(self) -> None:
         self.assertEqual(topics.ha_websocket_url("http://127.0.0.1:8123"), "ws://127.0.0.1:8123/api/websocket")
@@ -731,3 +736,169 @@ class ClockTests(unittest.TestCase):
         self.assertTrue(topics.clock_wanted({"displays": {"a": {}, "b": {"ui": {"header": True}}}}))
 
 
+
+
+
+SEQ_ENGINE_CONFIG = {
+    "heartbeat_s": 5,
+    "instruments": {
+        "depth": {"path": "d", "convert": "none", "unit": "m", "precision": 1, "stale_after_s": 10,
+                  "thresholds": {"alarm_below": 4, "warn_below": 6}},
+    },
+    "notifications": {"anchor": {"path": ANCHOR, "label": "Anchor"}},
+}
+
+
+class LostAlarmTests(unittest.TestCase):
+    """An alarm never clears because data stopped: it is "lost" until positive evidence says otherwise."""
+
+    def instruments(self):
+        return topics.Engine(SEQ_ENGINE_CONFIG)
+
+    def summary(self, *engines_items):
+        items = [i for group in engines_items for i in group]
+        return json.loads(topics.alarm_summary(items, "T"))
+
+    def test_alarm_then_stale_is_lost(self) -> None:
+        engine = self.instruments()
+        engine.update("d", 2.0, TS, 0.0)
+        engine.tick(11.0)
+        got = self.summary(engine.summary_items())
+        self.assertEqual((got["max"], got["na"], got["nu"], got["nl"], got["ids"], got["lost"]),
+                         ("alarm", 1, 0, 1, ["depth"], ["depth"]))
+        payload = decode(engine.tick(17.0))[0][1]                  # the heartbeat republishes the item topic
+        self.assertEqual((payload["st"], payload["sev"]), ("stale", "unknown"))   # ... unchanged by the latch
+
+    def test_alarm_then_null_or_invalid_is_lost(self) -> None:
+        for bad in (None, float("nan"), "x"):
+            engine = self.instruments()
+            engine.update("d", 2.0, TS, 0.0)
+            engine.update("d", bad, TS, 1.0)
+            self.assertEqual(engine.summary_items(), [("depth", "lost")], repr(bad))
+            engine.update("d", bad, TS, 2.0)                      # repeated: still lost
+            self.assertEqual(engine.summary_items(), [("depth", "lost")], repr(bad))
+
+    def test_alarm_then_signalk_disconnect_is_lost_for_instruments_and_notifications(self) -> None:
+        engine, events = self.instruments(), topics.EventEngine(SEQ_ENGINE_CONFIG)
+        events.source_state("signalk", True, 0.0)
+        engine.update("d", 2.0, TS, 0.0)
+        events.update(ANCHOR, {"state": "alarm"}, TS, 0.0)
+        engine.source_state(False, 1.0)
+        events.source_state("signalk", False, 1.0)
+        self.assertEqual(engine.summary_items(), [("depth", "lost")])
+        self.assertEqual(events.summary_items(1.0), [("anchor", "lost")])
+        got = self.summary(engine.summary_items(), events.summary_items(1.0))
+        self.assertEqual((got["max"], got["na"], got["nu"], got["nl"], got["lost"]), ("alarm", 2, 0, 2, ["depth", "anchor"]))
+        payload = json.loads(events.tick(6.0)[0][1])
+        self.assertEqual((payload["st"], payload["sev"]), ("stale", "unknown"))
+
+    def test_only_an_alarm_is_latched(self) -> None:
+        for value in (5.0, 8.0):                                  # warn, ok
+            engine = self.instruments()
+            engine.update("d", value, TS, 0.0)
+            engine.tick(11.0)
+            self.assertEqual(engine.summary_items(), [("depth", "unknown")])
+        events = topics.EventEngine(SEQ_ENGINE_CONFIG)
+        events.source_state("signalk", True, 0.0)
+        events.update(ANCHOR, {"state": "warn"}, TS, 0.0)
+        events.source_state("signalk", False, 1.0)
+        self.assertEqual(events.summary_items(1.0), [("anchor", "unknown")])
+
+    def test_fresh_reading_clears_the_latch(self) -> None:
+        for value, want in ((8.0, "ok"), (5.0, "warn"), (2.0, "alarm")):
+            engine = self.instruments()
+            engine.update("d", 2.0, TS, 0.0)
+            engine.source_state(False, 1.0)
+            self.assertEqual(engine.summary_items(), [("depth", "lost")])
+            engine.source_state(True, 2.0)
+            self.assertEqual(engine.summary_items(), [("depth", "lost")])    # connecting alone proves nothing
+            engine.update("d", value, TS, 3.0)
+            self.assertEqual(engine.summary_items(), [("depth", want)])
+            engine.tick(20.0)                                                # a later loss of a non-alarm is unknown
+            expected = "lost" if want == "alarm" else "unknown"
+            self.assertEqual(engine.summary_items(), [("depth", expected)])
+        got = self.summary([("depth", "ok")])
+        self.assertEqual((got["max"], got["nl"]), ("ok", 0))
+
+    def test_lost_notification_ignores_the_settle_timeout_and_reconnect(self) -> None:
+        events = topics.EventEngine(SEQ_ENGINE_CONFIG)
+        events.source_state("signalk", True, 0.0)
+        events.update(ANCHOR, {"state": "alarm"}, TS, 0.0)
+        events.source_state("signalk", False, 1.0)
+        events.source_state("signalk", True, 2.0)
+        for now in (2.5, 2.0 + topics.EVENT_SETTLE_S + 1, 100.0):
+            events.tick(now)
+            self.assertEqual(events.summary_items(now), [("anchor", "lost")], now)
+        payload = json.loads(events.tick(100.0 + 5.0)[0][1])
+        self.assertEqual((payload["st"], payload["sev"]), ("ok", "unknown"))   # never a green "absent" while lost
+
+    def test_explicit_delta_clears_a_lost_notification(self) -> None:
+        for raw, want in ((None, "ok"), ({"state": "normal"}, "ok"), ({"state": "warn"}, "warn"),
+                          ({"state": "alarm"}, "alarm")):
+            events = topics.EventEngine(SEQ_ENGINE_CONFIG)
+            events.source_state("signalk", True, 0.0)
+            events.update(ANCHOR, {"state": "alarm"}, TS, 0.0)
+            events.source_state("signalk", False, 1.0)
+            events.source_state("signalk", True, 2.0)
+            events.update(ANCHOR, raw, TS, 3.0)
+            self.assertEqual(events.summary_items(3.0), [("anchor", want)], repr(raw))
+        events.source_state("signalk", False, 4.0)                # an alarm again after a live alarm: lost again
+        self.assertEqual(events.summary_items(4.0), [("anchor", "lost")])
+
+    def test_unrecognised_notification_state_does_not_clear_the_latch(self) -> None:
+        events = topics.EventEngine(SEQ_ENGINE_CONFIG)
+        events.source_state("signalk", True, 0.0)
+        events.update(ANCHOR, {"state": "alarm"}, TS, 0.0)
+        events.source_state("signalk", False, 1.0)
+        events.source_state("signalk", True, 2.0)
+        events.update(ANCHOR, {"state": "bogus"}, TS, 3.0)
+        self.assertEqual(events.summary_items(3.0), [("anchor", "lost")])
+
+    def test_ids_order_is_live_then_lost_then_warn_and_capped(self) -> None:
+        got = self.summary([("w", "warn"), ("l1", "lost"), ("a", "alarm"), ("u", "unknown"), ("l2", "lost")])
+        self.assertEqual((got["max"], got["na"], got["nw"], got["nu"], got["nl"]), ("alarm", 3, 1, 1, 2))
+        self.assertEqual(got["ids"], ["a", "l1", "l2", "w"])
+        self.assertEqual(got["lost"], ["l1", "l2"])
+        only_lost = self.summary([("w", "warn"), ("l1", "lost"), ("ok", "ok")])
+        self.assertEqual((only_lost["max"], only_lost["ids"]), ("alarm", ["l1", "w"]))
+        many = self.summary([(f"a{i}", "alarm") for i in range(10)] + [(f"l{i}", "lost") for i in range(20)])
+        self.assertEqual(many["na"], 30)
+        self.assertEqual(many["nl"], 20)
+        self.assertEqual(many["ids"], [f"a{i}" for i in range(10)] + [f"l{i}" for i in range(6)])
+        self.assertEqual(many["lost"], [f"l{i}" for i in range(16)])
+
+    def test_ha_alarm_then_disconnect_or_unavailable_is_lost_until_a_usable_state(self) -> None:
+        engine = topics.HaEngine(HA_CONFIG)
+        engine.source_state(True, 0.0)
+        engine.set_state("sensor.temp", "41", "t", 0.0)
+        engine.source_state(False, 1.0)
+        self.assertEqual(dict(engine.summary_items())["temp"], "lost")
+        engine.source_state(True, 2.0)
+        self.assertEqual(dict(engine.summary_items())["temp"], "lost")
+        engine.set_state("sensor.temp", "25", "t", 3.0)
+        self.assertEqual(dict(engine.summary_items())["temp"], "ok")
+        for bad in ("unavailable", "unknown", "nan", None):
+            engine.set_state("sensor.temp", "41", "t", 4.0)
+            engine.set_state("sensor.temp", bad, "t", 5.0)
+            self.assertEqual(dict(engine.summary_items())["temp"], "lost", repr(bad))
+            engine.set_state("sensor.temp", "unavailable", "t", 6.0)           # stays lost
+            self.assertEqual(dict(engine.summary_items())["temp"], "lost", repr(bad))
+            engine.set_state("sensor.temp", "41", "t", 7.0)                    # alarm again: live, latch cleared
+            self.assertEqual(dict(engine.summary_items())["temp"], "alarm", repr(bad))
+            engine.set_state("sensor.temp", "25", "t", 8.0)
+
+    def test_ha_item_that_was_only_warn_is_not_latched(self) -> None:
+        engine = topics.HaEngine(HA_CONFIG)
+        engine.source_state(True, 0.0)
+        engine.set_state("binary_sensor.bilge", "on", "t", 0.0)
+        engine.source_state(False, 1.0)
+        self.assertEqual(dict(engine.summary_items())["bilge"], "unknown")
+
+    def test_an_item_removed_from_the_configuration_is_gone(self) -> None:
+        engine = self.instruments()
+        engine.update("d", 2.0, TS, 0.0)
+        engine.source_state(False, 1.0)
+        self.assertEqual(engine.summary_items(), [("depth", "lost")])
+        rebuilt = topics.Engine(dict(SEQ_ENGINE_CONFIG, instruments={}))      # the bridge rebuilds engines from the config
+        self.assertEqual(rebuilt.summary_items(), [])
+        self.assertIsNone(topics.alarm_summary(rebuilt.summary_items(), "T"))

@@ -223,17 +223,18 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
         self.assertIsNone(tiles[-1]["v"])
         seen = []
         for body, _, _ in self.summaries(pub):
-            key = (body["max"], body["na"], body["nu"], tuple(body["ids"]))
+            key = (body["max"], body["na"], body["nu"], body["nl"], tuple(body["ids"]))
             if not seen or seen[-1] != key:
                 seen.append(key)
-        # Instruments are published before the summary is recomputed; today a stale instrument counts as
-        # "unknown" in the summary at once (no alarm latching in this slice).
-        self.assertEqual(seen, [("unknown", 0, 1, ()), ("alarm", 1, 0, ("sog",)), ("unknown", 0, 1, ())])
+        # Instruments are published before the summary is recomputed; the stale instrument was in alarm,
+        # so the summary keeps the alarm (lost) instead of dropping to "unknown".
+        self.assertEqual(seen, [("unknown", 0, 1, 0, ()), ("alarm", 1, 0, 0, ("sog",)), ("alarm", 1, 0, 1, ("sog",))])
         order = [(t, json.loads(p).get("st", json.loads(p).get("max"))) for t, p, _, _ in pub.sent
                  if t in (SOG_TOPIC, SUMMARY)]
         i = order.index((SOG_TOPIC, "stale"))
         self.assertEqual(order[i - 2:i + 2], [(SOG_TOPIC, "ok"), (SUMMARY, "alarm"),
-                                              (SOG_TOPIC, "stale"), (SUMMARY, "unknown")])
+                                              (SOG_TOPIC, "stale"), (SUMMARY, "alarm")])
+        self.assertEqual(self.summaries(pub)[-1][0]["lost"], ["sog"])
 
     def test_instrument_without_thresholds_is_not_counted_and_nothing_published(self):
         pub = Harness([[("msg", delta(10 * KN)), ("idle",), ("close",)]]).run()
@@ -245,13 +246,26 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
         self.assertGreaterEqual(len(times), 3)
         self.assertLess(len(times), 8)
 
-    def test_clean_shutdown_publishes_unknown_last(self):
+    def test_clean_shutdown_keeps_an_alarm_as_lost(self):
         script = [("idle",)] * 4 + [("msg", note_delta({"state": "alarm"})), ("idle",)]
         h = Harness([script], NOTE_CONFIG)
         pub = h.run()
         self.assertTrue(any(b["max"] == "alarm" for b, _, _ in self.summaries(pub)))
         last, retain, qos = self.summaries(pub)[-1]
-        self.assertEqual((last["max"], last["na"], last["nu"], last["ids"]), ("unknown", 0, 1, []))
+        self.assertEqual((last["max"], last["na"], last["nu"], last["nl"], last["ids"], last["lost"]),
+                         ("alarm", 1, 0, 1, ["anchor"], ["anchor"]))
+        self.assertTrue(retain)
+        self.assertEqual(qos, 1)
+        self.assertEqual(pub.sent[-1][0], STATUS)
+        self.assertEqual(pub.sent[-1][1], "offline")
+
+    def test_clean_shutdown_without_alarms_publishes_unknown_last(self):
+        script = [("idle",)] * 4 + [("msg", note_delta({"state": "warn"})), ("idle",)]
+        h = Harness([script], NOTE_CONFIG)
+        pub = h.run()
+        last, retain, qos = self.summaries(pub)[-1]
+        self.assertEqual((last["max"], last["na"], last["nu"], last["nl"], last["ids"], last["lost"]),
+                         ("unknown", 0, 1, 0, [], []))
         self.assertTrue(retain)
         self.assertEqual(qos, 1)
         self.assertEqual(pub.sent[-1][0], STATUS)
@@ -260,6 +274,92 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
     def test_timestamp_is_utc_iso(self):
         pub = Harness([[("idle",), ("close",)]], NOTE_CONFIG).run()
         self.assertRegex(self.summaries(pub)[0][0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+
+
+SEQ_PATHS = {"a": "notifications.a", "b": "notifications.b"}
+SEQ_CONFIG = {"heartbeat_s": 5, "instruments": {},
+              "notifications": {"a": {"path": SEQ_PATHS["a"], "label": "A"},
+                                "b": {"path": SEQ_PATHS["b"], "label": "B"}}}
+
+
+def multi_delta(**values):
+    return json.dumps({"updates": [{"timestamp": "2026-01-01T00:00:00.000Z",
+                                    "values": [{"path": SEQ_PATHS[k], "value": v} for k, v in values.items()]}]})
+
+
+ALARM = {"state": "alarm"}
+
+
+class AlarmSeqTests(unittest.TestCase):
+    def setUp(self):
+        self.h = Harness([], SEQ_CONFIG)
+        self.b, self.pub = self.h.bridge, self.h.publisher
+        self.b._set_signalk(bridge.SIGNALK_CONNECTED)
+        self.h.clock.now += 10          # past the notification settle time
+
+    def last(self):
+        return json.loads([p for t, p, _, _ in self.pub.sent if t == SUMMARY][-1])
+
+    def test_seq_starts_as_a_31_bit_int_and_is_in_every_summary(self):
+        seeds = {bridge.Bridge(SEQ_CONFIG, FakePublisher(), None)._alarm_seq for _ in range(20)}
+        self.assertTrue(all(isinstance(x, int) and 0 <= x < 2 ** 31 for x in seeds))
+        self.assertGreater(len(seeds), 1)
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.b._tick()
+        bodies = [json.loads(p) for t, p, _, _ in self.pub.sent if t == SUMMARY]
+        self.assertGreaterEqual(len(bodies), 2)
+        self.assertTrue(all(isinstance(x["seq"], int) and 0 <= x["seq"] < 2 ** 32 for x in bodies))
+
+    def test_a_new_alarm_increments_once_and_staying_in_alarm_does_not(self):
+        s0 = self.b._alarm_seq
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.assertEqual(self.last()["seq"], (s0 + 1) % 2 ** 32)
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.h.clock.now += 6
+        self.b._tick()
+        self.assertEqual(self.last()["seq"], (s0 + 1) % 2 ** 32)
+
+    def test_alarm_to_lost_and_back_to_alarm_do_not_increment(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        s1 = self.b._alarm_seq
+        self.b._set_signalk(bridge.SIGNALK_DISCONNECTED)
+        self.assertEqual((self.last()["max"], self.last()["nl"], self.last()["seq"]), ("alarm", 1, s1))
+        self.b._set_signalk(bridge.SIGNALK_CONNECTED)
+        self.assertEqual(self.last()["seq"], s1)
+        self.b.handle_message(multi_delta(a=ALARM))      # lost -> alarm
+        self.assertEqual((self.last()["nl"], self.last()["na"], self.last()["seq"]), (0, 1, s1))
+
+    def test_a_clearing_and_b_raising_in_one_delta_increments_although_na_is_unchanged(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        before = self.last()
+        self.b.handle_message(multi_delta(a=None, b=ALARM))
+        after = self.last()
+        self.assertEqual((before["na"], after["na"], after["ids"]), (1, 1, ["b"]))
+        self.assertEqual(after["seq"], (before["seq"] + 1) % 2 ** 32)
+
+    def test_two_new_alarms_in_one_delta_increment_by_two(self):
+        s0 = self.b._alarm_seq
+        self.b.handle_message(multi_delta(a=ALARM, b=ALARM))
+        self.assertEqual(self.last()["seq"], (s0 + 2) % 2 ** 32)
+
+    def test_an_alarm_that_cleared_and_returns_is_new_again(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        s1 = self.b._alarm_seq
+        self.b.handle_message(multi_delta(a=None))
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.assertEqual(self.last()["seq"], (s1 + 1) % 2 ** 32)
+
+    def test_seq_wraps_at_2_pow_32(self):
+        self.b._alarm_seq = 2 ** 32 - 1
+        self.b.handle_message(multi_delta(a=ALARM, b=ALARM))
+        self.assertEqual(self.last()["seq"], 1)
+
+    def test_shutdown_keeps_the_seq_and_the_lost_alarm(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        s1 = self.b._alarm_seq
+        self.b.shutdown()
+        last = self.last()
+        self.assertEqual((last["max"], last["lost"], last["seq"]), ("alarm", ["a"], s1))
 
 
 class BridgeLoopTests(unittest.TestCase):
@@ -964,13 +1064,14 @@ class HomeAssistantBridgeTests(unittest.TestCase):
             pub = Harness([[("close",)]], HA_CONFIG, ha=ha).run()
         self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
 
-    def test_clean_stop_publishes_every_counted_ha_item_as_unknown(self):
+    def test_clean_stop_keeps_an_ha_alarm_as_lost_and_the_rest_unknown(self):
         ha = FakeHa()
         script = [ha.put("connected"), ha.put("update", "binary_sensor.high_water", "high"), ("idle",), ("idle",),
                   ("close",)]
         pub = Harness([script], HA_CONFIG, ha=ha).run()
         last = json.loads(pub.on(SUMMARY)[-1][0])
-        self.assertEqual((last["max"], last["na"], last["ids"]), ("unknown", 0, []))
+        self.assertEqual((last["max"], last["na"], last["nu"], last["nl"], last["ids"], last["lost"]),
+                         ("alarm", 1, 1, 1, ["high"], ["high"]))      # bilge never reported: unknown
 
     def test_ha_only_config_is_loadable(self):
         cfg = json.loads((ROOT / "displays" / "displays.example.json").read_text())
