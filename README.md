@@ -428,6 +428,8 @@ With a saved configuration from an earlier run, `--yes` and `--defaults` reuse i
 and skipped, an already installed version just reports "nothing to do". Rollback of this
 installer change: use the previous release's `get-vesselstack.sh`; nothing else changed.
 
+While an installation or update is running, the installer keeps `config/install-in-progress`; it is removed once the services have started (or, for a run without `--start`, when no earlier `--start` run failed), so a leftover file means the last run did not finish. `installed-version` is written before the services are started and does not by itself show that they were. Nothing acts on the marker yet.
+
 **What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
 root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the
 downloads) and the VesselStack release you fetch it from. The tarball's `.sha256`

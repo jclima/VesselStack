@@ -125,7 +125,10 @@ update` and the Control Panel updater stop before the backup, naming only the se
 see [Upgrading to 0.6.0](../README.md#upgrading-to-060). The env files are then written
 atomically (temporary file, then rename), so a failed run never leaves one truncated. When
 the code, units and `compose.yml` have been replaced, the staged virtualenv is swapped
-in and `installed-version` is written last.
+in and `installed-version` records the configuration version once everything is rendered.
+Starting the services comes after that. `config/install-in-progress` exists from the first
+change until the start phase has succeeded; its presence means an installation or update did
+not finish.
 
 ## Rollback
 

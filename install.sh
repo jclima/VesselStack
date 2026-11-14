@@ -1179,6 +1179,66 @@ if ! python3 -m venv "$STAGING_VENV" \
     exit 1
 fi
 
+# Install-in-progress marker. config/installed-version is written before the start phase, so
+# a run that dies while starting services would otherwise look finished. The marker exists from
+# the first change until the run has finished; absent means finished. Plain KEY=VALUE lines,
+# never sourced. A failed run leaves it behind on purpose; nothing in an EXIT/ERR trap touches it.
+INSTALL_MARKER="$VESSELSTACK_ROOT/config/install-in-progress"
+install_marker_begin() {
+    local dir="$VESSELSTACK_ROOT/config" key value
+    local from=none backup="" start=0 line
+    local old_from="" old_backup="" old_start=0 have_old=0
+    [ -d "$dir" ] || install -d -m 0755 "$dir"
+    [ ! -L "$INSTALL_MARKER" ] || rm -f -- "$INSTALL_MARKER"
+    if [ -f "$INSTALL_MARKER" ]; then
+        have_old=1
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+            case "$key" in
+                from) old_from=$value ;;
+                backup) old_backup=$value ;;
+                start) old_start=$value ;;
+            esac
+        done <"$INSTALL_MARKER"
+    fi
+    if [ "$have_old" -eq 1 ] && [[ $old_from =~ ^([0-9]+\.[0-9]+\.[0-9]+|none)$ ]]; then
+        from=$old_from
+    elif [ -f "$dir/installed-version" ]; then
+        line=$(head -n 1 "$dir/installed-version" 2>/dev/null) || line=
+        [[ $line =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && from=$line
+    fi
+    if [ "$have_old" -eq 1 ] && [[ $old_backup == /* && $old_backup != *[[:cntrl:]]* ]]; then
+        backup=$old_backup
+    fi
+    if [ -z "$backup" ] && [[ ${VESSELSTACK_PREUPDATE_BACKUP:-} == /* && ${VESSELSTACK_PREUPDATE_BACKUP:-} != *[[:cntrl:]]* ]]; then
+        backup=$VESSELSTACK_PREUPDATE_BACKUP
+    fi
+    if [ "$START" -eq 1 ] || { [ "$have_old" -eq 1 ] && [ "$old_start" = 1 ]; }; then start=1; fi
+    {
+        printf 'version=%s\n' "$(<"$SCRIPT_DIR/VERSION")"
+        printf 'from=%s\n' "$from"
+        printf 'started=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'start=%s\n' "$start"
+        printf 'source=%s\n' "$SCRIPT_DIR"
+        printf 'backup=%s\n' "$backup"
+    } >"$INSTALL_MARKER.tmp"
+    chmod 0644 "$INSTALL_MARKER.tmp"
+    mv -f -- "$INSTALL_MARKER.tmp" "$INSTALL_MARKER"
+}
+# Called once at the end of a successful run. A render-only run after a failed --start run
+# leaves the marker, because the services were never started.
+install_marker_finish() {
+    local key value marker_start=0
+    if [ -f "$INSTALL_MARKER" ] && [ ! -L "$INSTALL_MARKER" ]; then
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+            [ "$key" != start ] || marker_start=$value
+        done <"$INSTALL_MARKER"
+    fi
+    if [ "$START" -eq 1 ] || [ "$marker_start" != 1 ]; then
+        rm -f -- "$INSTALL_MARKER"
+    fi
+}
+install_marker_begin
+
 if [ "$START" -eq 1 ]; then
     # Reconcile before managed data ownership repair or native installation can
     # touch SignalK shared state. Desired values are from validated input.
@@ -2228,6 +2288,8 @@ if [ "$START" -eq 0 ]; then
         echo "NOTICE: the displays bridge is enabled but not running; start it with: sudo vesselstackctl start"
     fi
 fi
+
+install_marker_finish
 
 echo "VesselStack rendered successfully at $VESSELSTACK_ROOT"
 echo "Secrets are stored in mode-600 config files and were not printed."
