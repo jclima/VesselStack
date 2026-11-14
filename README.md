@@ -2595,6 +2595,7 @@ Historical release scope and review-fix notes are kept in
 
 Contributors: CI runs ShellCheck 0.9.0 from the Ubuntu package at info severity; a clean run of a newer
 local ShellCheck is not enough (see [Development](docs/DEVELOPMENT.md)).
+The shell scripts checked by `tests/test-distribution.sh` pass ShellCheck 0.9.0 and newer (verified on 0.11.0) with default options and no `-x`; the `A && B || C` patterns in `scripts/vesselstackctl` are written as `if ! { A && B; }; then C; fi`, and the few remaining suppressions carry a reason.
 
 ### Boat equipment profiles
 

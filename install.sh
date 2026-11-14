@@ -66,10 +66,14 @@ for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
 PY
 # Prompt helpers for the fixes offered below (see scripts/lib/remediate.sh).
 # shellcheck source=scripts/lib/remediate.sh
+# shellcheck disable=SC1091  # Not followed without -x; scripts/lib/remediate.sh is shellchecked as its own input.
 source "$SCRIPT_DIR/scripts/lib/remediate.sh"
 # After a fix this installer restarts itself with the answers descriptor still open; this process
 # owns it now, so vs_prompt_close closes it before anything is installed or started.
-if [ "${VESSELSTACK_REMEDIATION_ROUND:-0}" != 0 ] && [ -n "$VS_PROMPT_FD" ]; then VS_PROMPT_OWNED=1; fi
+if [ "${VESSELSTACK_REMEDIATION_ROUND:-0}" != 0 ] && [ -n "$VS_PROMPT_FD" ]; then
+    # shellcheck disable=SC2034  # Read by vs_prompt_close in the sourced scripts/lib/remediate.sh.
+    VS_PROMPT_OWNED=1
+fi
 # config_key_assigned KEY: true when CONFIG_FILE itself assigns KEY (so editing it can fix it).
 config_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }
 # Set below when an interactive run may offer to fix the value instead of stopping.

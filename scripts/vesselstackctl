@@ -2395,6 +2395,7 @@ load_remediation_lib() {
         dir=$(dirname -- "$dir")
     done
     # shellcheck source=scripts/lib/remediate.sh
+    # shellcheck disable=SC1091  # Not followed without -x; scripts/lib/remediate.sh is shellchecked as its own input.
     source "$lib"
 }
 
@@ -3087,10 +3088,10 @@ restore_stack() {
     local data_old_moved=0 data_new_published=0 root_old_moved=0 root_new_published=0 new_start_attempted=0
     stage_parent=$(dirname "$data")
     for path in "$root" "$data"; do
-        [ -d "$path" ] && [ ! -L "$path" ] || {
+        if ! { [ -d "$path" ] && [ ! -L "$path" ]; }; then
             echo "Refusing to restore: $path must be an ordinary directory (not a symlink or special file)" >&2
             exit 1
-        }
+        fi
     done
     [ "$(stat -c %d "$stage_parent")" = "$(stat -c %d "$(dirname "$root")")" ] || {
         echo "Refusing to restore: application and data trees are on different filesystems from their parent directories" >&2
@@ -3159,7 +3160,7 @@ PY
     else
         echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage"; exit 1
     fi
-    [ -x "$old_controller" ] && [ -x "$new_controller" ] || { echo "Restore controllers are not executable" >&2; rm -rf -- "$stage"; exit 1; }
+    if ! { [ -x "$old_controller" ] && [ -x "$new_controller" ]; }; then echo "Restore controllers are not executable" >&2; rm -rf -- "$stage"; exit 1; fi
     if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$old_controller" "$new_controller" "$skip_installer"; then
         rm -rf -- "$stage" "$journal"
         echo "Restore completed"
@@ -3229,12 +3230,12 @@ print(json.dumps(data, sort_keys=True))
 }
 
 backup_drive_mount() {
-    local mode='' uuid='' kind path size label fs id listing count=0 dev='' devfs='' actual=''
+    local mode='' uuid='' kind path _size label fs id listing count=0 dev='' devfs='' actual=''
     while [ $# -gt 0 ]; do
         case "$1" in
             --fstab) [ -z "$mode" ] || { usage >&2; exit 2; }; mode=fstab ;;
             --uuid)
-                [ -z "$mode" ] && [ $# -ge 2 ] || { usage >&2; exit 2; }
+                if ! { [ -z "$mode" ] && [ $# -ge 2 ]; }; then usage >&2; exit 2; fi
                 mode=uuid; uuid=$2; shift ;;
             *) usage >&2; exit 2 ;;
         esac
@@ -3274,8 +3275,8 @@ backup_drive_mount() {
         echo "Mounted $(vs_printable "$BD_MOUNT_DIR")." >&2
     else
         listing=$(VS_BACKUP_DATA=$VESSELSTACK_DATA vs_backup_list_drives "$BD_MOUNT_DIR") || exit 1
-        while IFS=$'\x1f' read -r kind path size label fs id; do
-            [ "$kind" = OK ] && [ "$id" = "$uuid" ] || continue
+        while IFS=$'\x1f' read -r kind path _size label fs id; do
+            if ! { [ "$kind" = OK ] && [ "$id" = "$uuid" ]; }; then continue; fi
             count=$((count + 1)); dev=$path; devfs=$fs
         done <<<"$listing"
         if [ "$count" -ne 1 ]; then
@@ -3302,7 +3303,7 @@ backup_drive_command() {
     local sub=$1
     shift
     case "$sub" in
-        list) [ $# -eq 1 ] && [ "$1" = --json ] || { usage >&2; exit 2; }; backup_drive_list_json ;;
+        list) if ! { [ $# -eq 1 ] && [ "$1" = --json ]; }; then usage >&2; exit 2; fi; backup_drive_list_json ;;
         mount) backup_drive_mount "$@" ;;
         *) usage >&2; exit 2 ;;
     esac
