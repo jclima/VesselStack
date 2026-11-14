@@ -24,6 +24,7 @@
 - Fuel rate is stored as SignalK cubic meters per second.
 - Boat Chat converts fuel rate to US gallons/hour, then integrates by minute for fuel totals.
 - Internal canonical fuel totals and cache fields remain gallons/gal/h, while answers use the selected Boat Chat display units. Engine, pressure, and distance values are converted only when the source unit is known; unknown source units are not assumed.
+- Every numeric live value carries its unit in `units`. A value whose unit is empty has an unknown unit: report it as having an unknown unit, never assume one. `unit_conflicts` lists values whose unit reported by the boat disagreed with the expected one; those were left unconverted and keep the reported unit.
 - Fuel totals include only minutes where at least one engine is above the running threshold.
 - Fuel economy estimates distance from `navigation.speedOverGround`; current, tide, GPS noise, and docking maneuvers can affect the result.
 

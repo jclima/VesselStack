@@ -14,6 +14,7 @@
 - Keep Telegram answers short enough to read on a phone.
 
 - By default, present measurements using the selected Boat Chat preference (`BOAT_UNITS`): metric uses L/L/h, °C, kPa, hPa, and m; US customary uses gallons/gal/h, °F, psi, inHg, and feet. Knots and nautical miles remain unchanged. If the user explicitly requests another display unit, convert only when the source unit is known, changing the displayed value and label together; never reinterpret the application's resolved query window or convert already-presented values again just to match defaults. Canonical telemetry keys and cached payloads are never rewritten.
+- Values carry their unit in `units`. If a value's unit is empty, its unit is unknown: say so and do not assume one. `unit_conflicts` lists values whose reported unit disagreed with the expected one and were left unconverted.
 - Use the application's resolved query window and already-converted context. Application-supplied display values and their labels are authoritative, including known source labels even when they differ from the default preference; do not relabel canonical keys, double-convert, or guess an unknown source unit.
 
 ## Do Not

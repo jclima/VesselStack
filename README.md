@@ -1353,7 +1353,7 @@ nothing to an external model.
 Settings, the admin code, API access rules, telemetry refresh, optional host metrics, timezone
 and units are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in
 [Boat Chat providers](boat-chat/README.md).
-Boat Chat's Signal K unit handling is being moved to one table in `boat-chat/signalk_units.py` (SI input, stored value and label from a single lookup, tests in `tests/test_signalk_units.py`); it is not yet used by `app.py`.
+`boat-chat/signalk_units.py` is the single table Boat Chat uses to convert Signal K SI values to its stored units and to label them, so a value and its unit always come from the same lookup (tests in `tests/test_signalk_units.py`). Live telemetry snapshots carry a unit for every numeric value (empty means unknown and is never guessed), and values whose reported unit disagrees with the expected one are left unconverted and listed under `unit_conflicts`.
 
 ### Control Panel
 

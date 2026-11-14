@@ -147,11 +147,14 @@ PATTERNS: tuple[Rule, ...] = (
     Rule("depth", "m", "ft", _scale(M_TO_FT), (_p("environment.depth.*"),)),
     Rule("distance", "m", "NM", _divide(M_PER_NM), (
         _p("navigation.log"), _p("navigation.trip.log"), Pattern("tail", "nextPoint.distance"))),
-    Rule("voltage", "V", "V", _identity, (_leaf("voltage", "electrical."),)),
+    Rule("voltage", "V", "V", _identity, (
+        _leaf("voltage", "electrical."), Pattern("suffix", "Voltage", "electrical."))),
     Rule("current", "A", "A", _identity, (_leaf("current", "electrical."),)),
-    Rule("power", "W", "W", _identity, (_leaf("power", "electrical."),)),
+    Rule("power", "W", "W", _identity, (
+        _leaf("power", "electrical."), Pattern("suffix", "Power", "electrical."))),
     Rule("frequency", "Hz", "Hz", _identity, (_leaf("frequency", "electrical."),)),
-    Rule("charge", "C", "Ah", _divide(3600.0), (_leaf("consumedCharge"),)),
+    Rule("charge", "C", "Ah", _divide(3600.0), (
+        _leaf("consumedCharge"), _p("electrical.batteries.*.capacity.consumed"))),
     Rule("rpm", "Hz", "RPM", _scale(60.0), (_leaf("revolutions", "propulsion."),)),
     Rule("duration", "s", "h", _divide(3600.0), (
         _p("propulsion.*.runTime"), _leaf("timeRemaining", "electrical."))),

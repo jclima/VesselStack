@@ -35,6 +35,7 @@ import telemetry_cache
 import status_model
 from cruise_efficiency import matched_sample
 import display_units
+import signalk_units
 import profile_runtime
 
 
@@ -1608,7 +1609,7 @@ def _threshold_unit_for_measurement(
     if source_unit == "":
         return None
     aliases = {"f": "°F", "c": "°C", "psi": "psi", "kpa": "kPa", "pa": "Pa", "hpa": "hPa", "inhg": "inHg", "ft": "ft", "feet": "ft", "m": "m", "l/h": "L/h", "gph": "gal/h", "gal/h": "gal/h", "v": "V", "volts": "V", "percent": "%", "%": "%", "kn": "kn", "kt": "kn", "knot": "kn", "knots": "kn"}
-    row_unit = aliases.get(source_unit.lower(), source_unit) if source_unit is not None else display_units.unit_for_measurement(measurement, "us_customary")
+    row_unit = aliases.get(source_unit.lower(), source_unit) if source_unit is not None else (canonical_unit_for_measurement(measurement) or display_units.unit_for_measurement(measurement, "us_customary"))
     if not row_unit:
         return None
     dimensions = {
@@ -2821,33 +2822,8 @@ def summarize_numeric_rows(rows: list[dict[str, str]], unit_scale: dict[str, flo
 
 
 def convert_generic_value(measurement: str, value: float) -> float:
-    if measurement.startswith("tanks.fuel.") and measurement.endswith(".currentLevel"):
-        return value * 100.0
-    if "stateOfCharge" in measurement or "state_of_charge" in measurement:
-        return value * 100.0 if abs(value) <= 1.2 else value
-    if measurement.endswith(".temperature"):
-        return (value - 273.15) * 9.0 / 5.0 + 32.0
-    if measurement.startswith("environment.depth."):
-        return value * 3.280839895
-    if "environment" in measurement and "pressure" in measurement.lower():
-        return value / 3386.389 if value > 2000 else value
-    if measurement.endswith(".oilPressure") or measurement.endswith(".boostPressure") or "pressure" in measurement.lower() and value > 2000:
-        return value / 6894.757
-    if measurement in {"navigation.speedOverGround", "navigation.speedThroughWater"}:
-        return value * 1.94384449
-    if any(term in measurement for term in ["headingMagnetic", "courseOverGroundTrue", "attitude.pitch", "attitude.roll", "attitude.yaw"]):
-        return value * 180.0 / 3.141592653589793
-    if measurement == "navigation.rateOfTurn":
-        return value * 180.0 / 3.141592653589793 * 60.0
-    if measurement.endswith(".revolutions"):
-        return value * 60.0
-    if measurement.endswith(".fuel.rate"):
-        return value * 951019.4
-    if measurement.endswith(".runTime") or measurement.endswith(".timeRemaining"):
-        return value / 3600.0
-    if measurement.endswith((".engineLoad", ".engineTorque", ".trimState")):
-        return value * 100.0
-    return value
+    """Stored-form value for a Signal K path; the label comes from the same table."""
+    return signalk_units.canonical(measurement, value)[0]
 
 
 def convert_generic_rows(rows: list[dict[str, str]], source: str = "signalk") -> list[dict[str, str]]:
@@ -2873,23 +2849,15 @@ from(bucket: "{INFLUX_RAW_BUCKET}")
   |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
 '''
     rows = query_influx(flux)
-    # US units: fuel gal/h, temperature °F, oil pressure psi. Temperature needs
-    # add+scale, not multiply; handle all conversions manually here.
+    # Stored form (gal/h, RPM, F, psi, %) comes from the shared units table, so the
+    # value and its label agree with every other Boat Chat path.
     values: dict[str, list[float]] = {}
     for row in rows:
         measurement = row.get("_measurement") or ""
         value = safe_float(row.get("_value"))
         if not measurement or value is None:
             continue
-        if measurement.endswith(".fuel.rate"):
-            value *= 951019.4
-        elif measurement.endswith(".revolutions"):
-            value *= 60.0
-        elif measurement.endswith(".temperature"):
-            value = (value - 273.15) * 9.0 / 5.0 + 32.0
-        elif measurement.endswith(".oilPressure") or measurement.endswith(".boostPressure"):
-            value /= 6894.757
-        values.setdefault(measurement, []).append(value)
+        values.setdefault(measurement, []).append(convert_generic_value(measurement, value))
     summary = summarize_numeric_rows(
         [{"_measurement": key, "_value": str(value)} for key, nums in values.items() for value in nums]
     )
@@ -2906,13 +2874,7 @@ from(bucket: "{INFLUX_RAW_BUCKET}")
         derived["starboard_minus_port_rpm"] = round(stbd_rpm - port_rpm, 1)
     return {
         "window_hours": hours,
-        "units": {
-            "fuel.rate": "gal/h",
-            "revolutions": "RPM",
-            "temperature": "F",
-            "oilPressure/boostPressure": "psi",
-            "engineLoad/engineTorque/trimState": "source units",
-        },
+        "units": {path: canonical_unit_for_measurement(path) for path in PROPULSION_PATHS},
         "summary": summary,
         "derived": derived,
     }
@@ -2950,26 +2912,33 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
     selected_paths = matched if concepts == {"ais"} else baseline.union(matched)
     values: dict[str, Any] = {}
     units: dict[str, str] = {}
+    timestamps = {}
+    unknown_unit_paths: list[str] = []
+    unit_conflicts: dict[str, str] = {}
     for key in sorted(selected_paths):
         if key not in flat or key.startswith("notifications."):
             continue
-        value = flat[key]
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            value = round(convert_generic_value(key, float(value)), 4)
-        values[key] = value
-        unit = canonical_unit_for_measurement(key)
-        if unit:
-            units[key] = unit
-
-    timestamps = {}
-    for key in values:
         node = signalk
         for part in key.split("."):
             if not isinstance(node, dict):
                 node = {}
                 break
             node = node.get(part, {})
-        if isinstance(node, dict) and node.get("timestamp"):
+        node = node if isinstance(node, dict) else {}
+        meta = node.get("meta")
+        meta_units = meta.get("units") if isinstance(meta, dict) and isinstance(meta.get("units"), str) else None
+        value = flat[key]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            resolution = signalk_units.resolve(key, meta_units)
+            value = round(signalk_units.canonical(key, float(value), meta_units)[0], 4)
+            # Every numeric value gets a units entry; "" means the unit is unknown.
+            units[key] = resolution.unit
+            if resolution.origin == "unknown":
+                unknown_unit_paths.append(key)
+            elif resolution.origin == "conflict":
+                unit_conflicts[key] = resolution.unit
+        values[key] = value
+        if node.get("timestamp"):
             timestamps[key] = node["timestamp"]
 
     active_notifications: dict[str, Any] = {}
@@ -3016,6 +2985,9 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         "values": values,
         "timestamps": timestamps,
         "units": units,
+        "unit_schema": 2,
+        "unknown_unit_paths": sorted(unknown_unit_paths),
+        "unit_conflicts": dict(sorted(unit_conflicts.items())),
         "active_notifications": active_notifications,
         "alarm_summary": notifications_summary,
         "normal_notification_count": normal_notification_count,
@@ -4076,68 +4048,9 @@ def history_source_priority(bucket: str) -> int:
     return 0 if bucket == INFLUX_HISTORY_BUCKET else 1
 
 
-def unit_for_measurement(measurement: str, context: dict[str, Any]) -> str:
-    pref = display_units.preference(setting_value)
-    ha = context.get("ha_telemetry", {})
-    for item in ha.get("matched", []) if isinstance(ha, dict) else []:
-        if item.get("entity_id") == measurement and item.get("unit"):
-            source_unit = str(item["unit"])
-            if pref == "metric":
-                return display_units.unit_for_measurement(measurement, pref, source_unit) or source_unit
-            return source_unit
-    if measurement.endswith("humidity") or "humidity" in measurement:
-        return "%"
-    if measurement.startswith("tanks.fuel.") or "fuel_tank" in measurement or measurement.endswith("currentLevel"):
-        return "%"
-    if "stateOfCharge" in measurement or "state_of_charge" in measurement or measurement.endswith("_soc"):
-        return "%"
-    if measurement.endswith("temperature") or "temperature" in measurement or "temp" in measurement:
-        return display_units.unit_for_measurement(measurement, pref) if measurement.startswith(("propulsion.", "environment.")) else ""
-    if measurement.startswith("environment.depth.") or "water_depth" in measurement:
-        return display_units.unit_for_measurement(measurement, pref)
-    if "voltage" in measurement:
-        return "V"
-    if "current" in measurement:
-        return "A"
-    if "speedOverGround" in measurement or "speedThroughWater" in measurement:
-        return "kn"
-    if "heading" in measurement or "courseOverGround" in measurement or "attitude" in measurement:
-        return "deg"
-    if measurement == "navigation.rateOfTurn":
-        return "deg/min"
-    if "pressure" in measurement.lower():
-        return display_units.unit_for_measurement(measurement, pref)
-    if measurement.endswith(".revolutions"):
-        return "RPM"
-    if measurement.endswith(".fuel.rate"):
-        return display_units.unit_for_measurement(measurement, pref)
-    if measurement.endswith(".runTime") or measurement.endswith(".timeRemaining"):
-        return "h"
-    if measurement.endswith((".engineLoad", ".engineTorque", ".trimState")):
-        return "%"
-    if measurement.endswith(".power"):
-        return "W"
-    return ""
-
-
 def canonical_unit_for_measurement(measurement: str) -> str:
-    """Unit label for canonical API/cache payloads (always legacy US baseline)."""
-    m = measurement.lower()
-    if m.startswith("tanks.") or "currentlevel" in m or "stateofcharge" in m or "humidity" in m: return "%"
-    if "temperature" in m or "temp" in m: return "F" if m.startswith(("propulsion.", "environment.")) else ""
-    if "voltage" in m: return "V"
-    if "current" in m and "currentlevel" not in m: return "A"
-    if "speedoverground" in m or "speedthroughwater" in m: return "kn"
-    if "heading" in m or "courseoverground" in m or "attitude" in m: return "deg"
-    if m.endswith(".revolutions"): return "RPM"
-    if m == "navigation.rateofturn": return "deg/min"
-    if m.endswith(".fuel.rate"): return "gal/h"
-    if m.endswith((".runtime", ".timeremaining")): return "h"
-    if m.endswith((".engineload", ".enginetorque", ".trimstate")): return "%"
-    if m.endswith(".power"): return "W"
-    if "depth" in m: return "ft"
-    if "pressure" in m or "oilpressure" in m or "boostpressure" in m: return "inHg" if m.startswith("environment.") else "psi"
-    return ""
+    """Unit label for canonical API/cache payloads ("" when the unit is unknown)."""
+    return signalk_units.resolve(measurement).unit
 
 
 def answer_from_telemetry_overview(context: dict[str, Any]) -> str | None:

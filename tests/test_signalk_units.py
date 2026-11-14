@@ -65,6 +65,10 @@ GOLDEN = [
     ("electrical.batteries.house.voltage", 13.1, 13.1, "V"),
     ("electrical.batteries.house.current", -4.2, -4.2, "A"),
     ("electrical.ac.0.frequency", 60, 60, "Hz"),
+    ("electrical.batteries.0.capacity.consumed", 36000, 10, "Ah"),
+    ("electrical.ac.0.phase.A.lineNeutralVoltage", 120.5, 120.5, "V"),
+    ("electrical.ac.0.phase.AB.lineLineVoltage", 208.0, 208.0, "V"),
+    ("electrical.solar.0.panelPower", 250.0, 250.0, "W"),
     ("environment.current.drift", 1.0, 1.94, "kn"),
     ("propulsion.port.engineLoad", 0.4, 40, "%"),
 ]
@@ -77,12 +81,9 @@ US_CUSTOMARY_LABELS = {"F", "ft", "psi", "inHg", "US gal", "gal/h", "kn", "NM"}
 # (for example "US gal" is known, but "NM", "Ah", "deg/min" and "Hz" are not).
 PASSTHROUGH_LABELS = {"deg", "kn", "%", "V", "A", "W", "RPM", "h", "NM", "Ah", "deg/min", "Hz"}
 
-# Catalog paths (with "*" replaced) that resolve() does not recognise yet.
-CATALOG_GAPS = {
-    "electrical.batteries.0.capacity.consumed",
-    "electrical.solar.0.panelPower",
-    "electrical.ac.0.phase.A.lineNeutralVoltage",
-}
+# Catalog paths (with "*" replaced) that resolve() does not recognise.  Empty:
+# every non-notification catalog path with a known quantity is in the table.
+CATALOG_GAPS: set[str] = set()
 
 CATALOG_SI = {
     "temperature": "K", "depth": "m", "pressure": "Pa", "barometric": "Pa",
@@ -98,7 +99,7 @@ def sample_path(pattern):
     if pattern.kind == "leaf":
         return (pattern.under or "x.") + "0." + pattern.text
     if pattern.kind == "suffix":
-        return "x.dew" + pattern.text
+        return (pattern.under or "x.") + "dew" + pattern.text
     return "navigation.courseGreatCircle." + pattern.text
 
 
