@@ -113,16 +113,27 @@ warns, without failing, when `displays.json` defines `ha` items but
 `DISPLAYS_HA_TOKEN` is empty or `HOME_ASSISTANT_URL` is not a usable
 `http(s)://host:port` URL, and rejects a token with a line break or control character.
 
-Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
-`online` (and `offline` on a clean stop; Mosquitto publishes the retained last
-will `offline` if the bridge dies), reports `vesselstack/v1/bridge/signalk`
+Behaviour: on every MQTT connect it publishes `vesselstack/v1/bridge/status`
+`online`, **not retained**, and repeats it every `heartbeat_s` (`offline`, also
+not retained, on a clean stop; Mosquitto publishes the same non-retained last
+will `offline` if the bridge dies). Liveness is deliberately never stored by the
+broker: after a power cut the broker dies with the bridge, no will fires, and a
+retained `online` would be restored from the broker's last autosave, so displays
+would show old values as live. A bridge connect also deletes a retained
+`bridge/status` left by an older version. For tools it keeps the retained
+`vesselstack/v1/bridge/service` (`{"state","ts"}`, refreshed every
+`heartbeat_s`; after a crash it can still say `online` with an old `ts`, so
+judge it by `ts`; see [MQTT access control](MQTT.md)). It also reports `vesselstack/v1/bridge/signalk`
 `connected` or `disconnected`, and reconnects to Signal K with exponential
 backoff (1 s up to 30 s with jitter). When the Signal K connection is lost every
 numeric instrument that was `ok` turns `stale` at once (not after its
 `stale_after_s`) and stays `stale` while Signal K is unreachable; instruments
 read `missing` until the first value arrives. Treat `bridge/status` as the
 authority: if the bridge dies hard, `bridge/signalk` keeps its last retained
-value. A single Signal K message the bridge cannot process is logged (at most once a
+value. Displays already in the field need no reflash: after a broker restart
+nothing retained says `online`, so their tiles show `--` until a running bridge
+publishes; a display that connects while the bridge runs sees `online` within
+one `heartbeat_s` (default 5 s), and shows `--` for that gap. A single Signal K message the bridge cannot process is logged (at most once a
 minute, with a count of the ones suppressed) and dropped; it does not cost the
 Signal K connection. The MQTT client queues at most 1000 messages while the
 broker is down, bounding memory. An invalid `displays.json` or settings (exit
@@ -147,7 +158,8 @@ sudo bash -c 'source /opt/vesselstack/config/vesselstack.env &&
 
 Troubleshooting:
 
-- `bridge/status` is `offline` or missing: `sudo systemctl status
+- `vesselstackctl display status` shows the bridge as not running, or `bridge/status`
+  is `offline` or has no heartbeat: `sudo systemctl status
   vesselstack-displays-bridge` and `vesselstackctl logs displays`. An
   `invalid displays configuration` line names the offending JSON path;
   `MQTT connection refused` means the bridge password in
@@ -225,7 +237,7 @@ sudo vesselstackctl display remove helm --yes
 | `restore-config STAMP [--if-revision SHA]` | Root. Puts the backup `STAMP` back as `displays.json` (validated; the file it replaces is backed up first) and prints a JSON result. |
 | `serial-ports [--json]` | Nothing. Validated USB serial devices that `flash --serial` would accept. Prefers stable `/dev/serial/by-id` aliases, with `/dev/ttyACM*` and `/dev/ttyUSB*` fallback. JSON reports discovery errors separately. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it and also deletes `secrets.yaml` from every already rendered tree of every display id under `build/displays/` (`ID/project`, `ID/project.new`, `ID/project.prev`, an old-layout `ID/secrets.yaml`, and the old siblings `ID.new/` and `ID.prev/`), each under that display's build lock without following symlinks (a display whose build is running is skipped with a warning); it does this even when no Wi-Fi credentials were stored, so a rerun after a failed or partial clear still cleans up; a changed password prints a notice instead. In both cases projects rendered and firmware built earlier still contain the old Wi-Fi credentials until `render`/`build` runs again (the firmware cannot be scrubbed; `flash` refuses it without `--force`). Nothing is echoed. |
-| `status` | Reads the retained topics `vesselstack/v1/bridge/status`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state, the Signal K link state and each display's last retained state (`online`/`offline` as published by the bridge or device; `unknown`/`never seen` means no retained message exists, so the bridge or device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
+| `status` | Reads the retained topics `vesselstack/v1/bridge/service`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state with the age of its report (`online (reported 12 s ago)`; `last reported online 3 days ago; the bridge may not be running` when the report is older than 3 x `heartbeat_s`, because the retained record survives a crash or power loss; `offline (reported 5 min ago)` after a clean stop; `unknown (no report)` when the topic is absent), the Signal K link state and each display's last retained state (`online`/`offline` as published by the device; `unknown`/`never seen` means no retained message exists, so the device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
 Behaviour that applies to the changing commands (`add`, `remove`, `rotate`,
 `wifi`):
@@ -387,8 +399,9 @@ tile) and `grid-2x2` tiles inside the board's centred content box, a tile per
 item with its label, value and unit, and a value format of `precision`
 decimals. With more than one page, a tap anywhere shows the next page and
 wraps around; with one page there is no navigation. The display subscribes
-only to the instruments it shows. A tile shows `--` unless the retained
-`bridge/status` is `online`, MQTT is connected, the last message for that
+only to the instruments it shows. A tile shows `--` unless the bridge has
+said `online` (`bridge/status`, a heartbeat that is not retained, so it is
+only seen while the bridge runs), MQTT is connected, the last message for that
 instrument has `st` equal to `ok`, **and** a message arrived within
 `stale_after_s + 2 x heartbeat_s` seconds (computed per tile).
 
@@ -910,8 +923,10 @@ screen with a flashing banner.
   item had just gone stale: items in alarm are lost (`max` stays `alarm`),
   everything else is `unknown`, so a stopped bridge never leaves a retained
   `ok` and never turns an alarm into a clear. After a crash or power loss the
-  retained message stays, which is why displays also require `bridge/status`
-  `online` and a summary newer than 3 x `heartbeat_s`.
+  retained message stays (the broker restores it from its last autosave), which is
+  why displays also require a summary newer than 3 x `heartbeat_s` as well as a
+  `bridge/status` `online` received since they connected. `bridge/status` is not
+  retained, so a broker restart cannot replay it.
 - Needs the `alarms/#` ACL rule (see [MQTT access control](MQTT.md)).
 
 Per-display option in `displays.json` (on by default when anything in the
@@ -1016,7 +1031,7 @@ font, up to 200 px wide) sits in a second row at y 40, and one 8 px dot per page
 with the current page highlighted sits at y 414, below the 340 x 340 content
 area (y 70-410). Nothing overlaps the content area or the alarm banner. The
 dots, left to right, are Signal K (bridge reports `connected`), the bridge
-(`bridge/status` `online`) and MQTT (the display's own connection): green is
+(`bridge/status` `online`, seen since the display connected) and MQTT (the display's own connection): green is
 good, red is bad and grey is unknown. The Signal K dot is retained data, so it is
 only ever green while the bridge is online and MQTT is connected; a stopped
 bridge shows grey, never a stale green. When `displays.json` has any `ha` item a
@@ -1595,8 +1610,8 @@ as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","a
 `v` is converted, then rounded to `precision`, and is `null` unless `st` is
 `ok`. `ts` is the Signal K timestamp (or `null`); `age` is seconds since the
 bridge received the value, measured on the bridge clock, not the Signal K
-timestamp. Other reserved topics are `vesselstack/v1/bridge/status`,
-`vesselstack/v1/bridge/signalk`, `vesselstack/v1/bridge/clock` (see
+timestamp. Other reserved topics are `vesselstack/v1/bridge/status` (not retained),
+`vesselstack/v1/bridge/service` (retained, for tools), `vesselstack/v1/bridge/signalk`, `vesselstack/v1/bridge/clock` (see
 [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
 `vesselstack/v1/displays/<username>/status`.
 Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`

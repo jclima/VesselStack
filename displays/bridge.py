@@ -7,8 +7,8 @@ a SignalK websocket and an MQTT client.
 
 Threading: the Engine is only ever touched by the main thread (one loop that
 alternates a bounded websocket read with Engine.tick). paho's network thread
-only sends packets and runs on_connect, which publishes retained status
-messages and never touches the Engine, so no lock is needed.
+only sends packets and runs on_connect, which publishes the status messages
+and never touches the Engine, so no lock is needed.
 
 Third-party imports (paho-mqtt, websockets) are deferred to the real adapters
 so the loop is importable and unit-testable with the standard library alone.
@@ -205,6 +205,7 @@ class Bridge:
         self._night_schedule = config.get("night_schedule")
         self._clock_wanted = topics.clock_wanted(config)
         self._clock_sent = None     # (state, clock time) of the last bridge clock published
+        self._alive_sent = None     # clock time of the last bridge liveness (status + service) published
         self._summary_sent = None   # (content, clock time) of the last summary published
         self._alarm_seq = random.getrandbits(31)   # new-alarm counter (uint32, wraps); in memory only
         self._alarm_prev = frozenset()             # ids in alarm (live or lost) at the previous evaluation
@@ -221,13 +222,34 @@ class Bridge:
 
     def on_mqtt_connected(self):
         """Called on every (re)connection to the broker, possibly from its thread."""
-        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_ONLINE, True, qos=1)
+        # Liveness is never stored by the broker: a retained "online" outlives a power cut (the broker
+        # dies with the bridge, so the will never fires) and old values would look live after a restart.
+        # An older bridge left one behind, so every connect first deletes it (an empty retained payload),
+        # in the publisher's ordered queue and before the first "online".
+        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, "", True, qos=1)
+        self._publish_alive(self.clock())
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, self.signalk_state, True, qos=1)
         if self._ha_wanted:
             self.publisher.publish(topics.BRIDGE_HA_TOPIC, self.ha_state, True, qos=1)
         if self._clock_wanted:
             self.publisher.publish(topics.BRIDGE_CLOCK_TOPIC, topics.clock_payload(
                 topics.clock_state(self._local(), self._night_schedule), self._summary_ts()), True, qos=1)
+
+    def _publish_alive(self, now):
+        """Non-retained, QoS 0 "online" for the displays, and the retained "last known" record for tools."""
+        self._alive_sent = now
+        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_ONLINE, False, qos=0)
+        self.publisher.publish(topics.BRIDGE_SERVICE_TOPIC,
+                               topics.service_payload(STATUS_ONLINE, self._summary_ts()), True, qos=1)
+
+    def _publish_alive_heartbeat(self, now):
+        """Repeat the liveness every heartbeat while MQTT is connected (a reconnect publishes it at once)."""
+        sent = self._alive_sent
+        if sent is None or now - sent < self.engine.heartbeat_s:
+            return
+        if not getattr(self.publisher, "connected", True):
+            return
+        self._publish_alive(now)
 
     def _set_signalk(self, state):
         if state != self.signalk_state:
@@ -326,6 +348,7 @@ class Bridge:
         now = self.clock()
         if now >= self._next_tick:
             self._next_tick = now + TICK_INTERVAL_S
+            self._publish_alive_heartbeat(now)
             self._publish_clock(now)
             self._send(self.engine.tick(now))
             self._send(self.events.tick(now))
@@ -463,7 +486,9 @@ class Bridge:
         self._publish_summary(now, [(i, "lost" if sev in ("alarm", "lost") else "unknown") for i, sev in
                                     self.engine.summary_items() + self.events.summary_items(now)
                                     + self.has.summary_items()], force=True)
-        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, True, qos=1)
+        self.publisher.publish(topics.BRIDGE_SERVICE_TOPIC,
+                               topics.service_payload(STATUS_OFFLINE, self._summary_ts()), True, qos=1)
+        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, False, qos=0)
         self.publisher.stop()
 
 
@@ -595,7 +620,9 @@ class MqttPublisher:
         s = self._settings
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=CLIENT_ID)
         client.username_pw_set(s.mqtt_username, s.mqtt_password)
-        client.will_set(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, qos=1, retain=True)
+        # One will per connection: the displays' non-retained, unqueued "offline". bridge/service cannot have
+        # one, so after a crash it keeps "online" with an old ts (see docs/MQTT.md).
+        client.will_set(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, qos=0, retain=False)
         client.reconnect_delay_set(min_delay=1, max_delay=30)
         # Bound memory while the broker is down (paho's default queue is unbounded).
         client.max_queued_messages_set(MQTT_MAX_QUEUED_MESSAGES)
@@ -624,7 +651,19 @@ class MqttPublisher:
         client.connect_async(s.mqtt_host, s.mqtt_port, keepalive=30)
         client.loop_start()
 
+    @property
+    def connected(self):
+        return self._connected
+
     def publish(self, topic, payload, retain, qos=0):
+        if retain and payload in ("", b""):
+            # An empty retained payload deletes a retained message at the broker: there is no state to
+            # cache or replay, and it must stay in order with the (non-retained) publishes behind it.
+            with self._condition:
+                if not self._stopping:
+                    self._commands.append(("publish", topic, payload, True, qos))
+                    self._condition.notify()
+            return
         if retain and threading.current_thread() is self._worker:
             # Re-entrant publishes from on_connect already run on the owner
             # worker.  Apply them inline so a producer-thread update queued
@@ -714,6 +753,8 @@ class MqttPublisher:
             elif kind == "publish":
                 if self._connected:
                     self._send(args[0], args[1], args[2], args[3])
+                elif args[0] == topics.BRIDGE_STATUS_TOPIC and not args[2]:
+                    pass            # liveness is never queued for later: a late "online" would be a lie
                 elif len(self._waiting) < MQTT_MAX_QUEUED_MESSAGES:
                     self._waiting.append(tuple(args))
 

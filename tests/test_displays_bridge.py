@@ -41,6 +41,7 @@ CONFIG = {
 SOG_TOPIC = "vesselstack/v1/instruments/sog"
 STATUS = topics.BRIDGE_STATUS_TOPIC
 SIGNALK = topics.BRIDGE_SIGNALK_TOPIC
+SERVICE = topics.BRIDGE_SERVICE_TOPIC
 
 
 def delta(value, urn=None, ts="2026-01-01T00:00:00.000Z"):
@@ -63,9 +64,12 @@ class FakePublisher:
         self.sent = []
         self.started = False
         self.stopped = False
+        self.connected = True       # like MqttPublisher.connected; tests set False for an outage
+        self.on_connect = None
 
     def start(self, on_connect):
         self.started = True
+        self.on_connect = on_connect
         on_connect()
 
     def publish(self, topic, payload, retain, qos=0):
@@ -366,10 +370,10 @@ class BridgeLoopTests(unittest.TestCase):
     def test_startup_publishes_status_and_missing_instruments(self):
         pub = Harness([]).run()
         self.assertTrue(pub.started)
-        self.assertEqual(pub.on(STATUS)[0], ("online", True))
+        self.assertEqual(pub.on(STATUS)[:2], [("", True), ("online", False)])
         self.assertEqual(pub.on(SIGNALK)[0], ("disconnected", True))
         self.assertEqual(pub.states(SOG_TOPIC)[0], "missing")
-        self.assertTrue(all(retain for _, _, retain, _ in pub.sent))
+        self.assertTrue(all(retain for t, _, retain, _ in pub.sent if t != STATUS))
 
     def test_signalk_transitions_and_subscribe_frame(self):
         h = Harness([[("idle",), ("close",)]])
@@ -568,16 +572,149 @@ class BridgeLoopTests(unittest.TestCase):
 
     def test_mqtt_reconnect_republishes_online_and_signalk_state(self):
         h = Harness([])
-        h.bridge.publisher.publish(STATUS, "x", True)
         h.bridge.signalk_state = "connected"
         h.bridge.on_mqtt_connected()
-        self.assertEqual(h.publisher.sent[-2][:3], (STATUS, "online", True))
-        self.assertEqual(h.publisher.sent[-1][:3], (SIGNALK, "connected", True))
+        tail = [m[:3] for m in h.publisher.sent[-4:]]
+        self.assertEqual(tail[0], (STATUS, "", True))
+        self.assertEqual(tail[1], (STATUS, "online", False))
+        self.assertEqual(tail[2][0:1] + tail[2][2:], (SERVICE, True))
+        self.assertEqual(json.loads(tail[2][1])["state"], "online")
+        self.assertEqual(tail[3], (SIGNALK, "connected", True))
+
+    def test_status_is_a_non_retained_heartbeat_never_a_retained_online(self):
+        h = Harness([[("idle",)] * 30])
+        pub = h.run()
+        for topic, payload, retain, qos in pub.sent:
+            if topic == STATUS and retain:
+                self.assertEqual(payload, "")         # only the legacy delete is retained
+            if topic == STATUS and payload in ("online", "offline"):
+                self.assertEqual((retain, qos), (False, 0))
+        onlines = [i for i, (t, p, *_r) in enumerate(pub.sent) if t == STATUS and p == "online"]
+        self.assertGreaterEqual(len(onlines), 3)         # on connect, then every heartbeat_s
+        self.assertEqual(pub.sent[onlines[0] - 1][:3], (STATUS, "", True))   # the delete comes first
+        self.assertEqual(sum(1 for t, p, *_r in pub.sent if t == STATUS and p == ""), 1)
+
+    def test_online_repeats_every_heartbeat_only_while_connected(self):
+        h = Harness([[]])
+        h.run()
+        pub, clock = h.publisher, h.clock
+        pub.sent.clear()
+        h.bridge._alive_sent = clock.now
+        for _ in range(3):
+            clock.now += CONFIG["heartbeat_s"]
+            h.bridge._next_tick = 0
+            h.bridge._tick()
+        self.assertEqual(len(pub.on(STATUS)), 3)
+        clock.now += CONFIG["heartbeat_s"] - 1                    # not due yet
+        h.bridge._next_tick = 0
+        h.bridge._tick()
+        self.assertEqual(len(pub.on(STATUS)), 3)
+        pub.connected = False                                     # broker down: nothing is published
+        pub.sent.clear()
+        clock.now += 10 * CONFIG["heartbeat_s"]
+        h.bridge._next_tick = 0
+        h.bridge._tick()
+        self.assertEqual(pub.on(STATUS), [])
+        self.assertEqual(pub.on(SERVICE), [])
+        pub.connected = True                                      # reconnect: at once, delete first
+        pub.on_connect()
+        self.assertEqual(pub.on(STATUS), [("", True), ("online", False)])
+
+    def test_service_record_is_retained_online_with_a_timestamp_then_offline(self):
+        h = Harness([[("idle",), ("call", lambda: h.stop.set()), ("idle",)]])
+        pub = h.run()
+        records = [(json.loads(p), r) for p, r in pub.on(SERVICE)]
+        self.assertTrue(all(r for _, r in records))
+        self.assertEqual(records[0][0]["state"], "online")
+        self.assertRegex(records[0][0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(records[-1][0]["state"], "offline")
+        self.assertEqual({q for t, _, _, q in pub.sent if t == SERVICE}, {1})
+        # the offline pair is the last thing published, in this order
+        self.assertEqual([m[0] for m in pub.sent[-2:]], [SERVICE, STATUS])
+
+    def test_mqtt_will_is_a_non_retained_offline_on_the_status_topic(self):
+        created = []
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                created.append(self)
+                self.calls = []
+
+            def __getattr__(self, name):
+                def record(*args, **kwargs):
+                    self.calls.append((name, args, kwargs))
+                return record
+
+        fake_mqtt = mock.Mock()
+        fake_mqtt.Client = FakeClient
+        fake_pkg = mock.Mock(client=fake_mqtt)
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        with mock.patch.dict(sys.modules, {"paho": mock.Mock(mqtt=fake_pkg),
+                                           "paho.mqtt": fake_pkg,
+                                           "paho.mqtt.client": fake_mqtt}):
+            bridge.MqttPublisher(settings).start(lambda: None)
+        will = next(c for c in created[0].calls if c[0] == "will_set")
+        self.assertEqual(will[1], (STATUS, "offline"))
+        self.assertEqual((will[2]["qos"], will[2]["retain"]), (0, False))
+
+    def test_publisher_delete_precedes_online_and_is_never_cached_or_replayed(self):
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        publisher = bridge.MqttPublisher(settings)
+        published = []
+
+        class Info:
+            rc = 0
+
+            def __init__(self, mid): self.mid = mid
+
+        class Client:
+            def publish(self, topic, payload, qos, retain):
+                published.append((topic, payload, qos, retain))
+                return Info(len(published))
+            def disconnect(self): pass
+            def loop_stop(self): pass
+
+        publisher._client = Client()
+        publisher._worker = threading.Thread(target=publisher._run, daemon=True)
+        publisher._worker.start()
+        b = bridge.Bridge(CONFIG, publisher, lambda: None)
+
+        def connect():
+            ready = threading.Event()
+            publisher._event("connect", lambda: (b.on_mqtt_connected(), ready.set()))
+            self.assertTrue(ready.wait(1))
+            for _ in range(100):
+                if any(m[0] == SERVICE for m in published) and len(published) >= 4:
+                    break
+                time.sleep(0.01)
+
+        connect()
+        publisher._event("disconnect", None)
+        # a heartbeat queued behind the outage must not be replayed later as a fresh "online"
+        publisher.publish(STATUS, "online", False, qos=0)
+        time.sleep(0.1)
+        published.append(("--reconnect--", "", 0, False))
+        connect()
+        publisher.stop()
+        first, second = published[:published.index(("--reconnect--", "", 0, False))], \
+            published[published.index(("--reconnect--", "", 0, False)) + 1:]
+        for wire in (first, second):
+            status = [m for m in wire if m[0] == STATUS]
+            self.assertEqual(status[0], (STATUS, "", 1, True))
+            self.assertEqual(status[1], (STATUS, "online", 0, False))
+            self.assertEqual(len(status), 2)
+            self.assertFalse([m for m in status if m[3] and m[1]])        # never a retained non-empty value
+        self.assertNotIn(STATUS, publisher._retained)
+        self.assertNotIn(STATUS, publisher._retained_mailbox)
 
     def test_sigterm_path_publishes_offline_and_stops_publisher(self):
         h = Harness([[("idle",), ("call", lambda: h.stop.set()), ("idle",)]])
         pub = h.run()
-        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", False))
         self.assertEqual(pub.on(SIGNALK)[-1], ("disconnected", True))
         self.assertTrue(pub.stopped)
         self.assertTrue(h.sources[0].closed)
@@ -586,7 +723,7 @@ class BridgeLoopTests(unittest.TestCase):
         h = Harness([ConnectionError("down")])
         h.stop.set()
         pub = h.run()
-        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", False))
         self.assertTrue(pub.stopped)
 
 
@@ -1062,7 +1199,7 @@ class HomeAssistantBridgeTests(unittest.TestCase):
         ha.stop = lambda: (_ for _ in ()).throw(RuntimeError("stuck"))
         with self.assertLogs("vesselstack.displays.bridge", level="WARNING"):
             pub = Harness([[("close",)]], HA_CONFIG, ha=ha).run()
-        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", False))
 
     def test_clean_stop_keeps_an_ha_alarm_as_lost_and_the_rest_unknown(self):
         ha = FakeHa()

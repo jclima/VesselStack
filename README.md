@@ -184,7 +184,7 @@ equipment and logbook records.
 Optional ESP32 touch-screen displays that show Signal K values (speed, depth, wind,
 battery voltage and so on) on pages you define. The first supported board is the
 Waveshare ESP32-S3-Touch-LCD-2.8C running ESPHome with LVGL. This is a preview and
-the bridge service runs only when `DISPLAYS_ENABLE=true`.
+the bridge service runs only when `DISPLAYS_ENABLE=true`. Bridge liveness is a non-retained heartbeat on `vesselstack/v1/bridge/status`, so a broker restart after a power cut can never replay an old `online`; tools read the retained `vesselstack/v1/bridge/service` record (last known, judged by its timestamp) or run `vesselstackctl display status`.
 
 ```bash
 sudo vesselstackctl display list

@@ -22,6 +22,7 @@ ALARM_SUMMARY_TOPIC = f"{TOPIC_ROOT}/alarms/summary"
 SUMMARY_MAX_IDS = 16
 BRIDGE_STATUS_TOPIC = f"{TOPIC_ROOT}/bridge/status"
 BRIDGE_SIGNALK_TOPIC = f"{TOPIC_ROOT}/bridge/signalk"
+BRIDGE_SERVICE_TOPIC = f"{TOPIC_ROOT}/bridge/service"
 BRIDGE_CLOCK_TOPIC = f"{TOPIC_ROOT}/bridge/clock"
 BRIDGE_HA_TOPIC = f"{TOPIC_ROOT}/bridge/homeassistant"
 DISPLAY_STATUS_TOPIC = f"{TOPIC_ROOT}/displays/{{username}}/status"
@@ -518,6 +519,11 @@ def clock_state(local, schedule) -> tuple:
 def clock_payload(state: tuple, ts: str) -> str:
     """Compact JSON for the retained bridge clock: ``{"hm","night","ts"}``."""
     return json.dumps({"hm": state[0], "night": state[1], "ts": ts}, separators=(",", ":"))
+
+
+def service_payload(state: str, ts: str) -> str:
+    """Compact JSON for the retained bridge record read by tools: ``{"state","ts"}``."""
+    return json.dumps({"state": state, "ts": ts}, separators=(",", ":"))
 
 
 def clock_wanted(config: dict) -> bool:
