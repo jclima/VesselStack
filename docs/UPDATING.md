@@ -38,6 +38,12 @@ with no argument fails. To run it by hand once a release is unpacked (the instal
 sudo vesselstackctl update /opt/vesselstack-release/0.7.0
 ```
 
+If the installer fails part-way, `vesselstackctl update` stops with three lines: that the update
+to the new version did not finish and your data is kept, the command to try again (for example
+once the network is back), and the exact `sudo vesselstackctl restore ARCHIVE --yes` command for
+the backup it just made. If no backup was made (a skipped backup), it says to restore the newest
+`vesselstack-*.tar.gz` in your backup folder instead.
+
 From a terminal (`ssh -t`) the installer now offers to fix an unsupported `BOAT_UNITS` value or
 a setting that cannot be written safely at a prompt instead of stopping (choose, or `c` to
 cancel with nothing changed). A root-only copy of the previous settings file is kept as
@@ -135,6 +141,10 @@ in and `installed-version` records the configuration version once everything is 
 Starting the services comes after that. `config/install-in-progress` exists from the first
 change until the start phase has succeeded; its presence means an installation or update did
 not finish.
+`sudo vesselstackctl doctor` reports it as `FAIL installation of VERSION did not finish`, with the
+command to continue and, when a backup was recorded, the command to go back; `sudo vesselstackctl
+status` shows an `Installation INCOMPLETE` line (and exits non-zero) and `vesselstackctl version`
+adds a note.
 
 ## Rollback
 
