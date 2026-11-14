@@ -11,6 +11,8 @@ WorkingDirectory=@VESSELSTACK_ROOT@/displays
 EnvironmentFile=@VESSELSTACK_ROOT@/config/displays-bridge.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
+# The lost-alarm latch and alarm counter survive restarts here (created by the installer, mode 0700).
+Environment=VESSELSTACK_DISPLAYS_STATE_DIR=@VESSELSTACK_DATA@/displays-bridge
 ExecStart=@VESSELSTACK_ROOT@/displays/.venv/bin/python @VESSELSTACK_ROOT@/displays/bridge.py
 Restart=on-failure
 RestartSec=10
@@ -23,6 +25,7 @@ PrivateDevices=true
 CapabilityBoundingSet=
 LockPersonality=true
 ProtectSystem=strict
+ReadWritePaths=-@VESSELSTACK_DATA@/displays-bridge
 ProtectHome=read-only
 ProtectControlGroups=true
 ProtectKernelModules=true

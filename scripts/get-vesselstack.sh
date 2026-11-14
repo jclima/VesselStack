@@ -75,6 +75,13 @@ STAGE=
 RELEASE_DIR=
 ENV_FILE=
 UPGRADE=0
+RESUME=0
+MARKER_PRESENT=0
+MARKER_UNREADABLE=0
+MARKER_VERSION=
+MARKER_FROM=
+MARKER_STARTED=
+MARKER_BACKUP=
 PKG_MODE=apt
 APT_UPDATED=0
 DOCKER_KEY_DIR=
@@ -781,6 +788,132 @@ rerun_cmd() {
     fi
 }
 
+# The command that continues an unfinished install of version $1: the same release, and the offline
+# options when they were used. Answers to questions are not repeated, so they are asked again.
+resume_rerun_cmd() {
+    local -a args=(--version "$1")
+    if [ "$OFFLINE" -eq 1 ]; then
+        args+=(--offline --bundle "$BUNDLE")
+        if [ -n "$TARBALL_ARG" ]; then args+=(--tarball "$TARBALL_ARG"); fi
+    fi
+    local text='' arg
+    for arg in "${args[@]}"; do text+=" $(printf '%q' "$arg")"; done
+    rerun_cmd "${text# }"
+}
+
+# The line that tells the owner how to go back after an unfinished update: the named backup when
+# the marker recorded one, otherwise where to look for the newest one.
+restore_hint() {  # [prefix, default "Or go back"]
+    local prefix=${1:-Or go back}
+    if [ -n "$MARKER_BACKUP" ]; then
+        printf '%s: sudo vesselstackctl restore %q --yes' "$prefix" "$MARKER_BACKUP"
+    else
+        printf '%s: restore the newest vesselstack-*.tar.gz in your backup folder (default /var/backups/vesselstack): sudo vesselstackctl restore FILE --yes' "$prefix"
+    fi
+}
+
+# Finds the root of an installation made at a custom path. sudo strips VESSELSTACK_ROOT, so the
+# installed vesselstackctl, which install.sh writes with the real root on one line, is READ (never
+# run or sourced) for it. An explicit VESSELSTACK_ROOT wins; the default is /opt/vesselstack.
+discover_install_root() {
+    [ -z "${VESSELSTACK_ROOT:-}" ] || return 0
+    local ctl line path
+    local root_re='^ROOT=\$\{VESSELSTACK_ROOT:-(/[A-Za-z0-9_./+-]+)\}$'
+    ctl=$(find_ctl 2>/dev/null) || return 0
+    [ -f "$ctl" ] && [ -r "$ctl" ] || return 0
+    line=$(grep -a -m1 -E -- "$root_re" "$ctl" 2>/dev/null || true)
+    [[ "$line" =~ $root_re ]] || return 0
+    path=${BASH_REMATCH[1]}
+    [ -d "$path" ] || return 0
+    if [ "$path" != "$INSTALL_ROOT" ]; then
+        INSTALL_ROOT=$path
+        info "Found the installation at $INSTALL_ROOT (from $ctl)."
+    fi
+}
+
+# Reads $INSTALL_ROOT/config/install-in-progress, which install.sh keeps from its first change until
+# its start phase has succeeded. Plain KEY=VALUE lines, parsed here without sourcing. Sets
+# MARKER_PRESENT (0/1), MARKER_UNREADABLE (1 when it exists but names no usable version) and
+# MARKER_VERSION, MARKER_FROM, MARKER_STARTED, MARKER_BACKUP (each empty when missing or invalid).
+read_install_marker() {  # [quiet]
+    local quiet=${1:-} file=$INSTALL_ROOT/config/install-in-progress line key value size
+    MARKER_PRESENT=0; MARKER_UNREADABLE=0
+    MARKER_VERSION=; MARKER_FROM=; MARKER_STARTED=; MARKER_BACKUP=
+    if [ -L "$file" ]; then
+        [ -n "$quiet" ] || warn "Ignoring $file: it is a symbolic link, which the installer never creates."
+        return 0
+    fi
+    [ -e "$file" ] || return 0
+    if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+        [ -n "$quiet" ] || warn "Ignoring $file: it is not a readable regular file."
+        return 0
+    fi
+    size=$(wc -c < "$file" 2>/dev/null || echo 99999)
+    if [ "${size//[[:space:]]/}" -gt 4096 ]; then
+        [ -n "$quiet" ] || warn "Ignoring $file: it is larger than 4096 bytes, which the installer never writes."
+        return 0
+    fi
+    MARKER_PRESENT=1
+    local ver_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+    local when_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?$'
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^([a-z]+)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+        case "$key" in
+            version) if [[ "$value" =~ $ver_re ]]; then MARKER_VERSION=$value; fi ;;
+            from) if [[ "$value" =~ $ver_re || "$value" = none ]]; then MARKER_FROM=$value; fi ;;
+            started) if [[ "$value" =~ $when_re ]]; then MARKER_STARTED=$value; fi ;;
+            backup) if [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] ]]; then MARKER_BACKUP=$value; fi ;;
+        esac
+    done < "$file"
+    if [ -z "$MARKER_VERSION" ]; then
+        MARKER_UNREADABLE=1
+        [ -n "$quiet" ] || warn "$file exists but could not be read (no valid version in it)."
+    fi
+    return 0
+}
+
+# The end of a failed first-time install: tells apart "stopped part-way" (the installer left its
+# marker, so a rerun continues) from "failed before changing anything".
+die_install_failed() {
+    read_install_marker quiet
+    if [ "$MARKER_PRESENT" -eq 1 ]; then
+        die "The installation stopped part-way (see above). Your settings are saved." \
+            "Run the same command again to continue; it picks up where it stopped: $(resume_rerun_cmd "$VERSION")"
+    fi
+    die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
+        "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
+}
+
+# The end of a failed continuation of an unfinished install.
+die_resume_failed() {
+    read_install_marker quiet
+    local -a lines=("When the problem is fixed (for example the network is back), run the same command again: $(resume_rerun_cmd "$VERSION")")
+    if [ -n "$MARKER_BACKUP" ]; then
+        local back_to=$MARKER_FROM
+        if [ -z "$back_to" ] || [ "$back_to" = none ]; then back_to="the earlier state"; fi
+        lines+=("To go back to $back_to instead: sudo vesselstackctl restore $(printf '%q' "$MARKER_BACKUP") --yes")
+    fi
+    die "The installation still did not finish (see above). Your settings and data are kept." "${lines[@]}"
+}
+
+# The end of a failed update through vesselstackctl.
+die_update_failed() {
+    read_install_marker quiet
+    if [ "$MARKER_PRESENT" -eq 1 ]; then
+        local back
+        back=$(restore_hint 'Or go back')
+        if [ -n "$MARKER_BACKUP" ] && [ -n "$MARKER_FROM" ] && [ "$MARKER_FROM" != none ]; then
+            back=$(restore_hint "Or go back to $MARKER_FROM")
+        fi
+        die "The update to $VERSION did not finish (see above). Your data is kept." \
+            "Try again (for example once the network is back): $(resume_rerun_cmd "$VERSION")" \
+            "$back"
+    fi
+    die "The update stopped before changing anything. The installed version is unchanged." \
+        "Your data and the pre-update backup are untouched. See the README sections on updating and restoring."
+}
+
 # ---------------------------------------------------------------- steps
 
 step_check_computer() {
@@ -860,10 +993,48 @@ step_preflight() {
             "  sudo bash get-vesselstack.sh --offline --bundle DIR --tarball vesselstack-$VERSION.tar.gz" \
             "(see docs/DEPLOYMENT.md)"
     fi
+    read_install_marker
+    local have_installed=0
     if [ -r "$INSTALL_ROOT/config/installed-version" ]; then
+        have_installed=1
         INSTALLED_VERSION=$(<"$INSTALL_ROOT/config/installed-version")
         INSTALLED_VERSION=${INSTALLED_VERSION//[[:space:]]/}
+    fi
+    # An unfinished install (the installer's marker is still there) is continued, not reported as done.
+    if [ "$MARKER_PRESENT" -eq 1 ] && [ "$MARKER_UNREADABLE" -eq 1 ]; then
+        # No usable version in the marker: it only counts when the installed version is the requested one.
         if [ "$INSTALLED_VERSION" = "$VERSION" ]; then
+            MARKER_VERSION=$VERSION
+        else
+            MARKER_PRESENT=0
+        fi
+    fi
+    if [ "$MARKER_PRESENT" -eq 1 ]; then
+        local marker_when=${MARKER_STARTED:-an unknown time}
+        if [ "$MARKER_VERSION" = "$VERSION" ]; then
+            say ""
+            if [ -f "$INSTALL_ROOT/config/vesselstack.env" ] && [ ! -L "$INSTALL_ROOT/config/vesselstack.env" ]; then
+                RESUME=1
+                warn "The installation of VesselStack $VERSION in $INSTALL_ROOT did not finish (it started $marker_when)."
+                info "Your settings are kept. This run continues it: it runs the installer again with the installed configuration and starts the services. No new backup is made."
+                return 0
+            fi
+            warn "The installation of VesselStack $VERSION in $INSTALL_ROOT did not finish (it started $marker_when), and no saved configuration was found."
+            info "This run starts the installation again from the beginning."
+            INSTALLED_VERSION=
+            ok "no usable installation found in $INSTALL_ROOT (fresh install)"
+            return 0
+        elif [ "$(printf '%s\n%s\n' "$MARKER_VERSION" "$VERSION" | sort -V | head -n1)" = "$MARKER_VERSION" ]; then
+            say ""
+            warn "An unfinished installation of $MARKER_VERSION was found; it will be replaced by this upgrade to $VERSION."
+        else
+            die "The update to $MARKER_VERSION did not finish, so this computer is between versions. $VERSION cannot be installed over it." \
+                "Finish it: $(resume_rerun_cmd "$MARKER_VERSION")" \
+                "$(restore_hint 'Or go back')"
+        fi
+    fi
+    if [ "$have_installed" -eq 1 ]; then
+        if [ "$INSTALLED_VERSION" = "$VERSION" ] && [ "$MARKER_PRESENT" -eq 0 ]; then
             say ""
             ok "VesselStack $INSTALLED_VERSION is already installed in $INSTALL_ROOT; nothing to do."
             info "Check it with:  sudo vesselstackctl doctor"
@@ -1152,6 +1323,12 @@ finish_wizard_output() {
 step_configure() {
     step 5 "Configure"
     ENV_FILE=$RELEASE_BASE/vesselstack.env
+    if [ "$RESUME" -eq 1 ]; then
+        ENV_FILE=$INSTALL_ROOT/config/vesselstack.env
+        ok "continuing: the installed configuration ($ENV_FILE) is used; the wizard is skipped"
+        if [ -n "$CONFIG_ARG" ]; then info "--config $CONFIG_ARG is ignored: the installed configuration is used."; fi
+        return 0
+    fi
     if [ "$UPGRADE" -eq 1 ]; then
         ok "upgrade: the installed configuration ($INSTALL_ROOT/config/vesselstack.env) is kept; the wizard is skipped"
         return 0
@@ -1319,6 +1496,17 @@ step_install() {
             info "sudo ${offline_env}vesselstackctl update $RELEASE_DIR"
             exit 0
         fi
+    elif [ "$RESUME" -eq 1 ]; then
+        say ""
+        say "  Ready to continue the unfinished installation of VesselStack $VERSION with the installed configuration."
+        info "install.sh runs again with $ENV_FILE and starts the services; no backup is made and nothing is upgraded."
+        if ! ask_yn "Continue the unfinished installation now?" y; then
+            say ""
+            say "  Nothing was changed. To continue later:"
+            info "$(resume_rerun_cmd "$VERSION")"
+            exit 0
+        fi
+        ensure_service_account
     else
         show_summary "$ENV_FILE"
         local user
@@ -1378,14 +1566,22 @@ step_install() {
         say "  Running: ${offline_env}vesselstackctl update $RELEASE_DIR$choice_note"
         if [ "$OFFLINE" -eq 1 ]; then
             env "${ctl_env[@]}" VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$ctl" update "$RELEASE_DIR" ${update_choice[@]+"${update_choice[@]}"} </dev/null \
-                || die "The update failed (see above). Your data and the pre-update backup are untouched." \
-                       "See the README sections on updating and restoring."
+                || die_update_failed
         else
             env "${ctl_env[@]}" "$ctl" update "$RELEASE_DIR" ${update_choice[@]+"${update_choice[@]}"} </dev/null \
-                || die "The update failed (see above). Your data and the pre-update backup are untouched." \
-                       "See the README sections on updating and restoring."
+                || die_update_failed
         fi
         changed "upgraded VesselStack $INSTALLED_VERSION -> $VERSION (backup made first by vesselstackctl update)"
+    elif [ "$RESUME" -eq 1 ]; then
+        local -a resume_env=(${ctl_env[@]+"${ctl_env[@]}"})
+        if [ -n "$bundle_wheels" ]; then resume_env+=(VESSELSTACK_WHEELHOUSE="$bundle_wheels"); fi
+        say "  Preflight (changes nothing): install.sh ${install_args[*]} --dry-run"
+        env ${resume_env[@]+"${resume_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
+            || die_resume_failed
+        say "  Installing and starting..."
+        env ${resume_env[@]+"${resume_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
+            || die_resume_failed
+        changed "finished the interrupted installation of VesselStack $VERSION"
     else
         say "  Preflight (changes nothing): install.sh ${install_args[*]} --dry-run"
         if [ -n "$bundle_wheels" ]; then
@@ -1394,16 +1590,14 @@ step_install() {
                        "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
             env ${ctl_env[@]+"${ctl_env[@]}"} VESSELSTACK_WHEELHOUSE="$bundle_wheels" "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
-                || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
-                       "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
+                || die_install_failed
         else
             env ${ctl_env[@]+"${ctl_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --dry-run </dev/null \
                 || die "The installer's preflight failed (see above). Nothing was installed." \
                        "Fix the problem, then re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
             say "  Installing and starting..."
             env ${ctl_env[@]+"${ctl_env[@]}"} "$RELEASE_DIR/install.sh" "${install_args[@]}" --start </dev/null \
-                || die "The installation failed (see above). The installer is transactional: it makes no changes if the Python environment cannot be built." \
-                       "After fixing the problem, re-run: $(rerun_cmd --no-wizard --config "$ENV_FILE")"
+                || die_install_failed
         fi
         changed "installed VesselStack $VERSION to $(env_get "$ENV_FILE" VESSELSTACK_ROOT) and started its services"
     fi
@@ -1660,9 +1854,14 @@ main() {
     trap cleanup EXIT
     trap 'printf "\nInterrupted. Re-run the same command to continue; finished steps are skipped.\n" >&2; exit 130' INT TERM
     step_check_computer
+    discover_install_root
     require_terminal_or_options
     confirm_plan
     step_preflight
+    if [ "$RESUME" -eq 1 ] && [ "${#SETS[@]}" -gt 0 ]; then
+        die "--set cannot change the configuration of an installed system: continuing an unfinished installation keeps it." \
+            "Edit $INSTALL_ROOT/config/vesselstack.env, or finish the installation first and then change it. Nothing was changed."
+    fi
     if [ "$UPGRADE" -eq 1 ] && [ "${#SETS[@]}" -gt 0 ]; then
         die "--set cannot change the configuration of an installed system: an upgrade keeps it." \
             "Edit $INSTALL_ROOT/config/vesselstack.env and re-run install.sh, or use the control panel. Nothing was changed."

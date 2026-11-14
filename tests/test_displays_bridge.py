@@ -41,6 +41,7 @@ CONFIG = {
 SOG_TOPIC = "vesselstack/v1/instruments/sog"
 STATUS = topics.BRIDGE_STATUS_TOPIC
 SIGNALK = topics.BRIDGE_SIGNALK_TOPIC
+SERVICE = topics.BRIDGE_SERVICE_TOPIC
 
 
 def delta(value, urn=None, ts="2026-01-01T00:00:00.000Z"):
@@ -63,9 +64,12 @@ class FakePublisher:
         self.sent = []
         self.started = False
         self.stopped = False
+        self.connected = True       # like MqttPublisher.connected; tests set False for an outage
+        self.on_connect = None
 
     def start(self, on_connect):
         self.started = True
+        self.on_connect = on_connect
         on_connect()
 
     def publish(self, topic, payload, retain, qos=0):
@@ -213,6 +217,29 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
                                 ("ok", 0, 0, ()), ("unknown", 0, 1, ())])
         self.assertNotIn("secret text", json.dumps(pub.sent))
 
+    def test_signalk_disconnect_stales_an_alarming_instrument_and_recomputes_the_summary(self):
+        cfg = {"heartbeat_s": 5, "instruments": {"sog": dict(CONFIG["instruments"]["sog"],
+                                                             thresholds={"alarm_below": 5.0})}}
+        pub = Harness([[("msg", delta(1 * KN)), ("close",)]], cfg).run()
+        tiles = [json.loads(p) for p, _ in pub.on(SOG_TOPIC)]
+        self.assertEqual([(t["st"], t["sev"]) for t in tiles],
+                         [("missing", "unknown"), ("ok", "alarm"), ("stale", "unknown")])   # no "alarm" on a stale tile
+        self.assertIsNone(tiles[-1]["v"])
+        seen = []
+        for body, _, _ in self.summaries(pub):
+            key = (body["max"], body["na"], body["nu"], body["nl"], tuple(body["ids"]))
+            if not seen or seen[-1] != key:
+                seen.append(key)
+        # Instruments are published before the summary is recomputed; the stale instrument was in alarm,
+        # so the summary keeps the alarm (lost) instead of dropping to "unknown".
+        self.assertEqual(seen, [("unknown", 0, 1, 0, ()), ("alarm", 1, 0, 0, ("sog",)), ("alarm", 1, 0, 1, ("sog",))])
+        order = [(t, json.loads(p).get("st", json.loads(p).get("max"))) for t, p, _, _ in pub.sent
+                 if t in (SOG_TOPIC, SUMMARY)]
+        i = order.index((SOG_TOPIC, "stale"))
+        self.assertEqual(order[i - 2:i + 2], [(SOG_TOPIC, "ok"), (SUMMARY, "alarm"),
+                                              (SOG_TOPIC, "stale"), (SUMMARY, "alarm")])
+        self.assertEqual(self.summaries(pub)[-1][0]["lost"], ["sog"])
+
     def test_instrument_without_thresholds_is_not_counted_and_nothing_published(self):
         pub = Harness([[("msg", delta(10 * KN)), ("idle",), ("close",)]]).run()
         self.assertEqual(self.summaries(pub), [])
@@ -223,13 +250,26 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
         self.assertGreaterEqual(len(times), 3)
         self.assertLess(len(times), 8)
 
-    def test_clean_shutdown_publishes_unknown_last(self):
+    def test_clean_shutdown_keeps_an_alarm_as_lost(self):
         script = [("idle",)] * 4 + [("msg", note_delta({"state": "alarm"})), ("idle",)]
         h = Harness([script], NOTE_CONFIG)
         pub = h.run()
         self.assertTrue(any(b["max"] == "alarm" for b, _, _ in self.summaries(pub)))
         last, retain, qos = self.summaries(pub)[-1]
-        self.assertEqual((last["max"], last["na"], last["nu"], last["ids"]), ("unknown", 0, 1, []))
+        self.assertEqual((last["max"], last["na"], last["nu"], last["nl"], last["ids"], last["lost"]),
+                         ("alarm", 1, 0, 1, ["anchor"], ["anchor"]))
+        self.assertTrue(retain)
+        self.assertEqual(qos, 1)
+        self.assertEqual(pub.sent[-1][0], STATUS)
+        self.assertEqual(pub.sent[-1][1], "offline")
+
+    def test_clean_shutdown_without_alarms_publishes_unknown_last(self):
+        script = [("idle",)] * 4 + [("msg", note_delta({"state": "warn"})), ("idle",)]
+        h = Harness([script], NOTE_CONFIG)
+        pub = h.run()
+        last, retain, qos = self.summaries(pub)[-1]
+        self.assertEqual((last["max"], last["na"], last["nu"], last["nl"], last["ids"], last["lost"]),
+                         ("unknown", 0, 1, 0, [], []))
         self.assertTrue(retain)
         self.assertEqual(qos, 1)
         self.assertEqual(pub.sent[-1][0], STATUS)
@@ -240,14 +280,322 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
         self.assertRegex(self.summaries(pub)[0][0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 
 
+SEQ_PATHS = {"a": "notifications.a", "b": "notifications.b"}
+SEQ_CONFIG = {"heartbeat_s": 5, "instruments": {},
+              "notifications": {"a": {"path": SEQ_PATHS["a"], "label": "A"},
+                                "b": {"path": SEQ_PATHS["b"], "label": "B"}}}
+
+
+def multi_delta(**values):
+    return json.dumps({"updates": [{"timestamp": "2026-01-01T00:00:00.000Z",
+                                    "values": [{"path": SEQ_PATHS[k], "value": v} for k, v in values.items()]}]})
+
+
+ALARM = {"state": "alarm"}
+
+
+class AlarmSeqTests(unittest.TestCase):
+    def setUp(self):
+        self.h = Harness([], SEQ_CONFIG)
+        self.b, self.pub = self.h.bridge, self.h.publisher
+        self.b._set_signalk(bridge.SIGNALK_CONNECTED)
+        self.h.clock.now += 10          # past the notification settle time
+
+    def last(self):
+        return json.loads([p for t, p, _, _ in self.pub.sent if t == SUMMARY][-1])
+
+    def test_seq_starts_as_a_31_bit_int_and_is_in_every_summary(self):
+        seeds = {bridge.Bridge(SEQ_CONFIG, FakePublisher(), None)._alarm_seq for _ in range(20)}
+        self.assertTrue(all(isinstance(x, int) and 0 <= x < 2 ** 31 for x in seeds))
+        self.assertGreater(len(seeds), 1)
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.b._tick()
+        bodies = [json.loads(p) for t, p, _, _ in self.pub.sent if t == SUMMARY]
+        self.assertGreaterEqual(len(bodies), 2)
+        self.assertTrue(all(isinstance(x["seq"], int) and 0 <= x["seq"] < 2 ** 32 for x in bodies))
+
+    def test_a_new_alarm_increments_once_and_staying_in_alarm_does_not(self):
+        s0 = self.b._alarm_seq
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.assertEqual(self.last()["seq"], (s0 + 1) % 2 ** 32)
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.h.clock.now += 6
+        self.b._tick()
+        self.assertEqual(self.last()["seq"], (s0 + 1) % 2 ** 32)
+
+    def test_alarm_to_lost_and_back_to_alarm_do_not_increment(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        s1 = self.b._alarm_seq
+        self.b._set_signalk(bridge.SIGNALK_DISCONNECTED)
+        self.assertEqual((self.last()["max"], self.last()["nl"], self.last()["seq"]), ("alarm", 1, s1))
+        self.b._set_signalk(bridge.SIGNALK_CONNECTED)
+        self.assertEqual(self.last()["seq"], s1)
+        self.b.handle_message(multi_delta(a=ALARM))      # lost -> alarm
+        self.assertEqual((self.last()["nl"], self.last()["na"], self.last()["seq"]), (0, 1, s1))
+
+    def test_a_clearing_and_b_raising_in_one_delta_increments_although_na_is_unchanged(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        before = self.last()
+        self.b.handle_message(multi_delta(a=None, b=ALARM))
+        after = self.last()
+        self.assertEqual((before["na"], after["na"], after["ids"]), (1, 1, ["b"]))
+        self.assertEqual(after["seq"], (before["seq"] + 1) % 2 ** 32)
+
+    def test_two_new_alarms_in_one_delta_increment_by_two(self):
+        s0 = self.b._alarm_seq
+        self.b.handle_message(multi_delta(a=ALARM, b=ALARM))
+        self.assertEqual(self.last()["seq"], (s0 + 2) % 2 ** 32)
+
+    def test_an_alarm_that_cleared_and_returns_is_new_again(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        s1 = self.b._alarm_seq
+        self.b.handle_message(multi_delta(a=None))
+        self.b.handle_message(multi_delta(a=ALARM))
+        self.assertEqual(self.last()["seq"], (s1 + 1) % 2 ** 32)
+
+    def test_seq_wraps_at_2_pow_32(self):
+        self.b._alarm_seq = 2 ** 32 - 1
+        self.b.handle_message(multi_delta(a=ALARM, b=ALARM))
+        self.assertEqual(self.last()["seq"], 1)
+
+    def test_shutdown_keeps_the_seq_and_the_lost_alarm(self):
+        self.b.handle_message(multi_delta(a=ALARM))
+        s1 = self.b._alarm_seq
+        self.b.shutdown()
+        last = self.last()
+        self.assertEqual((last["max"], last["lost"], last["seq"]), ("alarm", ["a"], s1))
+
+
+PERSIST_CONFIG = {
+    "heartbeat_s": 5,
+    "instruments": {"sog": dict(CONFIG["instruments"]["sog"], thresholds={"alarm_below": 5.0})},
+    "notifications": {"anchor": {"path": NOTE_PATH, "label": "Anchor"}},
+    "ha": {"high": {"entity_id": "binary_sensor.high_water", "label": "High water", "kind": "binary",
+                    "states": [{"match": "high", "sev": "alarm", "text": "HIGH"}]}},
+}
+
+
+class StatePersistenceTests(unittest.TestCase):
+    """Slice S3: the lost-alarm latch and the alarm counter survive a bridge restart."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+        self.file = os.path.join(self.dir, "state.json")
+        self.n = 0
+
+    def make(self, config=PERSIST_CONFIG, state_dir="default"):
+        clock = FakeClock()
+        pub = FakePublisher()
+        b = bridge.Bridge(config, pub, None, clock=clock, state_dir=self.dir if state_dir == "default" else state_dir)
+        return b, pub
+
+    def ts(self):
+        self.n += 1
+        return f"2026-01-01T00:00:{self.n:02d}.000Z"
+
+    def sog(self, value):
+        return json.dumps({"updates": [{"timestamp": self.ts(), "values": [{"path": SOG, "value": value}]}]})
+
+    def last(self, pub):
+        return json.loads([p for t, p, _, _ in pub.sent if t == SUMMARY][-1])
+
+    def state(self):
+        with open(self.file, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def alarm_everything(self, b):
+        """SignalK and Home Assistant up; the instrument, the notification and the HA item in alarm; then both drop."""
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.has.source_state(True, b.clock())
+        b.clock.now += 10
+        b.handle_message(self.sog(1 * KN))
+        b.handle_message(note_delta({"state": "alarm"}))
+        b.has.set_state("binary_sensor.high_water", "HIGH", "t", b.clock())
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(b.publisher)["na"], 3)
+        b._set_signalk(bridge.SIGNALK_DISCONNECTED)
+        b.has.source_state(False, b.clock())
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(b.publisher)["nl"], 3)
+
+    def test_latch_and_seq_survive_a_restart(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        seq = first._alarm_seq
+        self.assertEqual(self.state(), {"format": 1, "seq": seq, "latched": {
+            "instruments": ["sog"], "notifications": ["anchor"], "ha": ["high"]}})
+        second, pub = self.make()
+        self.assertEqual(second._alarm_seq, seq)
+        second._publish_summary(second.clock())
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["na"], body["nl"], body["nu"], body["seq"]), ("alarm", 3, 3, 0, seq))
+        self.assertEqual(sorted(body["lost"]), ["anchor", "high", "sog"])
+
+    def test_a_clean_shutdown_keeps_the_latch_and_the_next_start_continues(self):
+        first, _ = self.make()
+        first._set_signalk(bridge.SIGNALK_CONNECTED)
+        first.clock.now += 10
+        first.handle_message(self.sog(1 * KN))
+        seq = first._alarm_seq
+        first.shutdown()
+        self.assertEqual(self.state()["latched"]["instruments"], ["sog"])
+        second, _ = self.make()
+        self.assertEqual(second._alarm_seq, seq)
+
+    def test_restored_lost_items_are_known_so_a_restart_is_not_a_new_alarm(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        seq = first._alarm_seq
+        second, pub = self.make()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(1 * KN))                 # the same alarm is live again: lost -> alarm
+        self.assertEqual((self.last(pub)["seq"], self.last(pub)["nl"]), (seq, 2))
+        second.handle_message(note_delta({"state": "alarm"}))
+        self.assertEqual((self.last(pub)["seq"], self.last(pub)["nl"], self.last(pub)["na"]), (seq, 1, 3))
+
+    def test_a_fresh_ok_clears_the_latch_and_the_file_is_rewritten_without_it(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        second, pub = self.make()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(10 * KN))
+        self.assertNotIn("sog", self.last(pub)["lost"])
+        self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": ["anchor"], "ha": ["high"]})
+        second.handle_message(note_delta(None))
+        self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": [], "ha": ["high"]})
+
+    def test_ids_no_longer_configured_or_no_longer_counted_are_dropped_on_load(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        smaller = dict(PERSIST_CONFIG, ha={}, notifications={"anchor": dict(PERSIST_CONFIG["notifications"]["anchor"],
+                                                                         alarm=False)})
+        second, pub = self.make(smaller)
+        second._publish_summary(second.clock())
+        self.assertEqual(self.last(pub)["lost"], ["sog"])
+        self.assertEqual(self.state()["latched"], {"instruments": ["sog"], "notifications": [], "ha": []})
+
+    def test_a_missing_file_means_nothing_latched_and_a_random_seq_which_is_then_written(self):
+        b, pub = self.make()
+        self.assertFalse(os.path.exists(self.file))
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(pub)["nl"], 0)
+        self.assertEqual(self.state(), {"format": 1, "seq": b._alarm_seq,
+                                        "latched": {"instruments": [], "notifications": [], "ha": []}})
+
+    def assert_ignored_and_overwritten(self, content):
+        with open(self.file, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        with self.assertLogs(bridge.LOG, "WARNING") as logs:
+            b, pub = self.make()
+        self.assertIn("state.json", logs.output[0])
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(pub)["nl"], 0)
+        self.assertEqual(self.state()["seq"], b._alarm_seq)       # overwritten at the next evaluation
+        self.assertEqual(self.state()["format"], 1)
+
+    def test_a_corrupt_file_is_ignored_with_a_warning_and_overwritten(self):
+        self.assert_ignored_and_overwritten("{not json")
+
+    def test_an_unknown_format_or_invalid_content_is_ignored(self):
+        for content in ('{"format":2,"seq":5,"latched":{}}', '[]', '{"format":1,"seq":-1,"latched":{}}',
+                        '{"format":1,"seq":true,"latched":{}}', '{"format":1,"seq":1,"latched":{"ha":[1]}}',
+                        '{"format":1,"seq":1}', '\xff'):
+            self.assert_ignored_and_overwritten(content)
+
+    def test_without_a_state_dir_one_warning_and_nothing_is_written(self):
+        for state_dir in (None, ""):
+            with self.assertLogs(bridge.LOG, "WARNING") as logs:
+                b, pub = self.make(state_dir=state_dir)
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn(bridge.STATE_DIR_ENV, logs.output[0])
+            b._set_signalk(bridge.SIGNALK_CONNECTED)
+            b._publish_summary(b.clock())
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_an_unusable_directory_warns_once_and_runs_without_persistence(self):
+        missing = os.path.join(self.dir, "nope")
+        with self.assertLogs(bridge.LOG, "WARNING") as logs:
+            b, pub = self.make(state_dir=missing)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(bridge.STATE_DIR_ENV, logs.output[0])
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b._publish_summary(b.clock())
+        self.assertFalse(os.path.exists(missing))
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            os.chmod(self.dir, 0o500)
+            self.addCleanup(os.chmod, self.dir, 0o700)
+            with self.assertLogs(bridge.LOG, "WARNING"):
+                self.make()
+
+    def test_a_write_failure_warns_once_and_does_not_raise(self):
+        b, pub = self.make()
+        with mock.patch.object(bridge.StateStore, "_write", side_effect=OSError("disk full")) as write:
+            with self.assertLogs(bridge.LOG, "WARNING") as logs:
+                b._publish_summary(b.clock())
+                b._publish_summary(b.clock())
+                b._alarm_seq += 1
+                b._publish_summary(b.clock())
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(write.call_count, 2)       # retried only when the content changed
+
+    def test_no_write_when_nothing_changed_and_one_write_when_it_did(self):
+        b, pub = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b._publish_summary(b.clock())
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            for _ in range(5):
+                b._publish_summary(b.clock())
+                b._tick()
+            self.assertEqual(write.call_count, 0)
+            b.handle_message(note_delta({"state": "alarm"}))         # seq moves: exactly one write
+            self.assertEqual(write.call_count, 1)
+            b.handle_message(note_delta({"state": "alarm"}))
+            self.assertEqual(write.call_count, 1)
+
+    def test_the_file_is_private_and_no_temporary_file_is_left(self):
+        b, _ = self.make()
+        b._publish_summary(b.clock())
+        self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)
+        self.assertEqual(os.listdir(self.dir), ["state.json"])
+        b._alarm_seq += 1
+        b._publish_summary(b.clock())
+        self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)
+        self.assertEqual(os.listdir(self.dir), ["state.json"])
+
+    def test_main_reads_the_state_dir_from_the_environment(self):
+        captured = {}
+
+        class Capture:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+            def run(self, stop):
+                pass
+
+        env = dict(SettingsAndConfigTests.ENV, **{bridge.STATE_DIR_ENV: self.dir})
+        with mock.patch.object(bridge, "Bridge", Capture), mock.patch.object(bridge, "MqttPublisher"), \
+                mock.patch.object(bridge, "load_config", return_value=PERSIST_CONFIG), \
+                mock.patch.object(bridge, "websocket_connector"), mock.patch.object(bridge, "make_ha_client"), \
+                mock.patch.dict(sys.modules, {"paho": mock.MagicMock(), "paho.mqtt": mock.MagicMock(),
+                                              "paho.mqtt.client": mock.MagicMock()}), \
+                mock.patch.object(bridge.signal, "signal"):
+            self.assertEqual(bridge.main(env), 0)
+        self.assertEqual(captured["state_dir"], self.dir)
+
+
 class BridgeLoopTests(unittest.TestCase):
     def test_startup_publishes_status_and_missing_instruments(self):
         pub = Harness([]).run()
         self.assertTrue(pub.started)
-        self.assertEqual(pub.on(STATUS)[0], ("online", True))
+        self.assertEqual(pub.on(STATUS)[:2], [("", True), ("online", False)])
         self.assertEqual(pub.on(SIGNALK)[0], ("disconnected", True))
         self.assertEqual(pub.states(SOG_TOPIC)[0], "missing")
-        self.assertTrue(all(retain for _, _, retain, _ in pub.sent))
+        self.assertTrue(all(retain for t, _, retain, _ in pub.sent if t != STATUS))
 
     def test_signalk_transitions_and_subscribe_frame(self):
         h = Harness([[("idle",), ("close",)]])
@@ -284,16 +632,17 @@ class BridgeLoopTests(unittest.TestCase):
         oks = [p for p, _ in pub.on(SOG_TOPIC) if json.loads(p)["st"] == "ok"]
         self.assertGreaterEqual(len(oks), 2)
 
-    def test_disconnect_makes_instrument_stale_after_threshold(self):
-        # Value arrives, SignalK drops, reconnects keep failing: the clock-driven
-        # tick must still age the value out after stale_after_s (10 s).
+    def test_disconnect_makes_instrument_stale_at_once(self):
+        # Value arrives, SignalK drops: the instrument is stale immediately, not after
+        # stale_after_s (10 s), and stays stale while reconnects keep failing.
         h = Harness([[("msg", delta(10 * KN)), ("close",)]] + [ConnectionError("down")] * 30)
         pub = h.run()
         self.assertIn("stale", pub.states(SOG_TOPIC))
         stale = [json.loads(p) for p, _ in pub.on(SOG_TOPIC) if json.loads(p)["st"] == "stale"][0]
         self.assertIsNone(stale["v"])
-        self.assertGreaterEqual(stale["age"], 10)
-        self.assertLess(stale["age"], 10 + 2)  # within one tick of the threshold
+        self.assertLess(stale["age"], 2)   # published at the disconnect, not at the staleness threshold
+        self.assertEqual(pub.states(SOG_TOPIC)[:2], ["missing", "ok"])
+        self.assertEqual(set(pub.states(SOG_TOPIC)[2:]), {"stale"})
         payloads = [p for p, _ in pub.on(SIGNALK)]
         self.assertEqual(payloads[payloads.index("connected") + 1], "disconnected")
 
@@ -315,8 +664,8 @@ class BridgeLoopTests(unittest.TestCase):
         self.assertEqual(gaps[3], 1)  # after the stable session the delay restarts at 1 s
 
     def test_one_bad_message_does_not_drop_the_connection(self):
-        h = Harness([[("msg", delta(5 * KN)), ("msg", delta(6 * KN)), ("msg", delta(7 * KN)),
-                      ("idle",)]])
+        h = Harness([[("msg", delta(5 * KN)), ("msg", delta(6 * KN, ts="2026-01-01T00:00:01.000Z")),
+                      ("msg", delta(7 * KN, ts="2026-01-01T00:00:02.000Z")), ("idle",)]])
         calls = []
         real = h.bridge.handle_message
 
@@ -445,16 +794,149 @@ class BridgeLoopTests(unittest.TestCase):
 
     def test_mqtt_reconnect_republishes_online_and_signalk_state(self):
         h = Harness([])
-        h.bridge.publisher.publish(STATUS, "x", True)
         h.bridge.signalk_state = "connected"
         h.bridge.on_mqtt_connected()
-        self.assertEqual(h.publisher.sent[-2][:3], (STATUS, "online", True))
-        self.assertEqual(h.publisher.sent[-1][:3], (SIGNALK, "connected", True))
+        tail = [m[:3] for m in h.publisher.sent[-4:]]
+        self.assertEqual(tail[0], (STATUS, "", True))
+        self.assertEqual(tail[1], (STATUS, "online", False))
+        self.assertEqual(tail[2][0:1] + tail[2][2:], (SERVICE, True))
+        self.assertEqual(json.loads(tail[2][1])["state"], "online")
+        self.assertEqual(tail[3], (SIGNALK, "connected", True))
+
+    def test_status_is_a_non_retained_heartbeat_never_a_retained_online(self):
+        h = Harness([[("idle",)] * 30])
+        pub = h.run()
+        for topic, payload, retain, qos in pub.sent:
+            if topic == STATUS and retain:
+                self.assertEqual(payload, "")         # only the legacy delete is retained
+            if topic == STATUS and payload in ("online", "offline"):
+                self.assertEqual((retain, qos), (False, 0))
+        onlines = [i for i, (t, p, *_r) in enumerate(pub.sent) if t == STATUS and p == "online"]
+        self.assertGreaterEqual(len(onlines), 3)         # on connect, then every heartbeat_s
+        self.assertEqual(pub.sent[onlines[0] - 1][:3], (STATUS, "", True))   # the delete comes first
+        self.assertEqual(sum(1 for t, p, *_r in pub.sent if t == STATUS and p == ""), 1)
+
+    def test_online_repeats_every_heartbeat_only_while_connected(self):
+        h = Harness([[]])
+        h.run()
+        pub, clock = h.publisher, h.clock
+        pub.sent.clear()
+        h.bridge._alive_sent = clock.now
+        for _ in range(3):
+            clock.now += CONFIG["heartbeat_s"]
+            h.bridge._next_tick = 0
+            h.bridge._tick()
+        self.assertEqual(len(pub.on(STATUS)), 3)
+        clock.now += CONFIG["heartbeat_s"] - 1                    # not due yet
+        h.bridge._next_tick = 0
+        h.bridge._tick()
+        self.assertEqual(len(pub.on(STATUS)), 3)
+        pub.connected = False                                     # broker down: nothing is published
+        pub.sent.clear()
+        clock.now += 10 * CONFIG["heartbeat_s"]
+        h.bridge._next_tick = 0
+        h.bridge._tick()
+        self.assertEqual(pub.on(STATUS), [])
+        self.assertEqual(pub.on(SERVICE), [])
+        pub.connected = True                                      # reconnect: at once, delete first
+        pub.on_connect()
+        self.assertEqual(pub.on(STATUS), [("", True), ("online", False)])
+
+    def test_service_record_is_retained_online_with_a_timestamp_then_offline(self):
+        h = Harness([[("idle",), ("call", lambda: h.stop.set()), ("idle",)]])
+        pub = h.run()
+        records = [(json.loads(p), r) for p, r in pub.on(SERVICE)]
+        self.assertTrue(all(r for _, r in records))
+        self.assertEqual(records[0][0]["state"], "online")
+        self.assertRegex(records[0][0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(records[-1][0]["state"], "offline")
+        self.assertEqual({q for t, _, _, q in pub.sent if t == SERVICE}, {1})
+        # the offline pair is the last thing published, in this order
+        self.assertEqual([m[0] for m in pub.sent[-2:]], [SERVICE, STATUS])
+
+    def test_mqtt_will_is_a_non_retained_offline_on_the_status_topic(self):
+        created = []
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                created.append(self)
+                self.calls = []
+
+            def __getattr__(self, name):
+                def record(*args, **kwargs):
+                    self.calls.append((name, args, kwargs))
+                return record
+
+        fake_mqtt = mock.Mock()
+        fake_mqtt.Client = FakeClient
+        fake_pkg = mock.Mock(client=fake_mqtt)
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        with mock.patch.dict(sys.modules, {"paho": mock.Mock(mqtt=fake_pkg),
+                                           "paho.mqtt": fake_pkg,
+                                           "paho.mqtt.client": fake_mqtt}):
+            bridge.MqttPublisher(settings).start(lambda: None)
+        will = next(c for c in created[0].calls if c[0] == "will_set")
+        self.assertEqual(will[1], (STATUS, "offline"))
+        self.assertEqual((will[2]["qos"], will[2]["retain"]), (0, False))
+
+    def test_publisher_delete_precedes_online_and_is_never_cached_or_replayed(self):
+        settings = bridge.load_settings({
+            "SIGNALK_URL": "http://127.0.0.1:3000", "DISPLAYS_CONFIG": "/x",
+            "DISPLAYS_BRIDGE_MQTT_USERNAME": "u", "DISPLAYS_BRIDGE_MQTT_PASSWORD": "p"})
+        publisher = bridge.MqttPublisher(settings)
+        published = []
+
+        class Info:
+            rc = 0
+
+            def __init__(self, mid): self.mid = mid
+
+        class Client:
+            def publish(self, topic, payload, qos, retain):
+                published.append((topic, payload, qos, retain))
+                return Info(len(published))
+            def disconnect(self): pass
+            def loop_stop(self): pass
+
+        publisher._client = Client()
+        publisher._worker = threading.Thread(target=publisher._run, daemon=True)
+        publisher._worker.start()
+        b = bridge.Bridge(CONFIG, publisher, lambda: None)
+
+        def connect():
+            ready = threading.Event()
+            publisher._event("connect", lambda: (b.on_mqtt_connected(), ready.set()))
+            self.assertTrue(ready.wait(1))
+            for _ in range(100):
+                if any(m[0] == SERVICE for m in published) and len(published) >= 4:
+                    break
+                time.sleep(0.01)
+
+        connect()
+        publisher._event("disconnect", None)
+        # a heartbeat queued behind the outage must not be replayed later as a fresh "online"
+        publisher.publish(STATUS, "online", False, qos=0)
+        time.sleep(0.1)
+        published.append(("--reconnect--", "", 0, False))
+        connect()
+        publisher.stop()
+        first, second = published[:published.index(("--reconnect--", "", 0, False))], \
+            published[published.index(("--reconnect--", "", 0, False)) + 1:]
+        for wire in (first, second):
+            status = [m for m in wire if m[0] == STATUS]
+            self.assertEqual(status[0], (STATUS, "", 1, True))
+            self.assertEqual(status[1], (STATUS, "online", 0, False))
+            self.assertEqual(len(status), 2)
+            self.assertFalse([m for m in status if m[3] and m[1]])        # never a retained non-empty value
+        self.assertNotIn(STATUS, publisher._retained)
+        self.assertNotIn(STATUS, publisher._retained_mailbox)
 
     def test_sigterm_path_publishes_offline_and_stops_publisher(self):
         h = Harness([[("idle",), ("call", lambda: h.stop.set()), ("idle",)]])
         pub = h.run()
-        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", False))
         self.assertEqual(pub.on(SIGNALK)[-1], ("disconnected", True))
         self.assertTrue(pub.stopped)
         self.assertTrue(h.sources[0].closed)
@@ -463,7 +945,7 @@ class BridgeLoopTests(unittest.TestCase):
         h = Harness([ConnectionError("down")])
         h.stop.set()
         pub = h.run()
-        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", False))
         self.assertTrue(pub.stopped)
 
 
@@ -879,7 +1361,9 @@ class HomeAssistantBridgeTests(unittest.TestCase):
             if not seq or seq[-1] != (b["st"], b["sev"]):
                 seq.append((b["st"], b["sev"]))
         self.assertEqual(seq[:3], [("missing", "unknown"), ("ok", "ok"), ("stale", "unknown")])
-        self.assertEqual(pub.states(SOG_TOPIC)[-1], "ok")
+        # The numeric item stays ok through the Home Assistant outage; it only goes stale when the
+        # script's final close drops SignalK.
+        self.assertEqual(pub.states(SOG_TOPIC), ["missing", "ok", "stale"])
         sk = [json.loads(p) for p, _ in pub.on(SUMMARY)]
         self.assertTrue(any(x["max"] == "unknown" for x in sk))
 
@@ -937,15 +1421,16 @@ class HomeAssistantBridgeTests(unittest.TestCase):
         ha.stop = lambda: (_ for _ in ()).throw(RuntimeError("stuck"))
         with self.assertLogs("vesselstack.displays.bridge", level="WARNING"):
             pub = Harness([[("close",)]], HA_CONFIG, ha=ha).run()
-        self.assertEqual(pub.on(STATUS)[-1], ("offline", True))
+        self.assertEqual(pub.on(STATUS)[-1], ("offline", False))
 
-    def test_clean_stop_publishes_every_counted_ha_item_as_unknown(self):
+    def test_clean_stop_keeps_an_ha_alarm_as_lost_and_the_rest_unknown(self):
         ha = FakeHa()
         script = [ha.put("connected"), ha.put("update", "binary_sensor.high_water", "high"), ("idle",), ("idle",),
                   ("close",)]
         pub = Harness([script], HA_CONFIG, ha=ha).run()
         last = json.loads(pub.on(SUMMARY)[-1][0])
-        self.assertEqual((last["max"], last["na"], last["ids"]), ("unknown", 0, []))
+        self.assertEqual((last["max"], last["na"], last["nu"], last["nl"], last["ids"], last["lost"]),
+                         ("alarm", 1, 1, 1, ["high"], ["high"]))      # bilge never reported: unknown
 
     def test_ha_only_config_is_loadable(self):
         cfg = json.loads((ROOT / "displays" / "displays.example.json").read_text())

@@ -425,6 +425,30 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.equal(node('#update-badge').hidden, false); assert.equal(node('#update-badge').textContent, '1');
   assert.match(node('#band').innerHTML, /0\.6\.1 available/); assert.match(node('#band').innerHTML, /Go to Updates/);
 
+  // An unfinished installation: persistent notice (escaped), no restart note, and a resumable release row.
+  const hostile = '/x/<img src=x onerror=alert(1)>.tar.gz';
+  const incomplete = { components: [], operation: { state: 'idle' }, installed_version: '0.6.1', running_version: '0.6.0', boot_id: 'b1', restart_needed: true, install_incomplete: { version: '0.6.1', from: '0.6.0', started: '2026-01-02T03:04:05Z', backup: hostile } };
+  ui.state.token = 'incomplete-token'; ui.state.bootId = null;
+  fetchImpl = () => Promise.resolve(ok(incomplete));
+  await ui.refreshStatus();
+  assert.match(ui.state.notices['install-incomplete'].text, /The update to 0\.6\.1 did not finish/); assert.match(ui.state.notices['install-incomplete'].text, /Finish this update/);
+  assert.match(ui.state.notices['install-incomplete'].text, /sudo vesselstackctl restore .* --yes/);
+  assert.equal(ui.state.notices['restart-needed'], undefined, 'no restart note beside the unfinished-install note');
+  assert.doesNotMatch(node('#notice').innerHTML, /<img/); assert.match(node('#notice').innerHTML, /&lt;img/);
+  fetchImpl = () => Promise.resolve(ok({ ...incomplete, install_incomplete: { version: null, from: null, started: '2026-01-02T03:04:05Z', backup: '' } }));
+  await ui.refreshStatus();
+  assert.match(ui.state.notices['install-incomplete'].text, /^An installation did not finish/); assert.doesNotMatch(ui.state.notices['install-incomplete'].text, /restore/);
+  ui.state.status = { install_incomplete: incomplete.install_incomplete };
+  ui.state.installedVersion = '0.6.1'; ui.state.releaseChecked = true;
+  ui.renderReleases({ channel: 'stable', installed_version: '0.6.1', running_version: '0.6.0', releases: [{ id: 5, tag: 'v0.6.1', version: '0.6.1', name: 'Fixes', resume: true, html_url: 'https://github.com/jclima/VesselStack/releases/tag/v0.6.1' }] });
+  assert.match(node('#release-result').innerHTML, /Finish this update/); assert.match(node('#release-result').innerHTML, /did not finish\./); assert.doesNotMatch(node('#release-result').innerHTML, /Back up &amp; install/);
+  ui.renderReleases({ channel: 'stable', installed_version: '0.6.1', running_version: '0.6.0', releases: [{ id: 5, tag: 'v0.6.1', version: '0.6.1', name: 'Fixes', html_url: 'https://github.com/jclima/VesselStack/releases/tag/v0.6.1' }] });
+  assert.doesNotMatch(node('#release-result').innerHTML, /Finish this update/, 'an equal version without resume is not offered');
+  fetchImpl = () => Promise.resolve(ok({ ...incomplete, install_incomplete: null, restart_needed: false }));
+  await ui.refreshStatus();
+  assert.equal(ui.state.notices['install-incomplete'], undefined, 'the notice goes away when the marker does');
+  ui.state.status = null; ui.state.installedVersion = '0.6.0';
+
   fetchImpl = (path) => { posts.push({ path }); return Promise.resolve(ok({ channel: 'stable', installed_version: '1.0.0', running_version: '1.0.0', releases: [{ id: 2, tag: 'v2', version: '2.0.0', name: 'Stable', html_url: 'https://github.com/example/repo/releases/tag/v2' }] })); };
   ui.state.token = 'async-token'; node('#include-lab').checked = true;
   let resolveLab;

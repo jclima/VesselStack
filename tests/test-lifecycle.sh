@@ -422,6 +422,38 @@ if run_ctl update --bogus "$UPDATE_SOURCE" >/dev/null 2>&1; then
     echo 'update accepted an unknown option' >&2
     exit 1
 fi
+# A failed installer prints how to retry and the exact archive of the backup just made, and it received
+# that archive through VESSELSTACK_PREUPDATE_BACKUP; with no backup (skip) it says to look in the folder.
+FAIL_SOURCE="$TEST_ROOT/update-fail-source"
+install -d "$FAIL_SOURCE"
+printf '9.9.9\n' > "$FAIL_SOURCE/VERSION"
+cat > "$FAIL_SOURCE/install.sh" <<FAKE_INSTALLER
+#!/bin/bash
+case " \$* " in *" --dry-run "*) exit 0 ;; esac
+printf '%s\\n' "\${VESSELSTACK_PREUPDATE_BACKUP-unset}" > "$TEST_ROOT/preupdate-env"
+exit 1
+FAKE_INSTALLER
+chmod +x "$FAIL_SOURCE/install.sh"
+rm -f "$TEST_ROOT/preupdate-env"
+backups_before=$(find "$BACKUP_ROOT" -maxdepth 1 -name 'vesselstack-*.tar.gz' | sort)
+if run_ctl update "$FAIL_SOURCE" >/dev/null 2>"$TEST_ROOT/update-fail.err"; then
+    echo 'update succeeded although the installer failed' >&2
+    exit 1
+fi
+new_archive=$(comm -13 <(printf '%s\n' "$backups_before") <(find "$BACKUP_ROOT" -maxdepth 1 -name 'vesselstack-*.tar.gz' | sort))
+test "$(wc -l <<<"$new_archive")" -eq 1
+test "$(cat "$TEST_ROOT/preupdate-env")" = "$new_archive"
+grep -Fxq 'The update to 9.9.9 did not finish (see above). Your data is kept.' "$TEST_ROOT/update-fail.err"
+grep -Fxq "Try again (for example once the network is back): sudo vesselstackctl update $FAIL_SOURCE" "$TEST_ROOT/update-fail.err"
+grep -Fxq "Or go back to 0.3.0: sudo vesselstackctl restore $new_archive --yes" "$TEST_ROOT/update-fail.err"
+rm -f "$TEST_ROOT/preupdate-env"
+if run_ctl update --backup-choice=skip "$FAIL_SOURCE" >/dev/null 2>"$TEST_ROOT/update-fail.err"; then
+    echo 'update (skip) succeeded although the installer failed' >&2
+    exit 1
+fi
+test "$(cat "$TEST_ROOT/preupdate-env")" = unset
+grep -Fxq 'Or go back: restore the newest vesselstack-*.tar.gz in your backup folder: sudo vesselstackctl restore FILE --yes' "$TEST_ROOT/update-fail.err"
+grep -q 'did not finish' "$TEST_ROOT/update-fail.err"
 if run_ctl backup "$DATA_ROOT/recursive-backups" >/dev/null 2>&1; then
     echo 'Backup accepted a destination inside the data tree' >&2
     exit 1
@@ -1037,6 +1069,41 @@ version_output=$(run_ctl version)
 status_output=$(run_ctl status)
 doctor_output=$(run_ctl doctor)
 grep -Eq 'OK   Boat Chat memory index: [1-9][0-9]* chunks' <<<"$doctor_output"
+
+# An unfinished installation (config/install-in-progress) is reported by doctor, status and version.
+MARKER_SRC="$TEST_ROOT/marker-source"
+install -d "$MARKER_SRC"
+printf '0.9.0\n' > "$MARKER_SRC/VERSION"
+printf '#!/bin/bash\n' > "$MARKER_SRC/install.sh"
+chmod +x "$MARKER_SRC/install.sh"
+MARKER_FILE="$APP_ROOT/config/install-in-progress"
+printf 'version=0.9.0\nfrom=0.3.0\nstarted=2026-01-02T03:04:05Z\nstart=1\nsource=%s\nbackup=/backups/vesselstack-x.tar.gz\nunknown=ignored\n' "$MARKER_SRC" > "$MARKER_FILE"
+marker_doctor=$(run_ctl doctor 2>&1 || true)
+grep -Fq 'FAIL installation of 0.9.0 did not finish (started 2026-01-02T03:04:05Z)' <<<"$marker_doctor"
+grep -Fq "continue: sudo $MARKER_SRC/install.sh --config $APP_ROOT/config/vesselstack.env --start" <<<"$marker_doctor"
+grep -Fq 'go back:  sudo vesselstackctl restore /backups/vesselstack-x.tar.gz --yes' <<<"$marker_doctor"
+grep -Fq 'RESULT attention required' <<<"$marker_doctor"
+test "$(grep -c 'did not finish' <<<"$marker_doctor")" -eq 1
+marker_status=$(run_ctl status 2>&1 || true)
+grep -Fq 'Installation         INCOMPLETE (0.9.0, started 2026-01-02T03:04:05Z); see: sudo vesselstackctl doctor' <<<"$marker_status"
+if run_ctl status >/dev/null 2>&1; then echo 'status succeeded with an unfinished installation' >&2; exit 1; fi
+grep -Fq 'VesselStack installed: 0.3.0 (installation did not finish; see: sudo vesselstackctl doctor)' <<<"$(run_ctl version)"
+# A source whose VERSION differs falls back to the bootstrap command.
+printf '0.8.0\n' > "$MARKER_SRC/VERSION"
+grep -Fq 'continue: run get-vesselstack.sh again with --version 0.9.0' <<<"$(run_ctl doctor 2>&1 || true)"
+# A symbolic link is never trusted.
+mv "$MARKER_FILE" "$MARKER_FILE.real"
+ln -s "$MARKER_FILE.real" "$MARKER_FILE"
+if grep -Fq 'did not finish' <<<"$(run_ctl doctor 2>&1 || true)$(run_ctl status 2>&1 || true)$(run_ctl version)"; then
+    echo 'a symlinked install marker was reported' >&2
+    exit 1
+fi
+rm -f "$MARKER_FILE" "$MARKER_FILE.real"
+if grep -Fq 'did not finish' <<<"$(run_ctl doctor 2>&1 || true)$(run_ctl status 2>&1 || true)$(run_ctl version)"; then
+    echo 'doctor, status or version reported a removed install marker' >&2
+    exit 1
+fi
+test "$(run_ctl version | sed -n 1p)" = 'VesselStack installed: 0.3.0'
 grep -q '127.0.0.1:9876' <<<"$urls_output" || grep -q ':9876' <<<"$urls_output"
 grep -q 'Boat Chat .*ALL interfaces' <<<"$urls_output"
 grep -q 'InfluxDB .*this device only' <<<"$urls_output"
@@ -1894,8 +1961,32 @@ printf 'wal after backup\n' > "$DATA_ROOT/created-after-backup.wal"
 printf 'unit two\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 printf 'UPDATE_KEY=two\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
 rm -f -- "$TEST_ROOT/installer-ran"
+# Units this system has but the archive does not (a newer release than the backup) are turned
+# off and reported; an owner-made unit is left alone.
+install -d "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants"
+printf 'newer\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.timer"
+printf 'newer\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service"
+printf 'owner\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service"
+ln -s ../vesselstack-alerts.timer "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-alerts.timer"
+ln -s ../vesselstack-custom.service "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
+: > "$FAKE_BIN/calls.log"
 restore_output=$(run_ctl restore "$archive" --yes)
 grep -q 'Restore completed' <<<"$restore_output"
+grep -qx 'Turned off because the restored version does not have them:' <<<"$restore_output" || {
+    echo 'Restore did not report the units it turned off' >&2
+    exit 1
+}
+grep -qx '  Telegram alerts (vesselstack-alerts.timer)' <<<"$restore_output"
+if [ -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.timer" ] || \
+   [ -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service" ] || \
+   [ -L "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-alerts.timer" ]; then
+    echo 'Restore left a unit the restored version does not have' >&2
+    exit 1
+fi
+grep -qx 'owner' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service"
+test -L "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
+rm -f -- "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service" \
+    "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
 grep -qx 'version one' "$DATA_ROOT/state.txt"
 test ! -e "$DATA_ROOT/created-after-backup.wal"
 [ "$(stat -c %u:%g "$DATA_ROOT/state.txt")" = 1234:1234 ] || {
@@ -1913,6 +2004,24 @@ test -d "$(printf '%s\n' "$APP_ROOT".pre-restore-* | head -n 1)"
 for leftover in "$TEST_ROOT"/opt/.vesselstack-restore.*; do
     [ ! -e "$leftover" ] || { echo 'Restore left a staging directory behind' >&2; exit 1; }
 done
+# The Control Panel and the timers read or write the trees, so they are stopped for the swap.
+grep -qx 'systemctl stop vesselstack-control-panel.service' "$FAKE_BIN/calls.log" || {
+    echo 'Restore did not stop the Control Panel' >&2
+    exit 1
+}
+grep -Eq '^systemctl stop vesselstack-[a-z-]+\.timer$' "$FAKE_BIN/calls.log" || {
+    echo 'Restore did not stop a VesselStack timer' >&2
+    exit 1
+}
+rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
+
+# --skip-installer succeeds and says how to finish: the Python environments are not in a backup.
+skip_output=$(run_ctl restore "$archive" --yes --skip-installer 2>&1)
+grep -q 'Restore completed' <<<"$skip_output"
+grep -qxF "sudo $APP_ROOT/installer/install.sh --config $APP_ROOT/config/vesselstack.env --start" <<<"$skip_output" || {
+    echo 'restore --skip-installer did not print the installer command' >&2
+    exit 1
+}
 rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
 
 touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \

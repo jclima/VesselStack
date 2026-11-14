@@ -101,6 +101,46 @@ class PromptPreferenceTests(unittest.TestCase):
         app.build_prompt("fuel today", source)
         self.assertEqual(source["current_telemetry"]["temperature"]["unit"], "°F")
 
+    def test_request_time_line_follows_context_and_survives_trimming(self) -> None:
+        context = {"now_utc": "2026-11-14T12:00:00Z", "question_type": {}, "answer_mode": "concise",
+                   "current_telemetry": {"clock_status": "unverified", "values": {}},
+                   "influx_history": {"blob": "x" * 5000}}
+        with mock.patch.object(app, "LOCAL_TZ", ZoneInfo("Europe/Oslo")):
+            prompt = app.build_prompt("battery?", context, max_chars=300)
+            cli = app.build_cli_prompt("battery?", context)
+        line = "Request time: 2026-11-14 13:00 CET (2026-11-14T12:00:00Z). Boat clock: unverified."
+        self.assertIn(line, prompt)
+        self.assertGreater(prompt.index(line), prompt.index("Boat context JSON:"))
+        self.assertGreater(prompt.index(line), prompt.index('"context_trimming"'))
+        self.assertLess(prompt.index(line), prompt.index("Question:\nbattery?"))
+        self.assertNotIn("Request time", prompt.split("\n\nResponse mode:", 1)[0])
+        self.assertIn(line, cli)
+        self.assertIn("never report a stale RPM", cli)
+
+    def test_data_age_rule_is_in_system_prompt(self) -> None:
+        self.assertIn(app.DATA_AGE_RULE, app.system_prompt())
+        self.assertIn(app.DATA_AGE_RULE, app.DEFAULT_SYSTEM_PROMPT)
+        for path in (app.BOAT_CHAT_AGENT, app.KNOWLEDGE_ROOT / "answering.md"):
+            self.assertIn(app.DATA_AGE_RULE, path.read_text(), str(path))
+
+    def test_data_age_rule_appears_exactly_once_whichever_base_is_used(self) -> None:
+        key = "Values in current_telemetry.stale_values are not current"
+        cases = {
+            "agent file": None,
+            "fallback default": app.DEFAULT_SYSTEM_PROMPT,
+            "custom without rule": "You are a custom boat assistant.",
+            "rule wrapped across lines": app.DATA_AGE_RULE.replace(". ", ".\n").replace(", ", ",\n"),
+        }
+        for name, base in cases.items():
+            with self.subTest(name):
+                # setUp gave an empty cache, so system_prompt() loads its base through load_system_prompt().
+                if base is None:
+                    prompt = app.system_prompt()
+                else:
+                    with mock.patch.object(app, "load_system_prompt", return_value=base):
+                        prompt = app.system_prompt()
+                self.assertEqual(" ".join(prompt.split()).count(key), 1, name)
+
     def test_stale_canonical_key_keeps_authoritative_source_label(self) -> None:
         context = {"ha_telemetry": {"matched": [{"entity_id": "sensor.temp", "unit": "°C", "state": "20"}]},
                    "influx_history": {"units": {"sensor.temp": "F"}}, "question_type": {}}

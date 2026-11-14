@@ -417,7 +417,10 @@ values, and record the `doctor` result and data-directory size each day.
    It runs `install.sh --dry-run`, takes a verified backup into
    `VESSELSTACK_BACKUP` (stopping the stack briefly), then installs with
    `--start`. `scripts/migrate.sh` runs any `scripts/migrations/<version>.sh`
-   steps in order; `installed-version` is written last.
+   steps in order; `installed-version` records the configuration version once everything is
+   rendered, and starting the services comes after it. `config/install-in-progress` exists from
+   the first change until the start phase has succeeded, so its presence means an installation or
+   update did not finish.
 
 2. **Backup, verify, restore.**
 
@@ -671,7 +674,10 @@ backup, the recorded sha256 and a console/Ethernet path ready.
 **Failed or interrupted update.** `install.sh` is transactional: preflight
 (`migrate.sh --check`, Compose validation, offline wheelhouse/image checks) runs
 before any file is touched, the Python environment is built in a staging
-virtualenv first, and `installed-version` is written last. A failure before the
+virtualenv first, and `installed-version` records the configuration version once everything is
+rendered (starting the services comes after it). `config/install-in-progress` exists from the
+first change until the start phase has succeeded, so its presence means an installation or
+update did not finish. A failure before the
 swap prints "Nothing was changed" and leaves the old install running config. If
 the process dies during the later swap, run `vesselstackctl doctor` and treat the
 host as suspect: restore the backup below rather than guessing.

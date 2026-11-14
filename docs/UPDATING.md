@@ -24,6 +24,12 @@ installs and starts the release:
 curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash
 ```
 
+Running it again for the version that is already installed reports "nothing to do". If the
+previous run did not finish (for example the network dropped while images were downloading),
+the same command continues it with the saved settings instead: the questions are not asked
+again and no new backup is made. After a failed update the message names the backup to restore
+(`sudo vesselstackctl restore FILE --yes`).
+
 The command itself needs the unpacked release directory, so plain `vesselstackctl update`
 with no argument fails. To run it by hand once a release is unpacked (the installer unpacks to
 `/opt/vesselstack-release/<version>`):
@@ -31,6 +37,12 @@ with no argument fails. To run it by hand once a release is unpacked (the instal
 ```bash
 sudo vesselstackctl update /opt/vesselstack-release/0.7.0
 ```
+
+If the installer fails part-way, `vesselstackctl update` stops with three lines: that the update
+to the new version did not finish and your data is kept, the command to try again (for example
+once the network is back), and the exact `sudo vesselstackctl restore ARCHIVE --yes` command for
+the backup it just made. If no backup was made (a skipped backup), it says to restore the newest
+`vesselstack-*.tar.gz` in your backup folder instead.
 
 From a terminal (`ssh -t`) the installer now offers to fix an unsupported `BOAT_UNITS` value or
 a setting that cannot be written safely at a prompt instead of stopping (choose, or `c` to
@@ -125,7 +137,14 @@ update` and the Control Panel updater stop before the backup, naming only the se
 see [Upgrading to 0.6.0](../README.md#upgrading-to-060). The env files are then written
 atomically (temporary file, then rename), so a failed run never leaves one truncated. When
 the code, units and `compose.yml` have been replaced, the staged virtualenv is swapped
-in and `installed-version` is written last.
+in and `installed-version` records the configuration version once everything is rendered.
+Starting the services comes after that. `config/install-in-progress` exists from the first
+change until the start phase has succeeded; its presence means an installation or update did
+not finish.
+`sudo vesselstackctl doctor` reports it as `FAIL installation of VERSION did not finish`, with the
+command to continue and, when a backup was recorded, the command to go back; `sudo vesselstackctl
+status` shows an `Installation INCOMPLETE` line (and exits non-zero) and `vesselstackctl version`
+adds a note.
 
 ## Rollback
 

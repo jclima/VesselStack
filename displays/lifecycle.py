@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -72,6 +73,7 @@ class Context:
     image: str | None = None
     container: str = mqtt_auth.CONTAINER
     out: Callable = print
+    now: Callable = lambda: datetime.now(timezone.utc)
 
     @property
     def config_dir(self) -> Path:
@@ -596,6 +598,41 @@ def parse_retained(output: str) -> dict:
     return messages
 
 
+def _age_text(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 120:
+        return f"{seconds} s"
+    if seconds < 7200:
+        return f"{seconds // 60} min"
+    if seconds < 172800:
+        return f"{seconds // 3600} h"
+    return f"{seconds // 86400} days"
+
+
+def bridge_report(raw, now, fresh_s: float) -> str:
+    """The bridge state from its retained bridge/service record, with the age of the report.
+
+    The record is "last known": after a crash or power loss it still says online, so a report older than
+    fresh_s is not shown as a live bridge.
+    """
+    if raw is None:
+        return "unknown (no report)"
+    try:
+        record = json.loads(raw)
+        state = record["state"]
+        reported = datetime.strptime(record["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if state not in ("online", "offline"):
+            raise ValueError("state")
+    except (ValueError, KeyError, TypeError):
+        return "unknown (unreadable report)"
+    age = (now - reported).total_seconds()
+    if age < -60:
+        return "unknown (report is dated in the future; check the clock)"
+    if state == "online" and age > fresh_s:
+        return f"last reported online {_age_text(age)} ago; the bridge may not be running"
+    return f"{state} (reported {_age_text(age)} ago)"
+
+
 def status(ctx: Context) -> int:
     registry = load_registry()
     with ConfigDir(ctx) as cfg_dir:
@@ -610,7 +647,7 @@ def status(ctx: Context) -> int:
                              "start the stack with 'vesselstackctl start'")
     result = ctx.exec_runner(
         ["docker", "exec", "-i", ctx.container, "sh", "-c", STATUS_SCRIPT, "status",
-         topics.BRIDGE_STATUS_TOPIC, topics.BRIDGE_SIGNALK_TOPIC,
+         topics.BRIDGE_SERVICE_TOPIC, topics.BRIDGE_SIGNALK_TOPIC,
          f"{topics.TOPIC_ROOT}/displays/+/status"],
         options)
     if result.returncode not in (0, 27):  # 27: mosquitto_sub -W timeout, the normal end
@@ -621,7 +658,9 @@ def status(ctx: Context) -> int:
     def state_of(topic: str, missing: str) -> str:
         return _clean(messages[topic]) if topic in messages else missing
 
-    ctx.out(f"{'Bridge':<20}{state_of(topics.BRIDGE_STATUS_TOPIC, 'unknown (no retained status)')}")
+    heartbeat = config.get("heartbeat_s", schema.DEFAULT_HEARTBEAT_S)
+    ctx.out(f"{'Bridge':<20}" + bridge_report(messages.get(topics.BRIDGE_SERVICE_TOPIC), ctx.now(),
+                                              3 * heartbeat))
     ctx.out(f"{'SignalK link':<20}{state_of(topics.BRIDGE_SIGNALK_TOPIC, 'unknown (no retained status)')}")
     if not config["displays"]:
         ctx.out("No displays configured.")

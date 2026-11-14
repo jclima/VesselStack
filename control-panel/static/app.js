@@ -120,6 +120,14 @@ function setNotice(id, text, kind = "info") {
   host.innerHTML = Object.entries(state.notices).map(([key, item]) => `<div class="banner ${item.kind}" role="status"><span class="icon" aria-hidden="true">i</span><div class="msg">${escapeHtml(item.text)}</div><button type="button" class="x" data-dismiss-notice="${escapeHtml(key)}" aria-label="Dismiss message">&#10005;</button></div>`).join("");
 }
 
+function installIncompleteText(marker) {
+  if (!marker || typeof marker !== "object") return "";
+  const backup = typeof marker.backup === "string" ? marker.backup : "";
+  const what = marker.version ? `The update to ${marker.version} did not finish.` : "An installation did not finish.";
+  const restore = backup ? `, or restore the backup made before it (${backup.split("/").pop()}) from a terminal: sudo vesselstackctl restore ${backup} --yes` : "";
+  return `${what} Services may be stopped or out of date. Open Updates and choose "Finish this update" to try again${restore}.`;
+}
+
 function setConnection(mode) {
   state.connection = mode;
   $("#connection-dot").className = mode === "connected" ? "dot online" : mode === "disconnected" ? "dot offline" : "dot";
@@ -1043,7 +1051,8 @@ async function refreshStatus() {
     $("#version-chip").textContent = state.installedVersion;
     $("#version-chip").hidden = state.installedVersion === "unknown";
     $("#boat-name").textContent = data.boat_name || "";
-    setNotice("restart-needed", data.restart_needed ? "A newer Control Panel is installed than the one running. Restart it from the Maintenance tab to use the new version." : "");
+    setNotice("install-incomplete", installIncompleteText(data.install_incomplete));
+    setNotice("restart-needed", data.restart_needed && !data.install_incomplete ? "A newer Control Panel is installed than the one running. Restart it from the Maintenance tab to use the new version." : "");
     renderRemote(data.remote);
     renderUpdates();
     renderComponents(data.components);
@@ -1101,6 +1110,7 @@ function releaseEligible(release) {
   const candidate = versionTuple(release.version);
   const installed = versionTuple(state.installedVersion);
   if (!candidate || !installed) return false;
+  if (release.resume === true) return compareVersions(release.version, state.installedVersion) >= 0;
   return compareVersions(release.version, state.installedVersion) > 0;
 }
 
@@ -1109,6 +1119,12 @@ const eligibleReleases = () => state.releases.filter(releaseEligible).sort((a, b
 function updateReleaseControls() {
   $("#check-releases").disabled = state.releaseCheckPending || state.busy;
   $$("[data-install]").forEach((button) => { button.disabled = state.releaseCheckPending || state.busy; });
+}
+
+function resumeDate() {
+  const started = state.status?.install_incomplete?.started;
+  const when = started ? new Date(started) : null;
+  return when && !Number.isNaN(when.getTime()) ? `started on ${escapeHtml(when.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" }))}` : "was started earlier";
 }
 
 function renderUpdates() {
@@ -1126,7 +1142,7 @@ function renderUpdates() {
   else if (!available.length) html = `<div class="banner ok" role="status"><span class="icon" aria-hidden="true">&#10003;</span><div class="msg"><strong>You're up to date on ${escapeHtml(state.installedVersion)}</strong><span class="detail">Checked ${escapeHtml(state.releaseCheckedAt)}.</span></div></div>`;
   else {
     html = `<div class="banner info" role="status"><span class="icon" aria-hidden="true">&#8593;</span><div class="msg"><strong>${escapeHtml(available[0].version)} is available</strong> <span class="muted">(you have ${escapeHtml(state.installedVersion)})</span><span class="detail">Checked ${escapeHtml(state.releaseCheckedAt)}.</span></div></div>`;
-    html += available.map((release) => `<div class="release-item"><h3>${escapeHtml(release.name)}${release.prerelease ? " (early test release)" : ""}</h3><p><a href="${releaseUrl(release.html_url)}" target="_blank" rel="noreferrer">Read the release notes on GitHub</a></p><button type="button" class="primary" data-install="${escapeHtml(release.id)}">Back up &amp; install ${escapeHtml(release.version)}</button><span class="hint">Takes a backup first, then installs. The Control Panel may restart and this page will reconnect by itself. Boat services pause briefly.</span></div>`).join("");
+    html += available.map((release) => `<div class="release-item"><h3>${escapeHtml(release.name)}${release.prerelease ? " (early test release)" : ""}</h3><p><a href="${releaseUrl(release.html_url)}" target="_blank" rel="noreferrer">Read the release notes on GitHub</a></p>${release.resume === true ? `<p class="muted">This update ${resumeDate()} and did not finish.</p>` : ""}<button type="button" class="primary" data-install="${escapeHtml(release.id)}">${release.resume === true ? "Finish this update" : `Back up &amp; install ${escapeHtml(release.version)}`}</button><span class="hint">Takes a backup first, then installs. The Control Panel may restart and this page will reconnect by itself. Boat services pause briefly.</span></div>`).join("");
     if (state.releaseChannel === "lab") html += `<p class="small warn-text">Early test releases are for testing. Read the release notes before installing.</p>`;
   }
   $("#release-result").innerHTML = html;

@@ -1,4 +1,5 @@
 import importlib.util
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -305,7 +306,7 @@ class MetricPresentationTests(unittest.TestCase):
             series = []
             for row in points:
                 value = APP.display_units.display_value(row["_measurement"], float(row["_value"]), "metric")
-                series.append({"value": value, "label": f"{value:g} {APP.unit_for_measurement(row['_measurement'], {})}"})
+                series.append({"value": value, "label": f"{value:g} {APP.display_units.unit_for_measurement(row['_measurement'], 'metric', APP.canonical_unit_for_measurement(row['_measurement']))}"})
         self.assertEqual(series[0], {"value": 100.0, "label": "100 °C"})
 
     def test_actual_history_keeps_ha_source_units_across_chart_cards_and_focus(self):
@@ -382,6 +383,179 @@ class MetricPresentationTests(unittest.TestCase):
             customary = APP.answer_from_fuel_balance(context)
         self.assertIn("L/h", metric); self.assertIn("7.571", metric); self.assertIn("-20.0", metric); self.assertIn("20.0%", metric); self.assertIn("L.", metric)
         self.assertIn("gal/h", customary); self.assertIn("2.000", customary); self.assertIn("-20.0", customary); self.assertIn("20.0%", customary); self.assertIn("gal.", customary)
+
+
+def _node(value, meta_units=None):
+    node = {"value": value, "timestamp": "2026-01-01T00:00:00Z"}
+    if meta_units:
+        node["meta"] = {"units": meta_units}
+    return node
+
+
+# Synthetic Signal K self tree: one path per unit mismatch the shared units
+# table fixes, plus an unknown path and a path whose metadata unit conflicts.
+SYNTHETIC_SIGNALK = {
+    "propulsion": {"port": {
+        "oilTemperature": _node(358.15), "engineLoad": _node(0.4),
+        "coolantTemperature": _node(80.0, "C"),
+    }},
+    "navigation": {
+        "headingTrue": _node(1.5708), "customGauge": _node(7.0),
+        "attitude": _node({"roll": 0.1, "pitch": 0.2, "yaw": 0.3}),
+    },
+    "tanks": {"fuel": {"0": {"capacity": _node(0.378541), "currentLevel": _node(0.5)}},
+              "freshWater": {"0": {"currentLevel": _node(0.25)}}},
+    "environment": {"wind": {"speedApparent": _node(10)}, "current": {"drift": _node(1.0)}},
+}
+
+
+class UnitSchemaSnapshotTests(unittest.TestCase):
+    def _snapshot(self):
+        with mock.patch.object(APP, "get_signalk_self", return_value=SYNTHETIC_SIGNALK), \
+                mock.patch.object(APP, "semantic_match_score", return_value=1):
+            return APP.current_telemetry_snapshot("units")
+
+    def test_snapshot_values_and_labels_agree(self):
+        snap = self._snapshot()
+        self.assertEqual(snap["unit_schema"], 2)
+        expected = {
+            "propulsion.port.oilTemperature": (185.0, "F"),
+            "navigation.headingTrue": (90.0, "deg"),
+            "tanks.fuel.0.capacity": (100.0, "US gal"),
+            "tanks.freshWater.0.currentLevel": (25.0, "%"),
+            "environment.wind.speedApparent": (19.44, "kn"),
+            "propulsion.port.engineLoad": (40.0, "%"),
+            "environment.current.drift": (1.94, "kn"),
+        }
+        for path, (value, unit) in expected.items():
+            with self.subTest(path=path):
+                self.assertAlmostEqual(snap["values"][path], value, places=1)
+                self.assertEqual(snap["units"][path], unit)
+        self.assertNotEqual(snap["units"]["environment.current.drift"], "A")
+
+    def test_unknown_and_conflicting_units_are_reported(self):
+        snap = self._snapshot()
+        self.assertEqual(snap["units"]["navigation.customGauge"], "")
+        self.assertEqual(snap["values"]["navigation.customGauge"], 7.0)
+        self.assertEqual(snap["unknown_unit_paths"], ["navigation.customGauge"])
+        path = "propulsion.port.coolantTemperature"
+        self.assertEqual(snap["values"][path], 80.0)
+        self.assertEqual(snap["units"][path], "C")
+        self.assertEqual(snap["unit_conflicts"], {path: "C"})
+
+    def test_every_numeric_value_has_a_units_entry(self):
+        snap = self._snapshot()
+        numeric = [k for k, v in snap["values"].items() if isinstance(v, (int, float))]
+        self.assertGreater(len(numeric), 5)
+        for key in numeric:
+            self.assertIn(key, snap["units"])
+
+    def test_attitude_object_becomes_labelled_degree_scalars(self):
+        snap = self._snapshot()
+        self.assertNotIn("navigation.attitude", snap["values"])
+        self.assertNotIn("navigation.attitude", snap["units"])
+        for axis, degrees in (("roll", 5.7296), ("pitch", 11.4592), ("yaw", 17.1887)):
+            path = f"navigation.attitude.{axis}"
+            with self.subTest(path=path):
+                self.assertAlmostEqual(snap["values"][path], degrees, places=3)
+                self.assertEqual(snap["units"][path], "deg")
+                self.assertEqual(snap["timestamps"][path], "2026-01-01T00:00:00Z")
+        self.assertFalse([k for k, v in snap["values"].items() if isinstance(v, dict) and "attitude" in k])
+
+    def test_stale_temperature_is_still_converted_in_metric_model_copy(self):
+        now = dt.datetime(2026, 1, 3, tzinfo=dt.timezone.utc)
+        with mock.patch.object(APP, "get_signalk_self", return_value=SYNTHETIC_SIGNALK), \
+                mock.patch.object(APP, "semantic_match_score", return_value=1):
+            snap = APP.current_telemetry_snapshot("units", now=now)
+        self.assertEqual(snap["freshness"]["propulsion.port.oilTemperature"], "stale")
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
+            shown = APP.compact_context({"current_telemetry": snap, "question_type": {"current_request": True}})["current_telemetry"]
+        self.assertNotIn("propulsion.port.oilTemperature", shown["values"])
+        self.assertAlmostEqual(shown["stale_values"]["propulsion.port.oilTemperature"], 85.0, places=1)
+        self.assertEqual(shown["units"]["propulsion.port.oilTemperature"], "\u00b0C")
+        self.assertEqual(snap["values"]["propulsion.port.oilTemperature"], 185.0)
+
+    def test_metric_display_of_snapshot(self):
+        snap = self._snapshot()
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
+            shown = APP.display_units.normalize_context({"current_telemetry": snap}, "metric")["current_telemetry"]
+        self.assertAlmostEqual(shown["values"]["propulsion.port.oilTemperature"], 85.0, places=1)
+        self.assertEqual(shown["units"]["propulsion.port.oilTemperature"], "\u00b0C")
+        self.assertAlmostEqual(shown["values"]["tanks.fuel.0.capacity"], 378.5, places=1)
+        self.assertEqual(shown["units"]["tanks.fuel.0.capacity"], "L")
+        self.assertAlmostEqual(shown["values"]["navigation.headingTrue"], 90.0, places=1)
+        # Unknown unit: passed through, no path-based guess; conflicting C stays 80.
+        self.assertEqual(shown["values"]["navigation.customGauge"], 7.0)
+        self.assertEqual(shown["units"]["navigation.customGauge"], "")
+        self.assertEqual(shown["values"]["propulsion.port.coolantTemperature"], 80.0)
+        self.assertEqual(shown["values"]["tanks.freshWater.0.currentLevel"], 25.0)
+
+    def test_empty_unit_is_never_guessed_from_the_path(self):
+        d = APP.display_units
+        self.assertEqual(d.display_value("propulsion.port.oilTemperature", 358.15, "metric", ""), 358.15)
+        context = {"values": {"environment.outside.pressure": 29.92}, "units": {"environment.outside.pressure": ""}}
+        shown = d.normalize_context(context, "metric")
+        self.assertEqual(shown["values"]["environment.outside.pressure"], 29.92)
+        self.assertEqual(shown["units"]["environment.outside.pressure"], "")
+        stats = {"units": {"propulsion.port.temperature": ""},
+                 "s": {"propulsion.port.temperature": {"min": 10.0, "delta": 2.0}}}
+        shown = d.normalize_context(stats, "metric")
+        self.assertEqual(shown["s"]["propulsion.port.temperature"], {"min": 10.0, "delta": 2.0})
+
+    def test_new_labels_pass_through_and_us_gal_converts(self):
+        d = APP.display_units
+        for label in ("NM", "Ah", "deg/min", "Hz", "s", "deg", "kn", "%"):
+            with self.subTest(label=label):
+                self.assertEqual(d.unit_for_measurement("x.y", "metric", label), label)
+                self.assertEqual(d.display_value("x.y", 3.0, "metric", label), 3.0)
+        self.assertEqual(d.unit_for_measurement("tanks.fuel.0.capacity", "metric", "US gal"), "L")
+        self.assertAlmostEqual(d.display_value("tanks.fuel.0.capacity", 100.0, "metric", "US gal"), 378.54, places=1)
+
+    def test_wrappers_share_one_resolution(self):
+        for path, value, unit in (("propulsion.port.oilTemperature", 358.15, "F"), ("navigation.headingTrue", 1.5708, "deg"),
+                                  ("tanks.fuel.0.capacity", 0.378541, "US gal"), ("custom.thing", 3.0, "")):
+            with self.subTest(path=path):
+                self.assertEqual(APP.canonical_unit_for_measurement(path), unit)
+                self.assertEqual(APP.convert_generic_value(path, value), APP.signalk_units.canonical(path, value)[0])
+
+    def test_history_values_and_labels_agree(self):
+        rows = [
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "propulsion.port.oilTemperature", "_value": "358.15"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "propulsion.port.oilTemperature", "_value": "358.15"},
+            {"_time": "2026-01-01T00:00:00Z", "_measurement": "navigation.headingTrue", "_value": "1.5708"},
+            {"_time": "2026-01-01T00:01:00Z", "_measurement": "navigation.headingTrue", "_value": "1.5708"},
+        ]
+        names = sorted({r["_measurement"] for r in rows})
+        def list_measurements(bucket):
+            return names if bucket == APP.INFLUX_HISTORY_BUCKET else []
+        def query(flux):
+            return [dict(r) for r in rows] if f'from(bucket: "{APP.INFLUX_HISTORY_BUCKET}")' in flux else []
+        with mock.patch.object(APP, "influx_measurements", side_effect=list_measurements), \
+                mock.patch.object(APP, "query_influx", side_effect=query), \
+                mock.patch.dict(os.environ, {"BOAT_UNITS": "us_customary"}, clear=False):
+            history = APP.generic_influx_history_summary("oil temperature and heading history")
+        bucket = history["buckets"][APP.INFLUX_HISTORY_BUCKET]
+        self.assertEqual(bucket["units"], {"navigation.headingTrue": "deg", "propulsion.port.oilTemperature": "F"})
+        summary = bucket["numeric_summary"]
+        self.assertAlmostEqual(summary["propulsion.port.oilTemperature"]["avg"], 185.0, places=1)
+        self.assertAlmostEqual(summary["navigation.headingTrue"]["avg"], 90.0, places=1)
+        series = {item["label"]: item for item in bucket["chart_series"]}
+        self.assertEqual(len(series), 2)
+        for item in series.values():
+            self.assertIn(item["unit"], {"F", "deg"})
+        temp = next(i for i in bucket["chart_series"] if i["unit"] == "F")
+        self.assertAlmostEqual(temp["points"][0]["value"], 185.0, places=1)
+        self.assertEqual(temp["points"][0]["label"], "185 F")
+
+    def test_propulsion_summary_units_agree_with_values(self):
+        rows = [{"_time": "2026-01-01T00:00:00Z", "_measurement": "propulsion.port.engineLoad", "_value": "0.4"}]
+        with mock.patch.object(APP, "query_influx", return_value=rows):
+            result = APP.propulsion_summary(1)
+        self.assertAlmostEqual(result["summary"]["propulsion.port.engineLoad"]["avg"], 40.0, places=2)
+        self.assertEqual(result["units"]["propulsion.port.engineLoad"], "%")
+        self.assertEqual(result["units"]["propulsion.port.fuel.rate"], "gal/h")
+        self.assertEqual(result["units"]["propulsion.port.temperature"], "F")
+        self.assertNotIn("source units", str(result["units"]))
 
 
 if __name__ == "__main__":

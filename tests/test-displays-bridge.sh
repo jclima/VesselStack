@@ -28,6 +28,7 @@ BROKER="vs-bridge-broker-$SUFFIX"
 SIGNALK="vs-bridge-signalk-$SUFFIX"
 HA="vs-bridge-ha-$SUFFIX"
 BRIDGE="vs-bridge-bridge-$SUFFIX"
+WATCH="vs-bridge-watch-$SUFFIX"
 VENV_VOL="vs-bridge-venv-$SUFFIX"
 TEST_ROOT=$(mktemp -d)
 ROOT="$TEST_ROOT/root"
@@ -43,7 +44,7 @@ install -m 0644 "$REPO_ROOT/templates/mosquitto.conf" "$ROOT/config/mosquitto/mo
 if [ "$IS_ROOT" -eq 1 ]; then AUTH_SRC="$MDIR"; else AUTH_SRC="$BROKER-auth"; fi
 
 cleanup() {
-    docker rm -f "$BROKER" "$SIGNALK" "$HA" "$BRIDGE" >/dev/null 2>&1 || true
+    docker rm -f "$BROKER" "$SIGNALK" "$HA" "$BRIDGE" "$WATCH" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
     docker volume rm "$VENV_VOL" >/dev/null 2>&1 || true
     [ "$IS_ROOT" -eq 1 ] || docker volume rm "$AUTH_SRC" >/dev/null 2>&1 || true
@@ -109,6 +110,26 @@ fi
 client() { docker run --rm --network "$NETWORK" "$IMAGE" "$@"; }
 # read1 USER PASS TOPIC : first (retained) message, empty when none within 3 s
 read1() { client mosquitto_sub -h "$BROKER" -u "$1" -P "$2" -t "$3" -C 1 -W 3 2>/dev/null || true; }
+# retained_only TOPIC : what the broker stores (retained) for TOPIC, as the helm display; empty when nothing
+retained_only() {
+    client mosquitto_sub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" -t "$1" --retained-only -W 3 -F '%r %p' \
+        2>/dev/null || true
+}
+# start_watch : record every bridge/status message (retain flag, payload) from now on, until the test ends
+start_watch() {
+    docker rm -f "$WATCH" >/dev/null 2>&1 || true
+    docker run -d --name "$WATCH" --network "$NETWORK" "$IMAGE" mosquitto_sub -h "$BROKER" -u "$HELM" \
+        -P "$HELM_PASS" -t vesselstack/v1/bridge/status -F '%r %p' -W 150 >/dev/null
+}
+# wait_watch REGEX SECONDS : poll the watcher's log (line-anchored regex over "RETAIN PAYLOAD" lines)
+wait_watch() {
+    local end=$((SECONDS + $2))
+    while [ "$SECONDS" -lt "$end" ]; do
+        docker logs "$WATCH" 2>&1 | grep -Eq "$1" && return 0
+        sleep 1
+    done
+    fail "the bridge/status watcher never saw /$1/ within ${2}s (saw: $(docker logs "$WATCH" 2>&1 | sort | uniq -c | tr '\n' ';'))"
+}
 # wait_for TOPIC REGEX SECONDS [USER PASS] : poll as the helm display until it matches
 wait_for() {
     local topic=$1 regex=$2 seconds=$3 end last=
@@ -157,16 +178,20 @@ grep -q 'Ran [0-9][0-9]* tests' "$TEST_ROOT/mqtt-publisher.log" \
     || fail "publisher regression suite skipped a critical Paho case"
 pass
 
-docker run -d --name "$BROKER" --network "$NETWORK" \
-    -v "$ROOT/config/mosquitto:/mosquitto/config:ro" \
-    -v "$PDIR:/mosquitto/data" -v "$AUTH_SRC:/mosquitto/auth:ro" "$IMAGE" >/dev/null
-for _ in $(seq 1 30); do
+start_broker() { # also used to restart the broker on the same data directory
+    docker rm -f "$BROKER" >/dev/null 2>&1 || true
+    docker run -d --name "$BROKER" --network "$NETWORK" \
+        -v "$ROOT/config/mosquitto:/mosquitto/config:ro" \
+        -v "$PDIR:/mosquitto/data" -v "$AUTH_SRC:/mosquitto/auth:ro" "$IMAGE" >/dev/null
+    for _ in $(seq 1 30); do
+        client mosquitto_sub -h "$BROKER" -u "$ADMIN_USER" -P "$ADMIN_PASS" -t '$SYS/broker/version' \
+            -C 1 -W 2 >/dev/null 2>&1 && break
+        sleep 1
+    done
     client mosquitto_sub -h "$BROKER" -u "$ADMIN_USER" -P "$ADMIN_PASS" -t '$SYS/broker/version' \
-        -C 1 -W 2 >/dev/null 2>&1 && break
-    sleep 1
-done
-client mosquitto_sub -h "$BROKER" -u "$ADMIN_USER" -P "$ADMIN_PASS" -t '$SYS/broker/version' \
-    -C 1 -W 2 >/dev/null 2>&1 || fail "broker did not become ready"
+        -C 1 -W 2 >/dev/null 2>&1 || fail "broker did not become ready"
+}
+start_broker
 
 # Bridge environment exactly as install.sh renders it (displayctl bridge-env), then
 # translated to a raw docker env file (systemd quoting removed) with host paths and
@@ -205,13 +230,25 @@ run_bridge() {
 
 # 1. The bridge starts while SignalK is still down: status online, signalk
 # disconnected, instrument missing (all from the real broker, as a display).
+# An older bridge left a retained "online" behind: the new one deletes it on connect, and its
+# own "online" is a heartbeat the broker never stores.
+client mosquitto_pub -h "$BROKER" -u "$ADMIN_USER" -P "$ADMIN_PASS" \
+    -t vesselstack/v1/bridge/status -m online -r -q 1 >/dev/null 2>&1 || fail "could not plant the legacy status"
+[ "$(retained_only vesselstack/v1/bridge/status)" = "1 online" ] || fail "the legacy retained status was not planted"
 run_bridge
 wait_for vesselstack/v1/bridge/status '^online$' 20
+[ -z "$(retained_only vesselstack/v1/bridge/status)" ] \
+    || fail "a retained bridge/status remains (legacy value not deleted, or the bridge retained its own)"
+[ "$(client mosquitto_sub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" -t vesselstack/v1/bridge/status \
+        -F '%r %p' -C 1 -W 3 2>/dev/null)" = "0 online" ] \
+    || fail "a late subscriber did not get a live, non-retained online within a heartbeat (1 s)"
+wait_for vesselstack/v1/bridge/service '^\{"state":"online","ts":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"\}$' 10
+[ "$(retained_only vesselstack/v1/bridge/service | cut -c1-2)" = "1 " ] || fail "bridge/service is not retained"
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 10
 wait_for vesselstack/v1/instruments/sog '"st":"missing"' 10
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"missing","sev":"unknown"' 10
 # Alarm summary: the one counted item (the notification) is unknown, retained, ids only.
-wait_for vesselstack/v1/alarms/summary '^\{"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\],"ts":"[0-9TZ:-]+"\}$' 10
+wait_for vesselstack/v1/alarms/summary '^\{"max":"unknown","na":0,"nw":0,"nu":1,"nl":0,"ids":\[\],"lost":\[\],"seq":[0-9]+,"ts":"[0-9TZ:-]+"\}$' 10
 # Bridge clock (a header display and a schedule are configured): retained, exact shape, the
 # bridge's local wall clock (UTC+05:30 here) and the night flag of the active window.
 wait_for vesselstack/v1/bridge/clock '^\{"hm":"[0-2][0-9]:[0-5][0-9]","night":true,"ts":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"\}$' 10
@@ -242,13 +279,13 @@ wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 15
 # The notification is "not raised" (ok) once SignalK is connected, then follows the fake's
 # alarm and clear; the message text never reaches MQTT.
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 15
-wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"ids":\[\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"nl":0,"ids":\[\]' 15
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"alarm"' 15
-wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"ids":\["anchor"\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"nl":0,"ids":\["anchor"\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/notifications/anchor | grep -c 'Anchor alarm')" = 0 ] \
     || fail "the notification message text was published"
 wait_for vesselstack/v1/notifications/anchor '"st":"ok","sev":"ok"' 25
-wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"ids":\[\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0,"nl":0,"ids":\[\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/alarms/summary | grep -c 'Anchor')" = 0 ] \
     || fail "the alarm summary carried a label or message text"
 pass
@@ -268,12 +305,11 @@ client mosquitto_pub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" \
     || fail "the display account could not publish its own status"
 pass
 
-# 4. The fake SignalK exits: signalk disconnected, sog becomes stale (stale_after_s=3
-# plus one heartbeat), value cleared.
+# 4. The fake SignalK exits: signalk disconnected, sog becomes stale at once, value cleared.
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 30
 wait_for vesselstack/v1/instruments/sog '"v":null,"u":"kn","st":"stale"' 15
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"stale","sev":"unknown"' 15
-wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1,"ids":\[\]' 15
+wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1,"nl":0,"ids":\[\]' 15
 [ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/status)" = online ] \
     || fail "bridge status should stay online while only SignalK is down"
 pass
@@ -287,9 +323,17 @@ wait_for vesselstack/v1/bridge/signalk '^connected$' 60
 wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 15
 pass
 
-# 6. Killing the bridge (no clean shutdown) fires the retained last will.
+# 6. Killing the bridge (no clean shutdown) fires the last will: a live, non-retained offline.
+# bridge/service has no will: it keeps saying online (last known) with its timestamp.
+wait_for vesselstack/v1/bridge/signalk '^connected$' 20
+start_watch
+wait_watch '^0 online$' 20
 docker kill "$BRIDGE" >/dev/null
-wait_for vesselstack/v1/bridge/status '^offline$' 30
+wait_watch '^0 offline$' 30
+[ -z "$(retained_only vesselstack/v1/bridge/status)" ] || fail "the last will left a retained bridge/status"
+[ "$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/service | grep -c '"state":"online"')" = 1 ] \
+    || fail "bridge/service should keep its last known online report after a kill"
+! docker logs "$WATCH" 2>&1 | grep -Eq '^1 ' || fail "a retained bridge/status message was delivered"
 pass
 
 # 7. A graceful SIGTERM publishes offline itself and exits 0, with no secrets logged. With
@@ -301,9 +345,13 @@ docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
 run_bridge
 wait_for vesselstack/v1/bridge/status '^online$' 20
 wait_for vesselstack/v1/alarms/summary '"max":"ok","na":0,"nw":0,"nu":0' 40
+start_watch
+wait_watch '^0 online$' 20
 docker stop -t 15 "$BRIDGE" >/dev/null
 [ "$(docker inspect -f '{{.State.ExitCode}}' "$BRIDGE")" = 0 ] || fail "SIGTERM did not exit 0"
-wait_for vesselstack/v1/bridge/status '^offline$' 10
+wait_watch '^0 offline$' 10
+[ -z "$(retained_only vesselstack/v1/bridge/status)" ] || fail "a clean stop left a retained bridge/status"
+wait_for vesselstack/v1/bridge/service '^\{"state":"offline","ts":' 10
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 10
 wait_for vesselstack/v1/alarms/summary '"max":"unknown","na":0,"nw":0,"nu":1' 10
 logs=$(docker logs "$BRIDGE" 2>&1)
@@ -311,6 +359,31 @@ for secret in "$SK_TOKEN" "$BRIDGE_PASS"; do
     ! grep -Fq "$secret" <<<"$logs" || fail "a secret appeared in the bridge log"
 done
 grep -q 'starting: 1 instrument' <<<"$logs" || fail "bridge log is missing the startup summary"
+pass
+
+# 7b. Power cut: the bridge and the broker die together (no will, no clean broker shutdown). The broker
+# is restarted alone on the same data directory, so it restores its last saved retained messages: the
+# instrument value is still there as "ok" (that is the old, stale-looking data), but no retained
+# bridge/status exists to make a display think the bridge is alive. bridge/service still says online
+# (last known) with the old ts.
+docker rm -f "$SIGNALK" >/dev/null 2>&1 || true
+docker run -d --name "$SIGNALK" --network "$NETWORK" "${UNPRIV[@]}" \
+    -v "$REPO_ROOT/tests/fixtures:/fx:ro" -v "$VENV_VOL:/venv:ro" "$PYIMAGE" \
+    /venv/bin/python /fx/fake_signalk.py --port 3000 --duration 90 --alarm-at 1000 --clear-at 1001 --token "$SK_TOKEN" >/dev/null
+run_bridge
+wait_for vesselstack/v1/bridge/status '^online$' 20
+wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 30
+wait_for vesselstack/v1/bridge/service '"state":"online"' 10
+docker kill --signal=USR1 "$BROKER" >/dev/null     # Mosquitto writes its persistence file now
+sleep 2
+docker kill "$BRIDGE" "$BROKER" >/dev/null
+docker rm -f "$SIGNALK" >/dev/null 2>&1 || true
+start_broker
+sog=$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/instruments/sog)
+grep -q '"st":"ok"' <<<"$sog" || fail "the restarted broker did not restore the saved retained values (no persistence?): ${sog:-none}"
+[ -z "$(retained_only vesselstack/v1/bridge/status)" ] || fail "the restarted broker has a retained bridge/status"
+grep -q '"state":"online"' <<<"$(read1 "$HELM" "$HELM_PASS" vesselstack/v1/bridge/service)" \
+    || fail "bridge/service should still hold the last known (old) report after a power cut"
 pass
 
 # 8. An invalid displays.json stops the bridge with a clear message and a non-zero exit.
@@ -395,13 +468,13 @@ wait_for vesselstack/v1/ha/high_water '"k":1,"u":"","st":"ok","sev":"ok"' 20
 wait_for vesselstack/v1/ha/bilge '"k":1,"u":"","st":"ok","sev":"ok"' 30
 wait_for vesselstack/v1/ha/high_water '"k":0,"u":"","st":"ok","sev":"alarm"' 30
 # (d) the alarm summary includes the Home Assistant alarm
-wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"ids":\["high_water"\]' 15
-# (c) Home Assistant stops: its items are stale, SignalK is untouched
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":0,"nl":0,"ids":\["high_water"\]' 15
+# (c) Home Assistant stops: its items are stale, SignalK is untouched; an alarm whose source stops is kept as a lost alarm
 wait_for vesselstack/v1/bridge/homeassistant '^disconnected$' 40
 wait_for vesselstack/v1/ha/bilge '"v":null,"k":null,"u":"","st":"stale","sev":"unknown"' 15
 wait_for vesselstack/v1/ha/high_water '"st":"stale","sev":"unknown"' 15
 wait_for vesselstack/v1/instruments/sog '"v":10\.0,"u":"kn","st":"ok"' 10
-wait_for vesselstack/v1/alarms/summary '"max":"unknown"' 15
+wait_for vesselstack/v1/alarms/summary '"max":"alarm","na":1,"nw":0,"nu":1,"nl":1,"ids":\["high_water"\],"lost":\["high_water"\]' 15
 logs=$(docker logs "$BRIDGE" 2>&1)
 for secret in "$HA_TOKEN" "$SK_TOKEN" "$BRIDGE_PASS"; do
     ! grep -Fq "$secret" <<<"$logs" || fail "a secret appeared in the bridge log (good token)"

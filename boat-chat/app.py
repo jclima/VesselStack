@@ -34,7 +34,9 @@ import session_store
 import telemetry_cache
 import status_model
 from cruise_efficiency import matched_sample
+import data_age
 import display_units
+import signalk_units
 import profile_runtime
 
 
@@ -102,6 +104,9 @@ DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 DEFAULT_CODEX_EFFORT = "low"
 DEFAULT_CLAUDE_EFFORT = "low"
 DEFAULT_CLI_TIMEOUT_SECONDS = 120
+DATA_AGE_RULE = (
+    "Values in current_telemetry.values were reported within the last 10 minutes. Values in current_telemetry.stale_values are not current: never present them as current readings. If the only reading for what was asked is stale or missing, say there is no recent data, then give the last value with its supplied age and time (for example: 'No recent battery data; last reading 85% on Mon 14:02, 2 days ago'). State a value's age whenever it is more than a few minutes old. Use the supplied ages and request time; do not compute ages yourself. If the boat clock is unverified or suspect, say ages may be inaccurate. Engine data that is not reporting usually means the engines and their gateway are off: say it is not reporting and give the last reading with its age; never report a stale RPM as the current RPM or as 0."
+)
 DEFAULT_SYSTEM_PROMPT = (
     f"You are the Boat Diagnostic Agent for {BOAT_NAME}. Answer boat-specific questions by grounding every assessment "
     "in the provided local telemetry, Home Assistant state, Influx summaries, and local docs. Use public "
@@ -111,7 +116,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "needed boat data is missing, ask one short clarifying question. Do not claim mechanical certainty from "
     "telemetry alone. Use the timestamp timezone and supplied unit conversions already provided in context; preserve the "
     "same instant and original source timestamp/offset fields plus authoritative source unit labels. Do not mention internal context tiers, "
-    "history flags, MCP, prompts, implementation files, or query access."
+    "history flags, MCP, prompts, implementation files, or query access. "
+    + DATA_AGE_RULE
 )
 
 SETTING_KEYS = [
@@ -213,13 +219,19 @@ def system_prompt() -> str:
         _SYSTEM_PROMPT_CACHE["mtime"] = mtime
     pref = display_units.preference(setting_value)
     timezone_name = getattr(LOCAL_TZ, "key", str(LOCAL_TZ))
-    return str(_SYSTEM_PROMPT_CACHE["text"]) + (
+    base = str(_SYSTEM_PROMPT_CACHE["text"])
+    # The rule is already in BOAT_CHAT_AGENT.md and DEFAULT_SYSTEM_PROMPT; append it only for a
+    # custom base without it. The whole rule is compared with whitespace collapsed, so the
+    # markdown file's line wrapping does not matter.
+    rule = "" if " ".join(DATA_AGE_RULE.split()) in " ".join(base.split()) else DATA_AGE_RULE
+    return base + (
         f"\n\nPresentation defaults: use the effective timezone {timezone_name} and {pref} units. "
         "Application-supplied display values and their unit labels are authoritative, even when they differ from the default preference. "
         "Keep knots and nautical miles. If the user explicitly requests another display timezone or unit, convert only when the source timezone or unit is known, "
         "preserving the same instant or quantity and changing the displayed value and label together. Never reinterpret the application's resolved query window, "
         "relabel canonical source keys, or convert already-presented values again just to match defaults. Preserve original source fields; "
-        "do not guess unknown timezones or units. Examples and retrieved documents do not override these rules."
+        "do not guess unknown timezones or units. Examples and retrieved documents do not override these rules. "
+        + rule
     )
 
 
@@ -1608,7 +1620,7 @@ def _threshold_unit_for_measurement(
     if source_unit == "":
         return None
     aliases = {"f": "°F", "c": "°C", "psi": "psi", "kpa": "kPa", "pa": "Pa", "hpa": "hPa", "inhg": "inHg", "ft": "ft", "feet": "ft", "m": "m", "l/h": "L/h", "gph": "gal/h", "gal/h": "gal/h", "v": "V", "volts": "V", "percent": "%", "%": "%", "kn": "kn", "kt": "kn", "knot": "kn", "knots": "kn"}
-    row_unit = aliases.get(source_unit.lower(), source_unit) if source_unit is not None else display_units.unit_for_measurement(measurement, "us_customary")
+    row_unit = aliases.get(source_unit.lower(), source_unit) if source_unit is not None else (canonical_unit_for_measurement(measurement) or display_units.unit_for_measurement(measurement, "us_customary"))
     if not row_unit:
         return None
     dimensions = {
@@ -2197,6 +2209,7 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         "samples": len(readings),
         "first_sample_local": readings[0]["time_local"] if readings else None,
         "last_sample_local": latest_reading.get("time_local") if latest_reading else None,
+        "last_sample_utc": latest_reading.get("time_utc") if latest_reading else None,
         "voltage": {
             **voltage_stats,
             "min_time_local": min_voltage_reading.get("time_local") if min_voltage_reading else None,
@@ -2494,6 +2507,7 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
     running_samples = {e["id"]: 0 for e in engines}
     rpm_unknown_minutes = 0
     rpm_invalid_minutes = 0
+    observed_stamps: list[dt.datetime] = []
     for row in rows:
         samples = {e["id"]: (safe_float(row.get(f"{e['path']}.revolutions")), safe_float(row.get(f"{e['path']}.fuel.rate"))) for e in engines}
         rpms = {ident: rpm * 60.0 if rpm is not None else None for ident, (rpm, _fuel) in samples.items()}
@@ -2502,6 +2516,9 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         if all(rpm is None for rpm in rpms.values()):
             rpm_unknown_minutes += 1
             continue
+        observed_stamp = data_age.parse_timestamp(row.get("_time"))
+        if observed_stamp is not None:
+            observed_stamps.append(observed_stamp)
         running_ids = [ident for ident, rpm in rpms.items() if rpm is not None and rpm >= rpm_threshold]
         if not running_ids:
             continue
@@ -2515,6 +2532,19 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
                 liters_by_engine[ident] += amount; partial_by_engine[ident] += amount; fuel_samples[ident] += 1
         running.append({"time": row.get("_time", ""), "engine_rpm": rpms})
 
+    # Minutes missing between consecutive observed minutes inside the running span.
+    gap_minutes = 0
+    largest_gap_minutes = 0
+    if running:
+        first_run = data_age.parse_timestamp(running[0]["time"])
+        last_run = data_age.parse_timestamp(running[-1]["time"])
+        if first_run is not None and last_run is not None:
+            inside = sorted(stamp for stamp in observed_stamps if first_run <= stamp <= last_run)
+            for earlier, later in zip(inside, inside[1:]):
+                gap = int(round((later - earlier).total_seconds() / 60.0)) - 1
+                if gap > 5:
+                    gap_minutes += gap
+                    largest_gap_minutes = max(largest_gap_minutes, gap)
     running_hours = len(running) / 60.0
     complete_coverage = bool(running) and rpm_invalid_minutes == 0 and all(running_samples[e["id"]] == fuel_samples[e["id"]] for e in engines)
     total_liters = sum(liters_by_engine.values()) if complete_coverage else None
@@ -2544,12 +2574,15 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         },
         "sample_counts": {
             "running_minutes": len(running),
+            "observed_minutes": len(rows) - rpm_unknown_minutes,
             **{f"{e['id']}_running_minutes": running_samples[e['id']] for e in engines},
             "rpm_unknown_minutes": rpm_unknown_minutes,
             "rpm_invalid_minutes": rpm_invalid_minutes,
             **{f"{e['id']}_fuel_samples": fuel_samples[e['id']] for e in engines},
         },
         "coverage_complete": complete_coverage,
+        "gap_minutes": gap_minutes,
+        "largest_gap_minutes": largest_gap_minutes,
         "coverage_scope": "returned_observation_minutes",
         "observed_partial_consumption": {
             **{f"{e['id']}_liters": round(partial_by_engine[e['id']], 2) for e in engines},
@@ -2821,33 +2854,8 @@ def summarize_numeric_rows(rows: list[dict[str, str]], unit_scale: dict[str, flo
 
 
 def convert_generic_value(measurement: str, value: float) -> float:
-    if measurement.startswith("tanks.fuel.") and measurement.endswith(".currentLevel"):
-        return value * 100.0
-    if "stateOfCharge" in measurement or "state_of_charge" in measurement:
-        return value * 100.0 if abs(value) <= 1.2 else value
-    if measurement.endswith(".temperature"):
-        return (value - 273.15) * 9.0 / 5.0 + 32.0
-    if measurement.startswith("environment.depth."):
-        return value * 3.280839895
-    if "environment" in measurement and "pressure" in measurement.lower():
-        return value / 3386.389 if value > 2000 else value
-    if measurement.endswith(".oilPressure") or measurement.endswith(".boostPressure") or "pressure" in measurement.lower() and value > 2000:
-        return value / 6894.757
-    if measurement in {"navigation.speedOverGround", "navigation.speedThroughWater"}:
-        return value * 1.94384449
-    if any(term in measurement for term in ["headingMagnetic", "courseOverGroundTrue", "attitude.pitch", "attitude.roll", "attitude.yaw"]):
-        return value * 180.0 / 3.141592653589793
-    if measurement == "navigation.rateOfTurn":
-        return value * 180.0 / 3.141592653589793 * 60.0
-    if measurement.endswith(".revolutions"):
-        return value * 60.0
-    if measurement.endswith(".fuel.rate"):
-        return value * 951019.4
-    if measurement.endswith(".runTime") or measurement.endswith(".timeRemaining"):
-        return value / 3600.0
-    if measurement.endswith((".engineLoad", ".engineTorque", ".trimState")):
-        return value * 100.0
-    return value
+    """Stored-form value for a Signal K path; the label comes from the same table."""
+    return signalk_units.canonical(measurement, value)[0]
 
 
 def convert_generic_rows(rows: list[dict[str, str]], source: str = "signalk") -> list[dict[str, str]]:
@@ -2873,23 +2881,15 @@ from(bucket: "{INFLUX_RAW_BUCKET}")
   |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
 '''
     rows = query_influx(flux)
-    # US units: fuel gal/h, temperature °F, oil pressure psi. Temperature needs
-    # add+scale, not multiply; handle all conversions manually here.
+    # Stored form (gal/h, RPM, F, psi, %) comes from the shared units table, so the
+    # value and its label agree with every other Boat Chat path.
     values: dict[str, list[float]] = {}
     for row in rows:
         measurement = row.get("_measurement") or ""
         value = safe_float(row.get("_value"))
         if not measurement or value is None:
             continue
-        if measurement.endswith(".fuel.rate"):
-            value *= 951019.4
-        elif measurement.endswith(".revolutions"):
-            value *= 60.0
-        elif measurement.endswith(".temperature"):
-            value = (value - 273.15) * 9.0 / 5.0 + 32.0
-        elif measurement.endswith(".oilPressure") or measurement.endswith(".boostPressure"):
-            value /= 6894.757
-        values.setdefault(measurement, []).append(value)
+        values.setdefault(measurement, []).append(convert_generic_value(measurement, value))
     summary = summarize_numeric_rows(
         [{"_measurement": key, "_value": str(value)} for key, nums in values.items() for value in nums]
     )
@@ -2906,19 +2906,14 @@ from(bucket: "{INFLUX_RAW_BUCKET}")
         derived["starboard_minus_port_rpm"] = round(stbd_rpm - port_rpm, 1)
     return {
         "window_hours": hours,
-        "units": {
-            "fuel.rate": "gal/h",
-            "revolutions": "RPM",
-            "temperature": "F",
-            "oilPressure/boostPressure": "psi",
-            "engineLoad/engineTorque/trimState": "source units",
-        },
+        "units": {path: canonical_unit_for_measurement(path) for path in PROPULSION_PATHS},
         "summary": summary,
         "derived": derived,
     }
 
 
-def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
+def current_telemetry_snapshot(message: str = "", now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or dt.datetime.now(dt.timezone.utc)
     signalk = get_signalk_self()
     flat = flatten_signalk(signalk) if "error" not in signalk else {}
     runtime = profile_runtime.current()
@@ -2950,27 +2945,59 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
     selected_paths = matched if concepts == {"ais"} else baseline.union(matched)
     values: dict[str, Any] = {}
     units: dict[str, str] = {}
+    timestamps = {}
+    unknown_unit_paths: list[str] = []
+    unit_conflicts: dict[str, str] = {}
     for key in sorted(selected_paths):
         if key not in flat or key.startswith("notifications."):
             continue
-        value = flat[key]
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            value = round(convert_generic_value(key, float(value)), 4)
-        values[key] = value
-        unit = canonical_unit_for_measurement(key)
-        if unit:
-            units[key] = unit
-
-    timestamps = {}
-    for key in values:
         node = signalk
         for part in key.split("."):
             if not isinstance(node, dict):
                 node = {}
                 break
             node = node.get(part, {})
-        if isinstance(node, dict) and node.get("timestamp"):
+        node = node if isinstance(node, dict) else {}
+        meta = node.get("meta")
+        meta_units = meta.get("units") if isinstance(meta, dict) and isinstance(meta.get("units"), str) else None
+        value = flat[key]
+        if key == "navigation.attitude" and isinstance(value, dict):
+            # One object of radians; give each angle its own labelled scalar
+            # that shares the parent's timestamp.
+            for axis in ("roll", "pitch", "yaw"):
+                raw = value.get(axis)
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw):
+                    axis_path = f"{key}.{axis}"
+                    values[axis_path] = round(signalk_units.canonical(axis_path, float(raw))[0], 4)
+                    units[axis_path] = signalk_units.resolve(axis_path).unit
+                    if node.get("timestamp"):
+                        timestamps[axis_path] = node["timestamp"]
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            resolution = signalk_units.resolve(key, meta_units)
+            value = round(signalk_units.canonical(key, float(value), meta_units)[0], 4)
+            # Every numeric value gets a units entry; "" means the unit is unknown.
+            units[key] = resolution.unit
+            if resolution.origin == "unknown":
+                unknown_unit_paths.append(key)
+            elif resolution.origin == "conflict":
+                unit_conflicts[key] = resolution.unit
+        values[key] = value
+        if node.get("timestamp"):
             timestamps[key] = node["timestamp"]
+    ages_seconds: dict[str, float] = {}
+    freshness: dict[str, str] = {}
+    for key in values:
+        verdict = data_age.classify(timestamps.get(key), now)
+        freshness[key] = verdict.state
+        if verdict.age_seconds is not None:
+            ages_seconds[key] = round(verdict.age_seconds, 1)
+    # Signal K keeps serving the last GPS time after the receiver stops, so a GPS
+    # time whose own update is not fresh cannot vouch for the boat clock.
+    gps_iso = flat.get("navigation.datetime")
+    gps_node = signalk.get("navigation", {}).get("datetime") if isinstance(signalk.get("navigation"), dict) else None
+    if not (isinstance(gps_node, dict) and data_age.classify(gps_node.get("timestamp"), now).state == "fresh"):
+        gps_iso = None
 
     active_notifications: dict[str, Any] = {}
     normal_notification_count = 0
@@ -3015,7 +3042,15 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         "matched_path_count": len(matched),
         "values": values,
         "timestamps": timestamps,
+        "observed_at_utc": now.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ages_seconds": ages_seconds,
+        "freshness": freshness,
+        "fresh_threshold_seconds": data_age.FRESH_SECONDS,
+        "clock_status": data_age.clock_status(now, timestamps.values(), gps_iso if isinstance(gps_iso, str) else None),
         "units": units,
+        "unit_schema": 2,
+        "unknown_unit_paths": sorted(unknown_unit_paths),
+        "unit_conflicts": dict(sorted(unit_conflicts.items())),
         "active_notifications": active_notifications,
         "alarm_summary": notifications_summary,
         "normal_notification_count": normal_notification_count,
@@ -3656,34 +3691,61 @@ def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
     values=(context.get("current_telemetry") or {}).get("values",{}); states=context.get("ha_states") or {}
     state=lambda entity,default="unknown":str((states.get(entity) or {}).get("state",default))
     timestamps = (context.get("current_telemetry") or {}).get("timestamps", {})
-    now = dt.datetime.now(dt.timezone.utc)
-    def fresh(path: str) -> bool:
-        try:
-            stamp = dt.datetime.fromisoformat(str(timestamps[path]).replace("Z", "+00:00"))
-            age = (now - stamp).total_seconds()
-            return age <= 600 and age >= -60
-        except (KeyError, TypeError, ValueError):
-            return False
-    def current(path: str) -> float | None:
-        return safe_float(values.get(path)) if fresh(path) else None
+    now = data_age.parse_timestamp(context.get("now_utc")) or dt.datetime.now(dt.timezone.utc)
+    def reading(path: str) -> tuple[str, float | None, float | None]:
+        """(state, value, age_seconds): state is fresh, stale (known value, known age) or missing."""
+        value = safe_float(values.get(path))
+        stamp = data_age.parse_timestamp(timestamps.get(path))
+        if value is None or stamp is None:
+            return "missing", None, None
+        age = (now - stamp).total_seconds()
+        if age < -data_age.FUTURE_TOLERANCE_SECONDS:
+            return "missing", None, None
+        if age <= data_age.FRESH_SECONDS:
+            return "fresh", value, age
+        return "stale", value, age
+    def qualify(label: str, path: str, shown) -> str:
+        state, value, age = reading(path)
+        if state == "fresh":
+            return shown(value)
+        if state == "stale":
+            return f"{label}: no recent data (last {shown(value)}, {data_age.describe_age(age)} ago)"
+        return f"{label} unavailable"
     runtime = profile_runtime.current()
     profile = runtime["profile"]
     primary = next((b for b in profile.get("battery_banks", []) if b.get("id") == profile.get("primary_battery_bank")), None)
-    soc=current(f"{primary['path']}.capacity.stateOfCharge") if primary else None
-    voltage=current(f"{primary['path']}.voltage") if primary else None
-    engines = [(e, current(f"{e['path']}.revolutions")) for e in profile.get("engines", [])]
     lines=[f"Boat briefing: {state('sensor.boat_health_summary','health unknown')}; {state('sensor.boat_watch_summary','watch state unavailable')}."]
     if runtime.get("diagnostic"):
         lines.append(runtime["diagnostic"] + ".")
     elif primary:
-        lines.append(f"Battery ({primary.get('label', primary['id'])}): {f'{soc:g}%' if soc is not None else 'SOC unavailable'}, {f'{voltage:.2f} V' if voltage is not None else 'voltage unavailable'}.")
+        soc_text = qualify("SOC", f"{primary['path']}.capacity.stateOfCharge", lambda v: f"{v:g}%")
+        voltage_text = qualify("voltage", f"{primary['path']}.voltage", lambda v: f"{v:.2f} V")
+        lines.append(f"Battery ({primary.get('label', primary['id'])}): {soc_text}, {voltage_text}.")
     else:
         lines.append("Battery: not configured.")
+    engines = profile.get("engines", [])
     if engines:
         def engine_label(e):
             return e['id'] if e.get('id') in {'port', 'starboard'} and e.get('label') in {'Port', 'Starboard'} else e.get('label', e['id'])
-        engine_text = ", ".join(f"{engine_label(e)} {v:.0f} RPM" if v is not None else f"{engine_label(e)} unavailable" for e, v in engines)
-        lines.append(f"Engines: {engine_text}. Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
+        current_parts, stale_parts = [], []
+        for e in engines:
+            engine_state, rpm, age = reading(f"{e['path']}.revolutions")
+            if engine_state == "fresh":
+                current_parts.append(f"{engine_label(e)} {rpm:.0f} RPM")
+            elif engine_state == "stale":
+                stale_parts.append(f"{engine_label(e)} {rpm:.0f} RPM, {data_age.describe_age(age)} ago")
+            else:
+                current_parts.append(f"{engine_label(e)} unavailable")
+        engine_text = ", ".join(current_parts)
+        if stale_parts:
+            not_reporting = (
+                "Engine data is not reporting (normal when engines and their gateway are off); last reading "
+                + "; ".join(stale_parts) + "."
+            )
+            engine_text = f"{engine_text}. {not_reporting}" if engine_text else not_reporting
+        elif engine_text:
+            engine_text += "."
+        lines.append(f"Engines: {engine_text} Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
     else:
         lines.append("Engines: not configured.")
     alarms=(context.get("current_telemetry") or {}).get("alarm_summary")
@@ -3813,6 +3875,18 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
     shown = display_units.normalize_context(summary, display_units.preference(setting_value))
     running_minutes = int(summary.get("running_minutes") or 0)
     if running_minutes <= 0:
+        observed = (summary.get("sample_counts") or {}).get("observed_minutes")
+        window_text = f"{summary.get('label', 'the requested period')} ({summary.get('start_local')} to {summary.get('stop_local')})"
+        if observed == 0:
+            return (
+                f"No engine or fuel data was recorded for {window_text} "
+                "(telemetry may not have been logging), so fuel use cannot be determined."
+            )
+        if isinstance(observed, int) and observed > 0:
+            return (
+                f"Engines were not running during {window_text} "
+                f"({observed} minutes of engine data recorded; RPM below {summary.get('rpm_threshold', ENGINE_RUNNING_RPM)})."
+            )
         return (
             f"I found no engine-running fuel samples for {summary.get('label', 'the requested period')} "
             f"({summary.get('start_local')} to {summary.get('stop_local')}) using RPM >= "
@@ -3824,6 +3898,11 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
     rate_unit = "L/h" if metric else "gal/h"
     total_key = "total_liters" if metric else "total_gallons"
     rate_key = "total_lph_running" if metric else "total_gph_running"
+    gap_total = int(summary.get("gap_minutes") or 0)
+    gap_note = (
+        f" About {gap_total} minutes of data are missing inside the running period, so the total is a minimum."
+        if gap_total > 5 else ""
+    )
     if not summary.get("coverage_complete") or totals.get(total_key) is None:
         partial = shown.get("observed_partial_consumption", {})
         partial_key = "total_liters" if metric else "total_gallons"
@@ -3834,6 +3913,7 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
             "one or more running-channel RPM or fuel-rate samples were missing or invalid within the returned observation minutes. "
             f"Observed partial consumption across {running_minutes} sampled running minutes is {partial_text}; "
             "I cannot report an authoritative total."
+            + gap_note
         )
     per_engine = []
     for engine in profile_runtime.engines(runtime_profile):
@@ -3850,6 +3930,7 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
         f"to {summary.get('last_running_sample_local')}. "
         f"Average burn while running: {averages.get(rate_key)} {rate_unit} total. "
         "This is a computed telemetry answer from retained 1-minute InfluxDB history."
+        + gap_note
     )
 
 
@@ -3936,6 +4017,9 @@ def answer_from_shore_power_history(context: dict[str, Any]) -> str | None:
     )
 
 
+BATTERY_SAMPLE_STALE_SECONDS = 2 * 3600
+
+
 def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
     kind = context.get("question_type", {})
     if not kind.get("battery_voltage_history") or kind.get("complex_history"):
@@ -3961,31 +4045,47 @@ def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
     soc = summary.get("smartshunt_soc", {})
     thresholds = summary.get("thresholds", {})
     agm = summary.get("agm_voltage_soc_estimate", {})
+    last_local = summary.get("last_sample_local")
+    sample_note = f"hourly mean, {last_local}" if last_local else "hourly mean"
+    # The boat profile records no nominal voltage or chemistry for a bank, so a
+    # bank counts as 12 V only when every observed hourly mean is in 9.0-16.0 V.
+    v_min, v_max = voltage.get("min"), voltage.get("max")
+    is_12v = isinstance(v_min, (int, float)) and isinstance(v_max, (int, float)) and 9.0 <= float(v_min) and float(v_max) <= 16.0
     lines = [
         f"Battery voltage over {summary.get('label', 'the retained period')}: "
         f"min {fmt(voltage.get('min'))} V, avg {fmt(voltage.get('avg'))} V, "
-        f"max {fmt(voltage.get('max'))} V, latest {fmt(voltage.get('latest'))} V."
+        f"max {fmt(voltage.get('max'))} V, latest {fmt(voltage.get('latest'))} V ({sample_note})."
     ]
     if soc.get("count"):
         lines.append(
             f"{summary.get('battery_label', 'Battery')} SOC: {fmt(soc.get('min'), 1)}-{fmt(soc.get('max'), 1)}%, "
-            f"latest {fmt(soc.get('latest'), 1)}%."
+            f"latest {fmt(soc.get('latest'), 1)}% ({sample_note})."
         )
 
-    below_118 = int(thresholds.get("below_11_8_samples") or 0)
-    below_50 = int(thresholds.get("below_12_05_samples") or 0)
-    if below_118 or below_50:
-        lines.append(f"Low-voltage flags: {below_118} hourly samples below 11.8 V; {below_50} below 12.05 V.")
-    else:
-        lines.append("No hourly samples were below the configured voltage thresholds.")
+    if is_12v:
+        below_118 = int(thresholds.get("below_11_8_samples") or 0)
+        below_50 = int(thresholds.get("below_12_05_samples") or 0)
+        if below_118 or below_50:
+            lines.append(f"Low-voltage flags: {below_118} hourly samples below 11.8 V; {below_50} below 12.05 V.")
+        else:
+            lines.append("No hourly samples were below the configured voltage thresholds.")
 
-    charging_samples = int(thresholds.get("charging_or_float_samples") or 0)
-    if charging_samples > samples / 2:
-        lines.append("Most samples look like charging/float; treat voltage-based level estimates as a reference.")
-    elif isinstance(voltage.get("latest"), (int, float)) and float(voltage["latest"]) >= 13.0:
-        lines.append("Latest voltage is high; treat voltage-based level estimates as a reference, not a precise SOC reading.")
-    elif agm.get("latest_voltage_percent") is not None:
-        lines.append(f"Resting-voltage estimate from latest voltage: about {fmt(agm.get('latest_voltage_percent'), 1)}%.")
+        charging_samples = int(thresholds.get("charging_or_float_samples") or 0)
+        if charging_samples > samples / 2:
+            lines.append("Most samples look like charging/float; treat voltage-based level estimates as a reference.")
+        elif isinstance(voltage.get("latest"), (int, float)) and float(voltage["latest"]) >= 13.0:
+            lines.append("Latest voltage is high; treat voltage-based level estimates as a reference, not a precise SOC reading.")
+        elif agm.get("latest_voltage_percent") is not None:
+            lines.append(f"Resting-voltage estimate from latest voltage: about {fmt(agm.get('latest_voltage_percent'), 1)}%.")
+    else:
+        lines.append(
+            f"Voltage guidance is shown only for 12 V banks; this bank's readings ({fmt(v_min)}-{fmt(v_max)} V) are outside that range."
+        )
+
+    last_sample = data_age.parse_timestamp(summary.get("last_sample_utc"))
+    request_time = data_age.parse_timestamp(context.get("now_utc"))
+    if last_sample is not None and request_time is not None and (request_time - last_sample).total_seconds() > BATTERY_SAMPLE_STALE_SECONDS:
+        lines.append(f"No samples since {last_local or summary.get('last_sample_utc')}; the readings above are not current.")
     return "\n".join(lines)
 
 
@@ -4076,68 +4176,9 @@ def history_source_priority(bucket: str) -> int:
     return 0 if bucket == INFLUX_HISTORY_BUCKET else 1
 
 
-def unit_for_measurement(measurement: str, context: dict[str, Any]) -> str:
-    pref = display_units.preference(setting_value)
-    ha = context.get("ha_telemetry", {})
-    for item in ha.get("matched", []) if isinstance(ha, dict) else []:
-        if item.get("entity_id") == measurement and item.get("unit"):
-            source_unit = str(item["unit"])
-            if pref == "metric":
-                return display_units.unit_for_measurement(measurement, pref, source_unit) or source_unit
-            return source_unit
-    if measurement.endswith("humidity") or "humidity" in measurement:
-        return "%"
-    if measurement.startswith("tanks.fuel.") or "fuel_tank" in measurement or measurement.endswith("currentLevel"):
-        return "%"
-    if "stateOfCharge" in measurement or "state_of_charge" in measurement or measurement.endswith("_soc"):
-        return "%"
-    if measurement.endswith("temperature") or "temperature" in measurement or "temp" in measurement:
-        return display_units.unit_for_measurement(measurement, pref) if measurement.startswith(("propulsion.", "environment.")) else ""
-    if measurement.startswith("environment.depth.") or "water_depth" in measurement:
-        return display_units.unit_for_measurement(measurement, pref)
-    if "voltage" in measurement:
-        return "V"
-    if "current" in measurement:
-        return "A"
-    if "speedOverGround" in measurement or "speedThroughWater" in measurement:
-        return "kn"
-    if "heading" in measurement or "courseOverGround" in measurement or "attitude" in measurement:
-        return "deg"
-    if measurement == "navigation.rateOfTurn":
-        return "deg/min"
-    if "pressure" in measurement.lower():
-        return display_units.unit_for_measurement(measurement, pref)
-    if measurement.endswith(".revolutions"):
-        return "RPM"
-    if measurement.endswith(".fuel.rate"):
-        return display_units.unit_for_measurement(measurement, pref)
-    if measurement.endswith(".runTime") or measurement.endswith(".timeRemaining"):
-        return "h"
-    if measurement.endswith((".engineLoad", ".engineTorque", ".trimState")):
-        return "%"
-    if measurement.endswith(".power"):
-        return "W"
-    return ""
-
-
 def canonical_unit_for_measurement(measurement: str) -> str:
-    """Unit label for canonical API/cache payloads (always legacy US baseline)."""
-    m = measurement.lower()
-    if m.startswith("tanks.") or "currentlevel" in m or "stateofcharge" in m or "humidity" in m: return "%"
-    if "temperature" in m or "temp" in m: return "F" if m.startswith(("propulsion.", "environment.")) else ""
-    if "voltage" in m: return "V"
-    if "current" in m and "currentlevel" not in m: return "A"
-    if "speedoverground" in m or "speedthroughwater" in m: return "kn"
-    if "heading" in m or "courseoverground" in m or "attitude" in m: return "deg"
-    if m.endswith(".revolutions"): return "RPM"
-    if m == "navigation.rateofturn": return "deg/min"
-    if m.endswith(".fuel.rate"): return "gal/h"
-    if m.endswith((".runtime", ".timeremaining")): return "h"
-    if m.endswith((".engineload", ".enginetorque", ".trimstate")): return "%"
-    if m.endswith(".power"): return "W"
-    if "depth" in m: return "ft"
-    if "pressure" in m or "oilpressure" in m or "boostpressure" in m: return "inHg" if m.startswith("environment.") else "psi"
-    return ""
+    """Unit label for canonical API/cache payloads ("" when the unit is unknown)."""
+    return signalk_units.resolve(measurement).unit
 
 
 def answer_from_telemetry_overview(context: dict[str, Any]) -> str | None:
@@ -4246,10 +4287,11 @@ def answer_from_generic_history(context: dict[str, Any]) -> str | None:
             value = stats.get(key)
             return display_units.display_value(measurement, float(value), pref, source_unit) if isinstance(value, (int, float)) else value
         suffix = f" {unit}" if unit else ""
+        latest_at = f" at {stats.get('last_time_local')}" if stats.get("last_time_local") else ""
         lines.append(
             f"- {display_measurement_name(measurement)}: "
             f"min {format_stat_value(shown_stat('min'))}{suffix}, avg {format_stat_value(shown_stat('avg'))}{suffix}, "
-            f"max {format_stat_value(shown_stat('max'))}{suffix}, latest {format_stat_value(shown_stat('last'))}{suffix} "
+            f"max {format_stat_value(shown_stat('max'))}{suffix}, latest {format_stat_value(shown_stat('last'))}{suffix}{latest_at} "
             f"({stats.get('count')} samples from {bucket}; min at {stats.get('min_time_local')}, max at {stats.get('max_time_local')})."
         )
     if len(rows) > 6:
@@ -4290,6 +4332,8 @@ def answer_from_event_history(context: dict[str, Any]) -> str | None:
 
 def _collect_context(message: str, history: list[dict[str, str]] | None = None, prior_query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.monotonic()
+    now = dt.datetime.now(dt.timezone.utc)
+    now_utc = now.isoformat().replace("+00:00", "Z")
     runtime = profile_runtime.current()
     if runtime.get("diagnostic"):
         # Invalid profiles must fail closed before any source discovery or
@@ -4299,6 +4343,7 @@ def _collect_context(message: str, history: list[dict[str, str]] | None = None, 
             "profile_fingerprint": runtime["fingerprint"],
             "profile_diagnostic": runtime["diagnostic"],
             "_profile_runtime": runtime,
+            "now_utc": now_utc,
             "question_type": {"concepts": [], "query_plan": {}},
             "query_plan": {},
             "context_profile": {"elapsed_ms": int((time.monotonic() - started) * 1000), "history": False},
@@ -4311,6 +4356,7 @@ def _collect_context(message: str, history: list[dict[str, str]] | None = None, 
         "profile_fingerprint": runtime["fingerprint"],
         "profile_diagnostic": runtime.get("diagnostic"),
         "_profile_runtime": runtime,
+        "now_utc": now_utc,
         "question_type": kind,
         "query_plan": kind.get("query_plan", {}),
         "match_tokens": sorted(message_tokens(query)),
@@ -4329,7 +4375,7 @@ def _collect_context(message: str, history: list[dict[str, str]] | None = None, 
     if query != message:
         context["interpreted_question"] = query
     if should_read_live_telemetry(kind):
-        context["current_telemetry"] = current_telemetry_snapshot(query)
+        context["current_telemetry"] = current_telemetry_snapshot(query, now=now)
     entity_ids = ha_entity_ids_for_question(kind)
     if entity_ids:
         context["ha_states"] = get_ha_states(entity_ids)
@@ -4766,6 +4812,49 @@ def generate_answer(message: str, context: dict[str, Any]) -> str:
         return _generate_answer(message, context)
 
 
+def model_current_telemetry(snapshot: Any) -> Any:
+    """Model-facing copy of the stored snapshot: only fresh readings stay in ``values``.
+
+    Everything else moves to ``stale_values`` with a supplied age, so the model never
+    has to compute ages or guess whether a reading is current. The stored snapshot
+    is not modified.
+    """
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("freshness"), dict):
+        return snapshot
+    freshness = snapshot["freshness"]
+    ages = snapshot.get("ages_seconds") or {}
+    stamps = snapshot.get("timestamps") or {}
+    observed = data_age.parse_timestamp(snapshot.get("observed_at_utc"))
+    shown = {key: value for key, value in snapshot.items()
+             if key not in ("values", "timestamps", "ages_seconds", "freshness")}
+    fresh_values: dict[str, Any] = {}
+    stale_values: dict[str, Any] = {}
+    stale_age: dict[str, str] = {}
+    last_update_local: dict[str, str] = {}
+    for key, value in (snapshot.get("values") or {}).items():
+        state = freshness.get(key, "missing")
+        if state == "fresh":
+            fresh_values[key] = value
+            continue
+        stale_values[key] = value
+        if state == "stale" and key in ages:
+            stale_age[key] = data_age.describe_age(ages[key])
+        elif state == "future":
+            stale_age[key] = "unverifiable (timestamp in the future)"
+        else:
+            stale_age[key] = "unknown (no source timestamp)"
+        if observed is not None and state in ("stale", "future"):
+            local = data_age.classify(stamps.get(key), observed, LOCAL_TZ).observed_local
+            if local:
+                last_update_local[key] = local
+    shown["values"] = fresh_values
+    if stale_values:
+        shown["stale_values"] = stale_values
+        shown["stale_age"] = stale_age
+        shown["last_update_local"] = last_update_local
+    return shown
+
+
 def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, Any]:
     # question_type and context_strategy are routing metadata, not evidence;
     # excluding them saves prompt tokens without changing answers.
@@ -4783,7 +4872,7 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
     question_type = context.get("question_type", {})
     current_first = bool(question_type.get("current_request")) and "freshness" not in set(question_type.get("concepts", []))
     if current_first:
-        compact["current_telemetry"] = context.get("current_telemetry")
+        compact["current_telemetry"] = model_current_telemetry(context.get("current_telemetry"))
         compact["ha_states"] = context.get("ha_states")
     if "answer_focus" in context:
         compact["answer_focus"] = context["answer_focus"]
@@ -4819,7 +4908,7 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
         if key in context:
             compact[key] = context[key]
     if not current_first:
-        compact["current_telemetry"] = context.get("current_telemetry")
+        compact["current_telemetry"] = model_current_telemetry(context.get("current_telemetry"))
         compact["ha_states"] = context.get("ha_states")
     docs = []
     for item in context.get("local_docs", [])[:doc_limit]:
@@ -4848,7 +4937,16 @@ def build_prompt(message: str, context: dict[str, Any], max_chars: int = 50000) 
         instruction = "Give a thorough, structured outing briefing that satisfies every answer requirement in the supplied context; do not shorten it merely because the UI mode is concise."
     else:
         instruction={"concise":"Answer every part of the question; keep simple answers concise and give complex questions enough explanation.","explain":"Explain the evidence and calculation clearly.","diagnose":"Organize the answer as observations, likely causes, and checks.","checklist":"Return a short actionable checklist."}.get(mode,"Answer every part of the question; keep simple answers concise and give complex questions enough explanation.")
-    return "Boat context JSON:\n" + context_json + f"\n\nResponse mode: {mode}. {instruction}" + "\n\nQuestion:\n" + message
+    # The request-time line follows the (size-limited) context JSON, so it cannot be
+    # trimmed away and does not disturb the cacheable prefix.
+    return "Boat context JSON:\n" + context_json + f"\n\nResponse mode: {mode}. {instruction}" + "\n\n" + request_time_line(context) + "\n\nQuestion:\n" + message
+
+
+def request_time_line(context: dict[str, Any]) -> str:
+    now = data_age.parse_timestamp(context.get("now_utc")) or dt.datetime.now(dt.timezone.utc)
+    clock = (context.get("current_telemetry") or {}).get("clock_status") if isinstance(context.get("current_telemetry"), dict) else None
+    local = now.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    return f"Request time: {local} ({now.isoformat().replace('+00:00', 'Z')}). Boat clock: {clock if clock in ('ok', 'unverified', 'suspect') else 'unverified'}."
 
 
 def serialize_context_with_budget(context: dict[str, Any], max_chars: int) -> str:

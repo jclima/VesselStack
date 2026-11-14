@@ -22,6 +22,8 @@ LIBEXEC_DIR="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 # Written by libexec/record-backup-result after every scheduled backup run.
 BACKUP_LAST_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last.json"
 BACKUP_LAST_ARCHIVE_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last-archive"
+# The archive the latest backup_stack call completed and verified; empty when none was made.
+LAST_BACKUP_ARCHIVE=''
 
 command_needs_lifecycle_lock() {
     case "${1:-}" in
@@ -532,6 +534,51 @@ stop_stack() {
     fi
 }
 
+# Reads $ROOT/config/install-in-progress, which install.sh keeps from its first change until its start
+# phase has succeeded (the bootstrap's read_install_marker follows the same rules). Plain KEY=VALUE
+# lines, read without sourcing. Sets MARKER_PRESENT (0/1) and MARKER_VERSION ("unknown" when invalid),
+# MARKER_FROM, MARKER_STARTED, MARKER_SOURCE, MARKER_BACKUP (each empty when missing or invalid).
+# Read-only; needs only $ROOT, so it works before load_config.
+# shellcheck disable=SC2034  # MARKER_FROM is part of the parsed record; callers read what they need.
+read_install_marker() {
+    local file=$ROOT/config/install-in-progress line key value size
+    local ver_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+    local when_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?$'
+    MARKER_PRESENT=0 MARKER_VERSION='' MARKER_FROM='' MARKER_STARTED='' MARKER_SOURCE='' MARKER_BACKUP=''
+    [ ! -L "$file" ] && [ -f "$file" ] && [ -r "$file" ] || return 0
+    size=$(wc -c < "$file" 2>/dev/null || echo 99999)
+    [ "${size//[[:space:]]/}" -le 4096 ] || return 0
+    MARKER_PRESENT=1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^([a-z]+)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+        case "$key" in
+            version) if [[ "$value" =~ $ver_re ]]; then MARKER_VERSION=$value; fi ;;
+            from) if [[ "$value" =~ $ver_re || "$value" = none ]]; then MARKER_FROM=$value; fi ;;
+            started) if [[ "$value" =~ $when_re ]]; then MARKER_STARTED=$value; fi ;;
+            source) if [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] ]]; then MARKER_SOURCE=$value; fi ;;
+            backup) if [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] ]]; then MARKER_BACKUP=$value; fi ;;
+        esac
+    done < "$file"
+    [ -n "$MARKER_VERSION" ] || MARKER_VERSION=unknown
+    return 0
+}
+
+# FAIL (returns 1) when the last installation or update did not finish; silent when it did.
+check_install_state() {
+    read_install_marker
+    [ "$MARKER_PRESENT" -eq 1 ] || return 0
+    printf 'FAIL installation of %s did not finish (started %s)\n' "$MARKER_VERSION" "${MARKER_STARTED:-unknown}" >&2
+    if [ -n "$MARKER_SOURCE" ] && [ -f "$MARKER_SOURCE/install.sh" ] && [ -f "$MARKER_SOURCE/VERSION" ] \
+        && [ "$(tr -d '[:space:]' < "$MARKER_SOURCE/VERSION")" = "$MARKER_VERSION" ]; then
+        printf '      continue: sudo %s/install.sh --config %s/config/vesselstack.env --start\n' "$MARKER_SOURCE" "$ROOT" >&2
+    else
+        printf '      continue: run get-vesselstack.sh again with --version %s\n' "$MARKER_VERSION" >&2
+    fi
+    [ -z "$MARKER_BACKUP" ] || printf '      go back:  sudo vesselstackctl restore %s --yes\n' "$MARKER_BACKUP" >&2
+    return 1
+}
+
 status_unit() {
     local label=$1 unit=$2 enabled=${3:-true}
     if [ "$enabled" != true ]; then
@@ -573,6 +620,14 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
 
 status_stack() {
     local failed=0 service running_services
+    # doctor reports the unfinished installation itself (check_install_state), so it passes "quiet".
+    if [ "${1:-}" != quiet ]; then
+        read_install_marker
+        if [ "$MARKER_PRESENT" -eq 1 ]; then
+            printf '%-20s %s\n' Installation "INCOMPLETE ($MARKER_VERSION, started ${MARKER_STARTED:-unknown}); see: sudo vesselstackctl doctor"
+            failed=1
+        fi
+    fi
     local services=(homeassistant influxdb grafana prometheus mosquitto homepage)
     local -a selected=()
     for service in "${services[@]}"; do
@@ -831,7 +886,10 @@ show_urls() {
 show_version() {
     local installed=unknown
     [ -r "$ROOT/config/installed-version" ] && installed=$(<"$ROOT/config/installed-version")
-    printf 'VesselStack installed: %s\n' "$installed"
+    local note=''
+    read_install_marker
+    [ "$MARKER_PRESENT" -eq 0 ] || note=' (installation did not finish; see: sudo vesselstackctl doctor)'
+    printf 'VesselStack installed: %s%s\n' "$installed" "$note"
     printf 'vesselstackctl source: %s\n' "${VESSELSTACK_VERSION:-$installed}"
 }
 
@@ -2316,6 +2374,7 @@ check_nodered() {
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
+    check_install_state || failed=1
     for command in docker curl tar sha256sum python3 systemctl; do
         if command -v "$command" >/dev/null 2>&1; then
             printf 'OK   command available: %s\n' "$command"
@@ -2351,7 +2410,7 @@ doctor_stack() {
     check_nodered
     check_remote
     check_power
-    status_stack || failed=1
+    status_stack quiet || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
     else
@@ -2613,6 +2672,7 @@ PY
     fi
     # The state that cleanup_backup reads is global on purpose: when errexit ends the shell inside this
     # function, bash runs the EXIT trap without the function's locals, and the stack must still restart.
+    LAST_BACKUP_ARCHIVE=''
     archive_created=0 archive_verified=0 BK_ARCHIVE='' BK_MANIFEST=''
     sample_timer_active=0 indexer_timer_active=0 chat_active=0 telegram_active=0 displays_active=0 signalk_active=0 socketcan_active=0
     declare -ga was_compose_services=()
@@ -2700,6 +2760,8 @@ PY
             echo "WARNING: could not prune old scheduled backups in $destination" >&2
         record_last_archive "$archive" || true
     fi
+    # Set only now that the archive is verified and the stack is running again (update_stack names it).
+    LAST_BACKUP_ARCHIVE=$archive
     printf '%s\n' "$archive"
 }
 
@@ -2847,26 +2909,45 @@ PY
 swap_in() {
     local staged=$1 target=$2 stamp=$3
     if [ -e "$target" ] || [ -L "$target" ]; then
-        mv -- "$target" "$target.pre-restore-$stamp" || return 1
+        mv -T -- "$target" "$target.pre-restore-$stamp" || return 1
     fi
-    mv -- "$staged" "$target" || return 1
+    mv -T -- "$staged" "$target" || return 1
 }
 
 # Snapshot the exact managed external files before the first stop. The journal
 # records absence as well as presence, so rollback removes files introduced by a
 # failed restore without touching unrelated /etc content.
-restore_external_candidates() {
-    local p unit
-    # This is the installer output allowlist.  It intentionally includes absent
-    # paths so a newer archive can remove files introduced by an old release.
-    for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service \
+# The unit names this CLI manages. Restore removes only these when the restored release
+# does not have them; any other vesselstack-* unit (for example one the owner made) is kept.
+restore_known_units() {
+    printf '%s\n' vesselstack-firewall.service vesselstack-homepage-refresh.service \
         vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
         vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.service vesselstack-telemetry-sample.timer \
         vesselstack-signalk.service vesselstack-socketcan.service vesselstack-displays-bridge.service \
         vesselstack-control-panel.service vesselstack-backup.service vesselstack-backup.timer \
-        vesselstack-alerts.service vesselstack-alerts.timer; do
+        vesselstack-alerts.service vesselstack-alerts.timer
+}
+
+# Installer helpers rebuilt from the restored release: source (under installer/scripts),
+# target, mode. The same mapping as install.sh.
+restore_helper_map() {
+    printf '%s\t%s\t%s\n' \
+        vesselstack-update "$SBIN_DIR/vesselstack-update" 0755 \
+        deploy-chat.py "$LIBEXEC_DIR/deploy-chat.py" 0755 \
+        lib/remediate.sh "$LIBEXEC_DIR/remediate.sh" 0644 \
+        lib/record-backup-result "$LIBEXEC_DIR/record-backup-result" 0755 \
+        vesselstack-alerts.py "$LIBEXEC_DIR/vesselstack-alerts.py" 0755
+}
+
+restore_external_candidates() {
+    local p unit
+    # This is the installer output allowlist.  Absent paths are inventoried too so
+    # rollback can restore the previous state, including removing files that a failed
+    # restore introduced.  Every unit file and enable link that exists now is inventoried
+    # as well, because restoring an older release may remove it.
+    while IFS= read -r unit; do
         printf '%s\n' "$SYSTEMD_DIR/$unit"
-    done
+    done < <(restore_known_units)
     printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/vesselstack-backup.timer" "$SYSTEMD_DIR/timers.target.wants/vesselstack-alerts.timer"
     for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.timer \
         vesselstack-telemetry-sample.timer vesselstack-signalk.service vesselstack-socketcan.service \
@@ -2874,9 +2955,15 @@ restore_external_candidates() {
         printf '%s\n' "$SYSTEMD_DIR/multi-user.target.wants/$unit"
         printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/$unit"
     done
+    for p in "$SYSTEMD_DIR"/vesselstack-*; do
+        if [ -f "$p" ] && [ ! -L "$p" ]; then printf '%s\n' "$p"; fi
+    done
+    for p in "$SYSTEMD_DIR"/*.wants/vesselstack-*; do
+        if [ -L "$p" ]; then printf '%s\n' "$p"; fi
+    done
     for p in "$SBIN_DIR/vesselstackctl" "$SBIN_DIR/vesselstack-firewall" "$SBIN_DIR/vesselstack-update" \
         "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" "$LIBEXEC_DIR/vesselstack-alerts.py" \
-        "$LIBEXEC_DIR/reconcile-lifecycle.sh" "$SYSTEM_ROOT/etc/vesselstack/update.env"; do
+        "$SYSTEM_ROOT/etc/vesselstack/update.env"; do
         printf '%s\n' "$p"
     done
 }
@@ -2971,6 +3058,146 @@ restore_publish_externals() {
         fi
     done < "$journal/publish-list"
 }
+# True when the path was captured by the snapshot, so rollback can restore it exactly.
+restore_journal_has_path() {
+    grep -qxF -- "$2" "$1/inventory"
+}
+restore_unit_label() {
+    case "$1" in
+        vesselstack-backup.timer) printf 'scheduled backups' ;;
+        vesselstack-backup.service) printf 'scheduled backup job' ;;
+        vesselstack-alerts.timer) printf 'Telegram alerts' ;;
+        vesselstack-alerts.service) printf 'Telegram alerts job' ;;
+        vesselstack-chat.service) printf 'Boat Chat' ;;
+        vesselstack-chat-telegram.service) printf 'Boat Chat on Telegram' ;;
+        vesselstack-displays-bridge.service) printf 'displays' ;;
+        vesselstack-control-panel.service) printf 'Control Panel' ;;
+        vesselstack-firewall.service) printf 'firewall' ;;
+        vesselstack-signalk.service) printf 'Signal K' ;;
+        vesselstack-socketcan.service) printf 'CAN bus' ;;
+        vesselstack-telemetry-*) printf 'telemetry' ;;
+        vesselstack-homepage-refresh.service) printf 'home page refresh' ;;
+    esac
+}
+# Leave the system-level files consistent with the restored release: turn off managed units
+# the archive does not have, and rebuild the installer helpers from the restored tree.
+# Everything touched here is in the snapshot, so a rollback puts it back exactly.
+restore_sync_system_files() {
+    local journal=$1 stage=$2 root=$3 unit link wants_link scripts source target mode tmp
+    local -a doomed=() links=() owner=()
+    local archive_units=0
+    : > "$journal/removed-units" || return 1
+    # An archive with no managed unit at all is malformed or hand-built (real archives have
+    # carried unit files since 0.6.4); removing every known unit because of it would be wrong.
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if [ -e "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/$unit" ] || [ -L "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/$unit" ]; then
+            archive_units=$((archive_units + 1))
+        fi
+    done < <(restore_known_units)
+    if [ "$archive_units" -eq 0 ]; then
+        echo "WARN the backup contains no VesselStack unit files; leaving the installed units in place" >&2
+    fi
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        [ "$archive_units" -gt 0 ] || break
+        [ ! -e "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/$unit" ] && [ ! -L "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/$unit" ] || continue
+        links=()
+        for wants_link in "$SYSTEMD_DIR"/*.wants/"$unit"; do
+            if [ -L "$wants_link" ]; then links+=("$wants_link"); fi
+        done
+        if [ -e "$SYSTEMD_DIR/$unit" ] || [ -L "$SYSTEMD_DIR/$unit" ] || [ "${#links[@]}" -gt 0 ]; then
+            doomed+=("$unit")
+        fi
+    done < <(restore_known_units)
+    for unit in ${doomed[@]+"${doomed[@]}"}; do
+        # Best effort: the writers are already quiesced and the stack stopped.
+        systemctl stop "$unit" 2>/dev/null || true
+    done
+    for unit in ${doomed[@]+"${doomed[@]}"}; do
+        for link in "$SYSTEMD_DIR"/*.wants/"$unit"; do
+            [ -L "$link" ] || continue
+            restore_journal_has_path "$journal" "$link" || return 1
+            restore_external_validate_path "$link" || return 1
+            rm -f -- "$link" || return 1
+        done
+        if [ -e "$SYSTEMD_DIR/$unit" ] || [ -L "$SYSTEMD_DIR/$unit" ]; then
+            restore_journal_has_path "$journal" "$SYSTEMD_DIR/$unit" || return 1
+            restore_external_validate_path "$SYSTEMD_DIR/$unit" || return 1
+            rm -f -- "$SYSTEMD_DIR/$unit" || return 1
+        fi
+        printf '%s\n' "$unit" >> "$journal/removed-units" || return 1
+    done
+    # A tree without installer/scripts (a very old release) leaves the helpers alone.
+    scripts="$root/installer/scripts"
+    [ -d "$scripts" ] || return 0
+    if [ "$(id -u)" -eq 0 ]; then owner=(-o root -g root); fi
+    while IFS=$'\t' read -r source target mode; do
+        restore_journal_has_path "$journal" "$target" || return 1
+        restore_external_validate_path "$target" || return 1
+        if [ -e "$scripts/$source" ] || [ -L "$scripts/$source" ]; then
+            [ -f "$scripts/$source" ] && [ ! -L "$scripts/$source" ] || return 1
+            install -d -m 0755 "$(dirname "$target")" || return 1
+            tmp=$(mktemp "$(dirname "$target")/.restore-publish.XXXXXX") || return 1
+            if ! install -m "$mode" ${owner[@]+"${owner[@]}"} "$scripts/$source" "$tmp" || ! mv -f -- "$tmp" "$target"; then
+                rm -f -- "$tmp"
+                return 1
+            fi
+        else
+            rm -f -- "$target" || return 1
+        fi
+    done < <(restore_helper_map)
+}
+# Units that read or write ROOT or DATA and are not stopped by stop_stack. They are
+# stopped for the swap only, and the ones actually stopped are recorded in
+# $journal/quiesced-units and the restore_quiesced variable (one unit per line).
+restore_quiesce_unit() {
+    local journal=$1 unit=$2
+    case $'\n'"$restore_quiesced" in *$'\n'"$unit"$'\n'*) return 0 ;; esac
+    systemctl is-active --quiet "$unit" 2>/dev/null || return 0
+    # Record first: a stop that fails half way must still be undone by a start.
+    restore_quiesced="$restore_quiesced$unit"$'\n'
+    printf '%s\n' "$unit" >> "$journal/quiesced-units" || return 1
+    systemctl stop "$unit" || return 1
+}
+restore_quiesce_writers() {
+    local journal=$1 timer service
+    restore_quiesced=''
+    : > "$journal/quiesced-units" || return 1
+    while IFS= read -r timer; do
+        [ -n "$timer" ] || continue
+        systemctl is-active --quiet "$timer" 2>/dev/null || continue
+        restore_quiesce_unit "$journal" "$timer" || return 1
+        service=$(systemctl show -p Unit --value "$timer" 2>/dev/null || true)
+        case "$service" in *.service) ;; *) service=${timer%.timer}.service ;; esac
+        restore_quiesce_unit "$journal" "$service" || return 1
+    done < <({ printf '%s\n' vesselstack-alerts.timer vesselstack-backup.timer \
+                   vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.timer
+               systemctl list-units --plain --no-legend --no-pager --type=timer 'vesselstack-*.timer' 2>/dev/null | awk '{print $1}'; } | sort -u)
+    restore_quiesce_unit "$journal" vesselstack-control-panel.service || return 1
+    restore_quiesce_unit "$journal" vesselstack-homepage-refresh.service || return 1
+}
+# Rollback: start exactly the units that were stopped. Best effort.
+restore_start_quiesced() {
+    local unit
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        systemctl start "$unit" || echo "WARN could not restart $unit after the restore rollback; run: sudo systemctl start $unit" >&2
+    done <<< "$restore_quiesced"
+    return 0
+}
+# Success: the installer normally restarts the panel and enables the timers itself; this
+# covers --skip-installer. Best effort.
+restore_resume_quiesced() {
+    local unit
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        [ -e "$SYSTEMD_DIR/$unit" ] || [ -L "$SYSTEMD_DIR/$unit" ] || continue
+        systemctl is-active --quiet "$unit" 2>/dev/null && continue
+        systemctl start "$unit" || echo "WARN could not start $unit after the restore; run: sudo systemctl start $unit" >&2
+    done <<< "$restore_quiesced"
+    return 0
+}
 restore_run_controller() {
     local journal=$1 controller=$2 action=$3
     [ "$action" = stop ] || [ "$action" = start ] || return 2
@@ -3013,46 +3240,71 @@ restore_commit_transaction() {
         if [ "$new_start_attempted" -eq 1 ]; then
             restore_run_controller "$journal" "$new_controller" stop || return 1
         fi
-        if [ "$root_new_published" -eq 1 ]; then mv -- "$root" "$failed_root" || return 1; fi
-        if [ "$data_new_published" -eq 1 ]; then mv -- "$data" "$failed_data" || return 1; fi
+        if [ "$root_new_published" -eq 1 ]; then mv -T -- "$root" "$failed_root" || return 1; fi
+        if [ "$data_new_published" -eq 1 ]; then mv -T -- "$data" "$failed_data" || return 1; fi
         if [ "$root_old_moved" -eq 1 ]; then
             [ ! -e "$root" ] && [ ! -L "$root" ] || return 1
-            mv -- "$root.pre-restore-$stamp" "$root" || return 1
+            mv -T -- "$root.pre-restore-$stamp" "$root" || return 1
         fi
         if [ "$data_old_moved" -eq 1 ]; then
             [ ! -e "$data" ] && [ ! -L "$data" ] || return 1
-            mv -- "$data.pre-restore-$stamp" "$data" || return 1
+            mv -T -- "$data.pre-restore-$stamp" "$data" || return 1
         fi
         [ -d "$root" ] && [ ! -L "$root" ] && [ -d "$data" ] && [ ! -L "$data" ] || return 1
         restore_restore_externals "$journal" || return 1
+        rm -f -- "$journal/removed-units"
         systemctl daemon-reload || return 1
         restore_run_controller "$journal" "$old_controller" start || return 1
+        restore_start_quiesced
     }
     restore_fail() {
         local reason=$1
         echo "Restore failed: $reason" >&2
         echo "Recovery journal: $journal" >&2
         echo "Failed trees (if published): $failed_root $failed_data" >&2
-        if restore_recover; then echo "Restore rollback completed; previous trees restored" >&2
-        else echo "RECOVERY ERROR: evidence retained; inspect journal and failed trees" >&2; fi
+        if restore_recover; then
+            restore_rollback=ok
+            echo "Restore rollback completed; previous trees restored" >&2
+        else
+            restore_rollback=failed
+            echo "RECOVERY ERROR: evidence retained; inspect journal and failed trees" >&2
+        fi
         return 1
     }
+    restore_rollback=none
+    restore_quiesced=''
     if ! restore_run_controller "$journal" "$old_controller" stop; then
+        restore_rollback=ok
         if ! restore_run_controller "$journal" "$old_controller" start; then
+            restore_rollback=failed
             echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
         fi
         echo "Restore failed: old controller stop failed; journal retained at $journal" >&2
         return 1
     fi
-    if ! mv -- "$data" "$data.pre-restore-$stamp"; then restore_fail "data old-tree rename"; return 1; fi
+    # Nothing has been renamed yet, so a failed quiesce only needs the old stack and the
+    # units that were already stopped brought back.
+    if ! restore_quiesce_writers "$journal"; then
+        restore_rollback=ok
+        if ! restore_run_controller "$journal" "$old_controller" start; then
+            restore_rollback=failed
+            echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
+        else
+            restore_start_quiesced
+        fi
+        echo "Restore failed: could not stop the Control Panel and timers; journal retained at $journal" >&2
+        return 1
+    fi
+    if ! mv -T -- "$data" "$data.pre-restore-$stamp"; then restore_fail "data old-tree rename"; return 1; fi
     data_old_moved=1
-    if ! mv -- "$stage/vesselstack-backup/${data#/}" "$data"; then restore_fail "data publication"; return 1; fi
+    if ! mv -T -- "$stage/vesselstack-backup/${data#/}" "$data"; then restore_fail "data publication"; return 1; fi
     data_new_published=1
-    if ! mv -- "$root" "$root.pre-restore-$stamp"; then restore_fail "root old-tree rename"; return 1; fi
+    if ! mv -T -- "$root" "$root.pre-restore-$stamp"; then restore_fail "root old-tree rename"; return 1; fi
     root_old_moved=1
-    if ! mv -- "$stage/vesselstack-backup/${root#/}" "$root"; then restore_fail "root publication"; return 1; fi
+    if ! mv -T -- "$stage/vesselstack-backup/${root#/}" "$root"; then restore_fail "root publication"; return 1; fi
     root_new_published=1
     if ! restore_publish_externals "$journal" "$stage"; then restore_fail "managed external publication"; return 1; fi
+    if ! restore_sync_system_files "$journal" "$stage" "$root"; then restore_fail "system file reconciliation"; return 1; fi
     if ! systemctl daemon-reload; then restore_fail "daemon reload"; return 1; fi
     new_start_attempted=1
     if [ "$skip_installer" -eq 0 ] && [ -x "$root/installer/install.sh" ]; then
@@ -3060,7 +3312,34 @@ restore_commit_transaction() {
     else
         if ! restore_run_controller "$journal" "$new_controller" start; then restore_fail "restored controller start"; return 1; fi
     fi
+    restore_resume_quiesced
     return 0
+}
+
+# Called by restore_stack after restore_commit_transaction failed.
+restore_finish_failed_commit() {
+    local stage=$1 journal=$2
+    if [ "${restore_rollback:-}" = ok ]; then
+        rm -rf -- "$stage"
+        echo "Restore failed, but the previous trees were restored. The staged copy of the backup was removed." >&2
+    else
+        echo "Restore failed and the rollback did not complete. Kept for recovery:" >&2
+        echo "  stage:   $stage" >&2
+        echo "  journal: $journal" >&2
+        echo "Both contain a copy of the backup (including secrets); remove them after recovery." >&2
+    fi
+}
+
+# Called by restore_stack after a successful restore with --skip-installer.
+restore_skip_installer_notice() {
+    local root=$1
+    echo "WARN The Python environments for Boat Chat and the displays are not part of a backup, so those services will not run until the installer has been run." >&2
+    if [ -f "$root/installer/install.sh" ]; then
+        echo "WARN Run this command to finish the restore:" >&2
+        echo "sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
+    else
+        echo "WARN The restored tree has no installer; rerun the VesselStack installer for this version." >&2
+    fi
 }
 
 restore_stack() {
@@ -3085,7 +3364,6 @@ restore_stack() {
         fi
     done
     local stage_parent stamp stage need_kib free_kib
-    local data_old_moved=0 data_new_published=0 root_old_moved=0 root_new_published=0 new_start_attempted=0
     stage_parent=$(dirname "$data")
     for path in "$root" "$data"; do
         if ! { [ -d "$path" ] && [ ! -L "$path" ]; }; then
@@ -3148,25 +3426,37 @@ PY
     old_controller="$journal/old-controller"
     cp -a -- "$0" "$old_controller" || { rm -rf -- "$journal"; exit 1; }
     restore_snapshot_externals "$journal" "$stage" || {
-        rm -rf -- "$stage"
+        rm -rf -- "$stage" "$journal"
         echo "Could not create the recovery journal; nothing was changed" >&2
         exit 1
     }
     new_controller="$journal/new-controller"
     if [ -f "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ]; then
-        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || { rm -rf -- "$stage"; exit 1; }
+        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || { rm -rf -- "$stage" "$journal"; exit 1; }
     elif [ -f "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ]; then
-        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || { rm -rf -- "$stage"; exit 1; }
+        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || { rm -rf -- "$stage" "$journal"; exit 1; }
     else
-        echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage"; exit 1
+        echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage" "$journal"; exit 1
     fi
-    if ! { [ -x "$old_controller" ] && [ -x "$new_controller" ]; }; then echo "Restore controllers are not executable" >&2; rm -rf -- "$stage"; exit 1; fi
+    if ! { [ -x "$old_controller" ] && [ -x "$new_controller" ]; }; then echo "Restore controllers are not executable" >&2; rm -rf -- "$stage" "$journal"; exit 1; fi
     if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$old_controller" "$new_controller" "$skip_installer"; then
+        local removed_units='' unit label
+        if [ -r "$journal/removed-units" ]; then removed_units=$(cat "$journal/removed-units"); fi
         rm -rf -- "$stage" "$journal"
         echo "Restore completed"
         echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
+        if [ -n "$removed_units" ]; then
+            echo "Turned off because the restored version does not have them:"
+            while IFS= read -r unit; do
+                [ -n "$unit" ] || continue
+                label=$(restore_unit_label "$unit")
+                if [ -n "$label" ]; then echo "  $label ($unit)"; else echo "  $unit"; fi
+            done <<< "$removed_units"
+        fi
+        if [ "$skip_installer" -eq 1 ]; then restore_skip_installer_notice "$root"; fi
         return 0
     fi
+    restore_finish_failed_commit "$stage" "$journal"
     return 1
 }
 
@@ -3325,7 +3615,8 @@ update_stack() {
         true|false) ;;
         *) echo "VESSELSTACK_OFFLINE must be true or false" >&2; exit 1 ;;
     esac
-    local install_args=(--config "$ENV_FILE")
+    local install_args=(--config "$ENV_FILE") given_args new_version='the new release' previous_version=unknown
+    given_args=$(printf ' %q' "$@")
     [ "$offline" != true ] || install_args+=(--offline)
     [ -x "$source/install.sh" ] || { echo "Not a VesselStack release directory: $source" >&2; exit 1; }
     if [ -n "$choice" ] && backup_system_disk_locked; then
@@ -3333,13 +3624,33 @@ update_stack() {
         exit 1
     fi
     "$source/install.sh" "${install_args[@]}" --dry-run
+    if [ -r "$source/VERSION" ]; then new_version=$(tr -d '[:space:]' < "$source/VERSION" || true); fi
+    if [ -r "$ROOT/config/installed-version" ]; then previous_version=$(tr -d '[:space:]' < "$ROOT/config/installed-version" || true); fi
+    : "${new_version:=the new release}" "${previous_version:=unknown}"
+    LAST_BACKUP_ARCHIVE=''
     case "$choice" in
         system-disk-once) VS_BACKUP_CONTEXT=update VS_BACKUP_UPDATE_DIR=$source backup_stack --system-disk-once ;;
         skip) echo "WARNING: backup skipped at the owner's request for this update; there is no archive to restore from." >&2 ;;
         # The backup check runs before anything is stopped; it may ask where to back up.
         *) VS_BACKUP_CONTEXT=update VS_BACKUP_UPDATE_DIR=$source backup_stack "${VESSELSTACK_BACKUP:-/var/backups/vesselstack}" ;;
     esac
-    "$source/install.sh" "${install_args[@]}" --start
+    # The installer records the backup in its in-progress marker. The subshell keeps the variable out of
+    # this shell; exec keeps the lifecycle lock descriptor and exit status exactly as a direct call has them.
+    if ! (
+        if [ -n "$LAST_BACKUP_ARCHIVE" ]; then export VESSELSTACK_PREUPDATE_BACKUP=$LAST_BACKUP_ARCHIVE; else unset VESSELSTACK_PREUPDATE_BACKUP; fi
+        exec "$source/install.sh" "${install_args[@]}" --start
+    ); then
+        {
+            printf 'The update to %s did not finish (see above). Your data is kept.\n' "$new_version"
+            printf 'Try again (for example once the network is back): sudo vesselstackctl update%s\n' "$given_args"
+            if [ -n "$LAST_BACKUP_ARCHIVE" ]; then
+                printf 'Or go back to %s: sudo vesselstackctl restore %q --yes\n' "$previous_version" "$LAST_BACKUP_ARCHIVE"
+            else
+                echo 'Or go back: restore the newest vesselstack-*.tar.gz in your backup folder: sudo vesselstackctl restore FILE --yes'
+            fi
+        } >&2
+        exit 1
+    fi
 }
 
 uninstall_stack() {

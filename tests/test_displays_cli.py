@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -30,6 +31,7 @@ import render  # noqa: E402
 import schema  # noqa: E402
 
 EXAMPLE = json.loads((ROOT / "displays" / "displays.example.json").read_text())
+NOW = datetime(2026, 3, 1, 12, 0, 12, tzinfo=timezone.utc)
 BOARD = "waveshare-esp32-s3-touch-lcd-2.8c"
 ADMIN_PASSWORD = "admin-secret-value"
 WIFI_PASSWORD = "wifi-pass-123"
@@ -800,15 +802,15 @@ class CliTests(unittest.TestCase):
         self.add("aux")
         self.runner.calls.clear()
         fake = FakeExec(stdout=(
-            "vesselstack/v1/bridge/status\tonline\n"
+            self.service("online", "2026-03-01T12:00:00Z") + "\n"
             "vesselstack/v1/bridge/signalk\tconnected\n"
             "vesselstack/v1/displays/vsdisp-helm/status\tonline\n"
             "vesselstack/v1/displays/vsdisp-aux/status\toffline\x1b[31m\n"),
             returncode=27)
-        ctx = self.ctx(exec_runner=fake)
+        ctx = self.ctx(exec_runner=fake, now=lambda: NOW)
         self.assertEqual(lifecycle.status(ctx), 0)
         text = self.output()
-        self.assertRegex(text, r"Bridge\s+online")
+        self.assertRegex(text, r"Bridge\s+online \(reported 12 s ago\)")
         self.assertRegex(text, r"SignalK link\s+connected")
         self.assertRegex(text, r"helm\s+online")
         self.assertRegex(text, r"aux\s+offline\?")  # control characters are neutralised
@@ -821,6 +823,52 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stdin_text, f"-u homeassistant\n-P {ADMIN_PASSWORD}\n")
         self.assertEqual(argv[:5], ["docker", "exec", "-i", mqtt_auth.CONTAINER, "sh"])
         self.assertNotIn("-e", argv)
+        self.assertIn("vesselstack/v1/bridge/service", argv)
+        self.assertNotIn("vesselstack/v1/bridge/status", argv)    # not retained any more: nothing to read
+
+    @staticmethod
+    def service(state, ts):
+        return "vesselstack/v1/bridge/service\t" + json.dumps({"state": state, "ts": ts},
+                                                                 separators=(",", ":"))
+
+    def bridge_line(self, stdout):
+        if "helm" not in self.cfg()["displays"]:
+            self.add("helm")
+        self.assertEqual(lifecycle.status(self.ctx(exec_runner=FakeExec(stdout=stdout, returncode=27),
+                                                   now=lambda: NOW)), 0)
+        return next(line for line in self.lines if line.startswith("Bridge"))
+
+    def test_status_bridge_old_report_is_last_known_not_live(self):
+        line = self.bridge_line(self.service("online", "2026-02-26T12:00:12Z") + "\n")
+        self.assertRegex(line, r"Bridge\s+last reported online 3 days ago; the bridge may not be running")
+        line = self.bridge_line(self.service("online", "2026-03-01T11:00:12Z") + "\n")
+        self.assertIn("last reported online 60 min ago", line)
+
+    def test_status_bridge_clean_stop_and_bad_reports(self):
+        self.assertRegex(self.bridge_line(self.service("offline", "2026-03-01T11:55:12Z") + "\n"),
+                         r"Bridge\s+offline \(reported 5 min ago\)")
+        self.assertRegex(self.bridge_line("vesselstack/v1/bridge/service\tnot json\n"),
+                         r"Bridge\s+unknown \(unreadable report\)")
+        self.assertRegex(self.bridge_line(self.service("online", "2030-01-01T00:00:00Z") + "\n"),
+                         r"Bridge\s+unknown \(report is dated in the future")
+        self.assertRegex(self.bridge_line("vesselstack/v1/bridge/service\t{\"state\":\"x\",\"ts\":\"y\"}\n"),
+                         r"unreadable report")
+
+    def test_status_bridge_without_a_report_is_unknown(self):
+        self.assertRegex(self.bridge_line(""), r"Bridge\s+unknown \(no report\)")
+        # the old retained topic is ignored: a leftover from an older bridge must not read as online
+        self.assertRegex(self.bridge_line("vesselstack/v1/bridge/status\tonline\n"),
+                         r"Bridge\s+unknown \(no report\)")
+
+    def test_status_freshness_follows_the_configured_heartbeat(self):
+        self.add("helm")
+        cfg = self.cfg()
+        cfg["heartbeat_s"] = 2
+        self.config.write_text(json.dumps(cfg))
+        line = self.bridge_line(self.service("online", "2026-03-01T12:00:00Z") + "\n")   # 12 s old, limit 6
+        self.assertIn("last reported online 12 s ago", line)
+        line = self.bridge_line(self.service("online", "2026-03-01T12:00:08Z") + "\n")   # 4 s old
+        self.assertIn("online (reported 4 s ago)", line)
 
     def test_status_missing_messages(self):
         self.add("helm")
