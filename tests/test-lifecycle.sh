@@ -1894,9 +1894,32 @@ printf 'wal after backup\n' > "$DATA_ROOT/created-after-backup.wal"
 printf 'unit two\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 printf 'UPDATE_KEY=two\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
 rm -f -- "$TEST_ROOT/installer-ran"
+# Units this system has but the archive does not (a newer release than the backup) are turned
+# off and reported; an owner-made unit is left alone.
+install -d "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants"
+printf 'newer\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.timer"
+printf 'newer\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service"
+printf 'owner\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service"
+ln -s ../vesselstack-alerts.timer "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-alerts.timer"
+ln -s ../vesselstack-custom.service "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
 : > "$FAKE_BIN/calls.log"
 restore_output=$(run_ctl restore "$archive" --yes)
 grep -q 'Restore completed' <<<"$restore_output"
+grep -qx 'Turned off because the restored version does not have them:' <<<"$restore_output" || {
+    echo 'Restore did not report the units it turned off' >&2
+    exit 1
+}
+grep -qx '  Telegram alerts (vesselstack-alerts.timer)' <<<"$restore_output"
+if [ -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.timer" ] || \
+   [ -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service" ] || \
+   [ -L "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-alerts.timer" ]; then
+    echo 'Restore left a unit the restored version does not have' >&2
+    exit 1
+fi
+grep -qx 'owner' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service"
+test -L "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
+rm -f -- "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service" \
+    "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
 grep -qx 'version one' "$DATA_ROOT/state.txt"
 test ! -e "$DATA_ROOT/created-after-backup.wal"
 [ "$(stat -c %u:%g "$DATA_ROOT/state.txt")" = 1234:1234 ] || {

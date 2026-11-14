@@ -7,7 +7,7 @@ CONTROLLER = ROOT / "scripts/vesselstackctl"
 
 def helper_source():
     text = CONTROLLER.read_text()
-    a = text.index("restore_external_candidates() {")
+    a = text.index("restore_known_units() {")
     b = text.index("restore_run_controller() {", a)
     return text[a:b]
 
@@ -69,6 +69,7 @@ __mv() {
 SYSTEMD_DIR="@SYSTEMD@"
 restore_run_controller() { action=$3; if [ "$action" = stop ]; then if [ "$2" = "@NEW@" ]; then [ "@MODE@" != new_stop_fail ]; else [ "@MODE@" != old_stop_fail ]; fi; elif [ "$action" = start ]; then if [ "$2" = "@NEW@" ]; then [ "@MODE@" != new_start_fail ] && [ "@MODE@" != new_stop_fail ]; else true; fi; fi; }
 restore_publish_externals() { return 0; }
+restore_sync_system_files() { return 0; }
 restore_restore_externals() { return 0; }
 systemctl() {
     echo "systemctl $*" >> "@LOG@"
@@ -232,6 +233,168 @@ test ! -e "$SYSTEMD_DIR/vesselstack-new.service"
 '''
             result = self.run_harness(body, system)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+
+    # ---- system-level files after restoring an older (or the same) release ----
+    NEWER_ONLY = ("vesselstack-backup.service", "vesselstack-backup.timer",
+                  "vesselstack-alerts.service", "vesselstack-alerts.timer")
+
+    @staticmethod
+    def fs_state(*dirs):
+        state = {}
+        for top in dirs:
+            for path in sorted(Path(top).rglob("*")):
+                if path.is_symlink():
+                    state[str(path)] = ("link", os.readlink(path))
+                elif path.is_file():
+                    state[str(path)] = ("file", path.read_bytes(), path.stat().st_mode & 0o777)
+        return state
+
+    def run_sync(self, archive="older", scripts="older", mode="success"):
+        td = tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup); base = Path(td.name)
+        root = base / "root"; data = base / "data"
+        (root / "old").mkdir(parents=True); (data / "old").mkdir(parents=True)
+        systemd = base / "etc/systemd/system"; sbin = base / "usr/local/sbin"; libexec = base / "usr/local/libexec/vesselstack"
+        for d in (systemd / "multi-user.target.wants", systemd / "timers.target.wants", sbin, libexec):
+            d.mkdir(parents=True)
+        def put(path, text, mode=0o644):
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_text(text); path.chmod(mode)
+        # the running (newer) system
+        for unit in ("vesselstack-chat.service", "vesselstack-control-panel.service", "vesselstack-custom.service") + self.NEWER_ONLY:
+            put(systemd / unit, f"current {unit}")
+        (systemd / "multi-user.target.wants/vesselstack-chat.service").symlink_to("../vesselstack-chat.service")
+        (systemd / "multi-user.target.wants/vesselstack-custom.service").symlink_to("../vesselstack-custom.service")
+        for unit in ("vesselstack-backup.timer", "vesselstack-alerts.timer"):
+            (systemd / "timers.target.wants" / unit).symlink_to(f"../{unit}")
+        put(sbin / "vesselstackctl", "ctl-new", 0o755); put(sbin / "vesselstack-update", "update-new", 0o755)
+        put(libexec / "deploy-chat.py", "chat-new", 0o755); put(libexec / "remediate.sh", "rem-new")
+        put(libexec / "record-backup-result", "rec-new", 0o755); put(libexec / "vesselstack-alerts.py", "alerts-new", 0o755)
+        put(base / "etc/vesselstack/update.env", "KEY=1", 0o600)
+        # the staged archive
+        stage = base / "stage"; backup = stage / "vesselstack-backup"
+        def staged(path): return backup / str(path).lstrip("/")
+        (staged(root)).mkdir(parents=True); (staged(data) / "x").parent.mkdir(parents=True); (staged(data) / "new").write_text("new")
+        (staged(root) / "new").write_text("new")
+        archived = ["vesselstack-chat.service", "vesselstack-control-panel.service"]
+        if archive == "same": archived += list(self.NEWER_ONLY)
+        if archive == "none": archived = []
+        for unit in archived: put(staged(systemd / unit), f"archived {unit}")
+        put(staged(sbin / "vesselstackctl"), "ctl-old", 0o755)
+        if scripts != "none":
+            sc = staged(root) / "installer/scripts"; (sc / "lib").mkdir(parents=True)
+            put(sc / "vesselstack-update", "update-old", 0o755); put(sc / "deploy-chat.py", "chat-old", 0o755)
+            put(sc / "lib/remediate.sh", "rem-old")
+            if scripts == "same":
+                put(sc / "lib/record-backup-result", "rec-old", 0o755); put(sc / "vesselstack-alerts.py", "alerts-old", 0o755)
+        journal = base / "journal"; journal.mkdir()
+        old = base / "old-controller"; new = base / "new-controller"; old.write_text("old"); new.write_text("new")
+        old.chmod(0o755); new.chmod(0o755)
+        log = base / "calls.log"; log.write_text("")
+        active = base / "active"
+        active.write_text("vesselstack-alerts.timer\nvesselstack-alerts.service\nvesselstack-control-panel.service\n")
+        before = self.fs_state(base / "etc", base / "usr")
+        body = transaction_source() + """
+SYSTEMD_DIR="@SYSTEMD@"
+restore_run_controller() {
+    action=$3
+    if [ "$action" = start ] && [ "$2" = "@NEW@" ]; then
+        [ -e "$SYSTEMD_DIR/vesselstack-backup.timer" ] || : > "@JOURNAL@.removed-before-start"
+        [ "@MODE@" != new_start_fail ]
+    else true; fi
+}
+mv() { __mv "$@"; }
+systemctl() {
+    local u state=missing
+    case "$1" in
+        is-active) u=${@: -1}; grep -qx "$u" "@ACTIVE@" ;;
+        stop) echo "systemctl $*" >> "@LOG@"; for u in "${@:2}"; do { grep -vx "$u" "@ACTIVE@" || true; } > "@ACTIVE@.n"; command mv "@ACTIVE@.n" "@ACTIVE@"; done ;;
+        start) u=$2; [ -e "$SYSTEMD_DIR/$u" ] && state=present
+               echo "systemctl start $u unit-file=$state" >> "@LOG@"; echo "$u" >> "@ACTIVE@" ;;
+        *) echo "systemctl $*" >> "@LOG@"; return 0 ;;
+    esac
+}
+restore_snapshot_externals "@JOURNAL@" "@STAGE@"
+restore_commit_transaction "@STAGE@" "@JOURNAL@" "@ROOT@" "@DATA@" S "@OLD@" "@NEW@" 1 && rc=0 || rc=$?
+exit "$rc"
+"""
+        for key, value in {"@SYSTEMD@": systemd, "@NEW@": new, "@OLD@": old, "@MODE@": mode, "@LOG@": log, "@ACTIVE@": active,
+                           "@ROOT@": root, "@DATA@": data, "@STAGE@": stage, "@JOURNAL@": journal}.items():
+            body = body.replace(key, str(value))
+        result = self.run_harness(body, base)
+        return {"base": base, "result": result, "before": before, "journal": journal, "log": log.read_text().splitlines(),
+                "systemd": systemd, "sbin": sbin, "libexec": libexec, "root": root}
+
+    def test_older_release_removes_units_it_does_not_have_and_rebuilds_helpers(self):
+        r = self.run_sync(); s = r["systemd"]
+        self.assertEqual(r["result"].returncode, 0, r["result"].stderr)
+        for unit in self.NEWER_ONLY:
+            self.assertFalse((s / unit).exists(), unit)
+        for wants in ("vesselstack-backup.timer", "vesselstack-alerts.timer"):
+            self.assertFalse((s / "timers.target.wants" / wants).is_symlink(), wants)
+        self.assertFalse((r["libexec"] / "vesselstack-alerts.py").exists())
+        self.assertEqual((s / "vesselstack-chat.service").read_text(), "archived vesselstack-chat.service")
+        self.assertEqual((r["libexec"] / "deploy-chat.py").read_text(), "chat-old")
+        self.assertEqual((r["libexec"] / "remediate.sh").read_text(), "rem-old")
+        self.assertEqual((r["sbin"] / "vesselstack-update").read_text(), "update-old")
+        self.assertEqual(oct((r["libexec"] / "deploy-chat.py").stat().st_mode & 0o777), "0o755")
+        self.assertEqual(oct((r["libexec"] / "remediate.sh").stat().st_mode & 0o777), "0o644")
+        # the helper the older tree does not ship is gone; vesselstackctl comes from the archive
+        self.assertFalse((r["libexec"] / "record-backup-result").exists())
+        self.assertEqual((r["sbin"] / "vesselstackctl").read_text(), "ctl-old")
+        # the owner's own unit and its enable link are untouched
+        self.assertEqual((s / "vesselstack-custom.service").read_text(), "current vesselstack-custom.service")
+        self.assertEqual(os.readlink(s / "multi-user.target.wants/vesselstack-custom.service"), "../vesselstack-custom.service")
+        self.assertEqual(sorted((r["journal"] / "removed-units").read_text().split()), sorted(self.NEWER_ONLY))
+        # removed units are not started again; the Control Panel (still present) is
+        calls = r["log"]
+        self.assertFalse([c for c in calls if c.startswith("systemctl start vesselstack-alerts")], calls)
+        self.assertIn("systemctl start vesselstack-control-panel.service unit-file=present", calls)
+        self.assertEqual([c for c in calls if c == "systemctl daemon-reload"], ["systemctl daemon-reload"])
+
+    def test_failure_after_the_externals_step_restores_everything(self):
+        r = self.run_sync(mode="new_start_fail")
+        self.assertNotEqual(r["result"].returncode, 0)
+        self.assertTrue(Path(str(r["journal"]) + ".removed-before-start").exists(), "units were never removed before the failure")
+        after = self.fs_state(r["base"] / "etc", r["base"] / "usr")
+        self.assertEqual(after, r["before"])
+        self.assertTrue(os.path.islink(r["systemd"] / "timers.target.wants/vesselstack-alerts.timer"))
+        self.assertEqual(os.readlink(r["systemd"] / "timers.target.wants/vesselstack-alerts.timer"), "../vesselstack-alerts.timer")
+        self.assertFalse((r["journal"] / "removed-units").exists())
+        # the quiesced timer comes back only after its unit file was restored
+        starts = [c for c in r["log"] if c.startswith("systemctl start vesselstack-alerts.timer")]
+        self.assertEqual(starts, ["systemctl start vesselstack-alerts.timer unit-file=present"])
+        self.assertTrue((r["root"] / "old").exists())
+
+    def test_tree_without_installer_scripts_leaves_helpers_alone(self):
+        r = self.run_sync(scripts="none")
+        self.assertEqual(r["result"].returncode, 0, r["result"].stderr)
+        self.assertEqual((r["libexec"] / "deploy-chat.py").read_text(), "chat-new")
+        self.assertEqual((r["libexec"] / "vesselstack-alerts.py").read_text(), "alerts-new")
+        self.assertEqual((r["sbin"] / "vesselstack-update").read_text(), "update-new")
+        self.assertFalse((r["systemd"] / "vesselstack-alerts.timer").exists())
+
+    def test_same_release_removes_nothing(self):
+        r = self.run_sync(archive="same", scripts="same")
+        self.assertEqual(r["result"].returncode, 0, r["result"].stderr)
+        for unit in self.NEWER_ONLY:
+            self.assertEqual((r["systemd"] / unit).read_text(), f"archived {unit}")
+        self.assertTrue((r["systemd"] / "timers.target.wants/vesselstack-alerts.timer").is_symlink())
+        self.assertEqual((r["journal"] / "removed-units").read_text(), "")
+        self.assertEqual((r["libexec"] / "vesselstack-alerts.py").read_text(), "alerts-old")
+        self.assertEqual((r["libexec"] / "record-backup-result").read_text(), "rec-old")
+
+    def test_archive_without_unit_files_removes_no_units(self):
+        r = self.run_sync(archive="none")
+        self.assertEqual(r["result"].returncode, 0, r["result"].stderr)
+        self.assertIn("WARN the backup contains no VesselStack unit files; leaving the installed units in place", r["result"].stderr)
+        s = r["systemd"]
+        for unit in ("vesselstack-chat.service", "vesselstack-control-panel.service", "vesselstack-custom.service") + self.NEWER_ONLY:
+            self.assertEqual((s / unit).read_text(), f"current {unit}", unit)
+        self.assertEqual(os.readlink(s / "multi-user.target.wants/vesselstack-chat.service"), "../vesselstack-chat.service")
+        for unit in ("vesselstack-backup.timer", "vesselstack-alerts.timer"):
+            self.assertEqual(os.readlink(s / "timers.target.wants" / unit), f"../{unit}")
+        removed = r["journal"] / "removed-units"
+        self.assertEqual(removed.read_text() if removed.exists() else "", "")
 
     def test_restore_config_identity_accepts_empty_values_and_inline_comments(self):
         with tempfile.TemporaryDirectory() as td:

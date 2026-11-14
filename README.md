@@ -132,7 +132,7 @@ for acceptance steps.
 Applying a restore is a bounded transaction. VesselStack stages and validates
 both application and data trees, journals the managed
 systemd units, launchers, libexec helpers, update environment, and enable links
-outside those trees, then stops services before swapping anything. If a later
+outside those trees, then stops services before swapping anything. Every VesselStack unit file and enable link that exists is journaled too, because restoring an older release removes the managed units it does not have. After the trees are swapped, restore turns off the managed units that the restored version does not have (it removes their unit files and enable links, never touching other `vesselstack-*` units you created), reinstalls `vesselstack-update` and the libexec helpers from the restored release's installer scripts (removing ones that release does not ship, and leaving them alone if the tree has no installer scripts), and lists what it turned off after "Restore completed". If a later
 swap, daemon reload, installer, or start fails, the old trees and journaled
 managed paths are restored and a best-effort daemon reload/start is attempted;
 failed trees and recovery materials are retained for inspection. If the rollback
@@ -2197,7 +2197,7 @@ backup, if you have one (`vesselstackctl restore`, see [Updating](#updating)).
 Besides the application and data trees the
 archive includes `/etc/systemd/system/vesselstack-*`,
 `/usr/local/sbin/vesselstack{ctl,-firewall}` and `/etc/vesselstack/update.env`
-when they exist, so a restore across versions is complete.
+when they exist, so a restore across versions is complete. Enable links and libexec helpers are not archived; restore rebuilds them from the restored release.
 
 The whole stack, including Home Assistant, stays stopped for the copy. Home
 Assistant, Grafana, InfluxDB and Boat Chat all keep SQLite or write-ahead-log
@@ -2220,7 +2220,7 @@ directory beside the data directory, (4) stops the stack, (5) renames the live
 trees to `/opt/vesselstack.pre-restore-STAMP` and
 `/opt/vesselstack-data.pre-restore-STAMP` and moves the staged trees in (so
 InfluxDB WAL/shard files created after the backup cannot mix with the restored
-ones), (6) restores the unit files, control scripts and `update.env` by rename,
+ones), (6) restores the unit files, control scripts and `update.env` by rename, removes the managed units, with their enable links, that the backup does not contain, and reinstalls `vesselstack-update` and the libexec helpers from the restored release's `installer/scripts`,
 and (7) runs the restored bundled installer
 (`/opt/vesselstack/installer/install.sh --config ... --start`) to rebuild the
 Boat Chat virtualenv (not part of the backup), re-render units and start the
@@ -2249,7 +2249,7 @@ again are started. If the rollback succeeds, the stage directory
 (`.vesselstack-restore.*`) is deleted; if it fails, the stage and the journal are
 kept and their paths are printed, and both hold a copy of the backup including
 secrets. If the restore fails before the swap starts, the journal is removed as
-well. The journal is kept after any failed swap. It is not durable across a crash,
+well. Removed units, their enable links and rebuilt helpers are in the same journal, so a failed restore puts them back exactly and restarts the units that were running. With `--skip-installer` the restored release's own installer does not run, so only these removals and helper rebuilds repair system files; units that are in the archive keep their current enabled state. The journal is kept after any failed swap. It is not durable across a crash,
 power loss or a lost SSH session, and there is no automatic recovery after a reboot
 yet.
 
