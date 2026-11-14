@@ -26,6 +26,22 @@ blueprint:
         duration: {}
     notification_actions:
       name: Notification actions
+      description: >-
+        What to do when this fires. The default creates a persistent notification
+        in Home Assistant, so the blueprint works as-is. To get a phone push
+        through the Home Assistant companion app instead, replace it with a
+        notify action, for example:
+        - action: notify.mobile_app_YOUR_PHONE (message: "Low battery")
+      default:
+        # Example for the companion app (replace YOUR_PHONE with your device name):
+        #   - action: notify.mobile_app_YOUR_PHONE
+        #     data:
+        #       title: VesselStack
+        #       message: "Low battery"
+        - action: persistent_notification.create
+          data:
+            title: VesselStack
+            message: "Low battery. VesselStack alerts are a convenience, not a sole alarm system."
       selector:
         action: {}
 

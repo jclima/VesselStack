@@ -1,0 +1,11 @@
+[Unit]
+Description=Run VesselStack alerts every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+Unit=vesselstack-alerts.service
+
+[Install]
+WantedBy=timers.target

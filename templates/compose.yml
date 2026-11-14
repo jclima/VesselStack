@@ -25,6 +25,40 @@ services:
       - "${AIS_WEB_PORT:-8100}:8100"
       - "${AIS_TCP_PORT:-5011}:5011"
 
+  # Optional (NODERED_ENABLE=true; README "Node-RED (optional)"). Nothing else depends on it.
+  nodered:
+    profiles: ["nodered"]
+    image: nodered/node-red:5.0.9-debian
+    container_name: vesselstack-nodered
+    restart: unless-stopped
+    user: "1000:1000"
+    init: true
+    mem_limit: 384m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    ports:
+      - "${NODERED_BIND_ADDRESS:-127.0.0.1}:${NODERED_PORT:-1880}:1880"
+    # Home Assistant and Signal K are host-networked; Mosquitto and InfluxDB are reached by service name.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TZ: ${BOAT_TIMEZONE}
+    # Pre-wired MQTT, InfluxDB (read-only) and sign-in values, rendered by the installer (root:root 0600).
+    env_file:
+      - path: ${VESSELSTACK_ROOT}/config/nodered.env
+        required: true
+    # Fail closed: settings.js is root-owned, mounted read-only and passed explicitly. If the file is missing
+    # the bind mount (create_host_path: false) or Node-RED itself refuses to start, never booting defaults.
+    command: ["--settings", "/vesselstack/settings.js"]
+    volumes:
+      - ${VESSELSTACK_DATA}/node-red:/data
+      - type: bind
+        source: ${VESSELSTACK_ROOT}/config/node-red/settings.js
+        target: /vesselstack/settings.js
+        read_only: true
+        bind:
+          create_host_path: false
+
   homeassistant:
     image: homeassistant/home-assistant:2026.6.4
     container_name: vesselstack-homeassistant

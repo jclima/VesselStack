@@ -119,7 +119,12 @@ port). Other names get `421 Misdirected request`; this blocks DNS-rebinding
 attacks from web pages. If you reach the panel through another name (a reverse
 proxy or a custom DNS name), add it to `CONTROL_PANEL_ALLOWED_HOSTS` in
 `config/control-panel.env` (comma separated, `name` or `name:port`; names
-without a port get the panel port), then restart the panel.
+without a port get the panel port), then restart the panel. `sudo vesselstackctl
+remote enable` adds `<name>.<tailnet>.ts.net:8780` here for you (optional Tailscale
+remote access, README "Remote access with Tailscale"); `tailscale serve` passes the original `Host`, which the panel's strict same-origin check on
+sign-in requires (it never trusts `X-Forwarded-Host`; a rewritten `Host` makes writes fail with 403).
+`GET /api/status` includes a read-only `remote` object (`enabled`, `online`, `name`,
+`panel_url`; `null` when Tailscale is not installed) that the Home tab shows.
 
 > **Plain HTTP on the boat network.** If you opened the panel with
 > `panel-access lan`, the passphrase and device token cross the network
@@ -166,7 +171,11 @@ Home is for looking, not for changing.
 - **Backup** shows when the last backup was made and whether the backup drive is
   mounted. It warns when there is no backup yet, when the drive is not mounted,
   when the folder is not writable, or when backups sit on the computer's own
-  disk instead of an external drive.
+  disk instead of an external drive. When scheduled backups are on
+  (`VESSELSTACK_BACKUP_SCHEDULE`) it also shows the schedule, whether the last scheduled run
+  succeeded, failed or was skipped because another operation was running, and when the timer runs
+  next. This is read-only; the schedule is changed under Settings, Storage & history (applied by a
+  reinstall). A scheduled backup stops the whole stack while it runs.
 - **Software** shows the installed version, or the newer version found by the
   last update check, with a link to the Updates tab. It never checks by itself.
 - **Back up now** is the one action on this page. It runs `vesselstackctl backup`.
@@ -215,6 +224,9 @@ Nothing changes on the boat until you press **Save** and then **Apply**.
 - The Telegram and telemetry-indexer switches take effect when settings are
   applied. Configure the Telegram bot token and allowed chat IDs before enabling
   the worker. Disabled workers cannot be started from the component cards.
+- The opt-in alert settings (**Boat alerts to Telegram** and the `ALERT_*` fields in the Boat Chat section) also apply
+  when settings are applied. Blank thresholds and entities leave those alerts off; the chat ids and heartbeat URL are
+  write-only. See the README section Alerts.
 - Changing the panel's own listener or port takes effect when the panel
   restarts: use **Maintenance → Restart Control Panel**.
 

@@ -9,14 +9,14 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" \
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-nodered-dashboard-auth.sh" \
     "$ROOT/tests/test-displays-envfile-systemd.sh" "$ROOT/scripts/install-displays-venv.sh" \
     "$ROOT/tests/test-displays-esphome-config.sh" "$ROOT/tests/compile-display-firmware.sh" \
     "$ROOT/scripts/prepare-offline-bundle.sh" \
     "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
     "$ROOT/scripts/update-requirements-lock.sh" "$ROOT/scripts/get-vesselstack.sh" "$ROOT/tests/test-get-vesselstack.sh" \
     "$ROOT/scripts/verify-release-tag.sh" "$ROOT/tests/test-verify-release-tag.sh" \
-    "$ROOT/scripts/lib/remediate.sh"
+    "$ROOT/scripts/lib/remediate.sh" "$ROOT/scripts/lib/record-backup-result"
 python3 -m py_compile "$ROOT/scripts/pin-displays-requirements.py"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/common/vesselstack_auth.py" "$ROOT/common/vesselstack_authctl.py" "$ROOT/common/qrcodegen.py"
@@ -36,14 +36,14 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" \
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" "$ROOT/tests/test-remote.sh" "$ROOT/tests/test-nodered-dashboard-auth.sh" \
     "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-displays-envfile-systemd.sh" \
     "$ROOT/scripts/install-displays-venv.sh" "$ROOT/tests/test-displays-esphome-config.sh" "$ROOT/tests/compile-display-firmware.sh" \
     "$ROOT/scripts/prepare-offline-bundle.sh" \
     "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
     "$ROOT/scripts/update-requirements-lock.sh" "$ROOT/scripts/get-vesselstack.sh" "$ROOT/tests/test-get-vesselstack.sh" \
     "$ROOT/scripts/verify-release-tag.sh" "$ROOT/tests/test-verify-release-tag.sh" \
-    "$ROOT/scripts/lib/remediate.sh"
+    "$ROOT/scripts/lib/remediate.sh" "$ROOT/scripts/lib/record-backup-result"
 if grep -nE 'mosquitto_passwd -b' "$ROOT/install.sh" "$ROOT/scripts/vesselstackctl" "$ROOT"/scripts/*.sh "$ROOT"/displays/*.py; then
     echo "MQTT passwords must not be passed on a command line" >&2
     exit 1
@@ -81,12 +81,17 @@ test -s "$ROOT/docs/images/wizard-preflight.png"
 test -s "$ROOT/docs/images/wizard-nmea.png"
 grep -q 'VesselStack InfluxDB' "$ROOT/templates/grafana/provisioning/datasources/vesselstack.yml"
 python3 -m json.tool "$ROOT/templates/grafana/dashboards/system-health.json" >/dev/null
+python3 -m json.tool "$ROOT/templates/grafana/dashboards/boat-overview.json" >/dev/null
+# The Signal K data path needs the npm registry: an offline install must skip it, and a failure of it
+# must never fail the installation.
+grep -qF "offline install: the Signal K data path" "$ROOT/install.sh"
+grep -qF 'configure-signalk-datapath.py' "$ROOT/install.sh"
 grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}' "$ROOT/templates/compose.yml"
 grep -q 'ghcr.io/jvde-github/ais-catcher:v0.70' "$ROOT/vesselstack.example.env"
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"
-"$ROOT/scripts/vesselstackctl" --help | grep -qF 'backup [--require-mounted] [--allow-unmounted] [DIRECTORY]'
+"$ROOT/scripts/vesselstackctl" --help | grep -qF 'backup [--require-mounted] [--allow-unmounted] [--scheduled] [DIRECTORY]'
 "$ROOT/scripts/vesselstackctl" --help | grep -q 'reindex  *Rebuild Boat Chat'
 test -x "$ROOT/scripts/memory-index.sh"
 # The memory index must be built by the installer (Boat Chat is not ready without it), and as

@@ -257,6 +257,16 @@ FIELDS = [
     field("GOOGLE_API_KEY", "Google API key", SEC_CHAT, source="chat", kind="secret", description="Write-only. Used only when Google is a provider."),
     field("GOOGLE_CLOUD_PROJECT", "Google Cloud project", SEC_CHAT, source="chat", description="The project name, if your Google setup needs one."),
     field("TELEGRAM_ENABLE", "Send alerts to Telegram", SEC_CHAT, kind="boolean", description="Runs the Telegram alerts component. It also needs the bot token below."),
+    field("REMOTE_ACCESS", "Remote access (Tailscale)", SEC_NETWORK, kind="select", choices=list(CONFIG_SETTINGS["REMOTE_ACCESS"].enum), description="Off by default. This only records the choice; Tailscale is installed and joined with 'sudo vesselstackctl remote enable' on the boat computer (needs internet). Applying settings never installs it."),
+    field("REMOTE_PANEL_SERVE", "Publish this panel on the tailnet", SEC_NETWORK, kind="boolean", description="With Tailscale remote access on, publish this panel to your tailnet only (https, port 8780) through tailscale serve. The panel itself stays on this device's loopback address."),
+    field("ALERTS_ENABLE", "Boat alerts to Telegram (opt-in)", SEC_CHAT, kind="boolean", description="Off by default. Sends Telegram messages for the alerts you configure below, using the bot token. A convenience, not a sole alarm system. Applies on the next apply."),
+    field("ALERT_TELEGRAM_CHAT_IDS", "Alert chat ids", SEC_CHAT, kind="secret", description="Numeric Telegram chat ids, comma separated. Alerts go only to these chats. Kept private."),
+    field("ALERT_BATTERY_LOW_V", "Low battery alert voltage", SEC_CHAT, description="Volts, for example 12.0 (12 V bank) or 24.0 (24 V bank). Alert after 2 minutes below it. Blank = no battery alert; no limit is assumed."),
+    field("ALERT_BILGE_ENTITY", "Bilge alert entity", SEC_CHAT, description="Home Assistant entity id such as binary_sensor.bilge_pump; alerts when it is on. Needs the Home Assistant token. Blank = off."),
+    field("ALERT_SHORE_POWER_ENTITY", "Shore power alert entity", SEC_CHAT, description="Home Assistant entity id; alerts when it is off or unavailable. Needs the Home Assistant token. Blank = off."),
+    field("ALERT_HEARTBEAT_URL", "Alert heartbeat URL", SEC_CHAT, kind="secret", description="Optional https address (for example healthchecks.io) pinged every minute, and at /fail while a stack component is down. Kept private. Blank = off."),
+    field("ALERT_REPEAT_MINUTES", "Repeat an active alert every (minutes)", SEC_CHAT, kind="number", description="How often a still-active alert is repeated. 5 to 10080."),
+    field("ALERT_STALE_DATA_MINUTES", "Stale Signal K data after (minutes)", SEC_CHAT, kind="number", description="Alert when no Signal K data has been logged for this long. 2 to 10080."),
     field("TELEGRAM_BOT_TOKEN", "Telegram bot token", SEC_CHAT, source="chat", kind="secret", description="From BotFather. Needed only for Telegram alerts."),
     field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chats", SEC_CHAT, source="chat", kind="secret", description="The Telegram chat IDs that may use the bot. Kept private."),
     # Signal K & NMEA 2000
@@ -264,6 +274,8 @@ FIELDS = [
     field("SIGNALK_VERSION", "Signal K version", SEC_SIGNALK, description="Release tag of the Signal K container image, for example v2.27.0."),
     field("SIGNALK_URL", "Signal K address", SEC_SIGNALK, kind="url", description="Where VesselStack reaches Signal K. Needed when the mode is Existing."),
     field("SIGNALK_VESSELTWIN_PRELOAD", "Preload the VesselTwin plugin", SEC_SIGNALK, kind="boolean", description="Installs the pinned signalk-vesseltwin plugin before Signal K starts (Docker and Native modes). Existing mode is never modified; turning this off skips installation and never uninstalls."),
+    field("SIGNALK_DATAPATH_AUTOCONFIG", "Configure the Signal K data path", SEC_SIGNALK, kind="boolean", description="Docker and Native modes: installs the pinned signalk-to-influxdb2 plugin, adds the NMEA 2000 provider and gives the plugin its own InfluxDB token on the next install or update. Existing mode is never modified; turning this off skips the step and never uninstalls anything."),
+    field("SIGNALK_MARINE_BUNDLE", "Marine essentials bundle", SEC_SIGNALK, kind="boolean", description="Docker and Native modes: NMEA 0183 on TCP port 10110 for chartplotter apps, an anchor alarm, an automatic logbook, and the KIP and Freeboard-SK web apps, applied on the next install or update (needs internet). Existing mode is never modified; turning this off never uninstalls anything."),
     field("SOCKETCAN_ENABLE", "Read the NMEA 2000 network (SocketCAN)", SEC_SIGNALK, kind="boolean", description="Turn on only after the CAN adapter is installed and tested."),
     field("SOCKETCAN_INTERFACE", "CAN interface", SEC_SIGNALK, description="Name of the CAN interface on this Pi, usually can0."),
     field("SOCKETCAN_BITRATE", "CAN speed (bits per second)", SEC_SIGNALK, kind="number", description="NMEA 2000 always uses 250000. Change it only for a non-marine CAN network. Whole number from 10000 to 1000000."),
@@ -276,6 +288,11 @@ FIELDS = [
     field("INFLUXDB_RAW_RETENTION", "Keep raw data for", SEC_STORAGE, description="A duration such as 720h, 30d or 8w, or 0 to keep forever. Empty means 30d on new installs and no change on existing ones. A value is applied to the existing raw bucket on the next apply or start and permanently deletes raw data older than the window."),
     field("PROMETHEUS_RETENTION", "Keep health numbers for", SEC_STORAGE, description="How long Prometheus keeps Pi and service health history: a duration such as 720h, 30d or 8w. Empty means 30d. Older metrics are deleted."),
     field("VESSELSTACK_BACKUP", "Backup folder", SEC_STORAGE, kind="path", description="Where backups are saved. Use a mounted external drive under /media or /mnt so a failed SD card does not take the backups with it."),
+    field("VESSELSTACK_BACKUP_SCHEDULE", "Scheduled backups", SEC_STORAGE, kind="select", choices=list(CONFIG_SETTINGS["VESSELSTACK_BACKUP_SCHEDULE"].enum), description="off, daily or weekly at about 03:30. Each backup stops the whole stack for several minutes, so the boat has no dashboards or logging meanwhile. Needs the backup drive mounted. Applied when you reinstall (Maintenance)."),
+    field("VESSELSTACK_BACKUP_KEEP", "Scheduled backups to keep", SEC_STORAGE, kind="number", description="A whole number from 1 to 365. After a verified scheduled backup, older scheduled archives (vesselstack-scheduled-*) beyond this many are deleted; manual and pre-update backups are never deleted."),
+    field("VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK", "Allow scheduled backups on the system disk", SEC_STORAGE, kind="boolean", description="Normally a scheduled backup is refused unless the backup folder is on a mounted external drive. Turn this on only if the folder is on this computer's own disk on purpose."),
+    field("VESSELSTACK_WATCHDOG", "Hardware watchdog", SEC_STORAGE, kind="select", choices=list(CONFIG_SETTINGS["VESSELSTACK_WATCHDOG"].enum), description="Reboots the boat computer automatically if it hangs. auto turns it on only on a Raspberry Pi that has a watchdog device; true turns it on for any computer with one. Applied when you reinstall."),
+    field("VESSELSTACK_JOURNAL_MAX_USE", "System log size limit", SEC_STORAGE, description="Caps the disk space used by the persistent system journal, for example 200M or 1G, or off to leave the system journal settings alone. Applied when you reinstall."),
     field("INFLUXDB_URL", "InfluxDB address", SEC_STORAGE, kind="url", description="Where VesselStack reaches InfluxDB."),
     field("INFLUXDB_ORG", "InfluxDB organization", SEC_STORAGE, description="The InfluxDB organization name."),
     field("INFLUXDB_USERNAME", "InfluxDB admin username", SEC_STORAGE, description="The InfluxDB administrator account name."),
@@ -296,6 +313,9 @@ FIELDS = [
     field("MQTT_PASSWORD", "MQTT password", SEC_SERVICES, kind="secret", description="Applied to the Mosquitto password file on the next apply or start; update Home Assistant's MQTT integration to match."),
     field("MQTT_PORT", "MQTT port", SEC_SERVICES, kind="port", description="The port Mosquitto is published on."),
     field("NODE_EXPORTER_ENABLE", "Report Pi health numbers (Node Exporter)", SEC_SERVICES, kind="boolean", description="Runs the optional hardened host metrics exporter so Prometheus can record Pi temperature and disk use."),
+    field("NODERED_ENABLE", "Run Node-RED (flow editor)", SEC_SERVICES, kind="boolean", description="Optional. Adds a password-protected Node-RED editor wired to MQTT, InfluxDB (read-only) and Home Assistant. The editor can run code on the Pi: keep it on a trusted network. Save and Apply installs it; the editor passphrase (user admin) is NODERED_ADMIN_PASSWORD and the dashboard passphrase (user crew) is NODERED_DASHBOARD_PASSWORD in the stack's vesselstack.env."),
+    field("NODERED_PORT", "Node-RED port", SEC_SERVICES, kind="port", description="The port the Node-RED editor is published on."),
+    field("NODERED_BIND_ADDRESS", "Node-RED visible to", SEC_SERVICES, description="127.0.0.1 = only this computer (recommended; use an SSH tunnel or Tailscale); 0.0.0.0 = whole boat network, plain HTTP, password only."),
     # Advanced: AIS receiver
     field("AIS_ENABLE", "Enable AIS-catcher", SEC_AIS, kind="boolean", description="Shows nearby ships from a USB AIS receiver. Turn on only when a receiver is plugged in."),
     field("AIS_IMAGE", "AIS-catcher image", SEC_AIS, description="The Docker image to run. Change only if you were told to."),
@@ -327,6 +347,7 @@ COMPONENT_INFO = {
     "signalk": ("Signal K", "Reads boat data and shares it with everything else.", SEC_SIGNALK),
     "ais-catcher": ("AIS-catcher", "Shows nearby ships from your AIS receiver.", SEC_AIS),
     "node-exporter": ("Node Exporter", "Reports Pi health (temperature, disk) for Prometheus.", SEC_SERVICES),
+    "nodered": ("Node-RED", "Optional flow editor wired to MQTT, InfluxDB and Home Assistant.", SEC_SERVICES),
     "boat-chat": ("Boat Chat", "Ask questions about your boat in plain language.", SEC_CHAT),
     "telegram": ("Telegram alerts", "Sends boat alerts to your phone through Telegram.", SEC_CHAT),
     "telemetry-indexer": ("Telemetry memory", "Keeps Boat Chat's memory of your boat data up to date.", SEC_CHAT),
@@ -486,7 +507,7 @@ def validate_value(spec: dict[str, Any], value: Any) -> str:
         validate_number(spec, text)
     if spec["key"] == "BOAT_TIMEZONE" and text and not timezone_exists(text):
         raise ValueError("Timezone not recognised. Use a name like Europe/Lisbon")
-    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS"} and text:
+    if spec["key"] in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS", "NODERED_BIND_ADDRESS"} and text:
         try:
             address = ipaddress.ip_address(text)
         except ValueError as exc:
@@ -764,11 +785,24 @@ def _update_configuration(updates: dict[str, Any], notes: list[str] | None = Non
     return str(backup)
 
 
+def nodered_prepared(settings: dict[str, str] | None = None) -> bool:
+    """Node-RED may start only when enabled AND the installer rendered nodered.env and the root-owned settings.js."""
+    settings = parse_env(VESSEL_ENV) if settings is None else settings
+    if settings.get("NODERED_ENABLE", "false") != "true":
+        return False
+    try:
+        return (ROOT / "config" / "nodered.env").stat().st_size > 0 and (ROOT / "config" / "node-red" / "settings.js").is_file()
+    except OSError:
+        return False
+
+
 def compose_base() -> list[str]:
-    return [
-        "docker", "compose", "--profile", "signalk", "--profile", "ais", "--profile", "metrics",
-        "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml"),
-    ]
+    # The nodered profile is added only when prepared: its env_file is required, and an unprepared profile
+    # would make every other compose command fail.
+    profiles = ["--profile", "signalk", "--profile", "ais", "--profile", "metrics"]
+    if nodered_prepared():
+        profiles += ["--profile", "nodered"]
+    return ["docker", "compose", *profiles, "--env-file", str(VESSEL_ENV), "-f", str(ROOT / "compose.yml")]
 
 
 def component_command(component: str, verb: str) -> list[str]:
@@ -786,6 +820,10 @@ def component_command(component: str, verb: str) -> list[str]:
             raise ValueError("Docker SignalK is disabled by configuration")
         if component == "ais-catcher" and settings.get("AIS_ENABLE", "false") != "true":
             raise ValueError("AIS-catcher is disabled by configuration")
+        if component == "nodered" and settings.get("NODERED_ENABLE", "false") != "true" and verb in {"start", "restart"}:
+            raise ValueError("Node-RED is disabled by configuration")
+        if component == "nodered" and verb in {"start", "restart"} and not nodered_prepared(settings):
+            raise ValueError("Node-RED is not prepared (missing config/nodered.env or config/node-red/settings.js); run Save and Apply or rerun the installer")
         if component == "node-exporter" and settings.get("NODE_EXPORTER_ENABLE", "false") != "true" and verb in {"start", "restart"}:
             raise ValueError("node-exporter is disabled by configuration")
         service = COMPOSE_COMPONENTS[component]
@@ -1186,6 +1224,8 @@ def component_status() -> list[dict[str, Any]]:
             enabled = vessel.get("AIS_ENABLE", "false") == "true"
         elif name == "node-exporter":
             enabled = vessel.get("NODE_EXPORTER_ENABLE", "false") == "true"
+        elif name == "nodered":
+            enabled = vessel.get("NODERED_ENABLE", "false") == "true"
         state = compose_state.get(service, "unknown" if compose_parse_failed else "stopped")
         components.append(describe_component(name, "container", enabled, state))
     for name, unit in SYSTEMD_COMPONENTS.items():
@@ -1210,7 +1250,71 @@ def component_status() -> list[dict[str, Any]]:
 
 
 DEFAULT_BACKUP_DIR = "/var/backups/vesselstack"
+# Written by libexec/record-backup-result after every scheduled backup.
+BACKUP_LAST_FILE = Path(os.environ.get("VESSELSTACK_SYSTEM_ROOT", "")) / "var/lib/vesselstack/backup-last.json"
 BACKUP_ARCHIVE = re.compile(r"vesselstack-[0-9A-Za-z._-]+\.tar\.gz")
+
+
+def scheduled_backup_status(settings: dict[str, str]) -> dict[str, Any]:
+    """Read-only: the configured schedule, the last scheduled run and the timer's next run."""
+    schedule = settings.get("VESSELSTACK_BACKUP_SCHEDULE") or "off"
+    if schedule not in {"off", "daily", "weekly"}:
+        schedule = "off"
+    last: dict[str, Any] | None = None
+    try:
+        data = json.loads(BACKUP_LAST_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("result") in {"success", "failed", "skipped_busy"}:
+            last = {"result": data["result"], "exit_status": data.get("exit_status"), "finished_at": str(data.get("finished_at") or "")[:32]}
+            if isinstance(data.get("archive"), str) and BACKUP_ARCHIVE.fullmatch(data["archive"]):
+                last["archive"] = data["archive"]
+    except (OSError, ValueError):
+        last = None
+    next_run = None
+    if schedule != "off":
+        code, output = command_output(["systemctl", "show", "vesselstack-backup.timer", "-p", "NextElapseUSecRealtime", "--value"], timeout=3)
+        if code == 0 and output and output != "n/a":
+            next_run = output[:48]
+    return {"schedule": schedule, "last_scheduled": last, "next_run": next_run}
+
+
+REMOTE_SERVE_PORT = 8780  # fixed https port of `tailscale serve` (vesselstackctl REMOTE_SERVE_PORT)
+REMOTE_CACHE_SECONDS = 30.0
+_REMOTE_CACHE: dict[str, Any] = {"at": None, "data": None}
+
+
+def remote_status() -> dict[str, Any] | None:
+    """Cached (30 s) wrapper so /api/status polling never spawns tailscale more than twice a minute."""
+    now = time.monotonic()
+    cached_at = _REMOTE_CACHE["at"]
+    if cached_at is not None and 0 <= now - cached_at < REMOTE_CACHE_SECONDS:
+        return _REMOTE_CACHE["data"]
+    data = remote_status_uncached()
+    _REMOTE_CACHE.update(at=now, data=data)
+    return data
+
+
+def remote_status_uncached() -> dict[str, Any] | None:
+    """Read-only Tailscale view for the Home tab: None when Tailscale is not installed or unreadable.
+
+    ``tailscale status --json`` is the only call (2 second limit). Nothing is changed, no key is read or shown.
+    """
+    binary = shutil.which("tailscale")
+    if not binary:
+        return None
+    try:
+        done = subprocess.run([binary, "status", "--json"], capture_output=True, text=True, timeout=2, check=False)
+        data = json.loads(done.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    me = data.get("Self") if isinstance(data.get("Self"), dict) else {}
+    name = str(me.get("DNSName") or "").rstrip(".")
+    online = data.get("BackendState") == "Running" and bool(me.get("Online", True))
+    serve = parse_env(VESSEL_ENV).get("REMOTE_PANEL_SERVE", "true") == "true"
+    return {"enabled": data.get("BackendState") not in {None, "NoState", "Stopped"},
+            "online": online, "name": name,
+            "panel_url": f"https://{name}:{REMOTE_SERVE_PORT}" if name and online and serve else ""}
 
 
 def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1221,9 +1325,11 @@ def backup_status(vessel: dict[str, str] | None = None) -> dict[str, Any]:
     that has its .sha256 manifest next to it is reported by modification time; nothing is hashed
     or written. Any problem reading the folder yields "unknown" and never an error.
     """
-    result: dict[str, Any] = {"path": "", "mount": "unknown", "writable": None, "last_backup_at": None, "state": "unknown", "message": ""}
+    result: dict[str, Any] = {"path": "", "mount": "unknown", "writable": None, "last_backup_at": None, "state": "unknown", "message": "",
+                              "schedule": "off", "last_scheduled": None, "next_run": None}
     try:
         settings = vessel if vessel is not None else parse_env(VESSEL_ENV)
+        result.update(scheduled_backup_status(settings))
         destination = os.path.realpath(settings.get("VESSELSTACK_BACKUP") or os.environ.get("VESSELSTACK_BACKUP") or DEFAULT_BACKUP_DIR)
         result["path"] = destination
         parts = Path(destination).parts
@@ -1819,7 +1925,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 memory = OPERATIONS.public()
                 operation = memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))
                 vessel = parse_env(VESSEL_ENV)
-                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
+                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "remote": remote_status(), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
             elif path == "/api/backup-preflight":
                 self.send_json(200, backup_preflight())
             elif path == "/api/operation":
@@ -1858,7 +1964,9 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
             try:
                 parsed = urllib.parse.urlsplit(origin)
                 expected = urllib.parse.urlsplit(f"//{self.headers.get('Host', '')}")
-                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port:
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                    raise ValueError
+                if parsed.hostname.lower() != (expected.hostname or "").lower() or parsed.port != expected.port:
                     raise ValueError
             except (ValueError, UnicodeError):
                 self.send_json(403, {"error": "request origin is not allowed"})

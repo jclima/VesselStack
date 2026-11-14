@@ -43,6 +43,8 @@ SETTINGS: dict[str, Setting] = {
     "HOMEPAGE_HEADING": _s("boat", enum=("boat", "brand"), component="homepage"),
     "HOMEPAGE_CLOCK": _s("24h", enum=("24h", "12h", "hidden"), component="homepage"),
     "SIGNALK_VESSELTWIN_PRELOAD": _s("true", kind="boolean", component="signalk"),
+    "SIGNALK_DATAPATH_AUTOCONFIG": _s("true", kind="boolean", component="signalk"),
+    "SIGNALK_MARINE_BUNDLE": _s("false", kind="boolean", component="signalk"),
     "BOAT_NAME": _s("My Boat", required=True), "BOAT_TYPE": _s("Motor vessel"),
     "BOAT_MMSI": _s(), "BOAT_CALLSIGN": _s(), "BOAT_LOA_M": _s(kind="number", minimum=0.01, maximum=500), "BOAT_BEAM_M": _s(kind="number", minimum=0.01, maximum=100),
     "BOAT_TIMEZONE": _s("UTC", required=True), "BOAT_UNITS": _s("us_customary", enum=("us_customary", "metric")),
@@ -55,15 +57,25 @@ SETTINGS: dict[str, Setting] = {
     "INFLUXDB_RAW_BUCKET": _s("signalk", required=True, component="influxdb"), "INFLUXDB_HISTORY_BUCKET": _s("signalk_1m", required=True, component="influxdb"), "INFLUXDB_HOME_ASSISTANT_BUCKET": _s("homeassistant", required=True, component="influxdb"), "INFLUXDB_AIS_BUCKET": _s("ais", required=True, component="influxdb"), "INFLUXDB_RAW_RETENTION": _s(), "INFLUXDB_PASSWORD": _s("GENERATE", owner="vessel"), "INFLUXDB_TOKEN": _s("GENERATE", owner="vessel"), "GRAFANA_ADMIN_PASSWORD": _s("GENERATE", owner="vessel"),
     "MQTT_USERNAME": _s("homeassistant", required=True, component="mosquitto"), "MQTT_PASSWORD": _s("GENERATE", component="mosquitto"), "MQTT_PORT": _s("1883", kind="port", minimum=1, maximum=65535, required=True, component="mosquitto"), "BOAT_CHAT_PROVIDER": _s("local", owner="chat", enum=("local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"), component="boat-chat"), "BOAT_CHAT_HOST": _s("0.0.0.0", owner="chat", required=True, component="boat-chat"), "BOAT_CHAT_PORT": _s("8765", kind="port", owner="chat", minimum=1, maximum=65535, required=True, component="boat-chat"), "BOAT_CHAT_SETTINGS_TOKEN": _s("GENERATE", owner="chat", component="boat-chat"), "BOAT_CHAT_ACCESS_TOKEN": _s("GENERATE", owner="chat", component="boat-chat"),
     "VESSELSTACK_DATA_BIND_ADDRESS": _s("127.0.0.1"), "VESSELSTACK_WEB_BIND_ADDRESS": _s("0.0.0.0"), "HOMEASSISTANT_BIND_ADDRESS": _s("0.0.0.0"), "TELEGRAM_ENABLE": _s("false", kind="boolean", owner="vessel", component="telegram"), "TELEMETRY_INDEXER_ENABLE": _s("true", kind="boolean", owner="vessel", component="telemetry-indexer"), "NODE_EXPORTER_ENABLE": _s("false", kind="boolean", component="node-exporter"),
+    # Optional Node-RED (README "Node-RED (optional)"). Local-only (127.0.0.1) by default; it no longer follows VESSELSTACK_WEB_BIND_ADDRESS.
+    "NODERED_ENABLE": _s("false", kind="boolean", component="nodered"), "NODERED_PORT": _s("1880", kind="port", minimum=1, maximum=65535, required=True, component="nodered"), "NODERED_BIND_ADDRESS": _s("127.0.0.1", component="nodered"),
+    "NODERED_ADMIN_PASSWORD": _s("GENERATE", owner="installer", component="nodered"), "NODERED_ADMIN_PASSWORD_HASH": _s("GENERATE", owner="installer", component="nodered"), "NODERED_DASHBOARD_PASSWORD": _s("GENERATE", owner="installer", component="nodered"), "NODERED_DASHBOARD_PASSWORD_HASH": _s("GENERATE", owner="installer", component="nodered"), "NODERED_CREDENTIAL_SECRET": _s("GENERATE", owner="installer", component="nodered"),
     "GRAFANA_PORT": _s("43000", kind="port", minimum=1, maximum=65535, required=True, component="grafana"), "HOMEPAGE_PORT": _s("80", kind="port", minimum=1, maximum=65535, required=True, component="homepage"), "PROMETHEUS_PORT": _s("9090", kind="port", minimum=1, maximum=65535, required=True, component="prometheus"), "PROMETHEUS_RETENTION": _s("30d", required=True), "VESSELSTACK_UNTRUSTED_INTERFACE": _s("wlan0"), "VESSELSTACK_FIREWALL_ENABLE": _s("false", kind="boolean", component="firewall"), "VESSELSTACK_FIREWALL_STRICT": _s("false", kind="boolean", component="firewall"), "VESSELSTACK_FIREWALL_ALLOW_TCP": _s("22", component="firewall"), "VESSELSTACK_FIREWALL_ALLOW_UDP": _s("", component="firewall"), "CONTROL_PANEL_HOST": _s("127.0.0.1", required=True, component="control-panel"), "CONTROL_PANEL_PORT": _s("8780", kind="port", minimum=1, maximum=65535, required=True, component="control-panel"),
     "DISPLAYS_ENABLE": _s("false", kind="boolean", component="displays-bridge"), "DISPLAYS_BRIDGE_MQTT_USERNAME": _s("vesselstack-bridge", required=True, component="displays-bridge"), "DISPLAYS_SIGNALK_TOKEN": _s(), "DISPLAYS_HA_TOKEN": _s(), "VESSELSTACK_DISABLED_COMPONENTS": _s(), "HOMEPAGE_ALLOWED_HOSTS": _s(), "HOMEPAGE_ALLOWED_HOSTS_EXTRA": _s(), "CONTROL_PANEL_PASSPHRASE_HASH": _s(owner="panel"), "BOAT_CHAT_PASSPHRASE_HASH": _s(owner="chat"),
+    "VESSELSTACK_WATCHDOG": _s("auto", enum=("auto", "true", "false")), "VESSELSTACK_JOURNAL_MAX_USE": _s("200M", required=True),
+    "VESSELSTACK_BACKUP_SCHEDULE": _s("off", enum=("off", "daily", "weekly")), "VESSELSTACK_BACKUP_KEEP": _s("8", kind="number", minimum=1, maximum=365, required=True), "VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK": _s("false", kind="boolean"),
+    # Opt-in Telegram alerts (README "Alerts"). Blank thresholds and entities leave that alert off.
+    "ALERTS_ENABLE": _s("false", kind="boolean", component="alerts"), "ALERT_TELEGRAM_CHAT_IDS": _s(component="alerts"), "ALERT_BATTERY_LOW_V": _s(component="alerts"), "ALERT_BILGE_ENTITY": _s(component="alerts"), "ALERT_SHORE_POWER_ENTITY": _s(component="alerts"),
+    # Optional Tailscale remote access (README "Remote access with Tailscale"). Off by default; enabled only by `vesselstackctl remote enable`.
+    "REMOTE_ACCESS": _s("off", enum=("off", "tailscale"), component="remote"), "REMOTE_PANEL_SERVE": _s("true", kind="boolean", component="remote"),
+    "ALERT_HEARTBEAT_URL": _s(component="alerts"), "ALERT_REPEAT_MINUTES": _s("60", kind="number", minimum=5, maximum=10080, required=True, component="alerts"), "ALERT_STALE_DATA_MINUTES": _s("15", kind="number", minimum=2, maximum=10080, required=True, component="alerts"),
 }
 
 DEFAULTS = {key: spec.default for key, spec in SETTINGS.items()}
 LEGACY_DEFAULTS = {"SIGNALK_MODE": "existing", "INFLUXDB_RAW_BUCKET": "vesselstack_raw", "INFLUXDB_HISTORY_BUCKET": "vesselstack_1m", "VESSELSTACK_BACKUP": "/var/backups/vesselstack"}
 CORE_COMPONENTS = ("homeassistant", "influxdb", "grafana", "prometheus", "mosquitto", "homepage")
-COMPOSE_COMPONENTS = {name: name for name in (*CORE_COMPONENTS, "signalk", "ais-catcher", "node-exporter")}
-SYSTEMD_COMPONENTS = {"boat-chat": "vesselstack-chat.service", "telegram": "vesselstack-chat-telegram.service", "telemetry-indexer": "vesselstack-telemetry-indexer.timer", "telemetry-sample": "vesselstack-telemetry-sample.timer", "displays-bridge": "vesselstack-displays-bridge.service", "signalk-native": "vesselstack-signalk.service", "socketcan": "vesselstack-socketcan.service", "firewall": "vesselstack-firewall.service", "control-panel": "vesselstack-control-panel.service"}
+COMPOSE_COMPONENTS = {name: name for name in (*CORE_COMPONENTS, "signalk", "ais-catcher", "node-exporter", "nodered")}
+SYSTEMD_COMPONENTS = {"boat-chat": "vesselstack-chat.service", "telegram": "vesselstack-chat-telegram.service", "telemetry-indexer": "vesselstack-telemetry-indexer.timer", "telemetry-sample": "vesselstack-telemetry-sample.timer", "displays-bridge": "vesselstack-displays-bridge.service", "signalk-native": "vesselstack-signalk.service", "socketcan": "vesselstack-socketcan.service", "firewall": "vesselstack-firewall.service", "control-panel": "vesselstack-control-panel.service", "alerts": "vesselstack-alerts.timer"}
 
 def validate_value(key: str, value: Any, *, allow_blank: bool = True) -> str:
     if key not in SETTINGS:
@@ -85,11 +97,17 @@ def validate_value(key: str, value: Any, *, allow_blank: bool = True) -> str:
     if spec.kind == "url" and text:
         parsed = urllib.parse.urlparse(text)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc: raise ValueError(f"Invalid URL for {key}")
-    if key in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS"} and text:
+    if key in {"CONTROL_PANEL_HOST", "BOAT_CHAT_HOST", "VESSELSTACK_DATA_BIND_ADDRESS", "VESSELSTACK_WEB_BIND_ADDRESS", "HOMEASSISTANT_BIND_ADDRESS", "NODERED_BIND_ADDRESS"} and text:
         try:
             if ipaddress.ip_address(text).version != 4: raise ValueError
         except ValueError: raise ValueError(f"Invalid IPv4 address for {key}") from None
     if key in {"MQTT_USERNAME", "DISPLAYS_BRIDGE_MQTT_USERNAME"} and text and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", text): raise ValueError(f"Invalid MQTT name for {key}")
+    if key == "VESSELSTACK_JOURNAL_MAX_USE" and text and text != "off" and not re.fullmatch(r"[1-9][0-9]*[KMG]", text): raise ValueError("Invalid VESSELSTACK_JOURNAL_MAX_USE: use a size such as 200M or 1G, or off")
+    if key == "VESSELSTACK_BACKUP_KEEP" and text and not (re.fullmatch(r"[1-9][0-9]*", text) and int(text) <= 365): raise ValueError("Invalid VESSELSTACK_BACKUP_KEEP: use a whole number from 1 to 365")
+    if key == "ALERT_BATTERY_LOW_V" and text and not (re.fullmatch(r"[0-9]{1,2}(?:\.[0-9]{1,2})?", text) and 0 < float(text) <= 60): raise ValueError("Invalid ALERT_BATTERY_LOW_V: use a voltage such as 12.0 (12 V bank) or 24.0 (24 V bank), or leave it blank to turn the alert off")
+    if key in {"ALERT_BILGE_ENTITY", "ALERT_SHORE_POWER_ENTITY"} and text and not re.fullmatch(r"[a-z_]+\.[A-Za-z0-9_]+", text): raise ValueError(f"Invalid {key}: use a Home Assistant entity id such as binary_sensor.bilge_pump")
+    if key == "ALERT_TELEGRAM_CHAT_IDS" and text and not re.fullmatch(r"-?[0-9]{1,20}(?:\s*,\s*-?[0-9]{1,20})*", text): raise ValueError("Invalid ALERT_TELEGRAM_CHAT_IDS: use comma-separated numeric Telegram chat ids")
+    if key == "ALERT_HEARTBEAT_URL" and text and not (re.fullmatch(r"https://[^\s'\"$`\\]+", text) and urllib.parse.urlparse(text).netloc): raise ValueError("Invalid ALERT_HEARTBEAT_URL: use an https:// address")
     if key == "BOAT_NAME" and text and not re.fullmatch(r"[A-Za-z0-9_. -]{1,60}", text): raise ValueError("Invalid BOAT_NAME")
     if key in {"VESSELSTACK_FIREWALL_ALLOW_TCP", "VESSELSTACK_FIREWALL_ALLOW_UDP"} and text:
         if not re.fullmatch(r"[0-9]{1,5}(?::[0-9]{1,5})?(?:,[0-9]{1,5}(?::[0-9]{1,5})?)*", text): raise ValueError(f"Invalid port list for {key}")

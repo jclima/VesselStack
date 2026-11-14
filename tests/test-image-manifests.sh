@@ -4,9 +4,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mapfile -t images < <(
-    docker compose --profile signalk --profile ais --profile metrics \
+    docker compose --profile signalk --profile ais --profile metrics --profile nodered \
         --env-file "$ROOT/vesselstack.example.env" \
-        -f "$ROOT/templates/compose.yml" config --images | sort -u
+        -f "$ROOT/templates/compose.yml" config --no-env-resolution --images | sort -u
 )
 # The optional on-host display firmware build runs the ESPHome image pinned (by
 # digest) in displays/esphome/IMAGE; it must also have a Linux ARM64 manifest.

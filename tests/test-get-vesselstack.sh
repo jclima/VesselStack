@@ -644,7 +644,7 @@ expect_no_web_wizard() {
 
 # Full walk with the default answer to every question (Enter): confirmation, 16 prompts, review, install.
 reset_state
-{ printf 'y\n'; blank 22; } > "$ANSWERS"
+{ printf 'y\n'; blank 23; } > "$ANSWERS"
 run_asking
 expect_rc 0 "terminal wizard, all defaults"
 expect_out "Review \\(secrets are never shown\\)"
@@ -679,7 +679,7 @@ SECRET=sekrit-token-value-123
     printf '%s\n' 2 http://192.0.2.10:3000                      # Signal K: existing server
     printf '%s\n' y n '' ''                                      # CAN on, no vcan, interface, bitrate
     printf '%s\n' y ''                                           # AIS on, device
-    printf '%s\n' '' '?' "$SECRET" 1 n                           # HA url, help, HA token, provider, telegram
+    printf '%s\n' '' '?' "$SECRET" 1 n n                         # HA url, help, HA token, provider, telegram bot, boat alerts
     printf '%s\n' '' ''                                         # sign-in passphrases: skip both
     printf '%s\n' y '' n 22,8080 -                               # firewall on ...
     printf '%s\n' 14d '' '' n                                    # retention, LAN access, panel access, no advanced
@@ -705,6 +705,7 @@ expect_saved "SOCKETCAN_ENABLE=true"
 expect_saved "VESSELSTACK_CAN_CREATE_VCAN=false"
 expect_saved "AIS_ENABLE=true"
 expect_saved "HOME_ASSISTANT_TOKEN=$SECRET"
+expect_saved "ALERTS_ENABLE=false"
 expect_saved "VESSELSTACK_FIREWALL_ENABLE=true"
 expect_saved "VESSELSTACK_FIREWALL_ALLOW_TCP=22,8080"
 expect_saved "VESSELSTACK_FIREWALL_ALLOW_UDP=''"
@@ -718,7 +719,7 @@ expect_no_web_wizard
 
 # Quitting at the review, and input that ends early, install nothing.
 reset_state
-{ printf 'y\n'; blank 19; printf 'q\n'; } > "$ANSWERS"
+{ printf 'y\n'; blank 20; printf 'q\n'; } > "$ANSWERS"
 run_asking
 expect_rc 1 "quit at the review"
 expect_out "Quit without saving"
@@ -735,7 +736,7 @@ refuse_log "^install "
 
 # Edit a section from the review screen, then save.
 reset_state
-{ printf 'y\n'; blank 19; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
+{ printf 'y\n'; blank 20; printf '%s\n' e 1 'Edited Boat'; blank 5; printf '%s\n' s y; } > "$ANSWERS"
 run_asking
 expect_rc 0 "edit a section at the review"
 expect_saved "BOAT_NAME='Edited Boat'"

@@ -19,6 +19,7 @@ from typing import Iterator, Mapping
 
 
 ENV_FD = "VESSELSTACK_LIFECYCLE_LOCK_FD"
+EXIT_BUSY = 75  # EX_TEMPFAIL, returned by "run" when the lock is held
 
 
 class LifecycleLockError(RuntimeError):
@@ -230,6 +231,12 @@ def _main(argv: list[str] | None = None) -> int:
             parser.error("run requires COMMAND after --")
         handle = LifecycleLock(args.install_root, args.system_root).acquire()
         os.execvpe(command[0], command, handle.child_env())
+    except LifecycleLockBusy as exc:
+        print(f"lifecycle lock: {exc}", file=__import__("sys").stderr)
+        # "run" exits EX_TEMPFAIL (75) so a caller such as vesselstack-backup.service can tell "another
+        # operation holds the lock, try again later" from a real failure. "check" validates a lock this
+        # process already inherited; a busy lock there is an ordinary error, so it keeps exit status 1.
+        return EXIT_BUSY if args.action == "run" else 1
     except LifecycleLockError as exc:
         print(f"lifecycle lock: {exc}", file=__import__("sys").stderr)
         return 1

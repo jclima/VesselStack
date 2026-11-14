@@ -68,6 +68,8 @@ working. With `DISPLAYS_ENABLE=true` these accounts are added:
 | `DISPLAYS_BRIDGE_MQTT_USERNAME` (default `vesselstack-bridge`) | `vesselstack/v1/displays/+/status` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/ha/#`, `vesselstack/v1/bridge/#` |
 | `vsdisp-<display id>`, one per display in `config/displays.json` | `vesselstack/v1/instruments/#`, `vesselstack/v1/notifications/#`, `vesselstack/v1/alarms/#`, `vesselstack/v1/ha/#`, `vesselstack/v1/bridge/#` | `vesselstack/v1/displays/vsdisp-<display id>/status` only |
 
+When `NODERED_ENABLE=true` the account `vesselstack-nodered` is added (independent of `DISPLAYS_ENABLE`): read `vesselstack/#`, read-write `vesselstack/nodered/#`. Its generated password lives in `config/displays.secrets.json` (root-only) and `config/nodered.env` (root-only); it is removed from the broker when Node-RED is disabled.
+
 Display accounts are read-only for instrument, notification, alarm and Home Assistant
 item data and cannot read other MQTT topics such as `homeassistant/#`. Any other MQTT
 account is granted nothing. The `vesselstack/v1/ha/#` rule is new with Home Assistant

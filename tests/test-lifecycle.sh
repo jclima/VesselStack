@@ -85,6 +85,10 @@ if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = show ] && [ -n "${FAKE_SYS
     esac
     echo loaded
 fi
+# Another watchdog daemon is only installed when a test says so.
+if [ "$(basename "$0")" = systemctl ] && { [ "${1:-}" = is-active ] || [ "${1:-}" = is-enabled ]; } && [[ " $* " == *" watchdog.service "* ]] && [ -z "${FAKE_WATCHDOG_OWNER:-}" ]; then
+    exit 3
+fi
 if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = stop ] && [ -n "${FAKE_SYSTEMCTL_FAIL_STOP_UNIT:-}" ]; then
     for unit in "${@:2}"; do
         [ "$unit" = "$FAKE_SYSTEMCTL_FAIL_STOP_UNIT" ] && exit 1
@@ -1163,6 +1167,11 @@ helper_empty_output=$(doctor_with)
 grep -q 'FAIL Boat Chat memory index is empty (0 chunks)' <<<"$helper_empty_output"
 rm -rf -- "$DATA_ROOT/boat-chat/memory"
 mv "$DATA_ROOT/boat-chat/memory.away" "$DATA_ROOT/boat-chat/memory"
+# Remote access: silent while off; a WARN (never a FAIL) when requested but Tailscale is not installed.
+if grep -q 'Tailscale' <<<"$(doctor_with)"; then echo 'doctor mentioned Tailscale while REMOTE_ACCESS is off' >&2; exit 1; fi
+remote_output=$(doctor_with REMOTE_ACCESS=tailscale FAKE_MEMORY_CHUNKS=7)
+grep -Fq 'WARN REMOTE_ACCESS=tailscale but Tailscale is not installed' <<<"$remote_output"
+if grep -q 'FAIL.*Tailscale' <<<"$remote_output"; then echo 'doctor failed on a missing Tailscale' >&2; exit 1; fi
 mv "$APP_ROOT/boat-chat/.venv/bin/python" "$APP_ROOT/boat-chat/.venv/bin/python.away"
 unknown_output=$(doctor_with)
 grep -q 'WARN could not determine the Boat Chat memory index state' <<<"$unknown_output"
@@ -1176,6 +1185,282 @@ if run_ctl reindex >/dev/null 2>"$TEST_ROOT/reindex.stderr"; then
 fi
 grep -q 'the Python environment is missing' "$TEST_ROOT/reindex.stderr"
 mv "$APP_ROOT/boat-chat/.venv/bin/python.away" "$APP_ROOT/boat-chat/.venv/bin/python"
+
+# ---- Unattended operation: scheduled backups, their result file, power and journal checks in doctor.
+SCHED_ENV="$TEST_ROOT/sched.env"
+SCHED_DIR=/mnt/vesselstack-sched-test
+RECORD_HELPER="$REPO_ROOT/scripts/lib/record-backup-result"
+LAST_JSON="$SYSTEM_ROOT/var/lib/vesselstack/backup-last.json"
+trap 'rm -rf -- "$TEST_ROOT" "$unmounted" "$SCHED_DIR"' EXIT
+write_sched_env() {  # folder [extra lines...]
+    local folder=$1
+    shift
+    sed -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=$folder|" "$APP_ROOT/config/vesselstack.env" > "$SCHED_ENV"
+    printf 'VESSELSTACK_BACKUP_SCHEDULE=weekly\nVESSELSTACK_BACKUP_KEEP=2\n' >> "$SCHED_ENV"
+    [ $# -eq 0 ] || printf '%s\n' "$@" >> "$SCHED_ENV"
+}
+sched_ctl() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+        VESSELSTACK_ENV="$SCHED_ENV" FAKE_MOUNTS="$TEST_ROOT/mounts" FAKE_MEMORY_CHUNKS=7 "$REPO_ROOT/scripts/vesselstackctl" "$@"
+}
+sched_doctor() { sched_ctl doctor 2>&1 || true; }
+record_result() {  # SERVICE_RESULT EXIT_STATUS
+    env VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" SERVICE_RESULT="$1" EXIT_STATUS="$2" "$RECORD_HELPER"
+}
+json_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$LAST_JSON" "$1"; }
+
+# Incompatible options are usage errors and change nothing.
+write_sched_env "$SCHED_DIR/backups"
+: > "$FAKE_BIN/calls.log"
+for combo in "--allow-unmounted" "--system-disk-once" "$TEST_ROOT/elsewhere"; do
+    rc=0
+    sched_ctl backup --scheduled "$combo" >/dev/null 2>&1 || rc=$?
+    test "$rc" -eq 2
+done
+test ! -s "$FAKE_BIN/calls.log"
+
+# Unmounted /mnt drive: refused before anything is stopped or created; the failure is recorded.
+: > "$TEST_ROOT/mounts"
+rm -f -- "$LAST_JSON"
+: > "$FAKE_BIN/calls.log"
+rc=0
+sched_ctl backup --scheduled >/dev/null 2>"$TEST_ROOT/sched.err" || rc=$?
+test "$rc" -eq 1
+grep -q 'is not mounted' "$TEST_ROOT/sched.err"
+test ! -e "$SCHED_DIR"
+test ! -s "$FAKE_BIN/calls.log"
+record_result exit-code 1
+test "$(json_field result)" = failed
+test "$(json_field exit_status)" = 1
+test -n "$(json_field finished_at)"
+test "$(file_mode "$LAST_JSON")" = 644
+test -z "$(json_field archive)"
+failed_doctor=$(sched_doctor)
+grep -q 'FAIL the last scheduled backup failed' <<<"$failed_doctor"
+grep -q 'RESULT attention required' <<<"$failed_doctor"
+
+# A busy lifecycle lock exits 75 and is recorded as skipped, which doctor only warns about.
+python3 -I "$REPO_ROOT/common/lifecycle_lock.py" run --root "$APP_ROOT" --system-root "$SYSTEM_ROOT" -- \
+    bash -c "touch \"\$0\"; sleep 30" "$TEST_ROOT/lock-held" &
+lock_holder=$!
+for _ in $(seq 1 100); do [ -e "$TEST_ROOT/lock-held" ] && break; sleep 0.1; done
+test -e "$TEST_ROOT/lock-held"
+rc=0
+sched_ctl backup --scheduled >/dev/null 2>&1 || rc=$?
+kill "$lock_holder" 2>/dev/null || true
+wait "$lock_holder" 2>/dev/null || true
+test "$rc" -eq 75
+record_result exit-code 75
+test "$(json_field result)" = skipped_busy
+busy_doctor=$(sched_doctor)
+grep -q 'WARN the last scheduled backup was skipped' <<<"$busy_doctor"
+grep -q 'RESULT healthy' <<<"$busy_doctor"
+
+# Scheduled backups off: doctor only warns.
+write_sched_env "$SCHED_DIR/backups" VESSELSTACK_BACKUP_SCHEDULE=off
+off_doctor=$(sched_doctor)
+grep -q 'WARN scheduled backups are off' <<<"$off_doctor"
+grep -q 'RESULT healthy' <<<"$off_doctor"
+
+# System-disk folder: refused unless VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK=true.
+SYSDISK_BACKUPS="$TEST_ROOT/sysdisk-backups"
+write_sched_env "$SYSDISK_BACKUPS"
+: > "$FAKE_BIN/calls.log"
+rc=0
+sched_ctl backup --scheduled >/dev/null 2>"$TEST_ROOT/sched.err" || rc=$?
+test "$rc" -eq 1
+grep -q 'is on the system disk' "$TEST_ROOT/sched.err"
+test ! -e "$SYSDISK_BACKUPS"
+test ! -s "$FAKE_BIN/calls.log"
+write_sched_env "$SYSDISK_BACKUPS" VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK=true
+sysdisk_archive=$(sched_ctl backup --scheduled 2>/dev/null | tail -n 1)
+test -s "$sysdisk_archive"
+test -s "$sysdisk_archive.sha256"
+test "$(cat "$SYSTEM_ROOT/var/lib/vesselstack/backup-last-archive")" = "$(basename "$sysdisk_archive")"
+record_result success 0
+test "$(json_field result)" = success
+test "$(json_field archive)" = "$(basename "$sysdisk_archive")"
+ok_doctor=$(sched_doctor)
+grep -q 'OK   scheduled backups (weekly): last success' <<<"$ok_doctor"
+grep -q 'RESULT healthy' <<<"$ok_doctor"
+# A success older than twice the interval is a warning.
+python3 - "$LAST_JSON" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+data["finished_at"] = "2020-01-01T00:00:00Z"
+json.dump(data, open(sys.argv[1], "w"))
+PY
+stale_doctor=$(sched_doctor)
+grep -q 'WARN the last successful scheduled backup was' <<<"$stale_doctor"
+grep -q 'RESULT healthy' <<<"$stale_doctor"
+# last_success_at survives a skipped run, and an old one escalates even when the last run was only skipped.
+record_result success 0
+success_stamp=$(json_field last_success_at)
+test -n "$success_stamp"
+record_result exit-code 75
+test "$(json_field result)" = skipped_busy
+test "$(json_field last_success_at)" = "$success_stamp"
+record_result exit-code 1
+test "$(json_field result)" = failed
+test "$(json_field last_success_at)" = "$success_stamp"
+python3 - "$LAST_JSON" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+data["result"] = "skipped_busy"
+data["last_success_at"] = "2020-01-01T00:00:00Z"
+json.dump(data, open(sys.argv[1], "w"))
+PY
+carry_doctor=$(sched_doctor)
+grep -q 'WARN the last scheduled backup was skipped' <<<"$carry_doctor"
+grep -q 'WARN no scheduled backup has succeeded for' <<<"$carry_doctor"
+grep -q 'RESULT healthy' <<<"$carry_doctor"
+rm -rf -- "${SYSDISK_BACKUPS:?}"
+
+# Retention and the mounted-drive path (needs root: the mount root must be root-owned).
+if [ "$(id -u)" -eq 0 ]; then
+    rm -rf -- "${SCHED_DIR:?}"
+    install -d -m 0755 "$SCHED_DIR" "$SCHED_DIR/backups"
+    printf '%s\n' "$SCHED_DIR" > "$TEST_ROOT/mounts"
+    for n in 1 2 3 4; do
+        printf 'old\n' > "$SCHED_DIR/backups/vesselstack-scheduled-2020010${n}T000000000000000Z-1.tar.gz"
+        printf 'sum\n' > "$SCHED_DIR/backups/vesselstack-scheduled-2020010${n}T000000000000000Z-1.tar.gz.sha256"
+    done
+    # Manual and pre-update backups (same folder, same checksum layout) are never pruned.
+    printf 'manual\n' > "$SCHED_DIR/backups/vesselstack-20190301T000000000Z-5.tar.gz"
+    printf 'sum\n' > "$SCHED_DIR/backups/vesselstack-20190301T000000000Z-5.tar.gz.sha256"
+    printf 'pre-update\n' > "$SCHED_DIR/backups/vesselstack-20190302T000000000Z-7-3.tar.gz"
+    printf 'sum\n' > "$SCHED_DIR/backups/vesselstack-20190302T000000000Z-7-3.tar.gz.sha256"
+    printf 'no checksum\n' > "$SCHED_DIR/backups/vesselstack-scheduled-20190101T000000000000000Z-1.tar.gz"   # no .sha256: never touched
+    printf 'x\n' > "$SCHED_DIR/backups/vesselstack-scheduled-latest.tar.gz"                             # not a stamped name
+    printf 'x\n' > "$SCHED_DIR/backups/vesselstack-scheduled-latest.tar.gz.sha256"
+    printf 'x\n' > "$SCHED_DIR/backups/other-20190101.tar.gz"                                # not ours
+    printf 'x\n' > "$SCHED_DIR/backups/other-20190101.tar.gz.sha256"
+    printf 'x\n' > "$SCHED_DIR/backups/notes.txt"
+    printf 'x\n' > "$SCHED_DIR/backups/vesselstack-bad name.tar.gz"
+    printf 'x\n' > "$SCHED_DIR/backups/vesselstack-bad name.tar.gz.sha256"
+    write_sched_env "$SCHED_DIR/backups"
+    mounted_archive=$(sched_ctl backup --scheduled 2>/dev/null | tail -n 1)
+    test -s "$mounted_archive"
+    # KEEP=2: the new archive and the newest old one remain; the three older pairs are gone.
+    case "${mounted_archive##*/}" in vesselstack-scheduled-*.tar.gz) ;; *) echo "scheduled archive has the wrong name: $mounted_archive" >&2; exit 1 ;; esac
+    test ! -e "$SCHED_DIR/backups/vesselstack-scheduled-20200101T000000000000000Z-1.tar.gz"
+    test ! -e "$SCHED_DIR/backups/vesselstack-scheduled-20200101T000000000000000Z-1.tar.gz.sha256"
+    test ! -e "$SCHED_DIR/backups/vesselstack-scheduled-20200103T000000000000000Z-1.tar.gz"
+    test -e "$SCHED_DIR/backups/vesselstack-scheduled-20200104T000000000000000Z-1.tar.gz"
+    test -e "$SCHED_DIR/backups/vesselstack-scheduled-20200104T000000000000000Z-1.tar.gz.sha256"
+    test -e "$mounted_archive"
+    test -e "$mounted_archive.sha256"
+    # The scheduled archive still verifies, so restore and verify accept the new name.
+    sched_ctl verify-backup "$mounted_archive" >/dev/null
+    for kept in vesselstack-20190301T000000000Z-5.tar.gz vesselstack-20190301T000000000Z-5.tar.gz.sha256 \
+        vesselstack-20190302T000000000Z-7-3.tar.gz vesselstack-20190302T000000000Z-7-3.tar.gz.sha256 \
+        vesselstack-scheduled-20190101T000000000000000Z-1.tar.gz vesselstack-scheduled-latest.tar.gz vesselstack-scheduled-latest.tar.gz.sha256 other-20190101.tar.gz other-20190101.tar.gz.sha256 notes.txt \
+        "vesselstack-bad name.tar.gz" "vesselstack-bad name.tar.gz.sha256"; do
+        test -e "$SCHED_DIR/backups/$kept"
+    done
+    # An invalid KEEP (leading zero, zero, octal-looking, too large) warns and prunes nothing.
+    for bad_keep in 08 00 010 400; do
+        before=$(find "$SCHED_DIR/backups" -mindepth 1 | wc -l)
+        write_sched_env "$SCHED_DIR/backups" "VESSELSTACK_BACKUP_KEEP=$bad_keep"
+        sched_ctl backup --scheduled >/dev/null 2>"$TEST_ROOT/keep.err"
+        grep -q 'VESSELSTACK_BACKUP_KEEP is not a whole number from 1 to 365' "$TEST_ROOT/keep.err"
+        test "$(find "$SCHED_DIR/backups" -mindepth 1 | wc -l)" -eq $((before + 2))
+    done
+    write_sched_env "$SCHED_DIR/backups"
+    # A run whose tar fails leaves no partial archive or checksum behind, and prunes nothing.
+    mkdir -p "$TEST_ROOT/failtar"
+    cat > "$TEST_ROOT/failtar/tar" <<'TAREOF'
+#!/bin/bash
+printf 'partial\n' > "$3"
+exit 1
+TAREOF
+    chmod +x "$TEST_ROOT/failtar/tar"
+    listing_before=$(find "$SCHED_DIR/backups" -mindepth 1 | LC_ALL=C sort)
+    rc=0
+    PATH="$TEST_ROOT/failtar:$PATH" sched_ctl backup --scheduled >/dev/null 2>"$TEST_ROOT/failtar.err" || rc=$?
+    if [ "$rc" -eq 0 ] || [ "$(find "$SCHED_DIR/backups" -mindepth 1 | LC_ALL=C sort)" != "$listing_before" ]; then
+        echo "A failed scheduled backup (rc=$rc) left files behind:" >&2
+        diff <(printf '%s\n' "$listing_before") <(find "$SCHED_DIR/backups" -mindepth 1 | LC_ALL=C sort) >&2 || true
+        cat "$TEST_ROOT/failtar.err" >&2
+        exit 1
+    fi
+    # A mounted drive whose folder can be changed by other users is refused.
+    chmod 0777 "$SCHED_DIR"
+    rc=0
+    sched_ctl backup --scheduled >/dev/null 2>&1 || rc=$?
+    test "$rc" -eq 1
+    rm -rf -- "${SCHED_DIR:?}"
+    : > "$TEST_ROOT/mounts"
+fi
+rm -f -- "$LAST_JSON" "$SYSTEM_ROOT/var/lib/vesselstack/backup-last-archive"
+
+# Power: a fake vcgencmd reporting under-voltage now and since boot (0x50005) only warns.
+cat > "$FAKE_BIN/vcgencmd" <<'EOF'
+#!/bin/bash
+[ "${1:-}" = get_throttled ] && echo "throttled=${FAKE_THROTTLED:-0x0}"
+EOF
+chmod +x "$FAKE_BIN/vcgencmd"
+write_sched_env "$SCHED_DIR/backups" VESSELSTACK_BACKUP_SCHEDULE=off
+power_doctor=$(FAKE_THROTTLED=0x50005 sched_doctor)
+grep -q 'WARN UNDER-VOLTAGE RIGHT NOW' <<<"$power_doctor"
+grep -q 'WARN the CPU is throttled right now' <<<"$power_doctor"
+grep -q 'WARN under-voltage has occurred since boot' <<<"$power_doctor"
+grep -q 'WARN throttling has occurred since boot' <<<"$power_doctor"
+if grep -q 'WARN ARM frequency\|soft temperature' <<<"$power_doctor"; then
+    echo 'doctor reported power bits that were not set' >&2
+    exit 1
+fi
+grep -q 'RESULT healthy' <<<"$power_doctor"
+grep -q 'OK   no power or temperature throttling' <<<"$(FAKE_THROTTLED=0x0 sched_doctor)"
+rm -f -- "$FAKE_BIN/vcgencmd"
+if grep -qi 'throttl' <<<"$(sched_doctor)"; then
+    echo 'doctor mentioned power without vcgencmd' >&2
+    exit 1
+fi
+# The GPIO shutdown overlay is reported, never edited.
+install -d "$SYSTEM_ROOT/boot/firmware"
+printf 'dtoverlay=gpio-shutdown,gpio_pin=3,active_low=1,gpio_pull=up\n' > "$SYSTEM_ROOT/boot/firmware/config.txt"
+config_before=$(sha256sum "$SYSTEM_ROOT/boot/firmware/config.txt")
+grep -q 'INFO a GPIO shutdown' <<<"$(sched_doctor)"
+test "$(sha256sum "$SYSTEM_ROOT/boot/firmware/config.txt")" = "$config_before"
+rm -f -- "$SYSTEM_ROOT/boot/firmware/config.txt"
+
+# Watchdog and journal lines (the drop-in contents are installer-tested in test-clean-install.sh).
+wd_dir="$SYSTEM_ROOT/etc/systemd/system.conf.d"
+jd_dir="$SYSTEM_ROOT/etc/systemd/journald.conf.d"
+grep -q 'INFO no hardware watchdog device found' <<<"$(sched_doctor)"
+grep -q 'WARN the system journal has no VesselStack size cap' <<<"$(sched_doctor)"
+install -d "$jd_dir" "$wd_dir" "$SYSTEM_ROOT/dev"
+printf '[Journal]\nSystemMaxUse=200M\n' > "$jd_dir/60-vesselstack.conf"
+grep -q 'OK   journal size capped at 200M' <<<"$(sched_doctor)"
+: > "$SYSTEM_ROOT/dev/watchdog"
+# auto only arms on a Raspberry Pi: a different board gets an INFO, a Pi gets the "rerun" WARN.
+grep -q 'INFO a hardware watchdog device exists, but VESSELSTACK_WATCHDOG=auto only enables it on a Raspberry Pi' <<<"$(sched_doctor)"
+install -d "$SYSTEM_ROOT/proc/device-tree"
+printf 'Raspberry Pi 4 Model B Rev 1.5\0' > "$SYSTEM_ROOT/proc/device-tree/model"
+grep -q 'WARN a hardware watchdog device exists' <<<"$(sched_doctor)"
+printf '[Manager]\nRuntimeWatchdogSec=10s\nRebootWatchdogSec=2min\n' > "$wd_dir/60-vesselstack-watchdog.conf"
+# The kernel's state is preferred; without it an empty systemctl answer is "unknown", never OK.
+install -d "$SYSTEM_ROOT/sys/class/watchdog/watchdog0"
+printf 'active\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/state"
+grep -q 'OK   hardware watchdog configured' <<<"$(sched_doctor)"
+printf 'inactive\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/state"
+grep -q 'WARN hardware watchdog is configured (10s) but the kernel reports it as "inactive"' <<<"$(sched_doctor)"
+rm -f -- "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/state"
+grep -q 'WARN hardware watchdog is configured (10s) but whether systemd is using it is unknown' <<<"$(sched_doctor)"
+rm -f -- "$wd_dir/60-vesselstack-watchdog.conf"
+# Another watchdog daemon owns the device: INFO, not "rerun the installer".
+owner_doctor=$(FAKE_WATCHDOG_OWNER=1 sched_doctor)
+grep -q 'INFO watchdog.service owns the hardware watchdog' <<<"$owner_doctor"
+if grep -q 'rerun the installer (VESSELSTACK_WATCHDOG' <<<"$owner_doctor"; then
+    echo 'doctor told the owner of watchdog.service to rerun the installer' >&2
+    exit 1
+fi
+# VESSELSTACK_JOURNAL_MAX_USE=off is reported as off, not as a missing cap.
+rm -f -- "$jd_dir/60-vesselstack.conf"
+write_sched_env "$SCHED_DIR/backups" VESSELSTACK_BACKUP_SCHEDULE=off VESSELSTACK_JOURNAL_MAX_USE=off
+grep -q 'INFO the journal size cap is turned off' <<<"$(sched_doctor)"
+rm -f -- "$SYSTEM_ROOT/dev/watchdog" "$SYSTEM_ROOT/proc/device-tree/model"
 
 # `vesselstackctl lan`: presets map to the real bind settings, the files are rewritten
 # atomically with owner and mode kept, the control panel is never touched, and the risky or
@@ -1457,6 +1742,109 @@ if [ "$(id -u)" -eq 0 ]; then
         exit 1
     fi
 fi
+
+# Signal K data path in doctor: managed modes only, always a WARN (never a FAIL), and the
+# InfluxDB token reaches docker through the environment, never an argument.
+DP_BIN="$TEST_ROOT/datapath-bin"
+install -d "$DP_BIN"
+cat > "$DP_BIN/docker" <<'EOF2'
+#!/bin/bash
+if [ "${1:-}" = exec ] && [[ " $* " == *" influx query --raw "* ]]; then
+    printf '%s\n' "$*" >> "$DP_BIN_LOG"
+    [ -z "${FAKE_INFLUX_FAIL:-}" ] || exit 1
+    [ -n "${INFLUX_TOKEN:-}" ] || exit 1
+    [ -z "${FAKE_INFLUX_REJECT:-}" ] || [ "$INFLUX_TOKEN" != "$FAKE_INFLUX_REJECT" ] || { echo "401 Unauthorized: unauthorized access" >&2; exit 1; }
+    if [[ "$*" == *"-1h"* ]]; then
+        [ -z "${FAKE_INFLUX_NEWEST:-}" ] || printf '#datatype,string,long,dateTime:RFC3339\r\n,result,table,_time\r\n,,0,%s\r\n\r\n' "$FAKE_INFLUX_NEWEST"
+    else
+        [ -z "${FAKE_INFLUX_COUNT:-}" ] || printf '#datatype,string,long,long\r\n,result,table,_value\r\n,,0,%s\r\n\r\n' "$FAKE_INFLUX_COUNT"
+    fi
+    exit 0
+fi
+if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --services "* ]]; then
+    "$FAKE_BIN/docker" "$@"
+    echo signalk
+    exit 0
+fi
+exec "$FAKE_BIN/docker" "$@"
+EOF2
+chmod +x "$DP_BIN/docker"
+DP_DATA="$TEST_ROOT/datapath-data"
+DP_ENV="$TEST_ROOT/datapath.env"
+install -d "$DP_DATA/signalk/plugin-config-data"
+if [ "$(id -u)" -eq 0 ]; then chown 1000:1000 "$DP_DATA/signalk"; fi  # doctor expects the container uid to own it
+sed -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=$DP_DATA|" "$APP_ROOT/config/vesselstack.env" \
+    | grep -vE '^(SIGNALK_MODE|SIGNALK_DATAPATH_AUTOCONFIG|SOCKETCAN_ENABLE|SOCKETCAN_INTERFACE|INFLUXDB_TOKEN|INFLUXDB_ORG|INFLUXDB_RAW_BUCKET|VESSELSTACK_DISABLED_COMPONENTS)=' > "$DP_ENV.base"
+printf 'SIGNALK_MODE=docker\nINFLUXDB_TOKEN=test-token-not-secret\nINFLUXDB_ORG=vessel\nINFLUXDB_RAW_BUCKET=boatraw\n' >> "$DP_ENV.base"
+dp_doctor() {  # extra env lines for the settings file; VAR=value arguments for the process
+    local lines=() assigns=() item
+    for item in "$@"; do case "$item" in FAKE_*) assigns+=("$item") ;; *) lines+=("$item") ;; esac; done
+    { cat "$DP_ENV.base"; [ "${#lines[@]}" -eq 0 ] || printf '%s\n' "${lines[@]}"; } > "$DP_ENV"
+    env "${assigns[@]}" DP_BIN_LOG="$TEST_ROOT/datapath-docker.log" FAKE_BIN="$FAKE_BIN" PATH="$DP_BIN:$FAKE_BIN:$PATH" VESSELSTACK_ROOT="$APP_ROOT" \
+        VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_ENV="$DP_ENV" \
+        VESSELSTACK_SYS_CLASS_NET="$TEST_ROOT/datapath-net" \
+        "$REPO_ROOT/scripts/vesselstackctl" doctor 2>&1 || true
+}
+: > "$TEST_ROOT/datapath-docker.log"
+DP_CONFIG="$DP_DATA/signalk/plugin-config-data/signalk-to-influxdb2.json"
+DP_SKIP="$SYSTEM_ROOT/var/lib/vesselstack/signalk-datapath-skipped"
+install -d "$SYSTEM_ROOT/var/lib/vesselstack"
+rm -f -- "$DP_CONFIG" "$DP_SKIP"
+out=$(dp_doctor)
+grep -q 'WARN the Signal K InfluxDB plugin has no configuration' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+printf '{"enabled": false, "configuration": {}}\n' > "$DP_CONFIG"
+out=$(dp_doctor)
+grep -q 'WARN the Signal K InfluxDB plugin is disabled' <<<"$out"
+printf '{"enabled": true, "configuration": {}}\n' > "$DP_CONFIG"
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-20 seconds' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=412)
+grep -Eq 'OK   Signal K data reaches InfluxDB: newest point [0-9]+s ago, 412 points in the last 10 minutes' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+# The token is in the environment of the docker client, not in any argument.
+if grep -q 'test-token-not-secret' "$TEST_ROOT/datapath-docker.log"; then echo 'doctor put the InfluxDB token on a command line' >&2; exit 1; fi
+grep -q -- 'exec -e INFLUX_TOKEN -e INFLUX_ORG vesselstack-influxdb influx query --raw' "$TEST_ROOT/datapath-docker.log"
+# A writer token InfluxDB no longer knows (after a wipe or restore) is called out, and neither
+# token ever appears in an argument. A valid one passes.
+printf '{"enabled": true, "configuration": {"influxes": [{"token": "stale-writer-token-not-secret"}]}}\n' > "$DP_CONFIG"
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-20 seconds' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=412 FAKE_INFLUX_REJECT=stale-writer-token-not-secret)
+grep -q 'WARN the Signal K InfluxDB writer token was rejected' <<<"$out"
+grep -q 'plugin-config-data/signalk-to-influxdb2.json' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+if grep -q 'Signal K data reaches InfluxDB' <<<"$out"; then echo 'doctor called a rejected writer token healthy' >&2; exit 1; fi
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-20 seconds' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=412 FAKE_INFLUX_REJECT=some-other-token)
+grep -q 'OK   Signal K data reaches InfluxDB' <<<"$out"
+if grep -q 'stale-writer-token-not-secret' "$TEST_ROOT/datapath-docker.log"; then echo 'doctor put the writer token on a command line' >&2; exit 1; fi
+printf '{"enabled": true, "configuration": {}}\n' > "$DP_CONFIG"
+out=$(dp_doctor "FAKE_INFLUX_NEWEST=$(date -u -d '-30 minutes' +%Y-%m-%dT%H:%M:%SZ)" FAKE_INFLUX_COUNT=0)
+grep -Eq 'WARN the newest Signal K point in InfluxDB is 3[01] minutes old' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+out=$(dp_doctor)
+grep -q 'WARN no Signal K data in InfluxDB in the last hour' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+out=$(dp_doctor FAKE_INFLUX_FAIL=1)
+grep -q 'WARN could not query InfluxDB to check the Signal K data path' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+# SocketCAN with no frames received is called out; frames received are not.
+install -d "$TEST_ROOT/datapath-net/can0/statistics"
+printf '0\n' > "$TEST_ROOT/datapath-net/can0/statistics/rx_packets"
+out=$(dp_doctor SOCKETCAN_ENABLE=true SOCKETCAN_INTERFACE=can0)
+grep -q 'WARN SocketCAN interface can0 has received 0 packets' <<<"$out"
+printf '9120\n' > "$TEST_ROOT/datapath-net/can0/statistics/rx_packets"
+out=$(dp_doctor SOCKETCAN_ENABLE=true SOCKETCAN_INTERFACE=can0)
+if grep -q 'received 0 packets' <<<"$out"; then echo 'doctor flagged a CAN interface that receives frames' >&2; exit 1; fi
+# A skipped install (npm prune guard) is reported and takes precedence.
+printf '2026-11-13T10:00:00Z their-plugin\n' > "$DP_SKIP"
+out=$(dp_doctor)
+grep -q 'WARN the signalk-to-influxdb2 plugin was not installed because npm would remove packages' <<<"$out"
+grep -q 'their-plugin' <<<"$out"
+grep -q 'RESULT healthy' <<<"$out"
+rm -f -- "$DP_SKIP"
+out=$(dp_doctor SIGNALK_DATAPATH_AUTOCONFIG=false)
+grep -q 'INFO Signal K data path automation is off' <<<"$out"
+# Existing mode is not judged at all.
+sed -i 's|^SIGNALK_MODE=docker$|SIGNALK_MODE=existing|' "$DP_ENV.base"
+out=$(dp_doctor)
+if grep -qE 'Signal K (InfluxDB|data reaches)|signalk-to-influxdb2|no Signal K data' <<<"$out"; then echo 'doctor judged the data path of an existing Signal K' >&2; exit 1; fi
 
 unsafe="$BACKUP_ROOT/unsafe.tar.gz"
 python3 - "$unsafe" "${APP_ROOT#/}" <<'PY'

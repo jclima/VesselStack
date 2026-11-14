@@ -49,6 +49,8 @@ jobs:
           TMPDIR="$trusted_test_tmp" tests/test-distribution.sh
       - name: Lifecycle backup and restore checks
         run: sudo tests/test-lifecycle.sh
+      - name: Remote access checks
+        run: sudo tests/test-remote.sh
       - name: Versioned migration checks
         run: tests/test-migrations.sh
       - name: Clean installation checks
@@ -68,7 +70,7 @@ jobs:
       - name: Validate Compose configuration
         run: docker compose --env-file vesselstack.example.env -f templates/compose.yml config --quiet
       - name: Validate optional Compose profiles
-        run: docker compose --profile signalk --profile ais --profile metrics --env-file vesselstack.example.env -f templates/compose.yml config --quiet
+        run: docker compose --profile signalk --profile ais --profile metrics --profile nodered --env-file vesselstack.example.env -f templates/compose.yml config --quiet --no-env-resolution
       - name: Validate Linux ARM64 image manifests
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
@@ -100,6 +102,8 @@ jobs:
         run: sudo tests/test-displays-bridge.sh
       - name: Verify the bridge EnvironmentFile and unit under real systemd
         run: tests/test-displays-envfile-systemd.sh
+      - name: Verify the Node-RED dashboard live channel requires the crew sign-in
+        run: tests/test-nodered-dashboard-auth.sh
 
   displays-esphome-config:
     runs-on: ubuntu-latest

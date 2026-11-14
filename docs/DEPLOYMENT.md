@@ -330,10 +330,13 @@ Lab settings worth checking (all defined in `vesselstack.example.env`):
 ```bash
 SIGNALK_MODE="docker"                      # self-contained; "existing" needs a running SignalK
 SIGNALK_VESSELTWIN_PRELOAD="true"           # package preload only; enable/pair/send remain explicit
+SIGNALK_DATAPATH_AUTOCONFIG="true"           # signalk-to-influxdb2, CAN provider and its own InfluxDB token (needs the npm registry)
 SOCKETCAN_ENABLE="true"
 SOCKETCAN_INTERFACE="vcan0"                # bitrate is ignored for vcan*
 VESSELSTACK_CAN_CREATE_VCAN="true"         # modprobe vcan + ip link add at boot
 VESSELSTACK_BACKUP="/media/vesselstack-backup/backups"   # must be a mounted device or backup refuses
+VESSELSTACK_BACKUP_SCHEDULE="off"          # off|daily|weekly; a scheduled backup STOPS the stack while it runs
+VESSELSTACK_WATCHDOG="auto"                # hardware watchdog on a Raspberry Pi with /dev/watchdog (true: any host; false: off)
 INFLUXDB_RAW_RETENTION="30d"               # see 3.6
 BOAT_CHAT_ACCESS_TOKEN="GENERATE"          # default; generated per host
 ```
@@ -454,7 +457,9 @@ values, and record the `doctor` result and data-directory size each day.
    `SIGNALK_VESSELTWIN_PRELOAD=true` requires a valid preload plugin install
    prepared while online; for a fresh offline install, set it to `false` or
    deliberately pre-provision the plugin state. Native Signal K installation is
-   not supported offline. `DISPLAYS_ENABLE=true` likewise requires its bridge
+   not supported offline. An offline `--start` skips the Signal K data path
+   (`SIGNALK_DATAPATH_AUTOCONFIG`) with a warning, because it needs the npm
+   registry. `DISPLAYS_ENABLE=true` likewise requires its bridge
    virtualenv to have been provisioned online first; set it to `false` for a
    fresh offline install.
 
@@ -586,6 +591,10 @@ backup, the recorded sha256 and a console/Ethernet path ready.
 
    Keep one copy off the Pi. `vesselstackctl update` also takes its own backup
    into `VESSELSTACK_BACKUP`, but that is not a substitute for this one.
+   Optional scheduled backups (`VESSELSTACK_BACKUP_SCHEDULE`, keep count
+   `VESSELSTACK_BACKUP_KEEP`) need the drive permanently mounted and each run stops the
+   whole stack; see the README sections "Scheduled backups" and "Unattended operation and power"
+   (hardware watchdog, journal cap, under-voltage warnings in `vesselstackctl doctor`).
 
 2. **Verify the tarball against the value recorded at build time** (compare with
    your notes, not with the `.sha256` file that travelled with it):
@@ -714,10 +723,16 @@ changed by this command.
 
 ## 8. Remote access, secrets, and known gaps
 
-**Remote access (later, optional).** Nothing here assumes it. If you add a
-Tailscale or other VPN, bind/allow services on that interface deliberately and
-update the firewall policy; keep the control panel on loopback plus tunnel. The
-repository ships no Tailscale integration.
+**Remote access (later, optional).** Nothing here assumes it. VesselStack has
+an optional, off-by-default Tailscale integration (`sudo vesselstackctl remote
+enable|status|disable`; README "Remote access with Tailscale"): it installs
+Tailscale from Tailscale's own apt repository (internet needed, not in the
+offline bundle), publishes only the Control Panel to your tailnet with
+`tailscale serve` (the panel stays on loopback) and opens no inbound ports. It
+does not restrict other services bound to `0.0.0.0`, which the tailnet can then
+reach: use Tailscale ACLs. For any other VPN, bind/allow services on that
+interface deliberately and update the firewall policy; keep the control panel
+on loopback plus tunnel. Rollback: `sudo vesselstackctl remote disable --purge`.
 
 **Secrets.** Secrets live in `/opt/vesselstack/config/*.env` (mode 600) and in
 backups (`chmod 0600` archives, which therefore contain them: store them

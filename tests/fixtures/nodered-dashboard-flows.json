@@ -1,0 +1,7 @@
+[{"id":"t1","type":"tab","label":"T"},
+{"id":"b1","type":"ui-base","name":"VS","path":"/dashboard","includeClientData":true,"acceptsClientConfig":["ui-notification","ui-control"],"showPathInSidebar":false,"navigationStyle":"default","titleBarStyle":"default"},
+{"id":"th1","type":"ui-theme","name":"Th","colors":{"surface":"#ffffff","primary":"#0094CE","bgPage":"#eeeeee","groupBg":"#ffffff","groupOutline":"#cccccc"},"sizes":{"pagePadding":"12px","groupGap":"12px","groupBorderRadius":"4px","widgetGap":"12px"}},
+{"id":"p1","type":"ui-page","name":"Boat","ui":"b1","path":"/boat","layout":"grid","theme":"th1","order":1,"className":"","visible":"true","disabled":"false"},
+{"id":"g1","type":"ui-group","name":"G","page":"p1","width":"6","height":"1","order":1,"showTitle":true,"className":"","visible":"true","disabled":"false"},
+{"id":"txt1","type":"ui-text","z":"t1","group":"g1","order":1,"width":0,"height":0,"name":"","label":"Secret","format":"{{msg.payload}}","layout":"row-spread","style":false,"font":"","fontSize":16,"color":"#717171","className":"","wires":[]},
+{"id":"inj1","type":"inject","z":"t1","name":"","props":[{"p":"payload"}],"repeat":"1","once":true,"onceDelay":"0.5","payload":"SECRET-WIDGET-VALUE","payloadType":"str","wires":[["txt1"]]}]

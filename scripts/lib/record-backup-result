@@ -1,0 +1,68 @@
+#!/bin/bash
+# Records the outcome of the last scheduled backup (vesselstack-backup.service ExecStopPost).
+# systemd supplies SERVICE_RESULT and EXIT_STATUS. The file holds no paths or secrets.
+set -euo pipefail
+umask 022
+
+STATE_DIR=${VESSELSTACK_SYSTEM_ROOT:-}/var/lib/vesselstack
+LAST_FILE=$STATE_DIR/backup-last.json
+ARCHIVE_FILE=$STATE_DIR/backup-last-archive
+
+service_result=${SERVICE_RESULT:-unknown}
+exit_status=${EXIT_STATUS:-}
+install -d -m 0755 -- "$STATE_DIR"
+
+python3 -I - "$service_result" "$exit_status" "$ARCHIVE_FILE" "$LAST_FILE" <<'PY'
+import datetime, json, os, re, sys
+
+service_result, exit_status, archive_file, last_file = sys.argv[1:]
+if service_result == "success":
+    result = "success"
+elif exit_status == "75":  # EX_TEMPFAIL: the lifecycle lock was busy
+    result = "skipped_busy"
+else:
+    result = "failed"
+finished_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+record = {
+    "result": result,
+    "exit_status": int(exit_status) if exit_status.isdigit() else (re.sub(r"[^0-9A-Za-z_-]", "", exit_status) or None),
+    "finished_at": finished_at,
+}
+# last_success_at survives failed and skipped runs so doctor can tell how long ago a backup last worked.
+last_success = None
+if result == "success":
+    last_success = finished_at
+else:
+    try:
+        with open(last_file, encoding="utf-8") as handle:
+            previous = json.load(handle)
+        candidate = previous.get("last_success_at") or (previous.get("finished_at") if previous.get("result") == "success" else None)
+        if isinstance(candidate, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", candidate):
+            last_success = candidate
+    except (OSError, ValueError, AttributeError):
+        pass
+if last_success:
+    record["last_success_at"] = last_success
+if result == "success":
+    try:
+        name = open(archive_file, encoding="utf-8").read().strip()
+    except OSError:
+        name = ""
+    if re.fullmatch(r"vesselstack-[0-9A-Za-z._-]+\.tar\.gz", name):
+        record["archive"] = name
+tmp = f"{last_file}.tmp.{os.getpid()}"
+try:
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, last_file)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY

@@ -66,10 +66,14 @@ for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
 PY
 # Prompt helpers for the fixes offered below (see scripts/lib/remediate.sh).
 # shellcheck source=scripts/lib/remediate.sh
+# shellcheck disable=SC1091  # Not followed without -x; scripts/lib/remediate.sh is shellchecked as its own input.
 source "$SCRIPT_DIR/scripts/lib/remediate.sh"
 # After a fix this installer restarts itself with the answers descriptor still open; this process
 # owns it now, so vs_prompt_close closes it before anything is installed or started.
-if [ "${VESSELSTACK_REMEDIATION_ROUND:-0}" != 0 ] && [ -n "$VS_PROMPT_FD" ]; then VS_PROMPT_OWNED=1; fi
+if [ "${VESSELSTACK_REMEDIATION_ROUND:-0}" != 0 ] && [ -n "$VS_PROMPT_FD" ]; then
+    # shellcheck disable=SC2034  # Read by vs_prompt_close in the sourced scripts/lib/remediate.sh.
+    VS_PROMPT_OWNED=1
+fi
 # config_key_assigned KEY: true when CONFIG_FILE itself assigns KEY (so editing it can fix it).
 config_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }
 # Set below when an interactive run may offer to fix the value instead of stopping.
@@ -119,6 +123,8 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${SIGNALK_MODE:=existing}"
 : "${SIGNALK_VERSION:=v2.27.0}"
 : "${SIGNALK_VESSELTWIN_PRELOAD:=true}"
+: "${SIGNALK_DATAPATH_AUTOCONFIG:=true}"
+: "${SIGNALK_MARINE_BUNDLE:=false}"
 : "${SOCKETCAN_ENABLE:=false}"
 : "${SOCKETCAN_INTERFACE:=can0}"
 : "${SOCKETCAN_BITRATE:=250000}"
@@ -153,6 +159,17 @@ if [ -z "${BOAT_CHAT_PORT_FROM_CONFIG:-}" ] && [ -r "$SOURCE_ROOT/common/config_
 fi
 : "${VESSELSTACK_BACKUP:=/var/backups/vesselstack}"
 : "${TELEGRAM_ENABLE:=false}"
+# Opt-in Telegram alerts (README "Alerts"): off by default, every threshold blank (= that alert off).
+: "${ALERTS_ENABLE:=false}"
+: "${REMOTE_ACCESS:=off}"
+: "${REMOTE_PANEL_SERVE:=true}"
+: "${ALERT_TELEGRAM_CHAT_IDS:=}"
+: "${ALERT_BATTERY_LOW_V:=}"
+: "${ALERT_BILGE_ENTITY:=}"
+: "${ALERT_SHORE_POWER_ENTITY:=}"
+: "${ALERT_HEARTBEAT_URL:=}"
+: "${ALERT_REPEAT_MINUTES:=60}"
+: "${ALERT_STALE_DATA_MINUTES:=15}"
 : "${TELEMETRY_INDEXER_ENABLE:=true}"
 : "${BOAT_UNITS:=us_customary}"
 # Older setup wizards offered "nautical" and installers before 0.5.7 did not check it, so
@@ -168,6 +185,15 @@ if [ "$BOAT_UNITS" = nautical ]; then
     BOAT_UNITS=metric
 fi
 : "${NODE_EXPORTER_ENABLE:=false}"
+# Optional Node-RED (README "Node-RED (optional)"). Local-only by default: it does not follow the dashboards' address.
+: "${NODERED_ENABLE:=false}"
+: "${NODERED_PORT:=1880}"
+: "${NODERED_BIND_ADDRESS:=127.0.0.1}"
+: "${NODERED_ADMIN_PASSWORD:=}"
+: "${NODERED_ADMIN_PASSWORD_HASH:=}"
+: "${NODERED_DASHBOARD_PASSWORD:=}"
+: "${NODERED_DASHBOARD_PASSWORD_HASH:=}"
+: "${NODERED_CREDENTIAL_SECRET:=}"
 : "${DISPLAYS_ENABLE:=false}"
 : "${DISPLAYS_BRIDGE_MQTT_USERNAME:=vesselstack-bridge}"
 : "${DISPLAYS_SIGNALK_TOKEN:=}"
@@ -178,6 +204,12 @@ fi
 # Prometheus TSDB retention (time only; never 0, which Prometheus would treat as the default).
 : "${PROMETHEUS_RETENTION:=30d}"
 : "${VESSELSTACK_DISABLED_COMPONENTS:=}"
+# Unattended operation (README "Unattended operation and power"). Upgrades keep scheduled backups off.
+: "${VESSELSTACK_WATCHDOG:=auto}"
+: "${VESSELSTACK_JOURNAL_MAX_USE:=200M}"
+: "${VESSELSTACK_BACKUP_SCHEDULE:=off}"
+: "${VESSELSTACK_BACKUP_KEEP:=8}"
+: "${VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK:=false}"
 
 if [ -r "$SOURCE_ROOT/common/config_registry.py" ]; then
     CORE_COMPONENTS=()
@@ -258,8 +290,50 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     echo "PROMETHEUS_RETENTION must be a duration such as 720h, 30d or 8w" >&2
     exit 1
 fi
+case "$VESSELSTACK_WATCHDOG" in auto|true|false) ;; *) echo "VESSELSTACK_WATCHDOG must be auto, true or false" >&2; exit 1 ;; esac
+if ! [[ "$ALERT_REPEAT_MINUTES" =~ ^[0-9]{1,5}$ ]] || [ "$ALERT_REPEAT_MINUTES" -lt 5 ] || [ "$ALERT_REPEAT_MINUTES" -gt 10080 ]; then
+    echo "ALERT_REPEAT_MINUTES must be a whole number from 5 to 10080" >&2
+    exit 1
+fi
+if ! [[ "$ALERT_STALE_DATA_MINUTES" =~ ^[0-9]{1,5}$ ]] || [ "$ALERT_STALE_DATA_MINUTES" -lt 2 ] || [ "$ALERT_STALE_DATA_MINUTES" -gt 10080 ]; then
+    echo "ALERT_STALE_DATA_MINUTES must be a whole number from 2 to 10080" >&2
+    exit 1
+fi
+if [ -n "$ALERT_BATTERY_LOW_V" ] && ! [[ "$ALERT_BATTERY_LOW_V" =~ ^[0-9]{1,2}(\.[0-9]{1,2})?$ ]]; then
+    echo "ALERT_BATTERY_LOW_V must be a voltage such as 12.0 or 24.0, or blank to turn the alert off" >&2
+    exit 1
+fi
+if ! [[ "$ALERT_TELEGRAM_CHAT_IDS" =~ ^(-?[0-9]{1,20}([[:space:]]*,[[:space:]]*-?[0-9]{1,20})*)?$ ]]; then
+    echo "ALERT_TELEGRAM_CHAT_IDS must be comma-separated numeric Telegram chat ids" >&2
+    exit 1
+fi
+for key in ALERT_BILGE_ENTITY ALERT_SHORE_POWER_ENTITY; do
+    if [ -n "${!key}" ] && ! [[ "${!key}" =~ ^[a-z_]+\.[A-Za-z0-9_]+$ ]]; then
+        echo "$key must be a Home Assistant entity id such as binary_sensor.bilge_pump, or blank" >&2
+        exit 1
+    fi
+done
+if [ -n "$ALERT_HEARTBEAT_URL" ] && ! [[ "$ALERT_HEARTBEAT_URL" =~ ^https://[^[:space:]\'\"\$\`\\]+$ ]]; then
+    echo "ALERT_HEARTBEAT_URL must be an https:// address, or blank (its value is not shown)" >&2
+    exit 1
+fi
+case "$REMOTE_ACCESS" in off|tailscale) ;; *) echo "REMOTE_ACCESS must be off or tailscale" >&2; exit 1 ;; esac
+case "$VESSELSTACK_BACKUP_SCHEDULE" in off|daily|weekly) ;; *) echo "VESSELSTACK_BACKUP_SCHEDULE must be off, daily or weekly" >&2; exit 1 ;; esac
+if [ "$VESSELSTACK_JOURNAL_MAX_USE" != off ] && ! [[ "$VESSELSTACK_JOURNAL_MAX_USE" =~ ^[1-9][0-9]*[KMG]$ ]]; then
+    echo "VESSELSTACK_JOURNAL_MAX_USE must be a size such as 200M or 1G, or off" >&2
+    exit 1
+fi
+# The raw bucket name is written into the Boat overview dashboard's Flux queries.
+if ! [[ "$INFLUXDB_RAW_BUCKET" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    echo "INFLUXDB_RAW_BUCKET must be 1 to 64 letters, digits, dots, hyphens or underscores" >&2
+    exit 1
+fi
+if ! [[ "$VESSELSTACK_BACKUP_KEEP" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$VESSELSTACK_BACKUP_KEEP" -gt 365 ]; then
+    echo "VESSELSTACK_BACKUP_KEEP must be a whole number from 1 to 365" >&2
+    exit 1
+fi
 for key in SOCKETCAN_ENABLE VESSELSTACK_CAN_CREATE_VCAN AIS_ENABLE VESSELSTACK_FIREWALL_ENABLE VESSELSTACK_FIREWALL_STRICT \
-    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD NODE_EXPORTER_ENABLE; do
+    TELEGRAM_ENABLE TELEMETRY_INDEXER_ENABLE DISPLAYS_ENABLE SIGNALK_VESSELTWIN_PRELOAD SIGNALK_DATAPATH_AUTOCONFIG NODE_EXPORTER_ENABLE NODERED_ENABLE SIGNALK_MARINE_BUNDLE VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK ALERTS_ENABLE REMOTE_PANEL_SERVE; do
     case "${!key}" in
         true|false) ;;
         *) echo "$key must be true or false" >&2; exit 1 ;;
@@ -303,7 +377,7 @@ for key in VESSELSTACK_FIREWALL_ALLOW_TCP VESSELSTACK_FIREWALL_ALLOW_UDP; do
 done
 for key in GRAFANA_PORT HOMEPAGE_PORT INFLUXDB_PORT \
     PROMETHEUS_PORT MQTT_PORT AIS_WEB_PORT AIS_TCP_PORT BOAT_CHAT_PORT \
-    CONTROL_PANEL_PORT; do
+    CONTROL_PANEL_PORT NODERED_PORT; do
     port_value=${!key}
     case "$port_value" in
         ''|*[!0-9]*) echo "$key must be a numeric TCP port" >&2; exit 1 ;;
@@ -318,7 +392,7 @@ done
     exit 1
 }
 for key in BOAT_CHAT_HOST CONTROL_PANEL_HOST VESSELSTACK_DATA_BIND_ADDRESS \
-    VESSELSTACK_WEB_BIND_ADDRESS HOMEASSISTANT_BIND_ADDRESS; do
+    VESSELSTACK_WEB_BIND_ADDRESS HOMEASSISTANT_BIND_ADDRESS NODERED_BIND_ADDRESS; do
     python3 - "${!key}" <<'PY' || { echo "$key must be an IPv4 address" >&2; exit 1; }
 import ipaddress
 import sys
@@ -354,11 +428,15 @@ fi
 if [ "$SIGNALK_MODE" != existing ]; then
     register_port SignalK 3000
 fi
+if [ "$NODERED_ENABLE" = true ]; then
+    register_port NodeRED "$NODERED_PORT"
+fi
 
 COMPOSE_PROFILES=()
 [ "$SIGNALK_MODE" = docker ] && COMPOSE_PROFILES+=(--profile signalk)
 [ "$AIS_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile ais)
 [ "$NODE_EXPORTER_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile metrics)
+[ "$NODERED_ENABLE" = true ] && COMPOSE_PROFILES+=(--profile nodered)
 
 compose() {
     docker compose "${COMPOSE_PROFILES[@]}" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env" \
@@ -449,7 +527,7 @@ compose_template() {
         docker compose "${COMPOSE_PROFILES[@]}" --env-file "$CONFIG_FILE" \
         -f "$SCRIPT_DIR/templates/compose.yml" "$@"
 }
-compose_template config --quiet 2>/dev/null || {
+compose_template config --no-env-resolution --quiet 2>/dev/null || {
     echo "Compose template validation failed for this configuration:" >&2
     compose_template config --quiet >&2 || true
     exit 1
@@ -485,7 +563,7 @@ if [ "$OFFLINE" = true ]; then
         exit 1
     }
     mapfile -t required_images < <(
-        compose_template config --images | sort -u
+        compose_template config --no-env-resolution --images | sort -u
     )
     missing_images=()
     for image in "${required_images[@]}"; do
@@ -527,7 +605,9 @@ SIGNALK_MODE
 SIGNALK_VERSION
 SIGNALK_URL
 SIGNALK_VESSELTWIN_PRELOAD
+SIGNALK_DATAPATH_AUTOCONFIG
 SOCKETCAN_ENABLE
+SIGNALK_MARINE_BUNDLE
 SOCKETCAN_INTERFACE
 SOCKETCAN_BITRATE
 VESSELSTACK_CAN_CREATE_VCAN
@@ -546,8 +626,26 @@ VESSELSTACK_FIREWALL_ALLOW_UDP
 CONTROL_PANEL_HOST
 CONTROL_PANEL_PORT
 TELEGRAM_ENABLE
+ALERTS_ENABLE
+REMOTE_ACCESS
+REMOTE_PANEL_SERVE
+ALERT_TELEGRAM_CHAT_IDS
+ALERT_BATTERY_LOW_V
+ALERT_BILGE_ENTITY
+ALERT_SHORE_POWER_ENTITY
+ALERT_HEARTBEAT_URL
+ALERT_REPEAT_MINUTES
+ALERT_STALE_DATA_MINUTES
 TELEMETRY_INDEXER_ENABLE
 NODE_EXPORTER_ENABLE
+NODERED_ENABLE
+NODERED_PORT
+NODERED_BIND_ADDRESS
+NODERED_ADMIN_PASSWORD
+NODERED_ADMIN_PASSWORD_HASH
+NODERED_DASHBOARD_PASSWORD
+NODERED_DASHBOARD_PASSWORD_HASH
+NODERED_CREDENTIAL_SECRET
 DISPLAYS_ENABLE
 DISPLAYS_BRIDGE_MQTT_USERNAME
 DISPLAYS_SIGNALK_TOKEN
@@ -583,6 +681,11 @@ MQTT_PORT
 VESSELSTACK_DATA_BIND_ADDRESS
 VESSELSTACK_WEB_BIND_ADDRESS
 HOMEASSISTANT_BIND_ADDRESS
+VESSELSTACK_WATCHDOG
+VESSELSTACK_JOURNAL_MAX_USE
+VESSELSTACK_BACKUP_SCHEDULE
+VESSELSTACK_BACKUP_KEEP
+VESSELSTACK_BACKUP_SCHEDULE_SYSTEM_DISK
 EOF
 }
 # Keys written to boat-chat.env and control-panel.env beyond the list above.
@@ -630,12 +733,15 @@ env_line() {
 # trap, so a Cancel (or a fix that cannot be applied safely) changes nothing else.
 
 # config_key_is_secret KEY: generated or preserved secrets. Replacing one here would
-# desynchronise a running service (see preserve_secret), so it is never offered.
+# desynchronise a running service (see preserve_secret), so it is never offered. Secrets
+# the user supplies (ALERT_HEARTBEAT_URL, a capability URL) are listed too: they are not
+# generated, but a fix must never print or auto-replace them.
 config_key_is_secret() {
     case $1 in
         INFLUXDB_PASSWORD|INFLUXDB_TOKEN|GRAFANA_ADMIN_PASSWORD|MQTT_PASSWORD|\
+        NODERED_ADMIN_PASSWORD|NODERED_ADMIN_PASSWORD_HASH|NODERED_DASHBOARD_PASSWORD|NODERED_DASHBOARD_PASSWORD_HASH|NODERED_CREDENTIAL_SECRET|\
         BOAT_CHAT_SETTINGS_TOKEN|BOAT_CHAT_ACCESS_TOKEN|CONTROL_PANEL_TOKEN|\
-        CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH) return 0 ;;
+        CONTROL_PANEL_PASSPHRASE_HASH|BOAT_CHAT_PASSPHRASE_HASH|ALERT_HEARTBEAT_URL) return 0 ;;
     esac
     return 1
 }
@@ -904,6 +1010,11 @@ preserve_secret INFLUXDB_PASSWORD
 preserve_secret INFLUXDB_TOKEN
 preserve_secret GRAFANA_ADMIN_PASSWORD
 preserve_secret MQTT_PASSWORD
+preserve_secret NODERED_ADMIN_PASSWORD
+preserve_secret NODERED_ADMIN_PASSWORD_HASH
+preserve_secret NODERED_DASHBOARD_PASSWORD
+preserve_secret NODERED_DASHBOARD_PASSWORD_HASH
+preserve_secret NODERED_CREDENTIAL_SECRET
 preserve_secret BOAT_CHAT_SETTINGS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
 preserve_secret BOAT_CHAT_ACCESS_TOKEN "$VESSELSTACK_ROOT/config/boat-chat.env"
 preserve_secret CONTROL_PANEL_TOKEN "$VESSELSTACK_ROOT/config/control-panel.env"
@@ -915,6 +1026,40 @@ BOAT_CHAT_SETTINGS_TOKEN=$(generate_secret "${BOAT_CHAT_SETTINGS_TOKEN:-GENERATE
 BOAT_CHAT_ACCESS_TOKEN=$(generate_secret "${BOAT_CHAT_ACCESS_TOKEN:-GENERATE}")
 CONTROL_PANEL_TOKEN=$(generate_secret "${CONTROL_PANEL_TOKEN:-GENERATE}")
 MQTT_PASSWORD=$(generate_secret "${MQTT_PASSWORD:-GENERATE}")
+# Node-RED secrets exist only while it is enabled; they are kept (never regenerated) once created.
+# GENERATE in the input config means "make one"; a stale hash would lock the owner out, so a
+# changed NODERED_ADMIN_PASSWORD is re-hashed after the dry run (see below), so rotating the
+# passphrase is: edit NODERED_ADMIN_PASSWORD, rerun the installer.
+[ "$NODERED_ADMIN_PASSWORD" != GENERATE ] || NODERED_ADMIN_PASSWORD=
+[ "$NODERED_ADMIN_PASSWORD_HASH" != GENERATE ] || NODERED_ADMIN_PASSWORD_HASH=
+[ "$NODERED_DASHBOARD_PASSWORD" != GENERATE ] || NODERED_DASHBOARD_PASSWORD=
+[ "$NODERED_DASHBOARD_PASSWORD_HASH" != GENERATE ] || NODERED_DASHBOARD_PASSWORD_HASH=
+[ "$NODERED_CREDENTIAL_SECRET" != GENERATE ] || NODERED_CREDENTIAL_SECRET=
+if [ "$NODERED_ENABLE" = true ]; then
+    [ -n "$NODERED_ADMIN_PASSWORD" ] || [ -n "$NODERED_ADMIN_PASSWORD_HASH" ] || NODERED_ADMIN_PASSWORD=$(openssl rand -hex 16)
+    [ -n "$NODERED_DASHBOARD_PASSWORD" ] || [ -n "$NODERED_DASHBOARD_PASSWORD_HASH" ] || NODERED_DASHBOARD_PASSWORD=$(openssl rand -hex 16)
+    [ -n "$NODERED_CREDENTIAL_SECRET" ] || NODERED_CREDENTIAL_SECRET=$(openssl rand -hex 32)
+fi
+for nodered_hash_key in NODERED_ADMIN_PASSWORD_HASH NODERED_DASHBOARD_PASSWORD_HASH; do
+    if [ -n "${!nodered_hash_key}" ] && ! [[ "${!nodered_hash_key}" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]]; then
+        echo "$nodered_hash_key is not a bcrypt hash (its value is not shown); remove it to have one generated" >&2
+        exit 1
+    fi
+done
+if [ "$NODERED_ENABLE" = true ]; then
+    # An owner-set passphrase protects code execution on the boat computer: at least 16 characters, and the
+    # editor and dashboard passphrases must differ (values are never printed).
+    for nodered_pw_key in NODERED_ADMIN_PASSWORD NODERED_DASHBOARD_PASSWORD; do
+        if [ -n "${!nodered_pw_key}" ] && [ "$(printf %s "${!nodered_pw_key}" | wc -m)" -lt 16 ]; then
+            echo "$nodered_pw_key must be at least 16 characters (leave it as GENERATE to have one generated)" >&2
+            exit 1
+        fi
+    done
+    if [ -n "$NODERED_ADMIN_PASSWORD" ] && [ "$NODERED_ADMIN_PASSWORD" = "$NODERED_DASHBOARD_PASSWORD" ]; then
+        echo "NODERED_ADMIN_PASSWORD and NODERED_DASHBOARD_PASSWORD must be different" >&2
+        exit 1
+    fi
+fi
 
 # Secrets are resolved (preserved or generated) before the preflight so the
 # check covers the values that will actually be written; read-only, so it is
@@ -953,7 +1098,7 @@ MOSQUITTO_COMPOSE="$SCRIPT_DIR/templates/compose.yml"
 displays_preflight() {
     PYTHONDONTWRITEBYTECODE=1 \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="${MQTT_PASSWORD:-}" \
-        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" NODERED_ENABLE="$NODERED_ENABLE" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
         DISPLAYS_HA_TOKEN="$DISPLAYS_HA_TOKEN" HOME_ASSISTANT_URL="$HOME_ASSISTANT_URL" \
         python3 "$SCRIPT_DIR/displays/displayctl.py" preflight \
@@ -971,6 +1116,28 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+
+# Node-RED sign-in: bcrypt runs inside the pinned Node-RED image (the passphrase goes in on stdin,
+# never on a command line). A hash that still matches the passphrase is kept, so a re-run does not
+# change it; editing NODERED_ADMIN_PASSWORD and rerunning the installer rotates the passphrase.
+if [ "$NODERED_ENABLE" = true ]; then
+    nodered_hash_args=(hash --compose "$SCRIPT_DIR/templates/compose.yml")
+    [ "$OFFLINE" != true ] || nodered_hash_args+=(--offline)
+    if [ -n "$NODERED_ADMIN_PASSWORD" ]; then
+        NODERED_ADMIN_PASSWORD_HASH=$(printf '%s\n%s\n' "$NODERED_ADMIN_PASSWORD" "$NODERED_ADMIN_PASSWORD_HASH" \
+            | python3 "$SCRIPT_DIR/scripts/configure-nodered.py" "${nodered_hash_args[@]}") || {
+            echo "Could not prepare the Node-RED sign-in (see above). Nothing else was changed." >&2
+            exit 1
+        }
+    fi
+    if [ -n "$NODERED_DASHBOARD_PASSWORD" ]; then
+        NODERED_DASHBOARD_PASSWORD_HASH=$(printf '%s\n%s\n' "$NODERED_DASHBOARD_PASSWORD" "$NODERED_DASHBOARD_PASSWORD_HASH" \
+            | python3 "$SCRIPT_DIR/scripts/configure-nodered.py" "${nodered_hash_args[@]}") || {
+            echo "Could not prepare the Node-RED dashboard sign-in (see above). Nothing else was changed." >&2
+            exit 1
+        }
+    fi
+fi
 
 # Remove temp files left in config/ by an earlier run that was killed between
 # creating and renaming an env file. Only the exact names new_env_temp creates
@@ -1153,6 +1320,7 @@ ensure_container_data_dir "$VESSELSTACK_DATA/prometheus" "$PROMETHEUS_CONTAINER_
 # under the state directory inside VESSELSTACK_DATA (see systemd ReadWritePaths).
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
+install -d -m 0700 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA/alerts"
 # Quarantined legacy state lives OUTSIDE every service-writable tree.
 QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
 ensure_quarantine_root() {
@@ -1308,7 +1476,7 @@ sed -i "s/VesselStack/$BOAT_NAME/g" \
 sync_mqtt_access() {
     PYTHONDONTWRITEBYTECODE=1 \
         MQTT_USERNAME="$MQTT_USERNAME" MQTT_PASSWORD="$MQTT_PASSWORD" \
-        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" \
+        DISPLAYS_ENABLE="$DISPLAYS_ENABLE" NODERED_ENABLE="$NODERED_ENABLE" \
         DISPLAYS_BRIDGE_MQTT_USERNAME="$DISPLAYS_BRIDGE_MQTT_USERNAME" \
         python3 "$VESSELSTACK_ROOT/displays/displayctl.py" sync-mqtt \
         --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" \
@@ -1396,6 +1564,10 @@ install -m 0644 "$SCRIPT_DIR/templates/grafana/provisioning/dashboards/vesselsta
     "$VESSELSTACK_ROOT/config/grafana/provisioning/dashboards/vesselstack.yml"
 install -m 0644 "$SCRIPT_DIR/templates/grafana/dashboards/system-health.json" \
     "$VESSELSTACK_ROOT/config/grafana/dashboards/system-health.json"
+# The Boat overview reads the raw bucket; its name was validated at the start of the run.
+sed "s/__VESSELSTACK_RAW_BUCKET__/$INFLUXDB_RAW_BUCKET/g" "$SCRIPT_DIR/templates/grafana/dashboards/boat-overview.json" \
+    > "$VESSELSTACK_ROOT/config/grafana/dashboards/boat-overview.json"
+chmod 0644 "$VESSELSTACK_ROOT/config/grafana/dashboards/boat-overview.json"
 safe_data_path "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
 safe_data_path "$VESSELSTACK_DATA/homeassistant/vesselstack-dashboard.example.yaml" leaf
 install -d -m 0755 "$VESSELSTACK_DATA/homeassistant/blueprints/automation/vesselstack"
@@ -1441,6 +1613,8 @@ if [ "$SCRIPT_DIR/scripts/reconcile-lifecycle.sh" != "$VESSELSTACK_ROOT/installe
 fi
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/record-backup-result" "$LIBEXEC_DIR/record-backup-result"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-alerts.py" "$LIBEXEC_DIR/vesselstack-alerts.py"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
     > "$SYSTEMD_DIR/vesselstack-firewall.service"
@@ -1459,6 +1633,15 @@ while IFS= read -r key; do
     env_line "$key" "${!key:-}" >> "$vs_env_tmp"
 done < <(vesselstack_env_keys)
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
+# Optional Node-RED: data directory, settings.js (only when absent) and the root-only nodered.env
+# (MQTT and sign-in values; the InfluxDB token is added once InfluxDB is up). Removes nodered.env when disabled.
+safe_data_path "$VESSELSTACK_DATA/node-red" leaf
+python3 "$SCRIPT_DIR/scripts/configure-nodered.py" render --root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" \
+    --env-file "$VESSELSTACK_ROOT/config/vesselstack.env" \
+    --settings-template "$SCRIPT_DIR/templates/node-red/settings.js" || {
+    echo "Could not prepare Node-RED (see above)." >&2
+    exit 1
+}
 if [ ! -e "$VESSELSTACK_ROOT/config/boat-profile.json" ] && [ ! -L "$VESSELSTACK_ROOT/config/boat-profile.json" ]; then
     python3 -I "$VESSELSTACK_ROOT/common/boat_profile_cli.py" init --root "$VESSELSTACK_ROOT" >/dev/null
 fi
@@ -1471,6 +1654,7 @@ previous_env_value() {
     value=${value#[\'\"]}; value=${value%[\'\"]}
     printf '%s' "$value"
 }
+PREVIOUS_CONTROL_PANEL_ALLOWED_HOSTS=$(previous_env_value "$VESSELSTACK_ROOT/config/control-panel.env" CONTROL_PANEL_ALLOWED_HOSTS)
 PREVIOUS_CONTROL_PANEL_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/control-panel.env" CONTROL_PANEL_TOKEN)
 PREVIOUS_BOAT_CHAT_ACCESS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_ACCESS_TOKEN)
 PREVIOUS_BOAT_CHAT_SETTINGS_TOKEN=$(previous_env_value "$VESSELSTACK_ROOT/config/boat-chat.env" BOAT_CHAT_SETTINGS_TOKEN)
@@ -1486,7 +1670,10 @@ for key in BOAT_NAME BOAT_TIMEZONE VESSELSTACK_VERSION BOAT_CHAT_SETTINGS_TOKEN 
     SIGNALK_URL HOME_ASSISTANT_URL \
     HOME_ASSISTANT_TOKEN INFLUXDB_URL INFLUXDB_ORG INFLUXDB_TOKEN \
     INFLUXDB_RAW_BUCKET INFLUXDB_HISTORY_BUCKET \
-    INFLUXDB_HOME_ASSISTANT_BUCKET INFLUXDB_AIS_BUCKET; do
+    INFLUXDB_HOME_ASSISTANT_BUCKET INFLUXDB_AIS_BUCKET \
+    ALERTS_ENABLE ALERT_TELEGRAM_CHAT_IDS ALERT_BATTERY_LOW_V ALERT_BILGE_ENTITY ALERT_SHORE_POWER_ENTITY \
+    ALERT_HEARTBEAT_URL ALERT_REPEAT_MINUTES ALERT_STALE_DATA_MINUTES VESSELSTACK_BACKUP_SCHEDULE \
+    SIGNALK_MODE SIGNALK_DATAPATH_AUTOCONFIG SIGNALK_MARINE_BUNDLE VESSELSTACK_DISABLED_COMPONENTS SOCKETCAN_ENABLE DISPLAYS_ENABLE; do
     sed -i "/^${key}=/d" "$boat_chat_temp"
 done
 for key in BOAT_CHAT_PROVIDER BOAT_CHAT_HOST BOAT_CHAT_PORT; do
@@ -1524,6 +1711,22 @@ done
     env_line INFLUXDB_HISTORY_BUCKET "$INFLUXDB_HISTORY_BUCKET"
     env_line INFLUXDB_HOME_ASSISTANT_BUCKET "$INFLUXDB_HOME_ASSISTANT_BUCKET"
     env_line INFLUXDB_AIS_BUCKET "$INFLUXDB_AIS_BUCKET"
+    # Read by the alerts one-shot (vesselstack-alerts.service); inert while ALERTS_ENABLE=false.
+    env_line ALERTS_ENABLE "$ALERTS_ENABLE"
+    env_line ALERT_TELEGRAM_CHAT_IDS "$ALERT_TELEGRAM_CHAT_IDS"
+    env_line ALERT_BATTERY_LOW_V "$ALERT_BATTERY_LOW_V"
+    env_line ALERT_BILGE_ENTITY "$ALERT_BILGE_ENTITY"
+    env_line ALERT_SHORE_POWER_ENTITY "$ALERT_SHORE_POWER_ENTITY"
+    env_line ALERT_HEARTBEAT_URL "$ALERT_HEARTBEAT_URL"
+    env_line ALERT_REPEAT_MINUTES "$ALERT_REPEAT_MINUTES"
+    env_line ALERT_STALE_DATA_MINUTES "$ALERT_STALE_DATA_MINUTES"
+    env_line VESSELSTACK_BACKUP_SCHEDULE "$VESSELSTACK_BACKUP_SCHEDULE"
+    env_line SIGNALK_MODE "$SIGNALK_MODE"
+    env_line SIGNALK_DATAPATH_AUTOCONFIG "$SIGNALK_DATAPATH_AUTOCONFIG"
+    env_line SIGNALK_MARINE_BUNDLE "$SIGNALK_MARINE_BUNDLE"
+    env_line VESSELSTACK_DISABLED_COMPONENTS "$VESSELSTACK_DISABLED_COMPONENTS"
+    env_line SOCKETCAN_ENABLE "$SOCKETCAN_ENABLE"
+    env_line DISPLAYS_ENABLE "$DISPLAYS_ENABLE"
 } >> "$boat_chat_temp"
 chown "$VESSELSTACK_USER:$VESSELSTACK_USER" "$boat_chat_temp"
 mv -f -- "$boat_chat_temp" "$VESSELSTACK_ROOT/config/boat-chat.env"
@@ -1533,6 +1736,8 @@ new_env_temp control-panel.env; control_panel_temp=$NEW_ENV_TEMP
     env_line CONTROL_PANEL_HOST "$CONTROL_PANEL_HOST"
     env_line CONTROL_PANEL_PORT "$CONTROL_PANEL_PORT"
     env_line CONTROL_PANEL_TOKEN "$CONTROL_PANEL_TOKEN"
+    # Written by `vesselstackctl remote enable` (the tailnet name); kept across reinstalls and updates.
+    [ -z "$PREVIOUS_CONTROL_PANEL_ALLOWED_HOSTS" ] || env_line CONTROL_PANEL_ALLOWED_HOSTS "$PREVIOUS_CONTROL_PANEL_ALLOWED_HOSTS"
 } >> "$control_panel_temp"
 mv -f -- "$control_panel_temp" "$VESSELSTACK_ROOT/config/control-panel.env"
 
@@ -1617,6 +1822,33 @@ sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
 chmod 0644 "$SYSTEMD_DIR/vesselstack-telemetry-sample.timer"
 install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-telemetry-indexer.timer" \
     "$SYSTEMD_DIR/vesselstack-telemetry-indexer.timer"
+# Scheduled backups: the service always exists (it is also what "systemctl start" runs); the
+# timer exists only while a schedule is set. Both are rendered before the daemon-reload below.
+sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+    "$SCRIPT_DIR/systemd/vesselstack-backup.service.in" > "$SYSTEMD_DIR/vesselstack-backup.service"
+chmod 0644 "$SYSTEMD_DIR/vesselstack-backup.service"
+case "$VESSELSTACK_BACKUP_SCHEDULE" in
+    daily) backup_oncalendar='*-*-* 03:30' ;;
+    weekly) backup_oncalendar='Sun *-*-* 03:30' ;;
+    *) backup_oncalendar='' ;;
+esac
+if [ -n "$backup_oncalendar" ]; then
+    sed "s|@BACKUP_ONCALENDAR@|$backup_oncalendar|g" \
+        "$SCRIPT_DIR/systemd/vesselstack-backup.timer.in" > "$SYSTEMD_DIR/vesselstack-backup.timer"
+    chmod 0644 "$SYSTEMD_DIR/vesselstack-backup.timer"
+else
+    systemctl disable --now vesselstack-backup.timer 2>/dev/null || true
+    rm -f -- "$SYSTEMD_DIR/vesselstack-backup.timer"
+fi
+# Opt-in alerts: the units are always rendered (the service is what "systemctl start" runs);
+# the timer is enabled only while ALERTS_ENABLE=true.
+for unit in vesselstack-alerts.service vesselstack-alerts.timer; do
+    sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \
+        -e "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
+        -e "s|@VESSELSTACK_DATA@|$VESSELSTACK_DATA|g" \
+        "$SCRIPT_DIR/systemd/$unit.in" > "$SYSTEMD_DIR/$unit"
+    chmod 0644 "$SYSTEMD_DIR/$unit"
+done
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-control-panel.service.in" \
     > "$SYSTEMD_DIR/vesselstack-control-panel.service"
@@ -1635,6 +1867,114 @@ else
     systemctl disable vesselstack-telemetry-indexer.timer 2>/dev/null || true
     systemctl disable vesselstack-telemetry-sample.timer 2>/dev/null || true
 fi
+if [ -n "$backup_oncalendar" ]; then
+    systemctl enable vesselstack-backup.timer
+else
+    systemctl disable vesselstack-backup.timer 2>/dev/null || true
+fi
+if [ "$ALERTS_ENABLE" = true ]; then
+    systemctl enable vesselstack-alerts.timer
+else
+    systemctl disable vesselstack-alerts.timer 2>/dev/null || true
+fi
+
+# --- Unattended operation: hardware watchdog and journal cap ----------------------------------
+# install_dropin DESTINATION: reads the new content on standard input and replaces DESTINATION
+# only when it differs. Returns 0 when the file changed, 1 when it was already identical and
+# 2 on any error (callers must treat 2 as a failure, never as "unchanged").
+install_dropin() {
+    local destination=$1 tmp
+    install -d -m 0755 -o root -g root "$(dirname -- "$destination")" || return 2
+    tmp=$(mktemp "$destination.XXXXXX") || return 2
+    if ! cat > "$tmp" || ! chmod 0644 "$tmp"; then
+        rm -f -- "$tmp"
+        return 2
+    fi
+    if [ -f "$destination" ] && cmp -s -- "$tmp" "$destination"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$destination"; then
+        rm -f -- "$tmp"
+        return 2
+    fi
+}
+# remove_dropin DESTINATION: returns 0 when a file was removed, 1 when there was none.
+remove_dropin() {
+    [ -e "$1" ] || [ -L "$1" ] || return 1
+    rm -f -- "$1"
+}
+WATCHDOG_DROPIN="$SYSTEM_ROOT/etc/systemd/system.conf.d/60-vesselstack-watchdog.conf"
+watchdog_arm=0
+case "$VESSELSTACK_WATCHDOG" in
+    true)
+        if [ -e "$SYSTEM_ROOT/dev/watchdog" ]; then
+            watchdog_arm=1
+        else
+            echo "WARNING: VESSELSTACK_WATCHDOG=true but $SYSTEM_ROOT/dev/watchdog does not exist; no hardware watchdog was configured." >&2
+        fi
+        ;;
+    auto)
+        # auto is limited to Raspberry Pi hardware, where the watchdog driver is known to be safe.
+        if [ -e "$SYSTEM_ROOT/dev/watchdog" ] && grep -qa 'Raspberry Pi' "$SYSTEM_ROOT/proc/device-tree/model" 2>/dev/null; then
+            watchdog_arm=1
+        fi
+        ;;
+esac
+if [ "$watchdog_arm" -eq 1 ]; then
+    if systemctl is-active --quiet watchdog.service 2>/dev/null || systemctl is-enabled --quiet watchdog.service 2>/dev/null; then
+        echo "WARNING: watchdog.service is installed and active or enabled, so it owns the hardware watchdog; VesselStack did not configure systemd's watchdog." >&2
+        watchdog_arm=0
+    else
+        # systemd pings at half the timeout. Stay below the hardware maximum (Raspberry Pi: 15 s):
+        # N = min(10, max_timeout - 1), and skip when that leaves fewer than 5 seconds.
+        watchdog_seconds=10
+        watchdog_max=$(cat "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout" 2>/dev/null || true)
+        if [[ $watchdog_max =~ ^[0-9]+$ ]]; then
+            watchdog_seconds=$((watchdog_max - 1))
+            [ "$watchdog_seconds" -le 10 ] || watchdog_seconds=10
+            if [ "$watchdog_seconds" -lt 5 ]; then
+                echo "WARNING: the hardware watchdog maximum timeout is ${watchdog_max}s, too short to use safely; VesselStack did not configure the hardware watchdog." >&2
+                watchdog_arm=0
+            fi
+        else
+            echo "WARNING: could not read the hardware watchdog's maximum timeout; assuming 10 seconds is safe." >&2
+        fi
+    fi
+fi
+if [ "$watchdog_arm" -eq 1 ]; then
+    watchdog_rc=0
+    # A here-string (not a pipe) keeps install_dropin and the exit below in this shell.
+    install_dropin "$WATCHDOG_DROPIN" <<<"$(printf '[Manager]\nRuntimeWatchdogSec=%ss\nRebootWatchdogSec=2min' "$watchdog_seconds")" || watchdog_rc=$?
+    if [ "$watchdog_rc" -eq 2 ]; then
+        echo "ERROR: could not write $WATCHDOG_DROPIN" >&2
+        exit 1
+    fi
+    if [ "$watchdog_rc" -eq 0 ]; then
+        systemctl daemon-reexec
+    fi
+elif remove_dropin "$WATCHDOG_DROPIN"; then
+    systemctl daemon-reexec
+fi
+# SystemMaxUse only limits the persistent journal (/var/log/journal); Storage= is left to the system.
+# VESSELSTACK_JOURNAL_MAX_USE=off removes VesselStack's drop-in and leaves journald as the system has it.
+JOURNAL_DROPIN="$SYSTEM_ROOT/etc/systemd/journald.conf.d/60-vesselstack.conf"
+if [ "$VESSELSTACK_JOURNAL_MAX_USE" = off ]; then
+    if remove_dropin "$JOURNAL_DROPIN"; then
+        systemctl restart systemd-journald
+    fi
+else
+    journal_rc=0
+    install_dropin "$JOURNAL_DROPIN" <<<"$(printf '[Journal]\nSystemMaxUse=%s\nSystemKeepFree=1G\nMaxFileSec=1week' "$VESSELSTACK_JOURNAL_MAX_USE")" || journal_rc=$?
+    if [ "$journal_rc" -eq 2 ]; then
+        echo "ERROR: could not write $JOURNAL_DROPIN" >&2
+        exit 1
+    fi
+    if [ "$journal_rc" -eq 0 ]; then
+        systemctl restart systemd-journald
+    fi
+fi
+
 if [ "$DISPLAYS_ENABLE" = true ]; then
     systemctl enable vesselstack-displays-bridge.service
     # The environment file was just rewritten; restart a running bridge so it
@@ -1656,6 +1996,46 @@ if [ "$SIGNALK_MODE" = native ]; then
     SIGNALK_CONTAINER_UID=$VESSELSTACK_UID
     SIGNALK_CONTAINER_GID=$VESSELSTACK_GID
 fi
+# Zero-touch Signal K -> InfluxDB path (scripts/configure-signalk-datapath.py). It runs once
+# InfluxDB is up (it needs an API token), so the call is in the start phase below. Exit 10
+# means it changed something (Signal K is stopped for the change and started once after);
+# 11 means the npm prune guard skipped the plugin install; anything else is a warning, never
+# an installation failure. "--bundle-only" (extra argument) runs just the optional marine
+# essentials bundle (SIGNALK_MARINE_BUNDLE=true) when the InfluxDB data path is not in use.
+configure_signalk_datapath() {
+    local rc=0 skip_file="$SYSTEM_ROOT/var/lib/vesselstack/signalk-datapath-skipped"
+    local -a args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env"
+        --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID" --status-file "$skip_file" "$@")
+    install -d -m 0755 "$SYSTEM_ROOT/var/lib/vesselstack"
+    python3 "$SCRIPT_DIR/scripts/configure-signalk-datapath.py" "${args[@]}" --check || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        10) ;;
+        11) echo "WARN: the Signal K data path was not configured (see above); 'vesselstackctl doctor' reports it until it is fixed." >&2; return 0 ;;
+        *) echo "WARN: could not check the Signal K data path; see above, then rerun the installer or follow README 'Signal K and InfluxDB'." >&2; return 0 ;;
+    esac
+    if [ "$SIGNALK_MODE" = docker ]; then
+        compose stop signalk || true
+    else
+        systemctl stop vesselstack-signalk.service 2>/dev/null || true
+    fi
+    rc=0
+    python3 "$SCRIPT_DIR/scripts/configure-signalk-datapath.py" "${args[@]}" || rc=$?
+    # Signal K comes back whatever the helper did; a failure to start it is a warning, never an
+    # installation failure (this hook is documented as such).
+    if [ "$SIGNALK_MODE" = docker ]; then
+        "${compose_up[@]}" signalk || echo "WARN: could not start Signal K again; run: sudo vesselstackctl start" >&2
+    else
+        systemctl start vesselstack-signalk.service || echo "WARN: could not start vesselstack-signalk.service; run: sudo systemctl start vesselstack-signalk.service" >&2
+    fi
+    case "$rc" in
+        0|10) ;;
+        11) echo "WARN: the Signal K data path was not configured (see above); 'vesselstackctl doctor' reports it until it is fixed." >&2 ;;
+        *) echo "WARN: the Signal K data path step failed (see above); Signal K was started again unchanged. Rerun the installer or follow README 'Signal K and InfluxDB'." >&2 ;;
+    esac
+    return 0
+}
+
 SIGNALK_PLUGIN_INSTALLED=0
 if [ "$SIGNALK_VESSELTWIN_PRELOAD" = true ] && [ "$SIGNALK_MODE" != existing ]; then
     preload_args=(--mode "$SIGNALK_MODE" --data "$VESSELSTACK_DATA" --uid "$SIGNALK_CONTAINER_UID" --gid "$SIGNALK_CONTAINER_GID")
@@ -1703,7 +2083,9 @@ fi
 if [ "$START" -eq 1 ]; then
     "$SCRIPT_DIR/scripts/configure-hardware.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
     if [ "$VESSELSTACK_FIREWALL_ENABLE" = true ]; then
-        systemctl enable --now vesselstack-firewall.service
+        systemctl enable vesselstack-firewall.service
+        # restart, not just start: rule changes (for example a new Node-RED port) apply on every install
+        systemctl restart vesselstack-firewall.service
     else
         systemctl disable --now vesselstack-firewall.service 2>/dev/null || true
     fi
@@ -1752,6 +2134,47 @@ if [ "$START" -eq 1 ]; then
     fi
     if ! component_disabled influxdb; then
         "$SCRIPT_DIR/scripts/bootstrap-influx.sh" "$VESSELSTACK_ROOT/config/vesselstack.env"
+        if [ "$SIGNALK_MODE" != existing ] && [ "$SIGNALK_DATAPATH_AUTOCONFIG" = true ]; then
+            if [ "$OFFLINE" = true ]; then
+                echo "WARN: offline install: the Signal K data path (signalk-to-influxdb2 plugin, CAN provider, InfluxDB token) was not configured because it needs the npm registry. Rerun online or follow README 'Signal K and InfluxDB'." >&2
+            else
+                configure_signalk_datapath
+            fi
+        fi
+    fi
+    # Optional marine essentials bundle (the helper reads SIGNALK_MARINE_BUNDLE from the env file). It rides
+    # on the data path run above when that ran; otherwise it runs alone.
+    if [ "$SIGNALK_MODE" != existing ] && [ "$SIGNALK_MARINE_BUNDLE" = true ]; then
+        if [ "$OFFLINE" = true ]; then
+            echo "WARN: offline install: the marine essentials bundle (anchor alarm, logbook, NMEA 0183 setup) was not configured because it needs the npm registry. Rerun online or follow README 'Marine essentials (optional)'." >&2
+        elif component_disabled influxdb || [ "$SIGNALK_DATAPATH_AUTOCONFIG" != true ]; then
+            configure_signalk_datapath --bundle-only
+        fi
+    fi
+    # Optional Node-RED: read-only InfluxDB token, palette packages, then the container. Failures here are
+    # warnings; nothing else depends on Node-RED.
+    nodered_args=(--root "$VESSELSTACK_ROOT" --data "$VESSELSTACK_DATA" --env-file "$VESSELSTACK_ROOT/config/vesselstack.env"
+        --compose "$SCRIPT_DIR/templates/compose.yml")
+    [ "$OFFLINE" != true ] || nodered_args+=(--offline)
+    if [ "$NODERED_ENABLE" = true ]; then
+        if component_disabled influxdb; then
+            echo "WARN: InfluxDB is disabled, so Node-RED gets no InfluxDB token." >&2
+        else
+            nodered_rc=0
+            python3 "$SCRIPT_DIR/scripts/configure-nodered.py" token "${nodered_args[@]}" || nodered_rc=$?
+            case "$nodered_rc" in
+                0|10) ;;
+                *) echo "WARN: Node-RED has no InfluxDB token yet; rerun the installer once InfluxDB is running." >&2 ;;
+            esac
+        fi
+        python3 "$SCRIPT_DIR/scripts/configure-nodered.py" palette "${nodered_args[@]}" || true
+        "${compose_up[@]}" nodered || echo "WARN: could not start Node-RED; run: sudo vesselstackctl start" >&2
+    else
+        compose rm --stop --force nodered 2>/dev/null || true
+        if ! component_disabled influxdb; then
+            python3 "$SCRIPT_DIR/scripts/configure-nodered.py" token "${nodered_args[@]}" >/dev/null 2>&1 \
+                || echo "WARN: could not revoke Node-RED's InfluxDB token (is InfluxDB running?); rerun the installer once it is." >&2
+        fi
     fi
     systemctl restart vesselstack-chat.service
     if [ "$TELEGRAM_ENABLE" = true ]; then
@@ -1763,6 +2186,14 @@ if [ "$START" -eq 1 ]; then
         systemctl start vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer
     else
         systemctl stop vesselstack-telemetry-sample.timer vesselstack-telemetry-indexer.timer 2>/dev/null || true
+    fi
+    if [ -n "$backup_oncalendar" ]; then
+        systemctl start vesselstack-backup.timer
+    fi
+    if [ "$ALERTS_ENABLE" = true ]; then
+        systemctl start vesselstack-alerts.timer
+    else
+        systemctl stop vesselstack-alerts.timer 2>/dev/null || true
     fi
     if [ "$DISPLAYS_ENABLE" = true ]; then
         systemctl restart vesselstack-displays-bridge.service
@@ -1800,4 +2231,7 @@ fi
 
 echo "VesselStack rendered successfully at $VESSELSTACK_ROOT"
 echo "Secrets are stored in mode-600 config files and were not printed."
+if [ "$NODERED_ENABLE" = true ]; then
+    echo "Node-RED editor: http://$NODERED_BIND_ADDRESS:$NODERED_PORT (user admin), dashboards under /dashboard (user crew). Passphrases: sudo grep '^NODERED_.*_PASSWORD=' $VESSELSTACK_ROOT/config/vesselstack.env"
+fi
 echo "Control panel: http://$CONTROL_PANEL_HOST:$CONTROL_PANEL_PORT"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Scheduled VesselStack backup
+Documentation=file://@VESSELSTACK_ROOT@/README.md
+After=docker.service local-fs.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# A scheduled backup stops the whole stack while it runs and starts it again afterwards.
+Environment=VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false
+ExecStart=/usr/local/sbin/vesselstackctl backup --scheduled
+ExecStopPost=/usr/local/libexec/vesselstack/record-backup-result
+TimeoutStartSec=2h
+TimeoutStopSec=15min

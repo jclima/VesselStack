@@ -263,6 +263,32 @@ class CommandAllowlistTests(unittest.TestCase):
                 self.assertIn("node-exporter", panel.component_command("node-exporter", "start"))
                 self.assertEqual(panel.component_command("telemetry-sample", "restart"), ["systemctl", "restart", "vesselstack-telemetry-sample.timer"])
 
+    def test_nodered_starts_only_when_enabled_and_prepared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = root / "vessel.env"
+            with mock.patch.object(panel, "VESSEL_ENV", env), mock.patch.object(panel, "ROOT", root):
+                env.write_text("NODERED_ENABLE=false\n")
+                with self.assertRaisesRegex(ValueError, "disabled"):
+                    panel.component_command("nodered", "start")
+                env.write_text("NODERED_ENABLE=true\n")
+                for verb in ("start", "restart"):
+                    with self.assertRaisesRegex(ValueError, "not prepared"):
+                        panel.component_command("nodered", verb)
+                self.assertNotIn("nodered", panel.compose_base())  # an unprepared profile would break every compose call
+                (root / "config" / "node-red").mkdir(parents=True)
+                (root / "config" / "nodered.env").write_text("")
+                (root / "config" / "node-red" / "settings.js").write_text("module.exports={}\n")
+                with self.assertRaisesRegex(ValueError, "not prepared"):  # empty nodered.env
+                    panel.component_command("nodered", "start")
+                (root / "config" / "nodered.env").write_text("A='1'\n")
+                self.assertIn("nodered", panel.component_command("nodered", "start"))
+                self.assertIn("nodered", panel.compose_base())
+                (root / "config" / "node-red" / "settings.js").unlink()
+                with self.assertRaisesRegex(ValueError, "not prepared"):
+                    panel.component_command("nodered", "restart")
+                self.assertEqual(panel.component_command("nodered", "stop")[-2:], ["stop", "nodered"])
+
     def test_displays_bridge_is_opt_in_and_token_is_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             vessel = Path(directory) / "vessel.env"
@@ -728,6 +754,40 @@ class StatusFieldTests(unittest.TestCase):
             self.assertEqual(status["mount"], "system_disk")
             self.assertEqual(status["state"], "ok")
             self.assertEqual({path.name for path in backup.iterdir()}, {old.name, new.name, orphan.name, old.name + ".sha256", new.name + ".sha256"})
+
+    def test_backup_status_reports_schedule_and_last_scheduled_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / "backups"
+            backup.mkdir()
+            record = Path(directory) / "backup-last.json"
+            settings = {"VESSELSTACK_BACKUP": str(backup), "VESSELSTACK_BACKUP_SCHEDULE": "weekly"}
+            with mock.patch.object(panel, "BACKUP_LAST_FILE", record), \
+                 mock.patch.object(panel, "command_output", return_value=(0, "Sun 2026-11-15 03:34:12 UTC")) as shown:
+                missing = panel.backup_status(settings)
+                self.assertEqual((missing["schedule"], missing["last_scheduled"], missing["next_run"]), ("weekly", None, "Sun 2026-11-15 03:34:12 UTC"))
+                self.assertEqual(shown.call_args.args[0], ["systemctl", "show", "vesselstack-backup.timer", "-p", "NextElapseUSecRealtime", "--value"])
+                record.write_text(json.dumps({"result": "success", "exit_status": 0, "finished_at": "2026-11-08T03:41:09Z", "archive": "vesselstack-20261108T033000Z-1.tar.gz"}))
+                present = panel.backup_status(settings)
+                self.assertEqual(present["last_scheduled"], {"result": "success", "exit_status": 0, "finished_at": "2026-11-08T03:41:09Z", "archive": "vesselstack-20261108T033000Z-1.tar.gz"})
+                record.write_text(json.dumps({"result": "failed", "exit_status": 1, "finished_at": "2026-11-09T03:41:09Z", "archive": "../../etc/passwd"}))
+                self.assertEqual(panel.backup_status(settings)["last_scheduled"], {"result": "failed", "exit_status": 1, "finished_at": "2026-11-09T03:41:09Z"})
+                record.write_text("not json")
+                self.assertIsNone(panel.backup_status(settings)["last_scheduled"])
+            with mock.patch.object(panel, "BACKUP_LAST_FILE", record), mock.patch.object(panel, "command_output") as shown:
+                off = panel.backup_status({"VESSELSTACK_BACKUP": str(backup)})
+                self.assertEqual((off["schedule"], off["next_run"]), ("off", None))
+                shown.assert_not_called()
+
+    def test_backup_status_lists_scheduled_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / "backups"
+            backup.mkdir()
+            scheduled = backup / "vesselstack-scheduled-20261108T033000123456789Z-4242.tar.gz"
+            scheduled.write_bytes(b"x")
+            (backup / (scheduled.name + ".sha256")).write_text("sum\n")
+            status = panel.backup_status({"VESSELSTACK_BACKUP": str(backup)})
+            self.assertEqual(status["state"], "ok")
+            self.assertEqual(status["last_backup_at"], int(scheduled.stat().st_mtime))
 
     def test_backup_status_unknown_or_missing_cases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1855,6 +1915,100 @@ class HostAllowlistApiTests(SignInApiTests):
             self.assertEqual(self.raw("GET", "/health", "boat.example")[0], 421, "port is required unless it is 80")
             self.assertEqual(self.raw("GET", "/health", "other.example:9")[0], 200)
         panel._HOST_ALLOWLISTS.clear()
+
+
+class TailnetHostApiTests(HostAllowlistApiTests):
+    """Host and Origin acceptance for https://<tailnet name>:8780 published by tailscale serve."""
+
+    NAME = "boat.example-tailnet.ts.net"
+
+    def login_status(self, host, origin, extra=None):
+        headers = {"Origin": origin, **(extra or {})}
+        return self.raw("POST", "/api/auth/login", host, headers, {"passphrase": "wrong passphrase", "remember": False})[0]
+
+    def with_allowed(self, value):
+        panel._HOST_ALLOWLISTS.clear()
+        return mock.patch.dict(panel.os.environ, {"CONTROL_PANEL_ALLOWED_HOSTS": value})
+
+    def test_host_preserved_by_serve_is_accepted_and_others_are_not(self) -> None:
+        with self.with_allowed(f"{self.NAME}:8780"):
+            self.assertEqual(self.raw("GET", "/health", f"{self.NAME}:8780")[0], 200)
+            self.assertEqual(self.raw("GET", "/health", f"{self.NAME.upper()}:8780")[0], 200)
+            self.assertEqual(self.raw("GET", "/health", self.NAME)[0], 421, "no port, not 80")
+            self.assertEqual(self.raw("GET", "/health", f"other.example-tailnet.ts.net:8780")[0], 421)
+            self.assertEqual(self.raw("GET", "/health", f"{self.NAME}:8781")[0], 421)
+        panel._HOST_ALLOWLISTS.clear()
+
+    def test_origin_matches_when_serve_preserves_the_host(self) -> None:
+        self.set_passphrase()
+        with self.with_allowed(f"{self.NAME}:8780"):
+            host = f"{self.NAME}:8780"
+            self.assertNotEqual(self.login_status(host, f"https://{self.NAME}:8780"), 403)
+            self.assertEqual(self.login_status(host, "https://evil.example:8780"), 403)
+            self.assertEqual(self.login_status(host, f"https://{self.NAME}:9999"), 403)
+        panel._HOST_ALLOWLISTS.clear()
+
+    def test_forwarded_host_header_never_relaxes_the_origin_check(self) -> None:
+        self.set_passphrase()
+        port = self.server.server_address[1]
+        loopback = f"127.0.0.1:{port}"
+        with self.with_allowed(f"{self.NAME}:8780"):
+            origin = f"https://{self.NAME}:8780"
+            # a rewritten Host (loopback) is not rescued by X-Forwarded-Host: fail safe with 403
+            self.assertEqual(self.login_status(loopback, origin, {"X-Forwarded-Host": f"{self.NAME}:8780"}), 403)
+            self.assertEqual(self.login_status(loopback, origin), 403)
+            self.assertEqual(self.login_status(f"{self.NAME}:8780", "https://evil.example:8780", {"X-Forwarded-Host": f"{self.NAME}:8780"}), 403)
+        panel._HOST_ALLOWLISTS.clear()
+
+
+class RemoteStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        panel._REMOTE_CACHE.update(at=None, data=None)
+
+    def fake_tailscale(self, payload, directory):
+        script = Path(directory) / "tailscale"
+        script.write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(payload) + "\nEOF\n")
+        script.chmod(0o755)
+        return mock.patch.object(panel.shutil, "which", lambda name: str(script) if name == "tailscale" else None)
+
+    def clear_cache(self):
+        panel._REMOTE_CACHE.update(at=None, data=None)
+
+    def test_remote_is_none_when_tailscale_is_absent(self) -> None:
+        with mock.patch.object(panel.shutil, "which", lambda name: None):
+            self.assertIsNone(panel.remote_status())
+
+    def test_remote_reports_name_and_panel_url_without_secrets(self) -> None:
+        running = {"BackendState": "Running", "AuthURL": "", "Self": {"DNSName": "boat.example-tailnet.ts.net.", "Online": True}}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.fake_tailscale(running, directory), mock.patch.object(panel, "parse_env", return_value={"CONTROL_PANEL_PORT": "9999"}):
+                remote = panel.remote_status()
+            self.assertEqual(remote, {"enabled": True, "online": True, "name": "boat.example-tailnet.ts.net", "panel_url": "https://boat.example-tailnet.ts.net:8780"})
+            self.clear_cache()
+            login = {"BackendState": "NeedsLogin", "AuthURL": "https://login.tailscale.com/a/secret", "Self": {}}
+            with self.fake_tailscale(login, directory), mock.patch.object(panel, "parse_env", return_value={}):
+                remote = panel.remote_status()
+            self.assertEqual((remote["enabled"], remote["online"], remote["panel_url"]), (True, False, ""))
+            self.assertNotIn("secret", json.dumps(remote))
+
+    def test_remote_status_is_cached_for_thirty_seconds(self) -> None:
+        running = {"BackendState": "Running", "Self": {"DNSName": "boat.example-tailnet.ts.net.", "Online": True}}
+        with tempfile.TemporaryDirectory() as directory, self.fake_tailscale(running, directory):
+            with mock.patch.object(panel.subprocess, "run", wraps=panel.subprocess.run) as run:
+                panel.remote_status()
+                panel.remote_status()
+                self.assertEqual(run.call_count, 1)
+                panel._REMOTE_CACHE["at"] -= 31
+                panel.remote_status()
+                self.assertEqual(run.call_count, 2)
+
+    def test_remote_survives_a_failing_or_garbled_tailscale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "tailscale"
+            script.write_text("#!/bin/sh\necho not json\n")
+            script.chmod(0o755)
+            with mock.patch.object(panel.shutil, "which", lambda name: str(script)):
+                self.assertIsNone(panel.remote_status())
 
 
 class HostAllowlistUnitTests(unittest.TestCase):

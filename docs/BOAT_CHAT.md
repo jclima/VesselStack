@@ -197,6 +197,8 @@ protection.
 
 ## Settings and configuration precedence
 
+The optional alert dispatcher (README, Alerts) reuses the Telegram bot token saved here, sends with `sendMessage` only and never polls, so it does not conflict with the Telegram bridge.
+
 Boat Chat reads two files; both Boat Chat and the Telegram bridge resolve them
 the same way (`boat-chat/env_config.py`):
 

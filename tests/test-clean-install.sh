@@ -35,6 +35,12 @@ if [ "${1:-}" = inspect ] && [[ "$*" == *Mounts* ]]; then
     [ -n "${FAKE_MOSQ_MOUNTS:-}" ] && printf '%b' "$FAKE_MOSQ_MOUNTS"
     exit 0
 fi
+# Emulate the bcrypt hashing container used for the optional Node-RED sign-in (stdin: passphrase, hash).
+if [ "${1:-}" = run ] && [[ "$*" == *bcryptjs* ]]; then
+    cat > /dev/null
+    printf '$2b$10$%s' "$(printf 'a%.0s' $(seq 1 53))"
+    exit 0
+fi
 # Emulate the Mosquitto hashing container used by displayctl sync-mqtt.
 if [ "${1:-}" = run ]; then
     for argument in "$@"; do
@@ -54,6 +60,13 @@ EOF
 cat > "$FAKE_BIN/systemctl" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$(dirname "$0")/systemctl.log"
+# Another watchdog daemon is only running when a test says so.
+if { [ "${1:-}" = is-active ] || [ "${1:-}" = is-enabled ]; } && [[ " $* " == *" watchdog.service "* ]]; then
+    case "${1:-}" in
+        is-active) [ -n "${FAKE_WATCHDOG_SERVICE_ACTIVE:-}" ] || exit 3 ;;
+        is-enabled) [ -n "${FAKE_WATCHDOG_SERVICE_ENABLED:-}" ] || exit 3 ;;
+    esac
+fi
 exit 0
 EOF
 cat > "$FAKE_BIN/curl" <<'EOF'
@@ -175,6 +188,12 @@ old_inode=$(stat -c %i "$SBIN/vesselstackctl")
 exec 9< "$SBIN/vesselstackctl"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+# Node-RED is optional and off by default: no environment file, no data directory, no secrets.
+grep -qx 'NODERED_ENABLE=false' "$APP_ROOT/config/vesselstack.env"
+test ! -e "$APP_ROOT/config/nodered.env"
+test ! -e "$DATA_ROOT/node-red"
+if grep -qE "^NODERED_ADMIN_PASSWORD=[^']" "$APP_ROOT/config/vesselstack.env"; then echo 'a Node-RED passphrase was generated while Node-RED is disabled' >&2; exit 1; fi
+if grep -q 'vesselstack-nodered' "$APP_ROOT/config/mosquitto-auth/acl"; then echo 'the Node-RED MQTT account exists while Node-RED is disabled' >&2; exit 1; fi
 cat <&9 > "$TEST_ROOT/old-vesselstackctl.read"
 exec 9<&-
 cmp "$TEST_ROOT/old-vesselstackctl.expected" "$TEST_ROOT/old-vesselstackctl.read"
@@ -214,6 +233,166 @@ if grep -qx 'enable vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.lo
     echo "Displays bridge was enabled with DISPLAYS_ENABLE=false" >&2
     exit 1
 fi
+# Unattended operation defaults: no watchdog device in the test root, so no watchdog drop-in; the
+# journal is capped; scheduled backups are off (service and helper exist, the timer does not).
+WATCHDOG_DROPIN="$SYSTEM_ROOT/etc/systemd/system.conf.d/60-vesselstack-watchdog.conf"
+JOURNAL_DROPIN="$SYSTEM_ROOT/etc/systemd/journald.conf.d/60-vesselstack.conf"
+test ! -e "$WATCHDOG_DROPIN"
+grep -qx 'SystemMaxUse=200M' "$JOURNAL_DROPIN"
+grep -qx 'SystemKeepFree=1G' "$JOURNAL_DROPIN"
+grep -qx 'MaxFileSec=1week' "$JOURNAL_DROPIN"
+if grep -q '^Storage=' "$JOURNAL_DROPIN"; then echo "The journald drop-in must not set Storage=" >&2; exit 1; fi
+grep -qx 'restart systemd-journald' "$FAKE_BIN/systemctl.log"
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx 'ExecStart=/usr/local/sbin/vesselstackctl backup --scheduled' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx 'Environment=VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx 'ExecStopPost=/usr/local/libexec/vesselstack/record-backup-result' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/record-backup-result")" = "0:755"
+grep -qx 'disable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"
+if grep -qx 'enable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"; then
+    echo "The backup timer was enabled with VESSELSTACK_BACKUP_SCHEDULE=off" >&2
+    exit 1
+fi
+# Alerts are opt-in: with ALERTS_ENABLE unset the units exist (sandboxed, as the service user) but the timer is not enabled.
+ALERTS_UNIT="$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service"
+ALERTS_TIMER="$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.timer"
+grep -qx 'Type=oneshot' "$ALERTS_UNIT"
+grep -qx "User=$(id -un)" "$ALERTS_UNIT" || grep -q '^User=.\+' "$ALERTS_UNIT"
+grep -qx 'ProtectSystem=strict' "$ALERTS_UNIT"
+grep -qx "ReadWritePaths=$DATA_ROOT/alerts" "$ALERTS_UNIT"
+grep -qx 'ExecStart=/usr/bin/python3 -I /usr/local/libexec/vesselstack/vesselstack-alerts.py run' "$ALERTS_UNIT"
+grep -qx 'OnBootSec=2min' "$ALERTS_TIMER"
+grep -qx 'OnUnitInactiveSec=60s' "$ALERTS_TIMER"
+if grep -q '@[A-Z_]*@' "$ALERTS_UNIT" "$ALERTS_TIMER"; then echo "Unrendered placeholder in the alerts units" >&2; exit 1; fi
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/vesselstack-alerts.py")" = "0:755"
+test -d "$DATA_ROOT/alerts"
+grep -qx 'ALERTS_ENABLE=false' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'disable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"
+if grep -qx 'enable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"; then
+    echo "The alerts timer was enabled with ALERTS_ENABLE=false" >&2
+    exit 1
+fi
+# Weekly schedule + a watchdog device on a Raspberry Pi: both drop-ins, the timer, and daemon-reexec.
+UNATTENDED_CONFIG="$TEST_ROOT/unattended.env"
+cp "$CONFIG" "$UNATTENDED_CONFIG"
+printf '\nVESSELSTACK_BACKUP_SCHEDULE="weekly"\nVESSELSTACK_JOURNAL_MAX_USE="64M"\n' >> "$UNATTENDED_CONFIG"
+install -d "$SYSTEM_ROOT/sys/class/watchdog/watchdog0" "$SYSTEM_ROOT/dev" "$SYSTEM_ROOT/proc/device-tree"
+printf '15\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+: > "$SYSTEM_ROOT/dev/watchdog"
+run_unattended() {  # [env assignments...]
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$@" "$REPO_ROOT/install.sh" --config "$UNATTENDED_CONFIG"
+}
+# auto without a Raspberry Pi model: a watchdog device alone does not arm anything.
+printf 'Generic x86 board\0' > "$SYSTEM_ROOT/proc/device-tree/model"
+run_unattended >/dev/null
+test ! -e "$WATCHDOG_DROPIN"
+# true arms on any host that has the device.
+printf '\nVESSELSTACK_WATCHDOG="true"\n' >> "$UNATTENDED_CONFIG"
+run_unattended >/dev/null
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+sed -i '/^VESSELSTACK_WATCHDOG=/d' "$UNATTENDED_CONFIG"
+rm -f -- "$WATCHDOG_DROPIN"
+printf 'Raspberry Pi 4 Model B Rev 1.5\0' > "$SYSTEM_ROOT/proc/device-tree/model"
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+grep -qx '\[Manager\]' "$WATCHDOG_DROPIN"
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+grep -qx 'RebootWatchdogSec=2min' "$WATCHDOG_DROPIN"
+grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+grep -qx 'SystemMaxUse=64M' "$JOURNAL_DROPIN"
+grep -qx 'OnCalendar=Sun \*-\*-\* 03:30' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+grep -qx 'RandomizedDelaySec=15min' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+grep -qx 'Persistent=false' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+grep -qx 'enable vesselstack-backup.timer' "$FAKE_BIN/systemctl.log"
+# Alerts on: the timer is enabled and the (secret) heartbeat URL is only in the service-user env file, never echoed.
+printf '\nALERTS_ENABLE="true"\nALERT_TELEGRAM_CHAT_IDS="12345"\nALERT_BATTERY_LOW_V="12.1"\nALERT_HEARTBEAT_URL="https://hc.example.org/ping/test-uuid"\n' >> "$UNATTENDED_CONFIG"
+: > "$FAKE_BIN/systemctl.log"
+alerts_output=$(run_unattended 2>&1)
+if printf '%s' "$alerts_output" | grep -q 'test-uuid'; then echo "The installer printed the heartbeat URL" >&2; exit 1; fi
+grep -qx 'enable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"
+grep -qx 'ALERTS_ENABLE=true' "$APP_ROOT/config/boat-chat.env"
+grep -qx 'ALERT_BATTERY_LOW_V=12.1' "$APP_ROOT/config/boat-chat.env"
+grep -q '^ALERT_HEARTBEAT_URL=' "$APP_ROOT/config/boat-chat.env"
+sed -i '/^ALERT/d' "$UNATTENDED_CONFIG"
+grep -qx 'TimeoutStopSec=15min' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+grep -qx "Documentation=file://$APP_ROOT/README.md" "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.service"
+# A second identical run changes nothing, so it neither re-execs systemd nor restarts journald.
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+if grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log" || grep -qx 'restart systemd-journald' "$FAKE_BIN/systemctl.log"; then
+    echo "An unchanged rerun re-executed systemd or restarted journald" >&2
+    exit 1
+fi
+# N = min(10, max_timeout - 1): 8 gives 7, 11 gives 10.
+printf '8\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+run_unattended >/dev/null
+grep -qx 'RuntimeWatchdogSec=7s' "$WATCHDOG_DROPIN"
+printf '11\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+run_unattended >/dev/null
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+# A maximum that leaves fewer than 5 seconds skips the watchdog with a warning and removes the drop-in.
+printf '5\n' > "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+: > "$FAKE_BIN/systemctl.log"
+warn_output=$(run_unattended 2>&1 >/dev/null)
+grep -q 'too short to use safely' <<<"$warn_output"
+test ! -e "$WATCHDOG_DROPIN"
+grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+# An unreadable maximum assumes 10 seconds and warns.
+rm -f -- "$SYSTEM_ROOT/sys/class/watchdog/watchdog0/max_timeout"
+warn_output=$(run_unattended 2>&1 >/dev/null)
+grep -q 'could not read the hardware watchdog' <<<"$warn_output"
+grep -qx 'RuntimeWatchdogSec=10s' "$WATCHDOG_DROPIN"
+# watchdog.service active, or enabled: our drop-in is removed (systemd re-executed) and the installer warns.
+for owner_env in FAKE_WATCHDOG_SERVICE_ACTIVE=1 FAKE_WATCHDOG_SERVICE_ENABLED=1; do
+    run_unattended >/dev/null
+    test -e "$WATCHDOG_DROPIN"
+    : > "$FAKE_BIN/systemctl.log"
+    warn_output=$(run_unattended "$owner_env" 2>&1 >/dev/null)
+    grep -q 'watchdog.service is installed and active or enabled' <<<"$warn_output"
+    test ! -e "$WATCHDOG_DROPIN"
+    grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+done
+# Device gone: the drop-in is removed and systemd re-executed. VESSELSTACK_WATCHDOG=false also removes it.
+run_unattended >/dev/null
+test -e "$WATCHDOG_DROPIN"
+rm -f -- "$SYSTEM_ROOT/dev/watchdog"
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+test ! -e "$WATCHDOG_DROPIN"
+grep -qx 'daemon-reexec' "$FAKE_BIN/systemctl.log"
+: > "$SYSTEM_ROOT/dev/watchdog"
+run_unattended >/dev/null
+test -e "$WATCHDOG_DROPIN"
+printf 'VESSELSTACK_WATCHDOG="false"\n' >> "$UNATTENDED_CONFIG"
+run_unattended >/dev/null
+test ! -e "$WATCHDOG_DROPIN"
+# VESSELSTACK_JOURNAL_MAX_USE=off removes VesselStack's journald drop-in and restarts journald once.
+test -e "$JOURNAL_DROPIN"
+printf 'VESSELSTACK_JOURNAL_MAX_USE="off"\n' >> "$UNATTENDED_CONFIG"
+: > "$FAKE_BIN/systemctl.log"
+run_unattended >/dev/null
+test ! -e "$JOURNAL_DROPIN"
+grep -qx 'restart systemd-journald' "$FAKE_BIN/systemctl.log"
+# A drop-in that cannot be written is an error, not "unchanged".
+printf 'VESSELSTACK_JOURNAL_MAX_USE="64M"\n' >> "$UNATTENDED_CONFIG"
+rm -rf -- "$SYSTEM_ROOT/etc/systemd/journald.conf.d"
+: > "$SYSTEM_ROOT/etc/systemd/journald.conf.d"   # a file where the directory belongs: nothing can be written
+rc=0
+run_unattended >/dev/null 2>&1 || rc=$?
+test "$rc" -ne 0
+rm -f -- "$SYSTEM_ROOT/etc/systemd/journald.conf.d"
+run_unattended >/dev/null
+test -e "$JOURNAL_DROPIN"
+# Back to schedule off: the timer is removed again.
+printf 'VESSELSTACK_BACKUP_SCHEDULE="off"\n' >> "$UNATTENDED_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$UNATTENDED_CONFIG" >/dev/null
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-backup.timer"
+rm -f -- "$SYSTEM_ROOT/dev/watchdog"
+# Restore the default installed state for the checks below.
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
 test ! -e "$APP_ROOT/config/displays-bridge.env"
 test ! -e "$APP_ROOT/config/displays.json"
 test ! -e "$APP_ROOT/displays/.venv"
@@ -1265,5 +1444,317 @@ printf 'HOMEPAGE_PORT="8090"\n' >> "$LEGACY_CONFIG"
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$LEGACY_CONFIG" >/dev/null 2>&1
 grep -q '^HOMEPAGE_PORT=8090$' "$APP_ROOT/config/vesselstack.env"
+
+# ---- Boat overview dashboard: the raw bucket name is validated, then substituted.
+dashboard_json="$APP_ROOT/config/grafana/dashboards/boat-overview.json"
+test -s "$dashboard_json"
+python3 -m json.tool "$dashboard_json" >/dev/null
+test "$(stat -c '%a' "$dashboard_json")" = 644
+if grep -q '__VESSELSTACK_RAW_BUCKET__' "$dashboard_json"; then
+    echo 'the dashboard still has the bucket placeholder' >&2; exit 1
+fi
+grep -q 'from(bucket: \\"signalk\\")' "$dashboard_json"
+if grep -q 'navigation.position' "$dashboard_json"; then echo 'the dashboard shows position' >&2; exit 1; fi
+BUCKET_CONFIG="$TEST_ROOT/bucket.env"
+{ grep -v '^INFLUXDB_RAW_BUCKET=' "$CONFIG"; printf 'INFLUXDB_RAW_BUCKET="my.raw-1_x"\n'; } > "$BUCKET_CONFIG"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$BUCKET_CONFIG" >/dev/null
+grep -q 'from(bucket: \\"my.raw-1_x\\")' "$dashboard_json"
+python3 -m json.tool "$dashboard_json" >/dev/null
+for hostile in 'a"b' 'a b' 'a/b' 'a&b' "$(printf 'x%.0s' $(seq 1 65))"; do
+    { grep -v '^INFLUXDB_RAW_BUCKET=' "$CONFIG"; printf 'INFLUXDB_RAW_BUCKET="%s"\n' "$hostile"; } > "$BUCKET_CONFIG"
+    if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$BUCKET_CONFIG" >/dev/null 2>"$TEST_ROOT/bucket.stderr"; then
+        echo "a bucket name of '$hostile' was accepted" >&2; exit 1
+    fi
+    # Characters the env-file writer cannot store safely are refused even earlier, with a different message.
+    grep -q 'INFLUXDB_RAW_BUCKET' "$TEST_ROOT/bucket.stderr"
+done
+grep -q 'from(bucket: \\"my.raw-1_x\\")' "$dashboard_json"   # the refused runs changed nothing
+
+# ---- Zero-touch Signal K data path through the installer (docker mode, --start). A fake
+# Docker plays npm and a tiny fake InfluxDB answers the API calls; the helper itself is real.
+DP_REL="$TEST_ROOT/dp-release"
+cp -a "$REPO_ROOT" "$DP_REL"
+rm -rf "$DP_REL/.git" "$DP_REL/generated"
+printf '#!/bin/bash\nexit 0\n' > "$DP_REL/scripts/bootstrap-influx.sh"
+DP_BIN="$TEST_ROOT/dp-bin"
+install -d "$DP_BIN"
+cat > "$DP_BIN/docker" <<'EOF2'
+#!/bin/bash
+# Fake npm container: --dry-run reports FAKE_NPM_REMOVE (a package name) or nothing.
+# The real npm runs as the Signal K user under the container's umask 022; install.sh itself runs
+# under umask 077, which would leave node_modules root-only (uutils "install -d", the default on
+# Ubuntu 26.04, honours the umask for the directories it creates; GNU does not) and unreadable to
+# the unprivileged helper.
+umask 022
+if [ "${1:-}" = run ] && [[ " $* " == *" --entrypoint npm "* ]]; then
+    printf '%s\n' "$*" >> "$(dirname "$0")/../bin/docker.log"
+    source_dir=
+    for argument in "$@"; do case "$argument" in *:/home/node/.signalk) source_dir=${argument%:/home/node/.signalk} ;; esac; done
+    if [[ " $* " == *" --dry-run "* ]]; then
+        if [ -n "${FAKE_NPM_REMOVE:-}" ]; then
+            printf 'remove %s 1.0.0\n{\n  "added": 1,\n  "removed": 1,\n  "remove": [{"name": "%s"}]\n}\n' "$FAKE_NPM_REMOVE" "$FAKE_NPM_REMOVE"
+        else
+            printf '{\n  "added": 1,\n  "removed": 0,\n  "remove": []\n}\n'
+        fi
+        exit 0
+    fi
+    deps=
+    for argument in "$@"; do
+        case "$argument" in
+            -*|*:*) ;;
+            *@[0-9]*.[0-9]*.[0-9]*)
+                package=${argument%@*}
+                install -d "$source_dir/node_modules/$package"
+                printf '{"name":"%s","version":"%s"}\n' "$package" "${argument##*@}" > "$source_dir/node_modules/$package/package.json"
+                deps="$deps${deps:+,}\"$package\":\"${argument##*@}\"" ;;
+        esac
+    done
+    printf '{"dependencies":{%s}}\n' "$deps" > "$source_dir/package.json"
+    exit 0
+fi
+exec "$(dirname "$0")/../bin/docker" "$@"
+EOF2
+chmod +x "$DP_BIN/docker"
+cat > "$TEST_ROOT/fake-influx.py" <<'EOF2'
+import http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, body):
+        data = json.dumps(body).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def do_GET(self):
+        if "/api/v2/buckets" in self.path:
+            import urllib.parse
+            name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("name", ["vesselstack_raw"])[0]
+            self.reply({"buckets": [{"id": "b-" + name, "orgID": "o1", "name": name}]})
+        elif "/api/v2/dbrps" in self.path: self.reply({"content": [{"id": "m1"}]})
+        else: self.reply({"authorizations": []})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.reply({"token": "fake-writer-token", "id": "a1"})
+server = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(server.server_port))
+server.serve_forever()
+EOF2
+python3 "$TEST_ROOT/fake-influx.py" "$TEST_ROOT/fake-influx.port" &
+FAKE_INFLUX_PID=$!
+trap 'kill "$FAKE_INFLUX_PID" 2>/dev/null || true; rm -rf -- "$TEST_ROOT"' EXIT
+for _ in $(seq 1 50); do [ -s "$TEST_ROOT/fake-influx.port" ] && break; sleep 0.1; done
+APP4="$TEST_ROOT/opt4/vesselstack"
+DATA4="$TEST_ROOT/opt4/vesselstack-data"
+DPCONFIG="$TEST_ROOT/datapath.env"
+{
+    grep -vE '^(VESSELSTACK_DISABLED_COMPONENTS|VESSELSTACK_ROOT|VESSELSTACK_DATA|SIGNALK_MODE|INFLUXDB_RAW_BUCKET|INFLUXDB_PORT)=' "$CONFIG"
+    printf 'VESSELSTACK_ROOT="%s"\nVESSELSTACK_DATA="%s"\nSIGNALK_MODE="docker"\nINFLUXDB_RAW_BUCKET="vesselstack_raw"\nINFLUXDB_PORT="%s"\n' \
+        "$APP4" "$DATA4" "$(<"$TEST_ROOT/fake-influx.port")"
+} > "$DPCONFIG"
+SYSTEM4="$TEST_ROOT/system-root4"
+dp_install() {
+    : > "$FAKE_BIN/docker.log"
+    env PATH="$DP_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM4" "$@" "$DP_REL/install.sh" --config "$DPCONFIG" --start 2>&1
+}
+SK_PLUGIN_CONFIG="$DATA4/signalk/plugin-config-data/signalk-to-influxdb2.json"
+SKIP_FILE="$SYSTEM4/var/lib/vesselstack/signalk-datapath-skipped"
+
+# Skipped by the prune guard: the installation still succeeds, warns, and Signal K is not stopped.
+dp_output=$(dp_install FAKE_NPM_REMOVE=their-plugin)
+grep -q 'WARN: skipped installing signalk-to-influxdb2: npm would remove their-plugin' <<<"$dp_output"
+grep -q "the Signal K data path was not configured" <<<"$dp_output"
+test ! -e "$SK_PLUGIN_CONFIG"
+grep -q 'their-plugin' "$SKIP_FILE"
+if grep -Eq 'compose .* stop signalk' "$FAKE_BIN/docker.log"; then echo 'Signal K was stopped for a skipped run' >&2; exit 1; fi
+
+# Normal run: stopped once, the plugin and its configuration appear, started again.
+dp_output=$(dp_install)
+test -s "$SK_PLUGIN_CONFIG"
+test "$(stat -c '%a' "$SK_PLUGIN_CONFIG")" = 600
+grep -q 'fake-writer-token' "$SK_PLUGIN_CONFIG"
+test -s "$DATA4/signalk/node_modules/signalk-to-influxdb2/package.json"
+test ! -e "$SKIP_FILE"
+if grep -q 'fake-writer-token' <<<"$dp_output"; then echo 'the installer printed the writer token' >&2; exit 1; fi
+stop_line=$(grep -nE 'compose .* stop signalk' "$FAKE_BIN/docker.log" | head -n 1 | cut -d: -f1)
+npm_line=$(grep -n -- '--entrypoint npm' "$FAKE_BIN/docker.log" | tail -n 1 | cut -d: -f1)
+start_line=$(grep -nE 'compose .* up -d signalk$' "$FAKE_BIN/docker.log" | tail -n 1 | cut -d: -f1)
+test -n "$stop_line" && test -n "$npm_line" && test -n "$start_line"
+test "$stop_line" -lt "$npm_line" && test "$npm_line" -lt "$start_line"
+test "$(grep -cE 'compose .* stop signalk' "$FAKE_BIN/docker.log")" = 1
+
+# Idempotent: a second run neither stops Signal K nor runs the real install.
+dp_output=$(dp_install)
+if grep -Eq 'compose .* stop signalk' "$FAKE_BIN/docker.log"; then echo 'a settled data path stopped Signal K again' >&2; exit 1; fi
+if grep -q -- '--entrypoint npm.* install ' "$FAKE_BIN/docker.log"; then echo 'a settled data path reinstalled the plugin' >&2; exit 1; fi
+
+# The owner's own configuration is never replaced, even when it is not ours.
+printf '{"enabled":false}\n' > "$SK_PLUGIN_CONFIG"
+dp_install >/dev/null
+test "$(<"$SK_PLUGIN_CONFIG")" = '{"enabled":false}'
+
+# Opt-out: nothing is run at all.
+rm -rf "$DATA4/signalk/plugin-config-data" "$DATA4/signalk/node_modules"
+printf 'SIGNALK_DATAPATH_AUTOCONFIG="false"\n' >> "$DPCONFIG"
+dp_output=$(dp_install)
+if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'SIGNALK_DATAPATH_AUTOCONFIG=false still ran npm' >&2; exit 1; fi
+test ! -e "$SK_PLUGIN_CONFIG"
+grep -q '^SIGNALK_DATAPATH_AUTOCONFIG=false$' "$APP4/config/vesselstack.env"
+
+# Existing mode never touches the owner's Signal K.
+sed -i -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="existing"|' -e 's|^SIGNALK_DATAPATH_AUTOCONFIG=.*|SIGNALK_DATAPATH_AUTOCONFIG="true"|' "$DPCONFIG"
+rm -rf "$DATA4/signalk"
+dp_output=$(dp_install)
+if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'existing mode ran npm' >&2; exit 1; fi
+if grep -q 'Signal K data path' <<<"$dp_output"; then echo 'existing mode reported on the data path' >&2; exit 1; fi
+test ! -e "$DATA4/signalk/plugin-config-data"
+
+# ---- Optional marine essentials bundle (README "Marine essentials (optional)"): off by default,
+# rides on the data path run when that runs, runs alone (--bundle-only) when it does not, and
+# never touches existing mode.
+sed -i -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="docker"|' "$DPCONFIG"
+rm -rf "$DATA4/signalk"
+dp_install >/dev/null
+grep -q '^SIGNALK_MARINE_BUNDLE=false$' "$APP4/config/vesselstack.env"
+test ! -e "$DATA4/signalk/plugin-config-data/anchoralarm.json"
+test ! -e "$DATA4/signalk/node_modules/signalk-anchoralarm-plugin"
+printf 'SIGNALK_MARINE_BUNDLE="true"\n' >> "$DPCONFIG"
+dp_output=$(dp_install)
+grep -q '^SIGNALK_MARINE_BUNDLE=true$' "$APP4/config/vesselstack.env"
+for plugin_id in sk-to-nmea0183 anchoralarm signalk-logbook signalk-autostate; do test -s "$DATA4/signalk/plugin-config-data/$plugin_id.json"; done
+grep -q '"RMC": true' "$DATA4/signalk/plugin-config-data/sk-to-nmea0183.json"
+test -s "$DATA4/signalk/node_modules/@meri-imperiumi/signalk-logbook/package.json"
+grep -q -- 'signalk-anchoralarm-plugin@2.0.1' "$FAKE_BIN/docker.log"
+test "$(grep -cE 'compose .* stop signalk' "$FAKE_BIN/docker.log")" = 1
+dp_output=$(dp_install)   # settled: nothing stops Signal K again
+if grep -Eq 'compose .* stop signalk' "$FAKE_BIN/docker.log"; then echo 'a settled marine bundle stopped Signal K again' >&2; exit 1; fi
+# Without the data path the bundle runs alone, and no InfluxDB plugin or token is involved.
+rm -rf "$DATA4/signalk"
+printf 'SIGNALK_DATAPATH_AUTOCONFIG="false"\n' >> "$DPCONFIG"
+dp_output=$(dp_install)
+test -s "$DATA4/signalk/plugin-config-data/anchoralarm.json"
+test ! -e "$SK_PLUGIN_CONFIG"
+test ! -e "$DATA4/signalk/node_modules/signalk-to-influxdb2"
+# Existing mode ignores the bundle completely.
+sed -i -e 's|^SIGNALK_MODE=.*|SIGNALK_MODE="existing"|' -e 's|^SIGNALK_DATAPATH_AUTOCONFIG=.*|SIGNALK_DATAPATH_AUTOCONFIG="true"|' "$DPCONFIG"
+rm -rf "$DATA4/signalk"
+dp_output=$(dp_install)
+if grep -q -- '--entrypoint npm' "$FAKE_BIN/docker.log"; then echo 'existing mode ran npm for the marine bundle' >&2; exit 1; fi
+test ! -e "$DATA4/signalk/plugin-config-data"
+
+# ---- Optional Node-RED (README "Node-RED (optional)"): rendering on and off, settings.js only when
+# absent, nodered.env mode 0600, the passphrase never printed or put on a command line.
+APP5="$TEST_ROOT/opt5/vesselstack"
+DATA5="$TEST_ROOT/opt5/vesselstack-data"
+SYSTEM5="$TEST_ROOT/system-root5"
+NRCONFIG="$TEST_ROOT/nodered.install.env"
+{
+    grep -vE '^(VESSELSTACK_DISABLED_COMPONENTS|VESSELSTACK_ROOT|VESSELSTACK_DATA|INFLUXDB_RAW_BUCKET|INFLUXDB_PORT|NODERED_[A-Z_]+)=' "$CONFIG"
+    printf 'VESSELSTACK_ROOT="%s"\nVESSELSTACK_DATA="%s"\nINFLUXDB_RAW_BUCKET="vesselstack_raw"\nINFLUXDB_PORT="%s"\n' \
+        "$APP5" "$DATA5" "$(<"$TEST_ROOT/fake-influx.port")"
+    printf 'NODERED_ENABLE="true"\nNODERED_PORT="1881"\nVESSELSTACK_WEB_BIND_ADDRESS="127.0.0.1"\n'
+} > "$NRCONFIG"
+# shellcheck disable=SC2119,SC2120
+nr_install() {
+    : > "$FAKE_BIN/docker.log"
+    env PATH="$DP_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$@" "$DP_REL/install.sh" --config "$NRCONFIG" --start 2>&1
+}
+nr_output=$(nr_install)
+NR_ENV="$APP5/config/nodered.env"
+test -f "$NR_ENV"
+test "$(stat -c '%a %U' "$NR_ENV")" = '600 root'
+grep -q "^MQTT_USER='vesselstack-nodered'$" "$NR_ENV"
+grep -q "^MQTT_HOST='mosquitto'$" "$NR_ENV"
+grep -q "^INFLUX_TOKEN='fake-writer-token'$" "$NR_ENV"
+grep -q "^INFLUX_RAW_BUCKET='vesselstack_raw'$" "$NR_ENV"
+grep -q "^SIGNALK_WS_URL='ws://host.docker.internal:3000/signalk/v1/stream?subscribe=self'$" "$NR_ENV"
+grep -qF "NODERED_ADMIN_PASSWORD_HASH='\$2b\$10\$" "$NR_ENV"
+grep -q "^NODERED_CREDENTIAL_SECRET='[0-9a-f]\{64\}'$" "$NR_ENV"
+grep -qx 'NODERED_ENABLE=true' "$APP5/config/vesselstack.env"
+grep -qx 'NODERED_BIND_ADDRESS=127.0.0.1' "$APP5/config/vesselstack.env"   # local-only by default, independent of the dashboards
+NR_PASS=$(sed -n 's/^NODERED_ADMIN_PASSWORD=//p' "$APP5/config/vesselstack.env")
+test "${#NR_PASS}" = 32
+NR_SECRET=$(sed -n 's/^NODERED_CREDENTIAL_SECRET=//p' "$APP5/config/vesselstack.env")
+# The passphrase is stored only in the root-only configuration: not in the output, a log, a command line or the data tree.
+if grep -qF -- "$NR_PASS" <<<"$nr_output"; then echo 'the installer printed the Node-RED passphrase' >&2; exit 1; fi
+grep -q "grep '^NODERED_.\*_PASSWORD='" <<<"$nr_output"
+# A separate dashboard passphrase (user crew), generated, different from the editor's, hash only in nodered.env.
+NR_DASH=$(sed -n 's/^NODERED_DASHBOARD_PASSWORD=//p' "$APP5/config/vesselstack.env")
+[[ "$NR_DASH" =~ ^[0-9a-f]{32}$ ]]
+[ "$NR_DASH" != "$NR_PASS" ]
+grep -qF "NODERED_DASHBOARD_PASSWORD_HASH='\$2b\$10\$" "$NR_ENV"
+if grep -qF -- "$NR_DASH" "$NR_ENV" "$FAKE_BIN/docker.log"; then echo 'the Node-RED dashboard passphrase leaked' >&2; exit 1; fi
+# The firewall is restarted (not just started) so rule changes apply on every install.
+# (the fake host has no iptables, so this is checked on the installer itself)
+grep -q '^        systemctl restart vesselstack-firewall.service$' "$DP_REL/install.sh"
+if grep -q 'enable --now vesselstack-firewall' "$DP_REL/install.sh"; then echo 'the firewall unit is only started, never restarted' >&2; exit 1; fi
+if grep -qF -- "$NR_PASS" "$FAKE_BIN/docker.log" "$FAKE_BIN/systemctl.log" "$TEST_ROOT/runuser.log"; then echo 'the Node-RED passphrase reached a command line' >&2; exit 1; fi
+if grep -rqF -- "$NR_PASS" "$DATA5"; then echo 'the Node-RED passphrase is in the data tree' >&2; exit 1; fi
+if grep -qF -- "$NR_PASS" "$NR_ENV"; then echo 'nodered.env holds the plaintext passphrase' >&2; exit 1; fi
+grep -qE 'compose .*--profile nodered .*up -d nodered$' "$FAKE_BIN/docker.log"
+grep -q -- 'npm_config_cache' "$FAKE_BIN/docker.log"
+grep -q -- 'node-red-contrib-home-assistant-websocket@0.83.0' "$FAKE_BIN/docker.log"
+grep -q -- '@flowfuse/node-red-dashboard@1.36.1' "$FAKE_BIN/docker.log"
+grep -q -- '--ignore-scripts' "$FAKE_BIN/docker.log"
+# settings.js: root-owned outside the container-writable data directory, seeded once, never overwritten.
+NR_SETTINGS="$APP5/config/node-red/settings.js"
+test -f "$NR_SETTINGS"
+test ! -e "$DATA5/node-red/settings.js"
+test "$(stat -c '%u:%g %a' "$NR_SETTINGS")" = '0:0 644'
+test "$(stat -c '%u:%g %a' "$APP5/config/node-red")" = '0:0 755'
+test "$(stat -c '%u:%g' "$DATA5/node-red")" = '1000:1000'
+# The installed compose file mounts it read-only and starts Node-RED with it explicitly (fail closed).
+grep -q 'command: \["--settings", "/vesselstack/settings.js"\]' "$APP5/compose.yml"
+# shellcheck disable=SC2016  # literal compose text
+grep -q 'source: ${VESSELSTACK_ROOT}/config/node-red/settings.js' "$APP5/compose.yml"
+grep -q 'read_only: true' "$APP5/compose.yml"
+# A short owner-set passphrase is refused before anything changes; a long, different pair is accepted elsewhere.
+{ grep -vE '^NODERED_ADMIN_PASSWORD=' "$NRCONFIG"; printf 'NODERED_ADMIN_PASSWORD=short\n'; } > "$TEST_ROOT/nodered.bad.env"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+    echo 'a short Node-RED passphrase was accepted' >&2; exit 1
+fi
+{ grep -vE '^NODERED_DASHBOARD_PASSWORD=' "$NRCONFIG"; printf 'NODERED_DASHBOARD_PASSWORD=short\n'; } > "$TEST_ROOT/nodered.bad.env"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+    echo 'a short Node-RED dashboard passphrase was accepted' >&2; exit 1
+fi
+printf '// my own edit\n' >> "$NR_SETTINGS"
+# MQTT: a dedicated account with its own prefix and read access to vesselstack/#.
+grep -qx 'user vesselstack-nodered' "$APP5/config/mosquitto-auth/acl"
+sed -n '/^user vesselstack-nodered$/,/^$/p' "$APP5/config/mosquitto-auth/acl" | grep -qx 'topic readwrite vesselstack/nodered/#'
+sed -n '/^user vesselstack-nodered$/,/^$/p' "$APP5/config/mosquitto-auth/acl" | grep -qx 'topic read vesselstack/#'
+grep -q '^vesselstack-nodered:' "$APP5/config/mosquitto-auth/passwords"
+# A re-run keeps the passphrase, the credential secret and the owner's settings.js.
+nr_output=$(nr_install)
+test "$(sed -n 's/^NODERED_ADMIN_PASSWORD=//p' "$APP5/config/vesselstack.env")" = "$NR_PASS"
+test "$(sed -n 's/^NODERED_CREDENTIAL_SECRET=//p' "$APP5/config/vesselstack.env")" = "$NR_SECRET"
+grep -qx '// my own edit' "$NR_SETTINGS"
+grep -q 'Node-RED: kept config/node-red/settings.js' <<<"$nr_output" || true
+# A symlinked settings.js is refused.
+rm -f "$NR_SETTINGS"; ln -s /etc/passwd "$NR_SETTINGS"
+if nr_install >/dev/null 2>&1; then echo 'a symlinked settings.js was accepted' >&2; exit 1; fi
+rm -f "$NR_SETTINGS"
+nr_install >/dev/null
+grep -q 'NODERED_ADMIN_PASSWORD_HASH' "$NR_SETTINGS" && grep -q 'functionExternalModules: false' "$NR_SETTINGS"
+# A settings.js left in the data directory by the first Node-RED release is kept, unused, with a note.
+printf '// legacy\n' > "$DATA5/node-red/settings.js"
+nr_output=$(nr_install)
+grep -q 'is no longer used' <<<"$nr_output"
+grep -qx '// legacy' "$DATA5/node-red/settings.js"
+rm -f "$DATA5/node-red/settings.js"
+# Disabled again: container removed, environment file and MQTT account gone, data and settings.js kept.
+sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="false"/' "$NRCONFIG"
+nr_install >/dev/null
+grep -qE 'compose .*rm --stop --force nodered' "$FAKE_BIN/docker.log"
+test ! -e "$NR_ENV"
+test -f "$NR_SETTINGS"
+if grep -q 'vesselstack-nodered' "$APP5/config/mosquitto-auth/acl"; then echo 'the Node-RED MQTT account survived disabling' >&2; exit 1; fi
+# Bad values are refused before anything changes.
+for bad in 'NODERED_PORT=0' 'NODERED_PORT=abc' 'NODERED_ENABLE=maybe' 'NODERED_BIND_ADDRESS=not-an-ip' 'NODERED_ADMIN_PASSWORD_HASH=plain'; do
+    { grep -vE "^${bad%%=*}=" "$NRCONFIG"; printf '%s\n' "$bad"; } > "$TEST_ROOT/nodered.bad.env"
+    if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+        echo "$bad was accepted" >&2; exit 1
+    fi
+done
+# A port clash with another enabled component is refused.
+{ grep -vE '^(NODERED_ENABLE|NODERED_PORT)=' "$NRCONFIG"; printf 'NODERED_ENABLE=true\nNODERED_PORT=43000\n'; } > "$TEST_ROOT/nodered.bad.env"
+if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
+    echo 'a Node-RED port clash was accepted' >&2; exit 1
+fi
 
 echo "clean installation checks passed"

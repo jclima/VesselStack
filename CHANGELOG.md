@@ -3,6 +3,110 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+- Security: require the `crew` sign-in on the Node-RED Dashboard 2.0 live channel. `httpNodeAuth` never covered `/dashboard/socket.io/`, so unauthenticated clients received `ui-config` and widget data; `settings.js` now sets `dashboard.ioMiddleware`, which keeps the dashboard's no-direct-websocket and no-cross-origin checks and checks the Basic `crew` credentials against the bcrypt hash (refused with `no bcrypt module found` logged if none loads). The first polling request still returns 200 with an empty session. New Docker test `tests/test-nodered-dashboard-auth.sh` runs in the CI `service-integration` job (needs internet). Operational impact: dashboards keep working in browsers that resend the cached sign-in; `settings.js` is seeded only when absent, so an existing install must delete `config/node-red/settings.js` as root and rerun the installer. Rollback: remove the `dashboard: { ioMiddleware: ... }` line and run `sudo vesselstackctl restart`. Node-RED is not in a release yet.
+- Clean up ShellCheck findings so `tests/test-distribution.sh` passes on newer ShellCheck (0.9.0 and 0.11.0, default options): rewrite `A && B || C` as `if ! { A && B; }; then C; fi` in `scripts/vesselstackctl`, rename an unused `read` field to `_size`, and add reasoned `disable` directives for the unfollowed `source` of `scripts/lib/remediate.sh` and the cross-file `VS_PROMPT_OWNED`. No behaviour change; rollback by reverting the commit.
+- Fix CI: the "Validate optional Compose profiles" step now passes `--no-env-resolution` to `docker compose config`, so it no longer fails on the installed-only `config/nodered.env` (the Node-RED `env_file` stays `required: true`). CI-only change; no runtime impact or rollback needed.
+- Warn instead of silently skipping when the Signal K data path helper cannot read an installed plugin's `package.json` (for example `permission denied` on `node_modules`): the InfluxDB writer plugin or a marine essentials plugin is still left alone, but the installer output now names the package, the path and the error. No change to exit codes or other behaviour. Rollback: revert the commit; see README "Signal K plugin skipped (WARN: skipped ...)".
+- Fix CI: `tests/test-get-vesselstack.sh` scripted wizard answers now include the new "Send boat alerts to Telegram?" prompt (and assert `ALERTS_ENABLE=false`), so later answers no longer shift onto the wrong questions. Test-only change; no runtime impact or rollback needed.
+- Fix CI: the fake npm container in `tests/test-clean-install.sh` now runs under `umask 022`, so the marine bundle check passes on Ubuntu 26.04 runners (uutils `install -d` honours `install.sh`'s umask 077 and left `node_modules` unreadable to the unprivileged helper). Test-only change; no runtime impact or rollback needed.
+- Fix CI: `tests/test-distribution.sh` now expects the `--scheduled` option in the `vesselstackctl backup` usage line. Test-only change; no runtime impact or rollback needed.
+- Add optional marine essentials bundle, off by default (`SIGNALK_MARINE_BUNDLE`, managed Docker/native modes only):
+  NMEA 0183 on TCP 10110 (the converter, KIP 4.8.0 and Freeboard-SK 2.22.1 ship inside Signal K v2.27.0), pinned
+  `signalk-anchoralarm-plugin` 2.0.1, `@meri-imperiumi/signalk-logbook` 0.15.1 and `@meri-imperiumi/signalk-autostate`
+  0.6.4 installed with the data path helper (`--ignore-scripts`, prune guard), plugin configurations written only when
+  absent, KIP/Freeboard/Logbook/Anchor alarm Homepage tiles, port 10110 dropped on the untrusted interface, WARN-only
+  `doctor` check. Operational impact: about 64 MB of npm packages with unpinned sub-dependencies; needs internet.
+  Rollback: `SIGNALK_MARINE_BUNDLE=false`, see README "Marine essentials (optional)".
+- Add optional Node-RED, off by default (`NODERED_ENABLE`, `NODERED_PORT`, `NODERED_BIND_ADDRESS`): pinned
+  `nodered/node-red:5.0.9-debian` with a bcrypt-protected editor (`admin`, generated passphrase in `vesselstack.env`),
+  encrypted credential store, a dedicated Mosquitto account `vesselstack-nodered`, a read-only InfluxDB token, pinned
+  palette preinstall (skipped offline), importable example flows, a homepage tile, a WARN-only `doctor` check, firewall
+  drop on the untrusted interface and backup coverage. Operational impact: one more container (384 MB limit); the editor
+  can run code, so keep it on a trusted LAN or Tailscale. Rollback: `NODERED_ENABLE=false` and rerun the installer
+  (data in `${VESSELSTACK_DATA}/node-red` is kept).
+- Harden Node-RED: `settings.js` is now root-owned at `config/node-red/settings.js`, mounted read-only and passed with
+  `--settings`, so a missing file stops the container instead of starting unauthenticated defaults (an old
+  `${VESSELSTACK_DATA}/node-red/settings.js` is kept but unused); it starts only when enabled, `nodered.env` is non-empty
+  and `settings.js` exists; `NODERED_BIND_ADDRESS` now defaults to `127.0.0.1` and no longer follows the dashboards; a
+  separate generated dashboard passphrase (`NODERED_DASHBOARD_PASSWORD`, user `crew`) and a 16-character minimum for
+  owner-set passphrases; `remote enable|disable|status` also manage a tailnet-only Node-RED handler on 1880; the firewall
+  always drops the Node-RED port and is restarted on install; `doctor` requires 401 from `/flows`. Known limitation:
+  the Dashboard 2.0 socket.io endpoint is not covered by `httpNodeAuth`; keep the default bind. Rollback: set
+  `NODERED_BIND_ADDRESS` explicitly to restore the previous exposure.
+- Add optional Tailscale remote access, off by default (`REMOTE_ACCESS=off|tailscale`, `REMOTE_PANEL_SERVE=true`):
+  `sudo vesselstackctl remote enable [--dry-run] [--auth-key-stdin] | status [--json] | disable [--purge]`
+  installs Tailscale from Tailscale's signed apt repository (internet needed; not in the offline bundle), joins the
+  tailnet with the printed sign-in link, and publishes the Control Panel (still on `127.0.0.1`) to the tailnet only
+  with `tailscale serve --https=8780`, adding its name to `CONTROL_PANEL_ALLOWED_HOSTS` (now preserved across
+  reinstalls). No inbound ports are opened; no auth key is stored or logged (`--auth-key-stdin` works only when the
+  installed Tailscale reads keys from a file). The panel's Origin check stays strict (`Host` must equal `Origin`; `tailscale serve` passes the original
+  `Host`, otherwise tailnet writes fail with 403). Default tailnet host name is `vesselstack` (`--hostname NAME` to change;
+  HTTPS publishes it in Certificate Transparency logs), `--accept-dns=false`, curl limited to https; `disable` runs only
+  `tailscale serve --https=8780 off`, removes only the recorded allowlist entry and runs `tailscale down` last, only for a
+  Tailscale VesselStack installed. `/api/status` gains read-only `remote`, shown on the Home tab; `doctor` warns
+  (never fails) on a missing or signed-out Tailscale; `uninstall` disables it. Operational impact: every tailnet device
+  can reach services bound to `0.0.0.0` (use Tailscale ACLs) and tailnet sign-in failures share the panel's 127.0.0.1
+  lockout bucket. Rollback: `sudo vesselstackctl remote disable --purge`.
+- Make alerts safer: an offline bilge or shore sensor is never an all-clear (separate "sensor not reporting" alerts after 5 minutes), bilge alerts on the first poll, the heartbeat pings `/fail` only for a real problem (also when Telegram delivery fails), per-run 90 s deadline, clock-backwards and reboot handling, orphaned entries pruned, dispatcher health in `doctor`, the script refuses to run as root, and more unit hardening. Rollback: set `ALERTS_ENABLE=false`.
+- Add opt-in Telegram alerts (`ALERTS_ENABLE`, default `false`; `ALERT_TELEGRAM_CHAT_IDS`,
+  `ALERT_BATTERY_LOW_V`, `ALERT_BILGE_ENTITY`, `ALERT_SHORE_POWER_ENTITY`, `ALERT_HEARTBEAT_URL`,
+  `ALERT_REPEAT_MINUTES`, `ALERT_STALE_DATA_MINUTES`): a one-minute systemd timer runs a sandboxed
+  one-shot dispatcher that uses the Boat Chat bot token with `sendMessage` only and alerts on low
+  battery, stale Signal K data, bilge and shore-power entities, stack components down, boat computer
+  restarts and failed or stale backups, with an optional healthchecks.io-style heartbeat. No threshold is
+  assumed (blank = off). New `vesselstackctl alerts test|status`; `doctor` warns only. Operational
+  impact: one small process per minute and outbound HTTPS to `api.telegram.org`; reads InfluxDB with the
+  existing admin token. Rollback: `ALERTS_ENABLE=false` and rerun the installer, or
+  `systemctl disable --now vesselstack-alerts.timer`.
+- The Home Assistant blueprints now default `notification_actions` to a persistent notification so they
+  work without choosing a notify action (a `notify.mobile_app_*` example is included as a comment).
+
+- Configure the Signal K data path automatically in Docker and native modes
+  (`SIGNALK_DATAPATH_AUTOCONFIG`, default `true`; existing mode is never modified): the installer installs
+  `signalk-to-influxdb2` 2.3.0 into the Signal K data directory, adds a `vesselstack-n2k-<interface>` NMEA 2000
+  provider when SocketCAN is enabled (after a `settings.json.vesselstack-<time>.bak` copy) and writes the
+  plugin configuration only when it does not exist. The plugin gets its own `vesselstack-signalk-writer`
+  InfluxDB token: read this organization, read and write the raw bucket only, read DBRP mappings (a missing
+  DBRP mapping is created first). Signal K is stopped and started once on the first run; an npm prune guard
+  (`npm install --dry-run`) skips the install, with a warning, if npm would delete packages that
+  `package.json` does not list; `--offline` installs skip the step. The token can read the raw bucket,
+  including position data, and is stored in the plugin configuration (mode 0600).
+  All file work inside the Signal K data directory runs in a child that has dropped to the Signal K
+  uid/gid (no root `chown` or link-following there; the token travels over a pipe), refusals are found
+  before a token is created, InfluxDB requests never follow redirects, a timed-out Docker `npm` container
+  is removed, Signal K is restarted in native mode too without ever failing the installation, a malformed
+  `settings.json` skips only the provider step, and `vesselstackctl doctor` reports a rejected writer token.
+- Add the **VesselStack Boat Overview** Grafana dashboard (batteries, tanks, engine, navigation without
+  position, environment) reading `INFLUXDB_RAW_BUCKET`; the installer rejects a bucket name that is not
+  1 to 64 letters, digits, dots, hyphens or underscores.
+- `vesselstackctl doctor` reports whether Signal K data reaches InfluxDB (warnings only).
+- Rollback: set `SIGNALK_DATAPATH_AUTOCONFIG=false`, delete
+  `signalk/plugin-config-data/signalk-to-influxdb2.json`, restore `settings.json` from its `.bak`, delete the
+  `vesselstack-signalk-writer` token and `npm uninstall signalk-to-influxdb2` (README, "Signal K and InfluxDB").
+- Add unattended-operation settings: a hardware watchdog (`VESSELSTACK_WATCHDOG`, default `auto`,
+  enabled only on a Raspberry Pi that has `/dev/watchdog`; `true` enables it on any computer with the
+  device) and a journal size cap (`VESSELSTACK_JOURNAL_MAX_USE`, default `200M`, or `off` for no
+  VesselStack drop-in), both applied by the installer through systemd drop-ins. The watchdog timeout
+  is `min(10, max_timeout - 1)` seconds and is skipped below 5; it is also skipped (and VesselStack's
+  drop-in removed) when `watchdog.service` is active or enabled.
+- Upgrading on a Raspberry Pi arms the hardware watchdog by default (`auto`). Opt out with
+  `VESSELSTACK_WATCHDOG="false"` and rerun the installer.
+- Add opt-in scheduled backups (`VESSELSTACK_BACKUP_SCHEDULE` off/daily/weekly, default off) with
+  retention (`VESSELSTACK_BACKUP_KEEP`, default 8, whole number 1 to 365) and `vesselstackctl backup --scheduled`, which
+  needs a mounted backup drive. Scheduled archives are named `vesselstack-scheduled-<stamp>.tar.gz`
+  and only those are pruned; manual and pre-update backups never are. The drive needs room for
+  `KEEP`+1 archives. A failed run removes its partial archive. A scheduled backup stops the whole stack while it runs. The last result is
+  recorded in `/var/lib/vesselstack/backup-last.json` and shown in `doctor` and the Control Panel.
+- `vesselstackctl doctor` reports the watchdog, journal cap, scheduled backups, Raspberry Pi
+  under-voltage/throttling (`vcgencmd get_throttled`), a configured GPIO shutdown overlay and whether
+  the previous boot ended cleanly. Only a failed scheduled backup makes `doctor` fail.
+- The lifecycle lock helper now exits with status 75 (instead of 1) when the lock is busy
+  (`run` only); a busy scheduled backup leaves its unit in the failed state until the next success.
+- Rollback: set `VESSELSTACK_WATCHDOG=false`, `VESSELSTACK_JOURNAL_MAX_USE=off` and
+  `VESSELSTACK_BACKUP_SCHEDULE=off` and rerun the installer (README, "Unattended operation and power").
+
 ## 0.8.0 - 2026-11-12
 
 - Configure the VesselStack Homepage from Control Panel Settings. Choose its palette, heading,

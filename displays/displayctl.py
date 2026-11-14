@@ -58,7 +58,7 @@ def cmd_sync_mqtt(args) -> int:
         return 2
     env = {key: os.environ[key] for key in
            ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
-            "DISPLAYS_BRIDGE_MQTT_USERNAME") if key in os.environ}
+            "DISPLAYS_BRIDGE_MQTT_USERNAME", "NODERED_ENABLE") if key in os.environ}
     try:
         # The same lock as the lifecycle commands: a Control Panel Apply cannot
         # interleave with a concurrent "displayctl add".
@@ -85,7 +85,7 @@ def cmd_preflight(args) -> int:
         return 2
     env = {key: os.environ[key] for key in
            ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE", "DISPLAYS_BRIDGE_MQTT_USERNAME",
-            "DISPLAYS_HA_TOKEN", "HOME_ASSISTANT_URL") if key in os.environ}
+            "DISPLAYS_HA_TOKEN", "HOME_ASSISTANT_URL", "NODERED_ENABLE") if key in os.environ}
     mode = "pull" if args.pull_image else "check" if args.check_image else "none"
     try:
         warnings = mqtt_auth.preflight(
@@ -170,7 +170,7 @@ def cmd_bridge_env(args) -> int:
 # SIGNALK_URL and never printed. VESSELSTACK_DATA_BIND_ADDRESS feeds the 'show' readiness block.
 LIFECYCLE_ENV_KEYS = ("MQTT_USERNAME", "MQTT_PASSWORD", "DISPLAYS_ENABLE",
                       "DISPLAYS_BRIDGE_MQTT_USERNAME", "SIGNALK_URL", "DISPLAYS_SIGNALK_TOKEN", "BOAT_UNITS",
-                      "VESSELSTACK_DATA_BIND_ADDRESS")
+                      "VESSELSTACK_DATA_BIND_ADDRESS", "NODERED_ENABLE")
 
 
 def run_lifecycle(args, action) -> int:

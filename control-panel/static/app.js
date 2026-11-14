@@ -713,14 +713,25 @@ function formatWhen(seconds) {
   return `${when.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" })} ${clock}`;
 }
 
+// One line about scheduled backups (read-only; they are configured with VESSELSTACK_BACKUP_SCHEDULE).
+function scheduleNote(backup) {
+  if (!backup.schedule || backup.schedule === "off") return "Scheduled backups: off";
+  const parts = [`Scheduled backups: ${backup.schedule}`];
+  const last = backup.last_scheduled;
+  if (last) parts.push(last.result === "success" ? "last scheduled run succeeded" : last.result === "skipped_busy" ? "last scheduled run skipped (busy)" : "last scheduled run FAILED");
+  if (backup.next_run) parts.push(`next ${backup.next_run}`);
+  return parts.join(", ");
+}
+
 function backupSummary() {
   const backup = state.status?.backup;
   if (!backup || !backup.path) return { tone: "warn", value: "Last backup: unknown", sub: "Backup status is not available yet." };
   if (backup.last_backup_at) {
-    const sub = backup.mount === "mounted" ? "Backup drive OK"
+    const sub = [backup.mount === "mounted" ? "Backup drive OK"
       : backup.state === "read_only" ? "Backup folder is not writable"
-      : backup.mount === "system_disk" ? "Saved on this computer's own disk, not an external drive" : "";
-    return { tone: backup.state === "ok" && backup.mount !== "system_disk" ? "good" : "warn", value: `Last backup: ${formatWhen(backup.last_backup_at)}`, sub };
+      : backup.mount === "system_disk" ? "Saved on this computer's own disk, not an external drive" : "", scheduleNote(backup)].filter(Boolean).join(" · ");
+    const scheduledBad = backup.last_scheduled && backup.last_scheduled.result !== "success";
+    return { tone: backup.state === "ok" && backup.mount !== "system_disk" && !scheduledBad ? "good" : "warn", value: `Last backup: ${formatWhen(backup.last_backup_at)}`, sub };
   }
   if (backup.mount === "not_mounted") return { tone: "warn", value: "Last backup: unknown", sub: "Backup drive not mounted, so it cannot be checked." };
   if (backup.state === "none") return { tone: "warn", value: "No backup yet", sub: backup.mount === "mounted" ? "Backup drive OK" : "Press Back up now to make the first one." };
@@ -1030,6 +1041,7 @@ async function refreshStatus() {
     $("#version-chip").hidden = state.installedVersion === "unknown";
     $("#boat-name").textContent = data.boat_name || "";
     setNotice("restart-needed", data.restart_needed ? "A newer Control Panel is installed than the one running. Restart it from the Maintenance tab to use the new version." : "");
+    renderRemote(data.remote);
     renderUpdates();
     renderComponents(data.components);
     setConnection("connected");
@@ -1046,6 +1058,17 @@ async function refreshStatus() {
     clearTimeout(state.reconnectTimer);
     if (state.reconnectAttempts <= 5) state.reconnectTimer = setTimeout(refreshStatus, Math.min(2000 * state.reconnectAttempts, 8000));
   }
+}
+
+function renderRemote(remote) {
+  const note = $("#remote-note");
+  if (!note) return;
+  if (!remote || !remote.enabled) { note.hidden = true; note.textContent = ""; return; }
+  const where = remote.panel_url ? ` Reach this panel at ${remote.panel_url} from your own devices.` : "";
+  note.textContent = remote.online
+    ? `Remote access over Tailscale is on (${remote.name || "this boat"}).${where}`
+    : "Tailscale is installed but this boat is not connected to your tailnet. Check it with: sudo vesselstackctl remote status";
+  note.hidden = false;
 }
 
 // ---------------------------------------------------------------- updates

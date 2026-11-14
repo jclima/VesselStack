@@ -63,6 +63,19 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(wizard.DEFAULTS["SIGNALK_VESSELTWIN_PRELOAD"], "true")
         self.assertEqual(wizard.validate({"SIGNALK_VESSELTWIN_PRELOAD": "false"})["SIGNALK_VESSELTWIN_PRELOAD"], "false")
 
+    def test_signalk_datapath_autoconfig_default_validation_and_advanced_field(self):
+        self.assertEqual(wizard.DEFAULTS["SIGNALK_DATAPATH_AUTOCONFIG"], "true")
+        self.assertEqual(wizard.validate({"SIGNALK_DATAPATH_AUTOCONFIG": "false"})["SIGNALK_DATAPATH_AUTOCONFIG"], "false")
+        with self.assertRaises(ValueError):
+            wizard.validate({"SIGNALK_DATAPATH_AUTOCONFIG": "maybe"})
+        field = wizard.FIELD_INDEX["SIGNALK_DATAPATH_AUTOCONFIG"]
+        self.assertTrue(field["advanced"])
+        state = types.SimpleNamespace(values={**wizard.DEFAULTS, "SIGNALK_MODE": "existing"})
+        self.assertFalse(field["when"](state))
+        for mode in ("docker", "native"):
+            state.values["SIGNALK_MODE"] = mode
+            self.assertTrue(field["when"](state), mode)
+
     def test_control_panel_access_defaults_and_lan_independence(self):
         self.assertEqual(wizard.DEFAULTS["CONTROL_PANEL_HOST"], "127.0.0.1")
         for preset in wizard.LAN_PRESETS:
@@ -495,7 +508,7 @@ class CliWizardTests(unittest.TestCase):
                    "y", "12345", "123456789", "b", "", "ABCD1", "11.5", "3.8",
                    "2", "http://192.0.2.10:3000",
                    "y", "y", "", "",   # CAN on, vcan on (interface becomes vcan0), interface, bitrate
-                   "n", "", "?", "", "1", "y", "", "", "y", "", "n", "22,8080", "-", "14d", "", "", "n", "s"]
+                   "n", "", "?", "", "1", "y", "", "", "", "y", "", "n", "22,8080", "-", "14d", "", "", "n", "s"]
         result, output = drive(answers, strict=True)
         self.assertIsInstance(result, dict, output)
         self.assertEqual(result["BOAT_NAME"], "Sea Wolf")
@@ -550,14 +563,14 @@ class CliWizardTests(unittest.TestCase):
         self.assertNotIn("123456789", output); self.assertNotIn("ABCD1", output)
 
     def test_quit_and_ended_input(self):
-        self.assertIsNone(drive([""] * 19 + ["q"], strict=True)[0])
+        self.assertIsNone(drive([""] * 20 + ["q"], strict=True)[0])
         self.assertEqual(drive([""] * 3, strict=True)[0], "aborted")
-        self.assertEqual(drive([""] * 19, strict=True)[0], "aborted")   # no review answer
+        self.assertEqual(drive([""] * 20, strict=True)[0], "aborted")   # no review answer
 
     def test_edit_a_section_from_the_review(self):
-        result, _ = drive([""] * 19 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
+        result, _ = drive([""] * 20 + ["e", "1", "Edited"] + [""] * 5 + ["s"], strict=True)
         self.assertEqual(result["BOAT_NAME"], "Edited")
-        result, output = drive([""] * 19 + ["e", "99", "x", "s"], strict=True)
+        result, output = drive([""] * 20 + ["e", "99", "x", "s"], strict=True)
         self.assertIn("Please enter a section number", output)
 
     def test_set_option_uses_the_same_rules(self):
@@ -724,6 +737,61 @@ class CliCommandTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             values = wizard.load_env(out2)
             self.assertEqual((values["BOAT_NAME"], values["VESSELSTACK_USER"], values["BOAT_TYPE"]), ("From Base", "daemon", "Yacht"))
+
+    def test_backup_schedule_is_set_with_set_and_defaults_to_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = self.run_wizard("--defaults", "--output", str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(wizard.load_env(out)["VESSELSTACK_BACKUP_SCHEDULE"], "off")
+            out2 = Path(directory) / "weekly.env"
+            result = self.run_wizard("--defaults", "--set", "VESSELSTACK_BACKUP_SCHEDULE=weekly", "--set", "VESSELSTACK_BACKUP_KEEP=4", "--output", str(out2))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            values = wizard.load_env(out2)
+            self.assertEqual((values["VESSELSTACK_BACKUP_SCHEDULE"], values["VESSELSTACK_BACKUP_KEEP"], values["VESSELSTACK_WATCHDOG"]), ("weekly", "4", "auto"))
+            self.assertEqual(self.run_wizard("--validate", str(out2)).returncode, 0)
+            bad = self.run_wizard("--defaults", "--set", "VESSELSTACK_BACKUP_SCHEDULE=hourly", "--output", str(Path(directory) / "bad.env"))
+            self.assertNotEqual(bad.returncode, 0)
+
+    def test_alerts_are_opt_in_and_follow_up_questions_only_appear_when_enabled(self):
+        self.assertEqual(wizard.DEFAULTS["ALERTS_ENABLE"], "false")
+        self.assertEqual(wizard.DEFAULTS["ALERT_BATTERY_LOW_V"], "")
+        off, on = dict(wizard.DEFAULTS, ALERTS_ENABLE="false"), dict(wizard.DEFAULTS, ALERTS_ENABLE="true")
+        for key in ("ALERT_TELEGRAM_CHAT_IDS", "ALERT_BATTERY_LOW_V", "ALERT_HEARTBEAT_URL"):
+            field = wizard.FIELD_INDEX[key]
+            self.assertTrue(field["optional"], key)
+            self.assertFalse(field["when"](types.SimpleNamespace(values=off, flags={})), key)
+            self.assertTrue(field["when"](types.SimpleNamespace(values=on, flags={})), key)
+        self.assertIn("12 V", wizard.FIELD_INDEX["ALERT_BATTERY_LOW_V"]["help"])
+        self.assertIn("24", wizard.FIELD_INDEX["ALERT_BATTERY_LOW_V"]["help"])
+        self.assertEqual(wizard.FIELD_INDEX["ALERT_HEARTBEAT_URL"]["kind"], "secret")
+        self.assertTrue(wizard.FIELD_INDEX["ALERT_BILGE_ENTITY"]["advanced"])  # entities are normally chosen later in settings
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = self.run_wizard("--defaults", "--set", "ALERTS_ENABLE=true", "--set", "ALERT_BATTERY_LOW_V=12.1",
+                                     "--set", "ALERT_TELEGRAM_CHAT_IDS=123456", "--output", str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            values = wizard.load_env(out)
+            self.assertEqual((values["ALERTS_ENABLE"], values["ALERT_BATTERY_LOW_V"]), ("true", "12.1"))
+            bad = self.run_wizard("--defaults", "--set", "ALERT_HEARTBEAT_URL=http://x.example", "--output", str(Path(directory) / "bad.env"))
+            self.assertNotEqual(bad.returncode, 0)
+
+    def test_remote_access_only_records_the_choice(self):
+        self.assertEqual((wizard.DEFAULTS["REMOTE_ACCESS"], wizard.DEFAULTS["REMOTE_PANEL_SERVE"]), ("off", "true"))
+        field = wizard.FIELD_INDEX["REMOTE_ACCESS"]
+        self.assertTrue(field["advanced"])
+        self.assertIn("sudo vesselstackctl remote enable", field["help"])
+        self.assertIn("never installs", field["help"])
+        serve = wizard.FIELD_INDEX["REMOTE_PANEL_SERVE"]
+        self.assertFalse(serve["when"](types.SimpleNamespace(values=dict(wizard.DEFAULTS), flags={})))
+        self.assertTrue(serve["when"](types.SimpleNamespace(values=dict(wizard.DEFAULTS, REMOTE_ACCESS="tailscale"), flags={})))
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "vesselstack.env"
+            result = self.run_wizard("--defaults", "--set", "REMOTE_ACCESS=tailscale", "--output", str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(wizard.load_env(out)["REMOTE_ACCESS"], "tailscale")
+            bad = self.run_wizard("--defaults", "--set", "REMOTE_ACCESS=vpn", "--output", str(Path(directory) / "bad.env"))
+            self.assertNotEqual(bad.returncode, 0)
 
     def test_displays_ha_token_is_a_hidden_optional_secret_set_with_set(self):
         field = wizard.FIELD_INDEX["DISPLAYS_HA_TOKEN"]

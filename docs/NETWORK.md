@@ -17,6 +17,8 @@ a preset that sets the real bind settings; `LAN_ACCESS` itself is never written 
 | `dashboards` (default, recommended) | `0.0.0.0` | `0.0.0.0` | `127.0.0.1` | `0.0.0.0` |
 | `all` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` | `0.0.0.0` |
 
+Optional Node-RED (`NODERED_BIND_ADDRESS`, port `NODERED_PORT`) defaults to `127.0.0.1` (this computer only) and does not follow the Grafana/Homepage column or `vesselstackctl lan`; `0.0.0.0` publishes it on the whole boat network over plain HTTP. The firewall always drops its port on the untrusted interface. Its editor can run code: use an SSH tunnel or Tailscale.
+
 The Control Panel (`CONTROL_PANEL_HOST`) defaults to `127.0.0.1` and is independent
 of every preset. Choose network access during setup or run
 `sudo vesselstackctl panel-access lan` to share only its administration listener;
@@ -138,7 +140,12 @@ Assistant reaches MQTT on loopback. AIS ports are unchanged. At minimum:
   protected by an authenticated reverse proxy;
 - keep the root-privileged Control Panel loopback-only or behind a trusted VPN
   and authenticated proxy;
-- use ZeroTier, Tailscale, or WireGuard for remote access; and
+- use ZeroTier, Tailscale, or WireGuard for remote access (VesselStack has optional Tailscale support,
+  off by default: `sudo vesselstackctl remote enable`, see
+  [Remote access with Tailscale](../README.md#remote-access-with-tailscale)). Tailscale reaches every service
+  bound to `0.0.0.0` on the boat, not only the Control Panel, so restrict it with Tailscale ACLs. The firewall
+  rules match only the untrusted interface and never mention `tailscale0`; under strict mode UDP `41641` may be
+  added to `VESSELSTACK_FIREWALL_ALLOW_UDP` for direct connections; and
 - keep `/opt/vesselstack/config/*.env` readable only by root or the required
   service account.
 
