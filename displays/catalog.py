@@ -590,7 +590,7 @@ def _instrument_row(entry: dict, units: str, heartbeat: int, path: str, instance
     return row
 
 
-def _notification_row(path: str, key, group: str, label: str, icon, absent, registry) -> dict:
+def _notification_row(path: str, key, group: str, label: str, icon, absent, registry, note=None) -> dict:
     row = {"row_id": key or "note:" + path, "kind": "notification", "catalog_key": key, "path": path,
            "group": group, "label": label, "path_template": None, "instance": None, "template": False,
            "roles": [], "id_stem": id_stem(key or path.rsplit(".", 1)[-1])}
@@ -598,6 +598,8 @@ def _notification_row(path: str, key, group: str, label: str, icon, absent, regi
         row["icon"] = icon
     if absent:
         row["absent"] = absent
+    if note:
+        row["note"] = note
     row["layouts"] = layouts_for("notification", False, [], registry)
     return row
 
@@ -622,7 +624,7 @@ def merged_catalog(catalog: dict, live: dict | None, units: str, config: dict, r
     for entry in catalog["entries"]:
         if entry.get("kind", "instrument") == "notification":
             row = _notification_row(entry["path"], entry["key"], entry["group"], clean_label(entry["label"]),
-                                    entry.get("icon"), entry.get("absent"), registry)
+                                    entry.get("icon"), entry.get("absent"), registry, entry.get("note"))
             row["live_state"] = ("live" if entry["path"] in active_notes else "no_live_data") if asked else "unknown"
             if entry["path"] in active_notes:
                 matched_notes.add(entry["path"])

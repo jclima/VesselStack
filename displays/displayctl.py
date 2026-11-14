@@ -41,6 +41,8 @@ def cmd_validate(args) -> int:
             print(f"{args.file}: {err}", file=sys.stderr)
         print(f"{len(errors)} error(s); nothing written", file=sys.stderr)
         return 1
+    for warning in schema.config_warnings(config):
+        print(f"{args.file}: warning: {warning}", file=sys.stderr)
     notes = config.get("notifications")
     extra = f"{len(notes)} notification(s), " if notes else ""
     print(f"OK: {args.file}: {len(config['instruments'])} instrument(s), {extra}"

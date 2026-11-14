@@ -848,7 +848,14 @@ page. Add a top-level `notifications` object to `displays.json`:
   `absent: "unknown"` shows grey `--` instead (right when a missing notification
   could just as well mean the monitoring plugin is not running). Either way,
   while Signal K is disconnected every notification is `stale` and grey, and
-  nothing is ever green on a stale or unknown state.
+  nothing is ever green on a stale or unknown state. The catalog offers `fire` and
+  `flooding` with `absent: "unknown"` (they show `--` until a source reports through
+  Signal K: a sensor that is silent until triggered cannot be told apart from no
+  sensor), and `anchor` and `mob` with `absent: "ok"`. An existing `displays.json`
+  keeps its explicit value; `displayctl validate` prints a warning (not an error, the
+  exit status is unchanged) for a notification on `notifications.fire` or
+  `notifications.flooding` that reads `ok` when nothing is reported, including one
+  that leaves `absent` out.
 - After Signal K (re)connects, notifications that nobody has reported on stay
   `unknown` for 3 s so that an alarm that is still active is shown red as soon
   as Signal K re-sends it instead of flashing green first.
@@ -908,11 +915,14 @@ screen with a flashing banner.
   is connected, or the item being removed from `displays.json`. The settle
   timeout after a Signal K reconnect never clears it (a lost notification keeps
   `sev` `unknown` on its own topic until a delta arrives), reconnecting does not
-  clear it, and there is no time limit. The latch is held in the bridge's memory
-  only: restarting the bridge while an alarmed sensor is silent forgets it until
-  a later change persists it.
-- `seq` is an unsigned 32-bit counter (wrapping at 2^32), starting from a random
-  value each time the bridge starts. It rises by one for every item that is a
+  clear it, and there is no time limit. The latch and `seq` are kept across bridge
+  restarts (and crashes and reboots) in `state.json` in the bridge's state
+  directory (see [Bridge state](#bridge-state)); a restored lost alarm reports as
+  lost until positive evidence clears it, exactly as if the bridge had stayed up.
+- `seq` is an unsigned 32-bit counter (wrapping at 2^32). It starts from a random
+  value when the bridge has no saved state and otherwise continues from the saved
+  value across restarts. A lost alarm restored after a restart counts as already
+  known, so a restart alone never raises it. It rises by one for every item that is a
   live alarm now and was neither a live alarm nor lost at the previous
   evaluation. An alarm turning into a lost one, or back, does not change it, but
   one alarm clearing while another raises does, even though `na` stays the
@@ -1404,7 +1414,8 @@ unknown, stale or offline.
 
 **Topics.** Each item is published retained, at most once a second when only a number
 changes and every `heartbeat_s`, to `vesselstack/v1/ha/<id>` as
-`{"v":null,"k":0,"u":"","st":"ok","sev":"warn","ts":"...","age":1.2}`: `v` is the
+`{"v":null,"k":0,"u":"","st":"ok","sev":"warn","ts":"...","age":1.2}` (numeric items
+also carry the `cu` unit tag described under [MQTT topics and freshness](#mqtt-topics-and-freshness)): `v` is the
 number of a numeric item (else `null`), `k` the index of the matched `states` entry
 (`-1`: the default; `null` for numeric and missing items), `st` is `ok`, `missing` or
 `stale`, and `ts` is the bridge's time of the last state received. The retained
@@ -1603,14 +1614,61 @@ layout that takes only instruments for the default page (`tank-bars`,
 `gauge-arc` and `electrical` are listed after `grid-2x2` so they never win a tie; they need
 `min` and `max` or slots); `status-grid` is chosen only when nothing else fits.
 
+### Bridge state
+
+The bridge keeps two things across restarts, so that a restart (every Control
+Panel save that adds instruments restarts it) neither forgets an alarm whose data
+stopped nor resets `seq`: the set of items that are *lost* (instruments,
+notifications and Home Assistant items) and `seq`. They are written to
+`state.json` in the directory named by `VESSELSTACK_DISPLAYS_STATE_DIR`, set by the
+installed systemd unit to `<data dir>/displays-bridge` (created by the installer,
+mode 0700, owned by the service account, and the only path the unit may write):
+
+```json
+{"format":1,"seq":3141592653,"latched":{"instruments":["depth"],"notifications":["anchor"],"ha":[]}}
+```
+
+- The file is replaced atomically (temporary file in the same directory, `fsync`,
+  rename, `fsync` of the directory), has mode 0600, and is written only when the
+  lost set or `seq` changed, at most once per evaluation. It holds ids only: no
+  readings, labels, positions or message text.
+- On start, before the first summary, an id that is still in `displays.json` and
+  still counts for the summary is marked lost (it has no reading yet, so it stays
+  lost until a fresh reading or an explicit notification delta clears it); other ids
+  are dropped. A missing file means nothing lost and a random `seq`, as before. A
+  corrupt, unreadable or unknown-`format` file is logged as a warning, treated as
+  missing and overwritten at the next change; the bridge never stops over it.
+- If the variable is unset, or the directory is missing or not writable, the bridge
+  logs one warning at start and runs without persistence, exactly as before.
+- Only a *lost* alarm is saved. An alarm that is live (its data still arriving) when
+  the bridge is killed is not: the bridge is not given the chance to latch it, so
+  after a crash it comes back as a live alarm if the sensor still reports it, and is
+  forgotten if the sensor is silent (and a live alarm that comes back after a crash
+  counts as new in `seq`). A clean stop (SIGTERM) latches first.
+- The directory is inside the data tree, so backups include it. Restoring an old
+  backup restores an old lost set and `seq`: that can only err towards showing an
+  alarm until fresh data arrives (and a `seq` that a display may see go backwards
+  once), never towards hiding one. Delete `state.json` to forget it.
+- Rollback: older releases ignore the file and the variable; the extra unit lines
+  are only rendered by this release's installer.
+
 ## MQTT topics and freshness
 
 Values are published retained to `vesselstack/v1/instruments/<instrument_id>`
-as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","age":0.4}`.
+as compact JSON: `{"v":6.4,"u":"kn","st":"ok","ts":"2026-01-01T00:00:00.000Z","age":0.4,"cu":"3f2a91c4"}`.
 `v` is converted, then rounded to `precision`, and is `null` unless `st` is
 `ok`. `ts` is the Signal K timestamp (or `null`); `age` is seconds since the
 bridge received the value, measured on the bridge clock, not the Signal K
-timestamp. Other reserved topics are `vesselstack/v1/bridge/status` (not retained),
+timestamp. A Signal K value whose timestamp is identical to that of the last value
+accepted for the instrument is a repeat (Signal K re-sending a cached value on a
+period or after a resubscribe): it neither refreshes `age` nor brings a `stale` or
+`missing` instrument back, so a dead sensor goes `stale` on schedule and stays
+there. Any different timestamp, older or newer, is accepted; a value without a
+timestamp is accepted as before (logged once per instrument). The last
+timestamp is kept in memory only, so after a bridge restart the first value Signal K
+re-sends is accepted once, and a dead sensor can look `ok` for one `stale_after_s`
+window before going `stale`. A source that stamps several different values with the
+same timestamp has the later ones ignored. Other reserved topics are `vesselstack/v1/bridge/status` (not retained),
 `vesselstack/v1/bridge/service` (retained, for tools), `vesselstack/v1/bridge/signalk`, `vesselstack/v1/bridge/clock` (see
 [Touch, header, night mode and dimming](#touch-header-night-mode-and-dimming)) and
 `vesselstack/v1/displays/<username>/status`.
@@ -1619,12 +1677,20 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 [Home Assistant items](#home-assistant-items)) and `vesselstack/v1/bridge/homeassistant`; the combined alarm state is
 `vesselstack/v1/alarms/summary` (see [Alarm summary and takeover](#alarm-summary-and-takeover)).
 
+- `cu` (unit tag, numeric instruments and numeric Home Assistant items only): the
+  first 8 hexadecimal characters of the SHA-256 of `<convert>|<unit>|<precision>`
+  (Home Assistant items use `ha` as the conversion), placed last. It changes
+  whenever the conversion, unit or precision of the item changes. It is reserved for
+  a future display-firmware check, so that a display built for another unit can show
+  `--` instead of the new number under the old label; **that check is not active
+  yet**, current firmware reads only `st`, `v` and `sev` (and `k` for Home Assistant
+  items) and ignores `u` and `cu`. Notification payloads and non-numeric Home
+  Assistant items do not carry it.
 - `sev` (optional): instruments that have `thresholds` also publish
   `"sev":"ok"|"warn"|"alarm"|"unknown"`, placed after `st` (for example
   `{"v":12.1,"u":"V","st":"ok","sev":"warn","ts":"...","age":0.4}`). It is
   `unknown` whenever `st` is not `ok`. Instruments without `thresholds` have no
-  `sev` field and their payloads are byte-for-byte unchanged, so this is
-  backward compatible: firmware built before this feature ignores `sev` and
+  `sev` field, so this is backward compatible: firmware built before this feature ignores `sev` and
   keeps working, but new firmware (a rebuild and reflash) is needed to show the
   colours. A change of `sev` is published like a value change (at most once per
   `min_interval_ms`).

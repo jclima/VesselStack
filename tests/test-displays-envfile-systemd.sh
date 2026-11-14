@@ -68,10 +68,13 @@ PY
 
 # The rendered bridge unit must verify cleanly under the container's systemd.
 sed -e 's|@VESSELSTACK_USER@|vesselstack|g' -e 's|@VESSELSTACK_ROOT@|/opt/vesselstack|g' \
+    -e 's|@VESSELSTACK_DATA@|/var/lib/vesselstack|g' \
     "$REPO_ROOT/systemd/vesselstack-displays-bridge.service.in" > "$WORK/vesselstack-displays-bridge.service"
 docker exec "$NAME" useradd --system --no-create-home vesselstack
 docker exec "$NAME" mkdir -p /opt/vesselstack/displays/.venv/bin /opt/vesselstack/config
 docker exec "$NAME" sh -c 'touch /opt/vesselstack/displays/bridge.py /opt/vesselstack/config/displays-bridge.env /opt/vesselstack/displays/.venv/bin/python && chmod 0755 /opt/vesselstack/displays/.venv/bin/python'
+grep -qx 'Environment=VESSELSTACK_DISPLAYS_STATE_DIR=/var/lib/vesselstack/displays-bridge' "$WORK/vesselstack-displays-bridge.service"
+grep -qx 'ReadWritePaths=-/var/lib/vesselstack/displays-bridge' "$WORK/vesselstack-displays-bridge.service"
 docker cp "$WORK/vesselstack-displays-bridge.service" "$NAME:/etc/systemd/system/vesselstack-displays-bridge.service"
 verify_out=$(docker exec "$NAME" systemd-analyze verify /etc/systemd/system/vesselstack-displays-bridge.service 2>&1) || {
     echo "$verify_out" >&2

@@ -1381,6 +1381,8 @@ ensure_container_data_dir "$VESSELSTACK_DATA/prometheus" "$PROMETHEUS_CONTAINER_
 BOAT_CHAT_STATE="$VESSELSTACK_DATA/boat-chat"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$BOAT_CHAT_STATE"
 install -d -m 0700 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA/alerts"
+# The displays bridge keeps its lost-alarm latch and alarm counter here (ReadWritePaths of its unit).
+install -d -m 0700 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$VESSELSTACK_DATA/displays-bridge"
 # Quarantined legacy state lives OUTSIDE every service-writable tree.
 QUARANTINE_ROOT="$SYSTEM_ROOT/var/lib/vesselstack/quarantine"
 ensure_quarantine_root() {

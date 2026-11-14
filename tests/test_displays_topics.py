@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,15 @@ CONFIG = {
 SOG = "navigation.speedOverGround"
 TS = "2026-01-01T00:00:00.000Z"
 KN = 1852 / 3600  # 1 knot in m/s
+
+
+_TS_COUNTER = iter(range(1, 10 ** 6))
+
+
+def nts():
+    """A fresh SignalK timestamp each call: an instrument reading repeated with the same one is ignored."""
+    return (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=next(_TS_COUNTER))).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def decode(msgs):
@@ -46,24 +56,25 @@ class EngineTests(unittest.TestCase):
         topic, payload, retain = msgs[0]
         self.assertEqual(topic, "vesselstack/v1/instruments/sog")
         self.assertTrue(retain)
-        self.assertEqual(payload, '{"v":6.4,"u":"kn","st":"ok","ts":"%s","age":0.0}' % TS)
+        self.assertEqual(payload, '{"v":6.4,"u":"kn","st":"ok","ts":"%s","age":0.0,"cu":"%s"}'
+                         % (TS, topics.unit_tag("m/s->kn", "kn", 1)))
 
     def test_unchanged_value_not_republished(self) -> None:
-        self.engine.update(SOG, 6.4 * KN, TS, 100.0)
-        self.assertEqual(self.engine.update(SOG, 6.4 * KN, TS, 101.0), [])
-        self.assertEqual(self.engine.update(SOG, 6.4004 * KN, TS, 102.0), [])  # rounds the same
+        self.engine.update(SOG, 6.4 * KN, nts(), 100.0)
+        self.assertEqual(self.engine.update(SOG, 6.4 * KN, nts(), 101.0), [])
+        self.assertEqual(self.engine.update(SOG, 6.4004 * KN, nts(), 102.0), [])  # rounds the same
 
     def test_min_interval_rate_limit_then_flush_on_tick(self) -> None:
-        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
-        self.assertEqual(self.engine.update(SOG, 7.0 * KN, TS, 100.2), [])
+        self.engine.update(SOG, 6.0 * KN, nts(), 100.0)
+        self.assertEqual(self.engine.update(SOG, 7.0 * KN, nts(), 100.2), [])
         sog = lambda msgs: [m for m in decode(msgs) if m[0].endswith("/sog")]  # noqa: E731
         self.assertEqual(sog(self.engine.tick(100.3)), [])
         flushed = sog(self.engine.tick(100.6))
         self.assertEqual(flushed[0][1]["v"], 7.0)
-        self.assertEqual(decode(self.engine.update(SOG, 8.0 * KN, TS, 101.2))[0][1]["v"], 8.0)
+        self.assertEqual(decode(self.engine.update(SOG, 8.0 * KN, nts(), 101.2))[0][1]["v"], 8.0)
 
     def test_heartbeat_republish_with_age(self) -> None:
-        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
+        self.engine.update(SOG, 6.0 * KN, nts(), 100.0)
         self.assertEqual([m for m in self.engine.tick(103.0) if m[0].endswith("/sog")], [])
         beat = [m for m in decode(self.engine.tick(105.0)) if m[0].endswith("/sog")]
         self.assertEqual(beat[0][1]["st"], "ok")
@@ -78,7 +89,7 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(stale[0][1]["v"])
         self.assertEqual(stale[0][1]["ts"], TS)
         self.assertEqual(stale[0][1]["age"], 10.5)
-        again = sog(self.engine.update(SOG, 6.0 * KN, TS, 111.0))
+        again = sog(self.engine.update(SOG, 6.0 * KN, nts(), 111.0))
         self.assertEqual(again[0][1]["st"], "ok")
         self.assertEqual(again[0][1]["v"], 6.0)
 
@@ -90,48 +101,48 @@ class EngineTests(unittest.TestCase):
             self.assertEqual((payload["st"], payload["v"], payload["ts"], payload["age"]), ("missing", None, None, None))
         self.assertEqual(self.engine.tick(1.0), [])
         self.assertEqual(len(self.engine.tick(5.0)), 2)  # heartbeat
-        self.assertEqual(decode(self.engine.update(SOG, KN, TS, 6.0))[0][1]["st"], "ok")
+        self.assertEqual(decode(self.engine.update(SOG, KN, nts(), 6.0))[0][1]["st"], "ok")
 
     def test_invalid_values_make_the_instrument_missing_once(self) -> None:
         for bad in (None, True, False, "6.4", float("nan"), float("inf"), {"a": 1}, [1]):
             engine = topics.Engine(CONFIG)
-            msgs = decode(engine.update(SOG, bad, TS, 1.0))
+            msgs = decode(engine.update(SOG, bad, nts(), 1.0))
             self.assertEqual([(t, p["st"], p["v"]) for t, p, _ in msgs],
                              [("vesselstack/v1/instruments/sog", "missing", None)], repr(bad))
-            self.assertEqual(engine.update(SOG, bad, TS, 1.1), [], repr(bad))   # a repeated null is not re-emitted
-        self.assertEqual(self.engine.update("unknown.path", 1.0, TS, 1.0), [])
+            self.assertEqual(engine.update(SOG, bad, nts(), 1.1), [], repr(bad))   # a repeated null is not re-emitted
+        self.assertEqual(self.engine.update("unknown.path", 1.0, nts(), 1.0), [])
         self.assertEqual(decode(self.engine.tick(2.0))[0][1]["st"], "missing")
 
     def test_invalid_value_replaces_a_fresh_reading_at_once(self) -> None:
         for bad in (None, float("nan"), float("inf"), float("-inf"), "6.4", {"a": 1}):
             engine = topics.Engine(CONFIG)
-            self.assertEqual(decode(engine.update(SOG, 6.4 * KN, TS, 1.0))[0][1]["st"], "ok")
-            msgs = decode(engine.update(SOG, bad, TS, 1.1))        # inside min_interval: still immediate
+            self.assertEqual(decode(engine.update(SOG, 6.4 * KN, nts(), 1.0))[0][1]["st"], "ok")
+            msgs = decode(engine.update(SOG, bad, nts(), 1.1))        # inside min_interval: still immediate
             self.assertEqual([(p["st"], p["v"]) for _, p, _ in msgs], [("missing", None)], repr(bad))
-            self.assertEqual(engine.update(SOG, bad, TS, 1.2), [])
-            again = decode(engine.update(SOG, 6.4 * KN, TS, 3.0))   # a later valid value recovers normally
+            self.assertEqual(engine.update(SOG, bad, nts(), 1.2), [])
+            again = decode(engine.update(SOG, 6.4 * KN, nts(), 3.0))   # a later valid value recovers normally
             self.assertEqual([(p["st"], p["v"]) for _, p, _ in again], [("ok", 6.4)])
 
     def test_invalid_value_only_affects_the_matching_path(self) -> None:
         depth = "environment.depth.belowTransducer"
-        self.engine.update(SOG, 6.4 * KN, TS, 1.0)
-        self.engine.update(depth, 3.0, TS, 1.0)
-        msgs = decode(self.engine.update(SOG, None, TS, 2.0))
+        self.engine.update(SOG, 6.4 * KN, nts(), 1.0)
+        self.engine.update(depth, 3.0, nts(), 1.0)
+        msgs = decode(self.engine.update(SOG, None, nts(), 2.0))
         self.assertEqual([t for t, _, _ in msgs], ["vesselstack/v1/instruments/sog"])
         self.assertEqual(self.engine.tick(2.5), [])                # depth is untouched and still ok
 
     def test_invalid_value_clears_severity_and_hysteresis_memory(self) -> None:
         engine = topics.Engine(SEV_CONFIG)
-        engine.update(HOUSE, 10.9, TS, 100.0)                      # alarm
-        msg = decode(engine.update(HOUSE, float("nan"), TS, 100.1))[0][1]
+        engine.update(HOUSE, 10.9, nts(), 100.0)                      # alarm
+        msg = decode(engine.update(HOUSE, float("nan"), nts(), 100.1))[0][1]
         self.assertEqual((msg["st"], msg["v"], msg["sev"]), ("missing", None, "unknown"))
         self.assertEqual(engine.summary_items()[0], ("house", "lost"))     # the alarm is latched, not cleared
         # 11.3 sits inside the alarm hold zone, but there is no memory left: warn, not alarm.
-        self.assertEqual(decode(engine.update(HOUSE, 11.3, TS, 101.0))[0][1]["sev"], "warn")
+        self.assertEqual(decode(engine.update(HOUSE, 11.3, nts(), 101.0))[0][1]["sev"], "warn")
 
     def test_source_state_disconnect_makes_ok_instruments_stale_once(self) -> None:
-        self.engine.update(SOG, 6.4 * KN, TS, 1.0)
-        self.engine.update("environment.depth.belowTransducer", 3.0, TS, 1.0)
+        self.engine.update(SOG, 6.4 * KN, nts(), 1.0)
+        self.engine.update("environment.depth.belowTransducer", 3.0, nts(), 1.0)
         msgs = decode(self.engine.source_state(False, 2.0))
         self.assertEqual(sorted((t, p["st"], p["v"]) for t, p, _ in msgs),
                          [("vesselstack/v1/instruments/depth", "stale", None),
@@ -141,40 +152,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.tick(3.5), [])
 
     def test_source_state_skips_stale_and_missing_instruments(self) -> None:
-        self.engine.update(SOG, None, TS, 1.0)                              # sog missing
-        self.engine.update("environment.depth.belowTransducer", 3.0, TS, 1.0)
+        self.engine.update(SOG, None, nts(), 1.0)                              # sog missing
+        self.engine.update("environment.depth.belowTransducer", 3.0, nts(), 1.0)
         self.engine.tick(20.0)                                              # depth stale
         self.assertEqual(self.engine.source_state(False, 21.0), [])
 
     def test_source_state_connect_emits_nothing_and_data_recovers(self) -> None:
-        self.engine.update(SOG, 6.4 * KN, TS, 1.0)
+        self.engine.update(SOG, 6.4 * KN, nts(), 1.0)
         self.engine.source_state(False, 2.0)
         self.assertEqual(self.engine.source_state(True, 3.0), [])
-        msgs = decode(self.engine.update(SOG, 6.4 * KN, TS, 4.0))
+        msgs = decode(self.engine.update(SOG, 6.4 * KN, nts(), 4.0))
         self.assertEqual([(p["st"], p["v"]) for _, p, _ in msgs], [("ok", 6.4)])
 
     def test_source_state_disconnect_clears_severity_and_hysteresis_memory(self) -> None:
         engine = topics.Engine(SEV_CONFIG)
-        engine.update(HOUSE, 10.9, TS, 100.0)                               # alarm
+        engine.update(HOUSE, 10.9, nts(), 100.0)                               # alarm
         msg = decode(engine.source_state(False, 101.0))[0][1]
         self.assertEqual((msg["st"], msg["sev"]), ("stale", "unknown"))
         self.assertEqual(engine.summary_items()[0], ("house", "lost"))     # the alarm is latched, not cleared
         engine.source_state(True, 102.0)
-        self.assertEqual(decode(engine.update(HOUSE, 11.3, TS, 103.0))[0][1]["sev"], "warn")
+        self.assertEqual(decode(engine.update(HOUSE, 11.3, nts(), 103.0))[0][1]["sev"], "warn")
 
     def test_out_of_range_values_are_missing(self) -> None:
         # 1e30 exceeds the magnitude limit; 1e308 only overflows after m/s->kn.
         for bad in (1e30, -1e30, 1e308):
             engine = topics.Engine(CONFIG)
-            msgs = decode(engine.update(SOG, bad, TS, 1.0))
+            msgs = decode(engine.update(SOG, bad, nts(), 1.0))
             self.assertEqual([p["st"] for _, p, _ in msgs], ["missing"], repr(bad))
-            self.assertEqual(engine.update(SOG, bad, TS, 1.1), [], repr(bad))
-        self.assertEqual(decode(self.engine.update(SOG, 1e30, TS, 1.0))[0][1]["st"], "missing")
+            self.assertEqual(engine.update(SOG, bad, nts(), 1.1), [], repr(bad))
+        self.assertEqual(decode(self.engine.update(SOG, 1e30, nts(), 1.0))[0][1]["st"], "missing")
         self.assertEqual(decode(self.engine.tick(2.0))[0][1]["st"], "missing")
-        msgs = decode(self.engine.update(SOG, KN * 6.4, TS, 3.0))
+        msgs = decode(self.engine.update(SOG, KN * 6.4, nts(), 3.0))
         self.assertEqual(msgs[0][1]["v"], 6.4)
         self.assertEqual(msgs[0][1]["st"], "ok")
-        self.assertEqual(decode(self.engine.update(SOG, 1e30, TS, 4.0))[0][1]["st"], "missing")
+        self.assertEqual(decode(self.engine.update(SOG, 1e30, nts(), 4.0))[0][1]["st"], "missing")
 
     def test_signed_conversion_rounding_in_payload(self) -> None:
         engine = topics.Engine({"instruments": {"awa": {"path": "environment.wind.angleApparent",
@@ -189,10 +200,10 @@ class EngineTests(unittest.TestCase):
         base = {"path": path, "convert": "none", "unit": "A", "precision": 1, "stale_after_s": 30}
         plain = topics.Engine({"instruments": {"a": dict(base)}})
         flipped = topics.Engine({"instruments": {"a": dict(base, convert="negate", thresholds={"warn_below": -20})}})
-        self.assertEqual(decode(plain.update(path, 12.34, TS, 0.0))[0][1]["v"], 12.3)
-        out = decode(flipped.update(path, 25.04, TS, 0.0))[0][1]                      # reversed: +25 A is a discharge
+        self.assertEqual(decode(plain.update(path, 12.34, nts(), 0.0))[0][1]["v"], 12.3)
+        out = decode(flipped.update(path, 25.04, nts(), 0.0))[0][1]                      # reversed: +25 A is a discharge
         self.assertEqual((out["v"], out["sev"]), (-25.0, "warn"))
-        raw = flipped.update(path, 0.0, TS, 1.0)[0][1]                                 # never "-0.0"
+        raw = flipped.update(path, 0.0, nts(), 1.0)[0][1]                                 # never "-0.0"
         self.assertIn('"v":0.0,', raw)
 
 
@@ -256,21 +267,21 @@ class SeverityPayloadTests(unittest.TestCase):
                          '{"v":1.5,"u":"V","st":"ok","sev":"warn","ts":"%s","age":0.0}' % TS)
 
     def test_sev_only_for_instruments_with_thresholds(self) -> None:
-        msgs = decode(self.engine.update(HOUSE, 13.0, TS, 100.0) + self.engine.update("x.y", 13.0, TS, 100.0))
+        msgs = decode(self.engine.update(HOUSE, 13.0, nts(), 100.0) + self.engine.update("x.y", 13.0, nts(), 100.0))
         self.assertEqual(msgs[0][1]["sev"], "ok")
         self.assertNotIn("sev", msgs[1][1])
-        self.assertEqual(list(msgs[0][1]), ["v", "u", "st", "sev", "ts", "age"])
+        self.assertEqual(list(msgs[0][1]), ["v", "u", "st", "sev", "ts", "age", "cu"])
 
     def test_sev_uses_the_unrounded_value(self) -> None:
         # 11.96 is below warn_below 12.0 although it displays as 12.0 (precision 1): warn.
-        msgs = decode(self.engine.update(HOUSE, 11.96, TS, 100.0))
+        msgs = decode(self.engine.update(HOUSE, 11.96, nts(), 100.0))
         self.assertEqual((msgs[0][1]["v"], msgs[0][1]["sev"]), (12.0, "warn"))
 
     def test_sev_boundaries_on_unrounded_values(self) -> None:
         def run(thresholds, value, precision, convert="none"):
             engine = topics.Engine({"instruments": {"d": {"path": "p", "convert": convert, "unit": "",
                                     "precision": precision, "stale_after_s": 10, "thresholds": thresholds}}})
-            body = decode(engine.update("p", value, TS, 1.0))[0][1]
+            body = decode(engine.update("p", value, nts(), 1.0))[0][1]
             return body["v"], body["sev"]
         self.assertEqual(run({"alarm_below": 3}, 2.5, 0), (3, "alarm"))     # displays 3, true 2.5
         self.assertEqual(run({"alarm_below": 3}, 3.0, 0), (3, "ok"))        # strict comparison
@@ -284,7 +295,7 @@ class SeverityPayloadTests(unittest.TestCase):
                                 "stale_after_s": 10, "min_interval_ms": 0,
                                 "thresholds": {"alarm_below": 3, "hysteresis": 0.5}}}})
         def sev(value, now):
-            engine.update("p", value, TS, now)    # the published value stays 3 throughout, so read the summary view
+            engine.update("p", value, nts(), now)    # the published value stays 3 throughout, so read the summary view
             return engine.summary_items()[0][1]
         self.assertEqual(sev(2.5, 1.0), "alarm")
         self.assertEqual(sev(3.4, 2.0), "alarm")   # inside the hold zone (needs > 3.5)
@@ -294,27 +305,27 @@ class SeverityPayloadTests(unittest.TestCase):
         engine = topics.Engine({"instruments": {"h": {"path": "p", "convert": "rad->deg_360", "unit": "deg",
                                 "precision": 0, "stale_after_s": 10,
                                 "thresholds": {"warn_above": 359.5}}}})
-        body = decode(engine.update("p", 359.6 * 3.141592653589793 / 180, TS, 1.0))[0][1]
+        body = decode(engine.update("p", 359.6 * 3.141592653589793 / 180, nts(), 1.0))[0][1]
         self.assertEqual((body["v"], body["sev"]), (0, "warn"))
 
     def test_sev_change_alone_publishes_respecting_the_rate_limit(self) -> None:
-        self.engine.update(HOUSE, 12.0, TS, 100.0)               # ok, 12.0
-        self.engine.update(HOUSE, 11.9, TS, 101.0)               # warn
-        self.assertEqual(self.engine.update(HOUSE, 11.4, TS, 102.0)[0][1].count('"warn"'), 1)  # still warn
-        msgs = decode(self.engine.update(HOUSE, 10.9, TS, 103.0))
+        self.engine.update(HOUSE, 12.0, nts(), 100.0)               # ok, 12.0
+        self.engine.update(HOUSE, 11.9, nts(), 101.0)               # warn
+        self.assertEqual(self.engine.update(HOUSE, 11.4, nts(), 102.0)[0][1].count('"warn"'), 1)  # still warn
+        msgs = decode(self.engine.update(HOUSE, 10.9, nts(), 103.0))
         self.assertEqual(msgs[0][1]["sev"], "alarm")
         # Rate limited: a sev change inside min_interval is deferred to tick.
-        self.assertEqual(self.engine.update(HOUSE, 12.9, TS, 103.2), [])
+        self.assertEqual(self.engine.update(HOUSE, 12.9, nts(), 103.2), [])
         house = lambda msgs: [m for m in decode(msgs) if m[0].endswith("/house")]  # noqa: E731
         self.assertEqual(house(self.engine.tick(103.5)), [])
         out = house(self.engine.tick(104.1))
         self.assertEqual((out[0][1]["v"], out[0][1]["sev"]), (12.9, "ok"))
 
     def test_hysteresis_applies_across_updates(self) -> None:
-        self.engine.update(HOUSE, 10.9, TS, 100.0)               # alarm
-        msgs = decode(self.engine.update(HOUSE, 11.3, TS, 101.5))  # inside hold zone (< 11.5)
+        self.engine.update(HOUSE, 10.9, nts(), 100.0)               # alarm
+        msgs = decode(self.engine.update(HOUSE, 11.3, nts(), 101.5))  # inside hold zone (< 11.5)
         self.assertEqual(msgs[0][1]["sev"], "alarm")
-        msgs = decode(self.engine.update(HOUSE, 11.6, TS, 103.0))
+        msgs = decode(self.engine.update(HOUSE, 11.6, nts(), 103.0))
         self.assertEqual(msgs[0][1]["sev"], "warn")
 
     def test_stale_and_missing_are_unknown(self) -> None:
@@ -322,20 +333,20 @@ class SeverityPayloadTests(unittest.TestCase):
         self.assertEqual(first[0][1]["st"], "missing")
         self.assertEqual(first[0][1]["sev"], "unknown")
         self.assertNotIn("sev", first[1][1])
-        self.engine.update(HOUSE, 13.0, TS, 101.0)
+        self.engine.update(HOUSE, 13.0, nts(), 101.0)
         stale = decode(self.engine.tick(120.0))
         house = [m for m in stale if m[0].endswith("/house")][0][1]
         self.assertEqual((house["st"], house["v"], house["sev"]), ("stale", None, "unknown"))
 
     def test_recovery_after_stale_has_no_hysteresis_memory(self) -> None:
-        self.engine.update(HOUSE, 10.9, TS, 100.0)               # alarm
+        self.engine.update(HOUSE, 10.9, nts(), 100.0)               # alarm
         self.engine.tick(120.0)                                  # stale
-        msgs = decode(self.engine.update(HOUSE, 11.3, TS, 121.0))
+        msgs = decode(self.engine.update(HOUSE, 11.3, nts(), 121.0))
         self.assertEqual(msgs[0][1]["sev"], "warn")
 
     def test_existing_payloads_are_unchanged_without_thresholds(self) -> None:
         engine = topics.Engine(CONFIG)
-        topic, payload, _ = engine.update(SOG, 6.4 * KN, TS, 100.0)[0]
+        topic, payload, _ = engine.update(SOG, 6.4 * KN, nts(), 100.0)[0]
         self.assertNotIn("sev", payload)
 
 
@@ -386,7 +397,7 @@ class AlarmSummaryTests(unittest.TestCase):
         engine = topics.Engine(cfg)
         self.assertEqual(engine.summary_items(), [("depth", "unknown"), ("forced", "unknown")])
         for path in "dmpf":
-            engine.update(path, 2.0, TS, 0.0)
+            engine.update(path, 2.0, nts(), 0.0)
         self.assertEqual(engine.summary_items(), [("depth", "alarm"), ("forced", "ok")])
         engine.tick(11.0)
         # depth was in alarm when its data stopped: lost (still an alarm); forced was ok: unknown
@@ -667,9 +678,9 @@ class EventEngineTests(unittest.TestCase):
     def test_instrument_engine_marks_non_numeric_values_missing(self) -> None:
         engine = topics.Engine({"instruments": {"n": {"path": ANCHOR, "convert": "none", "unit": "",
                                                        "precision": 0, "stale_after_s": 10}}})
-        msgs = decode(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.0))
+        msgs = decode(engine.update(ANCHOR, {"state": "alarm"}, nts(), 0.0))
         self.assertEqual([p["st"] for _, p, _ in msgs], ["missing"])
-        self.assertEqual(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.1), [])
+        self.assertEqual(engine.update(ANCHOR, {"state": "alarm"}, nts(), 0.1), [])
 
 
 class ClockTests(unittest.TestCase):
@@ -761,7 +772,7 @@ class LostAlarmTests(unittest.TestCase):
 
     def test_alarm_then_stale_is_lost(self) -> None:
         engine = self.instruments()
-        engine.update("d", 2.0, TS, 0.0)
+        engine.update("d", 2.0, nts(), 0.0)
         engine.tick(11.0)
         got = self.summary(engine.summary_items())
         self.assertEqual((got["max"], got["na"], got["nu"], got["nl"], got["ids"], got["lost"]),
@@ -772,16 +783,16 @@ class LostAlarmTests(unittest.TestCase):
     def test_alarm_then_null_or_invalid_is_lost(self) -> None:
         for bad in (None, float("nan"), "x"):
             engine = self.instruments()
-            engine.update("d", 2.0, TS, 0.0)
-            engine.update("d", bad, TS, 1.0)
+            engine.update("d", 2.0, nts(), 0.0)
+            engine.update("d", bad, nts(), 1.0)
             self.assertEqual(engine.summary_items(), [("depth", "lost")], repr(bad))
-            engine.update("d", bad, TS, 2.0)                      # repeated: still lost
+            engine.update("d", bad, nts(), 2.0)                      # repeated: still lost
             self.assertEqual(engine.summary_items(), [("depth", "lost")], repr(bad))
 
     def test_alarm_then_signalk_disconnect_is_lost_for_instruments_and_notifications(self) -> None:
         engine, events = self.instruments(), topics.EventEngine(SEQ_ENGINE_CONFIG)
         events.source_state("signalk", True, 0.0)
-        engine.update("d", 2.0, TS, 0.0)
+        engine.update("d", 2.0, nts(), 0.0)
         events.update(ANCHOR, {"state": "alarm"}, TS, 0.0)
         engine.source_state(False, 1.0)
         events.source_state("signalk", False, 1.0)
@@ -795,7 +806,7 @@ class LostAlarmTests(unittest.TestCase):
     def test_only_an_alarm_is_latched(self) -> None:
         for value in (5.0, 8.0):                                  # warn, ok
             engine = self.instruments()
-            engine.update("d", value, TS, 0.0)
+            engine.update("d", value, nts(), 0.0)
             engine.tick(11.0)
             self.assertEqual(engine.summary_items(), [("depth", "unknown")])
         events = topics.EventEngine(SEQ_ENGINE_CONFIG)
@@ -807,12 +818,12 @@ class LostAlarmTests(unittest.TestCase):
     def test_fresh_reading_clears_the_latch(self) -> None:
         for value, want in ((8.0, "ok"), (5.0, "warn"), (2.0, "alarm")):
             engine = self.instruments()
-            engine.update("d", 2.0, TS, 0.0)
+            engine.update("d", 2.0, nts(), 0.0)
             engine.source_state(False, 1.0)
             self.assertEqual(engine.summary_items(), [("depth", "lost")])
             engine.source_state(True, 2.0)
             self.assertEqual(engine.summary_items(), [("depth", "lost")])    # connecting alone proves nothing
-            engine.update("d", value, TS, 3.0)
+            engine.update("d", value, nts(), 3.0)
             self.assertEqual(engine.summary_items(), [("depth", want)])
             engine.tick(20.0)                                                # a later loss of a non-alarm is unknown
             expected = "lost" if want == "alarm" else "unknown"
@@ -896,9 +907,111 @@ class LostAlarmTests(unittest.TestCase):
 
     def test_an_item_removed_from_the_configuration_is_gone(self) -> None:
         engine = self.instruments()
-        engine.update("d", 2.0, TS, 0.0)
+        engine.update("d", 2.0, nts(), 0.0)
         engine.source_state(False, 1.0)
         self.assertEqual(engine.summary_items(), [("depth", "lost")])
         rebuilt = topics.Engine(dict(SEQ_ENGINE_CONFIG, instruments={}))      # the bridge rebuilds engines from the config
         self.assertEqual(rebuilt.summary_items(), [])
         self.assertIsNone(topics.alarm_summary(rebuilt.summary_items(), "T"))
+
+
+class RepeatedTimestampTests(unittest.TestCase):
+    """Slice S5: a delta with the same timestamp as the last accepted one is a re-sent old value."""
+
+    def setUp(self) -> None:
+        self.engine = topics.Engine(CONFIG)
+
+    def sog(self, msgs):
+        return [json.loads(p) for t, p, _ in msgs if t.endswith("/sog")]
+
+    def test_a_repeated_timestamp_does_not_refresh_and_the_instrument_goes_stale_on_schedule(self) -> None:
+        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
+        for now in (104.0, 108.0, 110.0):
+            self.assertEqual(self.engine.update(SOG, 6.0 * KN, TS, now), [])       # re-sent: ignored
+        stale = self.sog(self.engine.tick(110.5))
+        self.assertEqual((stale[0]["st"], stale[0]["v"], stale[0]["age"]), ("stale", None, 10.5))
+
+    def test_a_stale_instrument_stays_stale_when_the_old_value_is_re_sent(self) -> None:
+        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
+        self.engine.tick(111.0)
+        self.assertEqual(self.engine.update(SOG, 6.0 * KN, TS, 112.0), [])
+        self.assertEqual(dict(self.engine.summary_items()), {})
+        self.assertEqual(self.engine._state["sog"].state, "stale")
+        self.assertEqual(self.sog(self.engine.tick(116.5))[0]["st"], "stale")     # heartbeat: still stale
+
+    def test_a_stale_instrument_stays_stale_after_a_reconnect_re_sends_the_cached_value(self) -> None:
+        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
+        self.engine.source_state(False, 101.0)
+        self.engine.source_state(True, 102.0)
+        self.assertEqual(self.engine.update(SOG, 6.0 * KN, TS, 102.1), [])
+        self.assertEqual(self.engine._state["sog"].state, "stale")
+
+    def test_a_different_timestamp_is_fresh_again_newer_or_older(self) -> None:
+        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
+        self.engine.tick(111.0)
+        back = self.sog(self.engine.update(SOG, 6.0 * KN, "2026-01-01T00:00:01.000Z", 112.0))
+        self.assertEqual((back[0]["st"], back[0]["v"]), ("ok", 6.0))
+        older = self.sog(self.engine.update(SOG, 7.0 * KN, "2025-12-31T23:59:59.000Z", 113.0))
+        self.assertEqual((older[0]["st"], older[0]["v"]), ("ok", 7.0))
+
+    def test_the_comparison_is_per_instrument_and_per_path(self) -> None:
+        self.engine.update(SOG, 6.0 * KN, TS, 100.0)
+        depth = self.engine.update("environment.depth.belowTransducer", 3.0, TS, 100.0)
+        self.assertEqual(len(depth), 1)       # another instrument with the same timestamp is not a repeat
+
+    def test_without_a_timestamp_the_behaviour_is_unchanged(self) -> None:
+        self.engine.update(SOG, 6.0 * KN, None, 100.0)
+        self.engine.tick(105.0)
+        self.assertEqual(self.engine._state["sog"].received, 100.0)
+        self.engine.update(SOG, 6.0 * KN, None, 109.0)
+        self.assertEqual(self.engine._state["sog"].received, 109.0)
+        self.engine.update(SOG, 6.0 * KN, 12345, 112.0)                    # a non-string timestamp is "none"
+        self.assertEqual(self.engine._state["sog"].received, 112.0)
+
+    def test_a_missing_timestamp_is_logged_once_per_instrument(self) -> None:
+        with self.assertLogs(topics.LOG, level="INFO") as logs:
+            for now in (1.0, 2.0, 3.0):
+                self.engine.update(SOG, 6.0 * KN, None, now)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("sog", logs.output[0])
+
+    def test_a_repeated_null_is_ignored_too(self) -> None:
+        self.assertEqual(len(self.engine.update(SOG, None, TS, 1.0)), 1)
+        self.assertEqual(self.engine.update(SOG, None, TS, 2.0), [])
+
+
+class UnitTagTests(unittest.TestCase):
+    """Slice S6: ``cu`` identifies the conversion, unit and precision a number was produced with."""
+
+    def test_the_tag_is_eight_hex_characters_and_stable(self) -> None:
+        tag = topics.unit_tag("m/s->kn", "kn", 1)
+        self.assertRegex(tag, r"^[0-9a-f]{8}$")
+        self.assertEqual(tag, topics.unit_tag("m/s->kn", "kn", 1))
+        import hashlib
+        self.assertEqual(tag, hashlib.sha256(b"m/s->kn|kn|1").hexdigest()[:8])
+
+    def test_the_tag_changes_with_each_input(self) -> None:
+        base = topics.unit_tag("m/s->kn", "kn", 1)
+        self.assertNotEqual(base, topics.unit_tag("m/s->kmh", "kn", 1))
+        self.assertNotEqual(base, topics.unit_tag("m/s->kn", "km/h", 1))
+        self.assertNotEqual(base, topics.unit_tag("m/s->kn", "kn", 2))
+
+    def test_numeric_instruments_carry_cu_last_and_notifications_do_not(self) -> None:
+        engine = topics.Engine(CONFIG)
+        for _, body, _ in decode(engine.tick(0.0)):          # missing payloads carry it too
+            self.assertRegex(body["cu"], r"^[0-9a-f]{8}$")
+        body = decode(engine.update(SOG, 6.0 * KN, TS, 1.0))[0][1]
+        self.assertEqual(body["cu"], topics.unit_tag("m/s->kn", "kn", 1))
+        self.assertEqual(list(body)[-1], "cu")
+        events = topics.EventEngine(NOTE_CONFIG)
+        events.source_state("signalk", True, 0.0)
+        for _, note, _ in decode(events.tick(10.0)):
+            self.assertNotIn("cu", note)
+
+    def test_ha_numeric_items_carry_cu_and_other_kinds_do_not(self) -> None:
+        engine = topics.HaEngine(HA_CONFIG)
+        engine.source_state(True, 0.0)
+        out = {t.rsplit("/", 1)[1]: json.loads(p) for t, p, _ in engine.tick(10.0)}
+        self.assertEqual(out["temp"]["cu"], topics.unit_tag("ha", "C", 1))
+        self.assertNotIn("cu", out["bilge"])
+        self.assertNotIn("cu", out["shore"])

@@ -1,13 +1,17 @@
 """MQTT topics, payloads and the freshness state machine. Pure logic: no I/O, clock injected."""
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
 from urllib.parse import urlsplit, urlunsplit
 
 import conversions
 import severity
 from schema import DEFAULT_HEARTBEAT_S, DEFAULT_MIN_INTERVAL_MS
+
+LOG = logging.getLogger("vesselstack.displays.topics")
 
 TOPIC_ROOT = "vesselstack/v1"
 INSTRUMENT_TOPIC_PREFIX = f"{TOPIC_ROOT}/instruments/"
@@ -44,12 +48,19 @@ def display_status_topic(username: str) -> str:
     return DISPLAY_STATUS_TOPIC.format(username=username)
 
 
-def build_payload(value, unit, state, ts, age, sev=None) -> str:
-    """JSON payload; ``sev`` is added (after ``st``) only when not None."""
+def unit_tag(convert, unit, precision) -> str:
+    """First 8 hex characters of SHA-256 over ``convert|unit|precision``: changes when the number's meaning does."""
+    return hashlib.sha256(f"{convert}|{unit}|{precision}".encode("utf-8")).hexdigest()[:8]
+
+
+def build_payload(value, unit, state, ts, age, sev=None, cu=None) -> str:
+    """JSON payload; ``sev`` is added (after ``st``) only when not None, ``cu`` (unit tag, last) likewise."""
     body = {"v": value, "u": unit, "st": state}
     if sev is not None:
         body["sev"] = sev
     body.update({"ts": ts, "age": age})
+    if cu is not None:
+        body["cu"] = cu
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -74,6 +85,8 @@ class _State:
         self.pub_time = None
         self.dirty = False
         self.latched = None        # time an alarm lost its data; None unless the item was in alarm when data stopped
+        self.seen_ts = None        # timestamp string of the last accepted delta (a repeat of it is ignored)
+        self.no_ts_logged = False
 
 
 class Engine:
@@ -83,12 +96,30 @@ class Engine:
         self.heartbeat_s = config.get("heartbeat_s", DEFAULT_HEARTBEAT_S)
         self.instruments = config["instruments"]
         self._state = {iid: _State() for iid in self.instruments}
+        self._cu = {iid: unit_tag(inst["convert"], inst["unit"], inst["precision"])
+                    for iid, inst in self.instruments.items()}
         self._by_path: dict[str, list[str]] = {}
         for iid, inst in self.instruments.items():
             self._by_path.setdefault(inst["path"], []).append(iid)
 
     def paths(self):
         return list(self._by_path)
+
+    def _counts(self, iid) -> bool:
+        inst = self.instruments[iid]
+        return bool(inst.get("alarm", "thresholds" in inst))
+
+    def latched_ids(self) -> list:
+        """Ids (config order) that count for the alarm summary and are in the lost state."""
+        return [iid for iid, st in self._state.items() if st.latched is not None and self._counts(iid)]
+
+    def restore_latched(self, ids, now: float) -> list:
+        """Mark persisted lost ids (still configured and counted) as lost; returns the ids restored."""
+        wanted = set(ids)
+        restored = [iid for iid in self.instruments if iid in wanted and self._counts(iid)]
+        for iid in restored:
+            self._state[iid].latched = now
+        return restored
 
     def _min_interval(self, iid) -> float:
         return self.instruments[iid].get("min_interval_ms", DEFAULT_MIN_INTERVAL_MS) / 1000.0
@@ -102,7 +133,7 @@ class Engine:
         if "thresholds" in inst:
             sev = st.sev if ok and st.sev is not None else "unknown"
             st.pub_sev = sev
-        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev)
+        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev, self._cu[iid])
         return (instrument_topic(iid), payload, True)
 
     @staticmethod
@@ -124,11 +155,25 @@ class Engine:
 
         A null, NaN, infinite, non-numeric or unconvertible value makes the matching instruments
         "missing" at once (a previous reading is never kept alive), published once.
+
+        A delta whose timestamp string equals that of the last accepted delta for the instrument is a
+        repeat of something already seen (a cached value re-sent by SignalK) and is ignored: it never
+        refreshes the reading or brings a stale/missing instrument back. A different timestamp (newer or
+        older) is accepted; a delta without one is accepted as before.
         """
         raw = numeric(value)
         out = []
         for iid in self._by_path.get(path, ()):
             inst, st = self.instruments[iid], self._state[iid]
+            if isinstance(ts, str):
+                if ts == st.seen_ts:
+                    continue
+                st.seen_ts = ts
+            else:
+                st.seen_ts = None
+                if not st.no_ts_logged:
+                    st.no_ts_logged = True
+                    LOG.info("%s: SignalK delta without a timestamp; a re-sent old value cannot be detected", iid)
             converted = rounded = None
             if raw is not None:
                 try:
@@ -245,6 +290,19 @@ class EventEngine:
     def paths(self):
         return list(self._by_path)
 
+    def latched_ids(self) -> list:
+        """Ids (config order) that count for the alarm summary and are in the lost state."""
+        return [nid for nid, st in self._state.items()
+                if st.latched is not None and self.notifications[nid].get("alarm", True)]
+
+    def restore_latched(self, ids, now: float) -> list:
+        """Mark persisted lost ids (still configured and counted) as lost; returns the ids restored."""
+        wanted = set(ids)
+        restored = [nid for nid, note in self.notifications.items() if nid in wanted and note.get("alarm", True)]
+        for nid in restored:
+            self._state[nid].latched = now
+        return restored
+
     def _freshness(self) -> str:
         if self.connected:
             return "ok"
@@ -348,6 +406,18 @@ class HaEngine:
     def entity_ids(self):
         return list(self._by_entity)
 
+    def latched_ids(self) -> list:
+        """Ids (config order) that count for the alarm summary and are in the lost state."""
+        return [hid for hid, st in self._state.items() if st.latched is not None and self.items[hid].get("alarm", True)]
+
+    def restore_latched(self, ids, now: float) -> list:
+        """Mark persisted lost ids (still configured and counted) as lost; returns the ids restored."""
+        wanted = set(ids)
+        restored = [hid for hid, item in self.items.items() if hid in wanted and item.get("alarm", True)]
+        for hid in restored:
+            self._state[hid].latched = now
+        return restored
+
     def _freshness(self, hid) -> str:
         st = self._state[hid]
         if self.connected:
@@ -369,6 +439,8 @@ class HaEngine:
         st.pub, st.pub_time = view, now
         body = {"v": view[3], "k": view[2], "u": item.get("unit", ""), "st": view[0], "sev": view[1],
                 "ts": st.ts, "age": age}
+        if item.get("kind") == "numeric":
+            body["cu"] = unit_tag("ha", item.get("unit", ""), item.get("precision"))
         return (ha_topic(hid), json.dumps(body, separators=(",", ":"), ensure_ascii=False), True)
 
     def source_state(self, connected: bool, now: float) -> list:

@@ -290,6 +290,26 @@ def counts_for_alarm_summary(cfg: dict) -> bool:
                for h in (ha.values() if isinstance(ha, dict) else ()))
 
 
+SILENT_UNTIL_TRIGGERED_PATHS = ("notifications.fire", "notifications.flooding")
+
+
+def config_warnings(cfg) -> list[str]:
+    """Advisory findings on a valid config; never errors (they do not stop a build or the bridge).
+
+    A fire or flooding notification set to read "ok" when nothing was reported shows a green tile on a
+    boat with no such sensor, or with a dead one that is silent until triggered.
+    """
+    notifications = cfg.get("notifications") if isinstance(cfg, dict) else None
+    out = []
+    for nid, note in (notifications.items() if isinstance(notifications, dict) else ()):
+        if (isinstance(note, dict) and note.get("path") in SILENT_UNTIL_TRIGGERED_PATHS
+                and note.get("absent", "ok") == "ok"):
+            out.append(f"$.notifications.{nid}.absent: \"ok\" shows a green OK tile when no {note['path'].rsplit('.', 1)[1]} "
+                       "source reports (or its sensor is dead and silent until triggered); "
+                       "\"unknown\" shows -- until a source reports through Signal K")
+    return out
+
+
 def validate_night_schedule(value, where: str, errors: list) -> bool:
     """``{"start": "HH:MM", "end": "HH:MM"}`` in 24 h local time; the window may cross midnight."""
     if not isinstance(value, dict):

@@ -228,6 +228,10 @@ test -s "$unit"
 grep -q "^User=$(id -un)\$" "$unit"
 grep -q "^EnvironmentFile=$APP_ROOT/config/displays-bridge.env\$" "$unit"
 grep -q "^ExecStart=$APP_ROOT/displays/.venv/bin/python $APP_ROOT/displays/bridge.py\$" "$unit"
+grep -qx "Environment=VESSELSTACK_DISPLAYS_STATE_DIR=$DATA_ROOT/displays-bridge" "$unit"
+grep -qx "ReadWritePaths=-$DATA_ROOT/displays-bridge" "$unit"
+test -d "$DATA_ROOT/displays-bridge"
+test "$(stat -c '%a' "$DATA_ROOT/displays-bridge")" = "700"
 if grep -q '@' "$unit"; then echo "Unit contains an unrendered placeholder" >&2; exit 1; fi
 grep -qx 'disable --now vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"
 if grep -qx 'enable vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"; then

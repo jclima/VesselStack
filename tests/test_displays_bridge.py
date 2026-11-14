@@ -366,6 +366,228 @@ class AlarmSeqTests(unittest.TestCase):
         self.assertEqual((last["max"], last["lost"], last["seq"]), ("alarm", ["a"], s1))
 
 
+PERSIST_CONFIG = {
+    "heartbeat_s": 5,
+    "instruments": {"sog": dict(CONFIG["instruments"]["sog"], thresholds={"alarm_below": 5.0})},
+    "notifications": {"anchor": {"path": NOTE_PATH, "label": "Anchor"}},
+    "ha": {"high": {"entity_id": "binary_sensor.high_water", "label": "High water", "kind": "binary",
+                    "states": [{"match": "high", "sev": "alarm", "text": "HIGH"}]}},
+}
+
+
+class StatePersistenceTests(unittest.TestCase):
+    """Slice S3: the lost-alarm latch and the alarm counter survive a bridge restart."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+        self.file = os.path.join(self.dir, "state.json")
+        self.n = 0
+
+    def make(self, config=PERSIST_CONFIG, state_dir="default"):
+        clock = FakeClock()
+        pub = FakePublisher()
+        b = bridge.Bridge(config, pub, None, clock=clock, state_dir=self.dir if state_dir == "default" else state_dir)
+        return b, pub
+
+    def ts(self):
+        self.n += 1
+        return f"2026-01-01T00:00:{self.n:02d}.000Z"
+
+    def sog(self, value):
+        return json.dumps({"updates": [{"timestamp": self.ts(), "values": [{"path": SOG, "value": value}]}]})
+
+    def last(self, pub):
+        return json.loads([p for t, p, _, _ in pub.sent if t == SUMMARY][-1])
+
+    def state(self):
+        with open(self.file, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def alarm_everything(self, b):
+        """SignalK and Home Assistant up; the instrument, the notification and the HA item in alarm; then both drop."""
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.has.source_state(True, b.clock())
+        b.clock.now += 10
+        b.handle_message(self.sog(1 * KN))
+        b.handle_message(note_delta({"state": "alarm"}))
+        b.has.set_state("binary_sensor.high_water", "HIGH", "t", b.clock())
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(b.publisher)["na"], 3)
+        b._set_signalk(bridge.SIGNALK_DISCONNECTED)
+        b.has.source_state(False, b.clock())
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(b.publisher)["nl"], 3)
+
+    def test_latch_and_seq_survive_a_restart(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        seq = first._alarm_seq
+        self.assertEqual(self.state(), {"format": 1, "seq": seq, "latched": {
+            "instruments": ["sog"], "notifications": ["anchor"], "ha": ["high"]}})
+        second, pub = self.make()
+        self.assertEqual(second._alarm_seq, seq)
+        second._publish_summary(second.clock())
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["na"], body["nl"], body["nu"], body["seq"]), ("alarm", 3, 3, 0, seq))
+        self.assertEqual(sorted(body["lost"]), ["anchor", "high", "sog"])
+
+    def test_a_clean_shutdown_keeps_the_latch_and_the_next_start_continues(self):
+        first, _ = self.make()
+        first._set_signalk(bridge.SIGNALK_CONNECTED)
+        first.clock.now += 10
+        first.handle_message(self.sog(1 * KN))
+        seq = first._alarm_seq
+        first.shutdown()
+        self.assertEqual(self.state()["latched"]["instruments"], ["sog"])
+        second, _ = self.make()
+        self.assertEqual(second._alarm_seq, seq)
+
+    def test_restored_lost_items_are_known_so_a_restart_is_not_a_new_alarm(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        seq = first._alarm_seq
+        second, pub = self.make()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(1 * KN))                 # the same alarm is live again: lost -> alarm
+        self.assertEqual((self.last(pub)["seq"], self.last(pub)["nl"]), (seq, 2))
+        second.handle_message(note_delta({"state": "alarm"}))
+        self.assertEqual((self.last(pub)["seq"], self.last(pub)["nl"], self.last(pub)["na"]), (seq, 1, 3))
+
+    def test_a_fresh_ok_clears_the_latch_and_the_file_is_rewritten_without_it(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        second, pub = self.make()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(10 * KN))
+        self.assertNotIn("sog", self.last(pub)["lost"])
+        self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": ["anchor"], "ha": ["high"]})
+        second.handle_message(note_delta(None))
+        self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": [], "ha": ["high"]})
+
+    def test_ids_no_longer_configured_or_no_longer_counted_are_dropped_on_load(self):
+        first, _ = self.make()
+        self.alarm_everything(first)
+        smaller = dict(PERSIST_CONFIG, ha={}, notifications={"anchor": dict(PERSIST_CONFIG["notifications"]["anchor"],
+                                                                         alarm=False)})
+        second, pub = self.make(smaller)
+        second._publish_summary(second.clock())
+        self.assertEqual(self.last(pub)["lost"], ["sog"])
+        self.assertEqual(self.state()["latched"], {"instruments": ["sog"], "notifications": [], "ha": []})
+
+    def test_a_missing_file_means_nothing_latched_and_a_random_seq_which_is_then_written(self):
+        b, pub = self.make()
+        self.assertFalse(os.path.exists(self.file))
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(pub)["nl"], 0)
+        self.assertEqual(self.state(), {"format": 1, "seq": b._alarm_seq,
+                                        "latched": {"instruments": [], "notifications": [], "ha": []}})
+
+    def assert_ignored_and_overwritten(self, content):
+        with open(self.file, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        with self.assertLogs(bridge.LOG, "WARNING") as logs:
+            b, pub = self.make()
+        self.assertIn("state.json", logs.output[0])
+        b._publish_summary(b.clock())
+        self.assertEqual(self.last(pub)["nl"], 0)
+        self.assertEqual(self.state()["seq"], b._alarm_seq)       # overwritten at the next evaluation
+        self.assertEqual(self.state()["format"], 1)
+
+    def test_a_corrupt_file_is_ignored_with_a_warning_and_overwritten(self):
+        self.assert_ignored_and_overwritten("{not json")
+
+    def test_an_unknown_format_or_invalid_content_is_ignored(self):
+        for content in ('{"format":2,"seq":5,"latched":{}}', '[]', '{"format":1,"seq":-1,"latched":{}}',
+                        '{"format":1,"seq":true,"latched":{}}', '{"format":1,"seq":1,"latched":{"ha":[1]}}',
+                        '{"format":1,"seq":1}', '\xff'):
+            self.assert_ignored_and_overwritten(content)
+
+    def test_without_a_state_dir_one_warning_and_nothing_is_written(self):
+        for state_dir in (None, ""):
+            with self.assertLogs(bridge.LOG, "WARNING") as logs:
+                b, pub = self.make(state_dir=state_dir)
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn(bridge.STATE_DIR_ENV, logs.output[0])
+            b._set_signalk(bridge.SIGNALK_CONNECTED)
+            b._publish_summary(b.clock())
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_an_unusable_directory_warns_once_and_runs_without_persistence(self):
+        missing = os.path.join(self.dir, "nope")
+        with self.assertLogs(bridge.LOG, "WARNING") as logs:
+            b, pub = self.make(state_dir=missing)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(bridge.STATE_DIR_ENV, logs.output[0])
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b._publish_summary(b.clock())
+        self.assertFalse(os.path.exists(missing))
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            os.chmod(self.dir, 0o500)
+            self.addCleanup(os.chmod, self.dir, 0o700)
+            with self.assertLogs(bridge.LOG, "WARNING"):
+                self.make()
+
+    def test_a_write_failure_warns_once_and_does_not_raise(self):
+        b, pub = self.make()
+        with mock.patch.object(bridge.StateStore, "_write", side_effect=OSError("disk full")) as write:
+            with self.assertLogs(bridge.LOG, "WARNING") as logs:
+                b._publish_summary(b.clock())
+                b._publish_summary(b.clock())
+                b._alarm_seq += 1
+                b._publish_summary(b.clock())
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(write.call_count, 2)       # retried only when the content changed
+
+    def test_no_write_when_nothing_changed_and_one_write_when_it_did(self):
+        b, pub = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b._publish_summary(b.clock())
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            for _ in range(5):
+                b._publish_summary(b.clock())
+                b._tick()
+            self.assertEqual(write.call_count, 0)
+            b.handle_message(note_delta({"state": "alarm"}))         # seq moves: exactly one write
+            self.assertEqual(write.call_count, 1)
+            b.handle_message(note_delta({"state": "alarm"}))
+            self.assertEqual(write.call_count, 1)
+
+    def test_the_file_is_private_and_no_temporary_file_is_left(self):
+        b, _ = self.make()
+        b._publish_summary(b.clock())
+        self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)
+        self.assertEqual(os.listdir(self.dir), ["state.json"])
+        b._alarm_seq += 1
+        b._publish_summary(b.clock())
+        self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)
+        self.assertEqual(os.listdir(self.dir), ["state.json"])
+
+    def test_main_reads_the_state_dir_from_the_environment(self):
+        captured = {}
+
+        class Capture:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+            def run(self, stop):
+                pass
+
+        env = dict(SettingsAndConfigTests.ENV, **{bridge.STATE_DIR_ENV: self.dir})
+        with mock.patch.object(bridge, "Bridge", Capture), mock.patch.object(bridge, "MqttPublisher"), \
+                mock.patch.object(bridge, "load_config", return_value=PERSIST_CONFIG), \
+                mock.patch.object(bridge, "websocket_connector"), mock.patch.object(bridge, "make_ha_client"), \
+                mock.patch.dict(sys.modules, {"paho": mock.MagicMock(), "paho.mqtt": mock.MagicMock(),
+                                              "paho.mqtt.client": mock.MagicMock()}), \
+                mock.patch.object(bridge.signal, "signal"):
+            self.assertEqual(bridge.main(env), 0)
+        self.assertEqual(captured["state_dir"], self.dir)
+
+
 class BridgeLoopTests(unittest.TestCase):
     def test_startup_publishes_status_and_missing_instruments(self):
         pub = Harness([]).run()
@@ -442,8 +664,8 @@ class BridgeLoopTests(unittest.TestCase):
         self.assertEqual(gaps[3], 1)  # after the stable session the delay restarts at 1 s
 
     def test_one_bad_message_does_not_drop_the_connection(self):
-        h = Harness([[("msg", delta(5 * KN)), ("msg", delta(6 * KN)), ("msg", delta(7 * KN)),
-                      ("idle",)]])
+        h = Harness([[("msg", delta(5 * KN)), ("msg", delta(6 * KN, ts="2026-01-01T00:00:01.000Z")),
+                      ("msg", delta(7 * KN, ts="2026-01-01T00:00:02.000Z")), ("idle",)]])
         calls = []
         real = h.bridge.handle_message
 
