@@ -114,6 +114,7 @@ that every provider works offline. The optional [instrument displays preview](do
 is another separately enabled local feature. Displays show a full-screen alarm banner by default when anything
 counts towards the alarm summary; set `"ui": {"alarm_takeover": false}` in `displays.json` to turn it off, then
 rebuild and reflash (`vesselstackctl display build ID`, `display flash ID`).
+A null or invalid Signal K value, or a lost Signal K connection, turns the tile to a grey `--` at once, and warning and alarm colours are judged on the reading before it is rounded for display.
 
 ### Component lifecycle
 

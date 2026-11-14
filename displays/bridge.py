@@ -231,6 +231,7 @@ class Bridge:
         if state != self.signalk_state:
             self.signalk_state = state
             LOG.info("SignalK %s", state)
+            self._send(self.engine.source_state(state == SIGNALK_CONNECTED, self.clock()))
             self._send(self.events.source_state("signalk", state == SIGNALK_CONNECTED, self.clock()))
             self._publish_summary(self.clock())
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, state, True, qos=1)

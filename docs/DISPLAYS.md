@@ -117,8 +117,9 @@ Behaviour: on start it publishes retained `vesselstack/v1/bridge/status`
 `online` (and `offline` on a clean stop; Mosquitto publishes the retained last
 will `offline` if the bridge dies), reports `vesselstack/v1/bridge/signalk`
 `connected` or `disconnected`, and reconnects to Signal K with exponential
-backoff (1 s up to 30 s with jitter). While Signal K is unreachable the clock
-keeps running, so instruments turn `stale` after their `stale_after_s`; they
+backoff (1 s up to 30 s with jitter). When the Signal K connection is lost every
+numeric instrument that was `ok` turns `stale` at once (not after its
+`stale_after_s`) and stays `stale` while Signal K is unreachable; instruments
 read `missing` until the first value arrives. Treat `bridge/status` as the
 authority: if the bridge dies hard, `bridge/signalk` keeps its last retained
 value. A single Signal K message the bridge cannot process is logged (at most once a
@@ -766,12 +767,16 @@ are rejected):
 - A value below `warn_below` is `warn`, below `alarm_below` is `alarm`; above
   `warn_above` is `warn`, above `alarm_above` is `alarm`; otherwise `ok`. A
   value exactly on a bound is still on the safe side. The alarm bounds are
-  checked first. The value tested is the **rounded** published value, so the
-  colour always matches the digits on screen.
+  checked first. The value tested is the converted value **before** display
+  rounding (only float noise below 6 decimals is removed), so a tile can show a
+  rounded number equal to a limit while already in `warn` or `alarm`: with
+  `alarm_below: 3` and `precision` 0 a depth of 2.5 is published as `3` with
+  `sev` `alarm`, and exactly 3.0 stays `ok`. Home Assistant numeric items are
+  judged the same way.
 - Hysteresis applies only when the severity gets less severe: leaving `alarm`
   (or `warn`) needs the value to clear the bound by `hysteresis`. With
   `alarm_below: 11.8` and `hysteresis: 0.1` an `alarm` ends at 11.9 or above
-  (not at 11.8). Getting more severe is immediate. After the value was
+  (not at 11.8), judged on the unrounded value. Getting more severe is immediate. After the value was
   `stale` or `missing` there is no memory: the first value is judged on the
   bounds alone.
 - `alarm` (boolean, meaning "this instrument may raise an alarm", default true
@@ -1578,13 +1583,18 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
   colours. A change of `sev` is published like a value change (at most once per
   `min_interval_ms`).
 - `ok`: a value was received within `stale_after_s`.
-- `stale`: nothing received for more than `stale_after_s`; published
+- `stale`: nothing received for more than `stale_after_s`, or the Signal K
+  connection was lost (every `ok` instrument at once); published
   immediately on the transition, with `v` null.
-- `missing`: no value has been received since the bridge started.
+- `missing`: no value has been received since the bridge started, or the
+  latest Signal K value for the path was null, NaN, infinite, not a number or
+  could not be converted: the tile shows `--` at once instead of keeping the
+  last reading until `stale_after_s`. A later valid value returns it to `ok`.
 - A changed value is published at most once per `min_interval_ms`; unchanged
   values are not republished except by the `heartbeat_s` heartbeat, which also
-  refreshes `age`. Null, non-numeric, non-finite and boolean Signal K values are
-  ignored, as are values whose magnitude exceeds 1e15 after conversion.
+  refreshes `age`. Null, non-numeric, non-finite and boolean Signal K values, and
+  values whose magnitude exceeds 1e15 after conversion, make the instrument
+  `missing` (published once, not repeated for the same bad value).
 
 ## Supported boards
 

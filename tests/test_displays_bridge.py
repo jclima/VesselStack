@@ -213,6 +213,28 @@ class AlarmSummaryBridgeTests(unittest.TestCase):
                                 ("ok", 0, 0, ()), ("unknown", 0, 1, ())])
         self.assertNotIn("secret text", json.dumps(pub.sent))
 
+    def test_signalk_disconnect_stales_an_alarming_instrument_and_recomputes_the_summary(self):
+        cfg = {"heartbeat_s": 5, "instruments": {"sog": dict(CONFIG["instruments"]["sog"],
+                                                             thresholds={"alarm_below": 5.0})}}
+        pub = Harness([[("msg", delta(1 * KN)), ("close",)]], cfg).run()
+        tiles = [json.loads(p) for p, _ in pub.on(SOG_TOPIC)]
+        self.assertEqual([(t["st"], t["sev"]) for t in tiles],
+                         [("missing", "unknown"), ("ok", "alarm"), ("stale", "unknown")])   # no "alarm" on a stale tile
+        self.assertIsNone(tiles[-1]["v"])
+        seen = []
+        for body, _, _ in self.summaries(pub):
+            key = (body["max"], body["na"], body["nu"], tuple(body["ids"]))
+            if not seen or seen[-1] != key:
+                seen.append(key)
+        # Instruments are published before the summary is recomputed; today a stale instrument counts as
+        # "unknown" in the summary at once (no alarm latching in this slice).
+        self.assertEqual(seen, [("unknown", 0, 1, ()), ("alarm", 1, 0, ("sog",)), ("unknown", 0, 1, ())])
+        order = [(t, json.loads(p).get("st", json.loads(p).get("max"))) for t, p, _, _ in pub.sent
+                 if t in (SOG_TOPIC, SUMMARY)]
+        i = order.index((SOG_TOPIC, "stale"))
+        self.assertEqual(order[i - 2:i + 2], [(SOG_TOPIC, "ok"), (SUMMARY, "alarm"),
+                                              (SOG_TOPIC, "stale"), (SUMMARY, "unknown")])
+
     def test_instrument_without_thresholds_is_not_counted_and_nothing_published(self):
         pub = Harness([[("msg", delta(10 * KN)), ("idle",), ("close",)]]).run()
         self.assertEqual(self.summaries(pub), [])
@@ -284,16 +306,17 @@ class BridgeLoopTests(unittest.TestCase):
         oks = [p for p, _ in pub.on(SOG_TOPIC) if json.loads(p)["st"] == "ok"]
         self.assertGreaterEqual(len(oks), 2)
 
-    def test_disconnect_makes_instrument_stale_after_threshold(self):
-        # Value arrives, SignalK drops, reconnects keep failing: the clock-driven
-        # tick must still age the value out after stale_after_s (10 s).
+    def test_disconnect_makes_instrument_stale_at_once(self):
+        # Value arrives, SignalK drops: the instrument is stale immediately, not after
+        # stale_after_s (10 s), and stays stale while reconnects keep failing.
         h = Harness([[("msg", delta(10 * KN)), ("close",)]] + [ConnectionError("down")] * 30)
         pub = h.run()
         self.assertIn("stale", pub.states(SOG_TOPIC))
         stale = [json.loads(p) for p, _ in pub.on(SOG_TOPIC) if json.loads(p)["st"] == "stale"][0]
         self.assertIsNone(stale["v"])
-        self.assertGreaterEqual(stale["age"], 10)
-        self.assertLess(stale["age"], 10 + 2)  # within one tick of the threshold
+        self.assertLess(stale["age"], 2)   # published at the disconnect, not at the staleness threshold
+        self.assertEqual(pub.states(SOG_TOPIC)[:2], ["missing", "ok"])
+        self.assertEqual(set(pub.states(SOG_TOPIC)[2:]), {"stale"})
         payloads = [p for p, _ in pub.on(SIGNALK)]
         self.assertEqual(payloads[payloads.index("connected") + 1], "disconnected")
 
@@ -879,7 +902,9 @@ class HomeAssistantBridgeTests(unittest.TestCase):
             if not seq or seq[-1] != (b["st"], b["sev"]):
                 seq.append((b["st"], b["sev"]))
         self.assertEqual(seq[:3], [("missing", "unknown"), ("ok", "ok"), ("stale", "unknown")])
-        self.assertEqual(pub.states(SOG_TOPIC)[-1], "ok")
+        # The numeric item stays ok through the Home Assistant outage; it only goes stale when the
+        # script's final close drops SignalK.
+        self.assertEqual(pub.states(SOG_TOPIC), ["missing", "ok", "stale"])
         sk = [json.loads(p) for p, _ in pub.on(SUMMARY)]
         self.assertTrue(any(x["max"] == "unknown" for x in sk))
 

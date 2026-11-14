@@ -155,6 +155,17 @@ class HaStateTests(unittest.TestCase):
         self.assertEqual(severity.ha_state("12.2", "numeric", cfg, prev="warn")[1], "warn")
         self.assertEqual(severity.ha_state("12.2", "numeric", cfg)[1], "ok")
 
+    def test_numeric_severity_uses_the_value_before_rounding(self) -> None:
+        cfg = {"kind": "numeric", "unit": "m", "precision": 0, "thresholds": {"alarm_below": 3}}
+        self.assertEqual(severity.ha_state("2.5", "numeric", cfg), ("ok", "alarm", None, 3))
+        self.assertEqual(severity.ha_state("3.0", "numeric", cfg), ("ok", "ok", None, 3))
+        cfg = {"kind": "numeric", "unit": "V", "precision": 1, "thresholds": {"warn_above": 14.8}}
+        self.assertEqual(severity.ha_state("14.84", "numeric", cfg), ("ok", "warn", None, 14.8))
+        self.assertEqual(severity.ha_state("14.8", "numeric", cfg), ("ok", "ok", None, 14.8))
+        cfg = {"kind": "numeric", "unit": "m", "precision": 0, "thresholds": {"alarm_below": 3, "hysteresis": 0.5}}
+        self.assertEqual(severity.ha_state("3.4", "numeric", cfg, prev="alarm")[1], "alarm")
+        self.assertEqual(severity.ha_state("3.6", "numeric", cfg, prev="alarm")[1], "ok")
+
     def test_reproduces_boat_chat_classify_on_its_vocabulary(self) -> None:
         """An equivalent ``states`` config gives the same verdict as boat-chat's status_model.classify."""
         configs = {

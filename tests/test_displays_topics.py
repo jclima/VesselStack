@@ -92,21 +92,89 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(self.engine.tick(5.0)), 2)  # heartbeat
         self.assertEqual(decode(self.engine.update(SOG, KN, TS, 6.0))[0][1]["st"], "ok")
 
-    def test_invalid_values_ignored(self) -> None:
+    def test_invalid_values_make_the_instrument_missing_once(self) -> None:
         for bad in (None, True, False, "6.4", float("nan"), float("inf"), {"a": 1}, [1]):
-            self.assertEqual(self.engine.update(SOG, bad, TS, 1.0), [], repr(bad))
+            engine = topics.Engine(CONFIG)
+            msgs = decode(engine.update(SOG, bad, TS, 1.0))
+            self.assertEqual([(t, p["st"], p["v"]) for t, p, _ in msgs],
+                             [("vesselstack/v1/instruments/sog", "missing", None)], repr(bad))
+            self.assertEqual(engine.update(SOG, bad, TS, 1.1), [], repr(bad))   # a repeated null is not re-emitted
         self.assertEqual(self.engine.update("unknown.path", 1.0, TS, 1.0), [])
         self.assertEqual(decode(self.engine.tick(2.0))[0][1]["st"], "missing")
 
-    def test_out_of_range_values_ignored(self) -> None:
+    def test_invalid_value_replaces_a_fresh_reading_at_once(self) -> None:
+        for bad in (None, float("nan"), float("inf"), float("-inf"), "6.4", {"a": 1}):
+            engine = topics.Engine(CONFIG)
+            self.assertEqual(decode(engine.update(SOG, 6.4 * KN, TS, 1.0))[0][1]["st"], "ok")
+            msgs = decode(engine.update(SOG, bad, TS, 1.1))        # inside min_interval: still immediate
+            self.assertEqual([(p["st"], p["v"]) for _, p, _ in msgs], [("missing", None)], repr(bad))
+            self.assertEqual(engine.update(SOG, bad, TS, 1.2), [])
+            again = decode(engine.update(SOG, 6.4 * KN, TS, 3.0))   # a later valid value recovers normally
+            self.assertEqual([(p["st"], p["v"]) for _, p, _ in again], [("ok", 6.4)])
+
+    def test_invalid_value_only_affects_the_matching_path(self) -> None:
+        depth = "environment.depth.belowTransducer"
+        self.engine.update(SOG, 6.4 * KN, TS, 1.0)
+        self.engine.update(depth, 3.0, TS, 1.0)
+        msgs = decode(self.engine.update(SOG, None, TS, 2.0))
+        self.assertEqual([t for t, _, _ in msgs], ["vesselstack/v1/instruments/sog"])
+        self.assertEqual(self.engine.tick(2.5), [])                # depth is untouched and still ok
+
+    def test_invalid_value_clears_severity_and_hysteresis_memory(self) -> None:
+        engine = topics.Engine(SEV_CONFIG)
+        engine.update(HOUSE, 10.9, TS, 100.0)                      # alarm
+        msg = decode(engine.update(HOUSE, float("nan"), TS, 100.1))[0][1]
+        self.assertEqual((msg["st"], msg["v"], msg["sev"]), ("missing", None, "unknown"))
+        self.assertEqual(engine.summary_items()[0], ("house", "unknown"))
+        # 11.3 sits inside the alarm hold zone, but there is no memory left: warn, not alarm.
+        self.assertEqual(decode(engine.update(HOUSE, 11.3, TS, 101.0))[0][1]["sev"], "warn")
+
+    def test_source_state_disconnect_makes_ok_instruments_stale_once(self) -> None:
+        self.engine.update(SOG, 6.4 * KN, TS, 1.0)
+        self.engine.update("environment.depth.belowTransducer", 3.0, TS, 1.0)
+        msgs = decode(self.engine.source_state(False, 2.0))
+        self.assertEqual(sorted((t, p["st"], p["v"]) for t, p, _ in msgs),
+                         [("vesselstack/v1/instruments/depth", "stale", None),
+                          ("vesselstack/v1/instruments/sog", "stale", None)])
+        self.assertEqual([p["age"] for _, p, _ in msgs], [1.0, 1.0])
+        self.assertEqual(self.engine.source_state(False, 3.0), [])          # already stale: nothing again
+        self.assertEqual(self.engine.tick(3.5), [])
+
+    def test_source_state_skips_stale_and_missing_instruments(self) -> None:
+        self.engine.update(SOG, None, TS, 1.0)                              # sog missing
+        self.engine.update("environment.depth.belowTransducer", 3.0, TS, 1.0)
+        self.engine.tick(20.0)                                              # depth stale
+        self.assertEqual(self.engine.source_state(False, 21.0), [])
+
+    def test_source_state_connect_emits_nothing_and_data_recovers(self) -> None:
+        self.engine.update(SOG, 6.4 * KN, TS, 1.0)
+        self.engine.source_state(False, 2.0)
+        self.assertEqual(self.engine.source_state(True, 3.0), [])
+        msgs = decode(self.engine.update(SOG, 6.4 * KN, TS, 4.0))
+        self.assertEqual([(p["st"], p["v"]) for _, p, _ in msgs], [("ok", 6.4)])
+
+    def test_source_state_disconnect_clears_severity_and_hysteresis_memory(self) -> None:
+        engine = topics.Engine(SEV_CONFIG)
+        engine.update(HOUSE, 10.9, TS, 100.0)                               # alarm
+        msg = decode(engine.source_state(False, 101.0))[0][1]
+        self.assertEqual((msg["st"], msg["sev"]), ("stale", "unknown"))
+        self.assertEqual(engine.summary_items()[0], ("house", "unknown"))
+        engine.source_state(True, 102.0)
+        self.assertEqual(decode(engine.update(HOUSE, 11.3, TS, 103.0))[0][1]["sev"], "warn")
+
+    def test_out_of_range_values_are_missing(self) -> None:
         # 1e30 exceeds the magnitude limit; 1e308 only overflows after m/s->kn.
         for bad in (1e30, -1e30, 1e308):
-            self.assertEqual(self.engine.update(SOG, bad, TS, 1.0), [], repr(bad))
+            engine = topics.Engine(CONFIG)
+            msgs = decode(engine.update(SOG, bad, TS, 1.0))
+            self.assertEqual([p["st"] for _, p, _ in msgs], ["missing"], repr(bad))
+            self.assertEqual(engine.update(SOG, bad, TS, 1.1), [], repr(bad))
+        self.assertEqual(decode(self.engine.update(SOG, 1e30, TS, 1.0))[0][1]["st"], "missing")
         self.assertEqual(decode(self.engine.tick(2.0))[0][1]["st"], "missing")
         msgs = decode(self.engine.update(SOG, KN * 6.4, TS, 3.0))
         self.assertEqual(msgs[0][1]["v"], 6.4)
         self.assertEqual(msgs[0][1]["st"], "ok")
-        self.assertEqual(self.engine.update(SOG, 1e30, TS, 4.0), [])
+        self.assertEqual(decode(self.engine.update(SOG, 1e30, TS, 4.0))[0][1]["st"], "missing")
 
     def test_signed_conversion_rounding_in_payload(self) -> None:
         engine = topics.Engine({"instruments": {"awa": {"path": "environment.wind.angleApparent",
@@ -193,10 +261,41 @@ class SeverityPayloadTests(unittest.TestCase):
         self.assertNotIn("sev", msgs[1][1])
         self.assertEqual(list(msgs[0][1]), ["v", "u", "st", "sev", "ts", "age"])
 
-    def test_sev_uses_the_rounded_value(self) -> None:
-        # 11.96 rounds to 12.0 (precision 1): not below warn_below 12.0, so ok.
+    def test_sev_uses_the_unrounded_value(self) -> None:
+        # 11.96 is below warn_below 12.0 although it displays as 12.0 (precision 1): warn.
         msgs = decode(self.engine.update(HOUSE, 11.96, TS, 100.0))
-        self.assertEqual((msgs[0][1]["v"], msgs[0][1]["sev"]), (12.0, "ok"))
+        self.assertEqual((msgs[0][1]["v"], msgs[0][1]["sev"]), (12.0, "warn"))
+
+    def test_sev_boundaries_on_unrounded_values(self) -> None:
+        def run(thresholds, value, precision, convert="none"):
+            engine = topics.Engine({"instruments": {"d": {"path": "p", "convert": convert, "unit": "",
+                                    "precision": precision, "stale_after_s": 10, "thresholds": thresholds}}})
+            body = decode(engine.update("p", value, TS, 1.0))[0][1]
+            return body["v"], body["sev"]
+        self.assertEqual(run({"alarm_below": 3}, 2.5, 0), (3, "alarm"))     # displays 3, true 2.5
+        self.assertEqual(run({"alarm_below": 3}, 3.0, 0), (3, "ok"))        # strict comparison
+        self.assertEqual(run({"alarm_below": 3}, 2.9999999, 0), (3, "ok"))  # float noise (6 places) is removed
+        self.assertEqual(run({"warn_above": 14.8}, 14.84, 1), (14.8, "warn"))
+        self.assertEqual(run({"warn_above": 14.8}, 14.8, 1), (14.8, "ok"))
+        self.assertEqual(run({"alarm_below": 3}, 2.4, 0), (2, "alarm"))
+
+    def test_hysteresis_uses_unrounded_values(self) -> None:
+        engine = topics.Engine({"instruments": {"d": {"path": "p", "convert": "none", "unit": "", "precision": 0,
+                                "stale_after_s": 10, "min_interval_ms": 0,
+                                "thresholds": {"alarm_below": 3, "hysteresis": 0.5}}}})
+        def sev(value, now):
+            engine.update("p", value, TS, now)    # the published value stays 3 throughout, so read the summary view
+            return engine.summary_items()[0][1]
+        self.assertEqual(sev(2.5, 1.0), "alarm")
+        self.assertEqual(sev(3.4, 2.0), "alarm")   # inside the hold zone (needs > 3.5)
+        self.assertEqual(sev(3.6, 3.0), "ok")
+
+    def test_heading_wrap_stays_in_display_rounding(self) -> None:
+        engine = topics.Engine({"instruments": {"h": {"path": "p", "convert": "rad->deg_360", "unit": "deg",
+                                "precision": 0, "stale_after_s": 10,
+                                "thresholds": {"warn_above": 359.5}}}})
+        body = decode(engine.update("p", 359.6 * 3.141592653589793 / 180, TS, 1.0))[0][1]
+        self.assertEqual((body["v"], body["sev"]), (0, "warn"))
 
     def test_sev_change_alone_publishes_respecting_the_rate_limit(self) -> None:
         self.engine.update(HOUSE, 12.0, TS, 100.0)               # ok, 12.0
@@ -560,10 +659,12 @@ class EventEngineTests(unittest.TestCase):
         self.assertEqual(topics.subscribe_frame(CONFIG)["subscribe"],
                          [e for e in frame["subscribe"] if not e["path"].startswith("notifications.")])
 
-    def test_instrument_engine_still_drops_non_numeric_values(self) -> None:
+    def test_instrument_engine_marks_non_numeric_values_missing(self) -> None:
         engine = topics.Engine({"instruments": {"n": {"path": ANCHOR, "convert": "none", "unit": "",
                                                        "precision": 0, "stale_after_s": 10}}})
-        self.assertEqual(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.0), [])
+        msgs = decode(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.0))
+        self.assertEqual([p["st"] for _, p, _ in msgs], ["missing"])
+        self.assertEqual(engine.update(ANCHOR, {"state": "alarm"}, TS, 0.1), [])
 
 
 class ClockTests(unittest.TestCase):

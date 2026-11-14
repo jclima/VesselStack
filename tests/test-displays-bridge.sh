@@ -268,8 +268,7 @@ client mosquitto_pub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" \
     || fail "the display account could not publish its own status"
 pass
 
-# 4. The fake SignalK exits: signalk disconnected, sog becomes stale (stale_after_s=3
-# plus one heartbeat), value cleared.
+# 4. The fake SignalK exits: signalk disconnected, sog becomes stale at once, value cleared.
 wait_for vesselstack/v1/bridge/signalk '^disconnected$' 30
 wait_for vesselstack/v1/instruments/sog '"v":null,"u":"kn","st":"stale"' 15
 wait_for vesselstack/v1/notifications/anchor '"v":null,"u":"","st":"stale","sev":"unknown"' 15

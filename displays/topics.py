@@ -103,20 +103,41 @@ class Engine:
         payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev)
         return (instrument_topic(iid), payload, True)
 
+    def _lose(self, iid, now, state):
+        """The instrument has no usable reading: ``state`` (stale/missing), severity and hysteresis memory cleared."""
+        st = self._state[iid]
+        st.state = state
+        st.sev = None
+        return self._emit(iid, now)
+
     def update(self, path: str, value, ts, now: float) -> list:
-        """Handle a SignalK value; returns [(topic, payload, retain)]."""
+        """Handle a SignalK value; returns [(topic, payload, retain)].
+
+        A null, NaN, infinite, non-numeric or unconvertible value makes the matching instruments
+        "missing" at once (a previous reading is never kept alive), published once.
+        """
         raw = numeric(value)
-        if raw is None:
-            return []
         out = []
         for iid in self._by_path.get(path, ()):
             inst, st = self.instruments[iid], self._state[iid]
-            rounded = conversions.convert_and_round(inst["convert"], raw, inst["precision"])
+            converted = rounded = None
+            if raw is not None:
+                try:
+                    converted = conversions.convert(inst["convert"], raw)
+                except (OverflowError, ValueError):
+                    converted = None
+                rounded = None if converted is None else conversions.round_value(converted, inst["precision"])
             if rounded is None:
+                if st.pub_state != "missing":
+                    out.append(self._lose(iid, now, "missing"))
+                else:
+                    st.state, st.sev = "missing", None
                 continue
+            if inst["convert"] == "rad->deg_360" and rounded >= 360:
+                rounded = 0 if inst["precision"] == 0 else 0.0   # a heading that rounds up to 360 wraps to 0
+            if "thresholds" in inst:  # on the converted value before display rounding (6 places only removes float noise)
+                st.sev = severity.numeric_sev(round(converted, 6), inst["thresholds"], st.sev if st.state == "ok" else None)
             st.value = rounded
-            if "thresholds" in inst:  # on the rounded value, so the colour matches the digits
-                st.sev = severity.numeric_sev(rounded, inst["thresholds"], st.sev if st.state == "ok" else None)
             st.ts = ts if isinstance(ts, str) else None
             st.received = now
             st.state = "ok"
@@ -128,6 +149,16 @@ class Engine:
                 else:
                     st.dirty = True
         return out
+
+    def source_state(self, connected: bool, now: float) -> list:
+        """The SignalK connection went up or down; returns [(topic, payload, retain)].
+
+        On disconnect every "ok" instrument becomes "stale" at once (published once). On connect
+        nothing changes: instruments become "ok" again when data arrives.
+        """
+        if connected:
+            return []
+        return [self._lose(iid, now, "stale") for iid, st in self._state.items() if st.state == "ok"]
 
     def summary_items(self) -> list:
         """[(id, severity)] for the instruments that count towards the alarm summary.
