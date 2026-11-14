@@ -87,6 +87,28 @@ source "$CONFIG_FILE"
 # read-only and deliberately skip this block.
 if [ "$DRY_RUN" -eq 0 ]; then
     [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+    # An unfinished restore must be resolved first (vesselstackctl restore-recover). The restore itself runs
+    # the restored installer and identifies it with the journal's id. A restore that already committed (or was
+    # rolled back) and only left its journal behind does not block anything.
+    RESTORE_PENDING_DIR="$SYSTEM_ROOT/var/lib/vesselstack/restore/current"
+    if [ -f "$RESTORE_PENDING_DIR/state" ]; then
+        if ! python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" dump "$RESTORE_PENDING_DIR" >/dev/null 2>&1; then
+            echo "A restore did not finish and its journal state cannot be read (damaged, a repeated key, or no helper). Nothing else can change this system until it is resolved." >&2
+            echo "See: sudo $RESTORE_PENDING_DIR/recover status" >&2
+            exit 1
+        fi
+        RESTORE_PENDING_ID=$(python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" get "$RESTORE_PENDING_DIR" id || true)
+        RESTORE_PENDING_PHASE=$(python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" get "$RESTORE_PENDING_DIR" phase || true)
+        case "$RESTORE_PENDING_PHASE" in
+            committed|rolled-back) ;;
+            *)
+                if [ -z "${VESSELSTACK_RESTORE_ID:-}" ] || [ "${VESSELSTACK_RESTORE_ID}" != "$RESTORE_PENDING_ID" ]; then
+                    echo "A restore did not finish (phase: ${RESTORE_PENDING_PHASE:-unknown}). Nothing else can change this system until it is resolved." >&2
+                    echo "See: sudo $RESTORE_PENDING_DIR/recover status" >&2
+                    exit 1
+                fi ;;
+        esac
+    fi
     LIFECYCLE_LOCK_HELPER="$SOURCE_ROOT/common/lifecycle_lock.py"
     [ -r "$LIFECYCLE_LOCK_HELPER" ] || { echo "Missing lifecycle lock helper: $LIFECYCLE_LOCK_HELPER" >&2; exit 1; }
     if [ -n "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
@@ -1676,6 +1698,7 @@ fi
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/record-backup-result" "$LIBEXEC_DIR/record-backup-result"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/restore_journal.py" "$LIBEXEC_DIR/restore_journal.py"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-alerts.py" "$LIBEXEC_DIR/vesselstack-alerts.py"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \

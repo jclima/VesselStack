@@ -98,6 +98,19 @@ if [ "$(basename "$0")" = systemctl ] && [ "${FAKE_SYSTEMCTL_FAIL_ONCE:-}" = 1 ]
     : > "$FAKE_SYSTEMCTL_FAIL_MARKER"
     exit 1
 fi
+# Units are all active unless a test asks for a state directory: stop marks a unit stopped, start and restart clear it.
+if [ "$(basename "$0")" = systemctl ] && [ -n "${FAKE_SYSTEMCTL_FAIL_START_ONCE:-}" ] && [ "$*" = 'start vesselstack-chat.service' ] \
+    && [ ! -e "$FAKE_SYSTEMCTL_FAIL_START_ONCE" ]; then
+    : > "$FAKE_SYSTEMCTL_FAIL_START_ONCE"
+    exit 1
+fi
+if [ "$(basename "$0")" = systemctl ] && [ -n "${FAKE_SYSTEMCTL_STATE_DIR:-}" ]; then
+    case "${1:-}" in
+        stop) for unit in "${@:2}"; do : > "$FAKE_SYSTEMCTL_STATE_DIR/$unit.stopped"; done ;;
+        start|restart) for unit in "${@:2}"; do rm -f -- "$FAKE_SYSTEMCTL_STATE_DIR/$unit.stopped"; done ;;
+        is-active) [ ! -e "$FAKE_SYSTEMCTL_STATE_DIR/${!#}.stopped" ] || exit 3 ;;
+    esac
+fi
 if [ "$(basename "$0")" = curl ]; then
     if [ -n "${FAKE_MEMORY_CHUNKS:-}" ]; then
         printf '{"ok":true,"ready":true,"readiness":{"layers":{"memory":{"ready":true,"chunks":%s}}}}\n' "$FAKE_MEMORY_CHUNKS"
@@ -258,6 +271,7 @@ chmod +x "$FAKE_BIN/umount" "$FAKE_BIN/mountpoint" "$FAKE_BIN/mount" "$FAKE_BIN/
 LIBEXEC_TEST="$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 install -d -m 0755 "$LIBEXEC_TEST"
 install -m 0644 "$REPO_ROOT/scripts/lib/remediate.sh" "$LIBEXEC_TEST/remediate.sh"
+install -m 0755 "$REPO_ROOT/scripts/lib/restore_journal.py" "$LIBEXEC_TEST/restore_journal.py"
 export FAKE_MOUNT_COUNT="$TEST_ROOT/mount-count"
 : > "$TEST_ROOT/mounts"
 printf 'unit one\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
@@ -266,7 +280,9 @@ printf '#!/bin/sh\n' > "$SYSTEM_ROOT/usr/local/sbin/vesselstack-firewall"
 chmod +x "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl" "$SYSTEM_ROOT/usr/local/sbin/vesselstack-firewall"
 install -d "$SYSTEM_ROOT/etc/vesselstack"
 printf 'UPDATE_KEY=one\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
-printf '#!/bin/bash\necho "$@" > "%s/installer-ran"\n' "$TEST_ROOT" > "$APP_ROOT/installer/install.sh"
+# KILL_ON_INSTALLER lets a test kill the restore (the caller) at the moment the restored installer runs.
+# shellcheck disable=SC2016
+printf '#!/bin/bash\nif [ -n "${KILL_ON_INSTALLER:-}" ]; then kill -KILL "$PPID"; exit 137; fi\necho "$@" > "%s/installer-ran"\n' "$TEST_ROOT" > "$APP_ROOT/installer/install.sh"
 chmod +x "$APP_ROOT/installer/install.sh"
 chown 1234:1234 "$DATA_ROOT/state.txt"
 
@@ -1969,6 +1985,7 @@ printf 'newer\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-alerts.service"
 printf 'owner\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-custom.service"
 ln -s ../vesselstack-alerts.timer "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-alerts.timer"
 ln -s ../vesselstack-custom.service "$SYSTEM_ROOT/etc/systemd/system/timers.target.wants/vesselstack-custom.service"
+install -d -m 0755 "$SYSTEM_ROOT/var/lib/vesselstack"
 : > "$FAKE_BIN/calls.log"
 restore_output=$(run_ctl restore "$archive" --yes)
 grep -q 'Restore completed' <<<"$restore_output"
@@ -2004,6 +2021,21 @@ test -d "$(printf '%s\n' "$APP_ROOT".pre-restore-* | head -n 1)"
 for leftover in "$TEST_ROOT"/opt/.vesselstack-restore.*; do
     [ ! -e "$leftover" ] || { echo 'Restore left a staging directory behind' >&2; exit 1; }
 done
+# A restore that finished leaves no pending journal, only a small record that it committed.
+RESTORE_RECORDS="$SYSTEM_ROOT/var/lib/vesselstack/restore"
+# Only the restore directory is private; /var/lib/vesselstack keeps its mode (the alerts service reads it).
+[ "$(stat -c %a "$SYSTEM_ROOT/var/lib/vesselstack")" = 755 ] || { echo 'The restore changed the mode of /var/lib/vesselstack' >&2; exit 1; }
+[ "$(stat -c %a "$RESTORE_RECORDS")" = 700 ] || { echo 'The restore directory is not private' >&2; exit 1; }
+[ ! -e "$RESTORE_RECORDS/current" ] || { echo 'A finished restore left restore/current behind' >&2; exit 1; }
+done_records=("$RESTORE_RECORDS"/done-*)
+if ! grep -qx 'phase=committed' "${done_records[0]}/state"; then
+    echo 'A finished restore did not leave a committed record' >&2
+    exit 1
+fi
+if [ -e "${done_records[0]}/files" ] || [ -e "${done_records[0]}/controller" ]; then
+    echo 'The committed record still holds the system file snapshot or the controller copy' >&2
+    exit 1
+fi
 # The Control Panel and the timers read or write the trees, so they are stopped for the swap.
 grep -qx 'systemctl stop vesselstack-control-panel.service' "$FAKE_BIN/calls.log" || {
     echo 'Restore did not stop the Control Panel' >&2
@@ -2023,6 +2055,176 @@ grep -qxF "sudo $APP_ROOT/installer/install.sh --config $APP_ROOT/config/vessels
     exit 1
 }
 rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
+
+# A restore that is killed part-way (no hooks in the product: a test double for mv kills the restore
+# process at the chosen tree rename) can be inspected and undone with the journal's own recover command,
+# without help from the application folder, and a later restore then works.
+KILL_BIN="$TEST_ROOT/kill-bin"
+install -d "$KILL_BIN"
+cat > "$KILL_BIN/mv" <<'EOF'
+#!/bin/bash
+# Counts the restore's four tree renames (mv -T onto a live tree or a *.pre-restore-* name) and kills the
+# shell that called mv, the restore itself, before or after the chosen one.
+if [ -x /usr/bin/mv ]; then real_mv=/usr/bin/mv; else real_mv=/bin/mv; fi
+if [ -n "${KILL_AT:-}" ] && [ "${1:-}" = -T ]; then
+    dest=${*: -1}
+    case "$dest" in
+        "$KILL_APP_ROOT"|"$KILL_DATA_ROOT"|*.pre-restore-*)
+            n=$(( $(cat "$KILL_COUNT" 2>/dev/null || echo 0) + 1 ))
+            echo "$n" > "$KILL_COUNT"
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = before ]; then kill -KILL "$PPID"; exit 137; fi
+            "$real_mv" "$@" || exit $?
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = after ]; then kill -KILL "$PPID"; exit 137; fi
+            exit 0 ;;
+    esac
+fi
+exec "$real_mv" "$@"
+EOF
+chmod +x "$KILL_BIN/mv"
+run_ctl_killed() {
+    local at=$1 when=$2
+    shift 2
+    PATH="$KILL_BIN:$PATH" KILL_AT=$at KILL_WHEN=$when KILL_COUNT="$TEST_ROOT/kill-count" \
+        KILL_APP_ROOT="$APP_ROOT" KILL_DATA_ROOT="$DATA_ROOT" run_ctl "$@"
+}
+RESTORE_CURRENT="$SYSTEM_ROOT/var/lib/vesselstack/restore/current"
+# From here the fake systemctl remembers which units were stopped, because recovery checks that no unit is running.
+UNIT_STATE="$TEST_ROOT/unit-state"
+export FAKE_SYSTEMCTL_STATE_DIR="$UNIT_STATE"
+kill_number=0
+# rename 1 = data aside, 2 = restored data in, 3 = application aside, 4 = restored application in
+for point in "1 before data-swap" "2 before data-swap" "3 before root-swap" "4 after root-swap"; do
+    read -r kill_at kill_when kill_phase <<<"$point"
+    kill_number=$((kill_number + 1))
+    rm -rf -- "$UNIT_STATE"; install -d "$UNIT_STATE"
+    printf 'live data %s\n' "$kill_number" > "$DATA_ROOT/state.txt"
+    printf 'live app %s\n' "$kill_number" > "$APP_ROOT/live-marker"
+    live_app_inode=$(stat -c %i "$APP_ROOT")
+    live_data_inode=$(stat -c %i "$DATA_ROOT")
+    : > "$FAKE_BIN/calls.log"
+    rm -f -- "$TEST_ROOT/kill-count"
+    killed_rc=0
+    run_ctl_killed "$kill_at" "$kill_when" restore "$archive" --yes > "$TEST_ROOT/killed.out" 2>&1 || killed_rc=$?
+    [ "$killed_rc" -ge 128 ] || { echo "The restore was not killed at rename $kill_at (exit $killed_rc)" >&2; cat "$TEST_ROOT/killed.out" >&2; exit 1; }
+    [ -f "$RESTORE_CURRENT/state" ] || { echo "No journal was left after a restore killed at rename $kill_at" >&2; exit 1; }
+    [ -x "$RESTORE_CURRENT/recover" ] || { echo 'The journal has no recover command' >&2; exit 1; }
+    grep -qx "phase=$kill_phase" "$RESTORE_CURRENT/state" || { echo "Unexpected phase after a kill at rename $kill_at" >&2; cat "$RESTORE_CURRENT/state" >&2; exit 1; }
+    # Everything else is refused while the restore is pending; status and doctor say why.
+    if run_ctl start > "$TEST_ROOT/pending.out" 2>&1; then echo 'start ran while a restore was pending' >&2; exit 1; fi
+    grep -q "A restore did not finish (phase: $kill_phase)" "$TEST_ROOT/pending.out"
+    grep -q "See: sudo $RESTORE_CURRENT/recover status" "$TEST_ROOT/pending.out"
+    if run_ctl restore "$archive" --yes > "$TEST_ROOT/pending.out" 2>&1; then echo 'a second restore ran while one was pending' >&2; exit 1; fi
+    grep -q "A restore did not finish" "$TEST_ROOT/pending.out"
+    pending_status=$(run_ctl status 2>&1 || true)
+    grep -q "^Restore              INCOMPLETE (phase $kill_phase); see: sudo $RESTORE_CURRENT/recover status" <<<"$pending_status" || {
+        echo 'status does not report the unfinished restore' >&2
+        exit 1
+    }
+    pending_doctor=$(run_ctl doctor 2>&1 || true)
+    grep -q "FAIL restore did not finish (phase $kill_phase)" <<<"$pending_doctor"
+    recover_status=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" status)
+    grep -q "^Phase:     $kill_phase" <<<"$recover_status"
+    grep -q "sudo $RESTORE_CURRENT/recover rollback" <<<"$recover_status"
+    : > "$FAKE_BIN/calls.log"
+    recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 2>&1) || {
+        echo "recover rollback failed after a kill at rename $kill_at" >&2
+        echo "$recover_output" >&2
+        exit 1
+    }
+    grep -q 'Rollback completed' <<<"$recover_output"
+    [ ! -e "$RESTORE_CURRENT" ] || { echo 'recover rollback left restore/current behind' >&2; exit 1; }
+    rolled_back_records=("$RESTORE_RECORDS"/rolled-back-*)
+    grep -qx 'phase=rolled-back' "${rolled_back_records[0]}/state"
+    # The original trees are back, by identity and by content, and nothing of the restore is live.
+    if [ "$(stat -c %i "$APP_ROOT")" != "$live_app_inode" ] || [ "$(stat -c %i "$DATA_ROOT")" != "$live_data_inode" ]; then
+        echo "The original trees are not back in place after a kill at rename $kill_at" >&2
+        exit 1
+    fi
+    grep -qx "live data $kill_number" "$DATA_ROOT/state.txt"
+    grep -qx "live app $kill_number" "$APP_ROOT/live-marker"
+    for leftover in "$TEST_ROOT"/opt/.vesselstack-restore.*; do
+        [ ! -e "$leftover" ] || { echo 'The rollback left the staged copy behind' >&2; exit 1; }
+    done
+    grep -qx 'systemctl start vesselstack-control-panel.service' "$FAKE_BIN/calls.log" || {
+        echo 'The rollback did not start the Control Panel again' >&2
+        exit 1
+    }
+    grep -Eq 'docker compose.* up' "$FAKE_BIN/calls.log" || { echo 'The rollback did not start the stack again' >&2; exit 1; }
+    # Nothing is pending any more, so a second restore runs and succeeds.
+    run_ctl restore "$archive" --yes > "$TEST_ROOT/second.out" 2>&1 || { cat "$TEST_ROOT/second.out" >&2; exit 1; }
+    grep -q 'Restore completed' "$TEST_ROOT/second.out"
+    grep -qx 'version one' "$DATA_ROOT/state.txt"
+    [ ! -e "$RESTORE_CURRENT" ]
+    rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-* "$APP_ROOT".failed-restore-* "$DATA_ROOT".failed-restore-* \
+        "$RESTORE_RECORDS"/rolled-back-* "$RESTORE_RECORDS"/done-*
+done
+if run_ctl restore --status | grep -qvx 'No restore is pending.'; then echo 'restore --status reports a restore after recovery' >&2; exit 1; fi
+
+# A restore killed AFTER the system files were published (phase "starting": the restored installer is what
+# kills it) is undone completely, trees and system files. And when the previous stack then fails to start
+# during the recovery, the system is still rolled back: the journal is archived, nothing stays locked, and
+# the owner is told to start it.
+kill_at_installer() {
+    rm -rf -- "$UNIT_STATE"; install -d "$UNIT_STATE"
+    printf 'unit two\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+    printf 'UPDATE_KEY=two\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
+    printf 'live app installer kill\n' > "$APP_ROOT/live-marker"
+    live_app_inode=$(stat -c %i "$APP_ROOT")
+    live_data_inode=$(stat -c %i "$DATA_ROOT")
+    : > "$FAKE_BIN/calls.log"
+    killed_rc=0
+    KILL_ON_INSTALLER=1 run_ctl restore "$archive" --yes > "$TEST_ROOT/killed.out" 2>&1 || killed_rc=$?
+    [ "$killed_rc" -ge 128 ] || { echo "The restore was not killed at the restored installer (exit $killed_rc)" >&2; cat "$TEST_ROOT/killed.out" >&2; exit 1; }
+    grep -qx 'phase=starting' "$RESTORE_CURRENT/state" || { echo 'Unexpected phase after a kill at the restored installer' >&2; cat "$RESTORE_CURRENT/state" >&2; exit 1; }
+    grep -qx 'unit one' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" || { echo 'The system files were not published before the kill' >&2; exit 1; }
+}
+assert_back_after_installer_kill() {
+    if [ "$(stat -c %i "$APP_ROOT")" != "$live_app_inode" ] || [ "$(stat -c %i "$DATA_ROOT")" != "$live_data_inode" ]; then
+        echo 'The original trees are not back in place after the kill at the restored installer' >&2
+        exit 1
+    fi
+    grep -qx 'live app installer kill' "$APP_ROOT/live-marker"
+    grep -qx 'unit two' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" || { echo 'recover rollback did not restore the system files' >&2; exit 1; }
+    grep -qx 'UPDATE_KEY=two' "$SYSTEM_ROOT/etc/vesselstack/update.env" || { echo 'recover rollback did not restore update.env' >&2; exit 1; }
+    [ ! -e "$RESTORE_CURRENT" ] || { echo 'recover rollback left restore/current behind' >&2; exit 1; }
+    for leftover in "$TEST_ROOT"/opt/.vesselstack-restore.*; do
+        [ ! -e "$leftover" ] || { echo 'The rollback left the staged copy behind' >&2; exit 1; }
+    done
+}
+cleanup_after_installer_kill() {
+    rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-* "$APP_ROOT".failed-restore-* "$DATA_ROOT".failed-restore-* \
+        "$RESTORE_RECORDS"/rolled-back-* "$RESTORE_RECORDS"/done-*
+    rm -f -- "$APP_ROOT/live-marker"
+}
+kill_at_installer
+recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 2>&1) || {
+    echo 'recover rollback failed after a kill at the restored installer' >&2
+    echo "$recover_output" >&2
+    exit 1
+}
+grep -q 'Rollback completed' <<<"$recover_output"
+assert_back_after_installer_kill
+cleanup_after_installer_kill
+
+kill_at_installer
+fail_start_marker="$TEST_ROOT/fail-start-once"
+rm -f -- "$fail_start_marker"
+recover_rc=0
+recover_output=$(env PATH="$FAKE_BIN:$PATH" FAKE_SYSTEMCTL_FAIL_START_ONCE="$fail_start_marker" "$RESTORE_CURRENT/recover" rollback 2>&1) || recover_rc=$?
+[ "$recover_rc" -eq 3 ] || { echo "recover rollback exited $recover_rc, not 3, when the previous stack could not be started" >&2; echo "$recover_output" >&2; exit 1; }
+grep -q 'The previous system is back in place, but it could not be started' <<<"$recover_output"
+grep -q 'sudo vesselstackctl start, then sudo vesselstackctl doctor' <<<"$recover_output"
+grep -q 'could not be started (see above)' <<<"$recover_output"
+assert_back_after_installer_kill
+rolled_back_records=("$RESTORE_RECORDS"/rolled-back-*)
+grep -qx 'phase=rolled-back' "${rolled_back_records[0]}/state"
+grep -q '^last_error=.*could not be started' "${rolled_back_records[0]}/state"
+# Nothing is locked: the very next start is accepted and the status no longer reports a restore.
+run_ctl start > "$TEST_ROOT/start-after.out" 2>&1 || { echo 'start was refused after a rolled-back restore' >&2; cat "$TEST_ROOT/start-after.out" >&2; exit 1; }
+status_after=$(run_ctl status 2>&1 || true)
+if grep -q '^Restore  ' <<<"$status_after"; then echo 'status still reports a restore after the rollback' >&2; exit 1; fi
+cleanup_after_installer_kill
+unset FAKE_SYSTEMCTL_STATE_DIR
 
 touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \
     "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"

@@ -217,6 +217,8 @@ test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update")" = "0:
 test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py")" = "0:755"
 test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack")" = "0:755"
 cmp "$REPO_ROOT/scripts/deploy-chat.py" "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
+cmp "$REPO_ROOT/scripts/lib/restore_journal.py" "$SYSTEM_ROOT/usr/local/libexec/vesselstack/restore_journal.py"
+test "$(stat -c '%u:%a' "$SYSTEM_ROOT/usr/local/libexec/vesselstack/restore_journal.py")" = "0:755"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-control-panel.service"
 test -s "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat-telegram.service"

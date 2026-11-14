@@ -24,10 +24,15 @@ BACKUP_LAST_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last.json"
 BACKUP_LAST_ARCHIVE_FILE="$SYSTEM_ROOT/var/lib/vesselstack/backup-last-archive"
 # The archive the latest backup_stack call completed and verified; empty when none was made.
 LAST_BACKUP_ARCHIVE=''
+# An unfinished restore leaves its journal here. The directory exists from just before the first system
+# change until the restore has committed or been rolled back, so its presence means "a restore is pending".
+RESTORE_DIR="$SYSTEM_ROOT/var/lib/vesselstack/restore"
+RESTORE_CURRENT="$RESTORE_DIR/current"
 
 command_needs_lifecycle_lock() {
     case "${1:-}" in
-        status|doctor|urls|version|logs|verify-backup|alerts) return 1 ;;
+        status|doctor|urls|version|logs|verify-backup|alerts|restore-recover) return 1 ;;
+        restore) [ "${2:-}" = --status ] && [ "$#" -eq 2 ] && return 1 ;;
         profile) case "${2:-}" in show|validate) return 1 ;; esac ;;
         ha-http) [ "${2:-}" = status ] && return 1 ;;
         backup-drive) [ "${2:-}" = list ] && return 1 ;;
@@ -43,6 +48,55 @@ command_needs_lifecycle_lock() {
         lan) for arg in "${@:2}"; do [ "$arg" = --dry-run ] || continue; return 1; done ;;
     esac
     return 0
+}
+
+# Value of KEY in the state of the restore journal in directory DIR (plain KEY=VALUE lines, read with the
+# journal's own helper and never sourced); empty when the key is absent or the state cannot be read.
+restore_state_peek() {
+    python3 -I "$1/restore_journal.py" get "$1" "$2" 2>/dev/null || true
+}
+# True when the journal's state can be read: a helper is there and the file is intact, without a repeated key.
+restore_state_readable() {
+    python3 -I "$1/restore_journal.py" dump "$1" >/dev/null 2>&1
+}
+# Prints the one-line "Restore ..." status; fails when the restore blocks other commands. A restore
+# that is committed (or rolled back) and only left its journal behind never blocks anything.
+restore_status_line() {
+    local phase
+    [ -f "$RESTORE_CURRENT/state" ] || return 0
+    if ! restore_state_readable "$RESTORE_CURRENT"; then
+        printf '%-20s %s\n' Restore "INCOMPLETE (journal state unreadable); see: sudo $RESTORE_CURRENT/recover status"
+        return 1
+    fi
+    phase=$(restore_state_peek "$RESTORE_CURRENT" phase)
+    case "$phase" in
+        committed|rolled-back)
+            printf '%-20s %s\n' Restore "cleanup pending (phase $phase); finish with: sudo $RESTORE_CURRENT/recover rollback"
+            return 0 ;;
+    esac
+    printf '%-20s %s\n' Restore "INCOMPLETE (phase ${phase:-unknown}); see: sudo $RESTORE_CURRENT/recover status"
+    return 1
+}
+
+# Refuse every command that changes the system while a restore is unfinished. Runs before the lifecycle
+# lock is taken because $ROOT (and with it the lock helper) may be the thing that is missing. The restore's
+# own child processes carry VESSELSTACK_RESTORE_ID and are let through. A restore that already committed
+# (or was rolled back) and only left its journal behind blocks nothing.
+restore_pending_check() {
+    local dir=$RESTORE_CURRENT phase id
+    [ -f "$dir/state" ] || return 0
+    if ! restore_state_readable "$dir"; then
+        echo "A restore did not finish and its journal state in $dir cannot be read (damaged, a repeated key, or no helper). Nothing else can change this system until it is resolved." >&2
+        echo "See: sudo $dir/recover status" >&2
+        exit 1
+    fi
+    id=$(restore_state_peek "$dir" id)
+    if [ -n "${VESSELSTACK_RESTORE_ID:-}" ] && [ "${VESSELSTACK_RESTORE_ID}" = "$id" ]; then return 0; fi
+    phase=$(restore_state_peek "$dir" phase)
+    case "$phase" in committed|rolled-back) return 0 ;; esac
+    echo "A restore did not finish (phase: ${phase:-unknown}). Nothing else can change this system until it is resolved." >&2
+    echo "See: sudo $dir/recover status" >&2
+    exit 1
 }
 
 ensure_lifecycle_lock() {
@@ -144,7 +198,22 @@ Commands:
   verify-backup ARCHIVE        Verify an archive and its checksum
   restore ARCHIVE --yes [--skip-installer]
                                Stage and verify a backup, then swap it in; the
-                               previous trees are kept as *.pre-restore-STAMP
+                               previous trees are kept as *.pre-restore-STAMP.
+                               A journal in /var/lib/vesselstack/restore/current
+                               records progress, so an interrupted restore can be
+                               undone (restore-recover below)
+  restore --status             Same as restore-recover status
+  restore-recover status|rollback|abandon [--yes]
+                               After an interrupted or failed restore: status says
+                               how far it got and what to run next; rollback puts the
+                               previous application and data folders and the system
+                               files back and starts the stack again (a restore that
+                               had already completed is only cleaned up); abandon --yes
+                               gives up on the rollback and keeps the folders as they
+                               are, but only when both original folders are in place
+                               (without --yes it only says what it would do). Works even
+                               when /opt/vesselstack is missing; also available as
+                               /var/lib/vesselstack/restore/current/recover
   update [--offline] SOURCE_DIRECTORY
                                Back up and apply a reviewed release; --offline (or
                                VESSELSTACK_OFFLINE=true) installs without network
@@ -579,6 +648,44 @@ check_install_state() {
     return 1
 }
 
+# FAIL (returns 1) when a restore did not finish; silent when none is pending. Reads only the journal's
+# state file, so it works even when the application folder is missing.
+check_restore_state() {
+    local dir=$RESTORE_CURRENT phase
+    [ -f "$dir/state" ] || return 0
+    if ! restore_state_readable "$dir"; then
+        printf 'FAIL restore did not finish (the journal state cannot be read)\n' >&2
+        printf '      see: sudo %s/recover status\n' "$dir" >&2
+        return 1
+    fi
+    phase=$(restore_state_peek "$dir" phase)
+    case "$phase" in
+        committed|rolled-back)
+            printf 'WARN restore cleanup pending (phase %s); nothing is blocked\n' "$phase" >&2
+            printf '      finish with: sudo %s/recover rollback (here it only removes leftovers)\n' "$dir" >&2
+            return 0 ;;
+    esac
+    printf 'FAIL restore did not finish (phase %s)\n' "${phase:-unknown}" >&2
+    printf '      see: sudo %s/recover status\n' "$dir" >&2
+    return 1
+}
+
+# WARN about restore leftovers: a retired journal from an older release and stage directories of a
+# killed restore hold a copy of the backup (secrets included). Nothing here is removed automatically.
+check_restore_leftovers() {
+    local path now age stage=''
+    now=$(date +%s)
+    if [ -f "$RESTORE_CURRENT/state" ]; then stage=$(restore_state_peek "$RESTORE_CURRENT" stage); fi
+    for path in "$SYSTEM_ROOT"/var/lib/vesselstack/.restore-journal.* "$RESTORE_DIR"/building.* \
+        "$(dirname -- "$VESSELSTACK_DATA")"/.vesselstack-restore.*; do
+        [ -d "$path" ] && [ ! -L "$path" ] || continue
+        [ "$path" != "$stage" ] || continue
+        age=$(( (now - $(stat -c %Y "$path" 2>/dev/null || echo "$now")) / 86400 ))
+        printf 'WARN leftover restore data %s (%s days old) holds a copy of a backup, including secrets; remove it when it is no longer needed: sudo rm -rf %q\n' \
+            "${path//[![:print:]]/?}" "$age" "$path" >&2
+    done
+}
+
 status_unit() {
     local label=$1 unit=$2 enabled=${3:-true}
     if [ "$enabled" != true ]; then
@@ -620,7 +727,11 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
 
 status_stack() {
     local failed=0 service running_services
-    # doctor reports the unfinished installation itself (check_install_state), so it passes "quiet".
+    # doctor reports the unfinished restore and installation itself (check_restore_state, check_install_state),
+    # so it passes "quiet".
+    if [ "${1:-}" != quiet ]; then
+        restore_status_line || failed=1
+    fi
     if [ "${1:-}" != quiet ]; then
         read_install_marker
         if [ "$MARKER_PRESENT" -eq 1 ]; then
@@ -2374,6 +2485,8 @@ check_nodered() {
 doctor_stack() {
     local failed=0 command free_kib
     printf 'VesselStack diagnostics\n\n'
+    check_restore_state || failed=1
+    check_restore_leftovers
     check_install_state || failed=1
     for command in docker curl tar sha256sum python3 systemctl; do
         if command -v "$command" >/dev/null 2>&1; then
@@ -2969,22 +3082,30 @@ restore_external_candidates() {
 }
 
 restore_external_validate_path() {
-    local path=$1 cur parent
+    local path=$1 cur
     [ -n "$path" ] && [ "${path#/}" != "$path" ] || return 1
-    cur=/
-    while :; do
-        parent=$(dirname -- "$path")
-        [ "$parent" = "$path" ] && break
-        path=$parent
-    done
-    cur=$(dirname -- "$1")
-    while [ "$cur" != / ] && [ "$cur" != "${SYSTEM_ROOT:-}" ]; do
+    # A "." or ".." segment (or an empty one) would let a path escape the allowlist below.
+    case "$path/" in */../*|*/./*|*//*) return 1 ;; esac
+    cur=${path%/*}
+    while [ -n "$cur" ] && [ "$cur" != "${SYSTEM_ROOT:-}" ]; do
         if [ -L "$cur" ]; then return 1; fi
-        if [ -e "$cur" ] && [ ! -d "$cur" ] && [ "$cur" != "$1" ]; then return 1; fi
-        cur=$(dirname -- "$cur")
+        if [ -e "$cur" ] && [ ! -d "$cur" ]; then return 1; fi
+        cur=${cur%/*}
     done
-    if [ -e "$1" ] && [ ! -f "$1" ] || [ -d "$1" ] && [ ! -L "$1" ]; then return 1; fi
+    if [ -e "$path" ] && [ ! -f "$path" ] || [ -d "$path" ] && [ ! -L "$path" ]; then return 1; fi
     return 0
+}
+# True for a path the installer output allowlist covers: what the publish step may write.
+restore_external_allowed() {
+    case "$1" in
+        "$SYSTEMD_DIR"/*|"$SBIN_DIR"/*|"$LIBEXEC_DIR"/*|"$SYSTEM_ROOT/etc/vesselstack/update.env") return 0 ;;
+    esac
+    return 1
+}
+# Make an appended journal file, and its directory entry, durable.
+restore_sync_file() {
+    local journal=$1 file=$2
+    python3 -I "$journal/restore_journal.py" fsync-tree "$file" && python3 -I "$journal/restore_journal.py" fsync-dir "$journal"
 }
 restore_snapshot_externals() {
     local journal=$1 stage=$2 p rel src inventory
@@ -3010,28 +3131,77 @@ restore_snapshot_externals() {
         rel=${p#/}
         if [ -e "$p" ] || [ -L "$p" ]; then
             printf 'present\t%s\n' "$p" >> "$journal/manifest" || return 1
-            install -d -m 0700 "$journal/files/$(dirname "$rel")" || return 1
+            install -d -m 0700 "$journal/files/${rel%/*}" || return 1
             cp -a -- "$p" "$journal/files/$rel" || return 1
         else
             printf 'absent\t%s\n' "$p" >> "$journal/manifest" || return 1
         fi
     done < "$inventory"
 }
-restore_restore_externals() {
-    local journal=$1 p rel failed=0 state
+# Check the whole snapshot without changing anything. Fails, with the reason (and the file) in
+# restore_externals_error, when it is damaged: a manifest that lists a path outside the managed files, a
+# snapshot copy that is missing, or an empty copy of a file that must never be empty (unit files and the
+# sbin/libexec scripts; update.env may legitimately be empty) while the file in place is not.
+restore_check_externals() {
+    local journal=$1 p rel state
+    restore_externals_error=''
+    if [ ! -s "$journal/manifest" ]; then
+        restore_externals_error="the snapshot manifest $journal/manifest is missing or empty"
+        return 1
+    fi
     while IFS=$'\t' read -r state p; do
         [ -n "$p" ] || continue
-        restore_external_validate_path "$p" || return 1
-        if [ -e "$p" ] || [ -L "$p" ]; then
-            if [ -d "$p" ] && [ ! -L "$p" ]; then return 1; fi
-            rm -f -- "$p" || return 1
+        if ! restore_external_allowed "$p" || ! restore_external_validate_path "$p"; then
+            restore_externals_error="the snapshot lists a path that is not a managed system file: ${p//[![:print:]]/?}"
+            return 1
         fi
-        if [ "$state" = present ]; then
-            rel=${p#/}
-            install -d -m 0755 "$(dirname "$p")" || failed=1
-            cp -a -- "$journal/files/$rel" "$p" || failed=1
+        case "$state" in present|absent) ;; *)
+            restore_externals_error="the snapshot manifest has an unknown entry for $p"
+            return 1 ;;
+        esac
+        [ "$state" = present ] || continue
+        rel=${p#/}
+        if [ ! -e "$journal/files/$rel" ] && [ ! -L "$journal/files/$rel" ]; then
+            restore_externals_error="the snapshot has no copy of $p ($journal/files/$rel is missing)"
+            return 1
+        fi
+        if [ ! -L "$journal/files/$rel" ] && [ -f "$journal/files/$rel" ] && [ ! -s "$journal/files/$rel" ] && [ -s "$p" ]; then
+            case "$p" in
+                "$SYSTEM_ROOT/etc/vesselstack/update.env") ;;
+                "$SYSTEMD_DIR"/*|"$SBIN_DIR"/*|"$LIBEXEC_DIR"/*)
+                    restore_externals_error="the snapshot copy of $p is empty although the file is not ($journal/files/$rel is damaged)"
+                    return 1 ;;
+            esac
         fi
     done < "$journal/manifest"
+    return 0
+}
+# Put the system files back exactly as the snapshot has them. The snapshot is checked first and nothing is
+# changed when it is damaged; each file is then replaced by a rename, so a path is either the old copy or
+# the snapshot copy, never half written.
+restore_restore_externals() {
+    local journal=$1 p rel state dir tmp failed=0
+    restore_check_externals "$journal" || return 1
+    while IFS=$'\t' read -r state p; do
+        [ -n "$p" ] || continue
+        if [ "$state" = present ]; then
+            rel=${p#/}
+            dir=${p%/*}
+            [ -n "$dir" ] || dir=/
+            install -d -m 0755 "$dir" || { failed=1; continue; }
+            tmp=$(mktemp "$dir/.restore-recover.XXXXXX") || { failed=1; continue; }
+            rm -f -- "$tmp"
+            # A link that points at a directory would take the rename inside the directory.
+            if [ -L "$p" ] && [ -d "$p" ]; then rm -f -- "$p" || failed=1; fi
+            if ! cp -a -- "$journal/files/$rel" "$tmp" || ! mv -f -- "$tmp" "$p"; then
+                rm -f -- "$tmp"
+                failed=1
+            fi
+        else
+            rm -f -- "$p" || failed=1
+        fi
+    done < "$journal/manifest"
+    [ "$failed" -eq 0 ] || restore_externals_error="some system files could not be put back from the snapshot"
     return "$failed"
 }
 restore_publish_externals() {
@@ -3128,6 +3298,7 @@ restore_sync_system_files() {
         fi
         printf '%s\n' "$unit" >> "$journal/removed-units" || return 1
     done
+    restore_sync_file "$journal" "$journal/removed-units" || return 1
     # A tree without installer/scripts (a very old release) leaves the helpers alone.
     scripts="$root/installer/scripts"
     [ -d "$scripts" ] || return 0
@@ -3158,6 +3329,7 @@ restore_quiesce_unit() {
     # Record first: a stop that fails half way must still be undone by a start.
     restore_quiesced="$restore_quiesced$unit"$'\n'
     printf '%s\n' "$unit" >> "$journal/quiesced-units" || return 1
+    restore_sync_file "$journal" "$journal/quiesced-units" || return 1
     systemctl stop "$unit" || return 1
 }
 restore_quiesce_writers() {
@@ -3176,15 +3348,23 @@ restore_quiesce_writers() {
                systemctl list-units --plain --no-legend --no-pager --type=timer 'vesselstack-*.timer' 2>/dev/null | awk '{print $1}'; } | sort -u)
     restore_quiesce_unit "$journal" vesselstack-control-panel.service || return 1
     restore_quiesce_unit "$journal" vesselstack-homepage-refresh.service || return 1
+    restore_sync_file "$journal" "$journal/quiesced-units" || return 1
 }
-# Rollback: start exactly the units that were stopped. Best effort.
+# Rollback: bring back exactly the units that were stopped. A unit that is already running is restarted
+# so that it runs against the trees that are now in place. Tries every unit; fails, and names the ones
+# that did not come back in restore_unstarted, when any of them did not.
 restore_start_quiesced() {
-    local unit
+    local unit action
+    restore_unstarted=''
     while IFS= read -r unit; do
         [ -n "$unit" ] || continue
-        systemctl start "$unit" || echo "WARN could not restart $unit after the restore rollback; run: sudo systemctl start $unit" >&2
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then action=restart; else action=start; fi
+        if ! systemctl "$action" "$unit"; then
+            echo "WARN could not restart $unit after the restore rollback; run: sudo systemctl start $unit" >&2
+            restore_unstarted="$restore_unstarted $unit"
+        fi
     done <<< "$restore_quiesced"
-    return 0
+    [ -z "$restore_unstarted" ]
 }
 # Success: the installer normally restarts the panel and enables the timers itself; this
 # covers --skip-installer. Best effort.
@@ -3199,15 +3379,652 @@ restore_resume_quiesced() {
     return 0
 }
 restore_run_controller() {
-    local journal=$1 controller=$2 action=$3
+    local journal=$1 controller=$2 action=$3 rid
     [ "$action" = stop ] || [ "$action" = start ] || return 2
-    if [ -x "$controller" ]; then
-        VESSELSTACK_ROOT="$ROOT" VESSELSTACK_ENV="$ENV_FILE" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    # The id is already loaded when restore_reconcile validated this journal; otherwise ask the helper.
+    if [ "${restore_validated:-}" = "$journal" ]; then rid=$st_id; else rid=$(restore_state_get "$journal" id); fi
+    if [ -x "$controller" ] && [ -s "$controller" ]; then
+        # VESSELSTACK_RESTORE_ID lets the controller (and an installer it runs) work while this restore is pending.
+        VESSELSTACK_RESTORE_ID="$rid" VESSELSTACK_ROOT="$ROOT" VESSELSTACK_ENV="$ENV_FILE" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
             bash "$controller" "$action" || return 1
     else
-        echo "Missing controller for restore $action: $controller" >&2
+        echo "Missing or empty controller for restore $action: $controller" >&2
         return 1
     fi
+}
+
+# ---------------------------------------------------------------- restore journal and recovery
+# The journal ($RESTORE_CURRENT while a restore is pending) records how far a restore got, as a
+# phase written BEFORE the step it names, and carries everything recovery needs so that recovery
+# works with $ROOT moved aside and without the installed vesselstackctl: a copy of the running
+# controller (controller), the new release's (new-controller), the lifecycle lock helper and the
+# state helper, the snapshot of the external system files, and the `recover` wrapper.
+#
+# Phases: prepared (journal complete, nothing changed) -> stopping -> stopped -> data-swap ->
+# root-swap -> externals -> reloaded -> starting -> committed. Rollback: rolling-back ->
+# rolled-back, or rollback-failed. restore_reconcile decides what to do from the phase and, for
+# the two trees, from their inodes.
+restore_state_get() {
+    python3 -I "$1/restore_journal.py" get "$1" "$2" 2>/dev/null || true
+}
+restore_state_set() {
+    local journal=$1
+    shift
+    python3 -I "$journal/restore_journal.py" set "$journal" "$@"
+}
+# Read the whole state in ONE helper call into st_<key> variables (plain text, never evaluated). Fails,
+# with the helper's message on stderr, when the state is unreadable, corrupt or repeats a key.
+restore_state_load() {
+    local journal=$1 dump line key
+    st_format='' st_id='' st_stamp='' st_root='' st_data='' st_system_root='' st_stage='' st_archive='' st_started=''
+    st_root_live='' st_data_live='' st_root_new='' st_data_new='' st_phase='' st_rollback_from=''
+    st_last_error='' st_keys=$'\n'
+    dump=$(python3 -I "$journal/restore_journal.py" dump "$journal") || return 1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        key=${line%%=*}
+        st_keys="$st_keys$key"$'\n'
+        case "$key" in
+            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error)
+                printf -v "st_$key" '%s' "${line#*=}" ;;
+        esac
+    done <<< "$dump"
+}
+# True for an absolute path without an empty, "." or ".." segment that is not "/".
+restore_path_clean() {
+    case "$1" in /*) ;; *) return 1 ;; esac
+    case "$1" in /|*//*|*/|*/.|*/..|*/./*|*/../*) return 1 ;; esac
+    return 0
+}
+# Everything read from the state is checked here before it can reach a rename or a removal. Needs
+# restore_state_load first. Fails on the first problem with the reason in restore_validate_error and
+# changes nothing.
+restore_validate_state() {
+    local stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$' stage_re='^\.vesselstack-restore\.[A-Za-z0-9]{6}$' ino_re='^[0-9]+:[0-9]+$' value
+    restore_validate_error=''
+    if [ "$st_format" != 1 ]; then
+        restore_validate_error="its format is \"${st_format//[![:print:]]/?}\", not 1"
+        return 1
+    fi
+    case "$st_keys" in
+        *$'\n'system_root$'\n'*) ;;
+        *) restore_validate_error="it does not record the system root"; return 1 ;;
+    esac
+    if [ "$st_system_root" != "$SYSTEM_ROOT" ]; then
+        restore_validate_error="belongs to the system root '${st_system_root//[![:print:]]/?}', not '$SYSTEM_ROOT'"
+        return 1
+    fi
+    if ! restore_path_clean "$st_root"; then
+        restore_validate_error="the application folder \"${st_root//[![:print:]]/?}\" is not a clean absolute path"
+        return 1
+    fi
+    if ! restore_path_clean "$st_data"; then
+        restore_validate_error="the data folder \"${st_data//[![:print:]]/?}\" is not a clean absolute path"
+        return 1
+    fi
+    case "$st_root/" in "$st_data/"*) restore_validate_error="the application folder and the data folder are the same or one contains the other"; return 1 ;; esac
+    case "$st_data/" in "$st_root/"*) restore_validate_error="the application folder and the data folder are the same or one contains the other"; return 1 ;; esac
+    if [[ ! $st_stamp =~ $stamp_re ]]; then
+        restore_validate_error="the restore stamp \"${st_stamp//[![:print:]]/?}\" has an unexpected shape"
+        return 1
+    fi
+    if [ -n "$st_stage" ]; then
+        if ! restore_path_clean "$st_stage" || [ "${st_stage%/*}" != "${st_data%/*}" ] || [[ ! ${st_stage##*/} =~ $stage_re ]]; then
+            restore_validate_error="the staged copy path \"${st_stage//[![:print:]]/?}\" is not a staging directory next to the data folder"
+            return 1
+        fi
+        if { [ -e "$st_stage" ] || [ -L "$st_stage" ]; } && { [ -L "$st_stage" ] || [ ! -d "$st_stage" ]; }; then
+            restore_validate_error="the staged copy $st_stage is not an ordinary directory"
+            return 1
+        fi
+    fi
+    for value in "$st_root_live" "$st_data_live" "$st_root_new" "$st_data_new"; do
+        if [[ ! $value =~ $ino_re ]]; then
+            restore_validate_error="it does not record the identity of the application and data trees"
+            return 1
+        fi
+    done
+    return 0
+}
+# dev:ino of PATH itself, or "absent".
+restore_inode() {
+    python3 -I "$1/restore_journal.py" inode "$2"
+}
+# True when CURRENT (restore_inode output) is the tree recorded as RECORDED (dev:ino). Only the inode
+# number is compared: device numbers can change across a reboot.
+restore_same_ino() {
+    [ -n "$1" ] && [ "$1" != absent ] && [ -n "$2" ] && [ "${1##*:}" = "${2##*:}" ]
+}
+# Best-effort journal write for the recovery: remembers when the journal cannot be updated (a full
+# disk) so the recovery can go on, because its decisions come from the trees and not from the phase.
+restore_note() {
+    restore_state_set "$@" || { restore_journal_ok=0; return 1; }
+}
+# Rename a tree, then make the rename durable in both parent directories.
+restore_mv_tree() {
+    local journal=$1 from=$2 to=$3 from_parent to_parent
+    from_parent=${from%/*} to_parent=${to%/*}
+    mv -T -- "$from" "$to" || return 1
+    python3 -I "$journal/restore_journal.py" fsync-dir "${from_parent:-/}" "${to_parent:-/}"
+}
+# Record the phase the transaction is about to enter; a journal that cannot be written ends the restore.
+# The rollback then starts from the last phase that was recorded.
+restore_enter() {
+    local journal=$1 phase=$2
+    if ! restore_state_set "$journal" "phase=$phase"; then
+        restore_abort "$journal" "could not record the restore phase \"$phase\" in the journal"
+        return 1
+    fi
+}
+restore_failure_notice() {
+    local journal=$1 reason=$2 stage
+    stage=$(restore_state_get "$journal" stage)
+    echo "Restore failed: $reason" >&2
+    echo "Recovery journal: $journal" >&2
+    if [ -n "$stage" ] && [ -d "$stage" ]; then echo "Staged copy of the backup: $stage" >&2; fi
+    echo "See: sudo $journal/recover status" >&2
+}
+# In-process failure: say what happened, then let restore_reconcile decide how to undo it.
+# restore_exit_status is 3 when the previous system is back but could not be started, otherwise 1.
+restore_abort() {
+    local journal=$1 reason=$2 rc
+    restore_exit_status=1
+    restore_failure_notice "$journal" "$reason"
+    restore_state_set "$journal" "last_error=${reason//[$'\n\r']/ }" || true
+    restore_reconcile "$journal" && rc=0 || rc=$?
+    case "$rc" in
+        0)
+            echo "Restore rollback completed; the previous trees were restored" >&2
+            if [ -n "${restore_archived:-}" ]; then echo "Rollback record: $restore_archived" >&2; fi ;;
+        3)
+            restore_exit_status=3
+            echo "Restore rollback completed; the previous trees were restored, but the stack is not running" >&2
+            if [ -n "${restore_archived:-}" ]; then echo "Rollback record: $restore_archived" >&2; fi ;;
+        *)
+            echo "RECOVERY ERROR: the rollback did not complete; evidence retained" >&2
+            echo "See: sudo $journal/recover status" >&2 ;;
+    esac
+    return 1
+}
+restore_reconcile_fail() {
+    local journal=$1 message=$2
+    restore_note "$journal" phase=rollback-failed "last_error=${message//[$'\n\r']/ }" || true
+    restore_outcome=rollback-failed
+    echo "RECOVERY ERROR: $message" >&2
+    return 1
+}
+# Remove the staged copy named by the journal, only when the state validates (see restore_validate_state).
+restore_remove_stage() {
+    local journal=$1
+    # restore_reconcile has validated this journal's state already (only phase and last_error change after that).
+    if [ "${restore_validated:-}" != "$journal" ]; then
+        if ! restore_state_load "$journal"; then
+            echo "WARN not removing the staged copy: the journal state cannot be read" >&2
+            return 0
+        fi
+        if ! restore_validate_state; then
+            echo "WARN not removing the staged copy: the restore journal $restore_validate_error" >&2
+            return 0
+        fi
+    fi
+    [ -n "$st_stage" ] || return 0
+    rm -rf -- "$st_stage"
+}
+restore_prune_archives() {
+    local dir=$1 kind=$2 path count i
+    local -a list=()
+    for path in "$dir/$kind"-*; do
+        if [ -d "$path" ] && [ ! -L "$path" ]; then list+=("$path"); fi
+    done
+    count=${#list[@]}
+    for ((i = 0; i < count - 3; i++)); do rm -rf -- "${list[i]}"; done
+}
+# Move the finished journal out of the way (this is the atomic step that ends "pending"), then drop
+# what is large or secret: the snapshot of the system files and the controller copies. The state,
+# removed-units and quiesced-units files stay as a record; only the newest three of each kind stay.
+restore_archive_journal() {
+    local journal=$1 kind=$2 parent stamp target name
+    parent=${journal%/*}
+    if [ "${restore_validated:-}" = "$journal" ]; then stamp=$st_stamp; else stamp=$(restore_state_get "$journal" stamp); fi
+    [[ $stamp =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$ ]] || stamp=unknown-$$
+    target="$parent/$kind-$stamp"
+    if [ -e "$target" ] || [ -L "$target" ]; then target="$target.$$"; fi
+    mv -T -- "$journal" "$target" || return 1
+    restore_archived=$target
+    python3 -I "$target/restore_journal.py" fsync-dir "$parent" || true
+    for name in files controller new-controller old-controller lifecycle_lock.py restore_journal.py recover \
+        inventory manifest staged-all publish-list state.tmp; do
+        rm -rf -- "${target:?}/$name"
+    done
+    restore_prune_archives "$parent" "$kind"
+}
+restore_finish_committed() {
+    local journal=$1
+    restore_outcome=committed
+    restore_remove_stage "$journal"
+    if ! restore_archive_journal "$journal" "done"; then
+        echo "WARN the restore completed but its journal could not be archived; run: sudo $journal/recover rollback" >&2
+        return 1
+    fi
+}
+# Nothing has changed yet: refuse here what the tree steps would only find out after moving something.
+restore_tree_preflight() {
+    local journal=$1 label=$2 path=$3 live=$4 stamp=$5 current fs
+    read -r current fs <<< "$(python3 -I "$journal/restore_journal.py" inspect "$path")" || fs=unknown
+    case "$fs" in
+        same|absent) ;;
+        different)
+            restore_reconcile_fail "$journal" "the $label folder $path is not on the same filesystem as its parent directory (a mount point?); nothing was changed"
+            return 1 ;;
+        *)
+            restore_reconcile_fail "$journal" "could not check which filesystem the $label folder $path is on; nothing was changed"
+            return 1 ;;
+    esac
+    if ! restore_same_ino "$current" "$live" && [ -L "$path.pre-restore-$stamp" ]; then
+        restore_reconcile_fail "$journal" "the previous $label tree $path.pre-restore-$stamp is a symbolic link; refusing to move it into place. Nothing was changed"
+        return 1
+    fi
+}
+# From phase "stopped" onward the stack was stopped, but a reboot or a late start can have brought
+# units (and containers) back, and they may be using whichever tree is at ROOT now. Stop them all BEFORE
+# any tree is moved, then check. A failing controller stop is only a warning: the unit check decides.
+restore_stop_before_moving() {
+    local journal=$1 root=$2 root_live=$3 root_new=$4 pass unit current active=''
+    for pass in timer service; do
+        while IFS= read -r unit; do
+            case "$unit" in *".$pass") ;; *) continue ;; esac
+            if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                restore_stopped_units="$restore_stopped_units $unit"
+                systemctl stop "$unit" || echo "WARN could not stop $unit" >&2
+            fi
+        done < <(restore_known_units)
+    done
+    current=$(restore_inode "$journal" "$root")
+    if restore_same_ino "$current" "$root_new"; then
+        restore_run_controller "$journal" "$journal/new-controller" stop || \
+            echo "WARN the restored stack could not be stopped (new-controller stop); checking the units instead" >&2
+    elif restore_same_ino "$current" "$root_live"; then
+        restore_run_controller "$journal" "$journal/controller" stop || \
+            echo "WARN the stack could not be stopped (controller stop); checking the units instead" >&2
+    fi
+    while IFS= read -r unit; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then active="$active $unit"; fi
+    done < <(restore_known_units)
+    if [ -n "$active" ]; then
+        restore_reconcile_fail "$journal" "these units are still running and may be using the folders:$active; nothing was moved. Stop them (sudo systemctl stop ...) and run the recovery again"
+        return 1
+    fi
+}
+# One tree (ROOT, then DATA), decided by inode, not by phase: after any crash the live path holds the
+# original tree, the staged one, nothing, or something this restore never made.
+restore_reconcile_tree() {
+    local journal=$1 label=$2 path=$3 live_ino=$4 new_ino=$5 stamp=$6 current
+    local failed="$path.failed-restore-$stamp" pre="$path.pre-restore-$stamp"
+    if [ -z "$live_ino" ] || [ -z "$new_ino" ] || [ "$live_ino" = absent ] || [ "$new_ino" = absent ]; then
+        restore_reconcile_fail "$journal" "the journal has no inode recorded for the $label tree $path"
+        return 1
+    fi
+    current=$(restore_inode "$journal" "$path")
+    if restore_same_ino "$current" "$live_ino"; then
+        return 0
+    elif restore_same_ino "$current" "$new_ino"; then
+        restore_mv_tree "$journal" "$path" "$failed" || {
+            restore_reconcile_fail "$journal" "could not move the restored $label tree $path aside to $failed"
+            return 1
+        }
+    elif [ "$current" != absent ]; then
+        if [ -d "$path" ] && [ ! -L "$path" ] && rmdir -- "$path" 2>/dev/null; then
+            :
+        else
+            restore_reconcile_fail "$journal" "$path holds something this restore did not put there; nothing was changed or deleted. Move it away and run the recovery again"
+            return 1
+        fi
+    fi
+    if [ -L "$pre" ]; then
+        restore_reconcile_fail "$journal" "the previous $label tree $pre is a symbolic link; refusing to move it into place"
+        return 1
+    elif [ -e "$pre" ]; then
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            restore_reconcile_fail "$journal" "$path is in the way of the previous $label tree $pre; nothing was changed. Move it away and run the recovery again"
+            return 1
+        fi
+        restore_mv_tree "$journal" "$pre" "$path" || {
+            restore_reconcile_fail "$journal" "could not move the previous $label tree $pre back to $path"
+            return 1
+        }
+    else
+        restore_reconcile_fail "$journal" "the previous $label tree $pre does not exist and $path is not the original; nothing was changed"
+        return 1
+    fi
+}
+# The single decision function, idempotent, used by the in-process failure path and by
+# `restore-recover rollback`. It reads root, data, stamp and the inodes from the journal state
+# and never from $ROOT/config. Sets restore_outcome (rolled-back, committed or rollback-failed).
+# Returns 0 when the system is rolled back and running again (or the restore had committed), 3 when it
+# is rolled back but could not be started (the journal is archived, nothing is pending), 1 otherwise.
+#
+# "Rolled back" means: both trees are at their live paths with the recorded identity, the system files
+# are restored from the snapshot (when the restore had begun to publish them) and systemd was reloaded.
+# Starting the previous stack after that point can fail for reasons that have nothing to do with the
+# restore, so it must never leave the journal pending (that would lock the owner out of every command).
+restore_reconcile_run() {
+    local journal=$1 phase from stamp root data root_live root_new data_live data_new
+    local controller="$1/controller" need_start=0 start_error=''
+    restore_outcome='' restore_archived='' restore_stopped_units='' restore_journal_ok=1 restore_validated=''
+    if ! restore_state_load "$journal"; then
+        echo "RECOVERY ERROR: the journal state $journal/state cannot be read (damaged, a repeated key, or no helper); nothing was changed" >&2
+        restore_outcome=rollback-failed
+        return 1
+    fi
+    phase=$st_phase
+    if [ -z "$phase" ]; then
+        echo "RECOVERY ERROR: $journal/state has no phase" >&2
+        restore_outcome=rollback-failed
+        return 1
+    fi
+    if ! restore_validate_state; then
+        case "$phase" in
+            committed|rolled-back)
+                # Only cleanup was left: do not turn a finished restore into a failed rollback.
+                restore_note "$journal" "last_error=the restore journal $restore_validate_error" || true
+                restore_outcome=rollback-failed
+                echo "RECOVERY ERROR: the restore journal $restore_validate_error; nothing was changed" >&2 ;;
+            *) restore_reconcile_fail "$journal" "the restore journal $restore_validate_error; nothing was changed" ;;
+        esac
+        return 1
+    fi
+    restore_validated=$journal
+    stamp=$st_stamp root=$st_root data=$st_data
+    root_live=$st_root_live root_new=$st_root_new data_live=$st_data_live data_new=$st_data_new
+    case "$phase" in
+        committed)
+            restore_finish_committed "$journal"
+            return $? ;;
+        rolled-back)
+            restore_outcome=rolled-back
+            restore_remove_stage "$journal"
+            restore_archive_journal "$journal" rolled-back || {
+                echo "WARN could not archive the journal; run: sudo $journal/recover rollback" >&2
+                return 1
+            }
+            return 0 ;;
+        rolling-back|rollback-failed)
+            from=$st_rollback_from
+            [ -n "$from" ] || from=starting ;;
+        prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) from=$phase ;;
+        *)
+            restore_reconcile_fail "$journal" "the journal has an unknown phase: $phase"
+            return 1 ;;
+    esac
+    case "$from" in
+        prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) ;;
+        *)
+            restore_reconcile_fail "$journal" "the journal has an unknown rollback phase: $from"
+            return 1 ;;
+    esac
+    # The decisions below come from the trees, not from the phase, so a journal that cannot be
+    # written (a full disk) must not stop the rollback.
+    if ! restore_state_set "$journal" phase=rolling-back "rollback_from=$from"; then
+        restore_journal_ok=0
+        echo "WARN the journal $journal could not be updated (is the disk full?); the recovery goes on and decides from the folders themselves" >&2
+    fi
+    case "$from" in
+        prepared|stopping)
+            # Nothing was renamed. Bring back whatever may have been stopped.
+            if [ "$from" = stopping ] || [ -s "$journal/quiesced-units" ]; then need_start=1; fi ;;
+        *)
+            restore_tree_preflight "$journal" application "$root" "$root_live" "$stamp" || return 1
+            restore_tree_preflight "$journal" data "$data" "$data_live" "$stamp" || return 1
+            case "$from" in
+                externals|reloaded|starting)
+                    # A damaged snapshot is found now, while nothing has been moved.
+                    restore_check_externals "$journal" || {
+                        restore_reconcile_fail "$journal" "the system file snapshot in the journal is damaged: ${restore_externals_error:-unknown error}; nothing was changed"
+                        return 1
+                    } ;;
+            esac
+            restore_stop_before_moving "$journal" "$root" "$root_live" "$root_new" || return 1
+            restore_reconcile_tree "$journal" application "$root" "$root_live" "$root_new" "$stamp" || return 1
+            restore_reconcile_tree "$journal" data "$data" "$data_live" "$data_new" "$stamp" || return 1
+            if ! { [ -d "$root" ] && [ ! -L "$root" ] && [ -d "$data" ] && [ ! -L "$data" ]; }; then
+                restore_reconcile_fail "$journal" "$root and $data are not both ordinary directories after the rollback"
+                return 1
+            fi
+            case "$from" in
+                externals|reloaded|starting)
+                    # Only once the system files were being published; before that they were never touched
+                    # and a damaged snapshot must not overwrite good files.
+                    restore_restore_externals "$journal" || {
+                        restore_reconcile_fail "$journal" "the system files could not be restored from the journal snapshot: ${restore_externals_error:-unknown error}"
+                        return 1
+                    } ;;
+            esac
+            rm -f -- "$journal/removed-units"
+            systemctl daemon-reload || {
+                restore_reconcile_fail "$journal" "systemd could not be reloaded after the rollback"
+                return 1
+            }
+            need_start=1 ;;
+    esac
+    if [ "$need_start" -eq 1 ]; then
+        if ! restore_run_controller "$journal" "$controller" start; then
+            start_error="the previous stack could not be started ($controller start)"
+        fi
+        restore_quiesced=$(cat "$journal/quiesced-units" 2>/dev/null || true)
+        if ! restore_start_quiesced; then
+            start_error="${start_error:+$start_error; }could not start:$restore_unstarted"
+        fi
+    fi
+    if [ -n "$start_error" ]; then
+        restore_note "$journal" phase=rolled-back "last_error=${start_error//[$'\n\r']/ }" || true
+    else
+        restore_note "$journal" phase=rolled-back || true
+    fi
+    restore_outcome=rolled-back
+    restore_remove_stage "$journal"
+    restore_archive_journal "$journal" rolled-back || {
+        echo "WARN could not archive the journal; run: sudo $journal/recover rollback" >&2
+    }
+    if [ "$restore_journal_ok" -eq 0 ]; then
+        echo "WARN the journal ${restore_archived:-$journal} could not be updated during the recovery (is the disk full?); its state may show an earlier phase. The system itself was rolled back" >&2
+    fi
+    if [ -n "$start_error" ]; then
+        echo "The previous system is back in place, but it could not be started: $start_error. Run: sudo vesselstackctl start, then sudo vesselstackctl doctor" >&2
+        if [ -n "$restore_stopped_units" ]; then echo "Units stopped during the recovery:$restore_stopped_units" >&2; fi
+        return 3
+    fi
+    return 0
+}
+
+# restore_validated lets the helpers below trust the state loaded and validated by this run; it never
+# outlives the run, so a later journal at the same path is always read afresh.
+restore_reconcile() {
+    local rc=0
+    restore_reconcile_run "$@" || rc=$?
+    restore_validated=''
+    return "$rc"
+}
+
+restore_phase_words() {
+    case "$1" in
+        prepared) printf 'prepared; nothing had been changed yet' ;;
+        stopping) printf 'stopping the running stack; no folder had been moved' ;;
+        stopped) printf 'the stack was stopped; no folder had been moved' ;;
+        data-swap) printf 'swapping in the restored data folder' ;;
+        root-swap) printf 'swapping in the restored application folder' ;;
+        externals) printf 'publishing the restored system files' ;;
+        reloaded) printf 'reloading systemd' ;;
+        starting) printf 'starting the restored system' ;;
+        committed) printf 'completed; only cleanup was left' ;;
+        rolling-back) printf 'rolling back' ;;
+        rolled-back) printf 'rolled back; only cleanup was left' ;;
+        rollback-failed) printf 'the rollback did not complete' ;;
+        abandoned) printf 'abandoned; the original folders were kept' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+# Sets restore_original_reason (empty) and succeeds when BOTH trees are at their live paths with the
+# recorded live identity; otherwise fails and says which tree is not the original. Needs restore_state_load.
+restore_originals_in_place() {
+    local journal=$1 label path live new current
+    restore_original_reason=''
+    for label in application data; do
+        if [ "$label" = application ]; then path=$st_root live=$st_root_live new=$st_root_new
+        else path=$st_data live=$st_data_live new=$st_data_new; fi
+        current=$(restore_inode "$journal" "$path")
+        restore_same_ino "$current" "$live" && continue
+        if [ "$current" = absent ]; then
+            restore_original_reason="the $label folder $path is missing, so it is not the original"
+        elif restore_same_ino "$current" "$new"; then
+            restore_original_reason="the $label folder $path is the restored tree, not the original"
+        else
+            restore_original_reason="the $label folder $path is not the original tree (it is something this restore did not put there)"
+        fi
+        return 1
+    done
+    return 0
+}
+restore_recover_status() {
+    local journal=$1 path label
+    echo "A restore did not finish."
+    printf 'Phase:     %s (%s)\n' "${st_phase:-unknown}" "$(restore_phase_words "${st_phase:-}")"
+    printf 'Started:   %s\n' "$st_started"
+    printf 'Archive:   %s\n' "$st_archive"
+    printf 'Journal:   %s\n' "$journal"
+    if [ -n "$st_stage" ]; then
+        if [ -d "$st_stage" ]; then printf 'Staged copy of the backup: %s\n' "$st_stage"; else printf 'Staged copy of the backup: %s (already removed)\n' "$st_stage"; fi
+    fi
+    for label in application data; do
+        if [ "$label" = application ]; then path=$st_root; else path=$st_data; fi
+        [ -n "$path" ] || continue
+        printf 'The %s folder is %s\n' "$label" "$path"
+        if [ -e "$path.pre-restore-$st_stamp" ] || [ -L "$path.pre-restore-$st_stamp" ]; then
+            printf '  the previous one is kept as %s\n' "$path.pre-restore-$st_stamp"
+        fi
+        if [ -e "$path.failed-restore-$st_stamp" ] || [ -L "$path.failed-restore-$st_stamp" ]; then
+            printf '  the restored one that was set aside is %s\n' "$path.failed-restore-$st_stamp"
+        fi
+    done
+    if [ -n "$st_last_error" ]; then printf 'Last error: %s\n' "$st_last_error"; fi
+    case "$st_phase" in
+        committed|rolled-back)
+            echo "The restore itself is done; only leftovers remain. This finishes the cleanup and does not undo anything:" ;;
+        *) echo "To undo the restore (put the previous folders and system files back and start the stack again):" ;;
+    esac
+    echo "  sudo $journal/recover rollback"
+    if restore_originals_in_place "$journal"; then
+        echo "If the rollback keeps failing and the original folders are already in place, you can give up on it instead:"
+        echo "  sudo $journal/recover abandon --yes   (keeps the folders as they are; the system files are not checked and the stack is not started)"
+    fi
+    echo "These folders and the journal contain a copy of the backup, including secrets."
+}
+# The state is authoritative for recovery: it names the trees, the system root and the lock. It is
+# validated first; a journal that does not validate is not used for anything.
+restore_load_identity() {
+    local journal=$1
+    if ! restore_state_load "$journal"; then
+        echo "The restore journal $journal/state cannot be read (damaged, a repeated key, or no helper). Nothing was changed." >&2
+        return 1
+    fi
+    if ! restore_validate_state; then
+        echo "The restore journal $journal $restore_validate_error. Nothing was changed." >&2
+        return 1
+    fi
+    ROOT=$st_root
+    ENV_FILE=$st_root/config/vesselstack.env
+    VESSELSTACK_ROOT=$st_root
+    VESSELSTACK_DATA=$st_data
+}
+# Take the lifecycle lock with the journal's own copy of the helper ($ROOT may be moved aside): re-runs
+# this command under the lock when it is not held yet, and returns once it is.
+restore_take_lock() {
+    local journal=$1 lock_helper="$1/lifecycle_lock.py"
+    shift
+    [ -s "$lock_helper" ] || { echo "Missing $lock_helper; the journal is incomplete" >&2; exit 1; }
+    if [ -z "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
+        exec python3 -I "$lock_helper" run --root "$ROOT" --system-root "$SYSTEM_ROOT" -- bash "$0" restore-recover "$@"
+    fi
+    python3 -I "$lock_helper" check --root "$ROOT" --system-root "$SYSTEM_ROOT" || exit $?
+}
+restore_recover_rollback() {
+    local journal=$1 rc
+    restore_take_lock "$journal" rollback
+    echo "Recovering an unfinished restore (phase: ${st_phase:-unknown})"
+    restore_reconcile "$journal" && rc=0 || rc=$?
+    case "$rc" in
+        0)
+            case "$restore_outcome" in
+                committed) echo "The restore had already completed, so nothing was rolled back. Its leftovers were removed." ;;
+                *) echo "Rollback completed: the previous application and data folders and the system files are back and the stack was started." ;;
+            esac
+            if [ -n "${restore_archived:-}" ]; then echo "Record kept in $restore_archived"; fi
+            return 0 ;;
+        3)
+            echo "Rollback completed: the previous application and data folders and the system files are back, but the stack could not be started (see above)."
+            if [ -n "${restore_archived:-}" ]; then echo "Record kept in $restore_archived"; fi
+            return 3 ;;
+    esac
+    echo "The recovery did not complete." >&2
+    echo "See: sudo $journal/recover status" >&2
+    return 1
+}
+# Give up on the rollback: allowed only when both original trees are in place. Archives the journal as
+# abandoned-<stamp> and says what was not done. Without --yes it only says what it would do.
+restore_recover_abandon() {
+    local journal=$1 confirmed=$2
+    if [ "$confirmed" = yes ]; then
+        restore_take_lock "$journal" abandon --yes
+        # The lock is held now: look again, the folders may have changed while waiting for it.
+        restore_state_load "$journal" || return 1
+        restore_validate_state || { echo "The restore journal $journal $restore_validate_error. Nothing was changed." >&2; return 1; }
+    fi
+    if ! restore_originals_in_place "$journal"; then
+        echo "Refusing to abandon the restore: $restore_original_reason." >&2
+        echo "Abandoning is only allowed when both original folders are in place. Use: sudo $journal/recover rollback" >&2
+        return 1
+    fi
+    if [ "$confirmed" != yes ]; then
+        echo "Both original folders are in place ($st_root and $st_data)."
+        echo "abandon --yes would archive the journal as $(dirname -- "$journal")/abandoned-$st_stamp and remove the staged copy of the backup."
+        echo "It would NOT re-check or restore the system files and would NOT start the stack."
+        echo "To do it: sudo $journal/recover abandon --yes"
+        return 0
+    fi
+    restore_remove_stage "$journal"
+    restore_state_set "$journal" phase=abandoned || true
+    restore_archive_journal "$journal" abandoned || {
+        echo "Could not archive the journal $journal; nothing else was changed." >&2
+        return 1
+    }
+    echo "The restore was abandoned. The original application and data folders were kept as they are."
+    echo "Record kept in $restore_archived"
+    echo "Not done: the system files (units, helper scripts) were not re-checked against the snapshot, and the stack was not started."
+    echo "Next: sudo vesselstackctl doctor"
+    echo "      sudo vesselstackctl start"
+}
+restore_recover_command() {
+    local action=${1:-} journal=$RESTORE_CURRENT confirmed=no
+    case "$action" in
+        status|rollback) [ "$#" -eq 1 ] || { usage >&2; exit 2; } ;;
+        abandon)
+            if [ "$#" -eq 2 ] && [ "$2" = --yes ]; then confirmed=yes
+            elif [ "$#" -ne 1 ]; then usage >&2; exit 2; fi ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    if [ ! -f "$journal/state" ]; then
+        if [ -e "$journal" ] || [ -L "$journal" ]; then
+            echo "$journal exists but has no readable state file. Do not delete it while the application or data folder is missing; ask for help." >&2
+            return 1
+        fi
+        echo "No restore is pending."
+        return 0
+    fi
+    restore_load_identity "$journal" || return 1
+    case "$action" in
+        status) restore_recover_status "$journal" ;;
+        rollback) restore_recover_rollback "$journal" ;;
+        abandon) restore_recover_abandon "$journal" "$confirmed" ;;
+    esac
 }
 
 restore_config_identity() {
@@ -3233,100 +4050,72 @@ PY
 }
 
 restore_commit_transaction() {
-    local stage=$1 journal=$2 root=$3 data=$4 stamp=$5 old_controller=$6 new_controller=$7 skip_installer=$8
-    local root_old_moved=0 data_old_moved=0 root_new_published=0 data_new_published=0 new_start_attempted=0
-    local failed_root="$root.failed-restore-$stamp" failed_data="$data.failed-restore-$stamp"
-    restore_recover() {
-        if [ "$new_start_attempted" -eq 1 ]; then
-            restore_run_controller "$journal" "$new_controller" stop || return 1
-        fi
-        if [ "$root_new_published" -eq 1 ]; then mv -T -- "$root" "$failed_root" || return 1; fi
-        if [ "$data_new_published" -eq 1 ]; then mv -T -- "$data" "$failed_data" || return 1; fi
-        if [ "$root_old_moved" -eq 1 ]; then
-            [ ! -e "$root" ] && [ ! -L "$root" ] || return 1
-            mv -T -- "$root.pre-restore-$stamp" "$root" || return 1
-        fi
-        if [ "$data_old_moved" -eq 1 ]; then
-            [ ! -e "$data" ] && [ ! -L "$data" ] || return 1
-            mv -T -- "$data.pre-restore-$stamp" "$data" || return 1
-        fi
-        [ -d "$root" ] && [ ! -L "$root" ] && [ -d "$data" ] && [ ! -L "$data" ] || return 1
-        restore_restore_externals "$journal" || return 1
-        rm -f -- "$journal/removed-units"
-        systemctl daemon-reload || return 1
-        restore_run_controller "$journal" "$old_controller" start || return 1
-        restore_start_quiesced
-    }
-    restore_fail() {
-        local reason=$1
-        echo "Restore failed: $reason" >&2
-        echo "Recovery journal: $journal" >&2
-        echo "Failed trees (if published): $failed_root $failed_data" >&2
-        if restore_recover; then
-            restore_rollback=ok
-            echo "Restore rollback completed; previous trees restored" >&2
-        else
-            restore_rollback=failed
-            echo "RECOVERY ERROR: evidence retained; inspect journal and failed trees" >&2
-        fi
-        return 1
-    }
-    restore_rollback=none
+    local stage=$1 journal=$2 root=$3 data=$4 stamp=$5 old_controller=$6 new_controller=$7 skip_installer=$8 rid
     restore_quiesced=''
+    rid=$(restore_state_get "$journal" id)
+    # Every phase is written before the step it names; restore_reconcile undoes whatever the
+    # journal and the two trees show, whether this process fails or is killed.
+    restore_enter "$journal" stopping || return 1
     if ! restore_run_controller "$journal" "$old_controller" stop; then
-        restore_rollback=ok
-        if ! restore_run_controller "$journal" "$old_controller" start; then
-            restore_rollback=failed
-            echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
-        fi
-        echo "Restore failed: old controller stop failed; journal retained at $journal" >&2
+        restore_abort "$journal" "the running stack could not be stopped"
         return 1
     fi
-    # Nothing has been renamed yet, so a failed quiesce only needs the old stack and the
-    # units that were already stopped brought back.
     if ! restore_quiesce_writers "$journal"; then
-        restore_rollback=ok
-        if ! restore_run_controller "$journal" "$old_controller" start; then
-            restore_rollback=failed
-            echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
-        else
-            restore_start_quiesced
-        fi
-        echo "Restore failed: could not stop the Control Panel and timers; journal retained at $journal" >&2
+        restore_abort "$journal" "could not stop the Control Panel and timers"
         return 1
     fi
-    if ! mv -T -- "$data" "$data.pre-restore-$stamp"; then restore_fail "data old-tree rename"; return 1; fi
-    data_old_moved=1
-    if ! mv -T -- "$stage/vesselstack-backup/${data#/}" "$data"; then restore_fail "data publication"; return 1; fi
-    data_new_published=1
-    if ! mv -T -- "$root" "$root.pre-restore-$stamp"; then restore_fail "root old-tree rename"; return 1; fi
-    root_old_moved=1
-    if ! mv -T -- "$stage/vesselstack-backup/${root#/}" "$root"; then restore_fail "root publication"; return 1; fi
-    root_new_published=1
-    if ! restore_publish_externals "$journal" "$stage"; then restore_fail "managed external publication"; return 1; fi
-    if ! restore_sync_system_files "$journal" "$stage" "$root"; then restore_fail "system file reconciliation"; return 1; fi
-    if ! systemctl daemon-reload; then restore_fail "daemon reload"; return 1; fi
-    new_start_attempted=1
+    restore_enter "$journal" stopped || return 1
+    restore_enter "$journal" data-swap || return 1
+    if ! restore_mv_tree "$journal" "$data" "$data.pre-restore-$stamp"; then restore_abort "$journal" "data old-tree rename"; return 1; fi
+    if ! restore_mv_tree "$journal" "$stage/vesselstack-backup/${data#/}" "$data"; then restore_abort "$journal" "data publication"; return 1; fi
+    restore_enter "$journal" root-swap || return 1
+    if ! restore_mv_tree "$journal" "$root" "$root.pre-restore-$stamp"; then restore_abort "$journal" "root old-tree rename"; return 1; fi
+    if ! restore_mv_tree "$journal" "$stage/vesselstack-backup/${root#/}" "$root"; then restore_abort "$journal" "root publication"; return 1; fi
+    restore_enter "$journal" externals || return 1
+    if ! restore_publish_externals "$journal" "$stage"; then restore_abort "$journal" "managed external publication"; return 1; fi
+    if ! restore_sync_system_files "$journal" "$stage" "$root"; then restore_abort "$journal" "system file reconciliation"; return 1; fi
+    restore_enter "$journal" reloaded || return 1
+    if ! systemctl daemon-reload; then restore_abort "$journal" "daemon reload"; return 1; fi
+    restore_enter "$journal" starting || return 1
     if [ "$skip_installer" -eq 0 ] && [ -x "$root/installer/install.sh" ]; then
-        if ! "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start; then restore_fail "restored installer start"; return 1; fi
+        # The restored installer may be an older release that does not know the journal; a current one
+        # recognises this id and does not refuse because the restore is pending.
+        if ! VESSELSTACK_RESTORE_ID="$rid" "$root/installer/install.sh" --config "$root/config/vesselstack.env" --start; then
+            restore_abort "$journal" "restored installer start"
+            return 1
+        fi
     else
-        if ! restore_run_controller "$journal" "$new_controller" start; then restore_fail "restored controller start"; return 1; fi
+        if ! restore_run_controller "$journal" "$new_controller" start; then restore_abort "$journal" "restored controller start"; return 1; fi
     fi
     restore_resume_quiesced
+    restore_enter "$journal" committed || return 1
     return 0
 }
 
-# Called by restore_stack after restore_commit_transaction failed.
+# Called by restore_stack after restore_commit_transaction failed (restore_abort already ran the rollback).
+# A journal that is gone was archived by a rollback that finished; a journal that is still there means the
+# rollback did not finish, or finished but could not archive it. Nothing is claimed that was not seen.
 restore_finish_failed_commit() {
-    local stage=$1 journal=$2
-    if [ "${restore_rollback:-}" = ok ]; then
-        rm -rf -- "$stage"
-        echo "Restore failed, but the previous trees were restored. The staged copy of the backup was removed." >&2
+    local stage=$1 journal=$2 phase=''
+    if [ -e "$journal" ] || [ -L "$journal" ]; then
+        if restore_state_load "$journal" 2>/dev/null; then phase=$st_phase; fi
+        if [ "$phase" = rolled-back ]; then
+            echo "Restore failed, but the previous trees were restored. Its journal could not be archived: $journal" >&2
+            echo "Finish the cleanup with: sudo $journal/recover rollback" >&2
+        else
+            echo "Restore failed and the rollback did not complete. Kept for recovery:" >&2
+            echo "  stage:   $stage" >&2
+            echo "  journal: $journal" >&2
+            echo "Both contain a copy of the backup (including secrets); remove them after recovery." >&2
+            echo "See: sudo $journal/recover status" >&2
+        fi
     else
-        echo "Restore failed and the rollback did not complete. Kept for recovery:" >&2
-        echo "  stage:   $stage" >&2
-        echo "  journal: $journal" >&2
-        echo "Both contain a copy of the backup (including secrets); remove them after recovery." >&2
+        rm -rf -- "$stage"
+        if [ "${restore_exit_status:-1}" -eq 3 ]; then
+            echo "Restore failed, and the previous trees were restored, but the system could not be started (see above). The staged copy of the backup was removed." >&2
+        else
+            echo "Restore failed, but the previous trees were restored. The staged copy of the backup was removed." >&2
+        fi
     fi
 }
 
@@ -3342,8 +4131,101 @@ restore_skip_installer_notice() {
     fi
 }
 
+# Everything restore_create_journal puts into a journal that is still being built.
+restore_populate_journal() {
+    local building=$1 stage=$2 root=$3 data=$4 stamp=$5 archive=$6 skip_installer=$7
+    local helper="$building/restore_journal.py" new_controller="$building/new-controller" id
+    local root_live data_live root_new data_new
+    [ -r "$LIBEXEC_DIR/restore_journal.py" ] || {
+        echo "Missing $LIBEXEC_DIR/restore_journal.py (rerun the installer)" >&2
+        return 1
+    }
+    [ -r "$ROOT/common/lifecycle_lock.py" ] || {
+        echo "Missing $ROOT/common/lifecycle_lock.py (rerun the installer)" >&2
+        return 1
+    }
+    cp -- "$LIBEXEC_DIR/restore_journal.py" "$helper" || return 1
+    cp -- "$ROOT/common/lifecycle_lock.py" "$building/lifecycle_lock.py" || return 1
+    # The complete running controller; recovery runs it without the installed copy or $ROOT.
+    cp -a -- "$0" "$building/controller" || return 1
+    cat > "$building/recover" <<'RECOVER'
+#!/bin/bash
+# Recovery entry point for an interrupted VesselStack restore. It needs neither the application folder
+# nor the installed vesselstackctl: everything it runs is in this directory.
+#   recover status           what happened and what to run next
+#   recover rollback         put the previous folders and system files back and start the stack
+#   recover abandon --yes    give up on the rollback when both original folders are in place
+set -euo pipefail
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# A journal that was not fully written (a power loss) must not "recover" by doing nothing.
+for file in controller restore_journal.py state; do
+    if [ ! -s "$dir/$file" ]; then
+        echo "recover: $dir/$file is missing or empty; the restore journal in $dir is damaged and cannot be used" >&2
+        exit 1
+    fi
+done
+journal_get() { python3 -I "$dir/restore_journal.py" get "$dir" "$1"; }
+VESSELSTACK_ROOT=$(journal_get root) || { echo "Cannot read the restore journal in $dir" >&2; exit 1; }
+VESSELSTACK_SYSTEM_ROOT=$(journal_get system_root) || { echo "Cannot read the restore journal in $dir" >&2; exit 1; }
+VESSELSTACK_DATA=$(journal_get data) || { echo "Cannot read the restore journal in $dir" >&2; exit 1; }
+unset VESSELSTACK_ENV
+export VESSELSTACK_ROOT VESSELSTACK_SYSTEM_ROOT VESSELSTACK_DATA
+exec bash "$dir/controller" restore-recover "$@"
+RECOVER
+    chmod 0700 "$building/recover" "$building/controller" || return 1
+    restore_snapshot_externals "$building" "$stage" || return 1
+    if [ -f "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ]; then
+        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || return 1
+    elif [ -f "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ]; then
+        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || return 1
+    else
+        echo "Restore archive has no safe restored controller" >&2
+        return 1
+    fi
+    chmod 0700 "$new_controller" || return 1
+    root_live=$(python3 -I "$helper" inode "$root") || return 1
+    data_live=$(python3 -I "$helper" inode "$data") || return 1
+    root_new=$(python3 -I "$helper" inode "$stage/vesselstack-backup/${root#/}") || return 1
+    data_new=$(python3 -I "$helper" inode "$stage/vesselstack-backup/${data#/}") || return 1
+    if [ "$root_live" = absent ] || [ "$data_live" = absent ] || [ "$root_new" = absent ] || [ "$data_new" = absent ]; then
+        echo "Could not record the identity of the application and data trees" >&2
+        return 1
+    fi
+    id=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n') || return 1
+    python3 -I "$helper" set "$building" format=1 "id=$id" "stamp=$stamp" \
+        "root=$root" "data=$data" "system_root=$SYSTEM_ROOT" "stage=$stage" "archive=$archive" \
+        "skip_installer=$skip_installer" "root_live=$root_live" "data_live=$data_live" \
+        "root_new=$root_new" "data_new=$data_new" "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        last_error= phase=prepared || return 1
+}
+# Build the journal next to its final name, then rename it into place: "restore/current exists" then
+# always means "complete, nothing changed yet or later".
+restore_create_journal() {
+    local building path
+    # Only the restore directory is private: /var/lib/vesselstack keeps the mode the installer gave it
+    # (0755; the alerts service reads backup-last.json there) and GNU "install -d -m" would change it.
+    [ -d "$SYSTEM_ROOT/var/lib/vesselstack" ] || install -d -m 0755 "$SYSTEM_ROOT/var/lib/vesselstack" || return 1
+    install -d -m 0700 "$RESTORE_DIR" || return 1
+    for path in "$RESTORE_DIR"/building.*; do
+        if [ -d "$path" ] && [ ! -L "$path" ]; then rm -rf -- "$path"; fi
+    done
+    building=$(mktemp -d "$RESTORE_DIR/building.XXXXXX") || return 1
+    if ! restore_populate_journal "$building" "$@"; then
+        rm -rf -- "$building"
+        return 1
+    fi
+    # Every file is flushed before the rename that makes the journal "current".
+    if ! python3 -I "$building/restore_journal.py" fsync-tree "$building" || \
+       ! mv -T -- "$building" "$RESTORE_CURRENT" || \
+       ! python3 -I "$RESTORE_CURRENT/restore_journal.py" fsync-dir "$RESTORE_DIR"; then
+        rm -rf -- "$building"
+        return 1
+    fi
+}
+
 restore_stack() {
-    local archive='' confirmation='' skip_installer=0 argument
+    local archive='' confirmation='' skip_installer=0 argument pending_phase archive_rc
+    restore_exit_status=1
     for argument in "$@"; do
         case "$argument" in
             --yes) confirmation=--yes ;;
@@ -3355,6 +4237,18 @@ restore_stack() {
     done
     [ -n "$archive" ] || { usage; exit 2; }
     [ "$confirmation" = --yes ] || { echo "restore requires --yes" >&2; exit 2; }
+    if [ -e "$RESTORE_CURRENT" ] || [ -L "$RESTORE_CURRENT" ]; then
+        # A journal that only has cleanup left (committed, rolled back) is finished first: it never blocks.
+        pending_phase=$(restore_state_peek "$RESTORE_CURRENT" phase)
+        case "$pending_phase" in
+            committed|rolled-back) restore_reconcile "$RESTORE_CURRENT" >/dev/null 2>&1 || true ;;
+        esac
+    fi
+    if [ -e "$RESTORE_CURRENT" ] || [ -L "$RESTORE_CURRENT" ]; then
+        echo "Refusing to restore: an earlier restore did not finish, and its journal is still in place. Nothing was changed or deleted." >&2
+        echo "See: sudo $RESTORE_CURRENT/recover status" >&2
+        exit 1
+    fi
     verify_backup "$archive"
     local root=$VESSELSTACK_ROOT data=$VESSELSTACK_DATA path
     for path in "$root" "$data"; do
@@ -3420,31 +4314,35 @@ PY
     restore_config_identity "$ENV_FILE" "$stage/vesselstack-backup/${root#/}/config/vesselstack.env" || {
         rm -rf -- "$stage"; echo "Restored config does not identify the live root/data trees; nothing was changed" >&2; exit 1;
     }
-    local journal_parent="$SYSTEM_ROOT/var/lib/vesselstack" journal old_controller new_controller
-    install -d -m 0700 "$journal_parent" || exit 1
-    journal=$(mktemp -d "$journal_parent/.restore-journal.XXXXXX") || exit 1
-    old_controller="$journal/old-controller"
-    cp -a -- "$0" "$old_controller" || { rm -rf -- "$journal"; exit 1; }
-    restore_snapshot_externals "$journal" "$stage" || {
-        rm -rf -- "$stage" "$journal"
+    local journal new_controller removed_units='' unit label
+    # The staged copy is flushed to disk before the journal exists: after this the first change can follow.
+    if [ ! -r "$LIBEXEC_DIR/restore_journal.py" ]; then
+        rm -rf -- "$stage"
+        echo "Missing $LIBEXEC_DIR/restore_journal.py (rerun the installer); nothing was changed" >&2
+        exit 1
+    fi
+    if ! python3 -I "$LIBEXEC_DIR/restore_journal.py" fsync-tree "$stage"; then
+        rm -rf -- "$stage"
+        echo "Could not flush the staged copy of the backup to disk; nothing was changed" >&2
+        exit 1
+    fi
+    restore_create_journal "$stage" "$root" "$data" "$stamp" "$archive" "$skip_installer" || {
+        rm -rf -- "$stage"
         echo "Could not create the recovery journal; nothing was changed" >&2
         exit 1
     }
+    journal=$RESTORE_CURRENT
     new_controller="$journal/new-controller"
-    if [ -f "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ]; then
-        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || { rm -rf -- "$stage" "$journal"; exit 1; }
-    elif [ -f "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ]; then
-        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || { rm -rf -- "$stage" "$journal"; exit 1; }
-    else
-        echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage" "$journal"; exit 1
-    fi
-    if ! { [ -x "$old_controller" ] && [ -x "$new_controller" ]; }; then echo "Restore controllers are not executable" >&2; rm -rf -- "$stage" "$journal"; exit 1; fi
-    if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$old_controller" "$new_controller" "$skip_installer"; then
-        local removed_units='' unit label
+    if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$journal/controller" "$new_controller" "$skip_installer"; then
         if [ -r "$journal/removed-units" ]; then removed_units=$(cat "$journal/removed-units"); fi
-        rm -rf -- "$stage" "$journal"
+        # The phase is "committed": remove the stage and archive the journal (nothing is rolled back).
+        restore_reconcile "$journal" && archive_rc=0 || archive_rc=$?
         echo "Restore completed"
         echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
+        if [ "$archive_rc" -ne 0 ]; then
+            echo "WARN the restore completed, but its recovery journal could not be archived and is still in $journal (phase committed). Other commands are not blocked." >&2
+            echo "WARN finish the cleanup with: sudo $journal/recover rollback   (in this phase it only removes leftovers; it does not undo the restore)" >&2
+        fi
         if [ -n "$removed_units" ]; then
             echo "Turned off because the restored version does not have them:"
             while IFS= read -r unit; do
@@ -3457,7 +4355,7 @@ PY
         return 0
     fi
     restore_finish_failed_commit "$stage" "$journal"
-    return 1
+    return "${restore_exit_status:-1}"
 }
 
 # ---------------------------------------------------------------- backup drive (control panel helpers)
@@ -3700,7 +4598,7 @@ uninstall_stack() {
         "$SYSTEMD_DIR/vesselstack-displays-bridge.service" \
         "$SYSTEMD_DIR/vesselstack-control-panel.service" "$SBIN_DIR/vesselstackctl"
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SYSTEMD_DIR/vesselstack-homepage-refresh.service" "$SBIN_DIR/vesselstack-firewall" \
-        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" "$LIBEXEC_DIR/vesselstack-alerts.py"
+        "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" "$LIBEXEC_DIR/vesselstack-alerts.py" "$LIBEXEC_DIR/restore_journal.py"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
@@ -3745,6 +4643,29 @@ case "$command" in
     help|-h|--help) usage; exit 0 ;;
 esac
 require_root
+# Recovery has to work when $ROOT is missing (nothing below may need it), so it is dispatched before
+# the lock, the pending-restore refusal and the configuration are touched.
+if [ "$command" = restore-recover ]; then
+    restore_recover_command "$@"
+    exit $?
+fi
+if [ "$command" = restore ] && [ "${1:-}" = --status ]; then
+    [ $# -eq 1 ] || { usage; exit 2; }
+    restore_recover_command status
+    exit $?
+fi
+if command_needs_lifecycle_lock "$command" "$@"; then restore_pending_check; fi
+# status and doctor still answer when the restore left no configuration to load.
+if { [ "$command" = status ] || [ "$command" = doctor ]; } && [ ! -r "$ENV_FILE" ] && [ -f "$RESTORE_CURRENT/state" ]; then
+    if [ "$command" = doctor ]; then
+        printf 'VesselStack diagnostics\n\n'
+        check_restore_state || true
+        echo 'RESULT attention required' >&2
+    else
+        restore_status_line || true
+    fi
+    exit 1
+fi
 ensure_lifecycle_lock "$command" "$@"
 if [ "$command" = profile ]; then
     [ "$#" -ge 1 ] || { usage; exit 2; }
