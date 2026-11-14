@@ -326,18 +326,33 @@ grep -q 'vsdisp-ops' <<<"$CLI_OUT" || fail "list does not show the new display"
 ! grep -qF -e "$NEW_OPS_PASS" -e test-wifi-pass-1 -e "$ADMIN_PASS" <<<"$CLI_OUT" || fail "list printed a secret"
 pass
 
-# status reads the retained topics through the real broker with the admin options file.
-admin_put vesselstack/v1/bridge/status online
+# status reads the retained topics through the real broker with the admin options file. The bridge line comes
+# from the retained bridge/service record ({"state","ts"}, UTC like the bridge writes it): a fresh online record
+# shows its age, an online record far older than the heartbeat allows is "last reported online", and a missing
+# record is "unknown".
+service_record() { # service_record STATE SECONDS_AGO
+    python3 -c 'import json, sys, time
+print(json.dumps({"state": sys.argv[1], "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - int(sys.argv[2])))}, separators=(",", ":")))' "$1" "$2"
+}
+admin_put vesselstack/v1/bridge/service "$(service_record online 0)"
 admin_put vesselstack/v1/bridge/signalk connected
 admin_put vesselstack/v1/displays/vsdisp-ops/status online
 CLI_OUT=$(dctl status 2>&1) || fail "displayctl status failed: $CLI_OUT"
-grep -Eq '^Bridge +online$' <<<"$CLI_OUT" || fail "status did not show the bridge online: $CLI_OUT"
+grep -Eq '^Bridge +online \(reported [0-9]+ s ago\)$' <<<"$CLI_OUT" || fail "status did not show the bridge online: $CLI_OUT"
 grep -Eq '^ops +online$' <<<"$CLI_OUT" || fail "status did not show ops online: $CLI_OUT"
 grep -Eq '^helm +' <<<"$CLI_OUT" || fail "status did not list helm: $CLI_OUT"
 ! grep -qF "$ADMIN_PASS" <<<"$CLI_OUT" || fail "status printed the admin password"
 ! docker exec "$BROKER" ls /tmp 2>/dev/null | grep -q . || fail "status left a temporary options file in the broker container"
 pass
-clear_retained vesselstack/v1/bridge/status
+admin_put vesselstack/v1/bridge/service "$(service_record online 86400)"
+CLI_OUT=$(dctl status 2>&1) || fail "displayctl status failed with a stale bridge report: $CLI_OUT"
+grep -Eq '^Bridge +last reported online .* ago; the bridge may not be running$' <<<"$CLI_OUT" \
+    || fail "status did not flag the day-old online report: $CLI_OUT"
+pass
+clear_retained vesselstack/v1/bridge/service
+CLI_OUT=$(dctl status 2>&1) || fail "displayctl status failed without a bridge report: $CLI_OUT"
+grep -Eq '^Bridge +unknown \(no report\)$' <<<"$CLI_OUT" || fail "status did not show the missing bridge report as unknown: $CLI_OUT"
+pass
 clear_retained vesselstack/v1/bridge/signalk
 clear_retained vesselstack/v1/displays/vsdisp-ops/status
 
