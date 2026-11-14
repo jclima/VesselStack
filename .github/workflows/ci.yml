@@ -102,6 +102,8 @@ jobs:
         run: sudo tests/test-displays-bridge.sh
       - name: Verify the bridge EnvironmentFile and unit under real systemd
         run: tests/test-displays-envfile-systemd.sh
+      - name: Verify the Node-RED dashboard live channel requires the crew sign-in
+        run: tests/test-nodered-dashboard-auth.sh
 
   displays-esphome-config:
     runs-on: ubuntu-latest

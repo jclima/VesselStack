@@ -298,7 +298,9 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("delete process.env.NODERED_ADMIN_PASSWORD_HASH", text)
         for needle in ("adminAuth", "httpNodeAuth", "process.env.NODERED_ADMIN_PASSWORD_HASH", "process.env.NODERED_CREDENTIAL_SECRET",
                        "functionExternalModules: false", "projects: { enabled: false }",
-                       "telemetry: { enabled: false", "diagnostics: { enabled: false", "allowInstall: true"):
+                       "telemetry: { enabled: false", "diagnostics: { enabled: false", "allowInstall: true",
+                       "dashboard: { ioMiddleware: dashboardSocketAuth }", "timingSafeEqual", "'@node-rs/bcrypt', 'bcryptjs'",
+                       "transport=websocket", "xdomain"):
             self.assertIn(needle, text)
         self.assertNotRegex(text, r"\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}")  # no hash baked into the file
         self.assertIn("throw new Error", text)  # never starts without a sign-in
@@ -311,6 +313,35 @@ class TemplateTests(unittest.TestCase):
         self.assertNotEqual(run({"NODERED_ADMIN_PASSWORD_HASH": "", "NODERED_DASHBOARD_PASSWORD_HASH": "", "NODERED_CREDENTIAL_SECRET": ""}).returncode, 0)
         self.assertNotEqual(run({"NODERED_ADMIN_PASSWORD_HASH": HASH, "NODERED_DASHBOARD_PASSWORD_HASH": "", "NODERED_CREDENTIAL_SECRET": "x"}).returncode, 0)
         self.assertEqual(run({"NODERED_ADMIN_PASSWORD_HASH": HASH, "NODERED_DASHBOARD_PASSWORD_HASH": HASH2, "NODERED_CREDENTIAL_SECRET": "x"}).returncode, 0)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_dashboard_socket_middleware_refuses_without_the_crew_sign_in(self):
+        script = ROOT / "templates" / "node-red" / "settings.js"
+        driver = """
+const s = require(process.argv[1])
+const b64 = v => 'Basic ' + Buffer.from(v).toString('base64')
+const sock = (headers, url, xdomain) => ({ request: { url: url || '/dashboard/socket.io/?EIO=4&transport=polling', headers: headers }, handshake: { xdomain: xdomain === undefined ? false : xdomain } })
+const cases = [
+  ['no header', sock({})],
+  ['wrong user', sock({ authorization: b64('admin:x') })],
+  ['cross-origin', sock({ authorization: b64('crew:anything') }, undefined, true)],
+  ['direct websocket', sock({ authorization: b64('crew:anything') }, '/dashboard/socket.io/?EIO=4&transport=websocket')],
+  ['no bcrypt', sock({ authorization: b64('crew:anything') })],
+]
+;(async () => {
+  const out = []
+  for (const [name, socket] of cases) out.push(await new Promise(res => s.dashboard.ioMiddleware(socket, e => res([name, e instanceof Error ? e.message : String(e)]))))
+  console.log(JSON.stringify(out))
+})()
+"""
+        run = subprocess.run(["node", "-e", driver, str(script)], capture_output=True, text=True, timeout=60,
+                             env={**os.environ, "NODERED_ADMIN_PASSWORD_HASH": HASH, "NODERED_DASHBOARD_PASSWORD_HASH": HASH2, "NODERED_CREDENTIAL_SECRET": "x"})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        results = json.loads(run.stdout)
+        self.assertEqual([name for name, _ in results], ["no header", "wrong user", "cross-origin", "direct websocket", "no bcrypt"])
+        for name, message in results:  # every case is refused with an Error, never let through
+            self.assertRegex(message, r"^VesselStack: ", name)
+        self.assertIn("no bcrypt module found", run.stderr)  # the host has no bcrypt, so crew fails closed
 
     def test_example_flows_use_environment_variables_only(self):
         text = (ROOT / "templates" / "node-red" / "vesselstack-example-flows.json").read_text()

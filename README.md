@@ -1621,7 +1621,7 @@ and is not empty, and the root-owned `settings.js` exists; otherwise it is skipp
 compose `env_file` is required.
 
 **What is pre-configured.** `settings.js` sets `adminAuth` (editor), `httpNodeAuth` (dashboards), an encrypted
-credential store (`NODERED_CREDENTIAL_SECRET`), projects off, `functionExternalModules` off and telemetry off.
+credential store (`NODERED_CREDENTIAL_SECRET`), the `crew` sign-in on the dashboard live channel (`dashboard.ioMiddleware`), projects off, `functionExternalModules` off and telemetry off.
 Connection values arrive as environment variables from the root-only `config/nodered.env` (mode 0600):
 `MQTT_HOST`/`MQTT_PORT`/`MQTT_USER`/`MQTT_PASSWORD` for the dedicated Mosquitto account `vesselstack-nodered`
 (read `vesselstack/#`, read-write `vesselstack/nodered/#`; see [MQTT access control](docs/MQTT.md)), and a read-only
@@ -1659,12 +1659,14 @@ through Tailscale or an SSH tunnel. Limits to know about:
 - `host.docker.internal` lets flows reach listeners on the host (Signal K, Home Assistant, SSH): turn on Signal K
   security so a flow cannot read or write it unauthenticated.
 - Node-RED shares the default compose network with Mosquitto, InfluxDB, Prometheus and the other containers.
-- Dashboard 2.0 socket.io: the pinned `@flowfuse/node-red-dashboard@1.36.1` serves
-  `/dashboard/socket.io/` without applying `httpNodeAuth` (an unauthenticated polling request answered HTTP 200
-  in a test with the rendered settings). The dashboard page and the editor API return 401, but live widget data
-  can be reachable without a password by anyone who can reach the port. This is a known limitation; the default
-  `127.0.0.1` bind (plus Tailscale or an SSH tunnel) is the mitigation, so do not publish the port on `0.0.0.0`
-  with sensitive dashboards.
+- Dashboard 2.0 live channel (socket.io): `httpNodeAuth` does not cover the pinned `@flowfuse/node-red-dashboard@1.36.1`
+  socket (`/dashboard/socket.io/`), so `settings.js` sets `dashboard.ioMiddleware`. Every live connection must carry
+  the `crew` sign-in, which browsers resend from the credentials cached for the dashboard page. Without it the
+  connection is refused (`44{"message":"VesselStack: crew sign-in required"}`) and no widget data or button presses
+  pass. Cross-origin pages and direct websocket connections are refused, as before. The first polling request still
+  returns HTTP 200 with an empty session that closes after 45 s. With no bcrypt module available in the image,
+  everything is refused and the log says `no bcrypt module found`. After changing the pinned dashboard version,
+  rerun `tests/test-nodered-dashboard-auth.sh`.
 
 **Operational impact.** One more container, a data directory `${VESSELSTACK_DATA}/node-red`,
 `config/nodered.env` and `config/node-red/settings.js`, all included in backups. `sudo vesselstackctl doctor`
@@ -1675,11 +1677,25 @@ adds a WARN-only Node-RED check. A homepage tile appears when enabled.
 is deployed, `.../dashboard/` must also print `401`); anything else means the editor is not protected. `sudo
 vesselstackctl doctor` runs the same probes and WARNs otherwise.
 
+The dashboard live channel must be refused without the sign-in: take the `sid` from
+`curl -s 'http://127.0.0.1:1880/dashboard/socket.io/?EIO=4&transport=polling'`, then
+`curl -s -X POST --data 40 "http://127.0.0.1:1880/dashboard/socket.io/?EIO=4&transport=polling&sid=SID"` and
+`curl -s "http://127.0.0.1:1880/dashboard/socket.io/?EIO=4&transport=polling&sid=SID"` must print
+`44{"message":"VesselStack: crew sign-in required"}`. `tests/test-nodered-dashboard-auth.sh` (Docker and internet
+needed) runs this and the other checks against the pinned image. Still to be checked by hand: the dashboard in iOS
+Safari (including a home-screen app), Android Chrome and Firefox, on localhost, the LAN and the `tailscale serve` URL.
+
 **Roll back.** Set `NODERED_ENABLE=false` and rerun the installer: the container, the MQTT account, the
 InfluxDB token (revoked; the installer warns if InfluxDB is unreachable) and `nodered.env` are removed.
 `${VESSELSTACK_DATA}/node-red`, `config/node-red/settings.js` and the generated secrets are kept so re-enabling
 restores your flows; delete them yourself to discard them. To go back to the previous behavior of following the
 dashboards' address, set `NODERED_BIND_ADDRESS` explicitly.
+
+To reopen the dashboard live channel without a password (not recommended), remove the
+`dashboard: { ioMiddleware: ... }` line from `config/node-red/settings.js` as root and run `sudo vesselstackctl restart`.
+`settings.js` is seeded only when absent, so a Pi already installed from this branch keeps its old file: delete
+`config/node-red/settings.js` as root and rerun the installer (or apply the change by hand) to get the protection.
+Node-RED is not in any release yet.
 
 ## MQTT access control
 

@@ -9,7 +9,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" \
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-nodered-dashboard-auth.sh" \
     "$ROOT/tests/test-displays-envfile-systemd.sh" "$ROOT/scripts/install-displays-venv.sh" \
     "$ROOT/tests/test-displays-esphome-config.sh" "$ROOT/tests/compile-display-firmware.sh" \
     "$ROOT/scripts/prepare-offline-bundle.sh" \
@@ -36,7 +36,7 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
     "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
-    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" "$ROOT/tests/test-remote.sh" \
+    "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" "$ROOT/tests/test-remote.sh" "$ROOT/tests/test-nodered-dashboard-auth.sh" \
     "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-displays-envfile-systemd.sh" \
     "$ROOT/scripts/install-displays-venv.sh" "$ROOT/tests/test-displays-esphome-config.sh" "$ROOT/tests/compile-display-firmware.sh" \
     "$ROOT/scripts/prepare-offline-bundle.sh" \
