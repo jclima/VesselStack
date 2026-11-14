@@ -425,10 +425,10 @@ and Docker may already have been installed by the earlier steps; re-running is s
 `--set` cannot change the configuration of an installed system (an upgrade keeps it).
 With a saved configuration from an earlier run, `--yes` and `--defaults` reuse it and
 `--set` is applied on top of it (the old file is kept as `vesselstack.env.previous`). Re-running is safe: finished steps are reported
-and skipped, an already installed version just reports "nothing to do". Rollback of this
+and skipped, an already installed version reports "nothing to do", and an installation or update that did not finish is continued from where it stopped (see below). The bootstrap also finds an installation at a custom root by reading the installed `vesselstackctl` (`sudo` does not pass `VESSELSTACK_ROOT`). Rollback of this
 installer change: use the previous release's `get-vesselstack.sh`; nothing else changed.
 
-While an installation or update is running, the installer keeps `config/install-in-progress`; it is removed once the services have started (or, for a run without `--start`, when no earlier `--start` run failed), so a leftover file means the last run did not finish. `installed-version` is written before the services are started and does not by itself show that they were. Nothing acts on the marker yet.
+While an installation or update is running, the installer keeps `config/install-in-progress`; it is removed once the services have started (or, for a run without `--start`, when no earlier `--start` run failed), so a leftover file means the last run did not finish. `installed-version` is written before the services are started and does not by itself show that they were. `get-vesselstack.sh` reads the marker: a rerun for the same version continues the unfinished installation with the installed configuration, no wizard and no new backup (it asks first, unless `--yes` or `--defaults`); an older version is refused while a newer update is unfinished; and a failed update names the backup recorded in the marker. `vesselstackctl doctor`/`status` and the Control Panel do not read the marker yet.
 
 **What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
 root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the

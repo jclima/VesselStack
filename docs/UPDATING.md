@@ -24,6 +24,12 @@ installs and starts the release:
 curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.7.0/get-vesselstack.sh | sudo bash
 ```
 
+Running it again for the version that is already installed reports "nothing to do". If the
+previous run did not finish (for example the network dropped while images were downloading),
+the same command continues it with the saved settings instead: the questions are not asked
+again and no new backup is made. After a failed update the message names the backup to restore
+(`sudo vesselstackctl restore FILE --yes`).
+
 The command itself needs the unpacked release directory, so plain `vesselstackctl update`
 with no argument fails. To run it by hand once a release is unpacked (the installer unpacks to
 `/opt/vesselstack-release/<version>`):
