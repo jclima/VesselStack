@@ -37,6 +37,8 @@ class FakeIo(alerts.Io):
         self.http_cost = 0.0
         self.uid = 1000
         self.ha_error = False
+        self.ha_status = None        # forced HTTP status for every Home Assistant state read
+        self.influx_status = 200     # forced HTTP status for every InfluxDB query
 
     def now(self):
         return self.clock
@@ -61,6 +63,8 @@ class FakeIo(alerts.Io):
         if "/api/v2/query" in url:
             if not self.influx_up:
                 raise OSError("refused")
+            if self.influx_status != 200:
+                return self.influx_status, b""
             query = json.loads(body)["query"]
             if "electrical" in query:
                 if self.voltage is None:
@@ -71,6 +75,8 @@ class FakeIo(alerts.Io):
         if "/api/states/" in url:
             if self.ha_error:
                 raise OSError("ha down")
+            if self.ha_status:
+                return self.ha_status, b""
             entity = url.rsplit("/", 1)[1]
             if entity not in self.ha:
                 return 404, b""
@@ -466,6 +472,107 @@ class AlertTests(unittest.TestCase):
             env = {**settings(ALERT_SHORE_POWER_ENTITY="binary_sensor.shore"), "VESSELSTACK_DATA": data}
             alerts.main(["doctor"], env, FakeIo())
         self.assertIn("HOME_ASSISTANT_TOKEN is empty", out.getvalue())
+
+    def pings(self, h):
+        return [u for m, u in h.io.requests if u.startswith("https://hc.example.org")]
+
+    def test_bilge_without_token_raises_not_working_alert_and_heartbeat_fails(self):
+        h = Harness(self, ALERT_BILGE_ENTITY="binary_sensor.bilge", ALERT_HEARTBEAT_URL=HEARTBEAT)   # no HOME_ASSISTANT_TOKEN
+        h.run()
+        h.run(240)
+        self.assertEqual(h.texts(), [])                       # held 5 minutes like "not reporting"
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT)
+        h.run(60)
+        self.assertEqual(len(h.texts()), 1)
+        self.assertIn("Bilge alert is not working: Home Assistant token is missing or was rejected, so binary_sensor.bilge cannot be checked.", h.texts()[0])
+        self.assertIn("Set a new long-lived access token in Control Panel settings.", h.texts()[0])
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT + "/fail")
+        h.run(60)
+        self.assertEqual(len(h.texts()), 1)                   # de-duplicated
+        h.run(60 * 61)
+        self.assertEqual(len(h.texts()), 2)                   # repeats on ALERT_REPEAT_MINUTES
+        self.assertIn("bilge-auth", h.state()["alerts"])
+        self.assertNotIn("bilge", h.state()["alerts"])
+
+    def test_ha_401_and_403_raise_not_working_alert(self):
+        for status in (401, 403):
+            h = Harness(self, ALERT_SHORE_POWER_ENTITY="binary_sensor.shore", HOME_ASSISTANT_TOKEN="t-12345", ALERT_HEARTBEAT_URL=HEARTBEAT)
+            h.io.ha_status = status
+            h.run()
+            h.run(300)
+            self.assertEqual(len(h.texts()), 1, status)
+            self.assertIn("Shore power alert is not working", h.texts()[0])
+            self.assertNotIn("t-12345", h.texts()[0])
+            self.assertEqual(self.pings(h)[-1], HEARTBEAT + "/fail")
+
+    def test_active_bilge_alert_survives_rejected_token_and_recovery_clears_both(self):
+        h = self.bilge(ALERT_HEARTBEAT_URL=HEARTBEAT)
+        h.io.ha = {"binary_sensor.bilge": "on"}
+        h.run()
+        self.assertEqual(len(h.texts()), 1)
+        h.io.ha_status = 401
+        h.run(60)
+        h.run(300)
+        self.assertIn("bilge", h.state()["alerts"])           # not cleared by a token failure
+        self.assertFalse(any("off again" in t for t in h.texts()))
+        self.assertTrue(any("Bilge alert is not working" in t for t in h.texts()))
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT + "/fail")
+        h.io.ha_status = None
+        h.io.ha = {"binary_sensor.bilge": "off"}
+        h.run(60)
+        self.assertEqual(h.state()["alerts"], {})
+        self.assertTrue(any("Bilge alert is working again: binary_sensor.bilge can be read." in t for t in h.texts()))
+        self.assertTrue(any("off again" in t for t in h.texts()))
+        count = len(h.texts())
+        h.run(60)
+        self.assertEqual(len(h.texts()), count)               # clear message only once
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT)
+
+    def test_transient_ha_failures_do_not_raise_not_working_alert(self):
+        h = self.bilge(ALERT_HEARTBEAT_URL=HEARTBEAT)
+        h.io.ha_error = True
+        h.run()
+        h.run(600)
+        h.io.ha_error, h.io.ha_status = False, 503
+        h.run(600)
+        self.assertEqual(h.texts(), [])
+        self.assertEqual(h.state()["alerts"], {})
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT)
+
+    def test_recovery_before_hold_sends_nothing(self):
+        h = Harness(self, ALERT_BILGE_ENTITY="binary_sensor.bilge")
+        h.run()
+        h.run(60, HOME_ASSISTANT_TOKEN="t-12345")
+        self.assertEqual(h.texts(), [])
+        self.assertEqual(h.state()["alerts"].get("bilge-auth"), None)
+
+    def test_influx_rejected_token_raises_alert_and_recovers(self):
+        h = Harness(self, ALERT_BATTERY_LOW_V="12.0", ALERT_HEARTBEAT_URL=HEARTBEAT)
+        h.io.influx_status = 401
+        h.run()
+        h.run(299)
+        self.assertEqual(h.texts(), [])
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT)
+        h.run(1)
+        self.assertEqual(len(h.texts()), 1)
+        self.assertTrue(h.texts()[0].startswith("Battery and stale-data alerts are not working: InfluxDB rejected the read token."))
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT + "/fail")
+        h.io.influx_status = 503                              # transient: alert kept, nothing new
+        h.run(60)
+        self.assertEqual(len(h.texts()), 1)
+        h.io.influx_status = 200
+        h.run(60)
+        self.assertEqual(len(h.texts()), 2)
+        self.assertIn("working again", h.texts()[1])
+        self.assertEqual(h.state()["alerts"], {})
+        self.assertEqual(self.pings(h)[-1], HEARTBEAT)
+
+    def test_influx_rejected_token_ignored_when_no_influx_check_configured(self):
+        h = Harness(self, SIGNALK_MODE="existing")
+        h.io.influx_status = 403
+        h.run()
+        h.run(600)
+        self.assertEqual(h.texts(), [])
 
     def test_clock_backwards_clamps_and_boot_change_reannounces(self):
         h = Harness(self, ALERT_BATTERY_LOW_V="12.0")

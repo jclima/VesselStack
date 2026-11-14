@@ -38,6 +38,7 @@ const state = {
   bootId: null,
   reconnectTimer: null,
   reconnectAttempts: 0,
+  connection: "locked",
   reauthDirty: false,
   releaseCheckPending: false,
   installedVersion: "unknown",
@@ -120,6 +121,7 @@ function setNotice(id, text, kind = "info") {
 }
 
 function setConnection(mode) {
+  state.connection = mode;
   $("#connection-dot").className = mode === "connected" ? "dot online" : mode === "disconnected" ? "dot offline" : "dot";
   $("#connection-label").textContent = mode === "connected" ? "Connected" : mode === "disconnected" ? "Disconnected" : "Locked";
   $("#retry").hidden = mode !== "disconnected";
@@ -129,7 +131,8 @@ function setConnection(mode) {
 
 const LIVE_DATA_NOTE = "Live instrument data pauses briefly.";
 const CONFIRMS = {
-  stop: { title: "Stop all services?", intro: "These will go dark:", items: ["Instruments in Home Assistant and Grafana", "Signal K (no boat data comes in)", "Boat Chat and Telegram alerts", "Displays"], note: "The Control Panel stays available. Press Start all to bring them back.", ok: "Stop all", danger: true },
+  stop: { title: "Stop all services?", intro: "These will go dark:", items: ["Instruments in Home Assistant and Grafana", "Signal K (no boat data comes in)", "Boat Chat and the Telegram chat bot", "Displays"], note: "The Control Panel stays available. Press Start all to bring them back.", ok: "Stop all", danger: true },
+  backup: { title: "Back up now?", intro: "A backup stops every service so the databases are copied safely. These go dark until it finishes:", items: ["Instruments in Home Assistant and Grafana", "Signal K (no boat data comes in)", "Boat Chat and the Telegram chat bot", "Displays"], note: "Services start again by themselves when the backup finishes. This usually takes several minutes. Avoid it while under way or when you rely on an anchor alarm.", ok: "Back up now" },
   restart: { title: "Restart all services?", intro: "Every service stops and starts again. Live data pauses for under a minute.", ok: "Restart all" },
   start: { title: "Start all services?", intro: `Starts every enabled service that is stopped. ${LIVE_DATA_NOTE}`, ok: "Start all" },
   install: { title: "Reinstall & start?", intro: "This re-applies your saved settings and restarts every service.", items: ["Live data pauses for about a minute", "Unsaved edits on the Settings page are not included", "Your data and backups are not touched"], ok: "Reinstall & start" },
@@ -758,7 +761,7 @@ function renderBand() {
   const backup = backupSummary();
   const software = softwareSummary();
   const cell = (key, item) => `<div><span class="k">${key}</span><span class="v ${item.tone}">${escapeHtml(item.value)}</span><span class="sub">${item.html ?? escapeHtml(item.sub)}</span></div>`;
-  $("#band").innerHTML = `${cell("Services", services)}${cell("Backup", backup)}${cell("Software", software)}<div class="act"><button type="button" class="primary" data-action="backup">Back up now</button></div>`;
+  $("#band").innerHTML = `${cell("Services", services)}${cell("Backup", backup)}${cell("Software", software)}<div class="act"><button type="button" data-action="backup">Back up now</button></div>`;
   $("#maint-backup-last").textContent = backup.value;
   if (state.busy) setBusy(true);
 }
@@ -1053,10 +1056,10 @@ async function refreshStatus() {
     setConnection("disconnected");
     setBusy(true);
     state.reconnectAttempts += 1;
-    const more = state.reconnectAttempts <= 5 ? `Retrying (${Math.min(state.reconnectAttempts, 5)} of 5)…` : "Press Retry now to try again.";
-    setNotice("offline", `Can't reach the boat computer (${error.message}). Controls are paused until it answers. ${more}`);
+    const slow = state.reconnectAttempts >= 5;
+    setNotice("offline", `Can't reach the boat computer (${error.message}). Controls are paused until it answers. Retrying…${slow ? " Still trying every 15 seconds; press Retry now to try immediately." : ""}`);
     clearTimeout(state.reconnectTimer);
-    if (state.reconnectAttempts <= 5) state.reconnectTimer = setTimeout(refreshStatus, Math.min(2000 * state.reconnectAttempts, 8000));
+    state.reconnectTimer = setTimeout(refreshStatus, slow ? 15000 : 2000 * state.reconnectAttempts);
   }
 }
 
@@ -2825,7 +2828,14 @@ $$("[data-component-filter]").forEach((button) => button.addEventListener("click
   state.componentFilter = button.dataset.componentFilter;
   renderComponents(state.components, true);
 }));
-document.addEventListener("visibilitychange", () => { if (!document.hidden && signedIn() && !state.busy) refreshStatus(); });
+// Waking a phone or regaining the network should not wait out the retry timer.
+function reconnectNow() {
+  if (!signedIn()) return;
+  if (state.connection === "disconnected") { clearTimeout(state.reconnectTimer); refreshStatus(); }
+  else if (!state.busy) refreshStatus();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) reconnectNow(); });
+window.addEventListener("online", reconnectNow);
 
 window.addEventListener("beforeunload", (event) => { if (isConfigDirty() || displaysDirty()) { event.preventDefault(); event.returnValue = ""; } });
 

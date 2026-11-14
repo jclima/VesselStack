@@ -127,6 +127,10 @@ def alarm(cfg):
     cfg["instruments"]["sog"]["label"] = HOSTILE[:16]
     cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True, "alarm_page": 1}
 
+def alarm_off(cfg):
+    status(cfg)
+    cfg["displays"]["helm"]["ui"] = {"alarm_takeover": False}
+
 def ui_full(cfg):
     alarm(cfg)
     cfg["notifications"]["bilge"]["label"] = "Bilge"
@@ -258,6 +262,7 @@ variant("gaugesone", gauges_one)
 variant("thresholds", thresholds)
 variant("status", status)
 variant("alarm", alarm)
+variant("alarmoff", alarm_off)
 variant("ui", ui_full)
 variant("uimanual", ui_manual)
 variant("uisingle", ui_single)
@@ -310,6 +315,7 @@ check complex aux
 check thresholds helm
 check status helm
 check alarm helm
+check alarmoff helm
 check ui helm
 check uimanual helm
 check uisingle helm
@@ -440,9 +446,16 @@ grep -q 'vesselstack/v1/alarms/summary' "$log" || { echo "alarm summary subscrip
 grep -q 'light.turn_on\|board_backlight' "$log" || { echo "backlight action missing from the alarm config" >&2; fail=1; }
 # shellcheck disable=SC2016
 grep -qF '${y} Bilge' "$log" || { echo "hostile label was altered in the alarm banner" >&2; fail=1; }
-for plain in example thresholds status complex; do
-    if grep -q 'alarm_banner' "$WORK/$plain-helm.log"; then echo "alarm banner present without ui.alarm_takeover ($plain)" >&2; fail=1; fi
+# The banner is the default when something counts for the alarm summary, and absent when nothing does.
+for plain in example complex; do
+    if grep -q 'alarm_banner' "$WORK/$plain-helm.log"; then echo "alarm banner present although nothing counts for the alarm summary ($plain)" >&2; fail=1; fi
 done
+for name in thresholds status; do
+    grep -q 'id(alarm_banner)' "$WORK/$name-helm.log" || { echo "alarm banner missing by default although alarm sources exist ($name)" >&2; fail=1; }
+    grep -q 'vesselstack/v1/alarms/summary' "$WORK/$name-helm.log" || { echo "alarm summary subscription missing by default ($name)" >&2; fail=1; }
+done
+# An explicit ui.alarm_takeover false opts out even with alarm sources.
+if grep -q 'alarm_banner' "$WORK/alarmoff-helm.log"; then echo "alarm banner present despite ui.alarm_takeover false (alarmoff)" >&2; fail=1; fi
 grep -q 'lv_obj_set_style_bg_color(id(p1_content)' "$WORK/thresholds-helm.log" \
     || { echo "severity colour lambda missing from the validated thresholds config" >&2; fail=1; }
 

@@ -396,6 +396,7 @@ class StatusGrid(Base):
     def status_device(self, items=None, mutate=None):
         def apply(cfg):
             status_page(cfg, items)
+            cfg["displays"]["helm"]["ui"] = {"alarm_takeover": False}   # these tests are not about the banner
             if mutate:
                 mutate(cfg)
         self.set_config(apply)
@@ -571,14 +572,42 @@ class AlarmTakeover(Base):
         self.set_config(both)
         return self.device(allow_missing_wifi=True, **kw)
 
+    BANNER_NEEDLES = ("alarms/summary", "alarm_banner", "top_layer", "summary_max", "render_alarm",
+                      "board_backlight", "font_banner", "500ms")
+
     def test_nothing_is_generated_without_the_option(self):
-        for mutate in (None, status_page, lambda c: (status_page(c), c["displays"]["helm"].update(ui={}),
-                                                       c["displays"]["helm"]["ui"].update(alarm_takeover=False))):
+        # absent key and nothing counts for the alarm summary (the example), or an explicit false
+        for mutate in (None, lambda c: (status_page(c), c["displays"]["helm"].update(ui={}),
+                                        c["displays"]["helm"]["ui"].update(alarm_takeover=False))):
             self.set_config(mutate)
             text = self.device(allow_missing_wifi=True)
-            for needle in ("alarms/summary", "alarm_banner", "top_layer", "summary_max", "render_alarm",
-                           "board_backlight", "font_banner", "500ms"):
+            for needle in self.BANNER_NEEDLES:
                 self.assertNotIn(needle, text, needle)
+
+    def test_absent_key_with_alarm_sources_generates_the_same_as_explicit_true(self):
+        def absent(cfg):
+            alarm_takeover(cfg)
+            del cfg["displays"]["helm"]["ui"]["alarm_takeover"]
+        self.set_config(absent)
+        text = self.device(allow_missing_wifi=True)
+        for needle in ("alarms/summary", "alarm_banner", "top_layer", "summary_max", "render_alarm", "font_banner"):
+            self.assertIn(needle, text, needle)
+        self.set_config(alarm_takeover)
+        self.assertEqual(text, self.device(allow_missing_wifi=True))
+
+    def test_absent_key_without_ui_block_and_with_alarm_sources_gets_the_banner(self):
+        def mutate(cfg):
+            status_page(cfg)
+            cfg["displays"]["helm"].pop("ui", None)
+        self.set_config(mutate)
+        text = self.device(allow_missing_wifi=True)
+        self.assertIn("alarm_banner", text)
+
+    def test_explicit_false_with_alarm_sources_keeps_the_banner_off(self):
+        self.set_config(lambda c: (status_page(c), c["displays"]["helm"].update(ui={"alarm_takeover": False})))
+        text = self.device(allow_missing_wifi=True)
+        for needle in self.BANNER_NEEDLES:
+            self.assertNotIn(needle, text, needle)
 
     def test_banner_subscription_and_top_layer(self):
         text = self.alarm_device()
@@ -1099,6 +1128,7 @@ class Gauges(Base):
     def gauge_device(self, mutate=None, **kw):
         def build(cfg):
             gauge_pages(cfg, **kw)
+            cfg["displays"]["helm"].setdefault("ui", {})["alarm_takeover"] = False   # not about the banner
             if mutate:
                 mutate(cfg)
         self.set_config(build)
@@ -1462,6 +1492,7 @@ class Electrical(Base):
     def elec_device(self, mutate=None, **kw):
         def build(cfg):
             electrical_pages(cfg, **kw)
+            cfg["displays"]["helm"].setdefault("ui", {})["alarm_takeover"] = False   # not about the banner
             if mutate:
                 mutate(cfg)
         self.set_config(build)

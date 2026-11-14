@@ -178,7 +178,8 @@ Home is for looking, not for changing.
   reinstall). A scheduled backup stops the whole stack while it runs.
 - **Software** shows the installed version, or the newer version found by the
   last update check, with a link to the Updates tab. It never checks by itself.
-- **Back up now** is the one action on this page. It runs `vesselstackctl backup`.
+- **Back up now** is the one action on this page. It asks for confirmation first, because a backup stops every
+  service until it finishes. It runs `vesselstackctl backup`.
 
 Below the status row, every component has a card with its plain name, a status
 word (Running, Stopped, Disabled or Unknown) and what it does. Running
@@ -487,8 +488,9 @@ check still gate installer actions.
 ## When the panel cannot connect
 
 - **Disconnected.** The header says Disconnected and the page shows "Can't reach
-  the boat computer". Controls are paused. The panel retries five times and then
-  waits for **Retry now**. Check that the SSH tunnel window is still open and
+  the boat computer". Controls are paused. The panel keeps retrying by itself (every few
+  seconds at first, then every 15 seconds) and retries at once when the page
+  wakes or the network returns. **Retry now** tries immediately. Check that the SSH tunnel window is still open and
   that the Pi is powered, then press **Retry now**. If the Pi was updating or
   restarting, it reconnects by itself and reloads when the panel has restarted.
   Unsaved Settings edits are kept and you are asked to save or discard them

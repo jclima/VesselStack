@@ -111,7 +111,9 @@ navigation, collision avoidance, engine control, or a sole alarm system.
 Boat Chat defaults to a local provider. Other providers are optional and may
 need internet access or their own credentials; VesselStack does not promise
 that every provider works offline. The optional [instrument displays preview](docs/DISPLAYS.md)
-is another separately enabled local feature.
+is another separately enabled local feature. Displays show a full-screen alarm banner by default when anything
+counts towards the alarm summary; set `"ui": {"alarm_takeover": false}` in `displays.json` to turn it off, then
+rebuild and reflash (`vesselstackctl display build ID`, `display flash ID`).
 
 ### Component lifecycle
 
@@ -879,7 +881,7 @@ nano vesselstack.env
 | `INFLUXDB_RAW_RETENTION` | Raw-bucket retention: `720h`, `30d`, `8w`, or `0` (forever). Empty (default) = `30d` on a new install and **no change** to an existing bucket; see "Raw data retention" |
 | `*_PASSWORD`, `*_TOKEN` | Keep `GENERATE` for generated values; every generated secret is preserved from the installed config on re-runs |
 | `BOAT_CHAT_PROVIDER` | `local` works without an external LLM |
-| `TELEGRAM_ENABLE` | Run the optional Telegram worker; requires its token and allowed chat IDs in Boat Chat Settings |
+| `TELEGRAM_ENABLE` | Run the optional Telegram chat bot worker ("Ask Boat Chat from Telegram" in the Control Panel); requires its token and allowed chat IDs in Boat Chat Settings. It does not send boat alerts; those are `ALERTS_ENABLE` ("Boat alerts to Telegram") |
 | `ALERTS_ENABLE` and `ALERT_*` | Opt-in Telegram alerts, off by default; see [Alerts](#alerts) |
 | `TELEMETRY_INDEXER_ENABLE` | Enable five-minute current/power sampling and thirty-minute history refreshes |
 | `NODE_EXPORTER_ENABLE` | Optional private host metrics exporter; disabled by default; available in the wizard's advanced settings |
@@ -1468,7 +1470,7 @@ it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
 
 - **Home** is status only: services running or stopped, the last backup and backup drive (read-only;
   "unknown" when they cannot be read) and whether an update is known, with one **Back up now**
-  button and the components below. Component cards offer Start, Stop, Restart and, in a **⋯**
+  button (it asks for confirmation first, because a backup stops every service until it finishes) and the components below. Component cards offer Start, Stop, Restart and, in a **⋯**
   menu, Disable.
 - **Settings** has a jump list, help for every field, Advanced sections that start collapsed,
   inline field errors, and one save bar: **Save** writes the settings, **Apply** renders and installs
@@ -1478,7 +1480,9 @@ it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
   **Reinstall & start**, **Provision history** and **Restart Control Panel**.
 
 Stopping or interrupting actions ask first in an in-page dialog. If the connection drops the
-header shows Disconnected with **Retry now**. Rollback: restore the previous release from a
+header shows Disconnected with **Retry now**; the page keeps retrying by itself while you are signed in
+(2, 4, 6 and 8 seconds, then every 15 seconds) and retries at once when the page becomes visible again or the
+browser comes back online. Rollback: restore the previous release from a
 backup as described under [Updating](#updating); stored settings keys are unchanged.
 
 ### Homepage (the front door)
@@ -1946,7 +1950,8 @@ logged and retried on the next run, and state is saved after every delivered mes
 
 1. In Telegram, message `@BotFather`, create a bot and copy its token.
 2. Paste the token into **Boat Chat Settings** (Telegram bot token). Alerts reuse that
-   token; it is never stored in `vesselstack.env`, put on a command line or printed.
+   token (the Telegram chat bot, "Ask Boat Chat from Telegram" / `TELEGRAM_ENABLE`, is a separate switch
+   from the alerts, "Boat alerts to Telegram" / `ALERTS_ENABLE`); it is never stored in `vesselstack.env`, put on a command line or printed.
 3. Find your numeric chat id (message your bot, then ask Boat Chat's Telegram bot
    `/id`, or use a bot such as `@userinfobot`) and put it in `ALERT_TELEGRAM_CHAT_IDS`
    (comma separated; a group chat id is negative). Alerts go only to those chats. Send
@@ -1973,7 +1978,9 @@ logged and retried on the next run, and state is saved after every delivered mes
   point of the own vessel (`self="true"`, `_field="value"`, measurement named by the Signal K
   path) in `INFLUXDB_RAW_BUCKET`, seen below the limit on consecutive runs for at least 2 minutes.
   If a battery with an active alert stops reporting for `ALERT_STALE_DATA_MINUTES`, a "battery data
-  missing" message replaces silence.
+  missing" message replaces silence. If InfluxDB answers 401 or 403 while a low-battery threshold or the
+  stale-data check is active, "Battery and stale-data alerts are not working: InfluxDB rejected the read
+  token." is sent the same way.
 - **Signal K data stale**: no own-vessel point newer than `ALERT_STALE_DATA_MINUTES` (the query looks
   back at most 60 minutes; the newest point time is remembered for longer limits). Checked only
   when the managed Signal K data path is in use (`SIGNALK_MODE` docker or native with
@@ -1986,7 +1993,15 @@ logged and retried on the next run, and state is saved after every delivered mes
   repeating) and never clear it; only an explicit `off` (bilge) or `on` (shore) clears.
   A sensor that is `unavailable`, `unknown` or not found for 5 minutes raises "bilge sensor not
   reporting" / "shore power sensor not reporting"; `doctor` also warns "entity not found" for a 404
-  and when an entity is set but `HOME_ASSISTANT_TOKEN` is empty. **Limit:** the dispatcher
+  and when an entity is set but `HOME_ASSISTANT_TOKEN` is empty. **Missing or rejected token:**
+  when an entity is set and `HOME_ASSISTANT_TOKEN` is empty or Home Assistant answers 401 or 403, the
+  alert would otherwise go silent, so after a 5 minute hold a Telegram message says "Bilge alert is not
+  working: Home Assistant token is missing or was rejected, so <entity> cannot be checked. Set a new
+  long-lived access token in Control Panel settings." (likewise "Shore power"). It repeats every
+  `ALERT_REPEAT_MINUTES`, "... alert is working again: <entity> can be read." follows once the entity is
+  readable, and an already-active bilge or shore power alert is not cleared by it; network errors and 5xx
+  answers behave as before. After upgrading, owners with an entity but no valid token start receiving this
+  message (and `/fail` heartbeats); set the token to stop it. **Limit:** the dispatcher
   samples once a minute, so a bilge pump cycle that starts and ends between two polls is not
   seen (Home Assistant `last_changed` is not used); use the Home Assistant bilge blueprint or
   a hardware alarm for that. While Home Assistant is stopped (backup) these checks are blind.
@@ -2003,7 +2018,8 @@ logged and retried on the next run, and state is saved after every delivered mes
   announced once per `finished_at`; with scheduled backups on, no success within twice the
   interval raises a repeating alert.
 - **External heartbeat** (optional): every run sends a GET to `ALERT_HEARTBEAT_URL`, and to
-  `<url>/fail` (appended to the path, query kept) when a component-down alert has passed its hold-down, a Telegram
+  `<url>/fail` (appended to the path, query kept) when a component-down alert has passed its hold-down, a held
+  credentials-rejected alert (Home Assistant or InfluxDB token) is active, a Telegram
   delivery failed in this run, or alerts are on but no bot token or chat id is configured
   (healthchecks.io style), so a dead or offline boat is noticed from outside. A running backup
   is not a problem and still sends the success ping.

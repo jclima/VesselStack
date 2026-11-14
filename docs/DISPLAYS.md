@@ -878,19 +878,23 @@ screen with a flashing banner.
   summary newer than 3 x `heartbeat_s`.
 - Needs the `alarms/#` ACL rule (see [MQTT access control](MQTT.md)).
 
-Per-display option in `displays.json` (default off; nothing about the firmware
-changes without it):
+Per-display option in `displays.json` (on by default when anything in the
+configuration counts towards the summary; set it to false to turn it off):
 
 ```json
 "ui": {"alarm_takeover": true, "alarm_page": 1}
 ```
 
-- `alarm_takeover` (boolean, default false) turns the banner on. It is rejected
-  when nothing in the configuration counts towards the summary.
+- `alarm_takeover` (boolean) turns the banner on or off. When the key is absent
+  the banner is on if any instrument, notification or Home Assistant item counts
+  towards the alarm summary, and off otherwise, so a new display shows alarms
+  without editing the file. `"ui": {"alarm_takeover": false}` turns it off. An
+  explicit `true` is rejected when nothing in the configuration counts towards
+  the summary.
 - `alarm_page` (integer index into `pages`, default 0, validated) is the page
   shown when an alarm starts. Unknown `ui` keys are rejected.
 
-Behaviour of a display with `alarm_takeover`:
+Behaviour of a display with the banner on:
 
 - The firmware subscribes to the summary (the display ACL allows reading it).
   A red banner (0xC62828, 96 px high, as wide as the board's content area, 340
@@ -918,8 +922,11 @@ enables it with `alarm_page` set to the Status page. **Upgrade:** update
 VesselStack, let the installer (or `sudo vesselstackctl display sync-mqtt`)
 rewrite the ACL, restart the bridge (the installer does), then `display build ID`
 and `display flash ID` for each display that gets the option. Existing firmware
-ignores the summary. **Rollback:** remove `ui`, rebuild and reflash (or flash
-the previous firmware); the bridge's extra topic is harmless to older displays.
+ignores the summary. A display with alarm sources and no `alarm_takeover` key
+gets the banner after its next build, so it needs a rebuild and reflash too.
+**Rollback:** set `"ui": {"alarm_takeover": false}` (or remove `ui` only if the
+configuration has no alarm sources), rebuild and reflash (or flash the previous
+firmware); the bridge's extra topic is harmless to older displays.
 
 ### Touch, header, night mode and dimming
 
