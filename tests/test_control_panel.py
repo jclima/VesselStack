@@ -868,6 +868,14 @@ class StatusFieldTests(unittest.TestCase):
         with mock.patch.object(panel, "installed_version", return_value="0.6.0"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
             self.assertFalse(panel.restart_needed())
 
+    def test_unfinished_installation_hides_the_restart_note_and_shows_in_status(self) -> None:
+        marker = {"version": "0.6.1", "from": "0.6.0", "started": "2026-01-02T03:04:05Z", "backup": ""}
+        with mock.patch.object(panel, "installed_version", return_value="0.6.1"), mock.patch.object(panel, "RUNNING_IDENTITY", {"running_version": "0.6.0"}):
+            with mock.patch.object(panel, "install_in_progress", return_value=marker):
+                self.assertFalse(panel.restart_needed())
+            with mock.patch.object(panel, "install_in_progress", return_value=None):
+                self.assertTrue(panel.restart_needed())
+
     # ---- backup preflight and one-shot backup choices
 
     def _preflight(self, mount, listing=None, env_text="", code=0):
@@ -1082,6 +1090,17 @@ class DisplaysApiBase(unittest.TestCase):
                 return response.status, response.read().decode()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode()
+
+
+class InstallIncompleteStatusTests(DisplaysApiBase):
+    def test_status_carries_the_unfinished_installation_or_null(self) -> None:
+        marker = {"version": "0.6.1", "from": "0.6.0", "started": "2026-01-02T03:04:05Z", "backup": "/var/backups/x.tar.gz"}
+        with mock.patch.object(panel, "component_status", return_value=[]), mock.patch.object(panel, "backup_status", return_value={}), mock.patch.object(panel, "remote_status", return_value={}):
+            for value in (marker, None):
+                with mock.patch.object(panel, "install_in_progress", return_value=value):
+                    status, body = self.get("/api/status")
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(json.loads(body)["install_incomplete"], value)
 
 
 class DisplaysApiTests(DisplaysApiBase):

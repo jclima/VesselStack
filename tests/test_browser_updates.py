@@ -131,6 +131,66 @@ class BrowserUpdateTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in stable["releases"]], [1])
         self.assertEqual([item["id"] for item in lab["releases"]], [2, 1])
 
+    def _marker(self, root, text):
+        (root / "config").mkdir(exist_ok=True)
+        (root / "config" / "install-in-progress").write_text(text)
+
+    GOOD_MARKER = "version=0.6.0\nfrom=0.5.3\nstarted=2026-01-02T03:04:05Z\nstart=0\nsource=/x\nbackup=/var/backups/vs/pre-0.6.0.tar.gz\n"
+
+    def test_install_in_progress_reads_and_validates_the_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertIsNone(updates.install_in_progress(root))
+            self._marker(root, self.GOOD_MARKER + "junk line\nunknown=1\n")
+            self.assertEqual(updates.install_in_progress(root), {"version": "0.6.0", "from": "0.5.3", "started": "2026-01-02T03:04:05Z", "backup": "/var/backups/vs/pre-0.6.0.tar.gz"})
+            self._marker(root, "version=latest\nfrom=none\nstarted=2026-01-02T03:04:05Z\nbackup=\n")
+            self.assertEqual(updates.install_in_progress(root), {"version": None, "from": "none", "started": "2026-01-02T03:04:05Z", "backup": ""})
+            for bad in ("version=0.6.0\nstarted=yesterday\n", "version=0.6.0\nstarted=2026-01-02T03:04:05Z\nbackup=relative/x\n",
+                        "version=0.6.0\nstarted=2026-01-02T03:04:05Z\nbackup=/a/../b\n", "version=0.6.0\nstarted=2026-01-02T03:04:05Z\nbackup=/a/$(id)\n",
+                        "version=0.6.0\nstarted=2026-01-02T03:04:05Z\nbackup=/a b\n", "x" * 5000):
+                with self.subTest(bad=bad[:40]):
+                    self._marker(root, bad)
+                    self.assertIsNone(updates.install_in_progress(root))
+
+    def test_install_in_progress_refuses_a_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "config").mkdir()
+            (root / "real").write_text(self.GOOD_MARKER)
+            (root / "config" / "install-in-progress").symlink_to(root / "real")
+            self.assertIsNone(updates.install_in_progress(root))
+
+    def _snapshot_item(self, tag):
+        version = tag[1:]
+        return {"id": 9, "tag_name": tag, "draft": False, "prerelease": False, "published_at": "p", "updated_at": "u", "assets": [
+            {"id": 10, "name": f"vesselstack-{version}.tar.gz", "size": 12, "updated_at": "u"},
+            {"id": 11, "name": f"vesselstack-{version}.tar.gz.sha256", "size": 64, "updated_at": "u"}]}
+
+    def test_marker_version_is_eligible_for_catalog_and_snapshot_only_with_the_marker(self):
+        payload = [{"id": 1, "tag_name": "v0.6.0", "name": "Same", "prerelease": False}, {"id": 2, "tag_name": "v0.5.9", "name": "Older", "prerelease": False}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "config").mkdir(); (root / "config" / "installed-version").write_text("0.6.0\n")
+            with mock.patch.object(updates, "_json_get", return_value=payload):
+                self.assertEqual(updates.release_catalog("stable", root)["releases"], [])
+            with mock.patch.object(updates, "_json_get", return_value=self._snapshot_item("v0.6.0")):
+                with self.assertRaises(ValueError): updates.release_snapshot(9, "stable", root)
+            self._marker(root, self.GOOD_MARKER)
+            with mock.patch.object(updates, "_json_get", return_value=payload):
+                releases = updates.release_catalog("stable", root)["releases"]
+            self.assertEqual([(r["id"], r["resume"]) for r in releases], [(1, True)])
+            with mock.patch.object(updates, "_json_get", return_value=self._snapshot_item("v0.6.0")):
+                self.assertEqual(updates.release_snapshot(9, "stable", root)["version"], "0.6.0")
+            with mock.patch.object(updates, "_json_get", return_value=self._snapshot_item("v0.5.9")):
+                with self.assertRaises(ValueError): updates.release_snapshot(9, "stable", root)
+
+    def test_marker_for_another_version_changes_nothing(self):
+        payload = [{"id": 1, "tag_name": "v0.6.0", "name": "Same", "prerelease": False}, {"id": 3, "tag_name": "v0.7.0", "name": "New", "prerelease": False}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "config").mkdir(); (root / "config" / "installed-version").write_text("0.6.0\n")
+            self._marker(root, self.GOOD_MARKER.replace("version=0.6.0", "version=0.6.1"))
+            with mock.patch.object(updates, "_json_get", return_value=payload):
+                releases = updates.release_catalog("stable", root)["releases"]
+            self.assertEqual([(r["id"], r["resume"]) for r in releases], [(3, False)])
+
     def test_operation_is_private_and_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -235,6 +295,8 @@ class BrowserUpdateTests(unittest.TestCase):
         def download(url, dest, **kwargs): shutil.copy2(archive if dest.suffix == ".gz" else checksum, dest)
         def run(argv, root_arg=None, op=None, *args, **kw):
             calls.append(list(argv))
+            if argv[-1] == "--start":
+                self.start_env = dict(args[1]) if len(args) > 1 else {}
             if isinstance(op, dict):
                 op["output"] = ["output of " + Path(argv[0]).name]  # like the real runner, each command replaces the log
             if fail_on and argv[:len(fail_on)] == fail_on:
@@ -261,6 +323,13 @@ class BrowserUpdateTests(unittest.TestCase):
         _, calls, error, _ = self._run_choice({"mode": "require_mounted"})
         self.assertIsNone(error)
         self.assertIn([updates.FIXED_CTL, "backup", "--require-mounted"], calls)
+
+    def test_installer_gets_the_preupdate_backup_path_only_when_one_was_made(self):
+        with mock.patch.dict(os.environ, {"VESSELSTACK_PREUPDATE_BACKUP": "/stale/ignored.tar.gz"}):
+            self._run_choice(None)
+            self.assertEqual(self.start_env.get("VESSELSTACK_PREUPDATE_BACKUP"), "/backup/archive.tar.gz")
+            self._run_choice({"mode": "skip", "confirm": "install-without-backup"})
+            self.assertNotIn("VESSELSTACK_PREUPDATE_BACKUP", self.start_env)
 
     def test_mount_modes_mount_after_preflight_and_before_backup(self):
         for backup, mount_argv in (({"mode": "mount_fstab"}, [updates.FIXED_CTL, "backup-drive", "mount", "--fstab"]),

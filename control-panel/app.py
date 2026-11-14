@@ -37,14 +37,14 @@ from common.config_registry import (
 from common.lifecycle_lock import LifecycleLock, LifecycleLockError
 
 try:
-    from browser_updates import installed_version, release_catalog, read_operation, public_operation, release_snapshot, running_identity, acquire_slot, release_slot, start_detached
+    from browser_updates import installed_version, install_in_progress, release_catalog, read_operation, public_operation, release_snapshot, running_identity, acquire_slot, release_slot, start_detached
     from browser_updates import normalize_backup_choice, effective_backup_choice, backup_locked, ctl_supports
 except ImportError:
     import importlib.util
     _spec = importlib.util.spec_from_file_location("browser_updates", Path(__file__).with_name("browser_updates.py"))
     assert _spec and _spec.loader
     _updates = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_updates)
-    installed_version = _updates.installed_version; release_catalog = _updates.release_catalog
+    installed_version = _updates.installed_version; install_in_progress = _updates.install_in_progress; release_catalog = _updates.release_catalog
     read_operation = _updates.read_operation; public_operation = _updates.public_operation
     running_identity = _updates.running_identity
     acquire_slot = _updates.acquire_slot; release_slot = _updates.release_slot
@@ -1498,6 +1498,8 @@ def with_summary(operation: dict[str, Any]) -> dict[str, Any]:
 def restart_needed() -> bool:
     """True when a newer Control Panel is installed than the one now running."""
     try:
+        if install_in_progress(ROOT) is not None:
+            return False
         installed = installed_version(ROOT)
         running = str(RUNNING_IDENTITY.get("running_version") or "")
         return bool(running) and running != "unknown" and installed != running
@@ -1925,7 +1927,7 @@ class ControlPanelHandler(BaseHTTPRequestHandler):
                 memory = OPERATIONS.public()
                 operation = memory if memory.get("state") == "running" else max((persisted, memory), key=lambda item: int(item.get("finished_at") or item.get("started_at") or 0))
                 vessel = parse_env(VESSEL_ENV)
-                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "remote": remote_status(), "restart_needed": restart_needed(), **RUNNING_IDENTITY})
+                self.send_json(200, {"components": component_status(), "operation": with_summary(operation), "installed_version": installed_version(ROOT), "boat_name": vessel.get("BOAT_NAME", ""), "backup": backup_status(vessel), "remote": remote_status(), "restart_needed": restart_needed(), "install_incomplete": install_in_progress(ROOT), **RUNNING_IDENTITY})
             elif path == "/api/backup-preflight":
                 self.send_json(200, backup_preflight())
             elif path == "/api/operation":
