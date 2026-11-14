@@ -2,12 +2,13 @@
 import datetime as dt
 import math
 import re
+import data_age
 try:
     import profile_runtime
 except ImportError:  # direct module loading in older tests
     profile_runtime = None
 
-FRESH_SECONDS = 600
+FRESH_SECONDS = data_age.FRESH_SECONDS
 SOURCES = [
     ('Boat health', 'sensor.boat_health_summary', '/lovelace/health'),
     ('Boat watch', 'sensor.boat_watch_summary', '/lovelace/anchor'),
@@ -108,14 +109,11 @@ def normalize(cached, profile=None):
         paths = measurements.get(c['id'], [])
         ages = []
         for path in paths:
-            try:
-                stamp = dt.datetime.fromisoformat(str(timestamps[path]).replace('Z', '+00:00'))
-                ages.append((now - stamp).total_seconds())
-            except (KeyError, ValueError, TypeError):
-                ages.append(None)
+            stamp = data_age.parse_timestamp(timestamps.get(path))
+            ages.append((now - stamp).total_seconds() if stamp else None)
         if paths:
             c['source_age_seconds'] = max(ages) if all(x is not None for x in ages) else None
-            if any(x is None or x > FRESH_SECONDS or x < -60 for x in ages):
+            if any(x is None or x > FRESH_SECONDS or x < -data_age.FUTURE_TOLERANCE_SECONDS for x in ages):
                 c['tone'] = 'unknown'
                 c['value'] += ' · source age unverified' if c['source_age_seconds'] is None else ' · older reading'
     attention = [a for a in alerts if a['severity'] != 'ok']

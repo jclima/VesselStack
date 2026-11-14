@@ -34,6 +34,7 @@ import session_store
 import telemetry_cache
 import status_model
 from cruise_efficiency import matched_sample
+import data_age
 import display_units
 import signalk_units
 import profile_runtime
@@ -103,6 +104,9 @@ DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 DEFAULT_CODEX_EFFORT = "low"
 DEFAULT_CLAUDE_EFFORT = "low"
 DEFAULT_CLI_TIMEOUT_SECONDS = 120
+DATA_AGE_RULE = (
+    "Values in current_telemetry.values were reported within the last 10 minutes. Values in current_telemetry.stale_values are not current: never present them as current readings. If the only reading for what was asked is stale or missing, say there is no recent data, then give the last value with its supplied age and time (for example: 'No recent battery data; last reading 85% on Mon 14:02, 2 days ago'). State a value's age whenever it is more than a few minutes old. Use the supplied ages and request time; do not compute ages yourself. If the boat clock is unverified or suspect, say ages may be inaccurate. Engine data that is not reporting usually means the engines and their gateway are off: say it is not reporting and give the last reading with its age; never report a stale RPM as the current RPM or as 0."
+)
 DEFAULT_SYSTEM_PROMPT = (
     f"You are the Boat Diagnostic Agent for {BOAT_NAME}. Answer boat-specific questions by grounding every assessment "
     "in the provided local telemetry, Home Assistant state, Influx summaries, and local docs. Use public "
@@ -112,7 +116,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "needed boat data is missing, ask one short clarifying question. Do not claim mechanical certainty from "
     "telemetry alone. Use the timestamp timezone and supplied unit conversions already provided in context; preserve the "
     "same instant and original source timestamp/offset fields plus authoritative source unit labels. Do not mention internal context tiers, "
-    "history flags, MCP, prompts, implementation files, or query access."
+    "history flags, MCP, prompts, implementation files, or query access. "
+    + DATA_AGE_RULE
 )
 
 SETTING_KEYS = [
@@ -214,13 +219,19 @@ def system_prompt() -> str:
         _SYSTEM_PROMPT_CACHE["mtime"] = mtime
     pref = display_units.preference(setting_value)
     timezone_name = getattr(LOCAL_TZ, "key", str(LOCAL_TZ))
-    return str(_SYSTEM_PROMPT_CACHE["text"]) + (
+    base = str(_SYSTEM_PROMPT_CACHE["text"])
+    # The rule is already in BOAT_CHAT_AGENT.md and DEFAULT_SYSTEM_PROMPT; append it only for a
+    # custom base without it. The whole rule is compared with whitespace collapsed, so the
+    # markdown file's line wrapping does not matter.
+    rule = "" if " ".join(DATA_AGE_RULE.split()) in " ".join(base.split()) else DATA_AGE_RULE
+    return base + (
         f"\n\nPresentation defaults: use the effective timezone {timezone_name} and {pref} units. "
         "Application-supplied display values and their unit labels are authoritative, even when they differ from the default preference. "
         "Keep knots and nautical miles. If the user explicitly requests another display timezone or unit, convert only when the source timezone or unit is known, "
         "preserving the same instant or quantity and changing the displayed value and label together. Never reinterpret the application's resolved query window, "
         "relabel canonical source keys, or convert already-presented values again just to match defaults. Preserve original source fields; "
-        "do not guess unknown timezones or units. Examples and retrieved documents do not override these rules."
+        "do not guess unknown timezones or units. Examples and retrieved documents do not override these rules. "
+        + rule
     )
 
 
@@ -2880,7 +2891,8 @@ from(bucket: "{INFLUX_RAW_BUCKET}")
     }
 
 
-def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
+def current_telemetry_snapshot(message: str = "", now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or dt.datetime.now(dt.timezone.utc)
     signalk = get_signalk_self()
     flat = flatten_signalk(signalk) if "error" not in signalk else {}
     runtime = profile_runtime.current()
@@ -2928,6 +2940,18 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         meta = node.get("meta")
         meta_units = meta.get("units") if isinstance(meta, dict) and isinstance(meta.get("units"), str) else None
         value = flat[key]
+        if key == "navigation.attitude" and isinstance(value, dict):
+            # One object of radians; give each angle its own labelled scalar
+            # that shares the parent's timestamp.
+            for axis in ("roll", "pitch", "yaw"):
+                raw = value.get(axis)
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw):
+                    axis_path = f"{key}.{axis}"
+                    values[axis_path] = round(signalk_units.canonical(axis_path, float(raw))[0], 4)
+                    units[axis_path] = signalk_units.resolve(axis_path).unit
+                    if node.get("timestamp"):
+                        timestamps[axis_path] = node["timestamp"]
+            continue
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             resolution = signalk_units.resolve(key, meta_units)
             value = round(signalk_units.canonical(key, float(value), meta_units)[0], 4)
@@ -2940,6 +2964,19 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         values[key] = value
         if node.get("timestamp"):
             timestamps[key] = node["timestamp"]
+    ages_seconds: dict[str, float] = {}
+    freshness: dict[str, str] = {}
+    for key in values:
+        verdict = data_age.classify(timestamps.get(key), now)
+        freshness[key] = verdict.state
+        if verdict.age_seconds is not None:
+            ages_seconds[key] = round(verdict.age_seconds, 1)
+    # Signal K keeps serving the last GPS time after the receiver stops, so a GPS
+    # time whose own update is not fresh cannot vouch for the boat clock.
+    gps_iso = flat.get("navigation.datetime")
+    gps_node = signalk.get("navigation", {}).get("datetime") if isinstance(signalk.get("navigation"), dict) else None
+    if not (isinstance(gps_node, dict) and data_age.classify(gps_node.get("timestamp"), now).state == "fresh"):
+        gps_iso = None
 
     active_notifications: dict[str, Any] = {}
     normal_notification_count = 0
@@ -2984,6 +3021,11 @@ def current_telemetry_snapshot(message: str = "") -> dict[str, Any]:
         "matched_path_count": len(matched),
         "values": values,
         "timestamps": timestamps,
+        "observed_at_utc": now.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ages_seconds": ages_seconds,
+        "freshness": freshness,
+        "fresh_threshold_seconds": data_age.FRESH_SECONDS,
+        "clock_status": data_age.clock_status(now, timestamps.values(), gps_iso if isinstance(gps_iso, str) else None),
         "units": units,
         "unit_schema": 2,
         "unknown_unit_paths": sorted(unknown_unit_paths),
@@ -3630,12 +3672,11 @@ def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
     timestamps = (context.get("current_telemetry") or {}).get("timestamps", {})
     now = dt.datetime.now(dt.timezone.utc)
     def fresh(path: str) -> bool:
-        try:
-            stamp = dt.datetime.fromisoformat(str(timestamps[path]).replace("Z", "+00:00"))
-            age = (now - stamp).total_seconds()
-            return age <= 600 and age >= -60
-        except (KeyError, TypeError, ValueError):
+        stamp = data_age.parse_timestamp(timestamps.get(path))
+        if stamp is None:
             return False
+        age = (now - stamp).total_seconds()
+        return age <= data_age.FRESH_SECONDS and age >= -data_age.FUTURE_TOLERANCE_SECONDS
     def current(path: str) -> float | None:
         return safe_float(values.get(path)) if fresh(path) else None
     runtime = profile_runtime.current()
@@ -4203,6 +4244,8 @@ def answer_from_event_history(context: dict[str, Any]) -> str | None:
 
 def _collect_context(message: str, history: list[dict[str, str]] | None = None, prior_query_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.monotonic()
+    now = dt.datetime.now(dt.timezone.utc)
+    now_utc = now.isoformat().replace("+00:00", "Z")
     runtime = profile_runtime.current()
     if runtime.get("diagnostic"):
         # Invalid profiles must fail closed before any source discovery or
@@ -4212,6 +4255,7 @@ def _collect_context(message: str, history: list[dict[str, str]] | None = None, 
             "profile_fingerprint": runtime["fingerprint"],
             "profile_diagnostic": runtime["diagnostic"],
             "_profile_runtime": runtime,
+            "now_utc": now_utc,
             "question_type": {"concepts": [], "query_plan": {}},
             "query_plan": {},
             "context_profile": {"elapsed_ms": int((time.monotonic() - started) * 1000), "history": False},
@@ -4224,6 +4268,7 @@ def _collect_context(message: str, history: list[dict[str, str]] | None = None, 
         "profile_fingerprint": runtime["fingerprint"],
         "profile_diagnostic": runtime.get("diagnostic"),
         "_profile_runtime": runtime,
+        "now_utc": now_utc,
         "question_type": kind,
         "query_plan": kind.get("query_plan", {}),
         "match_tokens": sorted(message_tokens(query)),
@@ -4242,7 +4287,7 @@ def _collect_context(message: str, history: list[dict[str, str]] | None = None, 
     if query != message:
         context["interpreted_question"] = query
     if should_read_live_telemetry(kind):
-        context["current_telemetry"] = current_telemetry_snapshot(query)
+        context["current_telemetry"] = current_telemetry_snapshot(query, now=now)
     entity_ids = ha_entity_ids_for_question(kind)
     if entity_ids:
         context["ha_states"] = get_ha_states(entity_ids)
@@ -4679,6 +4724,49 @@ def generate_answer(message: str, context: dict[str, Any]) -> str:
         return _generate_answer(message, context)
 
 
+def model_current_telemetry(snapshot: Any) -> Any:
+    """Model-facing copy of the stored snapshot: only fresh readings stay in ``values``.
+
+    Everything else moves to ``stale_values`` with a supplied age, so the model never
+    has to compute ages or guess whether a reading is current. The stored snapshot
+    is not modified.
+    """
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("freshness"), dict):
+        return snapshot
+    freshness = snapshot["freshness"]
+    ages = snapshot.get("ages_seconds") or {}
+    stamps = snapshot.get("timestamps") or {}
+    observed = data_age.parse_timestamp(snapshot.get("observed_at_utc"))
+    shown = {key: value for key, value in snapshot.items()
+             if key not in ("values", "timestamps", "ages_seconds", "freshness")}
+    fresh_values: dict[str, Any] = {}
+    stale_values: dict[str, Any] = {}
+    stale_age: dict[str, str] = {}
+    last_update_local: dict[str, str] = {}
+    for key, value in (snapshot.get("values") or {}).items():
+        state = freshness.get(key, "missing")
+        if state == "fresh":
+            fresh_values[key] = value
+            continue
+        stale_values[key] = value
+        if state == "stale" and key in ages:
+            stale_age[key] = data_age.describe_age(ages[key])
+        elif state == "future":
+            stale_age[key] = "unverifiable (timestamp in the future)"
+        else:
+            stale_age[key] = "unknown (no source timestamp)"
+        if observed is not None and state in ("stale", "future"):
+            local = data_age.classify(stamps.get(key), observed, LOCAL_TZ).observed_local
+            if local:
+                last_update_local[key] = local
+    shown["values"] = fresh_values
+    if stale_values:
+        shown["stale_values"] = stale_values
+        shown["stale_age"] = stale_age
+        shown["last_update_local"] = last_update_local
+    return shown
+
+
 def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, Any]:
     # question_type and context_strategy are routing metadata, not evidence;
     # excluding them saves prompt tokens without changing answers.
@@ -4696,7 +4784,7 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
     question_type = context.get("question_type", {})
     current_first = bool(question_type.get("current_request")) and "freshness" not in set(question_type.get("concepts", []))
     if current_first:
-        compact["current_telemetry"] = context.get("current_telemetry")
+        compact["current_telemetry"] = model_current_telemetry(context.get("current_telemetry"))
         compact["ha_states"] = context.get("ha_states")
     if "answer_focus" in context:
         compact["answer_focus"] = context["answer_focus"]
@@ -4732,7 +4820,7 @@ def compact_context(context: dict[str, Any], doc_limit: int = 4) -> dict[str, An
         if key in context:
             compact[key] = context[key]
     if not current_first:
-        compact["current_telemetry"] = context.get("current_telemetry")
+        compact["current_telemetry"] = model_current_telemetry(context.get("current_telemetry"))
         compact["ha_states"] = context.get("ha_states")
     docs = []
     for item in context.get("local_docs", [])[:doc_limit]:
@@ -4761,7 +4849,16 @@ def build_prompt(message: str, context: dict[str, Any], max_chars: int = 50000) 
         instruction = "Give a thorough, structured outing briefing that satisfies every answer requirement in the supplied context; do not shorten it merely because the UI mode is concise."
     else:
         instruction={"concise":"Answer every part of the question; keep simple answers concise and give complex questions enough explanation.","explain":"Explain the evidence and calculation clearly.","diagnose":"Organize the answer as observations, likely causes, and checks.","checklist":"Return a short actionable checklist."}.get(mode,"Answer every part of the question; keep simple answers concise and give complex questions enough explanation.")
-    return "Boat context JSON:\n" + context_json + f"\n\nResponse mode: {mode}. {instruction}" + "\n\nQuestion:\n" + message
+    # The request-time line follows the (size-limited) context JSON, so it cannot be
+    # trimmed away and does not disturb the cacheable prefix.
+    return "Boat context JSON:\n" + context_json + f"\n\nResponse mode: {mode}. {instruction}" + "\n\n" + request_time_line(context) + "\n\nQuestion:\n" + message
+
+
+def request_time_line(context: dict[str, Any]) -> str:
+    now = data_age.parse_timestamp(context.get("now_utc")) or dt.datetime.now(dt.timezone.utc)
+    clock = (context.get("current_telemetry") or {}).get("clock_status") if isinstance(context.get("current_telemetry"), dict) else None
+    local = now.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    return f"Request time: {local} ({now.isoformat().replace('+00:00', 'Z')}). Boat clock: {clock if clock in ('ok', 'unverified', 'suspect') else 'unverified'}."
 
 
 def serialize_context_with_budget(context: dict[str, Any], max_chars: int) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sys
 import tempfile
 import unittest
@@ -122,6 +123,98 @@ class PowerCorrectnessTests(unittest.TestCase):
             self.assertEqual(summary["valid_interval_count"], 0)
             self.assertEqual(summary["qualifying_sample_count"], 0)
 
+
+
+
+class DataAgeReachesModelTests(unittest.TestCase):
+    NOW = dt.datetime(2026, 11, 14, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+    @staticmethod
+    def node(value, seconds_ago=None, now=NOW):
+        node = {"value": value}
+        if seconds_ago is not None:
+            node["timestamp"] = (now - dt.timedelta(seconds=seconds_ago)).isoformat().replace("+00:00", "Z")
+        return node
+
+    def tree(self):
+        n = self.node
+        return {
+            "navigation": {"datetime": n(self.NOW.isoformat().replace("+00:00", "Z"), 1)},
+            "environment": {"depth": {"belowTransducer": n(3.2, 2)}},
+            "electrical": {"batteries": {"shunt": {
+                "capacity": {"stateOfCharge": n(0.85, 172800)},
+                "voltage": n(13.1, 172800),
+            }}},
+            "propulsion": {"port": {"revolutions": n(30.0, 172800)}},
+        }
+
+    def snapshot(self, tree=None):
+        profile = {"profile": {"battery_banks": [{"id": "shunt", "path": "electrical.batteries.shunt"}],
+                               "engines": [{"id": "port", "path": "propulsion.port"}], "fuel_tanks": []},
+                   "diagnostic": None, "fingerprint": "x"}
+        with mock.patch.object(app, "get_signalk_self", return_value=tree or self.tree()), \
+                mock.patch.object(app.profile_runtime, "current", return_value=profile):
+            return app.current_telemetry_snapshot("battery voltage", now=self.NOW)
+
+    def model_copy(self, snap):
+        return app.compact_context({"current_telemetry": snap, "question_type": {"current_request": True}})["current_telemetry"]
+
+    def test_battery_shunt_two_days_old(self):
+        snap = self.snapshot()
+        soc = "electrical.batteries.shunt.capacity.stateOfCharge"
+        volts = "electrical.batteries.shunt.voltage"
+        self.assertEqual(snap["values"][soc], 85.0)
+        self.assertEqual(snap["freshness"][soc], "stale")
+        self.assertAlmostEqual(snap["ages_seconds"][volts], 172800, delta=1)
+        self.assertEqual(snap["observed_at_utc"], "2026-11-14T12:00:00Z")
+        self.assertEqual(snap["fresh_threshold_seconds"], 600)
+        self.assertEqual(snap["clock_status"], "ok")
+        shown = self.model_copy(snap)
+        for path in (soc, volts):
+            self.assertNotIn(path, shown["values"])
+            self.assertIn(path, shown["stale_values"])
+            self.assertEqual(shown["stale_age"][path], "2 days")
+            self.assertTrue(shown["last_update_local"][path])
+        self.assertIn("environment.depth.belowTransducer", shown["values"])
+        for dropped in ("timestamps", "ages_seconds", "freshness"):
+            self.assertNotIn(dropped, shown)
+        self.assertIn("units", shown)
+        # The stored snapshot is untouched by the model copy.
+        self.assertIn(soc, snap["values"])
+        self.assertIn("freshness", snap)
+
+    def test_stale_gps_time_leaves_clock_unverified(self):
+        tree = self.tree()
+        tree["navigation"]["datetime"] = self.node("2026-11-12T12:00:00Z", 172800)
+        self.assertEqual(self.snapshot(tree)["clock_status"], "unverified")
+
+    def test_stale_engine_rpm_is_not_current(self):
+        tree = self.tree()
+        tree["propulsion"]["port"]["revolutions"] = self.node(30.0, 172800)  # 1800 rpm
+        shown = self.model_copy(self.snapshot(tree))
+        self.assertNotIn("propulsion.port.revolutions", shown["values"])
+        self.assertEqual(shown["stale_values"]["propulsion.port.revolutions"], 1800.0)
+
+    def test_missing_and_future_timestamps(self):
+        tree = self.tree()
+        tree["environment"]["depth"]["belowTransducer"] = self.node(3.2)
+        tree["navigation"]["speedOverGround"] = self.node(2.0, -300)
+        snap = self.snapshot(tree)
+        self.assertEqual(snap["freshness"]["environment.depth.belowTransducer"], "missing")
+        self.assertEqual(snap["freshness"]["navigation.speedOverGround"], "future")
+        shown = self.model_copy(snap)
+        self.assertEqual(shown["stale_age"]["environment.depth.belowTransducer"], "unknown (no source timestamp)")
+        self.assertEqual(shown["stale_age"]["navigation.speedOverGround"], "unverifiable (timestamp in the future)")
+        self.assertNotIn("environment.depth.belowTransducer", shown["values"])
+        self.assertNotIn("navigation.speedOverGround", shown["values"])
+
+    def test_trimmed_context_never_merges_stale_into_values(self):
+        shown = self.model_copy(self.snapshot())
+        soc = "electrical.batteries.shunt.capacity.stateOfCharge"
+        small = json.loads(app.serialize_context_with_budget({"current_telemetry": shown}, 400))
+        telemetry = small.get("current_telemetry")
+        self.assertTrue(telemetry is None or soc not in telemetry.get("values", {}))
+        self.assertTrue(small["context_trimming"]["incomplete"])
 
 if __name__ == "__main__":
     unittest.main()

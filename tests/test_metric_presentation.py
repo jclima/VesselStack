@@ -1,4 +1,5 @@
 import importlib.util
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -449,10 +450,30 @@ class UnitSchemaSnapshotTests(unittest.TestCase):
         for key in numeric:
             self.assertIn(key, snap["units"])
 
-    def test_attitude_object_gets_no_label(self):
+    def test_attitude_object_becomes_labelled_degree_scalars(self):
         snap = self._snapshot()
-        self.assertEqual(snap["values"]["navigation.attitude"], {"roll": 0.1, "pitch": 0.2, "yaw": 0.3})
+        self.assertNotIn("navigation.attitude", snap["values"])
         self.assertNotIn("navigation.attitude", snap["units"])
+        for axis, degrees in (("roll", 5.7296), ("pitch", 11.4592), ("yaw", 17.1887)):
+            path = f"navigation.attitude.{axis}"
+            with self.subTest(path=path):
+                self.assertAlmostEqual(snap["values"][path], degrees, places=3)
+                self.assertEqual(snap["units"][path], "deg")
+                self.assertEqual(snap["timestamps"][path], "2026-01-01T00:00:00Z")
+        self.assertFalse([k for k, v in snap["values"].items() if isinstance(v, dict) and "attitude" in k])
+
+    def test_stale_temperature_is_still_converted_in_metric_model_copy(self):
+        now = dt.datetime(2026, 1, 3, tzinfo=dt.timezone.utc)
+        with mock.patch.object(APP, "get_signalk_self", return_value=SYNTHETIC_SIGNALK), \
+                mock.patch.object(APP, "semantic_match_score", return_value=1):
+            snap = APP.current_telemetry_snapshot("units", now=now)
+        self.assertEqual(snap["freshness"]["propulsion.port.oilTemperature"], "stale")
+        with mock.patch.dict(os.environ, {"BOAT_UNITS": "metric"}, clear=False):
+            shown = APP.compact_context({"current_telemetry": snap, "question_type": {"current_request": True}})["current_telemetry"]
+        self.assertNotIn("propulsion.port.oilTemperature", shown["values"])
+        self.assertAlmostEqual(shown["stale_values"]["propulsion.port.oilTemperature"], 85.0, places=1)
+        self.assertEqual(shown["units"]["propulsion.port.oilTemperature"], "\u00b0C")
+        self.assertEqual(snap["values"]["propulsion.port.oilTemperature"], 185.0)
 
     def test_metric_display_of_snapshot(self):
         snap = self._snapshot()

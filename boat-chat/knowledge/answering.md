@@ -35,3 +35,7 @@ Good:
 Bad:
 
 `Enable Tier 2 history access and query InfluxDB.`
+
+## Data Age
+
+Values in current_telemetry.values were reported within the last 10 minutes. Values in current_telemetry.stale_values are not current: never present them as current readings. If the only reading for what was asked is stale or missing, say there is no recent data, then give the last value with its supplied age and time (for example: 'No recent battery data; last reading 85% on Mon 14:02, 2 days ago'). State a value's age whenever it is more than a few minutes old. Use the supplied ages and request time; do not compute ages yourself. If the boat clock is unverified or suspect, say ages may be inaccurate. Engine data that is not reporting usually means the engines and their gateway are off: say it is not reporting and give the last reading with its age; never report a stale RPM as the current RPM or as 0.
