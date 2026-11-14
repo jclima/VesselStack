@@ -1345,6 +1345,7 @@ nothing to an external model.
 Settings, the admin code, API access rules, telemetry refresh, optional host metrics, timezone
 and units are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in
 [Boat Chat providers](boat-chat/README.md).
+Boat Chat's Signal K unit handling is being moved to one table in `boat-chat/signalk_units.py` (SI input, stored value and label from a single lookup, tests in `tests/test_signalk_units.py`); it is not yet used by `app.py`.
 
 ### Control Panel
 
