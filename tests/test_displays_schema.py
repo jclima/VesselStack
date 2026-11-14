@@ -245,6 +245,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("$.schema", result.stderr)
 
+    def fire_config(self, **fire):
+        cfg = copy.deepcopy(EXAMPLE)
+        with_notes(cfg, fire=dict({"path": "notifications.fire", "label": "Fire"}, **fire))
+        return cfg
+
+    def test_a_fire_or_flooding_notification_reading_ok_when_absent_is_a_warning_not_an_error(self) -> None:
+        for fire in ({"absent": "ok"}, {}):                  # an omitted "absent" reads "ok" too
+            cfg = self.fire_config(**fire)
+            self.assertEqual(schema.validate_config(cfg, REGISTRY), [])
+            warnings = schema.config_warnings(cfg)
+            self.assertEqual(len(warnings), 1, fire)
+            self.assertIn("$.notifications.fire.absent", warnings[0])
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "displays.json"
+                path.write_text(json.dumps(cfg))
+                result = self.run_cli("validate", str(path))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("OK", result.stdout)
+            self.assertIn("warning: $.notifications.fire.absent", result.stderr)
+            self.assertNotIn("warning", result.stdout)
+
+    def test_flooding_warns_and_everything_else_does_not(self) -> None:
+        cfg = copy.deepcopy(EXAMPLE)
+        with_notes(cfg, bilge={"path": "notifications.flooding", "label": "Flood", "absent": "ok"})
+        self.assertEqual(len(schema.config_warnings(cfg)), 1)
+        self.assertEqual(schema.config_warnings(self.fire_config(absent="unknown")), [])
+        self.assertEqual(schema.config_warnings(EXAMPLE), [])
+        other = copy.deepcopy(EXAMPLE)
+        with_notes(other, mob={"path": "notifications.mob", "label": "MOB", "absent": "ok"})
+        self.assertEqual(schema.config_warnings(other), [])
+        self.assertEqual(schema.config_warnings({"notifications": "x"}), [])
+
     def test_io_and_parse_errors_exit_2(self) -> None:
         self.assertEqual(self.run_cli("validate", "/nonexistent/displays.json").returncode, 2)
         with tempfile.TemporaryDirectory() as tmp:

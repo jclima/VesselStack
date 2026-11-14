@@ -13,6 +13,7 @@ import datetime as dt
 from typing import Any
 
 import app
+import data_age
 import memory_index
 import telemetry_cache
 import profile_runtime
@@ -330,7 +331,7 @@ def distance_ft_from_ha(state: Any) -> float | None:
         try:
             stamp = dt.datetime.fromisoformat(str(stamp_text).replace("Z", "+00:00")).timestamp()
             age = time.time() - stamp
-            if age > 600 or age < -60:
+            if age > data_age.FRESH_SECONDS or age < -data_age.FUTURE_TOLERANCE_SECONDS:
                 return None
         except (TypeError, ValueError, OverflowError):
             return None
@@ -352,14 +353,11 @@ def ha_state_is_fresh(state: Any, now: float | None = None) -> bool:
     stamp_text = state.get("last_reported") or state.get("last_updated")
     if not stamp_text:
         return False
-    try:
-        parsed = dt.datetime.fromisoformat(str(stamp_text).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            return False
-        age = (now or time.time()) - parsed.timestamp()
-        return -60 <= age <= 600
-    except (TypeError, ValueError, OverflowError):
+    parsed = data_age.parse_timestamp(stamp_text)
+    if parsed is None:
         return False
+    age = (now or time.time()) - parsed.timestamp()
+    return -data_age.FUTURE_TOLERANCE_SECONDS <= age <= data_age.FRESH_SECONDS
 
 
 def refresh_solar_inference(
@@ -399,15 +397,11 @@ def refresh_solar_inference(
     timestamps = current_telemetry.get("timestamps", {}) if isinstance(current_telemetry, dict) else {}
     source_times = []
     for path in source_paths:
-        try:
-            parsed = dt.datetime.fromisoformat(str(timestamps[path]).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                raise ValueError("naive source timestamp")
+        parsed = data_age.parse_timestamp(timestamps.get(path))
+        if parsed is not None:
             stamp = parsed.timestamp()
-            if math.isfinite(stamp) and stamp <= now + 60 and now - stamp <= 600:
+            if stamp <= now + data_age.FUTURE_TOLERANCE_SECONDS and now - stamp <= data_age.FRESH_SECONDS:
                 source_times.append(stamp)
-        except (KeyError, TypeError, ValueError, OverflowError):
-            pass
     source_quality = "verified" if len(source_times) == len(source_paths) else "legacy_unverified"
     source_timestamp = None
     try:

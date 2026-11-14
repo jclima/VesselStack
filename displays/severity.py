@@ -108,12 +108,12 @@ def ha_state(state_str, kind: str, cfg: dict, prev=None) -> tuple:
             return ("missing", "unknown", None, None)
         if not math.isfinite(value):
             return ("missing", "unknown", None, None)
-        value = conversions.round_value(value, cfg.get("precision", 0))
-        if value is None:
+        rounded = conversions.round_value(value, cfg.get("precision", 0))
+        if rounded is None:
             return ("missing", "unknown", None, None)
-        thresholds = cfg.get("thresholds")
-        sev = numeric_sev(value, thresholds, prev) if thresholds else "ok"
-        return ("ok", sev, None, value)
+        thresholds = cfg.get("thresholds")   # on the value before display rounding (6 places only removes float noise)
+        sev = numeric_sev(round(value, 6), thresholds, prev) if thresholds else "ok"
+        return ("ok", sev, None, rounded)
     state = ha_normalise(state_str)
     for index, entry in enumerate(cfg.get("states", ())):
         if "match" in entry:

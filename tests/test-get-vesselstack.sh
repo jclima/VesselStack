@@ -172,6 +172,12 @@ if [ "$1" = --help ] && [ -n "${FAKE_CTL_NEW:-}" ]; then
     echo "  backup-drive list --json"
     exit 0
 fi
+if [ "$1" = update ] && [ -n "${FAKE_CTL_WRITE_MARKER:-}" ]; then
+    # An update that died after install.sh recorded its marker (FAKE_CTL_WRITE_MARKER is the backup path).
+    mkdir -p "$VESSELSTACK_ROOT/config"
+    printf 'version=%s\nfrom=0.0.1\nstarted=2026-11-14T10:00:00Z\nstart=1\nsource=%s\nbackup=%s\n' \
+        "$(cat "$2/VERSION")" "$2" "${FAKE_CTL_WRITE_MARKER}" > "$VESSELSTACK_ROOT/config/install-in-progress"
+fi
 if [ "$1" = update ]; then
     [ -x "$2/install.sh" ] || { echo "Not a VesselStack release directory: $2" >&2; exit 1; }
     if [ -n "${FAKE_CTL_NEW:-}" ] && [ "$#" -eq 3 ] && [ "$3" = --backup-choice=system-disk-once ]; then :
@@ -208,7 +214,15 @@ case " $* " in
     *" --dry-run "*) [ -z "${FAKE_FAIL_DRY:-}" ] || exit 1; exit 0 ;;
 esac
 mkdir -p "$VESSELSTACK_ROOT/config"
+[ -e "$VESSELSTACK_ROOT/config/vesselstack.env" ] || cp -- "$2" "$VESSELSTACK_ROOT/config/vesselstack.env"
 printf '%s\n' "$(cat "$(dirname "$0")/VERSION")" > "$VESSELSTACK_ROOT/config/installed-version"
+# Like the real installer: the marker stays until the start phase has succeeded.
+if [ -n "${FAKE_FAIL_START:-}" ]; then
+    printf 'version=%s\nfrom=%s\nstarted=2026-11-14T10:00:00Z\nstart=1\nsource=%s\nbackup=%s\n' \
+        "$(cat "$(dirname "$0")/VERSION")" "${FAKE_MARKER_FROM:-none}" "$(dirname "$0")" "${FAKE_MARKER_BACKUP:-}" > "$VESSELSTACK_ROOT/config/install-in-progress"
+    exit 1
+fi
+rm -f "$VESSELSTACK_ROOT/config/install-in-progress"
 EOF2
 cat > "$SRC/scripts/prepare-offline-bundle.sh" <<'EOF2'
 #!/bin/bash
@@ -1520,6 +1534,213 @@ run --yes
 expect_rc 1 "downgrade"
 expect_out "Downgrades are not supported"
 expect_no_release
+
+# ---- 8b. an unfinished install is continued; a custom install root is found --------------
+write_marker() {  # VERSION FROM [BACKUP]
+    install -d "$APP_ROOT/config"
+    printf 'version=%s\nfrom=%s\nstarted=2026-11-14T10:00:00Z\nstart=1\nsource=/x\nbackup=%s\n' "$1" "$2" "${3:-}" \
+        > "$APP_ROOT/config/install-in-progress"
+}
+count_starts() { grep -c -- '^install .*--start' "$LOG" || true; }
+
+# (1) A fresh install whose start phase fails stops part-way and says how to continue.
+reset_state
+EXTRA_ENV=FAKE_FAIL_START=1 run --yes --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+expect_rc 1 "start phase fails on a fresh install"
+expect_out "stopped part-way"
+expect_out "Your settings are saved"
+expect_out "get-vesselstack.sh --version $VER"
+[ -f "$APP_ROOT/config/install-in-progress" ] || fail_test "fixture should have left the marker"
+
+# (2) Rerun: not "nothing to do"; the installed configuration, a dry run, then --start; no wizard, no backup.
+: > "$LOG"
+run --yes
+expect_rc 0 "rerun continues the unfinished install"
+refuse_out "nothing to do"
+expect_out "did not finish"
+expect_out "continuing: the installed configuration"
+expect_out "finished the interrupted installation of VesselStack $VER"
+expect_log "^install --config $APP_ROOT/config/vesselstack.env --dry-run"
+expect_log "^install --config $APP_ROOT/config/vesselstack.env --start"
+expect_log "^installenv --config $APP_ROOT/config/vesselstack.env --start NONINTERACTIVE=true$"
+refuse_log "^wizard "
+refuse_log "^ctl update"
+refuse_log "backup"
+[ ! -e "$APP_ROOT/config/install-in-progress" ] || fail_test "marker should be gone after the continued install"
+: > "$LOG"
+run --yes
+expect_rc 0 "further rerun after the continued install"
+expect_out "nothing to do"
+[ ! -s "$LOG" ] || fail_test "a finished install must not call anything"
+
+# --set and --config on a continuation: --set is refused, --config is ignored.
+reset_state
+EXTRA_ENV=FAKE_FAIL_START=1 run --yes --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+run --yes --set BOAT_NAME=Foo
+expect_rc 1 "--set on a continuation"
+expect_out "--set cannot change the configuration of an installed system"
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "--config on a continuation is ignored"
+expect_out "is ignored"
+expect_out "finished the interrupted installation"
+
+# A marker whose version cannot be read counts only when installed-version is the requested one.
+reset_state
+EXTRA_ENV=FAKE_FAIL_START=1 run --yes --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+printf 'garbage\n' > "$APP_ROOT/config/install-in-progress"
+run --yes
+expect_rc 0 "unreadable marker next to the requested installed-version"
+expect_out "could not be read"
+expect_out "finished the interrupted installation"
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+printf 'garbage\n' > "$APP_ROOT/config/install-in-progress"
+run --yes
+expect_rc 0 "unreadable marker next to an older installed-version is an ordinary upgrade"
+expect_out "could not be read"
+expect_out "UPGRADE"
+expect_log "^ctl update "
+
+# A first install that died before its configuration was saved starts again from the beginning.
+reset_state
+write_marker "$VER" none
+run --yes --no-wizard --config "$TEST_ROOT/in.env"
+expect_rc 0 "marker without a saved configuration"
+expect_out "starts the installation again from the beginning"
+expect_log "^install --config $RELEASE_BASE/vesselstack.env --start"
+
+# (3) Declining the continuation changes nothing and says how to continue later.
+reset_state
+EXTRA_ENV=FAKE_FAIL_START=1 run --yes --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+starts=$(count_starts)
+printf 'y\nn\n' > "$TEST_ROOT/answers"
+EXTRA_ENV=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" run
+EXTRA_ENV=
+expect_rc 0 "declined continuation"
+expect_out "Continue the unfinished installation now"
+expect_out "Nothing was changed. To continue later"
+expect_out "--version $VER"
+[ "$(count_starts)" = "$starts" ] || fail_test "a declined continuation must not start anything"
+[ -f "$APP_ROOT/config/install-in-progress" ] || fail_test "a declined continuation must keep the marker"
+
+# (4) A marker for an older version, with a newer version requested: the ordinary upgrade replaces it.
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+write_marker 0.0.5 0.0.1
+run --yes
+expect_rc 0 "upgrade over an older unfinished install"
+expect_out "An unfinished installation of 0.0.5 was found; it will be replaced by this upgrade to $VER"
+expect_log "^ctl update $RELEASE_BASE/$VER WHEELHOUSE= OFFLINE=$"
+
+# (5) A marker for a newer version than the requested one is refused, with the way back.
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+write_marker 99.0.0 0.0.1 /var/backups/x/vesselstack-0.0.1.tar.gz
+run --yes
+expect_rc 1 "older version requested than the unfinished one"
+expect_out "update to 99.0.0 did not finish, so this computer is between versions"
+expect_out "Finish it: .*--version 99.0.0"
+expect_out "Or go back: sudo vesselstackctl restore /var/backups/x/vesselstack-0.0.1.tar.gz --yes"
+expect_no_release
+write_marker 99.0.0 0.0.1
+run --yes
+expect_rc 1 "older version requested, no backup recorded"
+expect_out "Or go back: restore the newest vesselstack-\*.tar.gz in your backup folder \(default /var/backups/vesselstack\)"
+expect_out "vesselstackctl restore FILE --yes"
+expect_no_release
+
+# (6) A failed update names the backup recorded in the marker; without a marker it changed nothing.
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+EXTRA_ENV=FAKE_CTL_FAIL=update EXTRA_ENV2=FAKE_CTL_WRITE_MARKER=/abs/x.tar.gz run --yes
+EXTRA_ENV=; EXTRA_ENV2=
+expect_rc 1 "failed update with a recorded backup"
+expect_out "The update to $VER did not finish"
+expect_out "Try again .*--version $VER"
+expect_out "Or go back to 0.0.1: sudo vesselstackctl restore /abs/x.tar.gz --yes"
+reset_state
+install -d "$APP_ROOT/config"
+echo 0.0.1 > "$APP_ROOT/config/installed-version"
+EXTRA_ENV=FAKE_CTL_FAIL=update run --yes
+EXTRA_ENV=
+expect_rc 1 "failed update before anything changed"
+expect_out "The update stopped before changing anything. The installed version is unchanged"
+
+# A continuation that fails again keeps everything and offers both ways on.
+reset_state
+EXTRA_ENV=FAKE_FAIL_START=1 run --yes --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+EXTRA_ENV=FAKE_FAIL_START=1 EXTRA_ENV2=FAKE_MARKER_BACKUP=/abs/y.tar.gz run --yes
+EXTRA_ENV=; EXTRA_ENV2=
+expect_rc 1 "continuation fails again"
+expect_out "The installation still did not finish"
+expect_out "run the same command again: .*--version $VER"
+expect_out "To go back to .* instead: sudo vesselstackctl restore /abs/y.tar.gz --yes"
+
+# (7) A symlinked or oversized marker is ignored with a warning.
+reset_state
+install -d "$APP_ROOT/config"
+echo "$VER" > "$APP_ROOT/config/installed-version"
+printf 'version=%s\n' "$VER" > "$TEST_ROOT/real-marker"
+ln -s "$TEST_ROOT/real-marker" "$APP_ROOT/config/install-in-progress"
+run --yes
+expect_rc 0 "symlinked marker"
+expect_out "symbolic link"
+expect_out "nothing to do"
+rm -f "$APP_ROOT/config/install-in-progress"
+{ printf 'version=%s\n' "$VER"; head -c 5000 /dev/zero | tr '\0' 'a'; printf '\n'; } > "$APP_ROOT/config/install-in-progress"
+run --yes
+expect_rc 0 "oversized marker"
+expect_out "larger than 4096 bytes"
+expect_out "nothing to do"
+
+# (8) A custom install root: sudo strips VESSELSTACK_ROOT, so it is read from the installed vesselstackctl.
+CUSTOM_ROOT="$TEST_ROOT/custom/opt/vesselstack"
+fake_ctl_dir() {  # DIR ROOT-LINE-PATH: a vesselstackctl that records when it is run
+    install -d "$1"
+    # shellcheck disable=SC2016  # The $ are literal: they are the text the script reads from the file.
+    printf '#!/bin/bash\necho "ctl-ran-for-discovery $*" >> "$LOG"\nROOT=${VESSELSTACK_ROOT:-%s}\n' "$2" > "$1/vesselstackctl"
+    chmod 0755 "$1/vesselstackctl"
+}
+reset_state
+install -d "$CUSTOM_ROOT/config"
+echo "$VER" > "$CUSTOM_ROOT/config/installed-version"
+fake_ctl_dir "$TEST_ROOT/bin-ctl" "$CUSTOM_ROOT"
+EXTRA_ENV=VESSELSTACK_ROOT= RUN_PATH="$TEST_ROOT/bin-ctl:$FAKE_BIN:$PATH" run --yes
+EXTRA_ENV=
+expect_rc 0 "custom root found through vesselstackctl"
+expect_out "Found the installation at $CUSTOM_ROOT"
+expect_out "already installed in $CUSTOM_ROOT; nothing to do"
+refuse_log "ctl-ran-for-discovery"
+# An explicit VESSELSTACK_ROOT wins over the installed ctl.
+EXTRA_ENV=VESSELSTACK_ROOT="$APP_ROOT" RUN_PATH="$TEST_ROOT/bin-ctl:$FAKE_BIN:$PATH" run --yes --no-wizard --config "$TEST_ROOT/in.env"
+EXTRA_ENV=
+refuse_out "Found the installation at"
+expect_out "no existing installation found in $APP_ROOT"
+# Falls back to the default for a ctl without such a line, and for a path that is not a directory.
+rm -rf "$TEST_ROOT/bin-ctl"
+if [ ! -e /opt/vesselstack/config/installed-version ]; then
+    for ctl_root in '' /no/such/dir/for/vesselstack; do
+        reset_state
+        if [ -n "$ctl_root" ]; then fake_ctl_dir "$TEST_ROOT/bin-ctl" "$ctl_root"; run_path="$TEST_ROOT/bin-ctl:$FAKE_BIN:$PATH"; else run_path="$FAKE_BIN:$PATH"; fi
+        printf 'y\nn\n' > "$TEST_ROOT/answers"
+        EXTRA_ENV=VESSELSTACK_ROOT= EXTRA_ENV2=VESSELSTACK_BOOTSTRAP_ANSWERS="$TEST_ROOT/answers" RUN_PATH="$run_path" run --no-wizard --config "$TEST_ROOT/in.env"
+        EXTRA_ENV=; EXTRA_ENV2=
+        expect_rc 0 "default root when the ctl names none ($ctl_root)"
+        refuse_out "Found the installation at"
+        expect_out "no existing installation found in /opt/vesselstack"
+        refuse_log "ctl-ran-for-discovery"
+        rm -rf "$TEST_ROOT/bin-ctl"
+    done
+fi
 
 # ---- 9. offline -----------------------------------------------------------------------------
 reset_state

@@ -55,10 +55,12 @@ cp "$RELEASE/boat-chat/requirements.lock" "$GOOD_LOCK"
 : > "$IMAGES_PRESENT"
 export TEST_ROOT IMAGES_PRESENT
 export FAKE_PROMETHEUS_RECREATE_FAIL=0
+export FAKE_COMPOSE_UP_FAIL=0
 
 cat > "$FAKE_BIN/docker" <<'EOF2'
 #!/bin/bash
 echo "$*" >> "$TEST_ROOT/docker.log"
+if [ "${FAKE_COMPOSE_UP_FAIL:-0}" = 1 ] && [ "${1:-}" = compose ] && [[ " $* " == *" up "* ]]; then echo "simulated compose up failure" >&2; exit 1; fi
 if [ "${FAKE_PROMETHEUS_RECREATE_FAIL:-0}" = 1 ] && [[ " $* " == *" --force-recreate prometheus "* ]]; then
     exit 42
 fi
@@ -327,6 +329,16 @@ PROM_STAMP="$APP_ROOT/config/.prometheus-conf.sha256"
 PROM_CONFIG="$APP_ROOT/config/prometheus.yml"
 test -r "$PROM_STAMP" || fail "offline --start did not write Prometheus apply stamp"
 grep -qx "$(sha256sum "$PROM_CONFIG" | cut -d' ' -f1)" "$PROM_STAMP" || fail "Prometheus stamp does not match applied config"
+# A finished install carries no install-in-progress marker; an offline --start that dies in the
+# start phase leaves one, and the next successful offline --start clears it.
+MARKER="$APP_ROOT/config/install-in-progress"
+test ! -e "$MARKER" || fail "finished offline install left an install-in-progress marker"
+export FAKE_COMPOSE_UP_FAIL=1
+if installer --offline --start >/dev/null 2>"$TEST_ROOT/err"; then fail "offline --start ignored a failing compose up"; fi
+export FAKE_COMPOSE_UP_FAIL=0
+grep -qx 'start=1' "$MARKER" || fail "failed offline --start left no install-in-progress marker"
+installer --offline --start >/dev/null 2>"$TEST_ROOT/err" || { cat "$TEST_ROOT/err" >&2; fail "offline rerun failed"; }
+test ! -e "$MARKER" || fail "successful offline rerun left the install-in-progress marker"
 # Enabling node-exporter through the real installer selects a different scrape
 # template and must recreate Prometheus, then stamp that applied file.
 echo 'quay.io/prometheus/node-exporter:v1.10.2' >> "$IMAGES_PRESENT"

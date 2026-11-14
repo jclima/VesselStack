@@ -33,6 +33,9 @@ _CONVERSION_FACTORS = {
 }
 
 
+_SIGNALK_PREFIXES = ("propulsion.", "environment.", "navigation.", "electrical.", "tanks.")
+
+
 def normalize_preference(value: str | None) -> str:
     return "metric" if str(value or "").strip().lower() in {"metric", "si", "metre", "meters", "nautical"} else "us_customary"
 
@@ -182,15 +185,22 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
         result.setdefault("display_units", "us_customary")
         return result
 
-    def walk(value: Any, parent: str = "", inherited_units: dict[str, str] | None = None) -> Any:
+    def walk(value: Any, parent: str = "", inherited_units: dict[str, str] | None = None, explicit_units: bool = False) -> Any:
         if isinstance(value, dict):
             source_units = dict(inherited_units or fallback_units)
             if isinstance(value.get("units"), dict):
                 source_units = {str(key): str(unit or "") for key, unit in value["units"].items()}
+            # A units map that came from the data itself (not just Home
+            # Assistant entity fallbacks) is authoritative: a path it does not
+            # list has an unknown unit and must not get the path-based guess.
+            has_units_map = isinstance(value.get("units"), dict) or explicit_units
             def source_for(measurement: str) -> str | None:
                 if measurement in source_units:
                     return source_units[measurement]
-                return next((unit for key, unit in source_units.items() if measurement.endswith("." + key)), None)
+                found = next((unit for key, unit in source_units.items() if measurement.endswith("." + key)), None)
+                if found is None and has_units_map and measurement.startswith(_SIGNALK_PREFIXES):
+                    return ""
+                return found
             if p == "metric" and isinstance(value.get("port_measurement"), str):
                 measurement = str(value["port_measurement"])
                 for comparison_key in ("all_aligned_samples", "rpm_matched_within_50"):
@@ -231,7 +241,7 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
                         item = convert(float(item), "us gal" if "liter" in key else "gal/h", "L" if "liter" in key else "L/h")
                 if p == "metric" and isinstance(item, (int, float)) and (str(raw_key) in source_units or str(raw_key).startswith(("propulsion.", "environment.", "navigation.", "electrical.", "tanks."))):
                     item = display_value(str(raw_key), float(item), p, source_for(str(raw_key)))
-                out[key] = walk(item, key, source_units)
+                out[key] = walk(item, key, source_units, has_units_map)
             if p == "metric" and "state" in out and ("unit" in out or "unit_of_measurement" in out):
                 source = str(out.get("unit") or out.get("unit_of_measurement") or "")
                 targets = {"F": "°C", "°F": "°C", "psi": "kPa", "Pa": "kPa", "inHg": "hPa", "ft": "m", "gal": "L", "gal/h": "L/h"}
@@ -247,7 +257,7 @@ def normalize_context(context: dict[str, Any], pref: str = "us_customary") -> di
                     pass
             return out
         if isinstance(value, list):
-            items = [walk(item, parent, inherited_units) for item in value]
+            items = [walk(item, parent, inherited_units, explicit_units) for item in value]
             if p == "metric" and parent == "notes":
                 items = [
                     item.replace("Fuel rate is integrated by minute and reported in US gallons (gal, gal/h).", "Fuel rate is integrated by minute and reported in liters (L, L/h).")

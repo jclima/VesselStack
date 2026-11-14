@@ -7,8 +7,8 @@ a SignalK websocket and an MQTT client.
 
 Threading: the Engine is only ever touched by the main thread (one loop that
 alternates a bounded websocket read with Engine.tick). paho's network thread
-only sends packets and runs on_connect, which publishes retained status
-messages and never touches the Engine, so no lock is needed.
+only sends packets and runs on_connect, which publishes the status messages
+and never touches the Engine, so no lock is needed.
 
 Third-party imports (paho-mqtt, websockets) are deferred to the real adapters
 so the loop is importable and unit-testable with the standard library alone.
@@ -22,6 +22,7 @@ import queue
 import random
 import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -63,8 +64,108 @@ HA_MAX_MESSAGE_BYTES = 2 * 1024 * 1024     # one websocket message from Home Ass
                                            # fallback on a very large installation can exceed it: see the README)
 
 
+STATE_DIR_ENV = "VESSELSTACK_DISPLAYS_STATE_DIR"
+STATE_FILE = "state.json"
+STATE_FORMAT = 1
+
+
 class SettingsError(Exception):
     pass
+
+
+class StateStore:
+    """The latch and the alarm counter across restarts: ``<dir>/state.json``, written atomically.
+
+    ``{"format":1,"seq":<uint32>,"latched":{"instruments":[ids],"notifications":[ids],"ha":[ids]}}``.
+    Without a usable directory the bridge runs as it always did (one warning, nothing written). A
+    missing, corrupt or unknown-format file reads as "nothing persisted" and is overwritten by the
+    next change. Nothing here ever raises into the bridge.
+    """
+
+    KINDS = ("instruments", "notifications", "ha")
+
+    def __init__(self, directory):
+        self.path = None
+        self._written = None            # the content last known to be in the file; None: unknown/different
+        self._warned = False
+        text = (directory or "").strip() if isinstance(directory, str) else ""
+        if not (text and os.path.isdir(text) and os.access(text, os.W_OK | os.X_OK)):
+            LOG.warning("%s is unset or not a writable directory; the lost-alarm latch and alarm counter are "
+                        "not kept across restarts", STATE_DIR_ENV)
+            return
+        self.path = os.path.join(text, STATE_FILE)
+
+    def load(self):
+        """``(seq, {kind: [ids]})`` from the file, or None when there is nothing usable."""
+        if self.path is None:
+            return None
+        try:
+            with open(self.path, "rb") as handle:
+                data = json.loads(handle.read(1024 * 1024 + 1).decode("utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            LOG.warning("ignoring unreadable %s (%s); starting without a persisted latch", STATE_FILE,
+                        type(exc).__name__)
+            return None
+        seq, latched = self._parse(data)
+        if seq is None:
+            LOG.warning("ignoring %s with an unknown format or invalid content; starting without a persisted "
+                        "latch", STATE_FILE)
+            return None
+        self._written = (seq, latched)
+        return seq, {kind: list(ids) for kind, ids in latched}
+
+    def _parse(self, data):
+        latched = data.get("latched") if isinstance(data, dict) else None
+        if not (isinstance(data, dict) and type(data.get("format")) is int and data["format"] == STATE_FORMAT
+                and type(data.get("seq")) is int and 0 <= data["seq"] < 2 ** 32 and isinstance(latched, dict)):
+            return None, None
+        out = []
+        for kind in self.KINDS:
+            ids = latched.get(kind, [])
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                return None, None
+            out.append((kind, tuple(ids)))
+        return data["seq"], tuple(out)
+
+    def save(self, seq, latched):
+        """Write when the content differs from the file's; a failure warns once and is not retried until it changes."""
+        if self.path is None:
+            return
+        content = (seq, tuple((kind, tuple(latched.get(kind, ()))) for kind in self.KINDS))
+        if content == self._written:
+            return
+        self._written = content
+        body = json.dumps({"format": STATE_FORMAT, "seq": seq, "latched": {k: list(v) for k, v in content[1]}},
+                          separators=(",", ":"))
+        try:
+            self._write(body)
+        except OSError as exc:
+            if not self._warned:
+                self._warned = True
+                LOG.warning("cannot write %s: %s", STATE_FILE, type(exc).__name__)
+
+    def _write(self, body):
+        directory = os.path.dirname(self.path)
+        fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=directory)    # mode 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(body + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 class SourceClosed(Exception):
@@ -187,7 +288,7 @@ class Bridge:
     """
 
     def __init__(self, config, publisher, connect, clock=time.monotonic,
-                 wait=None, rng=random.random, wall=None, local=None, ha=None):
+                 wait=None, rng=random.random, wall=None, local=None, ha=None, state_dir=None):
         self.engine = topics.Engine(config)
         self.events = topics.EventEngine(config)
         self.has = topics.HaEngine(config)
@@ -205,12 +306,37 @@ class Bridge:
         self._night_schedule = config.get("night_schedule")
         self._clock_wanted = topics.clock_wanted(config)
         self._clock_sent = None     # (state, clock time) of the last bridge clock published
+        self._alive_sent = None     # clock time of the last bridge liveness (status + service) published
         self._summary_sent = None   # (content, clock time) of the last summary published
+        self._alarm_seq = random.getrandbits(31)   # new-alarm counter (uint32, wraps); in memory only
+        self._alarm_prev = frozenset()             # ids in alarm (live or lost) at the previous evaluation
+        self._store = StateStore(state_dir)
+        self._restore()
         self.self_urn = None
         self.signalk_state = SIGNALK_DISCONNECTED
         self._next_tick = 0.0
         self._error_logged_at = None
         self._errors_suppressed = 0
+
+    # -- persistence of the latch and the alarm counter --------------------------
+    def _restore(self):
+        """Before the first summary: continue the counter and keep persisted lost alarms lost."""
+        loaded = self._store.load()
+        if loaded is None:
+            return
+        self._alarm_seq, ids = loaded
+        now = self.clock()
+        restored = (self.engine.restore_latched(ids["instruments"], now)
+                    + self.events.restore_latched(ids["notifications"], now)
+                    + self.has.restore_latched(ids["ha"], now))
+        self._alarm_prev = frozenset(restored)     # restored lost items are known: a restart is not a new alarm
+        if restored:
+            LOG.info("restored %d lost alarm(s) from %s", len(restored), STATE_FILE)
+
+    def _persist(self):
+        self._store.save(self._alarm_seq, {"instruments": self.engine.latched_ids(),
+                                           "notifications": self.events.latched_ids(),
+                                           "ha": self.has.latched_ids()})
 
     # -- publishing -------------------------------------------------------
     def _send(self, messages):
@@ -219,7 +345,12 @@ class Bridge:
 
     def on_mqtt_connected(self):
         """Called on every (re)connection to the broker, possibly from its thread."""
-        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_ONLINE, True, qos=1)
+        # Liveness is never stored by the broker: a retained "online" outlives a power cut (the broker
+        # dies with the bridge, so the will never fires) and old values would look live after a restart.
+        # An older bridge left one behind, so every connect first deletes it (an empty retained payload),
+        # in the publisher's ordered queue and before the first "online".
+        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, "", True, qos=1)
+        self._publish_alive(self.clock())
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, self.signalk_state, True, qos=1)
         if self._ha_wanted:
             self.publisher.publish(topics.BRIDGE_HA_TOPIC, self.ha_state, True, qos=1)
@@ -227,10 +358,27 @@ class Bridge:
             self.publisher.publish(topics.BRIDGE_CLOCK_TOPIC, topics.clock_payload(
                 topics.clock_state(self._local(), self._night_schedule), self._summary_ts()), True, qos=1)
 
+    def _publish_alive(self, now):
+        """Non-retained, QoS 0 "online" for the displays, and the retained "last known" record for tools."""
+        self._alive_sent = now
+        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_ONLINE, False, qos=0)
+        self.publisher.publish(topics.BRIDGE_SERVICE_TOPIC,
+                               topics.service_payload(STATUS_ONLINE, self._summary_ts()), True, qos=1)
+
+    def _publish_alive_heartbeat(self, now):
+        """Repeat the liveness every heartbeat while MQTT is connected (a reconnect publishes it at once)."""
+        sent = self._alive_sent
+        if sent is None or now - sent < self.engine.heartbeat_s:
+            return
+        if not getattr(self.publisher, "connected", True):
+            return
+        self._publish_alive(now)
+
     def _set_signalk(self, state):
         if state != self.signalk_state:
             self.signalk_state = state
             LOG.info("SignalK %s", state)
+            self._send(self.engine.source_state(state == SIGNALK_CONNECTED, self.clock()))
             self._send(self.events.source_state("signalk", state == SIGNALK_CONNECTED, self.clock()))
             self._publish_summary(self.clock())
         self.publisher.publish(topics.BRIDGE_SIGNALK_TOPIC, state, True, qos=1)
@@ -293,7 +441,13 @@ class Bridge:
         """Publish the retained alarm summary on change and every heartbeat; none when nothing counts."""
         if items is None:
             items = self.engine.summary_items() + self.events.summary_items(now) + self.has.summary_items()
-        payload = topics.alarm_summary(items, self._summary_ts())
+        # seq counts alarms that are new since the previous evaluation (evaluated before the retained
+        # message is coalesced, so "A clears, B raises" still moves it); alarm <-> lost does not.
+        live = {iid for iid, sev in items if sev == "alarm"}
+        self._alarm_seq = (self._alarm_seq + len(live - self._alarm_prev)) % 2 ** 32
+        self._alarm_prev = frozenset(live | {iid for iid, sev in items if sev == "lost"})
+        self._persist()
+        payload = topics.alarm_summary(items, self._summary_ts(), self._alarm_seq)
         if payload is None:
             return
         content = json.loads(payload)
@@ -318,6 +472,7 @@ class Bridge:
         now = self.clock()
         if now >= self._next_tick:
             self._next_tick = now + TICK_INTERVAL_S
+            self._publish_alive_heartbeat(now)
             self._publish_clock(now)
             self._send(self.engine.tick(now))
             self._send(self.events.tick(now))
@@ -448,13 +603,16 @@ class Bridge:
             self._set_ha(HA_DISCONNECTED)
         if self.signalk_state != SIGNALK_DISCONNECTED:
             self._set_signalk(SIGNALK_DISCONNECTED)
-        # A clean stop must not leave a retained "ok" (or a stale "alarm"): publish every counted
-        # item as unknown. A crash cannot do this; displays then rely on the summary going stale.
+        # A clean stop must not leave a retained "ok" (or a stale "alarm"): publish the summary as if
+        # every counted item had just gone stale. An item in alarm stays an alarm (lost), the rest is
+        # unknown. A crash cannot do this; displays then rely on the summary going stale.
         now = self.clock()
-        self._publish_summary(now, [(i, "unknown") for i, _ in
+        self._publish_summary(now, [(i, "lost" if sev in ("alarm", "lost") else "unknown") for i, sev in
                                     self.engine.summary_items() + self.events.summary_items(now)
                                     + self.has.summary_items()], force=True)
-        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, True, qos=1)
+        self.publisher.publish(topics.BRIDGE_SERVICE_TOPIC,
+                               topics.service_payload(STATUS_OFFLINE, self._summary_ts()), True, qos=1)
+        self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, False, qos=0)
         self.publisher.stop()
 
 
@@ -586,7 +744,9 @@ class MqttPublisher:
         s = self._settings
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=CLIENT_ID)
         client.username_pw_set(s.mqtt_username, s.mqtt_password)
-        client.will_set(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, qos=1, retain=True)
+        # One will per connection: the displays' non-retained, unqueued "offline". bridge/service cannot have
+        # one, so after a crash it keeps "online" with an old ts (see docs/MQTT.md).
+        client.will_set(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, qos=0, retain=False)
         client.reconnect_delay_set(min_delay=1, max_delay=30)
         # Bound memory while the broker is down (paho's default queue is unbounded).
         client.max_queued_messages_set(MQTT_MAX_QUEUED_MESSAGES)
@@ -615,7 +775,19 @@ class MqttPublisher:
         client.connect_async(s.mqtt_host, s.mqtt_port, keepalive=30)
         client.loop_start()
 
+    @property
+    def connected(self):
+        return self._connected
+
     def publish(self, topic, payload, retain, qos=0):
+        if retain and payload in ("", b""):
+            # An empty retained payload deletes a retained message at the broker: there is no state to
+            # cache or replay, and it must stay in order with the (non-retained) publishes behind it.
+            with self._condition:
+                if not self._stopping:
+                    self._commands.append(("publish", topic, payload, True, qos))
+                    self._condition.notify()
+            return
         if retain and threading.current_thread() is self._worker:
             # Re-entrant publishes from on_connect already run on the owner
             # worker.  Apply them inline so a producer-thread update queued
@@ -705,6 +877,8 @@ class MqttPublisher:
             elif kind == "publish":
                 if self._connected:
                     self._send(args[0], args[1], args[2], args[3])
+                elif args[0] == topics.BRIDGE_STATUS_TOPIC and not args[2]:
+                    pass            # liveness is never queued for later: a late "online" would be a lie
                 elif len(self._waiting) < MQTT_MAX_QUEUED_MESSAGES:
                     self._waiting.append(tuple(args))
 
@@ -783,7 +957,8 @@ def main(env=None) -> int:
     if config.get("ha"):
         LOG.info("%d Home Assistant item(s)", len(config["ha"]))
     ha = make_ha_client(settings, config)
-    Bridge(config, publisher, connect, local=local_time_source(settings.timezone), ha=ha).run(stop)
+    Bridge(config, publisher, connect, local=local_time_source(settings.timezone), ha=ha,
+           state_dir=env.get(STATE_DIR_ENV)).run(stop)
     LOG.info("stopped")
     return EXIT_OK
 

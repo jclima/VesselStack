@@ -114,6 +114,7 @@ that every provider works offline. The optional [instrument displays preview](do
 is another separately enabled local feature. Displays show a full-screen alarm banner by default when anything
 counts towards the alarm summary; set `"ui": {"alarm_takeover": false}` in `displays.json` to turn it off, then
 rebuild and reflash (`vesselstackctl display build ID`, `display flash ID`).
+A null or invalid Signal K value, or a lost Signal K connection, turns the tile to a grey `--` at once, and warning and alarm colours are judged on the reading before it is rounded for display. An alarm never clears because its data stopped: the bridge keeps counting an item that was in alarm when its sensor went silent as a lost alarm in the alarm summary, so the banner stays up until a fresh reading or an explicit all-clear says otherwise. The bridge remembers lost alarms and its alarm counter across restarts in a small private state file under the data directory, a repeated old Signal K reading no longer keeps a dead sensor looking fresh, and the Fire and Flooding catalog entries show `--` until a source reports.
 
 ### Component lifecycle
 
@@ -131,10 +132,17 @@ for acceptance steps.
 Applying a restore is a bounded transaction. VesselStack stages and validates
 both application and data trees, journals the managed
 systemd units, launchers, libexec helpers, update environment, and enable links
-outside those trees, then stops services before swapping anything. If a later
+outside those trees, then stops services before swapping anything. Every VesselStack unit file and enable link that exists is journaled too, because restoring an older release removes the managed units it does not have. After the trees are swapped, restore turns off the managed units that the restored version does not have (it removes their unit files and enable links, never touching other `vesselstack-*` units you created), reinstalls `vesselstack-update` and the libexec helpers from the restored release's installer scripts (removing ones that release does not ship, and leaving them alone if the tree has no installer scripts), and lists what it turned off after "Restore completed". If a later
 swap, daemon reload, installer, or start fails, the old trees and journaled
 managed paths are restored and a best-effort daemon reload/start is attempted;
-failed trees and recovery materials are retained for inspection. If stopping the
+failed trees and recovery materials are retained for inspection. If the rollback
+succeeds, the staged copy of the backup is removed; if it fails, the stage directory
+and the recovery journal are kept (their paths are printed) and contain a copy of the
+backup including secrets, so remove them after recovery. While the trees are swapped,
+the Control Panel, `vesselstack-homepage-refresh.service` and the active VesselStack
+timers (and their services) are stopped and started again afterwards. The restore runs
+in your terminal session and is not yet protected against the session dropping; keep
+it on a stable connection or run it inside `screen` or `tmux`. If stopping the
 running stack fails, no rollback is attempted under live services. Unrelated
 `/etc` files, Docker services, AIS devices, and SocketCAN interfaces are not
 removed. A restore still requires `--yes`, sufficient same-filesystem space,
@@ -176,7 +184,7 @@ equipment and logbook records.
 Optional ESP32 touch-screen displays that show Signal K values (speed, depth, wind,
 battery voltage and so on) on pages you define. The first supported board is the
 Waveshare ESP32-S3-Touch-LCD-2.8C running ESPHome with LVGL. This is a preview and
-the bridge service runs only when `DISPLAYS_ENABLE=true`.
+the bridge service runs only when `DISPLAYS_ENABLE=true`. Bridge liveness is a non-retained heartbeat on `vesselstack/v1/bridge/status`, so a broker restart after a power cut can never replay an old `online`; tools read the retained `vesselstack/v1/bridge/service` record (last known, judged by its timestamp) or run `vesselstackctl display status`.
 
 ```bash
 sudo vesselstackctl display list
@@ -417,8 +425,10 @@ and Docker may already have been installed by the earlier steps; re-running is s
 `--set` cannot change the configuration of an installed system (an upgrade keeps it).
 With a saved configuration from an earlier run, `--yes` and `--defaults` reuse it and
 `--set` is applied on top of it (the old file is kept as `vesselstack.env.previous`). Re-running is safe: finished steps are reported
-and skipped, an already installed version just reports "nothing to do". Rollback of this
+and skipped, an already installed version reports "nothing to do", and an installation or update that did not finish is continued from where it stopped (see below). The bootstrap also finds an installation at a custom root by reading the installed `vesselstackctl` (`sudo` does not pass `VESSELSTACK_ROOT`). Rollback of this
 installer change: use the previous release's `get-vesselstack.sh`; nothing else changed.
+
+While an installation or update is running, the installer keeps `config/install-in-progress`; it is removed once the services have started (or, for a run without `--start`, when no earlier `--start` run failed), so a leftover file means the last run did not finish. `installed-version` is written before the services are started and does not by itself show that they were. `get-vesselstack.sh` reads the marker: a rerun for the same version continues the unfinished installation with the installed configuration, no wizard and no new backup (it asks first, unless `--yes` or `--defaults`); an older version is refused while a newer update is unfinished; and a failed update names the backup recorded in the marker. `vesselstackctl doctor`, `status` and `version` report the marker: `doctor` prints `FAIL installation of VERSION did not finish` with the command to continue and, when a backup is recorded, the command to restore it; `status` shows an `Installation INCOMPLETE` line and exits non-zero; and `vesselstackctl update` passes its backup to the installer in `VESSELSTACK_PREUPDATE_BACKUP`, so the marker records it and a failed update prints the exact restore command.
 
 **What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
 root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the
@@ -1345,6 +1355,7 @@ nothing to an external model.
 Settings, the admin code, API access rules, telemetry refresh, optional host metrics, timezone
 and units are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in
 [Boat Chat providers](boat-chat/README.md).
+`boat-chat/signalk_units.py` is the single table Boat Chat uses to convert Signal K SI values to its stored units and to label them, so a value and its unit always come from the same lookup (tests in `tests/test_signalk_units.py`). Live telemetry snapshots carry a unit for every numeric value (empty means unknown and is never guessed), and values whose reported unit disagrees with the expected one are left unconverted and listed under `unit_conflicts`. Boat Chat tells the model how old each live reading is and what time the question was asked: readings older than 10 minutes are presented as last known, with their age and local time, never as current, and a boat-clock check (against GPS time when available) warns when ages may be inaccurate. The freshness rule lives in `boat-chat/data_age.py`. Answers Boat Chat builds directly from telemetry (briefing, battery-voltage history, fuel usage, generic history) state the age or sample time of the values they print, say "no recent data" with the last known value and its age rather than "unavailable" for stale readings, distinguish "no data recorded" from "engines not running" for fuel use, and show 12 V voltage guidance only for banks whose readings fall between 9 and 16 V.
 
 ### Control Panel
 
@@ -1475,7 +1486,7 @@ it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
 - **Settings** has a jump list, help for every field, Advanced sections that start collapsed,
   inline field errors, and one save bar: **Save** writes the settings, **Apply** renders and installs
   them (it does not recreate containers and restarts only the displays bridge; restart a component to use the new values).
-- **Updates** checks only when you press **Check for updates**, which contacts github.com.
+- **Updates** checks only when you press **Check for updates**, which contacts github.com. If an update does not finish, the Control Panel keeps showing "The update to X did not finish" (with the pre-update backup and its restore command when one was made) until an installation completes, and the Updates tab offers **Finish this update** to try again.
 - **Maintenance** holds Back up now, Start all, Restart all, Stop all, **Check setup**,
   **Reinstall & start**, **Provision history** and **Restart Control Panel**.
 
@@ -2186,7 +2197,7 @@ backup, if you have one (`vesselstackctl restore`, see [Updating](#updating)).
 Besides the application and data trees the
 archive includes `/etc/systemd/system/vesselstack-*`,
 `/usr/local/sbin/vesselstack{ctl,-firewall}` and `/etc/vesselstack/update.env`
-when they exist, so a restore across versions is complete.
+when they exist, so a restore across versions is complete. Enable links and libexec helpers are not archived; restore rebuilds them from the restored release.
 
 The whole stack, including Home Assistant, stays stopped for the copy. Home
 Assistant, Grafana, InfluxDB and Boat Chat all keep SQLite or write-ahead-log
@@ -2209,12 +2220,16 @@ directory beside the data directory, (4) stops the stack, (5) renames the live
 trees to `/opt/vesselstack.pre-restore-STAMP` and
 `/opt/vesselstack-data.pre-restore-STAMP` and moves the staged trees in (so
 InfluxDB WAL/shard files created after the backup cannot mix with the restored
-ones), (6) restores the unit files, control scripts and `update.env` by rename,
+ones), (6) restores the unit files, control scripts and `update.env` by rename, removes the managed units, with their enable links, that the backup does not contain, and reinstalls `vesselstack-update` and the libexec helpers from the restored release's `installer/scripts`,
 and (7) runs the restored bundled installer
 (`/opt/vesselstack/installer/install.sh --config ... --start`) to rebuild the
 Boat Chat virtualenv (not part of the backup), re-render units and start the
 stack. This step needs network access for `pip`; use `--skip-installer` to
-only start services and run the printed installer command later. If the swap
+only start the restored controller and run the installer later. Restore then prints a
+WARN with the command `sudo /opt/vesselstack/installer/install.sh --config
+/opt/vesselstack/config/vesselstack.env --start` (with your install root), because the
+Boat Chat and displays Python environments are not part of a backup and those services
+do not run until the installer has been run. If the swap
 fails the previous trees are put back. `/opt/vesselstack` and
 `/opt/vesselstack-data` must be plain directories on one filesystem with their
 parent; restore refuses a mount point (restore manually in that case).
@@ -2223,9 +2238,20 @@ The swap is a journaled transaction: managed unit/helper files and `update.env`
 are recorded as present or absent before stopping, publication uses adjacent
 temporary names, and a failed publication, daemon reload, or restored-controller
 start attempts one rollback. Failed restored trees are renamed to
-`*.failed-restore-STAMP`; the recovery journal is retained whenever rollback
-itself fails, and unrelated files outside the explicit managed inventory are
-never removed.
+`*.failed-restore-STAMP`, and unrelated files outside the explicit managed
+inventory are never removed. Renames of whole trees use `mv -T`, so a directory
+that appears at a destination makes the step fail (and roll back) instead of
+nesting the restored tree inside it. Before the swap, restore stops the Control
+Panel, `vesselstack-homepage-refresh.service` and each active VesselStack timer
+and its service, and lists them in `quiesced-units` in the journal; a rollback
+starts exactly those again, and after a successful restore any that are not active
+again are started. If the rollback succeeds, the stage directory
+(`.vesselstack-restore.*`) is deleted; if it fails, the stage and the journal are
+kept and their paths are printed, and both hold a copy of the backup including
+secrets. If the restore fails before the swap starts, the journal is removed as
+well. Removed units, their enable links and rebuilt helpers are in the same journal, so a failed restore puts them back exactly and restarts the units that were running. With `--skip-installer` the restored release's own installer does not run, so only these removals and helper rebuilds repair system files; units that are in the archive keep their current enabled state. The journal is kept after any failed swap. It is not durable across a crash,
+power loss or a lost SSH session, and there is no automatic recovery after a reboot
+yet.
 
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall

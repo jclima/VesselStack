@@ -412,6 +412,8 @@ for the folder update). This cannot help the upgrade that delivers it: the Contr
 
 *After a check, a newer release appears with its notes and a Back up & install button.*
 
+**An update that did not finish.** The installer records `config/install-in-progress` at its first change and removes it only after the services have started. While it exists, every page shows a notice ("The update to X did not finish...") instead of the "newer Control Panel installed" notice, and `/api/status` carries it as `install_incomplete` (version, previous version, start time, backup path). Updates then lists that same release with a **Finish this update** button, even though its version is already recorded as installed. It uses the normal update flow, including the backup choice. When a pre-update backup was made, the notice names it and the terminal command to restore it (`sudo vesselstackctl restore <backup> --yes`). Only the marker file enables this; a release older than the marker's version stays refused. Rollback: restore the named backup.
+
 ### Maintenance
 
 ![Control Panel Maintenance tab grouped into Backup, Start and stop, Setup and repair, History storage and Panel](images/control-panel-maintenance.png)

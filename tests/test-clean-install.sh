@@ -30,6 +30,7 @@ if [ "${1:-}" = image ] && [ "${2:-}" = inspect ] && [ -n "${FAKE_DOCKER_NO_IMAG
 if [ "${1:-}" = manifest ] && [ -z "${FAKE_DOCKER_REGISTRY_OK:-}" ]; then exit 1; fi
 if [ "${1:-}" = pull ] && [ -n "${FAKE_DOCKER_NO_IMAGE:-}" ] && [ -z "${FAKE_DOCKER_REGISTRY_OK:-}" ]; then exit 1; fi
 if [ "${1:-}" = run ] && [ -n "${FAKE_DOCKER_FAIL_RUN:-}" ]; then echo "simulated hashing failure" >&2; exit 1; fi
+if [ "${1:-}" = compose ] && [[ " $* " == *" up "* ]] && [ -n "${FAKE_DOCKER_FAIL_UP:-}" ]; then echo "simulated compose up failure" >&2; exit 1; fi
 # A pre-existing broker container: FAKE_MOSQ_MOUNTS lists "destination=source" lines.
 if [ "${1:-}" = inspect ] && [[ "$*" == *Mounts* ]]; then
     [ -n "${FAKE_MOSQ_MOUNTS:-}" ] && printf '%b' "$FAKE_MOSQ_MOUNTS"
@@ -227,6 +228,10 @@ test -s "$unit"
 grep -q "^User=$(id -un)\$" "$unit"
 grep -q "^EnvironmentFile=$APP_ROOT/config/displays-bridge.env\$" "$unit"
 grep -q "^ExecStart=$APP_ROOT/displays/.venv/bin/python $APP_ROOT/displays/bridge.py\$" "$unit"
+grep -qx "Environment=VESSELSTACK_DISPLAYS_STATE_DIR=$DATA_ROOT/displays-bridge" "$unit"
+grep -qx "ReadWritePaths=-$DATA_ROOT/displays-bridge" "$unit"
+test -d "$DATA_ROOT/displays-bridge"
+test "$(stat -c '%a' "$DATA_ROOT/displays-bridge")" = "700"
 if grep -q '@' "$unit"; then echo "Unit contains an unrendered placeholder" >&2; exit 1; fi
 grep -qx 'disable --now vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"
 if grep -qx 'enable vesselstack-displays-bridge.service' "$FAKE_BIN/systemctl.log"; then
@@ -1756,5 +1761,63 @@ done
 if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
     echo 'a Node-RED port clash was accepted' >&2; exit 1
 fi
+
+# ---- Install-in-progress marker: written at the first change, cleared when the start
+# phase has succeeded, left behind when a --start run dies. Own root, own config.
+M_APP="$TEST_ROOT/m/opt/vesselstack"
+M_CONFIG="$TEST_ROOT/m.env"
+M_MARKER="$M_APP/config/install-in-progress"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$M_APP\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$TEST_ROOT/m/opt/vesselstack-data\"|" \
+    -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/m-backups\"|" "$CONFIG" > "$M_CONFIG"
+M_SYSTEM="$TEST_ROOT/m-system-root"
+minstall() { env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$M_SYSTEM" "$REPO_ROOT/install.sh" --config "$M_CONFIG" "$@"; }
+marker_value() { sed -n "s/^$1=//p" "$M_MARKER"; }
+M_VERSION=$(<"$REPO_ROOT/VERSION")
+# (a) a dry run writes nothing
+minstall --dry-run >/dev/null
+test ! -e "$M_MARKER"
+# (d) a render-only run on a clean root (own app and system root) leaves no marker
+D_APP="$TEST_ROOT/md/opt/vesselstack"
+sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=\"$D_APP\"|" \
+    -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=\"$TEST_ROOT/md/opt/vesselstack-data\"|" \
+    -e "s|^VESSELSTACK_BACKUP=.*|VESSELSTACK_BACKUP=\"$TEST_ROOT/md-backups\"|" "$CONFIG" > "$TEST_ROOT/md.env"
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$TEST_ROOT/md-system-root" \
+    "$REPO_ROOT/install.sh" --config "$TEST_ROOT/md.env" >/dev/null
+test -s "$D_APP/config/installed-version"
+test ! -e "$D_APP/config/install-in-progress"
+# (b) a --start run that dies in the start phase leaves a marker; installed-version is already written
+if env FAKE_DOCKER_FAIL_UP=1 PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$M_SYSTEM" \
+    "$REPO_ROOT/install.sh" --config "$M_CONFIG" --start >/dev/null 2>&1; then
+    echo 'a --start run succeeded although compose up failed' >&2; exit 1
+fi
+grep -qx "$M_VERSION" "$M_APP/config/installed-version"
+test -f "$M_MARKER"
+test "$(marker_value version)" = "$M_VERSION"
+test "$(marker_value from)" = none
+test "$(marker_value start)" = 1
+test "$(marker_value source)" = "$REPO_ROOT"
+test -z "$(marker_value backup)"
+[[ $(marker_value started) =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+# (g) regular file, mode 644, and no temp file left behind
+test ! -L "$M_MARKER"
+test "$(stat -c '%a' "$M_MARKER")" = 644
+test ! -e "$M_MARKER.tmp"
+# (e) a render-only run succeeds and keeps the marker, still start=1
+minstall >/dev/null
+test "$(marker_value start)" = 1
+# (f) a second failing run keeps the first backup path
+rm -f -- "$M_MARKER"
+for backup_path in /first/backup.tar.gz /second/backup.tar.gz; do
+    if env VESSELSTACK_PREUPDATE_BACKUP="$backup_path" FAKE_DOCKER_FAIL_UP=1 PATH="$FAKE_BIN:$PATH" \
+        VESSELSTACK_SYSTEM_ROOT="$M_SYSTEM" "$REPO_ROOT/install.sh" --config "$M_CONFIG" --start >/dev/null 2>&1; then
+        echo 'a --start run succeeded although compose up failed' >&2; exit 1
+    fi
+done
+test "$(marker_value backup)" = /first/backup.tar.gz
+test "$(marker_value from)" = "$M_VERSION"
+# (c) a successful --start run clears it
+minstall --start >/dev/null
+test ! -e "$M_MARKER"
 
 echo "clean installation checks passed"

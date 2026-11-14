@@ -81,6 +81,16 @@ class CatalogFileTests(unittest.TestCase):
         self.assertTrue(broken(lambda e: e.update(
             suggested_thresholds={"metric": {"alarm_below": 5, "warn_below": 1}, "us_customary": {}})))
 
+    def test_fire_and_flooding_default_to_unknown_with_a_note_and_the_others_stay_ok(self):
+        by_key = {e["key"]: e for e in CATALOG["entries"]}
+        for key in ("fire", "flooding"):
+            self.assertEqual(by_key[key]["absent"], "unknown", key)
+            self.assertIn("Shows --", by_key[key]["note"], key)
+            self.assertIn("cannot be told apart from no sensor", by_key[key]["note"], key)
+        for key in ("anchor", "mob"):
+            self.assertEqual(by_key[key]["absent"], "ok", key)
+            self.assertNotIn("note", by_key[key], key)
+
     def test_wildcard_entries_have_default_instances(self):
         wild = [e for e in CATALOG["entries"] if "*" in e["path"]]
         self.assertGreaterEqual(len(wild), 10)
@@ -512,6 +522,16 @@ class MergedCatalogTests(ServerCase):
         self.assertIsNone(catalog.uncatalogued_defaults("a.b.mains", "Hz", 5)["quantity"])
         self.assertEqual(catalog.uncatalogued_defaults("environment.long.name.x" + "y" * 40, None, 5)["label"],
                          ("x" + "y" * 40)[:16])
+
+    def test_fire_and_flooding_rows_carry_the_unknown_default_and_the_note(self):
+        for key in ("fire", "flooding"):
+            row = self.by_id[key]
+            self.assertEqual((row["absent"], row["definition"]["absent"]), ("unknown", "unknown"), key)
+            self.assertIn("Shows --", row["note"], key)
+        self.assertEqual(self.by_id["mob"]["definition"]["absent"], "ok")
+        self.assertNotIn("note", self.by_id["mob"])
+        item_id, note = catalog.materialise(self.by_id["fire"], base_config(), "metric")
+        self.assertEqual((item_id, note["absent"]), ("fire", "unknown"))
 
     def test_live_notifications_are_offered_only_where_they_are_accepted(self):
         extra = self.by_id["note:notifications.electrical.batteries.house.voltage"]

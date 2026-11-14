@@ -168,7 +168,12 @@ Useful options: `--yes` (no questions), `--defaults`, `--set KEY=VALUE`, `--conf
 `--dir DIR`, `--offline --bundle DIR --tarball FILE` (no internet; see
 [DEPLOYMENT.md](DEPLOYMENT.md)), `--help`. If VesselStack is already installed the
 script reports an upgrade and offers `vesselstackctl update`; it never overwrites an
-installation silently. Rollback: `sudo vesselstackctl stop`, and see the README
+installation silently, and for the version that is already installed it reports "nothing to do".
+If the previous run did not finish (for example the network dropped while images were
+downloading), running the same command again continues it with the saved settings: no
+questions are asked again and no new backup is made. After a failed update the message names
+the backup to restore. The installer finds an installation at a custom root by itself, even
+under `sudo`. Rollback: `sudo vesselstackctl stop`, and see the README
 restore and uninstall sections; unpacked releases stay under
 `/opt/vesselstack-release/` until you remove them.
 

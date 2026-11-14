@@ -207,7 +207,7 @@ def release_snapshot(release_id: int, channel: str, root: Path) -> dict[str, Any
     tag = item.get("tag_name", "")
     if not isinstance(tag, str) or not re.fullmatch(r"v\d+\.\d+\.\d+", tag): raise ValueError("release tag must be exact numeric semver")
     version = version_text(tag); current = version_tuple(installed_version(root))
-    if (version_tuple(version) or (0, 0, 0)) <= (current or (0, 0, 0)) or (channel == "stable" and item.get("prerelease") is True): raise ValueError("release is not eligible")
+    if not _eligible_version(version_tuple(version) or (0, 0, 0), current or (0, 0, 0), root) or (channel == "stable" and item.get("prerelease") is True): raise ValueError("release is not eligible")
     published = item.get("published_at"); updated = item.get("updated_at")
     if not isinstance(published, str) or not published or not isinstance(updated, str) or not updated: raise ValueError("release timestamps required")
     assets = item.get("assets")
@@ -245,6 +245,54 @@ def installed_version(root: Path, env: dict[str, str] | None = None) -> str:
     if not candidate:
         candidate = "0.0.0"
     return version_text(candidate)
+
+
+INSTALL_MARKER_LIMIT = 4096
+_MARKER_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z")
+_MARKER_PATH = re.compile(r"/[A-Za-z0-9/._+-]+")
+
+
+def install_in_progress(root: Path) -> dict[str, Any] | None:
+    """The unfinished-installation marker written by install.sh, or None when absent or unusable."""
+    try:
+        fd = os.open(root / "config" / "install-in-progress", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > INSTALL_MARKER_LIMIT:
+            return None
+        data = os.read(fd, INSTALL_MARKER_LIMIT + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > INSTALL_MARKER_LIMIT:
+        return None
+    fields: dict[str, str] = {}
+    for line in data.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in {"version", "from", "started", "backup"}:
+            fields[key] = value.strip()
+    started = fields.get("started", "")
+    if not _MARKER_TIME.fullmatch(started):
+        return None
+    backup = fields.get("backup", "")
+    if backup and (not _MARKER_PATH.fullmatch(backup) or ".." in backup.split("/")):
+        return None
+    def clean(value: str) -> str | None:
+        parsed = version_tuple(value) if re.fullmatch(r"\d+\.\d+\.\d+", value) else None
+        return ".".join(str(part) for part in parsed) if parsed else None
+    previous = fields.get("from", "")
+    return {"version": clean(fields.get("version", "")), "from": "none" if previous == "none" else clean(previous), "started": started, "backup": backup}
+
+
+def _eligible_version(candidate: tuple[int, int, int], current: tuple[int, int, int], root: Path) -> bool:
+    """Newer than installed, or the very version an unfinished installation (the marker) was installing."""
+    if candidate > current:
+        return True
+    marker = install_in_progress(root)
+    return bool(marker and marker["version"] and version_tuple(marker["version"]) == candidate)
 
 
 def running_identity(root: Path | None = None) -> dict[str, str]:
@@ -363,13 +411,13 @@ def release_catalog(channel: str, root: Path, env: dict[str, str] | None = None,
         if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
             continue
         parsed = version_tuple(tag)
-        if not parsed or parsed <= current_tuple:
+        if not parsed or not _eligible_version(parsed, current_tuple, root):
             continue
         if item.get("draft") is True: continue
         prerelease = bool(item.get("prerelease", False))
         if channel == "stable" and prerelease:
             continue
-        releases.append({"id": item["id"], "tag": tag, "version": version_text(tag), "name": str(item.get("name") or tag), "prerelease": prerelease, "published_at": item.get("published_at"), "html_url": f"https://github.com/{REPOSITORY}/releases/tag/{tag}"})
+        releases.append({"id": item["id"], "tag": tag, "version": version_text(tag), "name": str(item.get("name") or tag), "prerelease": prerelease, "published_at": item.get("published_at"), "html_url": f"https://github.com/{REPOSITORY}/releases/tag/{tag}", "resume": parsed <= current_tuple})
     releases.sort(key=lambda item: version_tuple(item["version"]) or (0, 0, 0), reverse=True)
     return {"channel": channel, "installed_version": current, "running_version": running_version if running_version is not None else running_identity(root)["running_version"], "releases": releases, "checked_at": datetime.now(timezone.utc).isoformat()}
 
@@ -806,6 +854,11 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path, s
         install_env["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
         install_env["VESSELSTACK_ROOT"] = str(root)
         install_env["VESSELSTACK_ENV"] = config
+        recorded_backup = str(operation.get("backup_path") or "") if mode != "skip" else ""
+        if recorded_backup.startswith("/"):
+            install_env["VESSELSTACK_PREUPDATE_BACKUP"] = recorded_backup
+        else:
+            install_env.pop("VESSELSTACK_PREUPDATE_BACKUP", None)
         run_command([str(installer), "--config", config, "--start"], root, operation, 1800, install_env, child_pass_fds)
         keep_skip_warning(operation)
         operation.update(phase="restarting"); write_operation(root, operation)

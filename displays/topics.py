@@ -1,13 +1,17 @@
 """MQTT topics, payloads and the freshness state machine. Pure logic: no I/O, clock injected."""
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
 from urllib.parse import urlsplit, urlunsplit
 
 import conversions
 import severity
 from schema import DEFAULT_HEARTBEAT_S, DEFAULT_MIN_INTERVAL_MS
+
+LOG = logging.getLogger("vesselstack.displays.topics")
 
 TOPIC_ROOT = "vesselstack/v1"
 INSTRUMENT_TOPIC_PREFIX = f"{TOPIC_ROOT}/instruments/"
@@ -22,6 +26,7 @@ ALARM_SUMMARY_TOPIC = f"{TOPIC_ROOT}/alarms/summary"
 SUMMARY_MAX_IDS = 16
 BRIDGE_STATUS_TOPIC = f"{TOPIC_ROOT}/bridge/status"
 BRIDGE_SIGNALK_TOPIC = f"{TOPIC_ROOT}/bridge/signalk"
+BRIDGE_SERVICE_TOPIC = f"{TOPIC_ROOT}/bridge/service"
 BRIDGE_CLOCK_TOPIC = f"{TOPIC_ROOT}/bridge/clock"
 BRIDGE_HA_TOPIC = f"{TOPIC_ROOT}/bridge/homeassistant"
 DISPLAY_STATUS_TOPIC = f"{TOPIC_ROOT}/displays/{{username}}/status"
@@ -43,12 +48,19 @@ def display_status_topic(username: str) -> str:
     return DISPLAY_STATUS_TOPIC.format(username=username)
 
 
-def build_payload(value, unit, state, ts, age, sev=None) -> str:
-    """JSON payload; ``sev`` is added (after ``st``) only when not None."""
+def unit_tag(convert, unit, precision) -> str:
+    """First 8 hex characters of SHA-256 over ``convert|unit|precision``: changes when the number's meaning does."""
+    return hashlib.sha256(f"{convert}|{unit}|{precision}".encode("utf-8")).hexdigest()[:8]
+
+
+def build_payload(value, unit, state, ts, age, sev=None, cu=None) -> str:
+    """JSON payload; ``sev`` is added (after ``st``) only when not None, ``cu`` (unit tag, last) likewise."""
     body = {"v": value, "u": unit, "st": state}
     if sev is not None:
         body["sev"] = sev
     body.update({"ts": ts, "age": age})
+    if cu is not None:
+        body["cu"] = cu
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -72,6 +84,9 @@ class _State:
         self.pub_sev = None
         self.pub_time = None
         self.dirty = False
+        self.latched = None        # time an alarm lost its data; None unless the item was in alarm when data stopped
+        self.seen_ts = None        # timestamp string of the last accepted delta (a repeat of it is ignored)
+        self.no_ts_logged = False
 
 
 class Engine:
@@ -81,12 +96,30 @@ class Engine:
         self.heartbeat_s = config.get("heartbeat_s", DEFAULT_HEARTBEAT_S)
         self.instruments = config["instruments"]
         self._state = {iid: _State() for iid in self.instruments}
+        self._cu = {iid: unit_tag(inst["convert"], inst["unit"], inst["precision"])
+                    for iid, inst in self.instruments.items()}
         self._by_path: dict[str, list[str]] = {}
         for iid, inst in self.instruments.items():
             self._by_path.setdefault(inst["path"], []).append(iid)
 
     def paths(self):
         return list(self._by_path)
+
+    def _counts(self, iid) -> bool:
+        inst = self.instruments[iid]
+        return bool(inst.get("alarm", "thresholds" in inst))
+
+    def latched_ids(self) -> list:
+        """Ids (config order) that count for the alarm summary and are in the lost state."""
+        return [iid for iid, st in self._state.items() if st.latched is not None and self._counts(iid)]
+
+    def restore_latched(self, ids, now: float) -> list:
+        """Mark persisted lost ids (still configured and counted) as lost; returns the ids restored."""
+        wanted = set(ids)
+        restored = [iid for iid in self.instruments if iid in wanted and self._counts(iid)]
+        for iid in restored:
+            self._state[iid].latched = now
+        return restored
 
     def _min_interval(self, iid) -> float:
         return self.instruments[iid].get("min_interval_ms", DEFAULT_MIN_INTERVAL_MS) / 1000.0
@@ -100,26 +133,70 @@ class Engine:
         if "thresholds" in inst:
             sev = st.sev if ok and st.sev is not None else "unknown"
             st.pub_sev = sev
-        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev)
+        payload = build_payload(st.pub_value, inst["unit"], st.state, st.ts, age, sev, self._cu[iid])
         return (instrument_topic(iid), payload, True)
 
+    @staticmethod
+    def _latch(st, now):
+        """An item in alarm that loses its data is remembered as lost, never as cleared."""
+        if st.state == "ok" and st.sev == "alarm" and st.latched is None:
+            st.latched = now
+
+    def _lose(self, iid, now, state):
+        """The instrument has no usable reading: ``state`` (stale/missing), severity and hysteresis memory cleared."""
+        st = self._state[iid]
+        self._latch(st, now)
+        st.state = state
+        st.sev = None
+        return self._emit(iid, now)
+
     def update(self, path: str, value, ts, now: float) -> list:
-        """Handle a SignalK value; returns [(topic, payload, retain)]."""
+        """Handle a SignalK value; returns [(topic, payload, retain)].
+
+        A null, NaN, infinite, non-numeric or unconvertible value makes the matching instruments
+        "missing" at once (a previous reading is never kept alive), published once.
+
+        A delta whose timestamp string equals that of the last accepted delta for the instrument is a
+        repeat of something already seen (a cached value re-sent by SignalK) and is ignored: it never
+        refreshes the reading or brings a stale/missing instrument back. A different timestamp (newer or
+        older) is accepted; a delta without one is accepted as before.
+        """
         raw = numeric(value)
-        if raw is None:
-            return []
         out = []
         for iid in self._by_path.get(path, ()):
             inst, st = self.instruments[iid], self._state[iid]
-            rounded = conversions.convert_and_round(inst["convert"], raw, inst["precision"])
+            if isinstance(ts, str):
+                if ts == st.seen_ts:
+                    continue
+                st.seen_ts = ts
+            else:
+                st.seen_ts = None
+                if not st.no_ts_logged:
+                    st.no_ts_logged = True
+                    LOG.info("%s: SignalK delta without a timestamp; a re-sent old value cannot be detected", iid)
+            converted = rounded = None
+            if raw is not None:
+                try:
+                    converted = conversions.convert(inst["convert"], raw)
+                except (OverflowError, ValueError):
+                    converted = None
+                rounded = None if converted is None else conversions.round_value(converted, inst["precision"])
             if rounded is None:
+                self._latch(st, now)
+                if st.pub_state != "missing":
+                    out.append(self._lose(iid, now, "missing"))
+                else:
+                    st.state, st.sev = "missing", None
                 continue
+            if inst["convert"] == "rad->deg_360" and rounded >= 360:
+                rounded = 0 if inst["precision"] == 0 else 0.0   # a heading that rounds up to 360 wraps to 0
+            if "thresholds" in inst:  # on the converted value before display rounding (6 places only removes float noise)
+                st.sev = severity.numeric_sev(round(converted, 6), inst["thresholds"], st.sev if st.state == "ok" else None)
             st.value = rounded
-            if "thresholds" in inst:  # on the rounded value, so the colour matches the digits
-                st.sev = severity.numeric_sev(rounded, inst["thresholds"], st.sev if st.state == "ok" else None)
             st.ts = ts if isinstance(ts, str) else None
             st.received = now
             st.state = "ok"
+            st.latched = None      # an accepted reading ends the lost state (a live alarm is shown as such)
             if st.pub_state != "ok":
                 out.append(self._emit(iid, now))
             elif st.value != st.pub_value or st.sev != st.pub_sev:
@@ -129,11 +206,22 @@ class Engine:
                     st.dirty = True
         return out
 
+    def source_state(self, connected: bool, now: float) -> list:
+        """The SignalK connection went up or down; returns [(topic, payload, retain)].
+
+        On disconnect every "ok" instrument becomes "stale" at once (published once). On connect
+        nothing changes: instruments become "ok" again when data arrives.
+        """
+        if connected:
+            return []
+        return [self._lose(iid, now, "stale") for iid, st in self._state.items() if st.state == "ok"]
+
     def summary_items(self) -> list:
         """[(id, severity)] for the instruments that count towards the alarm summary.
 
         An instrument counts when ``alarm`` is true (default: it has thresholds). Anything
-        not currently "ok" (stale, missing) is "unknown"; without thresholds a fresh value is "ok".
+        not currently "ok" (stale, missing) is "unknown", or "lost" when it was in alarm when its
+        data stopped (until a fresh reading arrives); without thresholds a fresh value is "ok".
         """
         out = []
         for iid, inst in self.instruments.items():
@@ -141,7 +229,7 @@ class Engine:
                 continue
             st = self._state[iid]
             if st.state != "ok":
-                sev = "unknown"
+                sev = "lost" if st.latched is not None else "unknown"
             else:
                 sev = (st.sev or "unknown") if "thresholds" in inst else "ok"
             out.append((iid, sev))
@@ -152,6 +240,7 @@ class Engine:
         for iid, inst in self.instruments.items():
             st = self._state[iid]
             if st.state == "ok" and now - st.received > inst["stale_after_s"]:
+                self._latch(st, now)
                 st.state = "stale"
                 st.sev = None
                 out.append(self._emit(iid, now))
@@ -171,6 +260,7 @@ class _EventState:
         self.received = None
         self.pub = None        # (state, sev) last published
         self.pub_time = None
+        self.latched = None    # time the connection dropped while this was in alarm; ends on an explicit delta
 
 
 class EventEngine:
@@ -200,6 +290,19 @@ class EventEngine:
     def paths(self):
         return list(self._by_path)
 
+    def latched_ids(self) -> list:
+        """Ids (config order) that count for the alarm summary and are in the lost state."""
+        return [nid for nid, st in self._state.items()
+                if st.latched is not None and self.notifications[nid].get("alarm", True)]
+
+    def restore_latched(self, ids, now: float) -> list:
+        """Mark persisted lost ids (still configured and counted) as lost; returns the ids restored."""
+        wanted = set(ids)
+        restored = [nid for nid, note in self.notifications.items() if nid in wanted and note.get("alarm", True)]
+        for nid in restored:
+            self._state[nid].latched = now
+        return restored
+
     def _freshness(self) -> str:
         if self.connected:
             return "ok"
@@ -211,8 +314,8 @@ class EventEngine:
         st = self._state[nid]
         if st.sev is not None:
             return st.sev
-        if now - self._connected_at < EVENT_SETTLE_S:
-            return "unknown"
+        if st.latched is not None or now - self._connected_at < EVENT_SETTLE_S:
+            return "unknown"      # a lost alarm is not settled to "absent": only an explicit delta ends it
         return severity.notification_sev(None, self.notifications[nid].get("absent", "ok"))
 
     def _emit(self, nid, now):
@@ -232,6 +335,8 @@ class EventEngine:
         else:
             self._connected_at = None
             for st in self._state.values():
+                if st.sev == "alarm" and st.latched is None:
+                    st.latched = now
                 st.sev = st.ts = st.received = None
         return [self._emit(nid, now) for nid in self.notifications]
 
@@ -244,6 +349,8 @@ class EventEngine:
         st.sev = severity.notification_sev(raw, note.get("absent", "ok"))
         st.ts = ts if isinstance(ts, str) else None
         st.received = now
+        if self.connected and (raw is None or st.sev in ("ok", "warn", "alarm")):
+            st.latched = None      # an explicit delta (cleared, or a recognised state) ends the lost state
         if st.pub == (self._freshness(), self._sev(nid, now)):
             return []
         return [self._emit(nid, now)]
@@ -255,9 +362,12 @@ class EventEngine:
         return out
 
     def summary_items(self, now: float) -> list:
-        """[(id, severity)] for the notifications that count towards the alarm summary (``alarm``, default true)."""
-        return [(nid, self._sev(nid, now)) for nid, note in self.notifications.items()
-                if note.get("alarm", True)]
+        """[(id, severity)] for the notifications that count towards the alarm summary (``alarm``, default true).
+
+        "lost": it was in alarm when SignalK disconnected and no explicit delta has said otherwise since.
+        """
+        return [(nid, "lost" if self._state[nid].latched is not None else self._sev(nid, now))
+                for nid, note in self.notifications.items() if note.get("alarm", True)]
 
     def tick(self, now: float) -> list:
         out = []
@@ -296,6 +406,18 @@ class HaEngine:
     def entity_ids(self):
         return list(self._by_entity)
 
+    def latched_ids(self) -> list:
+        """Ids (config order) that count for the alarm summary and are in the lost state."""
+        return [hid for hid, st in self._state.items() if st.latched is not None and self.items[hid].get("alarm", True)]
+
+    def restore_latched(self, ids, now: float) -> list:
+        """Mark persisted lost ids (still configured and counted) as lost; returns the ids restored."""
+        wanted = set(ids)
+        restored = [hid for hid, item in self.items.items() if hid in wanted and item.get("alarm", True)]
+        for hid in restored:
+            self._state[hid].latched = now
+        return restored
+
     def _freshness(self, hid) -> str:
         st = self._state[hid]
         if self.connected:
@@ -317,12 +439,17 @@ class HaEngine:
         st.pub, st.pub_time = view, now
         body = {"v": view[3], "k": view[2], "u": item.get("unit", ""), "st": view[0], "sev": view[1],
                 "ts": st.ts, "age": age}
+        if item.get("kind") == "numeric":
+            body["cu"] = unit_tag("ha", item.get("unit", ""), item.get("precision"))
         return (ha_topic(hid), json.dumps(body, separators=(",", ":"), ensure_ascii=False), True)
 
     def source_state(self, connected: bool, now: float) -> list:
         """The Home Assistant connection went up or down; returns [(topic, payload, retain)]."""
         if connected == self.connected:
             return []
+        if not connected:
+            for hid in self._state:
+                self._latch(hid, now)      # while the old readings are still the current view
         self.connected = connected
         if connected:
             self._ever_connected = True
@@ -331,13 +458,24 @@ class HaEngine:
                 st.result = st.ts = st.received = None
         return [self._emit(hid, now) for hid in self.items]
 
+    def _latch(self, hid, now):
+        """An item in alarm that loses its data is remembered as lost, never as cleared."""
+        st = self._state[hid]
+        if st.latched is None and self._view(hid)[1] == "alarm":
+            st.latched = now
+
     def set_state(self, entity_id: str, state, ts, now: float) -> list:
         """A state string (or None: the entity is gone) for an entity."""
         out = []
         for hid in self._by_entity.get(entity_id, ()):
             item, st = self.items[hid], self._state[hid]
             prev = st.result[1] if st.result is not None and st.result[0] == "ok" else None
-            st.result = severity.ha_state(state, item["kind"], item, prev)
+            result = severity.ha_state(state, item["kind"], item, prev)
+            if result[0] == "ok" and result[1] in ("ok", "warn", "alarm"):
+                st.latched = None      # a usable reading ends the lost state
+            elif result[0] != "ok":
+                self._latch(hid, now)  # before the old reading is replaced
+            st.result = result
             st.ts = ts if isinstance(ts, str) else None
             st.received = now
             view = self._view(hid)
@@ -349,8 +487,12 @@ class HaEngine:
         return out
 
     def summary_items(self) -> list:
-        """[(id, severity)] for the items that count towards the alarm summary (``alarm``, default true)."""
-        return [(hid, self._view(hid)[1]) for hid, item in self.items.items() if item.get("alarm", True)]
+        """[(id, severity)] for the items that count towards the alarm summary (``alarm``, default true).
+
+        "lost": it was in alarm when its data stopped and no usable state has arrived since.
+        """
+        return [(hid, "lost" if self._state[hid].latched is not None else self._view(hid)[1])
+                for hid, item in self.items.items() if item.get("alarm", True)]
 
     def tick(self, now: float) -> list:
         out = []
@@ -370,6 +512,7 @@ class _HaState:
         self.received = None
         self.pub = None
         self.pub_time = None
+        self.latched = None    # time an alarm lost its data; ends on the next usable state
 
 
 def ha_websocket_url(base: str) -> str:
@@ -386,24 +529,31 @@ def ha_websocket_url(base: str) -> str:
 SUMMARY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "alarm": 3}
 
 
-def alarm_summary(items, ts) -> str | None:
+def alarm_summary(items, ts, seq=None) -> str | None:
     """Compact JSON for the retained alarm summary, or None when nothing is counted.
 
     ``items`` is [(id, severity)] in config order (only items that count; any severity other
-    than ok/warn/alarm is treated as unknown). ``max`` is the highest of alarm > warn >
-    unknown > ok, so unknown outranks ok: a dead feed is never reported as all clear. ``ids``
-    lists alarm ids, then warn ids (each in config order), at most SUMMARY_MAX_IDS. Only ids
-    are published, never labels or message text.
+    than ok/warn/alarm/lost is treated as unknown). "lost" is an alarm whose data stopped: it
+    counts as an alarm in ``max``, ``na`` and ``ids`` (an alarm never clears because data
+    stopped) and is also listed in ``nl`` / ``lost``, never in ``nu``. ``max`` is the highest of
+    alarm > warn > unknown > ok, so unknown outranks ok: a dead feed is never reported as all
+    clear. ``ids`` lists live alarm ids, lost ids, then warn ids (each in config order), at
+    most SUMMARY_MAX_IDS. ``seq`` (when given) is the bridge's new-alarm counter. Only ids are
+    published, never labels or message text.
     """
-    items = [(iid, sev if sev in ("ok", "warn", "alarm") else "unknown") for iid, sev in items]
+    items = [(iid, sev if sev in ("ok", "warn", "alarm", "lost") else "unknown") for iid, sev in items]
     if not items:
         return None
     alarms = [iid for iid, sev in items if sev == "alarm"]
+    lost = [iid for iid, sev in items if sev == "lost"]
     warns = [iid for iid, sev in items if sev == "warn"]
     unknown = sum(1 for _, sev in items if sev == "unknown")
-    top = max((sev for _, sev in items), key=SUMMARY_RANK.__getitem__)
-    body = {"max": top, "na": len(alarms), "nw": len(warns), "nu": unknown,
-            "ids": (alarms + warns)[:SUMMARY_MAX_IDS], "ts": ts}
+    top = max(("alarm" if sev == "lost" else sev for _, sev in items), key=SUMMARY_RANK.__getitem__)
+    body = {"max": top, "na": len(alarms) + len(lost), "nw": len(warns), "nu": unknown, "nl": len(lost),
+            "ids": (alarms + lost + warns)[:SUMMARY_MAX_IDS], "lost": lost[:SUMMARY_MAX_IDS]}
+    if seq is not None:
+        body["seq"] = seq
+    body["ts"] = ts
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -441,6 +591,11 @@ def clock_state(local, schedule) -> tuple:
 def clock_payload(state: tuple, ts: str) -> str:
     """Compact JSON for the retained bridge clock: ``{"hm","night","ts"}``."""
     return json.dumps({"hm": state[0], "night": state[1], "ts": ts}, separators=(",", ":"))
+
+
+def service_payload(state: str, ts: str) -> str:
+    """Compact JSON for the retained bridge record read by tools: ``{"state","ts"}``."""
+    return json.dumps({"state": state, "ts": ts}, separators=(",", ":"))
 
 
 def clock_wanted(config: dict) -> bool:

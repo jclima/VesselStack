@@ -77,6 +77,29 @@ items: the next installer run or `sudo vesselstackctl display sync-mqtt` rewrite
 on an existing install and signals the broker; until then the bridge cannot publish
 Home Assistant items and displays cannot read them (the other topics keep working).
 
+**Bridge liveness.** `vesselstack/v1/bridge/status` is a live signal, **not retained**: the
+bridge publishes `online` (QoS 0) right after each connect and then every
+`heartbeat_s`, and `offline` (also not retained) on a clean stop or, through
+the MQTT last will, when its connection drops. Nothing about liveness is stored or queued
+by the broker, so it can never be replayed after a restart; Mosquitto has
+`persistence true`, and after a power cut (the broker dies with the bridge, so
+no will fires) a retained `online` would otherwise come back from the broker's
+last autosave and make old retained values look live. On every connect the
+bridge first deletes any retained `bridge/status` left by an older version
+(an empty retained payload). A client that subscribes sees nothing until the
+next heartbeat (at most `heartbeat_s`, default 5 s). The display firmware
+treats the bridge as offline until it has received `online`.
+
+`vesselstack/v1/bridge/service` is the **retained** record for tools and
+Node-RED (displays do not use it): `{"state":"online","ts":"2026-01-01T00:00:00Z"}`,
+published on connect, refreshed every `heartbeat_s` and set to `offline` on a clean stop.
+MQTT allows one last will per connection and it is used for `bridge/status`, so after a
+crash or power loss this topic can still say `online` with an old `ts`: treat it as
+"last known" and judge freshness by `ts` (`vesselstackctl display status` reports it
+as stale after 3 x `heartbeat_s`). An owner's own flow that read the retained
+`bridge/status` must switch to `bridge/service` or listen for the heartbeat. Other
+`bridge/*` topics (`signalk`, `homeassistant`, `clock`) are unchanged and still retained.
+
 **Existing installations:** the `vesselstack/v1/notifications/#` rules were added
 with the display notifications feature. The ACL file is rewritten by the next
 installer run (`install.sh`, `vesselstackctl update`) or by `sudo vesselstackctl

@@ -41,7 +41,7 @@
   {"key": "engine_fuel_rate", "path": "propulsion.*.fuel.rate", "group": "Engine", "label": "Fuel rate {0}", "icon": "local_gas_station", "quantity": "flow", "precision": 1, "stale_after_s": 30, "default_instance": "main"},
   {"key": "anchor", "path": "notifications.navigation.anchor", "group": "Notifications", "label": "Anchor", "icon": "anchor", "kind": "notification", "absent": "ok"},
   {"key": "mob", "path": "notifications.mob", "group": "Notifications", "label": "MOB", "icon": "warning", "kind": "notification", "absent": "ok"},
-  {"key": "fire", "path": "notifications.fire", "group": "Notifications", "label": "Fire", "icon": "warning", "kind": "notification", "absent": "ok"},
-  {"key": "flooding", "path": "notifications.flooding", "group": "Notifications", "label": "Flooding", "icon": "water", "kind": "notification", "absent": "ok"}
+  {"key": "fire", "path": "notifications.fire", "group": "Notifications", "label": "Fire", "icon": "warning", "kind": "notification", "absent": "unknown", "note": "Shows -- until a fire/flood source reports through Signal K. A sensor that is silent until triggered cannot be told apart from no sensor."},
+  {"key": "flooding", "path": "notifications.flooding", "group": "Notifications", "label": "Flooding", "icon": "water", "kind": "notification", "absent": "unknown", "note": "Shows -- until a fire/flood source reports through Signal K. A sensor that is silent until triggered cannot be told apart from no sensor."}
  ]
 }

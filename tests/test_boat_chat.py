@@ -195,8 +195,8 @@ class HistoryAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(app.convert_generic_value("environment.depth.belowTransducer", 3.0), 9.8425, places=3)
         self.assertEqual(app.convert_generic_value("propulsion.port.engineLoad", 0.5), 50.0)
         self.assertEqual(app.convert_generic_value("electrical.batteries.shunt.capacity.stateOfCharge", 0.8), 80.0)
-        self.assertEqual(app.unit_for_measurement("propulsion.port.temperature", {}), "F")
-        self.assertEqual(app.unit_for_measurement("environment.depth.belowTransducer", {}), "ft")
+        self.assertEqual(app.canonical_unit_for_measurement("propulsion.port.temperature"), "F")
+        self.assertEqual(app.canonical_unit_for_measurement("environment.depth.belowTransducer"), "ft")
 
     def test_complex_focus_leads_with_requested_extremum(self) -> None:
         history = {
