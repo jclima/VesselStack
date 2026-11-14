@@ -2847,9 +2847,9 @@ PY
 swap_in() {
     local staged=$1 target=$2 stamp=$3
     if [ -e "$target" ] || [ -L "$target" ]; then
-        mv -- "$target" "$target.pre-restore-$stamp" || return 1
+        mv -T -- "$target" "$target.pre-restore-$stamp" || return 1
     fi
-    mv -- "$staged" "$target" || return 1
+    mv -T -- "$staged" "$target" || return 1
 }
 
 # Snapshot the exact managed external files before the first stop. The journal
@@ -2857,8 +2857,9 @@ swap_in() {
 # failed restore without touching unrelated /etc content.
 restore_external_candidates() {
     local p unit
-    # This is the installer output allowlist.  It intentionally includes absent
-    # paths so a newer archive can remove files introduced by an old release.
+    # This is the installer output allowlist.  Absent paths are inventoried too so
+    # rollback can restore the previous state, including removing files that a failed
+    # restore introduced.  Removing files that an older archive lacks is not done yet.
     for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service \
         vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.service \
         vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.service vesselstack-telemetry-sample.timer \
@@ -2971,6 +2972,56 @@ restore_publish_externals() {
         fi
     done < "$journal/publish-list"
 }
+# Units that read or write ROOT or DATA and are not stopped by stop_stack. They are
+# stopped for the swap only, and the ones actually stopped are recorded in
+# $journal/quiesced-units and the restore_quiesced variable (one unit per line).
+restore_quiesce_unit() {
+    local journal=$1 unit=$2
+    case $'\n'"$restore_quiesced" in *$'\n'"$unit"$'\n'*) return 0 ;; esac
+    systemctl is-active --quiet "$unit" 2>/dev/null || return 0
+    # Record first: a stop that fails half way must still be undone by a start.
+    restore_quiesced="$restore_quiesced$unit"$'\n'
+    printf '%s\n' "$unit" >> "$journal/quiesced-units" || return 1
+    systemctl stop "$unit" || return 1
+}
+restore_quiesce_writers() {
+    local journal=$1 timer service
+    restore_quiesced=''
+    : > "$journal/quiesced-units" || return 1
+    while IFS= read -r timer; do
+        [ -n "$timer" ] || continue
+        systemctl is-active --quiet "$timer" 2>/dev/null || continue
+        restore_quiesce_unit "$journal" "$timer" || return 1
+        service=$(systemctl show -p Unit --value "$timer" 2>/dev/null || true)
+        case "$service" in *.service) ;; *) service=${timer%.timer}.service ;; esac
+        restore_quiesce_unit "$journal" "$service" || return 1
+    done < <({ printf '%s\n' vesselstack-alerts.timer vesselstack-backup.timer \
+                   vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.timer
+               systemctl list-units --plain --no-legend --no-pager --type=timer 'vesselstack-*.timer' 2>/dev/null | awk '{print $1}'; } | sort -u)
+    restore_quiesce_unit "$journal" vesselstack-control-panel.service || return 1
+    restore_quiesce_unit "$journal" vesselstack-homepage-refresh.service || return 1
+}
+# Rollback: start exactly the units that were stopped. Best effort.
+restore_start_quiesced() {
+    local unit
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        systemctl start "$unit" || echo "WARN could not restart $unit after the restore rollback; run: sudo systemctl start $unit" >&2
+    done <<< "$restore_quiesced"
+    return 0
+}
+# Success: the installer normally restarts the panel and enables the timers itself; this
+# covers --skip-installer. Best effort.
+restore_resume_quiesced() {
+    local unit
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        [ -e "$SYSTEMD_DIR/$unit" ] || [ -L "$SYSTEMD_DIR/$unit" ] || continue
+        systemctl is-active --quiet "$unit" 2>/dev/null && continue
+        systemctl start "$unit" || echo "WARN could not start $unit after the restore; run: sudo systemctl start $unit" >&2
+    done <<< "$restore_quiesced"
+    return 0
+}
 restore_run_controller() {
     local journal=$1 controller=$2 action=$3
     [ "$action" = stop ] || [ "$action" = start ] || return 2
@@ -3013,44 +3064,67 @@ restore_commit_transaction() {
         if [ "$new_start_attempted" -eq 1 ]; then
             restore_run_controller "$journal" "$new_controller" stop || return 1
         fi
-        if [ "$root_new_published" -eq 1 ]; then mv -- "$root" "$failed_root" || return 1; fi
-        if [ "$data_new_published" -eq 1 ]; then mv -- "$data" "$failed_data" || return 1; fi
+        if [ "$root_new_published" -eq 1 ]; then mv -T -- "$root" "$failed_root" || return 1; fi
+        if [ "$data_new_published" -eq 1 ]; then mv -T -- "$data" "$failed_data" || return 1; fi
         if [ "$root_old_moved" -eq 1 ]; then
             [ ! -e "$root" ] && [ ! -L "$root" ] || return 1
-            mv -- "$root.pre-restore-$stamp" "$root" || return 1
+            mv -T -- "$root.pre-restore-$stamp" "$root" || return 1
         fi
         if [ "$data_old_moved" -eq 1 ]; then
             [ ! -e "$data" ] && [ ! -L "$data" ] || return 1
-            mv -- "$data.pre-restore-$stamp" "$data" || return 1
+            mv -T -- "$data.pre-restore-$stamp" "$data" || return 1
         fi
         [ -d "$root" ] && [ ! -L "$root" ] && [ -d "$data" ] && [ ! -L "$data" ] || return 1
         restore_restore_externals "$journal" || return 1
         systemctl daemon-reload || return 1
         restore_run_controller "$journal" "$old_controller" start || return 1
+        restore_start_quiesced
     }
     restore_fail() {
         local reason=$1
         echo "Restore failed: $reason" >&2
         echo "Recovery journal: $journal" >&2
         echo "Failed trees (if published): $failed_root $failed_data" >&2
-        if restore_recover; then echo "Restore rollback completed; previous trees restored" >&2
-        else echo "RECOVERY ERROR: evidence retained; inspect journal and failed trees" >&2; fi
+        if restore_recover; then
+            restore_rollback=ok
+            echo "Restore rollback completed; previous trees restored" >&2
+        else
+            restore_rollback=failed
+            echo "RECOVERY ERROR: evidence retained; inspect journal and failed trees" >&2
+        fi
         return 1
     }
+    restore_rollback=none
+    restore_quiesced=''
     if ! restore_run_controller "$journal" "$old_controller" stop; then
+        restore_rollback=ok
         if ! restore_run_controller "$journal" "$old_controller" start; then
+            restore_rollback=failed
             echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
         fi
         echo "Restore failed: old controller stop failed; journal retained at $journal" >&2
         return 1
     fi
-    if ! mv -- "$data" "$data.pre-restore-$stamp"; then restore_fail "data old-tree rename"; return 1; fi
+    # Nothing has been renamed yet, so a failed quiesce only needs the old stack and the
+    # units that were already stopped brought back.
+    if ! restore_quiesce_writers "$journal"; then
+        restore_rollback=ok
+        if ! restore_run_controller "$journal" "$old_controller" start; then
+            restore_rollback=failed
+            echo "RECOVERY ERROR: old controller restart failed; journal retained" >&2
+        else
+            restore_start_quiesced
+        fi
+        echo "Restore failed: could not stop the Control Panel and timers; journal retained at $journal" >&2
+        return 1
+    fi
+    if ! mv -T -- "$data" "$data.pre-restore-$stamp"; then restore_fail "data old-tree rename"; return 1; fi
     data_old_moved=1
-    if ! mv -- "$stage/vesselstack-backup/${data#/}" "$data"; then restore_fail "data publication"; return 1; fi
+    if ! mv -T -- "$stage/vesselstack-backup/${data#/}" "$data"; then restore_fail "data publication"; return 1; fi
     data_new_published=1
-    if ! mv -- "$root" "$root.pre-restore-$stamp"; then restore_fail "root old-tree rename"; return 1; fi
+    if ! mv -T -- "$root" "$root.pre-restore-$stamp"; then restore_fail "root old-tree rename"; return 1; fi
     root_old_moved=1
-    if ! mv -- "$stage/vesselstack-backup/${root#/}" "$root"; then restore_fail "root publication"; return 1; fi
+    if ! mv -T -- "$stage/vesselstack-backup/${root#/}" "$root"; then restore_fail "root publication"; return 1; fi
     root_new_published=1
     if ! restore_publish_externals "$journal" "$stage"; then restore_fail "managed external publication"; return 1; fi
     if ! systemctl daemon-reload; then restore_fail "daemon reload"; return 1; fi
@@ -3060,7 +3134,34 @@ restore_commit_transaction() {
     else
         if ! restore_run_controller "$journal" "$new_controller" start; then restore_fail "restored controller start"; return 1; fi
     fi
+    restore_resume_quiesced
     return 0
+}
+
+# Called by restore_stack after restore_commit_transaction failed.
+restore_finish_failed_commit() {
+    local stage=$1 journal=$2
+    if [ "${restore_rollback:-}" = ok ]; then
+        rm -rf -- "$stage"
+        echo "Restore failed, but the previous trees were restored. The staged copy of the backup was removed." >&2
+    else
+        echo "Restore failed and the rollback did not complete. Kept for recovery:" >&2
+        echo "  stage:   $stage" >&2
+        echo "  journal: $journal" >&2
+        echo "Both contain a copy of the backup (including secrets); remove them after recovery." >&2
+    fi
+}
+
+# Called by restore_stack after a successful restore with --skip-installer.
+restore_skip_installer_notice() {
+    local root=$1
+    echo "WARN The Python environments for Boat Chat and the displays are not part of a backup, so those services will not run until the installer has been run." >&2
+    if [ -f "$root/installer/install.sh" ]; then
+        echo "WARN Run this command to finish the restore:" >&2
+        echo "sudo $root/installer/install.sh --config $root/config/vesselstack.env --start" >&2
+    else
+        echo "WARN The restored tree has no installer; rerun the VesselStack installer for this version." >&2
+    fi
 }
 
 restore_stack() {
@@ -3085,7 +3186,6 @@ restore_stack() {
         fi
     done
     local stage_parent stamp stage need_kib free_kib
-    local data_old_moved=0 data_new_published=0 root_old_moved=0 root_new_published=0 new_start_attempted=0
     stage_parent=$(dirname "$data")
     for path in "$root" "$data"; do
         if ! { [ -d "$path" ] && [ ! -L "$path" ]; }; then
@@ -3148,25 +3248,27 @@ PY
     old_controller="$journal/old-controller"
     cp -a -- "$0" "$old_controller" || { rm -rf -- "$journal"; exit 1; }
     restore_snapshot_externals "$journal" "$stage" || {
-        rm -rf -- "$stage"
+        rm -rf -- "$stage" "$journal"
         echo "Could not create the recovery journal; nothing was changed" >&2
         exit 1
     }
     new_controller="$journal/new-controller"
     if [ -f "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" ]; then
-        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || { rm -rf -- "$stage"; exit 1; }
+        cp -a -- "$stage/vesselstack-backup/${SBIN_DIR#/}/vesselstackctl" "$new_controller" || { rm -rf -- "$stage" "$journal"; exit 1; }
     elif [ -f "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ] && [ ! -L "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" ]; then
-        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || { rm -rf -- "$stage"; exit 1; }
+        cp -a -- "$stage/vesselstack-backup/${root#/}/scripts/vesselstackctl" "$new_controller" || { rm -rf -- "$stage" "$journal"; exit 1; }
     else
-        echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage"; exit 1
+        echo "Restore archive has no safe restored controller" >&2; rm -rf -- "$stage" "$journal"; exit 1
     fi
-    if ! { [ -x "$old_controller" ] && [ -x "$new_controller" ]; }; then echo "Restore controllers are not executable" >&2; rm -rf -- "$stage"; exit 1; fi
+    if ! { [ -x "$old_controller" ] && [ -x "$new_controller" ]; }; then echo "Restore controllers are not executable" >&2; rm -rf -- "$stage" "$journal"; exit 1; fi
     if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$old_controller" "$new_controller" "$skip_installer"; then
         rm -rf -- "$stage" "$journal"
         echo "Restore completed"
         echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
+        if [ "$skip_installer" -eq 1 ]; then restore_skip_installer_notice "$root"; fi
         return 0
     fi
+    restore_finish_failed_commit "$stage" "$journal"
     return 1
 }
 

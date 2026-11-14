@@ -1894,6 +1894,7 @@ printf 'wal after backup\n' > "$DATA_ROOT/created-after-backup.wal"
 printf 'unit two\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
 printf 'UPDATE_KEY=two\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
 rm -f -- "$TEST_ROOT/installer-ran"
+: > "$FAKE_BIN/calls.log"
 restore_output=$(run_ctl restore "$archive" --yes)
 grep -q 'Restore completed' <<<"$restore_output"
 grep -qx 'version one' "$DATA_ROOT/state.txt"
@@ -1913,6 +1914,24 @@ test -d "$(printf '%s\n' "$APP_ROOT".pre-restore-* | head -n 1)"
 for leftover in "$TEST_ROOT"/opt/.vesselstack-restore.*; do
     [ ! -e "$leftover" ] || { echo 'Restore left a staging directory behind' >&2; exit 1; }
 done
+# The Control Panel and the timers read or write the trees, so they are stopped for the swap.
+grep -qx 'systemctl stop vesselstack-control-panel.service' "$FAKE_BIN/calls.log" || {
+    echo 'Restore did not stop the Control Panel' >&2
+    exit 1
+}
+grep -Eq '^systemctl stop vesselstack-[a-z-]+\.timer$' "$FAKE_BIN/calls.log" || {
+    echo 'Restore did not stop a VesselStack timer' >&2
+    exit 1
+}
+rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
+
+# --skip-installer succeeds and says how to finish: the Python environments are not in a backup.
+skip_output=$(run_ctl restore "$archive" --yes --skip-installer 2>&1)
+grep -q 'Restore completed' <<<"$skip_output"
+grep -qxF "sudo $APP_ROOT/installer/install.sh --config $APP_ROOT/config/vesselstack.env --start" <<<"$skip_output" || {
+    echo 'restore --skip-installer did not print the installer command' >&2
+    exit 1
+}
 rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
 
 touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \

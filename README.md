@@ -135,7 +135,14 @@ systemd units, launchers, libexec helpers, update environment, and enable links
 outside those trees, then stops services before swapping anything. If a later
 swap, daemon reload, installer, or start fails, the old trees and journaled
 managed paths are restored and a best-effort daemon reload/start is attempted;
-failed trees and recovery materials are retained for inspection. If stopping the
+failed trees and recovery materials are retained for inspection. If the rollback
+succeeds, the staged copy of the backup is removed; if it fails, the stage directory
+and the recovery journal are kept (their paths are printed) and contain a copy of the
+backup including secrets, so remove them after recovery. While the trees are swapped,
+the Control Panel, `vesselstack-homepage-refresh.service` and the active VesselStack
+timers (and their services) are stopped and started again afterwards. The restore runs
+in your terminal session and is not yet protected against the session dropping; keep
+it on a stable connection or run it inside `screen` or `tmux`. If stopping the
 running stack fails, no rollback is attempted under live services. Unrelated
 `/etc` files, Docker services, AIS devices, and SocketCAN interfaces are not
 removed. A restore still requires `--yes`, sufficient same-filesystem space,
@@ -2216,7 +2223,11 @@ and (7) runs the restored bundled installer
 (`/opt/vesselstack/installer/install.sh --config ... --start`) to rebuild the
 Boat Chat virtualenv (not part of the backup), re-render units and start the
 stack. This step needs network access for `pip`; use `--skip-installer` to
-only start services and run the printed installer command later. If the swap
+only start the restored controller and run the installer later. Restore then prints a
+WARN with the command `sudo /opt/vesselstack/installer/install.sh --config
+/opt/vesselstack/config/vesselstack.env --start` (with your install root), because the
+Boat Chat and displays Python environments are not part of a backup and those services
+do not run until the installer has been run. If the swap
 fails the previous trees are put back. `/opt/vesselstack` and
 `/opt/vesselstack-data` must be plain directories on one filesystem with their
 parent; restore refuses a mount point (restore manually in that case).
@@ -2225,9 +2236,20 @@ The swap is a journaled transaction: managed unit/helper files and `update.env`
 are recorded as present or absent before stopping, publication uses adjacent
 temporary names, and a failed publication, daemon reload, or restored-controller
 start attempts one rollback. Failed restored trees are renamed to
-`*.failed-restore-STAMP`; the recovery journal is retained whenever rollback
-itself fails, and unrelated files outside the explicit managed inventory are
-never removed.
+`*.failed-restore-STAMP`, and unrelated files outside the explicit managed
+inventory are never removed. Renames of whole trees use `mv -T`, so a directory
+that appears at a destination makes the step fail (and roll back) instead of
+nesting the restored tree inside it. Before the swap, restore stops the Control
+Panel, `vesselstack-homepage-refresh.service` and each active VesselStack timer
+and its service, and lists them in `quiesced-units` in the journal; a rollback
+starts exactly those again, and after a successful restore any that are not active
+again are started. If the rollback succeeds, the stage directory
+(`.vesselstack-restore.*`) is deleted; if it fails, the stage and the journal are
+kept and their paths are printed, and both hold a copy of the backup including
+secrets. If the restore fails before the swap starts, the journal is removed as
+well. The journal is kept after any failed swap. It is not durable across a crash,
+power loss or a lost SSH session, and there is no automatic recovery after a reboot
+yet.
 
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall
