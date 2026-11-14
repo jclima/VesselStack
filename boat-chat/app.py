@@ -2209,6 +2209,7 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         "samples": len(readings),
         "first_sample_local": readings[0]["time_local"] if readings else None,
         "last_sample_local": latest_reading.get("time_local") if latest_reading else None,
+        "last_sample_utc": latest_reading.get("time_utc") if latest_reading else None,
         "voltage": {
             **voltage_stats,
             "min_time_local": min_voltage_reading.get("time_local") if min_voltage_reading else None,
@@ -2506,6 +2507,7 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
     running_samples = {e["id"]: 0 for e in engines}
     rpm_unknown_minutes = 0
     rpm_invalid_minutes = 0
+    observed_stamps: list[dt.datetime] = []
     for row in rows:
         samples = {e["id"]: (safe_float(row.get(f"{e['path']}.revolutions")), safe_float(row.get(f"{e['path']}.fuel.rate"))) for e in engines}
         rpms = {ident: rpm * 60.0 if rpm is not None else None for ident, (rpm, _fuel) in samples.items()}
@@ -2514,6 +2516,9 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         if all(rpm is None for rpm in rpms.values()):
             rpm_unknown_minutes += 1
             continue
+        observed_stamp = data_age.parse_timestamp(row.get("_time"))
+        if observed_stamp is not None:
+            observed_stamps.append(observed_stamp)
         running_ids = [ident for ident, rpm in rpms.items() if rpm is not None and rpm >= rpm_threshold]
         if not running_ids:
             continue
@@ -2527,6 +2532,19 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
                 liters_by_engine[ident] += amount; partial_by_engine[ident] += amount; fuel_samples[ident] += 1
         running.append({"time": row.get("_time", ""), "engine_rpm": rpms})
 
+    # Minutes missing between consecutive observed minutes inside the running span.
+    gap_minutes = 0
+    largest_gap_minutes = 0
+    if running:
+        first_run = data_age.parse_timestamp(running[0]["time"])
+        last_run = data_age.parse_timestamp(running[-1]["time"])
+        if first_run is not None and last_run is not None:
+            inside = sorted(stamp for stamp in observed_stamps if first_run <= stamp <= last_run)
+            for earlier, later in zip(inside, inside[1:]):
+                gap = int(round((later - earlier).total_seconds() / 60.0)) - 1
+                if gap > 5:
+                    gap_minutes += gap
+                    largest_gap_minutes = max(largest_gap_minutes, gap)
     running_hours = len(running) / 60.0
     complete_coverage = bool(running) and rpm_invalid_minutes == 0 and all(running_samples[e["id"]] == fuel_samples[e["id"]] for e in engines)
     total_liters = sum(liters_by_engine.values()) if complete_coverage else None
@@ -2556,12 +2574,15 @@ from(bucket: "{INFLUX_HISTORY_BUCKET}")
         },
         "sample_counts": {
             "running_minutes": len(running),
+            "observed_minutes": len(rows) - rpm_unknown_minutes,
             **{f"{e['id']}_running_minutes": running_samples[e['id']] for e in engines},
             "rpm_unknown_minutes": rpm_unknown_minutes,
             "rpm_invalid_minutes": rpm_invalid_minutes,
             **{f"{e['id']}_fuel_samples": fuel_samples[e['id']] for e in engines},
         },
         "coverage_complete": complete_coverage,
+        "gap_minutes": gap_minutes,
+        "largest_gap_minutes": largest_gap_minutes,
         "coverage_scope": "returned_observation_minutes",
         "observed_partial_consumption": {
             **{f"{e['id']}_liters": round(partial_by_engine[e['id']], 2) for e in engines},
@@ -3670,33 +3691,61 @@ def answer_from_briefing(message: str, context: dict[str, Any]) -> str | None:
     values=(context.get("current_telemetry") or {}).get("values",{}); states=context.get("ha_states") or {}
     state=lambda entity,default="unknown":str((states.get(entity) or {}).get("state",default))
     timestamps = (context.get("current_telemetry") or {}).get("timestamps", {})
-    now = dt.datetime.now(dt.timezone.utc)
-    def fresh(path: str) -> bool:
+    now = data_age.parse_timestamp(context.get("now_utc")) or dt.datetime.now(dt.timezone.utc)
+    def reading(path: str) -> tuple[str, float | None, float | None]:
+        """(state, value, age_seconds): state is fresh, stale (known value, known age) or missing."""
+        value = safe_float(values.get(path))
         stamp = data_age.parse_timestamp(timestamps.get(path))
-        if stamp is None:
-            return False
+        if value is None or stamp is None:
+            return "missing", None, None
         age = (now - stamp).total_seconds()
-        return age <= data_age.FRESH_SECONDS and age >= -data_age.FUTURE_TOLERANCE_SECONDS
-    def current(path: str) -> float | None:
-        return safe_float(values.get(path)) if fresh(path) else None
+        if age < -data_age.FUTURE_TOLERANCE_SECONDS:
+            return "missing", None, None
+        if age <= data_age.FRESH_SECONDS:
+            return "fresh", value, age
+        return "stale", value, age
+    def qualify(label: str, path: str, shown) -> str:
+        state, value, age = reading(path)
+        if state == "fresh":
+            return shown(value)
+        if state == "stale":
+            return f"{label}: no recent data (last {shown(value)}, {data_age.describe_age(age)} ago)"
+        return f"{label} unavailable"
     runtime = profile_runtime.current()
     profile = runtime["profile"]
     primary = next((b for b in profile.get("battery_banks", []) if b.get("id") == profile.get("primary_battery_bank")), None)
-    soc=current(f"{primary['path']}.capacity.stateOfCharge") if primary else None
-    voltage=current(f"{primary['path']}.voltage") if primary else None
-    engines = [(e, current(f"{e['path']}.revolutions")) for e in profile.get("engines", [])]
     lines=[f"Boat briefing: {state('sensor.boat_health_summary','health unknown')}; {state('sensor.boat_watch_summary','watch state unavailable')}."]
     if runtime.get("diagnostic"):
         lines.append(runtime["diagnostic"] + ".")
     elif primary:
-        lines.append(f"Battery ({primary.get('label', primary['id'])}): {f'{soc:g}%' if soc is not None else 'SOC unavailable'}, {f'{voltage:.2f} V' if voltage is not None else 'voltage unavailable'}.")
+        soc_text = qualify("SOC", f"{primary['path']}.capacity.stateOfCharge", lambda v: f"{v:g}%")
+        voltage_text = qualify("voltage", f"{primary['path']}.voltage", lambda v: f"{v:.2f} V")
+        lines.append(f"Battery ({primary.get('label', primary['id'])}): {soc_text}, {voltage_text}.")
     else:
         lines.append("Battery: not configured.")
+    engines = profile.get("engines", [])
     if engines:
         def engine_label(e):
             return e['id'] if e.get('id') in {'port', 'starboard'} and e.get('label') in {'Port', 'Starboard'} else e.get('label', e['id'])
-        engine_text = ", ".join(f"{engine_label(e)} {v:.0f} RPM" if v is not None else f"{engine_label(e)} unavailable" for e, v in engines)
-        lines.append(f"Engines: {engine_text}. Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
+        current_parts, stale_parts = [], []
+        for e in engines:
+            engine_state, rpm, age = reading(f"{e['path']}.revolutions")
+            if engine_state == "fresh":
+                current_parts.append(f"{engine_label(e)} {rpm:.0f} RPM")
+            elif engine_state == "stale":
+                stale_parts.append(f"{engine_label(e)} {rpm:.0f} RPM, {data_age.describe_age(age)} ago")
+            else:
+                current_parts.append(f"{engine_label(e)} unavailable")
+        engine_text = ", ".join(current_parts)
+        if stale_parts:
+            not_reporting = (
+                "Engine data is not reporting (normal when engines and their gateway are off); last reading "
+                + "; ".join(stale_parts) + "."
+            )
+            engine_text = f"{engine_text}. {not_reporting}" if engine_text else not_reporting
+        elif engine_text:
+            engine_text += "."
+        lines.append(f"Engines: {engine_text} Shore charging proxy: {state('binary_sensor.shore_power_connected')}.")
     else:
         lines.append("Engines: not configured.")
     alarms=(context.get("current_telemetry") or {}).get("alarm_summary")
@@ -3826,6 +3875,18 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
     shown = display_units.normalize_context(summary, display_units.preference(setting_value))
     running_minutes = int(summary.get("running_minutes") or 0)
     if running_minutes <= 0:
+        observed = (summary.get("sample_counts") or {}).get("observed_minutes")
+        window_text = f"{summary.get('label', 'the requested period')} ({summary.get('start_local')} to {summary.get('stop_local')})"
+        if observed == 0:
+            return (
+                f"No engine or fuel data was recorded for {window_text} "
+                "(telemetry may not have been logging), so fuel use cannot be determined."
+            )
+        if isinstance(observed, int) and observed > 0:
+            return (
+                f"Engines were not running during {window_text} "
+                f"({observed} minutes of engine data recorded; RPM below {summary.get('rpm_threshold', ENGINE_RUNNING_RPM)})."
+            )
         return (
             f"I found no engine-running fuel samples for {summary.get('label', 'the requested period')} "
             f"({summary.get('start_local')} to {summary.get('stop_local')}) using RPM >= "
@@ -3837,6 +3898,11 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
     rate_unit = "L/h" if metric else "gal/h"
     total_key = "total_liters" if metric else "total_gallons"
     rate_key = "total_lph_running" if metric else "total_gph_running"
+    gap_total = int(summary.get("gap_minutes") or 0)
+    gap_note = (
+        f" About {gap_total} minutes of data are missing inside the running period, so the total is a minimum."
+        if gap_total > 5 else ""
+    )
     if not summary.get("coverage_complete") or totals.get(total_key) is None:
         partial = shown.get("observed_partial_consumption", {})
         partial_key = "total_liters" if metric else "total_gallons"
@@ -3847,6 +3913,7 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
             "one or more running-channel RPM or fuel-rate samples were missing or invalid within the returned observation minutes. "
             f"Observed partial consumption across {running_minutes} sampled running minutes is {partial_text}; "
             "I cannot report an authoritative total."
+            + gap_note
         )
     per_engine = []
     for engine in profile_runtime.engines(runtime_profile):
@@ -3863,6 +3930,7 @@ def answer_from_fuel_usage(context: dict[str, Any]) -> str | None:
         f"to {summary.get('last_running_sample_local')}. "
         f"Average burn while running: {averages.get(rate_key)} {rate_unit} total. "
         "This is a computed telemetry answer from retained 1-minute InfluxDB history."
+        + gap_note
     )
 
 
@@ -3949,6 +4017,9 @@ def answer_from_shore_power_history(context: dict[str, Any]) -> str | None:
     )
 
 
+BATTERY_SAMPLE_STALE_SECONDS = 2 * 3600
+
+
 def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
     kind = context.get("question_type", {})
     if not kind.get("battery_voltage_history") or kind.get("complex_history"):
@@ -3974,31 +4045,47 @@ def answer_from_battery_voltage(context: dict[str, Any]) -> str | None:
     soc = summary.get("smartshunt_soc", {})
     thresholds = summary.get("thresholds", {})
     agm = summary.get("agm_voltage_soc_estimate", {})
+    last_local = summary.get("last_sample_local")
+    sample_note = f"hourly mean, {last_local}" if last_local else "hourly mean"
+    # The boat profile records no nominal voltage or chemistry for a bank, so a
+    # bank counts as 12 V only when every observed hourly mean is in 9.0-16.0 V.
+    v_min, v_max = voltage.get("min"), voltage.get("max")
+    is_12v = isinstance(v_min, (int, float)) and isinstance(v_max, (int, float)) and 9.0 <= float(v_min) and float(v_max) <= 16.0
     lines = [
         f"Battery voltage over {summary.get('label', 'the retained period')}: "
         f"min {fmt(voltage.get('min'))} V, avg {fmt(voltage.get('avg'))} V, "
-        f"max {fmt(voltage.get('max'))} V, latest {fmt(voltage.get('latest'))} V."
+        f"max {fmt(voltage.get('max'))} V, latest {fmt(voltage.get('latest'))} V ({sample_note})."
     ]
     if soc.get("count"):
         lines.append(
             f"{summary.get('battery_label', 'Battery')} SOC: {fmt(soc.get('min'), 1)}-{fmt(soc.get('max'), 1)}%, "
-            f"latest {fmt(soc.get('latest'), 1)}%."
+            f"latest {fmt(soc.get('latest'), 1)}% ({sample_note})."
         )
 
-    below_118 = int(thresholds.get("below_11_8_samples") or 0)
-    below_50 = int(thresholds.get("below_12_05_samples") or 0)
-    if below_118 or below_50:
-        lines.append(f"Low-voltage flags: {below_118} hourly samples below 11.8 V; {below_50} below 12.05 V.")
-    else:
-        lines.append("No hourly samples were below the configured voltage thresholds.")
+    if is_12v:
+        below_118 = int(thresholds.get("below_11_8_samples") or 0)
+        below_50 = int(thresholds.get("below_12_05_samples") or 0)
+        if below_118 or below_50:
+            lines.append(f"Low-voltage flags: {below_118} hourly samples below 11.8 V; {below_50} below 12.05 V.")
+        else:
+            lines.append("No hourly samples were below the configured voltage thresholds.")
 
-    charging_samples = int(thresholds.get("charging_or_float_samples") or 0)
-    if charging_samples > samples / 2:
-        lines.append("Most samples look like charging/float; treat voltage-based level estimates as a reference.")
-    elif isinstance(voltage.get("latest"), (int, float)) and float(voltage["latest"]) >= 13.0:
-        lines.append("Latest voltage is high; treat voltage-based level estimates as a reference, not a precise SOC reading.")
-    elif agm.get("latest_voltage_percent") is not None:
-        lines.append(f"Resting-voltage estimate from latest voltage: about {fmt(agm.get('latest_voltage_percent'), 1)}%.")
+        charging_samples = int(thresholds.get("charging_or_float_samples") or 0)
+        if charging_samples > samples / 2:
+            lines.append("Most samples look like charging/float; treat voltage-based level estimates as a reference.")
+        elif isinstance(voltage.get("latest"), (int, float)) and float(voltage["latest"]) >= 13.0:
+            lines.append("Latest voltage is high; treat voltage-based level estimates as a reference, not a precise SOC reading.")
+        elif agm.get("latest_voltage_percent") is not None:
+            lines.append(f"Resting-voltage estimate from latest voltage: about {fmt(agm.get('latest_voltage_percent'), 1)}%.")
+    else:
+        lines.append(
+            f"Voltage guidance is shown only for 12 V banks; this bank's readings ({fmt(v_min)}-{fmt(v_max)} V) are outside that range."
+        )
+
+    last_sample = data_age.parse_timestamp(summary.get("last_sample_utc"))
+    request_time = data_age.parse_timestamp(context.get("now_utc"))
+    if last_sample is not None and request_time is not None and (request_time - last_sample).total_seconds() > BATTERY_SAMPLE_STALE_SECONDS:
+        lines.append(f"No samples since {last_local or summary.get('last_sample_utc')}; the readings above are not current.")
     return "\n".join(lines)
 
 
@@ -4200,10 +4287,11 @@ def answer_from_generic_history(context: dict[str, Any]) -> str | None:
             value = stats.get(key)
             return display_units.display_value(measurement, float(value), pref, source_unit) if isinstance(value, (int, float)) else value
         suffix = f" {unit}" if unit else ""
+        latest_at = f" at {stats.get('last_time_local')}" if stats.get("last_time_local") else ""
         lines.append(
             f"- {display_measurement_name(measurement)}: "
             f"min {format_stat_value(shown_stat('min'))}{suffix}, avg {format_stat_value(shown_stat('avg'))}{suffix}, "
-            f"max {format_stat_value(shown_stat('max'))}{suffix}, latest {format_stat_value(shown_stat('last'))}{suffix} "
+            f"max {format_stat_value(shown_stat('max'))}{suffix}, latest {format_stat_value(shown_stat('last'))}{suffix}{latest_at} "
             f"({stats.get('count')} samples from {bucket}; min at {stats.get('min_time_local')}, max at {stats.get('max_time_local')})."
         )
     if len(rows) > 6:

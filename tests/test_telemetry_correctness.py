@@ -73,8 +73,190 @@ class BriefingCorrectnessTests(unittest.TestCase):
         now = dt.datetime.now(dt.timezone.utc)
         context = {"current_telemetry": {"values": {"propulsion.port.revolutions": 0, "propulsion.starboard.revolutions": 0, "electrical.batteries.shunt.voltage": 12}, "timestamps": {"propulsion.port.revolutions": (now - dt.timedelta(seconds=700)).isoformat(), "propulsion.starboard.revolutions": (now + dt.timedelta(seconds=90)).isoformat()}}, "ha_states": {}, "question_type": {}}
         answer = app.answer_from_briefing("brief", context)
-        self.assertIn("port unavailable", answer)
+        # A stale reading is no longer "unavailable": it says it is old (see DataAgeBriefingTests).
+        self.assertIn("Engine data is not reporting", answer)
+        self.assertNotIn("Engines: port 0 RPM", answer)
         self.assertIn("starboard unavailable", answer)
+
+
+NOW = dt.datetime(2026, 11, 14, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def iso(seconds_ago: float) -> str:
+    return (NOW - dt.timedelta(seconds=seconds_ago)).isoformat().replace("+00:00", "Z")
+
+
+class DataAgeBriefingTests(unittest.TestCase):
+    SOC = "electrical.batteries.shunt.capacity.stateOfCharge"
+    VOLT = "electrical.batteries.shunt.voltage"
+
+    def brief(self, values, ages):
+        context = {
+            "now_utc": iso(0),
+            "current_telemetry": {"values": values, "timestamps": {k: iso(v) for k, v in ages.items()}},
+            "ha_states": {}, "question_type": {},
+        }
+        return app.answer_from_briefing("brief", context)
+
+    def test_fresh_soc_prints_as_before(self):
+        answer = self.brief({self.SOC: 85, self.VOLT: 12.8}, {self.SOC: 30, self.VOLT: 30})
+        self.assertIn(": 85%, 12.80 V.", answer)
+
+    def test_two_day_old_soc_says_how_old(self):
+        answer = self.brief({self.SOC: 85, self.VOLT: 12.8}, {self.SOC: 2 * 86400 + 60, self.VOLT: 30})
+        self.assertIn("SOC: no recent data (last 85%, 2 days ago)", answer)
+        self.assertIn("12.80 V", answer)
+
+    def test_no_reading_is_unavailable(self):
+        answer = self.brief({}, {})
+        self.assertIn("SOC unavailable", answer)
+        self.assertIn("voltage unavailable", answer)
+        self.assertNotIn("no recent data", answer)
+
+    def test_stale_voltage_says_how_old(self):
+        answer = self.brief({self.SOC: 85, self.VOLT: 12.8}, {self.SOC: 30, self.VOLT: 3 * 3600})
+        self.assertIn("voltage: no recent data (last 12.80 V, 3 h ago)", answer)
+
+    def test_stale_rpm_is_not_current_and_never_zero(self):
+        values = {"propulsion.port.revolutions": 1800, "propulsion.starboard.revolutions": 0}
+        answer = self.brief(values, {"propulsion.port.revolutions": 86400 * 2, "propulsion.starboard.revolutions": 86400 * 2})
+        self.assertIn("Engine data is not reporting (normal when engines and their gateway are off); last reading", answer)
+        self.assertIn("2 days ago", answer)
+        self.assertNotIn("Engines: port 1800", answer)
+        self.assertNotIn("port 1800 RPM,", answer.split("last reading")[0])
+        self.assertNotIn("Engines: port 0 RPM", answer)
+
+    def test_fresh_rpm_prints_current(self):
+        answer = self.brief({"propulsion.port.revolutions": 1200, "propulsion.starboard.revolutions": 1200},
+                            {"propulsion.port.revolutions": 5, "propulsion.starboard.revolutions": 5})
+        self.assertIn("port 1200 RPM, starboard 1200 RPM.", answer)
+        self.assertNotIn("not reporting", answer)
+
+
+class DataAgeBatteryVoltageTests(unittest.TestCase):
+    def summary(self, vmin, vmax, last_age_seconds=1800, with_utc=True, soc=True):
+        data = {
+            "samples": 48, "label": "last 14 days", "battery_label": "House",
+            "last_sample_local": "Wed 2026-11-11 09:00 UTC",
+            "voltage": {"count": 48, "min": vmin, "avg": (vmin + vmax) / 2, "max": vmax, "latest": vmax},
+            "smartshunt_soc": {"count": 48, "min": 60.0, "max": 95.0, "latest": 90.0} if soc else {"count": 0},
+            "thresholds": {"below_11_8_samples": 0, "below_12_05_samples": 0, "charging_or_float_samples": 0},
+            "agm_voltage_soc_estimate": {"latest_voltage_percent": 80.0},
+        }
+        if with_utc:
+            data["last_sample_utc"] = iso(last_age_seconds)
+        return data
+
+    def answer(self, summary):
+        return app.answer_from_battery_voltage({"question_type": {"battery_voltage_history": True}, "battery_voltage": summary, "now_utc": iso(0)})
+
+    def test_latest_values_carry_sample_time(self):
+        answer = self.answer(self.summary(12.2, 12.9))
+        self.assertIn("latest 12.9 V (hourly mean, Wed 2026-11-11 09:00 UTC)", answer)
+        self.assertIn("latest 90% (hourly mean, Wed 2026-11-11 09:00 UTC)", answer)
+        self.assertIn("No hourly samples were below the configured voltage thresholds.", answer)
+        self.assertIn("Resting-voltage estimate", answer)
+        self.assertNotIn("No samples since", answer)
+        self.assertNotIn("only for 12 V banks", answer)
+
+    def test_old_last_sample_adds_not_current_sentence(self):
+        answer = self.answer(self.summary(12.2, 12.9, last_age_seconds=3 * 86400))
+        self.assertIn("No samples since Wed 2026-11-11 09:00 UTC; the readings above are not current.", answer)
+
+    def test_cached_summary_without_timestamp_omits_sentence(self):
+        answer = self.answer(self.summary(12.2, 12.9, with_utc=False))
+        self.assertNotIn("No samples since", answer)
+
+    def test_24v_bank_gets_numbers_without_12v_commentary(self):
+        answer = self.answer(self.summary(25.2, 27.6))
+        self.assertIn("min 25.2 V", answer)
+        self.assertIn("Voltage guidance is shown only for 12 V banks; this bank's readings (25.2-27.6 V) are outside that range.", answer)
+        for phrase in ("thresholds", "charging/float", "Resting-voltage estimate", "Latest voltage is high", "Low-voltage flags"):
+            self.assertNotIn(phrase, answer)
+        self.assertIn("SOC: 60-95%", answer)
+
+
+class DataAgeGenericHistoryTests(unittest.TestCase):
+    def test_latest_carries_its_time(self):
+        history = {"label": "last 7 days", "start_local": "a", "stop_local": "b", "buckets": {app.INFLUX_HISTORY_BUCKET: {
+            "numeric_summary": {"environment.outside.temperature": {"count": 3, "min": 280.0, "avg": 281.0, "max": 282.0, "last": 281.5,
+                                "min_time_local": "t1", "max_time_local": "t2", "last_time_local": "Fri 2026-11-13 18:00 UTC"}}}}}
+        answer = app.answer_from_generic_history({"question_type": {"generic_history": True}, "influx_history": history, "match_tokens": ["temperature"]})
+        self.assertRegex(answer, r"latest [^,;(]+ at Fri 2026-11-13 18:00 UTC \(3 samples")
+
+    def test_missing_time_keeps_old_shape(self):
+        history = {"label": "x", "start_local": "a", "stop_local": "b", "buckets": {app.INFLUX_HISTORY_BUCKET: {
+            "numeric_summary": {"environment.outside.temperature": {"count": 3, "min": 1.0, "avg": 2.0, "max": 3.0, "last": 2.5}}}}}
+        answer = app.answer_from_generic_history({"question_type": {"generic_history": True}, "influx_history": history, "match_tokens": ["temperature"]})
+        self.assertIn("latest 2.5 F (3 samples", answer)
+
+
+class FuelNoDataTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(telemetry_cache, "put_summary")
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def run_summary(self, rows, minutes=60):
+        window = fuel_window()
+        window["stop"] = window["start"] + dt.timedelta(minutes=minutes)
+        with mock.patch.object(app, "query_influx", return_value=rows):
+            return app.fuel_usage_summary(window, use_cache=False)
+
+    def answer(self, summary):
+        return app.answer_from_fuel_usage({"question_type": {"fuel_usage": True}, "fuel_usage": summary})
+
+    @staticmethod
+    def row(minute, rpm):
+        return {"_time": f"2025-01-01T00:{minute:02d}:00Z", "propulsion.port.revolutions": rpm / 60.0, "propulsion.starboard.revolutions": rpm / 60.0,
+                "propulsion.port.fuel.rate": 0.001, "propulsion.starboard.fuel.rate": 0.001}
+
+    def test_zero_rows_is_no_data_not_not_running(self):
+        summary = self.run_summary([])
+        self.assertEqual(summary["sample_counts"]["observed_minutes"], 0)
+        answer = self.answer(summary)
+        self.assertIn("No engine or fuel data was recorded for test", answer)
+        self.assertIn("telemetry may not have been logging), so fuel use cannot be determined.", answer)
+        self.assertNotIn("Engines were not running", answer)
+
+    def test_rows_with_only_fuel_rate_count_as_no_engine_data(self):
+        summary = self.run_summary([{"_time": "2025-01-01T00:00:00Z", "propulsion.port.fuel.rate": 0.001}])
+        self.assertEqual(summary["sample_counts"]["observed_minutes"], 0)
+
+    def test_rpm_below_threshold_means_engines_not_running(self):
+        summary = self.run_summary([self.row(0, 0), self.row(1, 0), self.row(2, 0)])
+        self.assertEqual(summary["sample_counts"]["observed_minutes"], 3)
+        answer = self.answer(summary)
+        self.assertIn("Engines were not running during test", answer)
+        self.assertIn("3 minutes of engine data recorded", answer)
+        self.assertNotIn("No engine or fuel data", answer)
+
+    def test_normal_running_window_unchanged(self):
+        summary = self.run_summary([self.row(0, 1500), self.row(1, 1500), self.row(2, 1500)])
+        self.assertEqual(summary["gap_minutes"], 0)
+        answer = self.answer(summary)
+        self.assertIn("across 3 sampled running minutes", answer)
+        self.assertNotIn("missing inside the running period", answer)
+
+    def test_cached_summary_without_new_field_keeps_old_wording(self):
+        summary = {"label": "test", "start_local": "s", "stop_local": "e", "running_minutes": 0, "rpm_threshold": 400, "sample_counts": {"running_minutes": 0}}
+        self.assertIn("I found no engine-running fuel samples for test", self.answer(summary))
+        summary.pop("sample_counts")
+        self.assertIn("I found no engine-running fuel samples for test", self.answer(summary))
+
+    def test_gap_inside_running_span_is_reported_as_minimum(self):
+        rows = [self.row(0, 1500), self.row(1, 1500), self.row(12, 1500), self.row(13, 1500)]
+        summary = self.run_summary(rows)
+        self.assertEqual(summary["gap_minutes"], 10)
+        self.assertEqual(summary["largest_gap_minutes"], 10)
+        self.assertIn("About 10 minutes of data are missing inside the running period, so the total is a minimum.", self.answer(summary))
+
+    def test_observed_idle_minutes_inside_span_are_not_gaps(self):
+        rows = [self.row(0, 1500)] + [self.row(m, 0) for m in range(1, 11)] + [self.row(11, 1500)]
+        self.assertEqual(self.run_summary(rows)["gap_minutes"], 0)
+
+    def test_short_gap_is_ignored(self):
+        rows = [self.row(0, 1500), self.row(4, 1500)]
+        self.assertEqual(self.run_summary(rows)["gap_minutes"], 0)
 
 
 class PowerCorrectnessTests(unittest.TestCase):
