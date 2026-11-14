@@ -400,6 +400,37 @@ rm -f -- "$SYSTEM_ROOT/dev/watchdog"
 # Restore the default installed state for the checks below.
 env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" \
     "$REPO_ROOT/install.sh" --config "$CONFIG" >/dev/null
+# An unfinished restore blocks the installer; a finished one (committed, rolled back) does not, and the
+# restore's own run identifies itself with the journal's id.
+PENDING_DIR="$SYSTEM_ROOT/var/lib/vesselstack/restore/current"
+install -d -m 0700 "$PENDING_DIR"
+cp "$REPO_ROOT/scripts/lib/restore_journal.py" "$PENDING_DIR/restore_journal.py"
+set_pending_phase() {
+    python3 -I "$PENDING_DIR/restore_journal.py" set "$PENDING_DIR" format=1 id=pending123 "phase=$1"
+}
+run_pending_install() {
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$@" "$REPO_ROOT/install.sh" --config "$CONFIG"
+}
+set_pending_phase starting
+ctl_inode=$(stat -c %i "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl")
+if run_pending_install > "$TEST_ROOT/pending.out" 2> "$TEST_ROOT/pending.err"; then
+    echo "The installer ran while a restore was unfinished" >&2
+    exit 1
+fi
+grep -q 'A restore did not finish (phase: starting)' "$TEST_ROOT/pending.err"
+test -z "$(cat "$TEST_ROOT/pending.out")"
+test "$(stat -c %i "$SYSTEM_ROOT/usr/local/sbin/vesselstackctl")" = "$ctl_inode"
+for finished in committed rolled-back; do
+    set_pending_phase "$finished"
+    run_pending_install >/dev/null
+done
+set_pending_phase starting
+run_pending_install VESSELSTACK_RESTORE_ID=pending123 >/dev/null
+if run_pending_install VESSELSTACK_RESTORE_ID=other >/dev/null 2>&1; then
+    echo "The installer accepted another restore's id" >&2
+    exit 1
+fi
+rm -rf -- "${PENDING_DIR:?}"
 test ! -e "$APP_ROOT/config/displays-bridge.env"
 test ! -e "$APP_ROOT/config/displays.json"
 test ! -e "$APP_ROOT/displays/.venv"

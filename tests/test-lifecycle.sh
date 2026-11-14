@@ -78,6 +78,11 @@ cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$(dirname "$0")/calls.log"
 [ -z "${FAKE_CALL_LOG:-}" ] || printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALL_LOG"
+# The recovery asks for ActiveState: a unit is inactive unless a test keeps state and has not stopped it.
+if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = show ] && [ "${3:-}" = ActiveState ]; then
+    if [ -n "${FAKE_SYSTEMCTL_STATE_DIR:-}" ] && [ ! -e "$FAKE_SYSTEMCTL_STATE_DIR/${!#}.stopped" ]; then echo active; else echo inactive; fi
+    exit 0
+fi
 if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = show ] && [ -n "${FAKE_SYSTEMCTL_NOT_FOUND_UNITS:-}" ]; then
     unit=${5:-}
     case " $FAKE_SYSTEMCTL_NOT_FOUND_UNITS " in
