@@ -1458,7 +1458,7 @@ def _fonts_lines(display: dict, config: dict) -> list:
         if STATUS_FONTS[key] in status:
             fonts.append((STATUS_FONTS[key], "bold", FONT_SIZES[f"status_{key}"], status[STATUS_FONTS[key]]))
     fonts.append(("font_small", "regular", FONT_SIZES["small"], _small_glyphs(config, display)))
-    if alarm_takeover_enabled(display):
+    if alarm_takeover_enabled(display, config):
         fonts.append(("font_banner", "bold", FONT_SIZES["banner"], BANNER_GLYPHS))
         fonts.append(("font_banner_name", "bold", FONT_SIZES["banner_name"], _small_glyphs(config, display)))
     lines = ["font:"]
@@ -1620,8 +1620,12 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: boo
     return lines
 
 
-def alarm_takeover_enabled(display: dict) -> bool:
-    return display.get("ui", {}).get("alarm_takeover", False) is True
+def alarm_takeover_enabled(display: dict, config: dict) -> bool:
+    """An explicit ``ui.alarm_takeover`` wins; absent, the banner is on whenever anything counts for the summary."""
+    ui = display.get("ui", {})
+    if "alarm_takeover" in ui:
+        return ui["alarm_takeover"] is True
+    return schema.counts_for_alarm_summary(config)
 
 
 def alarm_page_index(display: dict) -> int:
@@ -1980,7 +1984,7 @@ def _night_script(config: dict, display: dict, used: list, pal: Palette = CLASSI
     return lines
 
 
-def _power_script(display: dict) -> list:
+def _power_script(display: dict, config: dict) -> list:
     """One backlight controller: banner 100 %, else idle dim, else night, else day; only on change."""
     lines = [
         "  - id: apply_power", "    mode: restart", "    then:", "      - lambda: |-",
@@ -1991,7 +1995,7 @@ def _power_script(display: dict) -> list:
     if dim_enabled(display):
         lines.append(f"          if (id(dim_idle) && target > {dim_brightness(display)}) "
                      f"target = {dim_brightness(display)};")
-    if alarm_takeover_enabled(display):
+    if alarm_takeover_enabled(display, config):
         lines.append("          if (!lv_obj_has_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN)) target = 100;")
     lines += [
         "          if (target != id(bl_drawn)) {",
@@ -2070,7 +2074,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             lines.append(f'  - {{id: ins_{iid}_gdrawn, type: uint8_t, initial_value: "255"}}')
         if shore_instrument(config, display, iid):
             lines.append(f'  - {{id: ins_{iid}_sdrawn, type: uint8_t, initial_value: "255"}}')
-    takeover = alarm_takeover_enabled(display)
+    takeover = alarm_takeover_enabled(display, config)
     if takeover:
         lines += ALARM_GLOBALS
     lines += _ui_globals(display, has_ha(config))
@@ -2131,7 +2135,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     if night_enabled(display):
         lines += _night_script(config, display, used, pal=pal)
     if power_enabled(display):
-        lines += _power_script(display)
+        lines += _power_script(display, config)
     lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles"]
     if takeover:
         lines.append("      - script.execute: render_alarm")

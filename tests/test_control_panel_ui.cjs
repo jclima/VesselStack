@@ -281,7 +281,13 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.equal(locked[0].title, 'Lock the panel?'); assert.equal(ui.state.token, 'test-token', 'cancelling the lock keeps the session');
   formControls[0].value = 'Original';
   // Starting everything, restarting one component and the safe actions.
-  for (const action of ['backup', 'preflight', 'bootstrap-history']) {
+  ui.state.busy = false; ui.state.pendingOperation = null; posts.length = 0;
+  const backupAsked = await askedFor(() => ui.runAction('backup'));
+  assert.equal(backupAsked.length, 1, 'a plain backup asks exactly once'); assert.equal(backupAsked[0].title, 'Back up now?');
+  assert.equal(posts.length, 0, 'cancelling the backup confirmation starts nothing');
+  dialogAnswer = 'ok'; await ui.runAction('backup'); await tick();
+  assert.equal(posts.at(-1).body.action, 'backup', 'confirming starts the backup');
+  for (const action of ['preflight', 'bootstrap-history']) {
     ui.state.busy = false; ui.state.pendingOperation = null;
     assert.equal((await askedFor(() => ui.runAction(action))).length, 0, `${action} is not interrupting and needs no dialog`);
     assert.equal(posts.at(-1).body.action, action);
@@ -299,21 +305,23 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   ui.state.busy = false; ui.state.pendingOperation = null;
   await ui.runComponent('grafana', 'remove'); await tick();
   assert.deepEqual(posts.at(-1), { path: '/api/component', body: { component: 'grafana', action: 'remove' } });
-  assert.equal(Object.keys(ui.CONFIRMS).sort().join(), ['apply', 'install', 'restart', 'restart-panel', 'start', 'stop'].join());
+  assert.ok(ui.CONFIRMS.backup && ui.CONFIRMS.backup.ok === 'Back up now' && ui.CONFIRMS.backup.items.length > 0, 'a plain backup stops every service, so it needs its own confirmation');
+  assert.match(appSource, /<button type="button" data-action="backup">Back up now<\/button>/, 'the Home band backup button is not the primary action');
+  assert.equal(Object.keys(ui.CONFIRMS).sort().join(), ['apply', 'backup', 'install', 'restart', 'restart-panel', 'start', 'stop'].join());
   ui.state.pendingOperation = null; ui.state.busy = false;
 
   // ---- components: names, statuses, menu, configure -----------------------
   const comps = [
     { id: 'grafana', label: 'Grafana', description: 'Charts', section: 'Services & ports', manageable: true, enabled: true, state: 'running', status: 'running' },
     { id: 'homepage', label: 'Home page', description: 'Start page', section: 'Services & ports', manageable: true, enabled: true, state: 'exited', status: 'stopped' },
-    { id: 'telegram', label: 'Telegram alerts', description: 'Alerts', section: 'Boat Chat', manageable: false, enabled: false, state: 'active', status: 'disabled', still_running: true },
+    { id: 'telegram', label: 'Telegram chat bot', description: 'Chat bot', section: 'Boat Chat', manageable: false, enabled: false, state: 'active', status: 'disabled', still_running: true },
     { id: 'socketcan', label: 'SocketCAN', description: 'CAN', section: 'Signal K & NMEA 2000', manageable: false, enabled: false, state: 'inactive', status: 'disabled' },
     { id: 'ais-catcher', label: 'AIS-catcher', description: 'AIS', section: 'AIS receiver', manageable: false, enabled: true, state: 'unknown', status: 'unknown' },
     { id: 'control-panel', label: 'Control Panel', status: 'running' },
   ];
   ui.renderComponents(comps, true);
   const grid = node('#component-grid').innerHTML;
-  assert.match(grid, /<h3>AIS-catcher<\/h3>/); assert.match(grid, /<h3>Telegram alerts<\/h3>/); assert.match(grid, /<h3>SocketCAN<\/h3>/);
+  assert.match(grid, /<h3>AIS-catcher<\/h3>/); assert.match(grid, /<h3>Telegram chat bot<\/h3>/); assert.match(grid, /<h3>SocketCAN<\/h3>/);
   assert.doesNotMatch(grid, /Control Panel<\/h3>/, 'the panel does not list itself');
   assert.doesNotMatch(grid, /Active|Available|Ais Catcher|Socketcan/, 'only Running, Stopped and Disabled words, real names');
   assert.match(grid, /status running">Running/); assert.match(grid, /status stopped">Stopped/); assert.match(grid, /status disabled">Disabled/); assert.match(grid, /status unknown">Unknown/);
@@ -468,6 +476,13 @@ assert.equal(node('#sb-apply').disabled, false, 'Apply is available once nothing
   assert.equal(ui.state.reconnectTimer, 0, 'status 404 schedules bounded retry without recursive hot loop');
   assert.equal(node('#connection-label').textContent, 'Disconnected', 'a dead backend is Disconnected, not Locked');
   assert.equal(node('#retry').hidden, false, 'Retry now is offered');
+  assert.equal(ui.state.connection, 'disconnected');
+  for (let i = 0; i < 6; i += 1) await ui.refreshStatus();
+  assert.equal(ui.state.reconnectTimer, 0, 'polling keeps being rescheduled after more than five failures');
+  assert.match(ui.state.notices.offline.text, /Still trying every 15 seconds; press Retry now/);
+  assert.doesNotMatch(appSource, /reconnectAttempts <= 5/, 'no hard stop after five attempts');
+  assert.match(appSource, /window\.addEventListener\("online", reconnectNow\)/, 'regaining the network reconnects at once');
+  assert.match(appSource, /visibilitychange", \(\) => \{ if \(!document\.hidden\) reconnectNow\(\)/, 'waking the page reconnects even while busy');
   assert.match(ui.state.notices.offline.text, /Can't reach the boat computer/); assert.doesNotMatch(JSON.stringify(ui.state.notices), /Unlock button|Use Unlock/);
   ui.state.bootId = null;
   fetchImpl = () => Promise.resolve(ok({ components: [{ id: 'grafana', label: 'Grafana', status: 'running' }], operation: { state: 'idle' }, installed_version: '0.6.0', running_version: '0.6.0', boot_id: 'b1', boat_name: 'Example Vessel', backup: { path: '/media/backup', mount: 'mounted', state: 'ok', last_backup_at: Math.floor(Date.now() / 1000) }, restart_needed: false }));

@@ -689,6 +689,20 @@ class UiOptionTests(unittest.TestCase):
             self.assertError(self.with_ui(alarm_page=bad), w)
         self.assertError(self.with_ui(alarm_page=2), "out of range")
 
+    def test_absent_takeover_key_never_needs_anything_to_count(self) -> None:
+        def nothing(cfg):
+            cfg["displays"]["helm"]["ui"] = {"alarm_page": 0}
+        self.assertEqual(errors_for(nothing), [])
+
+        def thresholded(cfg):
+            nothing(cfg)
+            inst(cfg)["thresholds"] = {"alarm_below": 1}
+        self.assertEqual(errors_for(thresholded), [])
+
+        def off(cfg):
+            cfg["displays"]["helm"]["ui"] = {"alarm_takeover": False}
+        self.assertEqual(errors_for(off), [])
+
     def test_takeover_needs_something_to_count(self) -> None:
         def nothing(cfg):
             cfg["displays"]["helm"]["ui"] = {"alarm_takeover": True}
