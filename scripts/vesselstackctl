@@ -131,9 +131,92 @@ To resolve this by hand:
      Either way, finish with: sudo vesselstackctl doctor
 EOF
 }
+# The record the boot recovery (boot-vesselstack-restore.service) leaves in $RESTORE_DIR/boot-recovery. It is
+# data written by another program: only the keys below are read, one line each, and printable characters only.
+# Sets br_journal_id, br_result, br_finished, br_finished_epoch, br_boot_id, br_reason, br_note; fails when
+# there is no usable record.
+restore_boot_value() {
+    local value
+    value=$(sed -n "s/^$1=//p" "$RESTORE_DIR/boot-recovery" 2>/dev/null | sed -n '1p') || value=''
+    value=${value//[![:print:]]/?}
+    printf '%s' "${value:0:200}"
+}
+restore_boot_record_read() {
+    br_journal_id='' br_result='' br_finished='' br_finished_epoch='' br_boot_id='' br_reason='' br_note=''
+    [ -f "$RESTORE_DIR/boot-recovery" ] && [ ! -L "$RESTORE_DIR/boot-recovery" ] || return 1
+    br_journal_id=$(restore_boot_value journal_id)
+    br_result=$(restore_boot_value result)
+    br_finished=$(restore_boot_value finished)
+    br_finished_epoch=$(restore_boot_value finished_epoch)
+    br_boot_id=$(restore_boot_value boot_id)
+    br_reason=$(restore_boot_value reason)
+    br_note=$(restore_boot_value note)
+    case "$br_result" in
+        rolled-back|rolled-back-not-started|cleaned-up|held|failed|timed-out|internal-error) ;;
+        *) return 1 ;;
+    esac
+    [ -n "$br_finished" ] || br_finished=unknown
+}
+# Succeeds when the record should be shown. Rule: with a restore journal pending, only a record about THAT
+# journal (the same id); with none pending, a record of a rollback or cleanup that finished in this boot or
+# less than two days ago. A hold or a failure is shown only while its journal is still pending, because
+# resolving the journal is what ends it.
+restore_boot_record_current() {
+    local pending_id='' now age current_boot=''
+    if [ -f "$RESTORE_CURRENT/state" ]; then
+        pending_id=$(restore_state_peek "$RESTORE_CURRENT" id)
+        [ -n "$pending_id" ] && [ "$pending_id" = "$br_journal_id" ]
+        return
+    fi
+    case "$br_result" in rolled-back|rolled-back-not-started|cleaned-up) ;; *) return 1 ;; esac
+    current_boot=$(tr -d '[:space:]' < "${VESSELSTACK_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null || true)
+    if [ -n "$current_boot" ] && [ "$current_boot" = "$br_boot_id" ]; then return 0; fi
+    [[ $br_finished_epoch =~ ^[0-9]{1,12}$ ]] || return 1
+    now=$(date +%s)
+    age=$((now - br_finished_epoch))
+    [ "$age" -ge -300 ] && [ "$age" -lt 172800 ]
+}
+# Prints the status line for the last automatic recovery at boot, when there is one to show.
+restore_boot_status_line() {
+    local note=''
+    restore_boot_record_read && restore_boot_record_current || return 0
+    [ -z "$br_note" ] || note=" ($br_note)"
+    case "$br_result" in
+        rolled-back) printf '%-20s %s\n' Restore "rolled back automatically at boot ($br_finished)$note" ;;
+        rolled-back-not-started) printf '%-20s %s\n' Restore "rolled back at boot ($br_finished) but the stack was not started; run: sudo vesselstackctl start" ;;
+        cleaned-up) printf '%-20s %s\n' Restore "the leftovers of a finished restore were cleaned up at boot ($br_finished)" ;;
+        held) printf '%-20s %s\n' Restore "HELD at boot: ${br_reason:-no reason recorded}; see: sudo $RESTORE_CURRENT/recover status" ;;
+        timed-out) printf '%-20s %s\n' Restore "automatic rollback at boot timed out (see $RESTORE_DIR/boot-recovery.log); see: sudo $RESTORE_CURRENT/recover status" ;;
+        *) printf '%-20s %s\n' Restore "automatic rollback failed at boot (see $RESTORE_DIR/boot-recovery.log); see: sudo $RESTORE_CURRENT/recover status" ;;
+    esac
+}
+# The same for doctor: INFO for what needs nothing, WARN when the owner has to act. The FAIL for a journal that is
+# still pending comes from check_restore_pending.
+restore_boot_doctor_lines() {
+    restore_boot_record_read && restore_boot_record_current || return 0
+    case "$br_result" in
+        rolled-back)
+            printf 'INFO an interrupted restore was rolled back automatically at boot (%s); the previous folders are back and the stack was started\n' "$br_finished"
+            [ -z "$br_note" ] || printf '     %s\n' "$br_note" ;;
+        rolled-back-not-started)
+            printf 'WARN an interrupted restore was rolled back at boot (%s) but the stack was not started\n' "$br_finished" >&2
+            printf '      run: sudo vesselstackctl start\n' >&2 ;;
+        cleaned-up) printf 'INFO the leftovers of a finished restore were cleaned up at boot (%s)\n' "$br_finished" ;;
+        held) printf 'INFO the automatic recovery at boot held and changed nothing: %s\n' "${br_reason:-no reason recorded}" ;;
+        timed-out) printf 'INFO the automatic rollback at boot timed out; see %s/boot-recovery.log\n' "$RESTORE_DIR" ;;
+        *) printf 'INFO the automatic rollback at boot failed; see %s/boot-recovery.log\n' "$RESTORE_DIR" ;;
+    esac
+}
+
+restore_status_line() {
+    local rc=0
+    restore_status_pending_line || rc=$?
+    restore_boot_status_line || true
+    return "$rc"
+}
 # Prints the one-line "Restore ..." status; fails when the restore blocks other commands. A restore
 # that is committed (or rolled back) and only left its journal behind never blocks anything.
-restore_status_line() {
+restore_status_pending_line() {
     local phase
     [ -f "$RESTORE_CURRENT/state" ] || return 0
     if ! restore_state_readable "$RESTORE_CURRENT"; then
@@ -723,8 +806,15 @@ check_install_state() {
 }
 
 # FAIL (returns 1) when a restore did not finish; silent when none is pending. Reads only the journal's
-# state file, so it works even when the application folder is missing.
+# state file, so it works even when the application folder is missing. Then says what the automatic
+# recovery at boot did, when there is something to show.
 check_restore_state() {
+    local rc=0
+    check_restore_pending || rc=$?
+    restore_boot_doctor_lines
+    return "$rc"
+}
+check_restore_pending() {
     local dir=$RESTORE_CURRENT phase
     [ -f "$dir/state" ] || return 0
     if ! restore_state_readable "$dir"; then
@@ -5405,6 +5495,10 @@ uninstall_stack() {
     rm -f -- "$SYSTEMD_DIR/vesselstack-firewall.service" "$SYSTEMD_DIR/vesselstack-homepage-refresh.service" "$SBIN_DIR/vesselstack-firewall" \
         "$SBIN_DIR/vesselstack-update" "$LIBEXEC_DIR/deploy-chat.py" "$LIBEXEC_DIR/remediate.sh" "$LIBEXEC_DIR/record-backup-result" "$LIBEXEC_DIR/vesselstack-alerts.py" "$LIBEXEC_DIR/restore_journal.py"
     rmdir -- "$LIBEXEC_DIR" 2>/dev/null || true
+    # Recovery at boot: its unit is not a vesselstack-* unit on purpose, so it is removed by name.
+    systemctl disable boot-vesselstack-restore.service || true
+    rm -f -- "$SYSTEMD_DIR/boot-vesselstack-restore.service" "$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+    rm -rf -- "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
     systemctl daemon-reload
     if [ "$purge" -eq 1 ]; then
         rm -rf -- /opt/vesselstack /opt/vesselstack-data

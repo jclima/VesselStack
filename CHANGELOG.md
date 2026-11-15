@@ -10,8 +10,8 @@ Semantic Versioning.
 - The restore journal now records which boot last wrote it (`boot_id`, read from
   `/proc/sys/kernel/random/boot_id`, left out when that is unavailable) and, after a failed
   rollback, whether trying again can help (`last_error_kind`: retry, manual or previous).
-  `vesselstackctl restore --status` and `recover status` say so on the `Last error` line. This
-  prepares an automatic rollback check at boot; nothing acts on it yet.
+  `vesselstackctl restore --status` and `recover status` say so on the `Last error` line. The
+  recovery at boot (below) uses both.
 
 **Operational impact:** none for a running system. Journals written by 0.9.0 have neither key and
 stay valid; rollback decisions, phases and the by-hand steps are unchanged.
@@ -22,6 +22,38 @@ journal's `state` file contains a `boot_id=` line (the same value as
 
 **Rollback:** reinstall the previous release. A journal that already has the new keys stays
 readable by 0.9.0, which ignores them.
+
+### Recovery at boot
+
+- After a power loss in the middle of a restore, the boat computer now recovers by itself at the
+  next boot. The new `boot-vesselstack-restore.service` runs once per boot, only while a restore
+  journal exists, and runs the journal's own `recover rollback` when the journal was written in an
+  earlier boot. When it is not sure it holds: it changes nothing and writes down why.
+  Cleanup of a finished restore runs in both modes.
+- New setting `VESSELSTACK_RESTORE_AT_BOOT` (`rollback`, the default, or `hold`), written to
+  `/etc/vesselstack-recovery.conf`.
+- The outcome is in `/var/lib/vesselstack/restore/boot-recovery` and `boot-recovery.log`, and in
+  `sudo vesselstackctl status` and `doctor`.
+- Known limits: a restore that had finished all but its last step is rolled back too (the restored
+  folders are kept as `*.failed-restore-<stamp>`); a failed automatic rollback leaves the services
+  stopped; services still start at boot before the recovery stops them; containers that Docker
+  restarts itself are stopped by the rollback, not prevented from starting.
+
+**Operational impact:** the installer adds `/usr/local/lib/vesselstack-recovery/restore-boot`, the
+unit `/etc/systemd/system/boot-vesselstack-restore.service` (enabled, not started) and
+`/etc/vesselstack-recovery.conf`. Nothing changes while no restore is pending. At the next boot with
+a pending journal from an earlier boot, the previous folders come back and the stack is started.
+A journal written by 0.9.0 has no boot id: it is held, not rolled back. Restoring an older backup
+leaves the new files in place. Uninstall removes all three.
+
+**Verify:** `systemctl is-enabled boot-vesselstack-restore.service` prints `enabled` and
+`cat /etc/vesselstack-recovery.conf` prints `MODE=rollback`. After an interrupted restore and a
+reboot: `sudo journalctl -b -u boot-vesselstack-restore`,
+`sudo cat /var/lib/vesselstack/restore/boot-recovery` and `sudo vesselstackctl status`.
+
+**Rollback:** set `VESSELSTACK_RESTORE_AT_BOOT="hold"` in `vesselstack.env` and rerun the
+installer, or run `sudo systemctl disable boot-vesselstack-restore.service`. Recovery by hand with
+`recover rollback` is unchanged.
 
 ## 0.9.0 - 2026-11-15
 

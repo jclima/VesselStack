@@ -2228,7 +2228,7 @@ assert_back_after_installer_kill() {
 cleanup_after_installer_kill() {
     rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-* "$APP_ROOT".failed-restore-* "$DATA_ROOT".failed-restore-* \
         "$RESTORE_RECORDS"/rolled-back-* "$RESTORE_RECORDS"/done-*
-    rm -f -- "$APP_ROOT/live-marker"
+    rm -f -- "$APP_ROOT/live-marker" "$RESTORE_RECORDS/boot-recovery" "$RESTORE_RECORDS/boot-recovery.log"
 }
 kill_at_installer
 recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 2>&1) || {
@@ -2238,6 +2238,28 @@ recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 
 }
 grep -q 'Rollback completed' <<<"$recover_output"
 assert_back_after_installer_kill
+cleanup_after_installer_kill
+
+# The same kill, undone by the boot recovery script instead of by hand: a different boot id plays "the next boot".
+kill_at_installer
+printf 'f0e1d2c3-b4a5-4968-8776-655443322110\n' > "$TEST_ROOT/next-boot-id"
+boot_output=$(env PATH="$FAKE_BIN:$PATH" SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_BOOT_ID_FILE="$TEST_ROOT/next-boot-id" \
+    "$REPO_ROOT/scripts/lib/restore-boot" 2>&1) || {
+    echo 'restore-boot failed after a kill at the restored installer' >&2
+    echo "$boot_output" >&2
+    exit 1
+}
+grep -q 'was rolled back' <<<"$boot_output"
+assert_back_after_installer_kill
+grep -qx 'result=rolled-back' "$RESTORE_RECORDS/boot-recovery"
+grep -qx 'phase_before=starting' "$RESTORE_RECORDS/boot-recovery"
+grep -qx 'phase_after=archived' "$RESTORE_RECORDS/boot-recovery"
+grep -q 'Rollback completed' "$RESTORE_RECORDS/boot-recovery.log"
+test "$(stat -c %a "$RESTORE_RECORDS/boot-recovery")" = 600
+test "$(stat -c %a "$RESTORE_RECORDS/boot-recovery.log")" = 600
+boot_status=$(run_ctl status 2>&1 || true)
+grep -q '^Restore  *rolled back automatically at boot' <<<"$boot_status" || { echo 'status does not report the automatic recovery' >&2; echo "$boot_status" >&2; exit 1; }
+grep -q 'INFO an interrupted restore was rolled back automatically at boot' <<<"$(run_ctl doctor 2>&1 || true)"
 cleanup_after_installer_kill
 
 kill_at_installer
@@ -2269,6 +2291,10 @@ touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \
 install -d "$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 touch "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update" \
     "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
+# Recovery at boot is not a vesselstack-* unit, so uninstall removes it by name: unit, script directory and setting.
+install -d "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
+touch "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery/restore-boot" "$SYSTEM_ROOT/etc/systemd/system/boot-vesselstack-restore.service" \
+    "$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
 if run_ctl uninstall --purge-data >/dev/null 2>&1; then
     echo 'Purge uninstall accepted missing --yes confirmation' >&2
     exit 1
@@ -2285,6 +2311,10 @@ test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
 # Uninstall also removes the root-owned update launcher and its helper.
 test ! -e "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update"
 test ! -e "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/boot-vesselstack-restore.service"
+test ! -e "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
+test ! -e "$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+grep -qx 'systemctl disable boot-vesselstack-restore.service' "$FAKE_BIN/calls.log"
 test -e "$DATA_ROOT/state.txt"
 
 if run_ctl status unexpected >/dev/null 2>&1; then

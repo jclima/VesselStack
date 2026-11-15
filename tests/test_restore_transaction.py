@@ -5,6 +5,7 @@ import os, re, shutil, subprocess, sys, tempfile, unittest
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = ROOT / "scripts/vesselstackctl"
 JOURNAL_HELPER = ROOT / "scripts/lib/restore_journal.py"
+BOOT_SCRIPT = ROOT / "scripts/lib/restore-boot"
 
 def replace_with_foreign_dir(path):
     """Swap `path` for a different directory that can never share its inode.
@@ -127,6 +128,16 @@ def manual_procedure_block(path, function, marker, end):
 
 class RestoreTransactionTests(unittest.TestCase):
     def run_harness(self, body, root, real_rename=False):
+        script = self.build_harness(body, real_rename)
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write(script); name = f.name
+        os.chmod(name, 0o700)
+        try:
+            return subprocess.run(["bash", name, str(root)], capture_output=True, text=True)
+        finally:
+            os.unlink(name)
+
+    def build_harness(self, body, real_rename=False):
         script = '''#!/bin/bash
 set -eu
 SYSTEM_ROOT=$1
@@ -153,13 +164,7 @@ __mv() {
             # helper (restore_rename_tree, tested on its own). Route the harness through the hooked mv.
             script = script.replace("restore_rename_tree() {", "restore_rename_tree_real() {")
             script = script.replace('# GNU "mv -T" is what', 'restore_rename_tree() { mv -T -- "$2" "$3"; }\n# GNU "mv -T" is what', 1)
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
-            f.write(script); name = f.name
-        os.chmod(name, 0o700)
-        try:
-            return subprocess.run(["bash", name, str(root)], capture_output=True, text=True)
-        finally:
-            os.unlink(name)
+        return script
 
     def run_transaction(self, mode, quiesce=False, mv_hook="", post="", pre=""):
         td = tempfile.TemporaryDirectory(); base = Path(td.name)
@@ -739,7 +744,7 @@ VESSELSTACK_ROOT="{root}" VESSELSTACK_DATA="{data}" restore_config_identity "{cu
                 "original": original, "new": new, "published": published, "log": base / "calls.log",
                 "active": base / "active", "root_step": root_step, "data_step": data_step, "phase": phase}
 
-    def reconcile(self, lay, extra=""):
+    def reconcile(self, lay, extra="", via_recover=False):
         body = pending_source() + transaction_source() + """
 SYSTEMD_DIR="@SYSTEMD@"
 mv() { if [ "${LOG_RM:-0}" = 1 ]; then echo "MV $*" >> "@LOG@"; fi; __mv "$@"; }
@@ -809,6 +814,18 @@ exit "$rc"
         for key, value in {"@SYSTEMD@": lay["systemd"], "@LOG@": lay["log"], "@J@": lay["journal"], "@STAGE@": lay["stage"],
                            "@ACTIVE@": lay["active"], "@CONT@": lay["base"] / "containers", "@PUBLISHED@": "1" if lay["published"] else "0", "@EXTRA@": extra}.items():
             body = body.replace(key, str(value))
+        if via_recover:
+            # Not run here: the journal's own `recover` (extracted from the controller) runs this body as its controller,
+            # which is how the boot script reaches the same code in these tests.
+            tail = 'restore_reconcile "%s" && rc=0 || rc=$?\necho "outcome=${restore_outcome:-}"\nexit "$rc"\n' % lay["journal"]
+            assert tail in body
+            body = body.replace(tail, f'SYSTEM_ROOT="{lay["base"]}"\nRESTORE_CURRENT="{lay["journal"]}"\nROOT="/nonexistent/vesselstack"\n'
+                                       f'usage() {{ echo usage; }}\nrestore_take_lock() {{ :; }}\nrestore_recover_command rollback\n')
+            harness = lay["base"] / "controller-harness.sh"
+            harness.write_text(self.build_harness(body, lay.get("real_rename", False))); harness.chmod(0o700)
+            controller = lay["journal"] / "controller"
+            controller.write_text(f'#!/bin/bash\nexec bash "{harness}" "{lay["base"]}"\n'); controller.chmod(0o700)
+            return None
         result = self.run_harness(body, lay["base"], real_rename=lay.get("real_rename", False))
         lay["result"] = result
         lay["calls"] = lay["log"].read_text().splitlines() if lay["log"].exists() else []
@@ -1837,6 +1854,75 @@ restore_status_line && echo status-ok || echo status-blocked
                 self.assertIn("state-ok", result.stdout); self.assertIn("status-ok", result.stdout)
                 self.assertIn("restore cleanup pending", result.stderr)
                 self.assertIn("cleanup pending", result.stdout)
+
+    # ---- recovery at boot (scripts/lib/restore-boot) ----
+    OTHER_BOOT_ID = "f0e1d2c3-b4a5-4968-8776-655443322110"
+
+    def real_recover_wrapper(self):
+        # The journal's own `recover`, exactly as the controller writes it.
+        text = CONTROLLER.read_text()
+        start = "cat > \"$building/recover\" <<'RECOVER'\n"
+        a = text.index(start) + len(start)
+        return text[a:text.index("\nRECOVER\n", a) + 1]
+
+    def boot_ready(self, **layout_args):
+        """A journal from the harness whose `recover` is the real wrapper and whose controller is the harness."""
+        lay = self.layout(*layout_args.pop("args"), **layout_args)
+        self.reconcile(lay, via_recover=True)
+        recover = lay["journal"] / "recover"
+        recover.write_text(self.real_recover_wrapper()); recover.chmod(0o700)
+        return lay
+
+    def run_restore_boot(self, lay, boot_id):
+        seam = lay["base"] / "boot_id.now"; seam.write_text(boot_id + "\n")
+        # The harness keeps its journals in <base>/restore; the boot script looks under var/lib/vesselstack/restore.
+        link = lay["base"] / "var/lib/vesselstack/restore"
+        if not link.exists():
+            link.parent.mkdir(parents=True, exist_ok=True); link.symlink_to(lay["base"] / "restore")
+        env = dict(os.environ, SYSTEM_ROOT=str(lay["base"]), VESSELSTACK_BOOT_ID_FILE=str(seam), RESTORE_BOOT_BUSY_WAIT="0", RESTORE_BOOT_TIMEOUT="120")
+        return subprocess.run(["/bin/bash", str(BOOT_SCRIPT)], env=env, capture_output=True, text=True, timeout=300)
+
+    def test_the_boot_script_drives_the_real_recover_and_the_folders_come_back(self):
+        for name, phase, data_step, root_step, published in self.CRASH_POINTS:
+            with self.subTest(name):
+                lay = self.boot_ready(args=(phase, data_step, root_step, published))
+                self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+                result = self.run_restore_boot(lay, self.OTHER_BOOT_ID)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                record = (lay["base"] / "restore" / "current").exists()
+                self.assertFalse(record, "the journal is archived")
+                self.assertEqual(phase_of(self.archive(lay, "rolled-back")), "rolled-back")
+                self.assertEqual(inode(lay["root"]), lay["original"]["root"]); self.assertEqual(inode(lay["data"]), lay["original"]["data"])
+                self.assertEqual((lay["root"] / "marker").read_text(), "old-root"); self.assertEqual((lay["data"] / "marker").read_text(), "old-data")
+                values = dict(line.partition("=")[::2] for line in (lay["base"] / "restore" / "boot-recovery").read_text().splitlines())
+                self.assertEqual((values["result"], values["phase_after"], values["phase_before"], values["attempts"], values["rc"]),
+                                 ("rolled-back", "archived", phase, "1", "0"))
+                self.assertIn("Rollback completed", (lay["base"] / "restore" / "boot-recovery.log").read_text())
+
+    def test_the_boot_script_moves_nothing_when_the_journal_is_from_this_boot(self):
+        lay = self.boot_ready(args=("root-swap", "swapped", "swapped", False))
+        result = self.run_restore_boot(lay, BOOT_ID)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(lay["journal"].exists()); self.assertEqual(phase_of(lay["journal"]), "root-swap")
+        self.assertEqual(inode(lay["root"]), lay["new"]["root"]); self.assertEqual(inode(lay["data"]), lay["new"]["data"])
+        self.assertFalse((lay["base"] / "restore" / "boot-recovery").exists())
+
+    def test_a_rollback_leaves_the_boot_recovery_unit_script_and_setting_alone(self):
+        lay = self.layout("externals", "swapped", "swapped", True)
+        planted = {lay["systemd"] / "boot-vesselstack-restore.service": "unit",
+                   lay["base"] / "usr/local/lib/vesselstack-recovery/restore-boot": "script",
+                   lay["base"] / "etc/vesselstack-recovery.conf": "MODE=hold\n",
+                   lay["systemd"] / "multi-user.target.wants/boot-vesselstack-restore.service": None}
+        for path, text in planted.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if text is None: path.symlink_to("../boot-vesselstack-restore.service")
+            else: path.write_text(text)
+        self.reconcile(lay)
+        self.assert_rolled_back(lay)
+        for path, text in planted.items():
+            if text is None: self.assertTrue(path.is_symlink(), path)
+            else: self.assertEqual(path.read_text(), text, path)
+        self.assertFalse((lay["systemd"] / "vesselstack-extra.service").exists(), "the rollback did remove what the restore published")
 
     # ---- recover abandon ----
     def recover_harness(self, lay, arguments, env=""):

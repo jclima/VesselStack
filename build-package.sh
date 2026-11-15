@@ -68,6 +68,7 @@ for required_runtime in \
     systemd/vesselstack-telemetry-sample.timer.in templates/prometheus-node-exporter.yml scripts/render-homepage.py \
     systemd/vesselstack-homepage-refresh.service.in scripts/reconcile-lifecycle.sh \
     scripts/lib/record-backup-result scripts/lib/remediate.sh scripts/lib/restore_journal.py \
+    scripts/lib/restore-boot systemd/boot-vesselstack-restore.service.in \
     scripts/configure-signalk-datapath.py templates/grafana/dashboards/boat-overview.json \
     scripts/configure-nodered.py templates/node-red/settings.js templates/node-red/vesselstack-example-flows.json \
     systemd/vesselstack-backup.service.in systemd/vesselstack-backup.timer.in \

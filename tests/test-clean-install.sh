@@ -280,6 +280,26 @@ if grep -qx 'enable vesselstack-alerts.timer' "$FAKE_BIN/systemctl.log"; then
     echo "The alerts timer was enabled with ALERTS_ENABLE=false" >&2
     exit 1
 fi
+# Recovery at boot: the script and the unit are installed, the unit is enabled and never started, the
+# setting defaults to rollback, and the unit does not look like a vesselstack-* unit.
+RECOVERY_SCRIPT="$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery/restore-boot"
+RECOVERY_UNIT="$SYSTEM_ROOT/etc/systemd/system/boot-vesselstack-restore.service"
+RECOVERY_CONF="$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+test "$(stat -c '%u:%a' "$RECOVERY_SCRIPT")" = "0:755"
+test "$(stat -c '%u:%a' "$RECOVERY_UNIT")" = "0:644"
+test "$(stat -c '%u:%a' "$RECOVERY_CONF")" = "0:644"
+cmp -s "$REPO_ROOT/scripts/lib/restore-boot" "$RECOVERY_SCRIPT"
+cmp -s "$REPO_ROOT/systemd/boot-vesselstack-restore.service.in" "$RECOVERY_UNIT"
+grep -qx 'ExecStart=/usr/local/lib/vesselstack-recovery/restore-boot' "$RECOVERY_UNIT"
+grep -qx 'ConditionPathExists=/var/lib/vesselstack/restore/current' "$RECOVERY_UNIT"
+grep -qx 'RefuseManualStart=yes' "$RECOVERY_UNIT"
+grep -qx 'enable boot-vesselstack-restore.service' "$FAKE_BIN/systemctl.log"
+if grep -Eq '^(start|restart|enable --now) .*boot-vesselstack-restore' "$FAKE_BIN/systemctl.log"; then
+    echo "The boot recovery unit was started by the installer" >&2
+    exit 1
+fi
+grep -qx 'MODE=rollback' "$RECOVERY_CONF"
+test "$(wc -l < "$RECOVERY_CONF" | tr -d ' ')" = 1
 # Weekly schedule + a watchdog device on a Raspberry Pi: both drop-ins, the timer, and daemon-reexec.
 UNATTENDED_CONFIG="$TEST_ROOT/unattended.env"
 cp "$CONFIG" "$UNATTENDED_CONFIG"
@@ -294,6 +314,25 @@ run_unattended() {  # [env assignments...]
 printf 'Generic x86 board\0' > "$SYSTEM_ROOT/proc/device-tree/model"
 run_unattended >/dev/null
 test ! -e "$WATCHDOG_DROPIN"
+# VESSELSTACK_RESTORE_AT_BOOT=hold writes MODE=hold; running again is idempotent; a bad value is refused.
+printf '\nVESSELSTACK_RESTORE_AT_BOOT="hold"\n' >> "$UNATTENDED_CONFIG"
+run_unattended >/dev/null
+grep -qx 'MODE=hold' "$RECOVERY_CONF"
+run_unattended >/dev/null
+grep -qx 'MODE=hold' "$RECOVERY_CONF"
+test "$(wc -l < "$RECOVERY_CONF" | tr -d ' ')" = 1
+test "$(stat -c '%u:%a' "$RECOVERY_CONF")" = "0:644"
+bad_config="$TEST_ROOT/bad-restore-at-boot.env"
+cp "$UNATTENDED_CONFIG" "$bad_config"
+printf 'VESSELSTACK_RESTORE_AT_BOOT="sometimes"\n' >> "$bad_config"
+rc=0
+env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$bad_config" >/dev/null 2>&1 || rc=$?
+test "$rc" -ne 0
+grep -qx 'MODE=hold' "$RECOVERY_CONF"
+rm -f -- "$bad_config"
+printf 'VESSELSTACK_RESTORE_AT_BOOT="rollback"\n' >> "$UNATTENDED_CONFIG"
+run_unattended >/dev/null
+grep -qx 'MODE=rollback' "$RECOVERY_CONF"
 # true arms on any host that has the device.
 printf '\nVESSELSTACK_WATCHDOG="true"\n' >> "$UNATTENDED_CONFIG"
 run_unattended >/dev/null

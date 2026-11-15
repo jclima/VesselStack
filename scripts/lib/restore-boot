@@ -1,0 +1,297 @@
+#!/bin/bash
+# Recovery at boot for an interrupted VesselStack restore.
+#
+# Installed as /usr/local/lib/vesselstack-recovery/restore-boot and run once per boot by
+# boot-vesselstack-restore.service, only when /var/lib/vesselstack/restore/current exists.
+# It decides from the journal alone and then either runs the journal's own `recover rollback`
+# or HOLDS (changes nothing and writes down why). It never stops, starts or moves anything itself.
+#
+# Needs only bash, coreutils, sed, timeout and the journal's own files. It does not use python,
+# the application folder or vesselstackctl, because a restore may have just replaced them.
+#
+# Environment (tests): SYSTEM_ROOT prefix for every path, VESSELSTACK_BOOT_ID_FILE, RESTORE_BOOT_TIMEOUT
+# (default 28m) and RESTORE_BOOT_BUSY_WAIT (seconds, default 20).
+#
+# Files: $dir/boot-recovery (the record, key=value, written atomically, mode 0600) and
+# $dir/boot-recovery.log (what was run and its output, mode 0600, truncated at each run).
+# Exit status: 0 for every decided outcome (also a hold or a failed rollback); non-zero only when
+# this script itself broke.
+
+set -euo pipefail
+umask 077
+
+SYSTEM_ROOT=${SYSTEM_ROOT:-}
+dir="$SYSTEM_ROOT/var/lib/vesselstack/restore"
+journal="$dir/current"
+record="$dir/boot-recovery"
+log="$dir/boot-recovery.log"
+conf="$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+boot_file=${VESSELSTACK_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
+run_timeout=${RESTORE_BOOT_TIMEOUT:-28m}
+busy_wait=${RESTORE_BOOT_BUSY_WAIT:-20}
+uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+id_re='^[A-Za-z0-9._-]{1,64}$'
+
+# The record, as shell variables.
+r_journal_id='' r_attempts=0 r_started='' r_finished='' r_finished_epoch='' r_phase_before='' r_phase_after=''
+r_boot_id='' r_action='' r_rc='' r_result='' r_reason='' r_note='' r_mode=''
+finished_cleanly=0
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# One printable line: control characters become "?", length is capped.
+clean() {
+    local text=${1//[![:print:]]/?}
+    printf '%s' "${text:0:300}"
+}
+
+log_line() { printf '%s %s\n' "$(now_utc)" "$1" >> "$log" 2>/dev/null || true; }
+
+log_started=0
+start_log() {
+    [ "$log_started" -eq 0 ] || return 0
+    log_started=1
+    : > "$log" || true
+    chmod 0600 "$log" 2>/dev/null || true
+}
+
+# Writes the record from the r_* variables: a temp file in the same directory, then a rename.
+save_record() {
+    local tmp
+    tmp=$(mktemp "$dir/.boot-recovery.XXXXXX") || return 1
+    {
+        printf 'journal_id=%s\n' "$(clean "$r_journal_id")"
+        printf 'attempts=%s\n' "$r_attempts"
+        printf 'started=%s\n' "$(clean "$r_started")"
+        printf 'finished=%s\n' "$(clean "$r_finished")"
+        printf 'finished_epoch=%s\n' "$(clean "$r_finished_epoch")"
+        printf 'phase_before=%s\n' "$(clean "$r_phase_before")"
+        printf 'phase_after=%s\n' "$(clean "$r_phase_after")"
+        printf 'boot_id=%s\n' "$(clean "$r_boot_id")"
+        printf 'mode=%s\n' "$(clean "$r_mode")"
+        printf 'action=%s\n' "$(clean "$r_action")"
+        printf 'rc=%s\n' "$(clean "$r_rc")"
+        printf 'result=%s\n' "$(clean "$r_result")"
+        printf 'reason=%s\n' "$(clean "$r_reason")"
+        printf 'note=%s\n' "$(clean "$r_note")"
+    } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$record" || { rm -f -- "$tmp"; return 1; }
+}
+
+# Last resort: an internal error of this script is written into the record when it still can be.
+# shellcheck disable=SC2329  # runs from the EXIT trap
+on_exit() {
+    local status=$?
+    if [ "$status" -ne 0 ] && [ "$finished_cleanly" -eq 0 ]; then
+        r_result=internal-error
+        r_rc=$status
+        r_finished=$(now_utc) || true
+        r_finished_epoch=$(date +%s) || true
+        r_reason="the boot recovery script stopped with status $status"
+        save_record 2>/dev/null || true
+        echo "VesselStack recovery at boot: the recovery script itself failed (status $status); see $log" >&2
+    fi
+}
+trap on_exit EXIT
+
+# Value of KEY in the journal state: exactly one line is a value, no line is empty, a repeated key is
+# unreadable. Sets state_value; returns 1 when unreadable.
+state_value=''
+state_get() {
+    local key=$1 count
+    count=$(sed -n "/^$key=/p" "$journal/state" 2>/dev/null | wc -l | tr -d ' ') || return 1
+    case "$count" in
+        0) state_value=''; return 0 ;;
+        1) ;;
+        *) return 1 ;;
+    esac
+    state_value=$(clean "$(sed -n "s/^$key=//p" "$journal/state")")
+}
+
+# Reads a key of the previous record (defensively: it is data).
+record_get() {
+    [ -f "$record" ] && [ ! -L "$record" ] || return 0
+    sed -n "s/^$1=//p" "$record" 2>/dev/null | sed -n '1p'
+}
+
+# ---- mode -------------------------------------------------------------------------------------
+mode=rollback
+if [ -f "$conf" ] && [ ! -L "$conf" ]; then
+    # Parsed, never sourced: the first MODE= line decides, and only these two words count.
+    conf_mode=$(sed -n 's/^MODE=//p' "$conf" 2>/dev/null | sed -n '1p' | tr -d '[:space:]') || conf_mode=''
+    case "$conf_mode" in hold) mode=hold ;; esac
+fi
+
+# ---- nothing to do ----------------------------------------------------------------------------
+if [ ! -e "$journal" ] && [ ! -L "$journal" ]; then
+    echo "VesselStack recovery at boot: no restore is pending; nothing to do"
+    finished_cleanly=1
+    exit 0
+fi
+
+cur_boot=''
+if [ -r "$boot_file" ]; then
+    cur_boot=$(sed -n '1p' "$boot_file" 2>/dev/null | tr -d '[:space:]') || cur_boot=''
+fi
+[[ $cur_boot =~ $uuid_re ]] || cur_boot=''
+r_boot_id=$cur_boot
+r_mode=$mode
+
+# ---- hold -------------------------------------------------------------------------------------
+hold() {
+    local why=$1
+    start_log
+    log_line "HOLD: $why"
+    r_action=hold
+    r_result=held
+    r_rc=''
+    r_reason=$why
+    r_started=$(now_utc)
+    r_finished=$r_started
+    r_finished_epoch=$(date +%s)
+    save_record || true
+    if [ -f "$journal/recover" ]; then
+        {
+            echo "--- recover status ---"
+            timeout 60 /bin/bash "$journal/recover" status 2>&1 || true
+        } >> "$log" 2>&1 || true
+    fi
+    echo "VesselStack recovery at boot: HELD, nothing was changed: $why. See: sudo $journal/recover status"
+    finished_cleanly=1
+    exit 0
+}
+
+# ---- read the journal -------------------------------------------------------------------------
+phase='' jid='' jboot='' rollback_from='' kind=''
+unreadable=''
+if [ ! -s "$journal/state" ] || [ ! -s "$journal/recover" ]; then
+    unreadable=1
+else
+    state_get phase && phase=$state_value || unreadable=1
+    state_get id && jid=$state_value || unreadable=1
+    state_get boot_id && jboot=$state_value || unreadable=1
+    state_get rollback_from && rollback_from=$state_value || unreadable=1
+    state_get last_error_kind && kind=$state_value || unreadable=1
+    if [ -z "$phase" ] || ! [[ $jid =~ $id_re ]]; then unreadable=1; fi
+    if [ -n "$jboot" ] && ! [[ $jboot =~ $uuid_re ]]; then unreadable=1; fi
+    case "$phase" in
+        prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting|committed|rolling-back|rolled-back|rollback-failed|abandoned) ;;
+        *) unreadable=1 ;;
+    esac
+fi
+r_phase_before=$phase
+r_journal_id=$jid
+
+prev_attempts=0
+if [ -n "$jid" ] && [ "$(record_get journal_id)" = "$jid" ]; then
+    prev_attempts=$(record_get attempts)
+    [[ $prev_attempts =~ ^[0-9]{1,3}$ ]] || prev_attempts=0
+fi
+r_attempts=$prev_attempts
+
+# ---- decide (first match wins) ----------------------------------------------------------------
+if [ -n "$unreadable" ]; then
+    # `recover` is the journal's own entry point; a missing one is the same unreadable journal.
+    hold "the journal cannot be read"
+fi
+if [ -z "$cur_boot" ]; then
+    hold "cannot read this boot's id"
+fi
+if [ -z "$jboot" ]; then
+    hold "the journal does not say which boot wrote it"
+fi
+if [ "$jboot" = "$cur_boot" ]; then
+    # Written in this very boot: a restore may be running right now. Not a recovery; write no record.
+    log_line "no action: the journal (phase $phase) was written in this boot; a restore may be running"
+    echo "VesselStack recovery at boot: the restore journal was written in this boot; a restore may be running; nothing to do"
+    finished_cleanly=1
+    exit 0
+fi
+
+action=''
+case "$phase" in
+    committed|rolled-back|abandoned) action=cleanup ;;
+esac
+if [ -z "$action" ]; then
+    [ "$mode" != hold ] || hold "automatic rollback is turned off"
+    case "$phase" in
+        prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) action=rollback ;;
+        rolling-back)
+            [ -n "$rollback_from" ] || hold "the journal does not say where the rollback started"
+            action=rollback ;;
+        rollback-failed)
+            [ "$kind" = retry ] || hold "a retry will not help (the earlier rollback stopped for a reason a retry cannot change)"
+            [ -n "$rollback_from" ] || hold "the journal does not say where the rollback started"
+            [ "$prev_attempts" -lt 2 ] || hold "the rollback was already tried twice at boot"
+            action=rollback ;;
+    esac
+fi
+r_action=$action
+if [ "$phase" = starting ]; then
+    r_note='the restore may have finished except for its last step; the restored folders are kept as *.failed-restore-<stamp>'
+fi
+
+# ---- run --------------------------------------------------------------------------------------
+start_log
+r_attempts=$((prev_attempts + 1))
+r_started=$(now_utc)
+r_finished=''
+r_finished_epoch=''
+r_rc=''
+r_result=''
+r_reason=''
+# Written BEFORE the run, so a hang, a brown-out or a reboot loop still counts as an attempt.
+save_record
+echo "VesselStack recovery at boot: restore journal in phase $phase from an earlier boot; running: recover rollback ($action)"
+log_line "running: recover rollback (phase $phase, action $action, attempt $r_attempts)"
+
+rc=0
+tries=0
+while :; do
+    tries=$((tries + 1))
+    rc=0
+    timeout -k 60 "$run_timeout" /bin/bash "$journal/recover" rollback >> "$log" 2>&1 || rc=$?
+    [ "$rc" -eq 75 ] || break
+    if [ "$tries" -ge 3 ]; then break; fi
+    log_line "the lifecycle lock is busy; waiting ${busy_wait}s"
+    sleep "$busy_wait"
+done
+
+if [ "$rc" -eq 75 ]; then
+    # Not an attempt and not a failure: another operation holds the lock.
+    r_attempts=$prev_attempts
+    hold "another VesselStack operation holds the lock"
+fi
+
+r_rc=$rc
+r_finished=$(now_utc)
+r_finished_epoch=$(date +%s)
+if [ ! -e "$journal" ] && [ ! -L "$journal" ]; then
+    r_phase_after=archived
+elif [ -s "$journal/state" ] && state_get phase; then
+    r_phase_after=$state_value
+else
+    r_phase_after=unknown
+fi
+case "$rc" in
+    0) if [ "$action" = cleanup ]; then r_result=cleaned-up; else r_result=rolled-back; fi ;;
+    3) if [ "$action" = cleanup ]; then r_result=failed; else r_result=rolled-back-not-started; fi ;;
+    124) r_result=timed-out ;;
+    *) r_result=failed ;;
+esac
+case "$r_result" in
+    timed-out) r_reason="recover rollback did not finish within $run_timeout" ;;
+    failed) r_reason="recover rollback exited with status $rc" ;;
+esac
+save_record
+log_line "recover rollback exited with status $rc ($r_result)"
+case "$r_result" in
+    rolled-back) echo "VesselStack recovery at boot: the interrupted restore was rolled back" ;;
+    cleaned-up) echo "VesselStack recovery at boot: the leftovers of a finished restore were cleaned up" ;;
+    rolled-back-not-started) echo "VesselStack recovery at boot: the interrupted restore was rolled back, but the stack was not started; run: sudo vesselstackctl start" ;;
+    timed-out) echo "VesselStack recovery at boot: the rollback did not finish in time; see $log and: sudo $journal/recover status" ;;
+    *) echo "VesselStack recovery at boot: the rollback failed (status $rc); see $log and: sudo $journal/recover status" ;;
+esac
+finished_cleanly=1
+exit 0
