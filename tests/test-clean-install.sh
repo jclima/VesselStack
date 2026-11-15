@@ -438,7 +438,7 @@ if run_pending_install > "$TEST_ROOT/pending.out" 2> "$TEST_ROOT/pending.err"; t
 fi
 grep -q 'To resolve this by hand:' "$TEST_ROOT/pending.err"
 grep -q "sudo mv $PENDING_DIR $PENDING_DIR.manual-" "$TEST_ROOT/pending.err"
-grep -q 'run: sudo vesselstackctl doctor' "$TEST_ROOT/pending.err"
+grep -q 'finish with: sudo vesselstackctl doctor' "$TEST_ROOT/pending.err"
 rm -rf -- "${PENDING_DIR:?}"
 test ! -e "$APP_ROOT/config/displays-bridge.env"
 test ! -e "$APP_ROOT/config/displays.json"

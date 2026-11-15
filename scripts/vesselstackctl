@@ -62,12 +62,20 @@ restore_state_readable() {
 # The way out of a journal that cannot be used (state unreadable, a repeated key, or rejected by the
 # validator). The same text everywhere. Root and data are printed only when the state can still be read.
 restore_manual_procedure() {
-    local dir=$1 root data stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
+    local dir=$1 root data app stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
     root=$(restore_state_peek "$dir" root)
     data=$(restore_state_peek "$dir" data)
+    root=${root//[![:print:]]/?}
+    data=${data//[![:print:]]/?}
+    app=$root
     [ -n "$root" ] || root='(not readable from the journal)'
     [ -n "$data" ] || data='(not readable from the journal)'
+    [ -n "$app" ] || app='<application folder>'
     stamp=$(restore_state_peek "$dir" stamp)
+    # A repeated key of another name makes the quiet read fail for every key: look at the stamp= lines directly.
+    if ! [[ $stamp =~ $stamp_re ]]; then
+        stamp=$(sed -n 's/^stamp=//p' "$dir/state" 2>/dev/null | sort -u 2>/dev/null || true)
+    fi
     # Only a stamp of the shape the validator accepts is ever printed (anything else counts as not readable).
     if [[ $stamp =~ $stamp_re ]]; then
         suffix=$stamp
@@ -75,22 +83,37 @@ restore_manual_procedure() {
      <folder>.failed-restore-* folder with a different stamp was left by an earlier restore: leave it alone."
     else
         suffix='<stamp>'
-        note="The stamp could not be read from the journal. If more than one <folder>.pre-restore-* exists next to a
-     folder, this restore's is normally the one with the newest stamp (the stamp is a UTC time). A boat
-     computer's clock can be wrong, so also compare the folders' modification times (ls -ld) and, if still
-     unsure, stop and move nothing."
+        note="The stamp could not be read from the journal, so these steps cannot tell this restore's folders from
+     ones left by earlier restores. A <folder>.pre-restore-* folder whose stamp also names an archived journal
+     next to the journal directory (${dir%/*}/done-<stamp>, rolled-back-<stamp> or abandoned-<stamp>)
+     belongs to that earlier restore: ignore it. If you cannot tell for certain which folder belongs to this
+     restore, move no folder: do step 1 and step 4 only if both folders are present, and otherwise stop and
+     get help."
     fi
     cat >&2 <<EOF
 To resolve this by hand:
-  1) the two folders are the application folder $root and the data folder $data. For each one:
+  1) stop everything that uses the two folders. After a reboot the stack starts again by itself and keeps
+     writing into a folder even after it is renamed, and vesselstackctl stop is refused while this restore is
+     pending. These commands need no vesselstackctl (never stop vesselstack-firewall or vesselstack-socketcan):
+       systemctl list-units 'vesselstack-*' --state=active --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
+       sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
+     Look at sudo docker ps too and stop any other container that mounts either folder. Then run the first
+     command again without its last part (the xargs) and sudo docker ps, and go on only when nothing is left;
+  2) the two folders are the application folder $root and the data folder $data. For each one:
      - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
        move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
      - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
      - do not delete anything;
      $note
-  2) both folders must come from the same side (both the previous ones) before you go on;
-  3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
+  3) both folders must come from the same side (both the previous ones) before you go on;
+  4) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  5) start the stack and check it. If the moved-aside journal ($dir.manual-...) contains both files/ and
+     manifest, the restore had begun publishing system files and the unit files, /usr/local/sbin/vesselstackctl
+     and the helpers may belong to the restored release: run the installer of the application folder instead:
+       sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
+     (the snapshot of the previous system files stays in the moved-aside journal). Otherwise run:
+       sudo vesselstackctl start
+     Either way, finish with: sudo vesselstackctl doctor
 EOF
 }
 # Prints the one-line "Restore ..." status; fails when the restore blocks other commands. A restore
@@ -3619,6 +3642,31 @@ restore_abort() {
     esac
     return 1
 }
+# The two ways out when the previous folder (PRE = <folder>.pre-restore-<stamp>) cannot be put back. The by-hand
+# procedure is not printed here: its folder step would move a foreign folder into place. The stop commands are
+# the lines of step 1 of that procedure, taken from its own output so the text exists once.
+restore_previous_ways_out() {
+    local journal=$1 pre=$2 link=${3:-} stop_lines
+    stop_lines=$(restore_manual_procedure "$journal" 2>&1 | grep -E '^ +(systemctl list-units|sudo docker ps -q --filter)' | sed 's/^ */      /' || true)
+    {
+        echo "The previous folder cannot be put back by this recovery, and trying again will not change that. Two ways out:"
+        echo "  (a) If the real previous folder still exists:"
+        if [ -n "$link" ]; then
+            echo "      $pre is a symbolic link. Replace the link with the folder it points to: remove the link itself"
+            echo "      (sudo rm $pre removes only the link), then MOVE that folder to $pre with sudo mv."
+        else
+            echo "      MOVE it to $pre with sudo mv."
+        fi
+        echo "      If a different folder is at that path now, move that one away first (do not delete it)."
+        echo "      Use mv on the same disk: a copy is never recognised, the folder is identified by its identity."
+        echo "      Then run: sudo $journal/recover rollback"
+        echo "  (b) If it is gone, this restore cannot be rolled back. Stop the stack by hand (never stop"
+        echo "      vesselstack-firewall or vesselstack-socketcan; also stop any other container that mounts either folder):"
+        if [ -n "$stop_lines" ]; then printf '%s\n' "$stop_lines"; fi
+        echo "      then move the journal aside: sudo mv $journal $journal.manual-$(date +%Y%m%d)"
+        echo "      and restore again from a backup, which replaces both folders together: sudo vesselstackctl restore ARCHIVE"
+    } >&2
+}
 # A third argument "manual" says the journal itself cannot be used (retrying cannot help): then the way out by hand is
 # printed. Every other refusal names its cause and ends with the one command to run again once it is fixed.
 restore_reconcile_fail() {
@@ -3634,6 +3682,8 @@ restore_reconcile_fail() {
     restore_firewall_notice >&2
     if [ "$kind" = manual ]; then
         restore_manual_procedure "$journal"
+    elif [ "$kind" = previous ]; then
+        restore_previous_ways_out "$journal" "$4" "${5:-}"
     else
         echo "Fix the cause above, then run the recovery again: sudo $journal/recover rollback" >&2
     fi
@@ -3719,13 +3769,17 @@ restore_tree_preflight() {
         return 1
     fi
     current=$restore_current
-    if ! restore_same_ino "$current" "$live" && [ -L "$path.pre-restore-$stamp" ]; then
-        restore_reconcile_fail "$journal" "the previous $label tree $path.pre-restore-$stamp is a symbolic link; refusing to move it into place. Nothing was changed"
+    restore_same_ino "$current" "$live" && return 0
+    if [ -L "$path.pre-restore-$stamp" ]; then
+        restore_reconcile_fail "$journal" "the previous $label tree $path.pre-restore-$stamp is a symbolic link; refusing to move it into place. Nothing was moved" previous "$path.pre-restore-$stamp" link
         return 1
-    fi
-    if ! restore_same_ino "$current" "$live" && [ -e "$path.pre-restore-$stamp" ] && \
-       ! restore_same_ino "$(restore_inode "$journal" "$path.pre-restore-$stamp")" "$live"; then
-        restore_reconcile_fail "$journal" "$path.pre-restore-$stamp is not the previous $label tree this restore recorded (a different folder); nothing was moved"
+    elif [ -e "$path.pre-restore-$stamp" ]; then
+        if ! restore_same_ino "$(restore_inode "$journal" "$path.pre-restore-$stamp")" "$live"; then
+            restore_reconcile_fail "$journal" "$path.pre-restore-$stamp is not the previous $label tree this restore recorded (a different folder); nothing was moved" previous "$path.pre-restore-$stamp"
+            return 1
+        fi
+    else
+        restore_reconcile_fail "$journal" "the previous $label tree $path.pre-restore-$stamp does not exist and $path is not the original; nothing was moved" previous "$path.pre-restore-$stamp"
         return 1
     fi
 }
@@ -3961,7 +4015,12 @@ restore_verify_stopped() {
                 restore_verify_suffix="; nothing was moved"
                 return 1
             fi
-            echo "WARN these containers could not be recorded in the journal (is the disk full?), so they will NOT be started again automatically:$restore_container_names. They are stopped now so the recovery can go on; start them yourself afterwards: sudo docker start${restore_container_names}" >&2
+            local i others=''
+            for i in "${!restore_container_name_list[@]}"; do
+                [ "${restore_container_label_list[i]:--}" = vesselstack ] || others="$others ${restore_container_name_list[i]}"
+            done
+            echo "WARN these containers could not be recorded in the journal (is the disk full?), so they may not be started again automatically:$restore_container_names. They are stopped now so the recovery can go on." >&2
+            if [ -n "$others" ]; then echo "Start the ones outside the stack yourself afterwards: sudo docker start${others}" >&2; fi
         fi
         tried=("${restore_container_name_list[@]}")
         docker stop -t 30 "${restore_container_ids[@]}" >/dev/null 2>&1 || true
@@ -4034,11 +4093,11 @@ restore_reconcile_tree() {
         fi
     fi
     if [ -L "$pre" ]; then
-        restore_reconcile_fail "$journal" "the previous $label tree $pre is a symbolic link; refusing to move it into place"
+        restore_reconcile_fail "$journal" "the previous $label tree $pre is a symbolic link; refusing to move it into place. The restored tree may already have been set aside to $failed" previous "$pre" link
         return 1
     elif [ -e "$pre" ]; then
         if ! restore_same_ino "$(restore_inode "$journal" "$pre")" "$live_ino"; then
-            restore_reconcile_fail "$journal" "$pre is not the previous $label tree this restore recorded (a different folder); it was not moved into place"
+            restore_reconcile_fail "$journal" "$pre is not the previous $label tree this restore recorded (a different folder); it was not moved into place. The restored tree may already have been set aside to $failed" previous "$pre"
             return 1
         fi
         if [ -e "$path" ] || [ -L "$path" ]; then
@@ -4050,7 +4109,7 @@ restore_reconcile_tree() {
             return 1
         }
     else
-        restore_reconcile_fail "$journal" "the previous $label tree $pre does not exist and $path is not the original; nothing was changed"
+        restore_reconcile_fail "$journal" "the previous $label tree $pre does not exist and $path is not the original. The restored tree may already have been set aside to $failed" previous "$pre"
         return 1
     fi
 }
@@ -4190,7 +4249,9 @@ restore_reconcile_run() {
             touched=2
             if [ -n "$st_abandoned_from" ]; then
                 touched=0
-                if restore_abandoned_touched "$st_abandoned_from"; then touched=1; fi
+                # Returns 0 (touched), 1 (not touched) or 2 (not a phase the journal can explain: it may have).
+                restore_abandoned_touched "$st_abandoned_from" || touched=$?
+                case "$touched" in 0) touched=1 ;; 1) touched=0 ;; esac
             fi
             if [ "$touched" -ne 0 ]; then restore_keep_snapshot=1; fi
             if ! restore_archive_journal "$journal" abandoned; then
@@ -4471,7 +4532,13 @@ restore_system_files_touched() {
 }
 # Like restore_system_files_touched, for the phase the restore was in (or abandoned from).
 restore_abandoned_touched() {
-    local st_phase=$1
+    local st_phase=$1 st_rollback_from=${st_rollback_from:-}
+    case "$st_phase" in
+        rolling-back|rollback-failed) [ -n "$st_rollback_from" ] || st_rollback_from=starting ;;
+        prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) ;;
+        # A value the journal does not explain: it may have touched the system files.
+        *) return 2 ;;
+    esac
     restore_system_files_touched
 }
 # Give up on the rollback: allowed only when both original trees are in place. Archives the journal as
@@ -4696,12 +4763,21 @@ dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 journal_peek() { python3 -I "$dir/restore_journal.py" get "$dir" "$1" 2>/dev/null || true; }
 # A journal that cannot be used: say why, then how to resolve it by hand.
 cannot_read() {
-    local root data stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
+    echo "Cannot read the restore journal in $dir: $1" >&2
+    local root data app stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
     root=$(journal_peek root)
     data=$(journal_peek data)
+    root=${root//[![:print:]]/?}
+    data=${data//[![:print:]]/?}
+    app=$root
     [ -n "$root" ] || root='(not readable from the journal)'
     [ -n "$data" ] || data='(not readable from the journal)'
+    [ -n "$app" ] || app='<application folder>'
     stamp=$(journal_peek stamp)
+    # A repeated key of another name makes the quiet read fail for every key: look at the stamp= lines directly.
+    if ! [[ $stamp =~ $stamp_re ]]; then
+        stamp=$(sed -n 's/^stamp=//p' "$dir/state" 2>/dev/null | sort -u 2>/dev/null || true)
+    fi
     # Only a stamp of the shape the validator accepts is ever printed (anything else counts as not readable).
     if [[ $stamp =~ $stamp_re ]]; then
         suffix=$stamp
@@ -4709,23 +4785,37 @@ cannot_read() {
      <folder>.failed-restore-* folder with a different stamp was left by an earlier restore: leave it alone."
     else
         suffix='<stamp>'
-        note="The stamp could not be read from the journal. If more than one <folder>.pre-restore-* exists next to a
-     folder, this restore's is normally the one with the newest stamp (the stamp is a UTC time). A boat
-     computer's clock can be wrong, so also compare the folders' modification times (ls -ld) and, if still
-     unsure, stop and move nothing."
+        note="The stamp could not be read from the journal, so these steps cannot tell this restore's folders from
+     ones left by earlier restores. A <folder>.pre-restore-* folder whose stamp also names an archived journal
+     next to the journal directory (${dir%/*}/done-<stamp>, rolled-back-<stamp> or abandoned-<stamp>)
+     belongs to that earlier restore: ignore it. If you cannot tell for certain which folder belongs to this
+     restore, move no folder: do step 1 and step 4 only if both folders are present, and otherwise stop and
+     get help."
     fi
-    echo "Cannot read the restore journal in $dir: $1" >&2
     cat >&2 <<MANUAL
 To resolve this by hand:
-  1) the two folders are the application folder $root and the data folder $data. For each one:
+  1) stop everything that uses the two folders. After a reboot the stack starts again by itself and keeps
+     writing into a folder even after it is renamed, and vesselstackctl stop is refused while this restore is
+     pending. These commands need no vesselstackctl (never stop vesselstack-firewall or vesselstack-socketcan):
+       systemctl list-units 'vesselstack-*' --state=active --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
+       sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
+     Look at sudo docker ps too and stop any other container that mounts either folder. Then run the first
+     command again without its last part (the xargs) and sudo docker ps, and go on only when nothing is left;
+  2) the two folders are the application folder $root and the data folder $data. For each one:
      - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
        move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
      - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
      - do not delete anything;
      $note
-  2) both folders must come from the same side (both the previous ones) before you go on;
-  3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
+  3) both folders must come from the same side (both the previous ones) before you go on;
+  4) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  5) start the stack and check it. If the moved-aside journal ($dir.manual-...) contains both files/ and
+     manifest, the restore had begun publishing system files and the unit files, /usr/local/sbin/vesselstackctl
+     and the helpers may belong to the restored release: run the installer of the application folder instead:
+       sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
+     (the snapshot of the previous system files stays in the moved-aside journal). Otherwise run:
+       sudo vesselstackctl start
+     Either way, finish with: sudo vesselstackctl doctor
 MANUAL
     exit 1
 }

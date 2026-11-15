@@ -1,6 +1,6 @@
 """Real temp-root subprocess coverage for restore external transactions."""
 from pathlib import Path
-import os, shutil, subprocess, sys, tempfile, unittest
+import os, re, shutil, subprocess, sys, tempfile, unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = ROOT / "scripts/vesselstackctl"
@@ -83,6 +83,26 @@ def controller_function_source(name, end_marker):
 
 def pending_source():
     return controller_function_source("restore_state_peek() {", "ensure_lifecycle_lock() {")
+
+
+def manual_procedure_block(path, function, marker, end):
+    """From stamp_re= through the end of the heredoc of FUNCTION, with only the way a value is read and the
+    indentation of the code normalised (the heredoc body itself is compared exactly by the callers' text)."""
+    text = Path(path).read_text()
+    a = text.index(f"{function}() {{")
+    start = text.index("stamp_re=", a)
+    stop = text.index(end, text.index(marker, start)) + len(end)
+    block = text[start:stop]
+    body_start = block.index(marker + "\n") + len(marker) + 1
+    code, body = block[:body_start], block[body_start:]
+    word = marker[2:]
+    code = code.replace(marker, "<<HEREDOC")
+    body = body.replace("\n" + word + "\n", "\nHEREDOC\n")
+    code = re.sub(r'restore_state_peek "\$dir" (\w+)', r"READ \1", code)
+    code = re.sub(r"journal_peek (\w+)", r"READ \1", code)
+    code = re.sub(r'python3 -I "\$dir/restore_journal\.py" get "\$dir" (\w+) 2>/dev/null \|\| true', r"READ \1", code)
+    code = "\n".join(line.lstrip() for line in code.splitlines())
+    return code, body
 
 
 class RestoreTransactionTests(unittest.TestCase):
@@ -1531,6 +1551,59 @@ restore_validate_state && echo VALID || echo "INVALID $restore_validate_error"
                 self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM ", "controller ", "systemctl stop"))], lay["calls"])
                 self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
 
+    def assert_two_ways_out(self, err, pre):
+        self.assertIn("Two ways out", err)
+        self.assertIn("MOVE", err); self.assertIn(f"{pre}", err)
+        self.assertIn("recover rollback", err)
+        self.assertIn(".manual-", err); self.assertIn("sudo vesselstackctl restore ARCHIVE", err)
+        self.assertIn("xargs -r sudo systemctl stop", err); self.assertIn("xargs -r sudo docker stop", err)
+        self.assertNotIn("To resolve this by hand", err)
+
+    def test_a_missing_pre_restore_tree_is_refused_before_anything_moves_and_every_retry_says_the_same(self):
+        for which in ("root", "data"):
+            with self.subTest(which):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                pre = Path(f"{lay[which]}.pre-restore-{STAMP}")
+                shutil.rmtree(pre)
+                for attempt in (1, 2):
+                    self.reconcile(lay, extra="export LOG_RM=1")
+                    result = lay["result"]
+                    self.assertNotEqual(result.returncode, 0, attempt)
+                    self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
+                    self.assert_two_ways_out(result.stderr, pre)
+                    self.assertIn("does not exist", result.stderr); self.assertIn("Nothing was moved".lower(), result.stderr.lower())
+                    self.assertFalse(self.moves(lay), lay["calls"])
+                    for tree in ("root", "data"):
+                        self.assertEqual(inode(lay[tree]), lay["new"][tree], tree)
+                        self.assertEqual((lay[tree] / "marker").read_text(), f"new-{tree}")
+                    self.assertEqual(sorted(p.name for p in lay["base"].glob("opt/*failed-restore*")), [])
+
+    def test_a_foreign_or_symlinked_pre_restore_tree_gets_the_two_ways_out_and_nothing_moves(self):
+        for kind in ("foreign", "symlink"):
+            for which in ("root", "data"):
+                with self.subTest(kind=kind, which=which):
+                    lay = self.layout("root-swap", "swapped", "swapped", False)
+                    pre = Path(f"{lay[which]}.pre-restore-{STAMP}")
+                    if kind == "foreign":
+                        replace_with_foreign_dir(pre)
+                    else:
+                        moved = Path(f"{pre}.real"); os.rename(pre, moved); pre.symlink_to(moved, target_is_directory=True)
+                    self.reconcile(lay, extra="export LOG_RM=1")
+                    result = lay["result"]
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assert_two_ways_out(result.stderr, pre)
+                    if kind == "symlink":
+                        self.assertIn("Replace the link", result.stderr); self.assertIn("sudo mv", result.stderr)
+                    self.assertFalse(self.moves(lay), lay["calls"])
+                    for tree in ("root", "data"):
+                        self.assertEqual(inode(lay[tree]), lay["new"][tree], tree)
+                    self.assertEqual(sorted(p.name for p in lay["base"].glob("opt/*failed-restore*")), [])
+
+    def test_a_crash_with_the_folder_absent_and_the_previous_one_set_aside_still_rolls_back(self):
+        lay = self.layout("root-swap", "away", "away", False)
+        self.reconcile(lay)
+        self.assert_rolled_back(lay)
+
     def test_a_tree_on_another_filesystem_than_its_parent_is_refused(self):
         lay = self.layout("root-swap", "swapped", "swapped", False)
         # a stub of the helper's same-fs check stands in for a mount point
@@ -1756,12 +1829,8 @@ restore_recover_command {arguments}
         self.assertEqual(pending.returncode, 1); self.assertIn("To resolve this by hand:", pending.stderr)
 
     def test_install_sh_prints_the_same_manual_procedure_as_vesselstackctl(self):
-        def heredoc(path, function):
-            text = Path(path).read_text()
-            a = text.index(f"{function}() {{")
-            start = text.index("<<EOF\n", a) + len("<<EOF\n")
-            return text[start:text.index("\nEOF\n", start)]
-        self.assertEqual(heredoc(ROOT / "install.sh", "restore_manual_procedure"), heredoc(CONTROLLER, "restore_manual_procedure"))
+        self.assertEqual(manual_procedure_block(ROOT / "install.sh", "restore_manual_procedure", "<<EOF", "\nEOF\n"),
+                         manual_procedure_block(CONTROLLER, "restore_manual_procedure", "<<EOF", "\nEOF\n"))
 
     def test_a_journal_the_validator_rejects_gets_the_manual_procedure_with_the_folders(self):
         lay = self.layout("stopped")
@@ -2123,23 +2192,74 @@ restore_probe_renames "'''.format(base / "opt"), 1)
                 self.assertIn("<folder>.pre-restore-<stamp> exists next to it", err)
                 self.assertIn("<folder>.failed-restore-<stamp>", err)
                 self.assertIn("The stamp could not be read from the journal", err)
-                self.assertIn("normally the one with the newest stamp", err)
-                self.assertIn("modification times (ls -ld)", err)
-                self.assertIn("stop and move nothing", err)
+                self.assertIn("cannot tell this restore's folders from", err)
+                self.assertIn("/done-<stamp>, rolled-back-<stamp> or abandoned-<stamp>)", err)
+                self.assertIn("belongs to that earlier restore: ignore it", err)
+                self.assertIn("move no folder", err)
+                self.assertNotIn("modification", err)
+                self.assertNotIn("ls -ld", err)
+                self.assertNotIn("newest stamp", err)
                 # the validator's own error line may quote the value; the procedure itself never does
                 procedure = err[err.index("To resolve this by hand"):]
                 self.assertNotIn("bogus", procedure)
                 self.assertNotIn("\x01", procedure)
-                self.assertNotIn("earlier restore", procedure)
+                self.assertNotIn("was left by an earlier restore", procedure)
+                self.assertNotIn("modification", procedure)
 
     def test_the_manual_procedure_text_is_the_same_in_the_recover_wrapper(self):
-        def heredoc(text, marker, end):
-            a = text.index(marker); start = text.index("\n", a) + 1
-            return text[start:text.index(end, start)]
-        text = CONTROLLER.read_text()
-        func = heredoc(text[text.index("restore_manual_procedure() {"):], "<<EOF", "\nEOF\n")
-        wrapper = heredoc(text[text.index("cannot_read() {"):], "<<MANUAL", "\nMANUAL\n")
-        self.assertEqual(func, wrapper)
+        self.assertEqual(manual_procedure_block(CONTROLLER, "restore_manual_procedure", "<<EOF", "\nEOF\n"),
+                         manual_procedure_block(CONTROLLER, "cannot_read", "<<MANUAL", "\nMANUAL\n"))
+
+    def test_the_manual_procedure_still_names_the_stamp_when_a_repeated_key_breaks_the_quiet_read(self):
+        lay = self.layout("stopped")
+        state = lay["journal"] / "state"
+        state.write_text(state.read_text() + "phase=stopped\n")  # a repeated non-stamp key: get fails for every key
+        for command in ("status", "rollback"):
+            with self.subTest(command=command):
+                result = self.recover_harness(lay, command)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"<folder>.pre-restore-{STAMP} exists next to it", result.stderr)
+                self.assertIn(f"Only folders carrying the stamp {STAMP} belong to this restore", result.stderr)
+                self.assertNotIn("<stamp>", result.stderr)
+        # two different stamp= lines are no stamp at all
+        state.write_text(state.read_text() + "stamp=20260102T030405Z-2-2\n")
+        result = self.recover_harness(lay, "status")
+        self.assertIn("The stamp could not be read from the journal", result.stderr)
+        self.assertNotIn(STAMP, result.stderr.split("To resolve this by hand")[1])
+
+    def test_the_manual_procedure_stops_everything_first_and_starts_with_the_installer_when_system_files_were_published(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.set_state(lay["journal"], "format=2")
+        self.reconcile(lay)
+        err = lay["result"].stderr
+        procedure = err[err.index("To resolve this by hand"):]
+        stop, first_move = procedure.index("1) stop everything that uses the two folders"), procedure.index("move it to <folder>.failed-restore")
+        self.assertLess(stop, first_move)
+        first = procedure[stop:first_move]
+        self.assertIn("systemctl list-units 'vesselstack-*' --state=active --no-legend", first)
+        self.assertIn("vesselstack-firewall", first); self.assertIn("vesselstack-socketcan", first)
+        self.assertIn("sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop", first)
+        self.assertIn("go on only when nothing is left", first)
+        start = procedure[procedure.index("5) start the stack"):]
+        self.assertIn("contains both files/ and", start)
+        self.assertIn(f"sudo {lay['root']}/installer/install.sh --config {lay['root']}/config/vesselstack.env --start", start)
+        self.assertIn("sudo vesselstackctl start", start)
+        self.assertIn("sudo vesselstackctl doctor", start)
+        # a root that cannot be read still gives an instruction that makes sense
+        state = lay["journal"] / "state"
+        state.write_text("".join(l for l in state.read_text().splitlines(True) if not l.startswith("root=")) + "phase=stopped\n")
+        result = self.recover_harness(lay, "status")
+        self.assertIn("sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start", result.stderr)
+
+    def test_a_root_with_a_control_character_is_printed_with_a_question_mark(self):
+        lay = self.layout("stopped")
+        self.set_state(lay["journal"], "format=2")
+        subprocess.run([sys.executable, "-I", str(lay["journal"] / "restore_journal.py"), "set", str(lay["journal"]),
+                        "root=/opt/vessel\x01stack"], check=True)
+        result = self.recover_harness(lay, "status")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("application folder /opt/vessel?stack", result.stderr)
+        self.assertNotIn("\x01", result.stderr.split("To resolve this by hand")[1])
 
     def test_a_container_stopped_by_the_recovery_is_named_only_when_it_really_stopped(self):
         lay = self.layout("root-swap", "swapped", "swapped", False)
@@ -2153,12 +2273,13 @@ restore_probe_renames "'''.format(base / "opt"), 1)
 
     def test_a_rollback_goes_on_when_the_containers_cannot_be_recorded_and_says_so(self):
         lay = self.layout("root-swap", "swapped", "swapped", False)
-        self.containers(lay, "c1|mine|other|%s/x" % lay["root"])
+        self.containers(lay, "c1|mine|other|%s/x" % lay["root"], "c2|vesselstack-grafana|vesselstack|%s/y" % lay["data"])
         self.reconcile(lay, extra='restore_sync_file() { case "$2" in *quiesced-containers) return 1 ;; *) return 0 ;; esac; }')
         self.assert_rolled_back(lay)
         err = lay["result"].stderr
-        self.assertIn("could not be recorded", err); self.assertIn("will NOT be started again automatically: mine", err)
-        self.assertIn("sudo docker start mine", err)
+        self.assertIn("could not be recorded", err); self.assertIn("may not be started again automatically: mine vesselstack-grafana", err)
+        self.assertNotIn("will NOT", err)
+        self.assertIn("sudo docker start mine\n", err); self.assertNotIn("docker start mine vesselstack-grafana", err)
         self.assertTrue([c for c in lay["calls"] if c.startswith("docker stop")], lay["calls"])
 
     def test_a_rollback_from_a_rescue_system_without_systemd_ends_rolled_back_with_status_3(self):
@@ -2194,6 +2315,26 @@ restore_probe_renames "'''.format(base / "opt"), 1)
         self.set_state(lay["journal"], "rollback_from=externals")
         self.assertEqual(self.recover_harness(lay, "abandon --yes").returncode, 0)
         self.assertIn("abandoned_from=rollback-failed", (self.archive(lay, "abandoned") / "state").read_text())
+
+    def test_an_abandoned_journal_with_an_unknown_origin_keeps_the_system_files_warning(self):
+        for source, extra in (("unknown", None), ("somethingelse", None)):
+            with self.subTest(source=source, rollback_from=extra):
+                lay = self.layout("abandoned")
+                self.set_state(lay["journal"], f"abandoned_from={source}")
+                if extra: self.set_state(lay["journal"], f"rollback_from={extra}")
+                self.reconcile(lay)
+                self.assertEqual(lay["result"].returncode, 0, lay["result"].stderr)
+                self.assertIn("may have begun publishing system files", lay["result"].stdout)
+        lay = self.layout("abandoned")
+        self.set_state(lay["journal"], "abandoned_from=rollback-failed")
+        self.reconcile(lay)
+        self.assertEqual(lay["result"].returncode, 0, lay["result"].stderr)
+        self.assertIn("had begun publishing system files", lay["result"].stdout)
+        self.assertTrue((self.archive(lay, "abandoned") / "manifest").exists(), "the snapshot is kept")
+        lay = self.layout("abandoned")
+        self.set_state(lay["journal"], "abandoned_from=rollback-failed", "rollback_from=prepared")
+        self.reconcile(lay)
+        self.assertNotIn("publishing system files", lay["result"].stdout)
 
     def test_the_recover_wrapper_explains_each_way_the_journal_can_be_unreadable(self):
         text = CONTROLLER.read_text()

@@ -144,7 +144,7 @@ timers (and their services) are stopped and started again afterwards. The restor
 keeps a durable journal in `/var/lib/vesselstack/restore/current`, so an interrupted
 restore (a lost SSH session, a power loss) can be undone with
 `sudo /var/lib/vesselstack/restore/current/recover status` and then `recover rollback`
-(see [If a restore is interrupted](#if-a-restore-is-interrupted)). If the journal itself is damaged and the commands refuse to use it, they print a short procedure to resolve it by hand (see below). That procedure is safe after a failed forward restore too: for each of the two folders, a `<folder>.pre-restore-<stamp>` next to it means the folder at the normal path is the restored copy, which you move to `<folder>.failed-restore-<stamp>` before moving the previous one back; both folders must come from the same side before the journal is moved aside. The procedure names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>` with the real value from the journal) and says to leave `.pre-restore-*` and `.failed-restore-*` folders with other stamps alone, because earlier restores can leave such folders behind. When the stamp cannot be read from the journal, it keeps the generic `<stamp>` wording and says that the newest `.pre-restore-*` folder is normally this restore's (the stamp is a UTC time), that a boat computer's clock can be wrong, so compare the folders' modification times with `ls -ld`, and, if still unsure, to stop and move nothing. The restore still
+(see [If a restore is interrupted](#if-a-restore-is-interrupted)). If the journal itself is damaged and the commands refuse to use it, they print a short procedure to resolve it by hand (see below). The procedure starts by stopping everything that uses the two folders, because after a reboot the stack and its `unless-stopped` containers start again and keep writing into a folder even after it is renamed (`vesselstackctl stop` is refused while the journal is pending): it gives plain `systemctl` and `docker` commands that stop every active `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan` and every container of the `vesselstack` compose project, tells you to stop any other container that mounts either folder, and says to go on only when nothing is left. It is safe after a failed forward restore too: for each of the two folders, a `<folder>.pre-restore-<stamp>` next to it means the folder at the normal path is the restored copy, which you move to `<folder>.failed-restore-<stamp>` before moving the previous one back; both folders must come from the same side before the journal is moved aside. The procedure names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>` with the real value from the journal) and says to leave `.pre-restore-*` and `.failed-restore-*` folders with other stamps alone, because earlier restores can leave such folders behind. If the usual read of the journal fails (for example a repeated key), the stamp is read from the `stamp=` line of the state file; only a value of the expected shape is ever printed. When the stamp cannot be read at all, it keeps the generic `<stamp>` wording and says that these steps cannot tell this restore's folders from ones left by earlier restores: a `.pre-restore-*` folder whose stamp also names an archived journal next to the journal directory (`done-<stamp>`, `rolled-back-<stamp>` or `abandoned-<stamp>`) belongs to that earlier restore and is ignored, and if you cannot tell for certain which folder is this restore's, move no folder (do the stop step and the journal step only if both folders are present, otherwise stop and get help). Modification times are not used, because renaming a folder does not change them. The last step starts the stack: if the moved-aside journal holds both `files/` and `manifest` (the restore had begun publishing system files, so the unit files, `/usr/local/sbin/vesselstackctl` and the helpers may belong to the restored release) it runs the installer of the application folder (`sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start`) instead of `sudo vesselstackctl start`, then `sudo vesselstackctl doctor`. Folder paths read from the journal are printed with control characters replaced by `?`. The restore still
 runs in your terminal session and nothing recovers automatically at boot yet, so keep
 it on a stable connection or run it inside `screen` or `tmux`. If stopping the
 running stack fails, no rollback is attempted under live services. Unrelated
@@ -2352,16 +2352,42 @@ names the folder that is not the original. Without `--yes` it only says what it 
 lists the same.
 
 If the state file of the journal is unreadable, has a repeated key or fails validation, every
-recovery command refuses, changes nothing, and ends with the same procedure: 1) check with
-`ls -ld` that the application and data folders (printed when they can be read from the journal)
-are the ones you expect; 2) if one is missing, its previous copy is next to it as
-`<name>.pre-restore-STAMP` (delete nothing); 3) once both are in place, move the journal aside
+recovery command refuses, changes nothing, and ends with the same procedure: 1) stop every
+active `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan`, and the
+containers of the `vesselstack` project and any other container that mounts the two folders, with
+the `systemctl` and `docker` commands it prints, and go on only when nothing is left; 2) check that
+the application and data folders (printed when they can be read from the journal) are the ones you
+expect; if one is missing, or was swapped, its previous copy is next to it as
+`<name>.pre-restore-STAMP` (delete nothing; with an unreadable stamp it tells you to move no folder
+unless you can tell for certain which one is this restore's); 3) both folders must come from the
+same side; 4) move the journal aside
 with `sudo mv /var/lib/vesselstack/restore/current /var/lib/vesselstack/restore/current.manual-DATE`;
-4) run `sudo vesselstackctl doctor`. There is deliberately no command that deletes or clears the
+5) start the stack with `sudo vesselstackctl start`, or, when the moved-aside journal holds `files/`
+and `manifest`, with the installer of the application folder (`--start`), then run
+`sudo vesselstackctl doctor`. There is deliberately no command that deletes or clears the
 journal. The `recover` script prints the same procedure, with the folders shown as unreadable, when
 `python3` is missing or the journal's helper does not run. A folder that is a file instead of a
 directory is reported as something in the way at that path (move it away) rather than as a failed
 filesystem check.
+
+If the rollback finds that a previous folder cannot be put back (`<folder>.pre-restore-<stamp>` is missing, is a
+different folder than the one recorded, or is a symbolic link), it refuses and prints two ways out instead of
+the by-hand procedure, whose folder step would move a foreign folder into place. A missing, foreign or
+symlinked previous folder is found before anything is moved, so both folders stay where they are; a retry
+alone cannot succeed and `abandon` is refused too. (a) If the real previous folder still exists, MOVE it to
+`<folder>.pre-restore-<stamp>` with `mv` on the same disk (a copy never matches, the folder is recognised by
+its identity; for a symbolic link, remove the link itself and move the folder it pointed to), then run
+`sudo /var/lib/vesselstack/restore/current/recover rollback` again. (b) If it is gone, this restore cannot
+be rolled back: stop the stack units and containers by hand (the same two commands as step 1 of the by-hand
+procedure), move the journal aside (`sudo mv /var/lib/vesselstack/restore/current
+/var/lib/vesselstack/restore/current.manual-YYYYMMDD`) and restore again from a backup with
+`sudo vesselstackctl restore ARCHIVE`, which replaces both folders together. On a full disk, when the
+containers that had to be stopped could not be recorded in the journal, the warning says they "may not be
+started again automatically" and suggests `docker start` only for containers outside the `vesselstack`
+compose project (the stack's own containers come back with `vesselstackctl start`). A journal whose
+`abandoned_from` is not a known phase is treated as having possibly published system files, and
+`abandoned_from=rollback-failed` without a `rollback_from` counts as `starting`. Operational impact: only
+rollback refusals and warnings changed. Rollback: revert the change.
 
 A finished restore leaves a small record under `/var/lib/vesselstack/restore/done-*`, a
 rolled-back one `rolled-back-*`, an abandoned one `abandoned-*` (the newest three of each

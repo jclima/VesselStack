@@ -94,12 +94,20 @@ if [ "$DRY_RUN" -eq 0 ]; then
     # The way out of a journal that cannot be read: the same text as restore_manual_procedure in
     # vesselstackctl (a test keeps the two identical; this script cannot source vesselstackctl).
     restore_manual_procedure() {
-        local dir=$1 root data stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
+        local dir=$1 root data app stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
         root=$(python3 -I "$dir/restore_journal.py" get "$dir" root 2>/dev/null || true)
         data=$(python3 -I "$dir/restore_journal.py" get "$dir" data 2>/dev/null || true)
+        root=${root//[![:print:]]/?}
+        data=${data//[![:print:]]/?}
+        app=$root
         [ -n "$root" ] || root='(not readable from the journal)'
         [ -n "$data" ] || data='(not readable from the journal)'
+        [ -n "$app" ] || app='<application folder>'
         stamp=$(python3 -I "$dir/restore_journal.py" get "$dir" stamp 2>/dev/null || true)
+        # A repeated key of another name makes the quiet read fail for every key: look at the stamp= lines directly.
+        if ! [[ $stamp =~ $stamp_re ]]; then
+            stamp=$(sed -n 's/^stamp=//p' "$dir/state" 2>/dev/null | sort -u 2>/dev/null || true)
+        fi
         # Only a stamp of the shape the validator accepts is ever printed (anything else counts as not readable).
         if [[ $stamp =~ $stamp_re ]]; then
             suffix=$stamp
@@ -107,22 +115,37 @@ if [ "$DRY_RUN" -eq 0 ]; then
      <folder>.failed-restore-* folder with a different stamp was left by an earlier restore: leave it alone."
         else
             suffix='<stamp>'
-            note="The stamp could not be read from the journal. If more than one <folder>.pre-restore-* exists next to a
-     folder, this restore's is normally the one with the newest stamp (the stamp is a UTC time). A boat
-     computer's clock can be wrong, so also compare the folders' modification times (ls -ld) and, if still
-     unsure, stop and move nothing."
+            note="The stamp could not be read from the journal, so these steps cannot tell this restore's folders from
+     ones left by earlier restores. A <folder>.pre-restore-* folder whose stamp also names an archived journal
+     next to the journal directory (${dir%/*}/done-<stamp>, rolled-back-<stamp> or abandoned-<stamp>)
+     belongs to that earlier restore: ignore it. If you cannot tell for certain which folder belongs to this
+     restore, move no folder: do step 1 and step 4 only if both folders are present, and otherwise stop and
+     get help."
         fi
         cat >&2 <<EOF
 To resolve this by hand:
-  1) the two folders are the application folder $root and the data folder $data. For each one:
+  1) stop everything that uses the two folders. After a reboot the stack starts again by itself and keeps
+     writing into a folder even after it is renamed, and vesselstackctl stop is refused while this restore is
+     pending. These commands need no vesselstackctl (never stop vesselstack-firewall or vesselstack-socketcan):
+       systemctl list-units 'vesselstack-*' --state=active --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
+       sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
+     Look at sudo docker ps too and stop any other container that mounts either folder. Then run the first
+     command again without its last part (the xargs) and sudo docker ps, and go on only when nothing is left;
+  2) the two folders are the application folder $root and the data folder $data. For each one:
      - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
        move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
      - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
      - do not delete anything;
      $note
-  2) both folders must come from the same side (both the previous ones) before you go on;
-  3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
+  3) both folders must come from the same side (both the previous ones) before you go on;
+  4) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  5) start the stack and check it. If the moved-aside journal ($dir.manual-...) contains both files/ and
+     manifest, the restore had begun publishing system files and the unit files, /usr/local/sbin/vesselstackctl
+     and the helpers may belong to the restored release: run the installer of the application folder instead:
+       sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
+     (the snapshot of the previous system files stays in the moved-aside journal). Otherwise run:
+       sudo vesselstackctl start
+     Either way, finish with: sudo vesselstackctl doctor
 EOF
     }
     if [ -f "$RESTORE_PENDING_DIR/state" ]; then
