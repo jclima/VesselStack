@@ -3,7 +3,7 @@
 ## Supported versions
 
 Security fixes are provided for the newest published release (the highest version
-number, whether or not GitHub marks it Latest or as a prerelease) and for the default
+number, whether or not GitHub marks it Latest or as a pre-release) and for the default
 branch. Older releases, including 0.4.x, receive no fixes: update to the newest release.
 Pre-release builds may change without compatibility guarantees.
 
@@ -22,7 +22,8 @@ suggested mitigation. You should receive an acknowledgement within seven days.
 
 VesselStack is not certified navigation, collision-avoidance, engine-control,
 alarm, or life-safety equipment. Operators must retain independent marine
-instruments, alarms, and safe operating procedures.
+instruments, alarms, and safe operating procedures. Never depend on this
+software as the sole source of safety data.
 
 ## Administrative surface
 
@@ -32,3 +33,16 @@ loopback-only and every API except `/health` requires the generated control-
 panel token. Do not publish it directly to the internet. Use an SSH tunnel or a
 trusted encrypted VPN, protect the token as a root credential, and keep the
 `vesselstackctl` CLI available as the recovery path.
+
+Remote access with Tailscale is off by default. When you enable it, the Control Panel is
+published to your tailnet only and the panel token is still required. Tailscale gives every
+device in your tailnet a route to the boat computer, so services bound to all interfaces are
+reachable too: limit who can reach the boat with Tailscale ACLs. The Node-RED editor (an
+optional feature, off by default) requires sign-in and can run code, so keep it on a trusted
+LAN or reach it through Tailscale or an SSH tunnel. The Telegram bot token used by Boat Chat
+and alerts is a credential stored on the Pi. The `*.pre-restore-*` and
+`*.failed-restore-*` folders left by a restore hold a copy of your data including secrets and are
+not removed automatically: delete them yourself once the restored system is verified. The restore
+journal under `/var/lib/vesselstack/restore/current` is readable by root only and holds a snapshot
+of system files while a restore is unfinished: do not delete it by hand, finish it with its
+`recover` command (see [If a restore is interrupted](README.md#if-a-restore-is-interrupted)).

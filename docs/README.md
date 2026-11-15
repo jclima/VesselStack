@@ -35,6 +35,15 @@ Boat Chat provider that sends data elsewhere.
 | Review power sources and instrument-reading coverage | [Power monitoring](../boat-chat/POWER_MONITORING.md) |
 | Connect selected readings to VesselTwin | [Optional VesselTwin connection](VESSELTWIN.md) |
 | Develop, test, or cut a release | [Development](DEVELOPMENT.md) |
+| Upgrade to 0.9.0 (pre-release) | [README: Upgrading to 0.9.0](../README.md#upgrading-to-090), [Updating](UPDATING.md#upgrading-to-090) |
+| Upgrade from 0.6.x or older | [Updating: upgrading from 0.6.x or older](UPDATING.md#upgrading-from-06x-or-older) |
+| Get alerts on Telegram (off by default) | [README: Alerts](../README.md#alerts) |
+| Reach the Control Panel from anywhere with Tailscale (off by default) | [README: Remote access with Tailscale](../README.md#remote-access-with-tailscale) |
+| Add Node-RED flows (off by default) | [README: Node-RED](../README.md#node-red-optional) |
+| Add marine essentials: NMEA 0183, KIP, Freeboard-SK, anchor alarm, logbook (off by default) | [README: Marine essentials](../README.md#marine-essentials-optional) |
+| Back up on a schedule (off by default) | [README: Scheduled backups](../README.md#scheduled-backups) |
+| Recover from an interrupted restore | [README: If a restore is interrupted](../README.md#if-a-restore-is-interrupted) |
+| Run the boat computer unattended (watchdog, power, journal size) | [README: Unattended operation and power](../README.md#unattended-operation-and-power) |
 | Fix an unhealthy service | [README troubleshooting](../README.md#troubleshooting) and [Installation troubleshooting](INSTALLATION.md#troubleshooting-boat-chat-not-ready-memory-index-empty) |
 
 ## Access and privacy in one minute
@@ -42,7 +51,7 @@ Boat Chat provider that sends data elsewhere.
 From another computer on the boat LAN, use the addresses printed by the
 installer for Grafana, Home Assistant, and Boat Chat. Retrieve the Boat Chat
 token on the Pi when needed; do not paste it into chat, tickets, or the
-repository. The administration control panel listens on loopback by default and
+repository. The administration Control Panel listens on loopback by default and
 should be reached through an SSH tunnel:
 
 ```bash

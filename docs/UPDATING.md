@@ -5,14 +5,27 @@ Purpose: update a running VesselStack with a reviewed release, roll back, and in
 [Back to README](../README.md) · [Documentation index](README.md)
 
 Back up first (see [Backups](../README.md#backups)); updating and rolling back are summarised
-in the README under [Updating](../README.md#updating) and
-[Upgrading to 0.6.0](../README.md#upgrading-to-060).
+in the README under [Updating](../README.md#updating). If you are on 0.6.x or older, read
+[Upgrading from 0.6.x or older](#upgrading-from-06x-or-older) first.
 
-**Heimdall to Homepage.** An update (`install.sh` or `vesselstackctl update`) stops and removes an
-existing `vesselstack-heimdall` container and its image if unused, then starts Homepage on port 80
-(443 is no longer published). `/opt/vesselstack-data/heimdall` is left on disk, with a one-line
-notice; delete it yourself when you no longer need it. Heimdall tiles are not migrated; add custom
-tiles in `config/homepage-custom/`. Rollback: restore the backup of the previous release.
+## Upgrading to 0.9.0
+
+0.9.0 is a pre-release. Physical Raspberry Pi acceptance is still pending, so it is not the
+release marked Latest. A boat should stay on 0.8.0 until 0.9.0 is promoted.
+
+- Run the full installer (the pinned installer below) or `sudo vesselstackctl update <release dir>`.
+  An application-only update is not enough, because 0.9.0 adds settings and units.
+- On a Raspberry Pi the hardware watchdog is armed by default (`VESSELSTACK_WATCHDOG=auto`). Set
+  `VESSELSTACK_WATCHDOG="false"` and rerun the installer to opt out.
+- While a restore is unfinished (a pending restore journal), commands that change the system and
+  the installer refuse to run. Run `sudo /var/lib/vesselstack/restore/current/recover status`, then
+  `recover rollback` if you need to go back. See
+  [If a restore is interrupted](../README.md#if-a-restore-is-interrupted).
+- `vesselstackctl status` exits non-zero while an installation or restore is unfinished.
+
+All upgrade notes, the list of settings to turn each new feature off, and rollback are in
+[Upgrading to 0.9.0](../README.md#upgrading-to-090) and in the `0.9.0` section of
+[CHANGELOG.md](../CHANGELOG.md).
 
 ## From the pinned installer
 
@@ -49,20 +62,17 @@ a setting that cannot be written safely at a prompt instead of stopping (choose,
 cancel with nothing changed). A root-only copy of the previous settings file is kept as
 `vesselstack.env.before-fix-<time>` next to it; delete these copies once the update works. Runs
 without a terminal (the Control Panel, `--yes`, `VESSELSTACK_NONINTERACTIVE=true`) still stop
-before changing anything and print the exact fix. Details: [Upgrading to 0.6.0](../README.md#upgrading-to-060).
+before changing anything and print the exact fix. Details: [Upgrading from 0.6.x or older](#upgrading-from-06x-or-older).
 
-Updating to 0.6.3 from an older version can end with `/usr/local/sbin/vesselstackctl: line N: syntax error
-near unexpected token ...` after the installer's `Control panel:` line. The install has completed; confirm
-with `cat /opt/vesselstack/config/installed-version`, `sudo vesselstackctl doctor` and
-`sudo vesselstackctl status`, and restore only if one fails. The 0.7.0 installer replaces the command atomically, so updating to 0.7.0 or later does not show it.
-See [Upgrading to 0.6.0](../README.md#upgrading-to-060).
+Updating to 0.6.3 from an older version can end with a shell error after the install has
+completed. See [The 0.6.3 shell error](#updating-to-063-can-end-with-a-shell-error-known-issue).
 
 ## From the Control Panel
 
 Open the **Updates** tab and press **Check for updates**. This is the only thing that
 contacts `github.com`; nothing about your boat is sent. A newer release is listed with a
 link to its notes and a **Back up & install** button. Releases that GitHub publishes as
-prereleases appear only after you turn on **Include early test releases** (0.5.x panels
+pre-releases appear only after you turn on **Include early test releases** (0.5.x panels
 call the same switch "Include lab prereleases"). **Back up & install** downloads the
 archive, checks its size and SHA-256 checksum, runs the installer's `--dry-run` check,
 takes a backup with `--require-mounted` (so the update stops if the external backup drive
@@ -94,6 +104,217 @@ once, use a different folder, or install without a backup). This cannot help the
 `VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=false` (in `vesselstack.env` or the environment) turns off the system-disk and no-backup choices; the choice is never saved. In the terminal
 menu, "back up to the system disk this once" also now writes to `/var/backups/vesselstack`, leaving the
 unmounted mount folder empty.
+
+## Upgrading from 0.6.x or older
+
+Use this section if you installed 0.6.4 or any older release, and you are updating to 0.7.0 or
+later. Find the line that matches your case. Update with a backup on a mounted external drive, not
+while underway. The pinned installer and `vesselstackctl update` make a verified backup first
+(see [From the pinned installer](#from-the-pinned-installer)).
+
+- Your `vesselstack.env` says `BOAT_UNITS=nautical`: see [Settings that say `BOAT_UNITS=nautical`](#settings-that-say-boat_unitsnautical).
+- The installer stopped on a setting it will not write: see [A value the installer refuses to write](#a-value-the-installer-refuses-to-write).
+- The backup drive is not mounted: see [When the backup drive is not mounted](#when-the-backup-drive-is-not-mounted), and [Backup drive notes from 0.6.1 and 0.6.2](#backup-drive-notes-from-061-and-062).
+- You use instrument displays and may go below 0.6.2: see [Instrument displays (0.6.2)](#instrument-displays-062).
+- You are on 0.6.2 or older and have Heimdall: see [Heimdall to Homepage (0.6.3)](#heimdall-to-homepage-063).
+- An update to 0.6.3 ended with a shell error: see [The 0.6.3 shell error](#updating-to-063-can-end-with-a-shell-error-known-issue).
+- You want the list of changes for an existing boat: see [What changes for an existing boat](#what-changes-for-an-existing-boat).
+- You are on 0.4.x: see [Coming from 0.4.x](#coming-from-04x).
+
+### Settings that say `BOAT_UNITS=nautical`
+
+Older setup wizards offered "nautical" as a units choice, and installers before 0.5.7 did not check
+it, so such a `vesselstack.env` may exist. 0.6.0 refused it with
+`BOAT_UNITS must be us_customary or metric` and stopped the update before changing anything.
+
+From 0.6.1 the installer reads `nautical` as `metric` (metres for depth; knots and nautical miles
+are kept in both systems) and prints one `Note:` line. A real install or update rewrites
+`vesselstack.env` with `BOAT_UNITS=metric`; a dry run only prints the note. The setup wizard and the
+Control Panel also show it as Metric without changing it. Any other unsupported value is still
+refused before anything is changed, now with a message that names the file and the fix.
+
+If you are stuck on 0.6.0, change the value by hand and run the update again:
+
+```bash
+sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /opt/vesselstack/config/vesselstack.env
+```
+
+Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1 needs no
+other manual step.
+
+### A value the installer refuses to write
+
+**Fix it at the prompt (0.6.1).** When you run the installer, an update or the pinned
+`get-vesselstack.sh` from a terminal (for example over `ssh -t`), an unsupported `BOAT_UNITS` value,
+or a setting in `vesselstack.env` that cannot be written safely, no longer just stops the run. The
+installer asks what to do before changing anything else:
+
+```text
+BOAT_UNITS in /opt/vesselstack/config/vesselstack.env is "imperial", which is not supported.
+  [1] US customary (feet, °F, psi, US gallons)
+  [2] Metric (metres, °C, kPa, litres)
+  [c] Cancel (nothing is changed)
+Choice:
+```
+
+An unsafe value (a token or other setting with an apostrophe plus a backslash, double quote, dollar
+sign or backtick, a line break, or a control character) is offered as `[1] Enter a new value for <KEY>`.
+What you type for a token, password or key is hidden and is never printed or logged, and a
+replacement that is still unsafe is refused. Your answer is saved in the settings file, the installer
+prints `Changed <KEY> in <file> (previous copy: <file>.before-fix-<time>)` and starts over with the
+same options. The previous copy is root-only; delete the `*.before-fix-*` copies once the install
+works. `c`, an empty answer at the end of input, or five minutes without an answer prints
+`Cancelled. Nothing was changed.` and leaves the file as it was.
+
+Limits:
+
+- Only settings written in the file you pass with `--config` are offered. A value that comes from
+  the environment is not.
+- Generated or preserved passwords and tokens (InfluxDB, Grafana, MQTT, Boat Chat, Control Panel)
+  are never offered, because the running services still hold the old value. Change it in the
+  service first, then edit the file.
+- A symbolic link, a file not owned by root, a file in a folder (or under a parent folder) that
+  other users can change, or a file whose edit cannot be verified is left untouched.
+- For an unsupported units value the manual `sed` command above is printed. For an unsafe value you
+  are told to edit the setting by hand.
+- Runs without a terminal (cron, a service, the Control Panel, `--yes`,
+  `VESSELSTACK_NONINTERACTIVE=true`) never ask. They stop before changing anything and print the
+  exact fix, as in 0.6.0.
+- A dry run that you answer does save the fix you chose.
+
+**Env-file values are checked before anything changes.** `sudo ./install.sh --config FILE --dry-run`,
+and therefore `vesselstackctl update` and the Control Panel updater (both run a dry run first),
+refuse an unsafe value before the backup is taken, services are stopped or any file is touched. The
+installer lists each offending setting by key name only (never the value), says why, and exits with
+an error:
+
+```text
+  BOAT_NAME: a single quote combined with a backslash, double quote, dollar sign or backtick
+Refusing to continue: the settings above cannot be written safely to the environment files.
+```
+
+Edit that value (for example `BOAT_NAME` in the Control Panel or `vesselstack.env`) so it no longer
+combines an apostrophe with one of those characters or spans lines, then run the dry run or the
+update again. A boat name such as `Skipper's "Dream"` is refused; `Skipper's Dream` is not. The installer
+also deletes stale `.vesselstack.env.*`, `.boat-chat.env.*` and `.control-panel.env.*` temp files from
+`config/` (left by a killed run) before writing; no other file is touched. If an older release left an update stopped on this problem, restore the pre-update
+backup with the commands under [Rollback](#rollback), fix the value, and update again. The env files
+are written atomically (see [From a source checkout](#from-a-source-checkout)).
+
+### Backup drive notes from 0.6.1 and 0.6.2
+
+The menu for an unmounted backup drive and its limits are described in
+[When the backup drive is not mounted](#when-the-backup-drive-is-not-mounted), including the
+`VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true` workaround for a direct `vesselstackctl update <dir>` run
+from an installed 0.6.0 or earlier controller. Two points are only recorded here:
+
+- The Control Panel dialog (0.6.2) applies to that one request only. Rollback: unmount with
+  `umount`. Nothing is written to `/etc/fstab` or `vesselstack.env`.
+- The dialog cannot help the upgrade that delivers it, because the worker uses the controller that
+  is already installed. For the upgrade to 0.6.2, mount the drive by hand or run the update from a
+  terminal.
+
+### Instrument displays (0.6.2)
+
+The Control Panel **Displays** tab can edit pages and themes and apply them to a screen over USB or
+Wi-Fi (see [Displays](DISPLAYS.md)). Displays are a preview and optional; an install that does not
+enable them is unaffected. Wi-Fi (OTA) updates are not yet verified on hardware: flash each display
+over USB first.
+
+**Before downgrading below 0.6.2**, run this for every themed display, otherwise the displays bridge
+exits with status 2 on the older version (it rejects the `theme` key):
+
+```bash
+sudo vesselstackctl display set-theme ID classic
+```
+
+Rollback of display settings: `sudo vesselstackctl display restore-config STAMP`, then
+`sudo vesselstackctl display flash ID --previous`.
+
+### Heimdall to Homepage (0.6.3)
+
+Homepage replaces Heimdall on port 80 (`HOMEPAGE_PORT`; `HEIMDALL_PORT` is migrated when
+`HOMEPAGE_PORT` is unset). An update (`install.sh` or `vesselstackctl update`) stops and removes an
+existing `vesselstack-heimdall` container (only if it carries this stack's Compose project label)
+and its image, and prints a notice. Port 443 is no longer published.
+
+- A leftover `heimdall` entry in `VESSELSTACK_DISABLED_COMPONENTS` is dropped (it is not turned into
+  `homepage`). `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT` are no longer kept.
+- `/opt/vesselstack-data/heimdall` (`$VESSELSTACK_DATA/heimdall`) is left on disk, with a one-line
+  notice. Delete it yourself when you no longer need it. Homepage uses no data directory.
+- Heimdall tiles are not migrated. Tiles follow the enabled components; add your own in
+  `config/homepage-custom/`.
+- If you restrict the firewall by hand, allow port 80 from trusted interfaces only.
+
+Easier sign-in arrived in the same release. The Control Panel and Boat Chat can be unlocked with a
+passphrase, optionally remembered on a device for 30 days, or by a pairing link or QR code
+(`sudo vesselstackctl panel-link [--for panel|chat]`). Existing long tokens and access/admin codes
+keep working. Passphrase sign-in is off until a passphrase is set. Rotating a token signs out the
+devices issued under the old value. The Control Panel and Boat Chat use plain HTTP on the LAN, so a
+passphrase or pairing link can be seen by anyone who can watch that network: use a trusted LAN only.
+Older versions ignore the sign-in store files.
+
+Rollback: reinstall 0.6.2 with its pinned installer (Homepage is replaced by Heimdall only on that
+reinstall), or restore the backup of the previous release. Before downgrading below 0.6.2, run
+`sudo vesselstackctl display set-theme ID classic` for every themed display.
+
+### Updating to 0.6.3 can end with a shell error (known issue)
+
+Releases up to 0.6.3 rewrote `/usr/local/sbin/vesselstackctl` in place while the older
+`vesselstackctl update` (or the pinned installer, which starts it) was still running, and that older
+script is read from disk as it runs. When the installer finished, the old command carried on reading
+the new file from its old position and could print
+`/usr/local/sbin/vesselstackctl: line N: syntax error near unexpected token ...` after the
+installer's final `Control panel:` line.
+
+**The install has completed.** The message comes from the old command after the work is done. Do not
+restore a backup because of it. To verify:
+
+```bash
+cat /opt/vesselstack/config/installed-version     # 0.6.3
+sudo vesselstackctl doctor
+sudo vesselstackctl status
+```
+
+Restore only if one of these fails. The 0.6.4 installer writes the new file beside the old one and
+renames it into place, so a running older command keeps its own copy and the message cannot happen on
+later updates. Operational impact: none at runtime; only the final message of the update is affected,
+and the installed command is the correct 0.6.3 one. Rollback: this note changes nothing to roll back.
+If you need to leave 0.6.3, downgrades are refused, so restore the verified pre-update backup as
+described under [Rollback](#rollback).
+
+### What changes for an existing boat
+
+The 0.6.0 section of [CHANGELOG.md](../CHANGELOG.md) records the changes for an existing boat: the
+stricter env-file checks, the Boat Chat settings API codes and the `X-Boat-Chat-Access-Token`
+header, the local `Host` requirement, the four-tab Control Panel, the **Reinstall & start** and
+**Check setup** labels, and the one-time Signal K restart for the VesselTwin preload. One detail is
+recorded only here.
+
+- **Limits the Control Panel checks when you save.** The timezone must be a valid IANA name such as
+  `Europe/Lisbon` (some legacy aliases such as `US/Eastern` may be rejected on newer systems where
+  they moved to the `tzdata-legacy` package). Boat length must be more than 0 and at most 500, beam
+  more than 0 and at most 100 (plain numbers in metres, no units), and CAN speed a whole number from
+  10000 to 1000000. The checks apply only to fields you edit, so an existing saved value you do not
+  touch is never rejected or cleared. Errors appear next to the field.
+
+### Coming from 0.4.x
+
+Update once from the command line with the pinned installer. Since 0.5.0 Mosquitto always enforces an
+access list, so the first update recreates the broker once, and MQTT users you added by hand to the
+old password file lose access unless you add them through VesselStack (see
+[MQTT access control](MQTT.md)).
+
+### Verify after updating
+
+```bash
+cat /opt/vesselstack/config/installed-version     # the version you installed
+sudo vesselstackctl doctor                        # RESULT healthy
+sudo vesselstackctl status
+```
+
+Open Boat Chat and the Control Panel, and confirm the dashboards show live values. To go back,
+restore the verified pre-update backup (see [Rollback](#rollback)); downgrades are refused.
 
 ## From a source checkout
 
@@ -134,7 +355,7 @@ installation, `vesselstack.env`, units and version marker as they were. A value 
 installer refuses to write (an apostrophe combined with a backslash, double quote, dollar
 sign or backtick, or a multi-line value) is caught by `--dry-run` itself, so `vesselstackctl
 update` and the Control Panel updater stop before the backup, naming only the setting's key;
-see [Upgrading to 0.6.0](../README.md#upgrading-to-060). The env files are then written
+see [Upgrading from 0.6.x or older](#upgrading-from-06x-or-older). The env files are then written
 atomically (temporary file, then rename), so a failed run never leaves one truncated. When
 the code, units and `compose.yml` have been replaced, the staged virtualenv is swapped
 in and `installed-version` records the configuration version once everything is rendered.

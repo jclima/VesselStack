@@ -49,6 +49,13 @@ The URL pins release `v0.9.0`, so it installs that release whatever GitHub marks
 points to whichever release GitHub marks Latest, which is not necessarily the newest one. For a
 lab Pi and an offline boat, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 
+**0.9.0 is a pre-release.** Physical Raspberry Pi acceptance is still pending, and the stable Latest
+release is 0.8.0. Use the command above on a lab Pi. For a boat, install 0.8.0 until 0.9.0 is promoted:
+
+```bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
+```
+
 The script checks the host first. It asks before installing missing Debian
 packages or Docker Engine and Compose v2 from Docker's official apt repository,
 then downloads and checksum-verifies VesselStack, asks configuration questions,
@@ -171,6 +178,22 @@ virtual environment on that Pi while it is online, or set
 `DISPLAYS_ENABLE=false`. See the
 [offline deployment path](DEPLOYMENT.md#simple-path-one-command) for the bundle
 and verification details.
+
+## After install: optional features
+
+These are off by default. Turn on only what you need. Each link goes to the README section with the
+setting and the command.
+
+- Telegram alerts: [Alerts](../README.md#alerts).
+- Remote access with Tailscale: [Remote access with Tailscale](../README.md#remote-access-with-tailscale).
+- Node-RED: [Node-RED (optional)](../README.md#node-red-optional).
+- Marine essentials (NMEA 0183, KIP, Freeboard-SK, anchor alarm, logbook): [Marine essentials (optional)](../README.md#marine-essentials-optional).
+- Scheduled backups: [Scheduled backups](../README.md#scheduled-backups).
+
+The hardware watchdog is the exception: on a Raspberry Pi that has `/dev/watchdog` it is armed by
+default (`VESSELSTACK_WATCHDOG=auto`), and an install or update turns it on without asking. Set
+`VESSELSTACK_WATCHDOG="false"` to opt out. See
+[Unattended operation and power](../README.md#unattended-operation-and-power).
 
 ## Keep data private
 

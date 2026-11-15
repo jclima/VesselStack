@@ -3,10 +3,10 @@
 ## Current coverage
 
 The reference configuration described here exposes one Victron SmartShunt
-through the SignalK `signalk-victron-ble` plugin. It measures whole-house-bank
+through the Signal K `signalk-victron-ble` plugin. It measures whole-house-bank
 voltage, current, power, state of charge, discharge since full, and time
 remaining. Your installation may expose different instruments or paths; verify
-the actual SignalK and Home Assistant entities before interpreting the examples.
+the actual Signal K and Home Assistant entities before interpreting the examples.
 In the reference configuration there is no dedicated solar-controller, PV,
 charger-output, or AC shore-power measurement.
 
@@ -43,7 +43,7 @@ normal VesselStack backup.
 2. Connect an existing compatible controller before replacing it, if your
    installation has one.
 
-   If you use the SignalK `signalk-victron-ble` plugin, verify that its current
+   If you use the Signal K `signalk-victron-ble` plugin, verify that its current
    version supports the controller. For a supported Victron SmartSolar MPPT
    controller, add its Bluetooth MAC address and Victron advertisement key as
    another plugin device. For a
@@ -74,7 +74,7 @@ normal VesselStack backup.
    lighting/accessories, and pumps. Put intermittent high-current loads on
    correctly rated channels or dedicated shunts. The optional NMEA 2000
    gateway can make measurements available to the marine data network, subject
-   to confirming the emitted PGNs with SignalK.
+   to confirming the emitted PGNs with Signal K.
 
 5. Add physical AC shore-input metering.
 

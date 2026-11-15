@@ -272,7 +272,7 @@ links to it.
   live numbers from Signal K when the data list has them, otherwise a dash. It is labelled
   **Approximate preview**; the display is the final word on spacing and fonts.
 - **Colour theme** swatches for `classic`, `high-contrast`, `daylight` and `ocean` with the current one
-  marked. Press **Edit pages and theme**, pick a swatch and the preview changes at once; nothing is
+  marked. Press **Edit theme and pages**, pick a swatch and the preview changes at once; nothing is
   stored until **Save**. (Going back to an older VesselStack: run `set-theme ID classic` first.)
 - **Editing**: **Edit theme and pages** opens a private draft. Choose a page by name or select
   **Add page**. Set its name and layout, then use **Add values** to search within that page. You can
@@ -295,7 +295,7 @@ links to it.
   reason and the command to run, when readiness blocks it (no Wi-Fi stored, no data password, no
   Docker). Disk space is checked when compilation is needed.
 - **History** lists the settings backups (`display history`) with **Restore**. When the previous
-  firmware is still what the stored `firmware.prev` is, **Put previous firmware back on screen** runs
+  firmware is still what the stored `firmware.prev` is, **Put previous firmware back** runs
   `display flash ID --previous` (never `--force`) after you restore the matching settings.
 - **Pages** with their layout and the items on each (labels from your instruments, notifications and
   Home Assistant items). Clicking a page previews it.
@@ -352,7 +352,7 @@ that contacts `github.com`; nothing about your boat is sent. The result is
 either "You're up to date" or the newer release with a link to its release
 notes on GitHub and a **Back up & install** button.
 
-**Include early test releases** adds GitHub prereleases to the check. They are
+**Include early test releases** adds GitHub pre-releases to the check. They are
 for testing; leave it off on a boat in regular use. The 0.5.x panels called the
 same switch "Include lab prereleases"; an owner updating from 0.5.x uses that older name.
 

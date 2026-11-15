@@ -206,10 +206,10 @@ the same way (`boat-chat/env_config.py`):
    selected by `BOAT_CHAT_ENV`. This is the only settings file the service user
    can write.
 2. **Base configuration**: `config/boat-chat.env`, written by the installer and
-   control panel and loaded by systemd into the environment.
+   Control Panel and loaded by systemd into the environment.
 
 Saving a value on the Settings page that equals the base value stores no
-override. Saving a Boat Chat field in the control panel removes that key from
+override. Saving a Boat Chat field in the Control Panel removes that key from
 the override file so the new value takes effect, and the panel marks any field
 that is currently overridden. `GET` and `POST /api/settings` require the access code.
 Settings writes also require the admin code (`BOAT_CHAT_SETTINGS_TOKEN`) from any
@@ -324,7 +324,7 @@ the private SQLite memory database
 (`$VESSELSTACK_DATA/boat-chat/memory/boat_memory.sqlite`, power observations in
 `$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`) and are excluded from
 release packages. Settings values containing a newline, carriage return or NUL
-byte are rejected (HTTP 400, nothing written), matching the control panel.
+byte are rejected (HTTP 400, nothing written), matching the Control Panel.
 
 `vesselstackctl urls` reports the **real** bind state of each service from the
 listening sockets (`ss -ltn`), so the host-networked Signal K (always) and Home Assistant
@@ -356,7 +356,7 @@ a `WARN` with the exact manual command, never aborts the install, and
 `vesselstackctl doctor` fails until it is fixed. `sudo vesselstackctl reindex`
 rebuilds it on demand.
 
-Hardening of service-writable paths: the control panel clears stale Settings
+Hardening of service-writable paths: the Control Panel clears stale Settings
 overrides without following symlinks (it refuses a symlinked override file,
 writes through a random `O_EXCL` temporary file and sets mode/owner on the open
 descriptor).

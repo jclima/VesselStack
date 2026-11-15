@@ -1051,7 +1051,7 @@ env_values_preflight() {
         if [ "$secrets" -eq 1 ]; then
             echo "A password or token that a running service already uses must be changed in that service first (replacing it here alone would lock the service out); then edit it in $CONFIG_FILE." >&2
         fi
-        echo "To fix: edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"Upgrading to 0.6.0\"." >&2
+        echo "To fix: edit them in $CONFIG_FILE (values cannot combine a single quote with a backslash, double quote, dollar sign or backtick, and cannot span lines), then run again. Nothing was changed. See README.md, \"4. Configure the vessel\"." >&2
         exit 1
     fi
 }

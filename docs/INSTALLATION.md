@@ -89,7 +89,7 @@ stay on the Pi. Units offers 1 US customary (feet, degrees F, psi, US gallons; t
 
 At the end, the installer prints the service addresses to use from another
 computer (Grafana, Home Assistant, and Boat Chat), how to sign in, and the SSH tunnel hint for the
-control panel (`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
+Control Panel (`ssh -L 8780:127.0.0.1:8780 YOUR_USER@PI`).
 
 **Sign-in questions.** After a successful install or update the guided installer asks, when a terminal
 is available and neither `--yes` nor `--defaults` is used: "Set a Control Panel passphrase now?" and
@@ -136,11 +136,11 @@ not upgrade an installed system or remove Docker conflicts). `--config FILE` use
 installer stops before changing anything and lists these options. `--web-wizard` is the
 optional browser wizard (loopback only; needs a browser on the Pi or an `ssh -L` tunnel).
 
-The pinned URL above works for any published release, including a prerelease; add
+The pinned URL above works for any published release, including a pre-release; add
 `--version 0.9.0` (`| sudo bash -s -- --version 0.9.0`) or set `VESSELSTACK_VERSION=0.9.0` for
 the same effect. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 points to whichever release GitHub marks Latest, which is not necessarily the newest release
-(every 0.5.x release was a prerelease), so it is a secondary option. The script installs the Debian
+(every 0.5.x release was a pre-release), so it is a secondary option. The script installs the Debian
 prerequisites, asks before installing Docker Engine and Compose v2 from Docker's official apt
 repository (see the box above), downloads and checksum-verifies the
 release, asks the configuration questions in the terminal, then runs the installer dry run, the
@@ -193,6 +193,9 @@ Use the [bill of materials](BOM.md). Before ordering the CAN interface, verify:
 
 Record the power circuit, fuse, device model, overlay lines, and rollback in the
 boat's electrical documentation.
+
+For under-voltage warnings, the optional GPIO shutdown button and the hardware watchdog, see
+[Unattended operation and power](../README.md#unattended-operation-and-power).
 
 ## 2. Assemble on the bench
 
@@ -351,6 +354,7 @@ sudo vesselstackctl backup
 sudo vesselstackctl verify-backup /path/to/archive.tar.gz
 ```
 
+- To run backups on a schedule (off by default), see [Scheduled backups](../README.md#scheduled-backups).
 - Record the Pi hostname/IP, fuse location, power isolation point, CAN adapter,
   connector, installed version, backup location, and recovery owner.
 

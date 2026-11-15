@@ -2,8 +2,8 @@
 
 ## Sources
 
-- Current marine telemetry comes from SignalK.
-- Nearby AIS traffic comes from the SignalK `/vessels` feed. Position timestamps older than 15 minutes are marked stale.
+- Current marine telemetry comes from Signal K.
+- Nearby AIS traffic comes from the Signal K `/vessels` feed. Position timestamps older than 15 minutes are marked stale.
 - Current health/watch state comes from Home Assistant.
 - Historical fuel, runtime, speed, and trend calculations come from retained InfluxDB summaries or cached SQLite summaries.
 - The SQLite telemetry cache stores derived summaries only; it is not the source of truth for raw telemetry.
@@ -13,7 +13,7 @@
 ## Engine Running
 
 - Engine-running samples use either port or starboard RPM >= 200 RPM.
-- SignalK stores engine revolutions in revolutions per second; answers convert to RPM.
+- Signal K stores engine revolutions in revolutions per second; answers convert to RPM.
 - Retained historical answers use the configured one-minute downsample bucket.
 - Complex engine questions include both all-sample and engine-running views. Prefer the running view for oil pressure, fuel rate, temperature, load, and side comparisons.
 - Historical summaries retain extrema timestamps and aligned values at those times. Port/starboard comparisons include all aligned samples and samples whose RPM differs by no more than 50 RPM.
@@ -21,7 +21,7 @@
 
 ## Fuel
 
-- Fuel rate is stored as SignalK cubic meters per second.
+- Fuel rate is stored as Signal K cubic meters per second.
 - Boat Chat converts fuel rate to US gallons/hour, then integrates by minute for fuel totals.
 - Internal canonical fuel totals and cache fields remain gallons/gal/h, while answers use the selected Boat Chat display units. Engine, pressure, and distance values are converted only when the source unit is known; unknown source units are not assumed.
 - Every numeric live value carries its unit in `units`. A value whose unit is empty has an unknown unit: report it as having an unknown unit, never assume one. `unit_conflicts` lists values whose unit reported by the boat disagreed with the expected one; those were left unconverted and keep the reported unit.

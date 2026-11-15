@@ -80,6 +80,8 @@ Power depends on the Pi model:
   most of a typical 3 A backbone budget. See Copperhill's
   [power supply article](https://copperhilltech.com/blog/raspberry-pi-and-picanm-in-marine-nmea-2000-systems-power-supply-considerations/).
 - Never feed the Pi from two sources, for example the SMPS variant plus USB-C.
+- For under-voltage warnings, clean shutdown and the hardware watchdog, see
+  [Unattended operation and power](../README.md#unattended-operation-and-power).
 
 Caveats:
 
@@ -119,8 +121,9 @@ preferred, and a non-isolated one works with the caveats above.
   only a device designed to power the Pi from that bus.
 - Keep the computer a drop device on the backbone. A normal drop does not add a
   terminator; the existing backbone should have exactly two end terminators.
-- VesselStack is supplementary monitoring software, not certified navigation,
-  collision avoidance, engine control, or a sole alarm system.
+- VesselStack is supplementary monitoring software.
+  VesselStack is not certified navigation, collision-avoidance, engine-control,
+  alarm, or life-safety equipment.
 
 ## Primary references
 

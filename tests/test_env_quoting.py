@@ -67,7 +67,7 @@ class EnvLineTests(unittest.TestCase):
         self.assertIn("BAD:", result.stderr)
         self.assertNotIn("GOOD", result.stderr)
         self.assertNotIn("SECRET", result.stderr)
-        self.assertIn("Upgrading to 0.6.0", result.stderr)
+        self.assertIn("4. Configure the vessel", result.stderr)
 
     def test_installer_checks_before_dry_run_exit_and_writes_atomically(self):
         self.assertLess(SOURCE.index("\nenv_values_preflight\n"), SOURCE.index('if [ "$DRY_RUN" -eq 1 ]; then\n    displays_preflight'))
