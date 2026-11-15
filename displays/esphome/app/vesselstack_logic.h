@@ -29,21 +29,35 @@ static inline bool vs_alarm_rising(bool first, uint8_t m, int na, bool has_seq, 
 
 enum VsBannerMode : int {
   VS_BANNER_HIDDEN = 0,
-  VS_BANNER_ALARM = 1,    // at least one counted alarm is live
-  VS_BANNER_NO_DATA = 2,  // every counted alarm is lost: its data stopped while it was in alarm
+  VS_BANNER_ALARM = 1,      // at least one counted alarm is live
+  VS_BANNER_NO_DATA = 2,    // every counted alarm is lost: its data stopped while it was in alarm
+  VS_BANNER_LINK_LOST = 3,  // the last known summary was an alarm, but the summary is stale or the link is down
 };
 
-// What the banner shows. The banner is visible only for a fresh summary, a working link, an
-// alarm and no dismissal. na counts live and lost alarms, nl the lost ones among them; a
-// bridge older than 0.9.0 sends no nl, which arrives here as 0 and gives the alarm wording.
-static inline int vs_banner_mode(bool fresh, bool link_ok, uint8_t max, int na, int nl, bool dismissed) {
-  if (!(fresh && link_ok && max == 3 && na > 0 && !dismissed))
+// What the banner shows. An alarm the display has seen is never cleared by losing data or the
+// link: it turns into NO DATA until the bridge reports again, the alarm is dismissed, or a fresh
+// summary says it is over.
+//   valid      a summary has arrived since boot (a display that boots while the link is down knows nothing)
+//   fresh      the last summary is recent
+//   link_ok    the bridge link is live
+//   na, nl     alarms counted, and the lost ones among them; a bridge older than 0.9.0 sends no nl,
+//              which arrives here as 0 and gives the alarm wording
+// Losing the link is not a new alarm: vs_alarm_rising decides that, and dismissed stays as it is.
+static inline int vs_banner_mode(bool valid, bool fresh, bool link_ok, uint8_t max, int na, int nl, bool dismissed) {
+  if (!valid || dismissed || max != 3 || na <= 0)
     return VS_BANNER_HIDDEN;
+  if (!(fresh && link_ok))
+    return VS_BANNER_LINK_LOST;
   return nl > 0 && nl >= na ? VS_BANNER_NO_DATA : VS_BANNER_ALARM;
 }
 
-// The count line: "<n> ALARM(S)" or "NO DATA" / "<n> NO DATA". More than 99 shows "99+".
+// The count line: "<n> ALARM(S)", "NO DATA" / "<n> NO DATA", or plain "NO DATA" when the link is lost
+// (the count is unknown then). More than 99 shows "99+".
 static inline void vs_banner_count(char *buf, size_t size, int mode, int na) {
+  if (mode == VS_BANNER_LINK_LOST) {
+    snprintf(buf, size, "NO DATA");
+    return;
+  }
   const char *plus = na > 99 ? "+" : "";
   int shown = na > 99 ? 99 : na;
   if (mode == VS_BANNER_NO_DATA) {
@@ -54,4 +68,14 @@ static inline void vs_banner_count(char *buf, size_t size, int mode, int na) {
     return;
   }
   snprintf(buf, size, "%d%s %s", shown, plus, na == 1 ? "ALARM" : "ALARMS");
+}
+
+// True when the unit tag in an instrument payload matches the one the firmware was built for.
+// The bridge adds cu (first 8 hex characters of SHA-256 over convert|unit|precision); a
+// mismatch means the number is in another unit than the label says. A payload without cu comes
+// from a bridge older than 0.9.0 and is accepted.
+static inline bool vs_unit_ok(const char *cu, const char *expected) {
+  if (cu == NULL || cu[0] == '\0')
+    return true;
+  return strcmp(cu, expected) == 0;
 }

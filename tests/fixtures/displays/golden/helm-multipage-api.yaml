@@ -18,17 +18,22 @@ packages:
 # ---- generated user interface ----
 globals:
   - {id: bridge_online, type: bool, initial_value: "false"}
+  - {id: bridge_seen, type: uint32_t, initial_value: "0"}
   - {id: ins_sog_ok, type: bool, initial_value: "false"}
   - {id: ins_sog_seen, type: uint32_t, initial_value: "0"}
+  - {id: ins_sog_cuw, type: bool, initial_value: "false"}
   - {id: ins_sog_val, type: std::string, initial_value: '"--"'}
   - {id: ins_depth_ok, type: bool, initial_value: "false"}
   - {id: ins_depth_seen, type: uint32_t, initial_value: "0"}
+  - {id: ins_depth_cuw, type: bool, initial_value: "false"}
   - {id: ins_depth_val, type: std::string, initial_value: '"--"'}
   - {id: ins_awa_ok, type: bool, initial_value: "false"}
   - {id: ins_awa_seen, type: uint32_t, initial_value: "0"}
+  - {id: ins_awa_cuw, type: bool, initial_value: "false"}
   - {id: ins_awa_val, type: std::string, initial_value: '"--"'}
   - {id: ins_house_v_ok, type: bool, initial_value: "false"}
   - {id: ins_house_v_seen, type: uint32_t, initial_value: "0"}
+  - {id: ins_house_v_cuw, type: bool, initial_value: "false"}
   - {id: ins_house_v_val, type: std::string, initial_value: '"--"'}
 
 font:
@@ -52,7 +57,9 @@ mqtt:
   on_message:
     - topic: vesselstack/v1/bridge/status
       then:
-        - lambda: 'id(bridge_online) = (x == "online");'
+        - lambda: |-
+            id(bridge_online) = (x == "online");
+            if (id(bridge_online)) id(bridge_seen) = millis();
         - script.execute: render_tiles
   on_json_message:
     - topic: vesselstack/v1/instruments/sog
@@ -60,8 +67,18 @@ mqtt:
         - lambda: |-
             const char *st = x["st"] | "missing";
             id(ins_sog_seen) = millis();
-            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>();
+            const char *cu = x["cu"] | "";
+            bool unit_ok = vs_unit_ok(cu, "b29be5c2");
+            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>() && unit_ok;
             id(ins_sog_ok) = ok;
+            if (!unit_ok) {
+              if (!id(ins_sog_cuw)) {
+                ESP_LOGW("vesselstack", "sog: the unit changed on the Pi; rebuild and reflash this display");
+                id(ins_sog_cuw) = true;
+              }
+            } else {
+              id(ins_sog_cuw) = false;
+            }
             if (ok) {
               char buf[VALUE_ACCURACY_MAX_LEN];
               value_accuracy_to_buf(buf, x["v"].as<float>(), 1);
@@ -73,8 +90,18 @@ mqtt:
         - lambda: |-
             const char *st = x["st"] | "missing";
             id(ins_depth_seen) = millis();
-            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>();
+            const char *cu = x["cu"] | "";
+            bool unit_ok = vs_unit_ok(cu, "6bed628b");
+            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>() && unit_ok;
             id(ins_depth_ok) = ok;
+            if (!unit_ok) {
+              if (!id(ins_depth_cuw)) {
+                ESP_LOGW("vesselstack", "depth: the unit changed on the Pi; rebuild and reflash this display");
+                id(ins_depth_cuw) = true;
+              }
+            } else {
+              id(ins_depth_cuw) = false;
+            }
             if (ok) {
               char buf[VALUE_ACCURACY_MAX_LEN];
               value_accuracy_to_buf(buf, x["v"].as<float>(), 1);
@@ -86,8 +113,18 @@ mqtt:
         - lambda: |-
             const char *st = x["st"] | "missing";
             id(ins_awa_seen) = millis();
-            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>();
+            const char *cu = x["cu"] | "";
+            bool unit_ok = vs_unit_ok(cu, "6eccd377");
+            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>() && unit_ok;
             id(ins_awa_ok) = ok;
+            if (!unit_ok) {
+              if (!id(ins_awa_cuw)) {
+                ESP_LOGW("vesselstack", "awa: the unit changed on the Pi; rebuild and reflash this display");
+                id(ins_awa_cuw) = true;
+              }
+            } else {
+              id(ins_awa_cuw) = false;
+            }
             if (ok) {
               char buf[VALUE_ACCURACY_MAX_LEN];
               value_accuracy_to_buf(buf, x["v"].as<float>(), 0);
@@ -99,8 +136,18 @@ mqtt:
         - lambda: |-
             const char *st = x["st"] | "missing";
             id(ins_house_v_seen) = millis();
-            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>();
+            const char *cu = x["cu"] | "";
+            bool unit_ok = vs_unit_ok(cu, "7a635a50");
+            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>() && unit_ok;
             id(ins_house_v_ok) = ok;
+            if (!unit_ok) {
+              if (!id(ins_house_v_cuw)) {
+                ESP_LOGW("vesselstack", "house_v: the unit changed on the Pi; rebuild and reflash this display");
+                id(ins_house_v_cuw) = true;
+              }
+            } else {
+              id(ins_house_v_cuw) = false;
+            }
             if (ok) {
               char buf[VALUE_ACCURACY_MAX_LEN];
               value_accuracy_to_buf(buf, x["v"].as<float>(), 2);
@@ -118,32 +165,32 @@ script:
       - lvgl.label.update:
           id: p0_sog_value
           text: !lambda |-
-            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_sog_ok) && (millis() - id(ins_sog_seen)) < 28000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 21000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_sog_ok) && (millis() - id(ins_sog_seen)) < 28000UL;
             return fresh ? id(ins_sog_val) : std::string("--");
       - lvgl.label.update:
           id: p0_depth_value
           text: !lambda |-
-            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_depth_ok) && (millis() - id(ins_depth_seen)) < 28000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 21000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_depth_ok) && (millis() - id(ins_depth_seen)) < 28000UL;
             return fresh ? id(ins_depth_val) : std::string("--");
       - lvgl.label.update:
           id: p0_awa_value
           text: !lambda |-
-            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_awa_ok) && (millis() - id(ins_awa_seen)) < 28000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 21000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_awa_ok) && (millis() - id(ins_awa_seen)) < 28000UL;
             return fresh ? id(ins_awa_val) : std::string("--");
       - lvgl.label.update:
           id: p1_house_v_value
           text: !lambda |-
-            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 28000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 21000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 28000UL;
             return fresh ? id(ins_house_v_val) : std::string("--");
       - lvgl.label.update:
           id: p2_house_v_value
           text: !lambda |-
-            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 28000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 21000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 28000UL;
             return fresh ? id(ins_house_v_val) : std::string("--");
       - lvgl.label.update:
           id: p2_sog_value
           text: !lambda |-
-            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_sog_ok) && (millis() - id(ins_sog_seen)) < 28000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 21000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_sog_ok) && (millis() - id(ins_sog_seen)) < 28000UL;
             return fresh ? id(ins_sog_val) : std::string("--");
 
 interval:

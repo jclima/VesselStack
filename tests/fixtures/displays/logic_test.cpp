@@ -89,7 +89,7 @@ static void rising_bridge_upgrade() {
   CHECK(!feed(s, 3, 1, 5));
 }
 
-static int mode_of(uint8_t max, int na, int nl) { return vs_banner_mode(true, true, max, na, nl, false); }
+static int mode_of(uint8_t max, int na, int nl) { return vs_banner_mode(true, true, true, max, na, nl, false); }
 
 static void mode_table() {
   CHECK(mode_of(3, 1, 0) == VS_BANNER_ALARM);        // one live alarm
@@ -106,11 +106,20 @@ static void mode_table() {
   CHECK(mode_of(2, 3, 3) == VS_BANNER_HIDDEN);       // only warnings
   CHECK(mode_of(1, 0, 0) == VS_BANNER_HIDDEN);
   CHECK(mode_of(0, 0, 0) == VS_BANNER_HIDDEN);
-  CHECK(vs_banner_mode(false, true, 3, 1, 0, false) == VS_BANNER_HIDDEN);   // stale
-  CHECK(vs_banner_mode(true, false, 3, 1, 0, false) == VS_BANNER_HIDDEN);   // link down
-  CHECK(vs_banner_mode(true, true, 3, 1, 0, true) == VS_BANNER_HIDDEN);     // dismissed
-  CHECK(vs_banner_mode(true, true, 3, 1, 1, true) == VS_BANNER_HIDDEN);     // dismissed, lost
-  CHECK(vs_banner_mode(false, false, 3, 1, 1, false) == VS_BANNER_HIDDEN);
+  // link lost or summary stale: the last known alarm turns into NO DATA, it never disappears
+  CHECK(vs_banner_mode(true, false, true, 3, 1, 0, false) == VS_BANNER_LINK_LOST);   // summary stale
+  CHECK(vs_banner_mode(true, true, false, 3, 1, 0, false) == VS_BANNER_LINK_LOST);   // link down
+  CHECK(vs_banner_mode(true, false, false, 3, 2, 1, false) == VS_BANNER_LINK_LOST);  // both, one lost
+  CHECK(vs_banner_mode(true, false, false, 3, 1, 1, false) == VS_BANNER_LINK_LOST);  // lost alarm, link lost
+  CHECK(vs_banner_mode(true, false, true, 2, 3, 0, false) == VS_BANNER_HIDDEN);      // last summary only warnings
+  CHECK(vs_banner_mode(true, true, false, 1, 0, 0, false) == VS_BANNER_HIDDEN);      // last summary ok
+  CHECK(vs_banner_mode(true, false, false, 3, 0, 0, false) == VS_BANNER_HIDDEN);     // no alarm counted
+  CHECK(vs_banner_mode(false, false, false, 3, 1, 0, false) == VS_BANNER_HIDDEN);    // never valid, link down
+  CHECK(vs_banner_mode(false, true, true, 3, 1, 0, false) == VS_BANNER_HIDDEN);      // never valid
+  CHECK(vs_banner_mode(true, true, true, 3, 1, 0, true) == VS_BANNER_HIDDEN);        // dismissed
+  CHECK(vs_banner_mode(true, true, true, 3, 1, 1, true) == VS_BANNER_HIDDEN);        // dismissed, lost
+  CHECK(vs_banner_mode(true, false, true, 3, 1, 0, true) == VS_BANNER_HIDDEN);       // dismissed, then stale
+  CHECK(vs_banner_mode(true, true, false, 3, 1, 0, true) == VS_BANNER_HIDDEN);       // dismissed, then link lost
 }
 
 static void count_text() {
@@ -133,8 +142,46 @@ static void count_text() {
   CHECK(strcmp(buf, "99+ NO DATA") == 0);
   vs_banner_count(buf, sizeof(buf), VS_BANNER_NO_DATA, 100000);
   CHECK(strcmp(buf, "99+ NO DATA") == 0);
+  vs_banner_count(buf, sizeof(buf), VS_BANNER_LINK_LOST, 1);
+  CHECK(strcmp(buf, "NO DATA") == 0);       // the count is unknown: never a number
+  vs_banner_count(buf, sizeof(buf), VS_BANNER_LINK_LOST, 7);
+  CHECK(strcmp(buf, "NO DATA") == 0);
+  vs_banner_count(buf, sizeof(buf), VS_BANNER_LINK_LOST, 100000);
+  CHECK(strcmp(buf, "NO DATA") == 0);
   vs_banner_count(buf, sizeof(buf), VS_BANNER_ALARM, 2147483647);
   CHECK(strcmp(buf, "99+ ALARMS") == 0);
+}
+
+// An alarm, the link is lost and returns: the dismissal and the page are not touched by the loss,
+// and only a new seq brings the banner back.
+static void link_loss_sequence() {
+  State s;
+  bool dismissed = false;
+  CHECK(feed(s, 3, 1, 20));                                                          // alarm raised
+  CHECK(vs_banner_mode(s.valid, true, true, s.max, s.na, 0, dismissed) == VS_BANNER_ALARM);
+  CHECK(vs_banner_mode(s.valid, false, false, s.max, s.na, 0, dismissed) == VS_BANNER_LINK_LOST);
+  dismissed = true;                                                                  // tap during the loss
+  CHECK(vs_banner_mode(s.valid, false, false, s.max, s.na, 0, dismissed) == VS_BANNER_HIDDEN);
+  CHECK(!feed(s, 3, 1, 20));                                                         // link back, same seq
+  CHECK(vs_banner_mode(s.valid, true, true, s.max, s.na, 0, dismissed) == VS_BANNER_HIDDEN);
+  bool rising = feed(s, 3, 1, 21);                                                   // a new alarm
+  CHECK(rising);
+  if (rising) dismissed = false;
+  CHECK(vs_banner_mode(s.valid, true, true, s.max, s.na, 0, dismissed) == VS_BANNER_ALARM);
+  CHECK(!feed(s, 1, 0, 21));                                                         // alarm cleared while the link was down
+  CHECK(vs_banner_mode(s.valid, true, true, s.max, s.na, 0, dismissed) == VS_BANNER_HIDDEN);
+}
+
+static void unit_tag_table() {
+  CHECK(vs_unit_ok("", "1a2b3c4d"));              // a bridge older than 0.9.0 sends no cu
+  CHECK(vs_unit_ok(NULL, "1a2b3c4d"));
+  CHECK(vs_unit_ok("1a2b3c4d", "1a2b3c4d"));      // equal
+  CHECK(!vs_unit_ok("1a2b3c4e", "1a2b3c4d"));     // different
+  CHECK(!vs_unit_ok("1a2b3c4", "1a2b3c4d"));      // shorter: a prefix is not a match
+  CHECK(!vs_unit_ok("1a2b3c4d0", "1a2b3c4d"));    // longer
+  CHECK(!vs_unit_ok("1A2B3C4D", "1a2b3c4d"));     // case matters
+  CHECK(!vs_unit_ok(" ", "1a2b3c4d"));            // not empty
+  CHECK(!vs_unit_ok("x", "1a2b3c4d"));
 }
 
 int main() {
@@ -145,6 +192,8 @@ int main() {
   rising_bridge_upgrade();
   mode_table();
   count_text();
+  link_loss_sequence();
+  unit_tag_table();
   printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

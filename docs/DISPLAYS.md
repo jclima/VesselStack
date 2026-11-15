@@ -436,8 +436,8 @@ item with its label, value and unit, and a value format of `precision`
 decimals. With more than one page, a tap anywhere shows the next page and
 wraps around; with one page there is no navigation. The display subscribes
 only to the instruments it shows. A tile shows `--` unless the bridge has
-said `online` (`bridge/status`, a heartbeat that is not retained, so it is
-only seen while the bridge runs), MQTT is connected, the last message for that
+said `online` within 3 x `heartbeat_s` (`bridge/status`, a heartbeat that is not
+retained, so it is only seen while the bridge runs), MQTT is connected, the last message for that
 instrument has `st` equal to `ok`, **and** a message arrived within
 `stale_after_s + 2 x heartbeat_s` seconds (computed per tile).
 
@@ -643,6 +643,11 @@ Requirements and limits:
   rebuild, the running firmware no longer matches it, so flash over USB. Changed
   Wi-Fi credentials do not change the OTA password; the display just cannot join
   the new network until it is reflashed over USB.
+- **Bridge version.** Display firmware built after 0.9.0 needs bridge 0.9.0 or
+  later. An older bridge published a retained `online` once and no heartbeat, so
+  new firmware would treat it as lost after 3 x `heartbeat_s` and show `--`. If you
+  roll the Pi back below 0.9.0, reflash each display with the previous firmware:
+  `sudo vesselstackctl display flash ID --previous`.
 - **Rollback.** `flash ID ... --previous` re-sends the previous build, subject
   to the same credential check (a rollback build that predates a `rotate` or
   Wi-Fi change is refused without `--force`, because it would not connect).
@@ -742,6 +747,29 @@ its own init table and appends a C7 command in the wrong register bank. ESPHome
 itself appends the `3A`, `36`, `20`/`21`, `11` and `29` commands, so the board
 file's `init_sequence` omits them. Delays are written as `- delay 120ms`.
 Please report the settings that worked on your unit.
+
+**Alarm banner and bridge link acceptance steps.** These cannot be verified
+without a display. Use a lab setup with a test alarm source, and tick each one:
+
+- [ ] Dismiss the banner, then raise a second alarm while clearing the first:
+  the banner returns.
+- [ ] Dismiss the banner, then drop the display's Wi-Fi for more than 30 s and
+  restore it: the banner does not come back and the page does not change.
+- [ ] Stop the sensor of an item in alarm: the banner says `NO DATA` with the
+  item's name.
+- [ ] During an alarm stop the bridge (`sudo systemctl stop vesselstack-displays-bridge`). Then
+  repeat with `sudo kill -9 PID` on the bridge process. Within about 15 s the banner
+  says `NO DATA`, the tiles show `--` and the bridge dot is red. When the bridge
+  returns, the banner does not take over again and the page does not switch.
+- [ ] Freeze the bridge with `sudo kill -STOP PID` during an alarm: the same
+  result within about 15 s. Resume it with `sudo kill -CONT PID`.
+- [ ] Change one instrument's unit on the Pi without reflashing the display:
+  that tile shows `--` and the display logs a warning. Rebuild and reflash, and
+  the number returns.
+- [ ] With the night schedule active, stop the bridge and reboot the display in
+  daytime: the brightness stays at the day level until the bridge is back.
+- [ ] Check that the longest count line (`99+ NO DATA`) and your longest label
+  fit the banner.
 
 ## Configuration and validation
 
@@ -972,7 +1000,7 @@ screen with a flashing banner.
   `ok` and never turns an alarm into a clear. After a crash or power loss the
   retained message stays (the broker restores it from its last autosave), which is
   why displays also require a summary newer than 3 x `heartbeat_s` as well as a
-  `bridge/status` `online` received since they connected. `bridge/status` is not
+  `bridge/status` `online` received within 3 x `heartbeat_s`. `bridge/status` is not
   retained, so a broker restart cannot replay it.
 - Needs the `alarms/#` ACL rule (see [MQTT access control](MQTT.md)).
 
@@ -1008,9 +1036,19 @@ Behaviour of a display with the banner on:
   gives the `ALARM` wording. The name is chosen from the display's own items by compile-time
   `!literal` branches (the summary carries ids only); an alarm that is not an
   item of this display shows the count only. The banner flashes (500 ms).
-- It is shown only while the newest summary has `max` `alarm`, is fresher than
-  3 x `heartbeat_s`, the bridge is `online` and MQTT is connected. Otherwise it
-  is hidden (never green, never stuck).
+- An alarm the display has seen is never cleared by losing data or the link.
+  While the newest summary has `max` `alarm` and is fresher than
+  3 x `heartbeat_s`, the bridge link is live and MQTT is connected, the banner
+  shows as described above. If the summary goes stale or the link is lost (see
+  [MQTT topics and freshness](#mqtt-topics-and-freshness)), the banner stays and
+  its count line says plain `NO DATA`, without a number, because the count is
+  unknown. It keeps the name of the last known first alarm, and colour, flashing
+  and brightness do not change. It goes away when you tap it, or when a fresh
+  summary says there is no alarm (never green, never stuck). Losing the link does
+  not count as a new alarm: it does not switch the page and does not undo a tap.
+  When the link returns, the `seq` rule below decides whether the banner comes
+  back. **Limit:** a display that boots while the link is down has seen no
+  summary, so it shows no banner until the link returns.
 - Takeover is edge-triggered by `seq`. When the summary has `max` `alarm` and
   its `seq` differs from the last one the display received, the display
   switches to `alarm_page`, shows the banner (also after you tapped it away) and
@@ -1022,7 +1060,8 @@ Behaviour of a display with the banner on:
   These do **not** re-arm: the same `seq` again (every heartbeat); a summary
   that comes back after a Wi-Fi or MQTT loss or a stale period with the same
   `seq` (the display keeps the last summary it received while the link is down,
-  and hides the banner meanwhile); an alarm that turns into a lost one, or back;
+  and shows `NO DATA` meanwhile, or nothing if you tapped it away); an alarm that
+  turns into a lost one, or back;
   an alarm that clears. A bridge older than 0.9.0 sends no `seq`; the display
   then uses the earlier rule: the count rose, or `max` changed to `alarm`.
   You can still navigate away. Tapping the banner hides it locally until the
@@ -1040,9 +1079,11 @@ rewrite the ACL, restart the bridge (the installer does), then `display build ID
 and `display flash ID` for each display that gets the option. Existing firmware
 ignores the summary. A display with alarm sources and no `alarm_takeover` key
 gets the banner after its next build, so it needs a rebuild and reflash too.
-The `seq` re-arm rule and the `NO DATA` wording are in firmware built after
-0.9.0: rebuild and reflash each display to get them. The bridge is unchanged and
-older display firmware keeps working with it.
+The `seq` re-arm rule, the `NO DATA` wording and the link-lost banner are in
+firmware built after 0.9.0: rebuild and reflash each display to get them. That
+firmware needs bridge 0.9.0 or later (see
+[Deploy and rollback](#deploy-and-rollback)). Older display firmware keeps
+working with the bridge.
 **Rollback:** set `"ui": {"alarm_takeover": false}` (or remove `ui` only if the
 configuration has no alarm sources), rebuild and reflash (or flash the previous
 firmware); the bridge's extra topic is harmless to older displays.
@@ -1099,7 +1140,7 @@ font, up to 200 px wide) sits in a second row at y 40, and one 8 px dot per page
 with the current page highlighted sits at y 414, below the 340 x 340 content
 area (y 70-410). Nothing overlaps the content area or the alarm banner. The
 dots, left to right, are Signal K (bridge reports `connected`), the bridge
-(`bridge/status` `online`, seen since the display connected) and MQTT (the display's own connection): green is
+(`bridge/status` `online` seen within 3 x `heartbeat_s`, the bridge link below) and MQTT (the display's own connection): green is
 good, red is bad and grey is unknown. The Signal K dot is retained data, so it is
 only ever green while the bridge is online and MQTT is connected; a stopped
 bridge shows grey, never a stale green. When `displays.json` has any `ha` item a
@@ -1125,11 +1166,17 @@ running and, without internet, feed it from a GPS/PPS source; a Pi that boots
 with a wrong clock shows a wrong time and switches night at the wrong hour. The
 firmware does not display the received string: it reads the two numbers, checks
 them (hour 0-23, minute 0-59) and draws digits it formats itself. The clock
-reads `--:--` when the message is older than 3 x `heartbeat_s`, the bridge is
-offline, MQTT is down or the payload is malformed. The night flag is then held
+reads `--:--` when the message is older than 3 x `heartbeat_s`, the bridge link
+is not live, MQTT is down or the payload is malformed. The night flag is then held
 at its last value (a dead bridge at night must not light up the cabin); use a
-long press to override. The display ACL already allows reading `bridge/#` and
-nothing else is written by the displays.
+long press to override. The display ignores a clock message unless the bridge
+link is live. The clock is retained, so the broker replays it when a display
+connects even if the bridge is dead; without this gate a display that reboots at
+noon with the bridge down would go to night brightness. When a display starts,
+the retained clock can arrive before the first `online`; it is then ignored and
+the next one, within one `heartbeat_s`, is used. Night mode can therefore take up
+to one heartbeat to apply after a display starts. The display ACL already allows
+reading `bridge/#` and nothing else is written by the displays.
 
 **Night.** `night` swaps the palette: tiles black, labels dim red-brown
 (`0x6A1600`), values `0xB02400`, severity fills `0x2A0800` (ok), `0x7A3E00`
@@ -1747,12 +1794,26 @@ Notifications use their own retained topics, `vesselstack/v1/notifications/<id>`
 - `cu` (unit tag, numeric instruments and numeric Home Assistant items only): the
   first 8 hexadecimal characters of the SHA-256 of `<convert>|<unit>|<precision>`
   (Home Assistant items use `ha` as the conversion), placed last. It changes
-  whenever the conversion, unit or precision of the item changes. It is reserved for
-  a future display-firmware check, so that a display built for another unit can show
-  `--` instead of the new number under the old label; **that check is not active
-  yet**, current firmware reads only `st`, `v` and `sev` (and `k` for Home Assistant
-  items) and ignores `u` and `cu`. Notification payloads and non-numeric Home
-  Assistant items do not carry it.
+  whenever the conversion, unit or precision of the item changes. Display firmware
+  built after 0.9.0 embeds the tag it was built for and compares it with `cu` in
+  every message. If they differ, the number is in another unit than the label
+  says, so the tile shows `--` and its colour and gauge go neutral, exactly as for
+  a missing value, and the display logs one warning per item until the tag matches
+  again. The fix is to rebuild and reflash the display
+  (`sudo vesselstackctl display build ID`, `sudo vesselstackctl display flash ID`).
+  A message without `cu` (a bridge older than 0.9.0) is accepted. The alarm
+  summary and the banner do not depend on `cu`. Notification payloads and
+  non-numeric Home Assistant items do not carry it.
+- **Bridge link.** `bridge/status` is `online` on connect and every `heartbeat_s`,
+  and `offline` on a clean stop and as the last will. A bridge that hangs while
+  its MQTT connection stays up sends neither, so display firmware built after
+  0.9.0 treats the bridge as live only while it has received `online` within
+  3 x `heartbeat_s` (the same limit as the alarm summary) and MQTT is connected.
+  Otherwise every tile shows `--`, the bridge dot is red, the clock reads `--:--`
+  and the night flag is not changed. A bridge that is stopped, killed, frozen
+  (`kill -STOP`) or unreachable all end this way within about 3 x `heartbeat_s`
+  plus a second. When the link is not live the alarm banner shows `NO DATA`
+  instead of disappearing (see [Alarm summary and takeover](#alarm-summary-and-takeover)).
 - `sev` (optional): instruments that have `thresholds` also publish
   `"sev":"ok"|"warn"|"alarm"|"unknown"`, placed after `st` (for example
   `{"v":12.1,"u":"V","st":"ok","sev":"warn","ts":"...","age":0.4}`). It is

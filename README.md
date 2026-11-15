@@ -184,7 +184,7 @@ sudo vesselstackctl display status
 ```
 
 Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports`.
-The alarm banner on a display comes back for every new alarm, even when another alarm clears at the same moment, and says `NO DATA` when the data of every alarm has stopped. A Wi-Fi blip no longer brings a dismissed banner back. Rebuild and reflash each display to get this; the bridge is unchanged.
+The alarm banner on a display comes back for every new alarm, even when another alarm clears at the same moment. A Wi-Fi blip no longer brings a dismissed banner back. An alarm a display has seen is never cleared by losing data or the bridge: the banner says `NO DATA` instead (a display that boots while the bridge is down shows nothing until it returns). A display treats the bridge as lost after three missed heartbeats, even if the bridge hangs with its connection up, and then shows `--`. It also compares the unit tag in each reading with the one it was built for, and shows `--` after you change a unit on the Pi until you reflash. Night mode only follows a live bridge. Rebuild and reflash each display to get this; it needs bridge 0.9.0 or later.
 
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
 

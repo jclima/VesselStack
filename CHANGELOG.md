@@ -14,12 +14,30 @@ Semantic Versioning.
   banner stays hidden; when it returns with the same alarms, nothing is raised again.
 - When the data of every alarm has stopped, the banner says `NO DATA` (or `2 NO DATA`) instead of
   `ALARM`. With at least one live alarm it still says `ALARM` or `ALARMS`.
-- **Operational impact:** rebuild and reflash each display that shows the banner. There is no
-  bridge or Pi configuration change, and no change to `displays.json`. Displays you do not reflash
-  keep the old behaviour.
+- An alarm a display has seen no longer disappears when the data or the bridge is lost. The banner
+  now says `NO DATA`, with the name of the last known alarm, when the summary is stale or the bridge
+  is lost. This reverses the earlier rule that the banner is hidden when the link is lost. Tap it
+  to dismiss it like any other banner. Losing the link does not switch the page or undo a tap.
+  A display that boots while the bridge is down has seen no alarm and shows no banner until the
+  bridge returns.
+- A display now treats the bridge as lost when it has not heard `online` for three heartbeats, not
+  only when the bridge says `offline`. Before, a bridge that hung with its connection up left the
+  header dot green and the tiles trusted. Tiles show `--` and the bridge dot turns red.
+- A display now compares the unit tag (`cu`) in each reading with the one it was built for. If you
+  change a unit, conversion or precision on the Pi, that tile shows `--` and the display logs one
+  warning, instead of a number under the old label. Reflash to get the number back.
+- A display now takes the night flag from the bridge clock only while the bridge is live, so a
+  display that reboots in daytime with the bridge down no longer dims. Night mode can take up to
+  one heartbeat to apply after a display starts.
+- **Operational impact:** rebuild and reflash every display. This firmware needs bridge 0.9.0 or
+  later: an older bridge sends no heartbeat, so the display would show `--` after three heartbeats.
+  If you roll the Pi back below 0.9.0, reflash the displays with the previous firmware. After you
+  change a unit on the Pi, tiles show `--` until you reflash. There is no change to
+  `displays.json`. Displays you do not reflash keep the old behaviour.
 - **Verify:** `sudo vesselstackctl display build ID`, then `sudo vesselstackctl display flash ID`.
   Raise an alarm, tap the banner away, then clear that alarm and raise another one: the banner
-  returns.
+  returns. During an alarm stop the bridge: within about 15 s the banner says `NO DATA` and the
+  tiles show `--`. The full list is in the Hardware bring-up checklist in `docs/DISPLAYS.md`.
 - **Rollback:** `sudo vesselstackctl display flash ID --previous`, or reflash the previous build.
 
 ## 0.9.0 - 2026-11-15
