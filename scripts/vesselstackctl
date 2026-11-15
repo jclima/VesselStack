@@ -5066,6 +5066,9 @@ restore_create_journal() {
         rm -rf -- "$building"
         return 1
     fi
+    # The record of an automatic recovery at boot describes an EARLIER restore: drop it now, so that status
+    # and doctor cannot show it next to this one. The log stays.
+    rm -f -- "$RESTORE_DIR/boot-recovery"
     if ! python3 -I "$RESTORE_CURRENT/restore_journal.py" fsync-dir "$RESTORE_DIR"; then
         # The journal is in place under its final name. Nothing else has been changed yet, so it can go;
         # if it cannot, it is pending and the owner must be told.

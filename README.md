@@ -2389,32 +2389,57 @@ stack is started. You then see what happened in `sudo vesselstackctl status` and
 
 It only acts on a journal written in an EARLIER boot. A journal written in the boot that is
 running now belongs to a restore that may still be going, so the service leaves it alone.
-It decides from the journal alone, and does nothing else: it never stops, starts or moves
-anything itself. When it is not sure, it HOLDS: it changes nothing, writes down why, and leaves
-the decision to you (`sudo /var/lib/vesselstack/restore/current/recover status` shows the state).
+It decides from the journal alone. The service itself only runs the journal's `recover rollback`
+command; what that command does depends on the phase (see the table). When the service is not
+sure, it HOLDS: it runs nothing, changes nothing, writes down why, and leaves the decision to you
+(`sudo /var/lib/vesselstack/restore/current/recover status` shows the state).
 
 | What the journal says | Setting `rollback` (default) | Setting `hold` |
 | --- | --- | --- |
-| The restore finished, was rolled back or was abandoned (phase `committed`, `rolled-back`, `abandoned`) | Cleanup only: removes the leftovers | Cleanup only |
-| The restore was interrupted (phase `prepared` to `starting`) | Rolled back automatically | Held |
+| The restore finished or was rolled back (phase `committed`, `rolled-back`) | Cleanup only: `recover rollback` removes the staged copy of the backup and archives the journal | Same cleanup |
+| The restore was abandoned (phase `abandoned`) | Cleanup: `recover rollback` archives the journal AND starts the services and containers that restore had stopped | Held: nothing is started |
+| The restore was interrupted (phase `prepared` to `starting`) | Rolled back automatically: the folders and system files are put back, then the stack is started | Held |
 | A rollback was interrupted (phase `rolling-back`) | Rolled back automatically if the journal says where it started, otherwise held | Held |
 | A rollback failed and trying again can help (`rollback-failed`, `retry`) | Tried again, up to two automatic attempts in all; then held | Held |
 | A rollback failed and trying again cannot help (`manual`, `previous`) | Held | Held |
 | The journal cannot be read, has no boot id (written by 0.9.0) or this boot's id cannot be read | Held | Held |
-| Another VesselStack operation holds the lock (three tries, 20 seconds apart) | Held | Held |
+| The service already ran 3 times for this journal (a rollback or cleanup that hung, was killed or failed) | Held | Held |
+| Another VesselStack operation holds the lock (up to ten tries, 30 seconds apart) | Held | Held |
+
+**The limit.** The service runs `recover rollback` at most 3 times for the same journal, whatever
+the phase (after a failed rollback, 2 times). Every run counts, also one that hung, was killed by
+the 28-minute limit or by a power loss, or ended with the journal in the same phase. A lock that
+stays busy is not a run. The cleanup of a finished or abandoned restore has the same limit of 3.
+After the limit the service HOLDS at every boot and never runs it again for that journal. That means
+the system stays AS IT IS: possibly with the application and data folders half swapped and the
+services stopped. Nothing then starts it by itself. Run
+`sudo /var/lib/vesselstack/restore/current/recover status` and decide: fix the cause and run
+`sudo /var/lib/vesselstack/restore/current/recover rollback` yourself, or follow the by-hand
+procedure above. A new restore has a new journal and starts again from zero.
 
 To turn the automatic rollback off, set `VESSELSTACK_RESTORE_AT_BOOT="hold"` in `vesselstack.env`
 and rerun the installer. The installer writes the choice to `/etc/vesselstack-recovery.conf`
 (`MODE=rollback` or `MODE=hold`), which the service reads at boot (it is read as text and never run).
-Restoring an older backup runs that release's installer, which does not know this file: the
-file stays as it was.
+The file must have exactly one `MODE=` line with the value `rollback` or `hold` (one pair of quotes
+around it is fine if you edit it by hand). A missing file, or one without a `MODE=` line, means
+`rollback`. Any other value, more than one `MODE=` line, or a file that is not a regular file means
+`hold`, and the log says why.
+
+A restore runs the installer of the backup, with the settings of the backup. If those settings do
+not contain `VESSELSTACK_RESTORE_AT_BOOT`, a release that knows the setting writes `MODE=rollback`
+again, so a `hold` you chose is lost after such a restore. Check
+`cat /etc/vesselstack-recovery.conf` after a restore, and set `VESSELSTACK_RESTORE_AT_BOOT="hold"`
+again and rerun the installer if you want it. A release that does not know the setting leaves the
+file as it was, and so does a restore with `--skip-installer`.
 
 The service leaves two files in `/var/lib/vesselstack/restore/`, both readable by root only:
 `boot-recovery` (what it decided and the result: `rolled-back`, `rolled-back-not-started`,
 `cleaned-up`, `held`, `failed` or `timed-out`, with the journal id, the number of attempts,
-the times and the reason) and `boot-recovery.log` (everything the rollback printed; it is
-overwritten at each run). The attempt is written down BEFORE the rollback starts, so a hang or a
-reboot loop still counts. See the outcome with:
+the times and the reason) and `boot-recovery.log` (everything the rollback printed). A run that
+acts starts the log afresh; a run that finds a journal written in the running boot only adds one
+line to it. The starting of a new restore deletes the `boot-recovery` record of an earlier one (not
+the log). The attempt is written down BEFORE the rollback starts, so a hang or a reboot loop still
+counts. See the outcome with:
 
 ```bash
 sudo vesselstackctl status
@@ -2445,6 +2470,21 @@ What to know:
 - Containers that Docker restarts by itself are stopped by the rollback; they are not prevented
   from starting.
 - A journal written by 0.9.0 has no boot id. It is held, not rolled back: use the commands above.
+- A restore that is interrupted WITHOUT a reboot is not recovered by this service, because its
+  journal belongs to the running boot. This is a dropped SSH session, a closed terminal or a killed
+  process. The restore does not catch a hangup or a termination signal: it simply stops where it is
+  (nothing is cleaned up), and the journal keeps the phase it had reached. Run
+  `sudo /var/lib/vesselstack/restore/current/recover rollback`, or restart the boat computer and
+  let the service do it.
+- A full `/var` blocks the automatic recovery. The service writes down its attempt before it runs
+  anything; if it cannot (a full disk or an unwritable `/var/lib/vesselstack/restore`), it runs
+  nothing, prints one line to the journal (`sudo journalctl -b -u boot-vesselstack-restore`) and the
+  unit ends without a failure. The restore stays pending. Free some space and run `recover rollback`
+  yourself.
+- The service waits up to ten times 30 seconds for the lock of another VesselStack operation, then
+  holds. Its unit allows 40 minutes in all.
+- `sudo vesselstackctl uninstall` is refused while a restore is pending, like every other command
+  that changes the system; resolve the journal first.
 - You can still run `recover rollback` yourself at any time. The service never starts by hand
   (`sudo systemctl start boot-vesselstack-restore.service` is refused). To remove it, set the
   setting to `hold`, or run `sudo systemctl disable boot-vesselstack-restore.service`.

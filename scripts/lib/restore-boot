@@ -4,16 +4,25 @@
 # Installed as /usr/local/lib/vesselstack-recovery/restore-boot and run once per boot by
 # boot-vesselstack-restore.service, only when /var/lib/vesselstack/restore/current exists.
 # It decides from the journal alone and then either runs the journal's own `recover rollback`
-# or HOLDS (changes nothing and writes down why). It never stops, starts or moves anything itself.
+# or HOLDS (changes nothing and writes down why). This script itself only runs the journal's `recover`
+# command; what that command does depends on the phase (a rollback moves the folders back and starts the
+# stack; the cleanup of a committed or rolled-back restore only removes the stage and archives the journal;
+# the cleanup of an abandoned restore archives the journal AND starts the units and containers that restore
+# had stopped, so it is not run in MODE=hold).
 #
-# Needs only bash, coreutils, sed, timeout and the journal's own files. It does not use python,
+# Needs only bash, coreutils, sed, grep, timeout and the journal's own files. It does not use python,
 # the application folder or vesselstackctl, because a restore may have just replaced them.
 #
+# Limits: RESTORE_BOOT_MAX_ATTEMPTS (3) automatic runs of `recover rollback` per journal id, whatever the
+# phase (after a failed rollback only 2); a lock that stays busy is waited for RESTORE_BOOT_BUSY_TRIES
+# (default 10) times RESTORE_BOOT_BUSY_WAIT (default 30) seconds and is not an attempt.
+#
 # Environment (tests): SYSTEM_ROOT prefix for every path, VESSELSTACK_BOOT_ID_FILE, RESTORE_BOOT_TIMEOUT
-# (default 28m) and RESTORE_BOOT_BUSY_WAIT (seconds, default 20).
+# (default 28m), RESTORE_BOOT_BUSY_WAIT and RESTORE_BOOT_BUSY_TRIES.
 #
 # Files: $dir/boot-recovery (the record, key=value, written atomically, mode 0600) and
-# $dir/boot-recovery.log (what was run and its output, mode 0600, truncated at each run).
+# $dir/boot-recovery.log (what was run and its output, mode 0600; a run that acts starts it afresh, a run
+# that finds a journal of the running boot only adds one line).
 # Exit status: 0 for every decided outcome (also a hold or a failed rollback); non-zero only when
 # this script itself broke.
 
@@ -28,7 +37,12 @@ log="$dir/boot-recovery.log"
 conf="$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
 boot_file=${VESSELSTACK_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
 run_timeout=${RESTORE_BOOT_TIMEOUT:-28m}
-busy_wait=${RESTORE_BOOT_BUSY_WAIT:-20}
+busy_wait=${RESTORE_BOOT_BUSY_WAIT:-30}
+busy_tries=${RESTORE_BOOT_BUSY_TRIES:-10}
+[[ $busy_wait =~ ^[0-9]{1,4}$ ]] || busy_wait=30
+[[ $busy_tries =~ ^[0-9]{1,3}$ ]] && [ $((10#$busy_tries)) -ge 1 ] || busy_tries=10
+# Automatic runs of `recover rollback` per journal id, whatever the phase.
+RESTORE_BOOT_MAX_ATTEMPTS=3
 uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 id_re='^[A-Za-z0-9._-]{1,64}$'
 
@@ -48,11 +62,13 @@ clean() {
 log_line() { printf '%s %s\n' "$(now_utc)" "$1" >> "$log" 2>/dev/null || true; }
 
 log_started=0
+mode_log=''
 start_log() {
     [ "$log_started" -eq 0 ] || return 0
     log_started=1
     : > "$log" || true
     chmod 0600 "$log" 2>/dev/null || true
+    if [ -n "$mode_log" ]; then log_line "$mode_log"; fi
 }
 
 # Writes the record from the r_* variables: a temp file in the same directory, then a rename.
@@ -116,11 +132,37 @@ record_get() {
 }
 
 # ---- mode -------------------------------------------------------------------------------------
+# Parsed, never sourced. A missing file, or one without a MODE= line, means rollback (the default). A file
+# with exactly one MODE= line whose value (one pair of surrounding quotes and surrounding whitespace removed)
+# is `rollback` or `hold` means that. Anything else (another value, several MODE= lines, a file that cannot
+# be read, a symbolic link) fails closed: hold.
 mode=rollback
-if [ -f "$conf" ] && [ ! -L "$conf" ]; then
-    # Parsed, never sourced: the first MODE= line decides, and only these two words count.
-    conf_mode=$(sed -n 's/^MODE=//p' "$conf" 2>/dev/null | sed -n '1p' | tr -d '[:space:]') || conf_mode=''
-    case "$conf_mode" in hold) mode=hold ;; esac
+if [ -e "$conf" ] || [ -L "$conf" ]; then
+    if [ ! -f "$conf" ] || [ -L "$conf" ]; then
+        mode=hold
+        mode_log="the mode file $conf is not a regular file; treated as MODE=hold"
+    elif conf_count_rc=0; conf_count=$(grep -c '^MODE=' "$conf" 2>/dev/null) || conf_count_rc=$?; [ "$conf_count_rc" -gt 1 ]; then
+        mode=hold
+        mode_log="the mode file $conf cannot be read; treated as MODE=hold"
+    elif [ "$conf_count" -gt 1 ]; then
+        mode=hold
+        mode_log="the mode file $conf has more than one MODE= line; treated as MODE=hold"
+    elif [ "$conf_count" -eq 1 ]; then
+        conf_mode=$(sed -n 's/^MODE=//p' "$conf" 2>/dev/null) || conf_mode=''
+        conf_raw=$conf_mode
+        conf_mode=${conf_mode#"${conf_mode%%[![:space:]]*}"}
+        conf_mode=${conf_mode%"${conf_mode##*[![:space:]]}"}
+        case "$conf_mode" in
+            \"*\"|\'*\') [ "${#conf_mode}" -lt 2 ] || conf_mode=${conf_mode:1:${#conf_mode}-2} ;;
+        esac
+        case "$conf_mode" in
+            rollback) mode=rollback ;;
+            hold) mode=hold ;;
+            *)
+                mode=hold
+                mode_log="the mode file $conf has MODE=$(clean "${conf_raw:0:60}"), which is neither rollback nor hold; treated as MODE=hold" ;;
+        esac
+    fi
 fi
 
 # ---- nothing to do ----------------------------------------------------------------------------
@@ -183,10 +225,15 @@ fi
 r_phase_before=$phase
 r_journal_id=$jid
 
+# Attempts already made for THIS journal id. Only "0" or a number without leading zeros of up to three
+# digits is a count; anything else is unreadable and counts as the limit reached (fail closed).
 prev_attempts=0
 if [ -n "$jid" ] && [ "$(record_get journal_id)" = "$jid" ]; then
     prev_attempts=$(record_get attempts)
-    [[ $prev_attempts =~ ^[0-9]{1,3}$ ]] || prev_attempts=0
+    if ! [[ $prev_attempts =~ ^(0|[1-9][0-9]{0,2})$ ]]; then
+        prev_attempts=$RESTORE_BOOT_MAX_ATTEMPTS
+    fi
+    prev_attempts=$((10#$prev_attempts))
 fi
 r_attempts=$prev_attempts
 
@@ -211,7 +258,14 @@ fi
 
 action=''
 case "$phase" in
-    committed|rolled-back|abandoned) action=cleanup ;;
+    committed|rolled-back)
+        # `recover rollback` only removes the stage and archives the journal here.
+        action=cleanup ;;
+    abandoned)
+        # `recover rollback` archives the journal AND starts the units and containers that restore had
+        # stopped. That is not "only record what was found", so it waits for MODE=rollback.
+        [ "$mode" != hold ] || hold "automatic recovery is turned off; the abandoned restore's stopped services and containers are not started"
+        action=cleanup ;;
 esac
 if [ -z "$action" ]; then
     [ "$mode" != hold ] || hold "automatic rollback is turned off"
@@ -223,9 +277,18 @@ if [ -z "$action" ]; then
         rollback-failed)
             [ "$kind" = retry ] || hold "a retry will not help (the earlier rollback stopped for a reason a retry cannot change)"
             [ -n "$rollback_from" ] || hold "the journal does not say where the rollback started"
-            [ "$prev_attempts" -lt 2 ] || hold "the rollback was already tried twice at boot"
+            [ "$prev_attempts" -lt 2 ] || hold "the rollback was already tried $prev_attempts times at boot after it failed; the limit after a failed rollback is 2"
             action=rollback ;;
     esac
+fi
+# One limit for every automatic run, whatever the phase: a rollback that hangs or is killed leaves the
+# journal in `rolling-back` (or in its old phase), and would otherwise be started again at every boot.
+if [ "$prev_attempts" -ge "$RESTORE_BOOT_MAX_ATTEMPTS" ]; then
+    if [ "$action" = cleanup ]; then
+        hold "the cleanup was already tried $prev_attempts times at boot; the limit is $RESTORE_BOOT_MAX_ATTEMPTS"
+    else
+        hold "the rollback was already tried $prev_attempts times at boot; the limit is $RESTORE_BOOT_MAX_ATTEMPTS, so the system is held as it is"
+    fi
 fi
 r_action=$action
 if [ "$phase" = starting ]; then
@@ -242,7 +305,14 @@ r_rc=''
 r_result=''
 r_reason=''
 # Written BEFORE the run, so a hang, a brown-out or a reboot loop still counts as an attempt.
-save_record
+if ! save_record; then
+    # Without a written attempt no rollback runs (it could repeat at every boot). The unit still ends
+    # cleanly: the reason is in the journal of the system service, and the restore stays pending.
+    log_line "the record $record cannot be written (is the disk full?); nothing was run"
+    echo "VesselStack recovery at boot: NOT run, because the attempt cannot be written down in $dir (is the disk full?). The restore is still pending. See: sudo $journal/recover status" >&2
+    finished_cleanly=1
+    exit 0
+fi
 echo "VesselStack recovery at boot: restore journal in phase $phase from an earlier boot; running: recover rollback ($action)"
 log_line "running: recover rollback (phase $phase, action $action, attempt $r_attempts)"
 
@@ -253,8 +323,8 @@ while :; do
     rc=0
     timeout -k 60 "$run_timeout" /bin/bash "$journal/recover" rollback >> "$log" 2>&1 || rc=$?
     [ "$rc" -eq 75 ] || break
-    if [ "$tries" -ge 3 ]; then break; fi
-    log_line "the lifecycle lock is busy; waiting ${busy_wait}s"
+    if [ "$tries" -ge "$((10#$busy_tries))" ]; then break; fi
+    log_line "the lifecycle lock is busy; waiting ${busy_wait}s (try $tries of $((10#$busy_tries)))"
     sleep "$busy_wait"
 done
 
@@ -277,14 +347,18 @@ fi
 case "$rc" in
     0) if [ "$action" = cleanup ]; then r_result=cleaned-up; else r_result=rolled-back; fi ;;
     3) if [ "$action" = cleanup ]; then r_result=failed; else r_result=rolled-back-not-started; fi ;;
-    124) r_result=timed-out ;;
+    124|137) r_result=timed-out ;;
     *) r_result=failed ;;
 esac
 case "$r_result" in
     timed-out) r_reason="recover rollback did not finish within $run_timeout" ;;
     failed) r_reason="recover rollback exited with status $rc" ;;
 esac
-save_record
+if ! save_record; then
+    # The run is over; a record that cannot be written must not turn it into an internal error.
+    log_line "the record $record cannot be written after the run (is the disk full?)"
+    echo "VesselStack recovery at boot: the result could not be written to $record (is the disk full?); it is in $log" >&2
+fi
 log_line "recover rollback exited with status $rc ($r_result)"
 case "$r_result" in
     rolled-back) echo "VesselStack recovery at boot: the interrupted restore was rolled back" ;;

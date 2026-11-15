@@ -1551,6 +1551,16 @@ if restore_validate_state; then echo "VALID"; else echo "INVALID $restore_valida
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip().splitlines()[-1], "VALID", result.stdout + result.stderr)
 
+    def test_a_new_journal_removes_the_record_of_an_earlier_automatic_recovery(self):
+        extra = ('mkdir -p "$RESTORE_DIR"; printf "journal_id=old\\nresult=rolled-back\\n" > "$RESTORE_DIR/boot-recovery"; '
+                 'echo OLD-LOG > "$RESTORE_DIR/boot-recovery.log"')
+        result = self.journal_for_layout("@B@/opt/vesselstack", "@B@/opt/vesselstack-data", extra=extra)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "VALID", result.stdout + result.stderr)
+        restore_dir = self.last_base / "var/lib/vesselstack/restore"
+        self.assertEqual(phase_of(restore_dir / "current"), "prepared")
+        self.assertFalse((restore_dir / "boot-recovery").exists(), "the record of the earlier restore is gone")
+        self.assertEqual((restore_dir / "boot-recovery.log").read_text(), "OLD-LOG\n", "the log is kept")
+
     def test_unusual_root_data_layouts_are_refused_up_front(self):
         for name, root, data in (
             ("data inside root", "@B@/opt/vs", "@B@/opt/vs/data"),

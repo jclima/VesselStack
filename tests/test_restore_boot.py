@@ -72,12 +72,13 @@ class BootCase(unittest.TestCase):
     def env(self, **more):
         env = dict(os.environ)
         env.update(SYSTEM_ROOT=str(self.base), VESSELSTACK_BOOT_ID_FILE=str(self.boot_file),
-                   RESTORE_BOOT_TIMEOUT="20", RESTORE_BOOT_BUSY_WAIT="0", CALLS_LOG=str(self.calls))
+                   RESTORE_BOOT_TIMEOUT="20", RESTORE_BOOT_BUSY_WAIT="0", RESTORE_BOOT_BUSY_TRIES="3", CALLS_LOG=str(self.calls))
         if self.shim: env["PATH"] = f"{self.shim}:{env['PATH']}"
         env.update(more)
         return env
 
-    def run_boot(self, **more):
+    def run_boot(self, boot=None, **more):
+        if boot is not None: self.boot_file.write_text(boot + "\n")
         result = subprocess.run(["/bin/bash", str(SCRIPT)], env=self.env(**more), capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
@@ -108,7 +109,7 @@ class DecisionTable(BootCase):
     def test_every_rollback_phase_rolls_back_in_rollback_mode(self):
         for phase in self.ROLLBACK_PHASES:
             with self.subTest(phase=phase):
-                self.calls.write_text("")
+                self.calls.write_text(""); (self.dir / "boot-recovery").unlink(missing_ok=True)
                 self.make_journal(phase)
                 self.run_boot()
                 self.assertEqual(self.calls_made(), ["rollback"])
@@ -128,17 +129,29 @@ class DecisionTable(BootCase):
                 self.assertIn("automatic rollback is turned off", rec["reason"])
                 self.assertIn("HELD", out.stdout)
 
-    def test_cleanup_phases_run_in_both_modes(self):
+    def test_committed_and_rolled_back_are_cleaned_up_in_both_modes(self):
         for mode in ("rollback", "hold"):
-            for phase in ("committed", "rolled-back", "abandoned"):
+            for phase in ("committed", "rolled-back"):
                 with self.subTest(mode=mode, phase=phase):
-                    self.calls.write_text("")
+                    self.calls.write_text(""); (self.dir / "boot-recovery").unlink(missing_ok=True)
                     self.conf(f"MODE={mode}\n")
                     self.make_journal(phase)
                     self.run_boot()
                     self.assertEqual(self.calls_made(), ["rollback"])
                     rec = self.record()
                     self.assertEqual((rec["action"], rec["result"]), ("cleanup", "cleaned-up"))
+
+    def test_an_abandoned_journal_is_cleaned_up_in_rollback_mode_and_held_in_hold_mode(self):
+        self.conf("MODE=rollback\n"); self.make_journal("abandoned"); self.run_boot()
+        self.assertEqual(self.calls_made(), ["rollback"])
+        self.assertEqual((self.record()["action"], self.record()["result"]), ("cleanup", "cleaned-up"))
+        shutil.rmtree(self.journal); self.calls.write_text(""); (self.dir / "boot-recovery").unlink()
+        self.conf("MODE=hold\n"); self.make_journal("abandoned"); out = self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"], "recover rollback would start the stopped services")
+        rec = self.record()
+        self.assertEqual((rec["action"], rec["result"], rec["attempts"]), ("hold", "held", "0"))
+        self.assertIn("automatic recovery is turned off", rec["reason"]); self.assertIn("not started", rec["reason"])
+        self.assertIn("HELD", out.stdout)
 
     def test_rolling_back_needs_rollback_from(self):
         self.make_journal("rolling-back", rollback_from="root-swap")
@@ -156,7 +169,7 @@ class DecisionTable(BootCase):
 
     def test_rollback_failed_retries_only_for_kind_retry_and_below_two_attempts(self):
         for kind, attempts, expect_run, reason in (
-                ("retry", 0, True, None), ("retry", 1, True, None), ("retry", 2, False, "tried twice"),
+                ("retry", 0, True, None), ("retry", 1, True, None), ("retry", 2, False, "tried 2 times"),
                 ("manual", 0, False, "a retry will not help"), ("previous", 0, False, "a retry will not help"),
                 ("", 0, False, "a retry will not help")):
             with self.subTest(kind=kind, attempts=attempts):
@@ -253,9 +266,10 @@ class SameBootAndUnreadable(BootCase):
 
 class RunsAndRecord(BootCase):
     def test_results_follow_the_exit_status(self):
-        for rc, result, extra in ((0, "rolled-back", {}), (3, "rolled-back-not-started", {}), (1, "failed", {}), (5, "failed", {})):
+        for rc, result, extra in ((0, "rolled-back", {}), (3, "rolled-back-not-started", {}), (1, "failed", {}), (5, "failed", {}), (124, "timed-out", {}), (137, "timed-out", {})):
             with self.subTest(rc=rc):
                 if self.journal.exists(): shutil.rmtree(self.journal)
+                (self.dir / "boot-recovery").unlink(missing_ok=True)
                 self.make_journal("starting"); (self.journal / "rc").write_text(str(rc))
                 out = self.run_boot()
                 rec = self.record()
@@ -334,34 +348,187 @@ class RunsAndRecord(BootCase):
         self.assertEqual(self.mode_of(self.dir / "boot-recovery"), 0o600); self.assertEqual(self.mode_of(self.dir / "boot-recovery.log"), 0o600)
         self.assertEqual([p.name for p in self.dir.iterdir() if p.name.startswith(".boot-recovery.")], [], "no temp file is left behind")
 
+    def stub_dir(self, name, body):
+        stubs = self.base / "stubs"; stubs.mkdir(exist_ok=True)
+        (stubs / name).write_text("#!/bin/bash\n" + body); (stubs / name).chmod(0o755)
+        return stubs
+
+    def run_with_stubs(self, stubs):
+        env = self.env(); env["PATH"] = f"{stubs}:{env['PATH']}"
+        return subprocess.run(["/bin/bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
+
     def test_an_internal_error_is_recorded_and_fails_the_unit(self):
+        self.make_journal("starting")
+        result = self.run_with_stubs(self.stub_dir("date", "exit 1\n"))
+        self.assertNotEqual(result.returncode, 0)
+        rec = self.record()
+        self.assertEqual(rec["result"], "internal-error"); self.assertIn("stopped with status", rec["reason"]); self.assertEqual(self.calls_made(), [])
+
+    def test_a_record_that_cannot_be_written_after_the_run_does_not_turn_it_into_an_error(self):
         self.make_journal("starting")
         flag = self.base / "fail-next-mktemp"
         (self.journal / "touch").write_text(str(flag))  # the fake recover arms the stub while it runs
-        stubs = self.base / "stubs"; stubs.mkdir()
-        (stubs / "mktemp").write_text(f'#!/bin/bash\nif [ -e "{flag}" ]; then rm -f "{flag}"; exit 1; fi\nexec "{shutil.which("mktemp")}" "$@"\n')
-        (stubs / "mktemp").chmod(0o755)
-        env = self.env(); env["PATH"] = f"{stubs}:{env['PATH']}"
-        result = subprocess.run(["/bin/bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
-        self.assertNotEqual(result.returncode, 0)
+        stubs = self.stub_dir("mktemp", f'if [ -e "{flag}" ]; then rm -f "{flag}"; exit 1; fi\nexec "{shutil.which("mktemp")}" "$@"\n')
+        result = self.run_with_stubs(stubs)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls_made(), ["rollback"])
+        self.assertIn("cannot be written after the run", self.log()); self.assertIn("exited with status 0 (rolled-back)", self.log())
+        self.assertIn("could not be written", result.stderr)
         rec = self.record()
-        self.assertEqual(rec["result"], "internal-error"); self.assertIn("stopped with status", rec["reason"]); self.assertEqual(self.calls_made(), ["rollback"])
+        self.assertEqual((rec["attempts"], rec["rc"], rec["result"]), ("1", "", ""), "the record written before the run stays")
+
+    def test_a_record_that_cannot_be_written_before_the_run_means_no_rollback_but_a_clean_unit(self):
+        self.make_journal("starting")
+        result = self.run_with_stubs(self.stub_dir("mktemp", "exit 1\n"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls_made(), [], "no rollback without a recorded attempt")
+        self.assertIn("NOT run", result.stderr); self.assertIn("is the disk full", result.stderr)
+        self.assertIn("nothing was run", self.log()); self.assertIsNone(self.record())
+
+
+class AttemptLimit(BootCase):
+    def boots(self, n):
+        return [f"{i:08x}-0000-4000-8000-000000000000" for i in range(1, n + 1)]
+
+    def test_a_rollback_that_never_ends_is_tried_three_times_and_then_held(self):
+        for phase in ("rolling-back", "data-swap", "starting", "prepared", "externals"):
+            with self.subTest(phase=phase):
+                if self.journal.exists(): shutil.rmtree(self.journal)
+                (self.dir / "boot-recovery").unlink(missing_ok=True); self.calls.write_text("")
+                self.make_journal(phase, rollback_from="data-swap" if phase == "rolling-back" else None)
+                (self.journal / "rc").write_text("1")  # recover fails, or is killed (137): the journal stays as it was
+                for n, boot in enumerate(self.boots(3), 1):
+                    self.run_boot(boot=boot)
+                    rec = self.record()
+                    self.assertEqual((rec["attempts"], rec["action"], rec["result"]), (str(n), "rollback", "failed"))
+                self.assertEqual(self.calls_made(), ["rollback"] * 3)
+                out = self.run_boot(boot=self.boots(4)[3])
+                self.assertEqual(self.calls_made(), ["rollback"] * 3 + ["status"], "recover rollback is not called a fourth time")
+                rec = self.record()
+                self.assertEqual((rec["action"], rec["result"], rec["attempts"]), ("hold", "held", "3"))
+                self.assertIn("tried 3 times", rec["reason"]); self.assertIn("limit is 3", rec["reason"])
+                self.assertIn("HELD", out.stdout)
+                self.run_boot(boot=self.boots(5)[4])
+                self.assertEqual(self.calls_made().count("rollback"), 3)
+
+    def test_a_killed_rollback_is_counted_too(self):
+        self.make_journal("rolling-back", rollback_from="data-swap"); (self.journal / "rc").write_text("137")
+        for n, boot in enumerate(self.boots(3), 1):
+            self.run_boot(boot=boot)
+            rec = self.record(); self.assertEqual((rec["attempts"], rec["rc"], rec["result"]), (str(n), "137", "timed-out"))
+        self.run_boot(boot=self.boots(4)[3])
+        self.assertEqual(self.calls_made().count("rollback"), 3); self.assertEqual(self.record()["action"], "hold")
+
+    def test_a_rollback_that_hangs_is_counted_and_limited(self):
+        self.make_journal("rolling-back", rollback_from="starting"); (self.journal / "sleep").write_text("30")
+        for n, boot in enumerate(self.boots(3), 1):
+            self.run_boot(boot=boot, RESTORE_BOOT_TIMEOUT="1")
+            self.assertEqual((self.record()["attempts"], self.record()["result"]), (str(n), "timed-out"))
+        self.run_boot(boot=self.boots(4)[3], RESTORE_BOOT_TIMEOUT="1")
+        self.assertEqual(self.calls_made().count("rollback"), 3); self.assertEqual(self.record()["result"], "held")
+
+    def test_rollback_failed_keeps_its_limit_of_two(self):
+        self.make_journal("rollback-failed", rollback_from="starting", kind="retry"); (self.journal / "rc").write_text("1")
+        for n, boot in enumerate(self.boots(2), 1):
+            self.run_boot(boot=boot); self.assertEqual(self.record()["attempts"], str(n))
+        self.run_boot(boot=self.boots(3)[2])
+        self.assertEqual(self.calls_made().count("rollback"), 2)
+        rec = self.record(); self.assertEqual((rec["action"], rec["attempts"]), ("hold", "2")); self.assertIn("limit after a failed rollback is 2", rec["reason"])
+
+    def test_a_different_journal_id_resets_the_limit(self):
+        self.make_journal("rolling-back", rollback_from="starting"); (self.journal / "rc").write_text("1")
+        (self.dir / "boot-recovery").write_text("journal_id=abc123\nattempts=3\n")
+        self.run_boot(); self.assertEqual(self.calls_made(), ["status"])
+        shutil.rmtree(self.journal); self.calls.write_text("")
+        self.make_journal("rolling-back", jid="another", rollback_from="starting"); (self.journal / "rc").write_text("1")
+        self.run_boot()
+        self.assertEqual(self.calls_made(), ["rollback"]); self.assertEqual(self.record()["attempts"], "1")
+
+    def test_a_cleanup_that_keeps_failing_is_capped_as_well(self):
+        for phase in ("committed", "rolled-back", "abandoned"):
+            with self.subTest(phase=phase):
+                if self.journal.exists(): shutil.rmtree(self.journal)
+                (self.dir / "boot-recovery").unlink(missing_ok=True); self.calls.write_text("")
+                self.make_journal(phase); (self.journal / "rc").write_text("1")
+                for n, boot in enumerate(self.boots(3), 1):
+                    self.run_boot(boot=boot)
+                    rec = self.record(); self.assertEqual((rec["action"], rec["result"], rec["attempts"]), ("cleanup", "failed", str(n)))
+                self.run_boot(boot=self.boots(4)[3])
+                self.assertEqual(self.calls_made().count("rollback"), 3)
+                rec = self.record(); self.assertEqual((rec["action"], rec["result"]), ("hold", "held"))
+                self.assertIn("cleanup was already tried 3 times", rec["reason"])
+
+    def test_a_busy_lock_is_not_an_attempt_and_does_not_use_up_the_limit(self):
+        self.make_journal("rolling-back", rollback_from="starting")
+        for boot in self.boots(5):
+            (self.journal / "rcs").write_text("75\n75\n75\n")
+            self.run_boot(boot=boot)
+            self.assertEqual(self.record()["attempts"], "0"); self.assertEqual(self.record()["result"], "held")
+
+    def test_the_attempts_value_must_be_a_plain_number(self):
+        for value, expect_run in (("0", True), ("2", True), ("002", False), ("+1", False), ("1x", False), ("", False), ("1000", False), ("-1", False), (" 1", False), ("3", False)):
+            with self.subTest(value=value):
+                if self.journal.exists(): shutil.rmtree(self.journal)
+                self.calls.write_text("")
+                (self.dir / "boot-recovery").write_text(f"journal_id=abc123\nattempts={value}\n")
+                self.make_journal("rolling-back", rollback_from="starting"); self.run_boot()
+                self.assertEqual("rollback" in self.calls_made(), expect_run)
+        # a base-10 reading: "08" and "09" are not octal accidents, they are refused as unreadable
+        shutil.rmtree(self.journal); self.calls.write_text("")
+        (self.dir / "boot-recovery").write_text("journal_id=abc123\nattempts=08\n")
+        self.make_journal("rolling-back", rollback_from="starting"); self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"])
+
+    def test_the_lock_is_waited_for_with_the_defaults_of_ten_tries(self):
+        self.make_journal("starting"); (self.journal / "rcs").write_text("75\n" * 10)
+        self.run_boot(RESTORE_BOOT_BUSY_TRIES="10")
+        self.assertEqual(self.calls_made(), ["rollback"] * 10 + ["status"])
+        text = SCRIPT.read_text()
+        self.assertIn("busy_wait=${RESTORE_BOOT_BUSY_WAIT:-30}", text); self.assertIn("busy_tries=${RESTORE_BOOT_BUSY_TRIES:-10}", text)
 
 
 class ModeFile(BootCase):
-    def test_mode_parsing(self):
-        for text, expect_run in (("MODE=rollback\n", True), ("MODE=hold\n", False), ("MODE=hold", False), ("MODE=garbage\n", True),
-                                 ("", True), ("hold\n", True), ("MODE=HOLD\n", True), ("# comment\nMODE=hold\n", False), ("MODE = hold\n", True)):
-            with self.subTest(text=text):
-                if self.journal.exists(): shutil.rmtree(self.journal)
-                self.calls.write_text(""); (self.dir / "boot-recovery").unlink(missing_ok=True)
-                self.conf(text)
-                self.make_journal("starting"); self.run_boot()
-                self.assertEqual("rollback" in self.calls_made(), expect_run)
-        shutil.rmtree(self.journal); self.calls.write_text("")
-        (self.base / "etc/vesselstack-recovery.conf").unlink()
+    def mode_runs(self, text):
+        if self.journal.exists(): shutil.rmtree(self.journal)
+        self.calls.write_text(""); (self.dir / "boot-recovery").unlink(missing_ok=True)
+        self.conf(text)
         self.make_journal("starting"); self.run_boot()
-        self.assertEqual(self.calls_made(), ["rollback"], "a missing file means rollback")
+        return "rollback" in self.calls_made()
+
+    def test_mode_parsing(self):
+        for text, expect_run in (("MODE=rollback\n", True), ("MODE=hold\n", False), ("MODE=hold", False), ("", True), ("hold\n", True),
+                                 ("# comment\nMODE=hold\n", False), ("MODE = hold\n", True), ("# only a comment\n", True),
+                                 ('MODE="hold"\n', False), ("MODE='hold'\n", False), ('MODE="rollback"\n', True), ("MODE='rollback'\n", True),
+                                 ("MODE=hold \n", False), ("MODE=hold\r\n", False), ("MODE=  hold\n", False), ('MODE= "hold" \n', False)):
+            with self.subTest(text=text):
+                self.assertEqual(self.mode_runs(text), expect_run)
+
+    def test_a_missing_file_means_rollback(self):
+        self.make_journal("starting"); self.run_boot()
+        self.assertEqual(self.calls_made(), ["rollback"]); self.assertEqual(self.record()["mode"], "rollback")
+
+    def test_a_file_with_a_bad_value_or_two_mode_lines_fails_closed_and_names_the_value(self):
+        for text, shown in (("MODE=garbage\n", "MODE=garbage"), ("MODE=HOLD\n", "MODE=HOLD"), ("MODE=Rollback\n", "MODE=Rollback"), ("MODE=\n", "MODE="),
+                            ('MODE="hold\n', 'MODE="hold'), ("MODE='rollback\"\n", "MODE='rollback\""), ("MODE=\"\"\n", 'MODE=""'),
+                            ('MODE=" hold"\n', 'MODE=" hold"'), ("MODE=hold hold\n", "MODE=hold hold"),
+                            ("MODE=rollback\nMODE=rollback\n", "more than one MODE= line"), ("MODE=hold\nMODE=rollback\n", "more than one MODE= line"),
+                            ("MODE=rollback\nMODE=hold\n", "more than one MODE= line")):
+            with self.subTest(text=text):
+                self.assertFalse(self.mode_runs(text), "a bad mode file holds")
+                rec = self.record()
+                self.assertEqual((rec["mode"], rec["action"]), ("hold", "hold"))
+                self.assertIn("treated as MODE=hold", self.log()); self.assertIn(shown, self.log())
+
+    def test_a_bad_value_is_sanitised_in_the_log(self):
+        self.assertFalse(self.mode_runs("MODE=ab\x01cd\x1b[31m\n"))
+        self.assertNotIn("\x01", self.log()); self.assertNotIn("\x1b", self.log()); self.assertIn("MODE=ab?cd?[31m", self.log())
+
+    def test_a_mode_file_that_is_not_a_regular_file_holds(self):
+        self.make_journal("starting")
+        target = self.base / "elsewhere"; target.write_text("MODE=rollback\n")
+        (self.base / "etc/vesselstack-recovery.conf").symlink_to(target)
+        self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"]); self.assertIn("not a regular file", self.log())
 
     def test_the_file_is_never_executed(self):
         planted = self.base / "planted"
@@ -375,7 +542,7 @@ class UnitAndInventory(unittest.TestCase):
         text = UNIT.read_text()
         for line in ("ConditionPathExists=/var/lib/vesselstack/restore/current", "RefuseManualStart=yes", "After=local-fs.target docker.service",
                      "Wants=docker.service", "Type=oneshot", "RemainAfterExit=yes", "ExecStart=/usr/local/lib/vesselstack-recovery/restore-boot",
-                     "TimeoutStartSec=30min", "WantedBy=multi-user.target"):
+                     "TimeoutStartSec=40min", "WantedBy=multi-user.target"):
             self.assertIn(line + "\n", text)
         self.assertNotIn("network-online", text); self.assertNotIn("@", text)
 

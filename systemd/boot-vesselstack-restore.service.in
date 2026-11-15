@@ -9,7 +9,7 @@ Wants=docker.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/lib/vesselstack-recovery/restore-boot
-TimeoutStartSec=30min
+TimeoutStartSec=40min
 
 [Install]
 WantedBy=multi-user.target

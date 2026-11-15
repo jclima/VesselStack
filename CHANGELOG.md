@@ -29,7 +29,18 @@ readable by 0.9.0, which ignores them.
   next boot. The new `boot-vesselstack-restore.service` runs once per boot, only while a restore
   journal exists, and runs the journal's own `recover rollback` when the journal was written in an
   earlier boot. When it is not sure it holds: it changes nothing and writes down why.
-  Cleanup of a finished restore runs in both modes.
+  Cleanup of a finished or rolled-back restore runs in both modes; the cleanup of an abandoned
+  restore also starts the services and containers it had stopped, so it runs only in `rollback` mode.
+- The service runs `recover rollback` at most 3 times per journal, whatever the phase (2 after a
+  failed rollback); the cleanup has the same limit. After that it holds at every boot and the
+  system stays as it is, possibly with the folders half swapped and the services stopped, until you
+  run `recover status`. It waits up to ten times 30 seconds for a busy lock.
+- `/etc/vesselstack-recovery.conf` fails closed: a bad value, a second `MODE=` line or a file that
+  is not regular means `hold`; a missing file or no `MODE=` line means `rollback`. A starting
+  restore removes the `boot-recovery` record of an earlier one.
+- A restore interrupted without a reboot (a dropped SSH session, a killed process) is not recovered
+  by the service; run `recover rollback`. A full `/var` blocks the automatic recovery; the unit then
+  ends without a failure and the restore stays pending. The unit allows 40 minutes (was 30).
 - New setting `VESSELSTACK_RESTORE_AT_BOOT` (`rollback`, the default, or `hold`), written to
   `/etc/vesselstack-recovery.conf`.
 - The outcome is in `/var/lib/vesselstack/restore/boot-recovery` and `boot-recovery.log`, and in
