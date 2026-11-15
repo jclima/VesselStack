@@ -7,6 +7,8 @@ substitutions:
 esphome:
   name: ${device_name}
   min_version: 2026.10.0
+  includes:
+    - app/vesselstack_logic.h
 
 packages:
   board: !include boards/waveshare-esp32-s3-touch-lcd-2.8c.yaml

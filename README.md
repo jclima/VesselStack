@@ -184,6 +184,8 @@ sudo vesselstackctl display status
 ```
 
 Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports`.
+The alarm banner on a display comes back for every new alarm, even when another alarm clears at the same moment, and says `NO DATA` when the data of every alarm has stopped. A Wi-Fi blip no longer brings a dismissed banner back. Rebuild and reflash each display to get this; the bridge is unchanged.
+
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
 
 Displays show a full-screen alarm banner by default when anything

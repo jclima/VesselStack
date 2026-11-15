@@ -427,7 +427,8 @@ sudo vesselstackctl display render helm                # writes /opt/vesselstack
 | `export ID (--output FILE \| --stdout) [--allow-missing-wifi]` | Root. Renders, then writes a deterministic `tar.gz` (sorted entries, fixed mtime, uid/gid 0, modes 0700/0600) containing `ID/`: the device file `ID.yaml`, `secrets.yaml`, the board and app packages, the fonts and their license, and a short `README.txt` with the build and flash commands. `--output` opens the file's directory without following a symlink (a symlinked directory is refused), creates FILE in that directory exclusively with mode 0600 and refuses an existing path or a symlink. When run through `sudo` it gives the file to the invoking user (`SUDO_UID`/`SUDO_GID`, only when both are numeric and name an existing account), still mode 0600, **only if** that very directory (checked by `fstat` on the descriptor the file is created through) is owned by that user and not writable by group or others; otherwise the file stays `root:root` 0600 and the command prints a hint (`sudo chown "$USER" FILE`, or use `--stdout` under `umask 077`). This stops a user whose `sudo` rights are limited to `vesselstackctl` from choosing a path such as `/etc/cron.d/x` and ending up owning a root-created file there. Group-writable home directories (umask 002) therefore also keep root ownership: use the hint. `--stdout` refuses a terminal. With `--stdout` the file is created by your shell, not by `vesselstackctl`: redirect inside `(umask 077; ...)` as shown, otherwise the archive, which holds secrets, is created world-readable under the usual umask 022. Warnings go to stderr, so stdout carries only the archive. |
 
 `ID.yaml` is generated and holds no secrets. It composes `boards/<board>.yaml`
-(hardware only), `app/vesselstack.yaml` (Wi-Fi, OTA, MQTT) and, only when the
+(hardware only), `app/vesselstack.yaml` (Wi-Fi, OTA, MQTT), `app/vesselstack_logic.h` (the
+alarm banner decisions, included through `esphome: includes:`) and, only when the
 display has `"home_assistant_api": true`, `app/api.yaml`, then adds the
 generated interface: one LVGL page per configured page, `single` (one big
 tile) and `grid-2x2` tiles inside the board's centred content box, a tile per
@@ -937,10 +938,10 @@ screen with a flashing banner.
   bridge stop) is *lost*: it is counted in `max` (`alarm`), `na` and `ids` as if
   it were still in alarm, and also in `nl` and listed in `lost` (at most 16).
   Lost items are not counted in `nu`. Its own topic is unchanged
-  (`st` `stale` or `missing`, `sev` `unknown`). Current display firmware ignores
-  `nl` and `lost`, so the banner now stays up showing the alarm when its data
-  stops; it does not yet say that the data is missing (that wording comes with a
-  later firmware change).
+  (`st` `stale` or `missing`, `sev` `unknown`). The banner stays up when the data
+  stops. Display firmware built after 0.9.0 reads `nl` and says `NO DATA`
+  instead of `ALARM` when every counted alarm is lost (see "Behaviour of a
+  display with the banner on" below). It does not use `lost`.
 - **When the latch is set and cleared.** It is set when an item whose severity is
   `alarm` loses its data, and only then: an item that was `ok` or `warn` when
   its data stopped is `unknown`, as before. It is cleared only by positive
@@ -961,8 +962,9 @@ screen with a flashing banner.
   live alarm now and was neither a live alarm nor lost at the previous
   evaluation. An alarm turning into a lost one, or back, does not change it, but
   one alarm clearing while another raises does, even though `na` stays the
-  same, so it can be used to re-arm a dismissed banner. Current firmware ignores
-  it.
+  same, so it can be used to re-arm a dismissed banner. Display firmware built
+  after 0.9.0 does exactly that (see "Behaviour of a display with the banner on"
+  below).
 - Published (retained, QoS 1) on every change and every `heartbeat_s`. On a
   clean stop (SIGTERM) the bridge publishes a last summary as if every counted
   item had just gone stale: items in alarm are lost (`max` stays `alarm`),
@@ -996,17 +998,35 @@ Behaviour of a display with the banner on:
   A red banner (0xC62828, 96 px high, as wide as the board's content area, 340
   px on the Waveshare 2.8C, centred on top of every page) shows the alarm count
   and the fixed word `ALARM` or `ALARMS` (`99+` above 99) and the name of the
-  first alarm. The name is chosen from the display's own items by compile-time
+  first alarm. When every counted alarm is lost (`nl` is at least `na`), the
+  count line says `NO DATA` for one and `2 NO DATA` for more (`99+ NO DATA`
+  above 99) instead: the alarm was active when its data stopped, and the
+  display cannot tell whether it is still active. As soon as one alarm is live
+  the line is `ALARM`/`ALARMS` again, counting lost alarms too. Colour,
+  flashing and brightness do not change, and the name is that of the first
+  item in `ids` (live alarms are listed first). A bridge that sends no `nl`
+  gives the `ALARM` wording. The name is chosen from the display's own items by compile-time
   `!literal` branches (the summary carries ids only); an alarm that is not an
   item of this display shows the count only. The banner flashes (500 ms).
 - It is shown only while the newest summary has `max` `alarm`, is fresher than
   3 x `heartbeat_s`, the bridge is `online` and MQTT is connected. Otherwise it
   is hidden (never green, never stuck).
-- Takeover is edge-triggered, when the alarm count rises or `max` changes to
-  `alarm` (also when the first summary after boot or after a stale period is an
-  alarm): the display switches to `alarm_page`, shows the banner and sets the
-  backlight to 100 %. You can still navigate away. Tapping the banner hides it
-  locally until the next such edge. Nothing is sent back: **there is no
+- Takeover is edge-triggered by `seq`. When the summary has `max` `alarm` and
+  its `seq` differs from the last one the display received, the display
+  switches to `alarm_page`, shows the banner (also after you tapped it away) and
+  sets the backlight to 100 %. Any new live alarm re-arms it, including one that
+  raises in the same update in which another clears (`na` stays the same, `seq`
+  changes). The first summary after the display boots re-arms it when it is an
+  alarm. Only `!=` is used, so a wrapped counter or one that restarts at a
+  random value also re-arms.
+  These do **not** re-arm: the same `seq` again (every heartbeat); a summary
+  that comes back after a Wi-Fi or MQTT loss or a stale period with the same
+  `seq` (the display keeps the last summary it received while the link is down,
+  and hides the banner meanwhile); an alarm that turns into a lost one, or back;
+  an alarm that clears. A bridge older than 0.9.0 sends no `seq`; the display
+  then uses the earlier rule: the count rose, or `max` changed to `alarm`.
+  You can still navigate away. Tapping the banner hides it locally until the
+  next re-arm. Nothing is sent back: **there is no
   acknowledgement in this version, the bridge and the alarm state are not
   affected and displays stay read-only**; acknowledging from a display is a
   possible future feature.
@@ -1020,6 +1040,9 @@ rewrite the ACL, restart the bridge (the installer does), then `display build ID
 and `display flash ID` for each display that gets the option. Existing firmware
 ignores the summary. A display with alarm sources and no `alarm_takeover` key
 gets the banner after its next build, so it needs a rebuild and reflash too.
+The `seq` re-arm rule and the `NO DATA` wording are in firmware built after
+0.9.0: rebuild and reflash each display to get them. The bridge is unchanged and
+older display firmware keeps working with it.
 **Rollback:** set `"ui": {"alarm_takeover": false}` (or remove `ui` only if the
 configuration has no alarm sources), rebuild and reflash (or flash the previous
 firmware); the bridge's extra topic is harmless to older displays.

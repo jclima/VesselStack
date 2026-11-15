@@ -10,6 +10,7 @@ import math
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -246,6 +247,51 @@ class Base(unittest.TestCase):
 
     def stored(self):
         return json.loads(self.secrets_path.read_text())
+
+
+def font_advances(data: bytes) -> dict:
+    """unitsPerEm and the advance width of every character the cmap (format 4) maps, from hmtx."""
+    count = struct.unpack_from(">H", data, 4)[0]
+    tables = {}
+    for i in range(count):
+        tag, _csum, offset, length = struct.unpack_from(">4sIII", data, 12 + 16 * i)
+        tables[tag] = (offset, length)
+    units = struct.unpack_from(">H", data, tables[b"head"][0] + 18)[0]
+    n_metrics = struct.unpack_from(">H", data, tables[b"hhea"][0] + 34)[0]
+    hmtx = tables[b"hmtx"][0]
+
+    def advance(gid):
+        return struct.unpack_from(">H", data, hmtx + 4 * min(gid, n_metrics - 1))[0]
+
+    cmap = tables[b"cmap"][0]
+    base = None
+    for i in range(struct.unpack_from(">H", data, cmap + 2)[0]):
+        platform, encoding, off = struct.unpack_from(">HHI", data, cmap + 4 + 8 * i)
+        if (platform, encoding) == (3, 1):
+            base = cmap + off
+    segx2 = struct.unpack_from(">H", data, base + 6)[0]
+    segs = segx2 // 2
+    ends = struct.unpack_from(f">{segs}H", data, base + 14)
+    starts = struct.unpack_from(f">{segs}H", data, base + 16 + segx2)
+    deltas = struct.unpack_from(f">{segs}h", data, base + 16 + 2 * segx2)
+    range_pos = base + 16 + 3 * segx2
+    ranges = struct.unpack_from(f">{segs}H", data, range_pos)
+
+    def gid_of(code):
+        for s in range(segs):
+            if starts[s] <= code <= ends[s]:
+                if ranges[s] == 0:
+                    return (code + deltas[s]) & 0xFFFF
+                gid = struct.unpack_from(">H", data, range_pos + 2 * s + ranges[s] + 2 * (code - starts[s]))[0]
+                return (gid + deltas[s]) & 0xFFFF if gid else 0
+        return 0
+
+    by_char = {}
+    for ch in render.BANNER_GLYPHS:
+        gid = gid_of(ord(ch))
+        assert gid, ch
+        by_char[ch] = advance(gid)
+    return {"units_per_em": units, "by_char": by_char}
 
 
 class GoldenAndDeterminism(Base):
@@ -656,12 +702,19 @@ class AlarmTakeover(Base):
 
     def test_edge_detection_staleness_and_dismissal(self):
         text = self.alarm_device()
-        self.assertIn("bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));", text)
+        self.assertIn("bool rising = vs_alarm_rising(!id(summary_valid), m, na, has_seq, seq, "
+                      "id(summary_has_seq), id(summary_seq), id(summary_max), id(summary_na));", text)
+        self.assertIn('bool has_seq = x["seq"].is<uint32_t>();', text)
+        self.assertNotIn("id(summary_max) = 0;", text)   # a stale summary keeps the last known state
+        self.assertNotIn("id(summary_na) = 0;", text)
         self.assertIn("(millis() - id(summary_seen)) < 15000UL", text)   # 3 x heartbeat_s (5 s)
         show = re.search(r"bool show = (.*);", text).group(1)
-        for guard in ("seen", "id(bridge_online)", "mqtt::global_mqtt_client->is_connected()",
-                      "id(summary_max) == 3", "!id(alarm_dismissed)"):
-            self.assertIn(guard, show)
+        self.assertTrue(show.startswith("mode != VS_BANNER_HIDDEN"), show)
+        mode = re.search(r"int mode = (.*);", text).group(1)
+        self.assertTrue(mode.startswith("vs_banner_mode(seen, "))
+        for guard in ("id(bridge_online)", "mqtt::global_mqtt_client->is_connected()",
+                      "id(summary_max)", "id(summary_nl)", "id(alarm_dismissed)"):
+            self.assertIn(guard, mode)
         self.assertIn("on_click:\n            - lambda: 'id(alarm_dismissed) = true;'", text)
         self.assertNotIn("mqtt.publish", text)
 
@@ -686,8 +739,13 @@ class AlarmTakeover(Base):
         for label in hostile.values():
             self.assertNotIn(label, inside)
         # the only composed text is the count and the two fixed words
-        composed = next(l for l in text.splitlines() if "snprintf" in l)
-        self.assertEqual(re.findall(r'"(ALARMS?)"', composed), ["ALARM", "ALARMS"])
+        self.assertIn("vs_banner_count(buf, sizeof(buf), mode, id(summary_na));", text)
+        self.assertIn('int nl = x["nl"] | 0;', text)
+        self.assertIn("id(summary_nl)", text)
+        header = "\n".join(l for l in (ROOT / "displays" / "esphome" / "app" / "vesselstack_logic.h").read_text().splitlines()
+                           if not l.lstrip().startswith("//"))
+        self.assertEqual(re.findall(r'"([^"]*(?:ALARMS?|NO DATA))"', header),
+                         ["NO DATA", "%d%s NO DATA", "ALARM", "ALARMS"])
 
     def test_banner_glyphs_cover_the_fixed_text_and_labels(self):
         text = self.alarm_device()
@@ -696,9 +754,29 @@ class AlarmTakeover(Base):
         banner = json.loads(re.search(r"id: font_banner\n    size: 48\n    bpp: 4\n    glyphs: !literal (\".*\")",
                                       text).group(1))
         self.assertTrue(set("0123456789+ ALARMS") <= set(banner))
+        self.assertTrue(set("NO DATA") <= set(banner))
+        self.assertEqual(set(render.BANNER_GLYPHS), set("0123456789+ ") | set("ALARMS") | set("NO DATA"))
         name = json.loads(re.search(r"id: font_banner_name\n    size: 28\n    bpp: 4\n    glyphs: !literal (\".*\")",
                                     text).group(1))
         self.assertTrue(set("SOGDepthAWAHouseAnchorLow batteryBilge") <= set(name))
+
+    def test_banner_count_lines_fit_the_banner_width(self):
+        """The widest count lines, measured from the bold font's advance widths at the banner size."""
+        data = (render.FONTS_DIR / render.FONT_FILES["bold"]).read_bytes()
+        advances = font_advances(data)
+        scale = render.FONT_SIZES["banner"] / advances["units_per_em"]
+
+        def width(text):
+            return sum(advances["by_char"][ch] for ch in text) * scale
+
+        text = self.alarm_device()
+        # the banner is board.content_width wide with pad_all 4 on both sides; labels fill the inside
+        self.assertIn(f"width: {REGISTRY['boards'][BOARD]['content_width']}\n          height: {render.BANNER_HEIGHT}", text)
+        self.assertIn("pad_all: 4", text.split("          id: alarm_banner\n")[1][:400])
+        for name, board in REGISTRY["boards"].items():
+            usable = board["content_width"] - 2 * 4
+            for line in ("99+ NO DATA", "99+ ALARMS"):
+                self.assertLessEqual(width(line), usable, f"{line} on {name}: {width(line):.1f} > {usable}")
 
     def test_unsupported_label_glyph_is_still_reported(self):
         def mutate(cfg):
@@ -2128,7 +2206,7 @@ class BuildDirectory(Base):
         names = {p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file()}
         self.assertEqual(names, {
             "helm.yaml", "secrets.yaml", "README.txt", f"boards/{BOARD}.yaml",
-            "app/vesselstack.yaml", "fonts/OFL.txt", "fonts/RobotoCondensed-Bold.ttf",
+            "app/vesselstack.yaml", "app/vesselstack_logic.h", "fonts/OFL.txt", "fonts/RobotoCondensed-Bold.ttf",
             "fonts/RobotoCondensed-Regular.ttf"})
 
     def test_rerender_keeps_previous_build(self):

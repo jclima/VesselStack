@@ -69,8 +69,9 @@ STATUS_FONTS = {"lg": "font_status_lg", "sm": "font_status_sm"}
 TAP_TIME = "0ms"
 BANNER_COLOR = 0xC62828
 BANNER_HEIGHT = 96
-BANNER_GLYPHS = "0123456789+ ALRMS"   # "<n> ALARM(S)" and "99+": the only text the banner composes
+BANNER_GLYPHS = "0123456789+ ALRMSDNOT"   # "<n> ALARM(S)", "<n> NO DATA" and "99+": the only text the banner composes
 BANNER_COUNT_MAX = 99
+LOGIC_HEADER = "app/vesselstack_logic.h"   # the banner decisions, host-tested; included by the device YAML
 BANNER_FLASH_INTERVAL = "500ms"
 HEADER_CLOCK_X = -24      # clock label centre, relative to the screen's middle
 HEADER_DOT_X = (13, 27, 41)   # SignalK, bridge, MQTT status dots (centres, same reference)
@@ -1640,8 +1641,11 @@ def summary_stale_ms(heartbeat: int) -> int:
 ALARM_GLOBALS = [
     '  - {id: summary_max, type: uint8_t, initial_value: "0"}',      # 0 unknown, 1 ok, 2 warn, 3 alarm
     '  - {id: summary_na, type: int, initial_value: "0"}',
+    '  - {id: summary_nl, type: int, initial_value: "0"}',             # how many counted alarms are lost
+    '  - {id: summary_seq, type: uint32_t, initial_value: "0"}',        # the bridge's counter of new live alarms
+    '  - {id: summary_has_seq, type: bool, initial_value: "false"}',   # false for a bridge older than 0.9.0
     '  - {id: summary_seen, type: uint32_t, initial_value: "0"}',
-    '  - {id: summary_valid, type: bool, initial_value: "false"}',
+    '  - {id: summary_valid, type: bool, initial_value: "false"}',     # a summary has arrived since boot
     '  - {id: summary_first, type: int, initial_value: "-1"}',       # index of ids[0] among this display\'s items
     '  - {id: alarm_rising, type: bool, initial_value: "false"}',
     '  - {id: alarm_dismissed, type: bool, initial_value: "false"}',
@@ -1661,15 +1665,22 @@ def _alarm_handler(used: list, display: dict) -> list:
         '            uint8_t m = strcmp(mx, "ok") == 0 ? 1 : strcmp(mx, "warn") == 0 ? 2 : '
         'strcmp(mx, "alarm") == 0 ? 3 : 0;',
         '            int na = x["na"] | 0;',
+        '            int nl = x["nl"] | 0;',
+        '            bool has_seq = x["seq"].is<uint32_t>();',
+        '            uint32_t seq = has_seq ? x["seq"].as<uint32_t>() : 0;',
         '            const char *id0 = x["ids"][0] | "";',
         "            int first = -1;",
     ]
     for index, iid in enumerate(used):
         lines.append(f'            {"" if index == 0 else "else "}if (strcmp(id0, "{iid}") == 0) first = {index};')
     lines += [
-        "            bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));",
+        "            bool rising = vs_alarm_rising(!id(summary_valid), m, na, has_seq, seq, id(summary_has_seq),"
+        " id(summary_seq), id(summary_max), id(summary_na));",
         "            id(summary_max) = m;",
         "            id(summary_na) = na;",
+        "            id(summary_nl) = nl;",
+        "            id(summary_seq) = seq;",
+        "            id(summary_has_seq) = has_seq;",
         "            id(summary_first) = first;",
         "            id(summary_seen) = millis();",
         "            id(summary_valid) = true;",
@@ -1713,18 +1724,13 @@ def _alarm_script(config: dict, used: list, heartbeat: int) -> list:
         "      - lambda: |-",
         "          bool seen = id(summary_valid) && (millis() - id(summary_seen)) < "
         f"{summary_stale_ms(heartbeat)}UL;",
-        "          if (!seen) {",
-        "            id(summary_max) = 0;",
-        "            id(summary_na) = 0;",
-        "          }",
-        "          bool show = seen && id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
-        " && id(summary_max) == 3 && id(summary_na) > 0 && !id(alarm_dismissed);",
+        "          int mode = vs_banner_mode(seen, id(bridge_online) && mqtt::global_mqtt_client->is_connected(),"
+        " id(summary_max), id(summary_na), id(summary_nl), id(alarm_dismissed));",
+        "          bool show = mode != VS_BANNER_HIDDEN;",
         "          id(alarm_idx) = show ? id(summary_first) : -1;",
         "          if (show) {",
         "            char buf[16];",
-        f"            snprintf(buf, sizeof(buf), \"%d%s %s\", id(summary_na) > {BANNER_COUNT_MAX} ? "
-        f"{BANNER_COUNT_MAX} : id(summary_na), id(summary_na) > {BANNER_COUNT_MAX} ? \"+\" : \"\", "
-        "id(summary_na) == 1 ? \"ALARM\" : \"ALARMS\");",
+        "            vs_banner_count(buf, sizeof(buf), mode, id(summary_na));",
         "            if (strcmp(lv_label_get_text(id(alarm_banner_count)), buf) != 0)"
         " lv_label_set_text(id(alarm_banner_count), buf);",
         "            lv_obj_clear_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN);",
@@ -2045,6 +2051,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         "esphome:",
         "  name: ${device_name}",
         f"  min_version: {esphome_version()}",
+        "  includes:",
+        f"    - {LOGIC_HEADER}",
         "",
         "packages:",
         f"  board: !include {board_package}",
@@ -2230,6 +2238,7 @@ def source_files(config: dict, registry: dict, display_id: str) -> dict:
     files: dict = {}
     files[f"{prefix}/{package}"] = _read_package(package)
     files[f"{prefix}/app/vesselstack.yaml"] = _read_package("app/vesselstack.yaml")
+    files[f"{prefix}/{LOGIC_HEADER}"] = _read_package(LOGIC_HEADER)
     if display.get("home_assistant_api", False):
         files[f"{prefix}/app/api.yaml"] = _read_package("app/api.yaml")
     fonts = sorted(FONT_FILES.values()) + [FONT_LICENSE]

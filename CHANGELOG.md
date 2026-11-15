@@ -3,6 +3,25 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Displays
+
+- The alarm banner on a display now comes back for every new alarm. Before, a banner you had
+  tapped away stayed away when one alarm cleared and another raised in the same update. The
+  display now follows the `seq` counter that the bridge has published since 0.9.0.
+- A Wi-Fi or MQTT blip no longer brings a dismissed banner back. While the link is down the
+  banner stays hidden; when it returns with the same alarms, nothing is raised again.
+- When the data of every alarm has stopped, the banner says `NO DATA` (or `2 NO DATA`) instead of
+  `ALARM`. With at least one live alarm it still says `ALARM` or `ALARMS`.
+- **Operational impact:** rebuild and reflash each display that shows the banner. There is no
+  bridge or Pi configuration change, and no change to `displays.json`. Displays you do not reflash
+  keep the old behaviour.
+- **Verify:** `sudo vesselstackctl display build ID`, then `sudo vesselstackctl display flash ID`.
+  Raise an alarm, tap the banner away, then clear that alarm and raise another one: the banner
+  returns.
+- **Rollback:** `sudo vesselstackctl display flash ID --previous`, or reflash the previous build.
+
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,
