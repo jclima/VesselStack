@@ -417,6 +417,7 @@ class StatePersistenceTests(unittest.TestCase):
         self.assertEqual(self.last(b.publisher)["na"], 3)
         b._set_signalk(bridge.SIGNALK_DISCONNECTED)
         b.has.source_state(False, b.clock())
+        b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S      # live -> lost adds no id: the write waits the interval
         b._publish_summary(b.clock())
         self.assertEqual(self.last(b.publisher)["nl"], 3)
 
@@ -466,6 +467,7 @@ class StatePersistenceTests(unittest.TestCase):
         second.handle_message(self.sog(10 * KN))
         self.assertNotIn("sog", self.last(pub)["lost"])
         self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": ["anchor"], "ha": ["high"]})
+        second.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S    # a second removal waits for the interval
         second.handle_message(note_delta(None))
         self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": [], "ha": ["high"]})
 
@@ -563,7 +565,10 @@ class StatePersistenceTests(unittest.TestCase):
                 b._tick()
                 b.handle_message(self.sog(1 * KN))
             self.assertEqual(write.call_count, 1)
-            b.handle_message(self.sog(10 * KN))                 # live set changes back: one more
+            b.handle_message(self.sog(10 * KN))                 # live set changes back: a removal, held back
+            self.assertEqual(write.call_count, 1)
+            b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S
+            b._tick()                                           # ... and written once the interval has passed
             self.assertEqual(write.call_count, 2)
 
     def test_a_file_without_the_live_key_loads_as_before(self):                                 # case f
@@ -685,6 +690,92 @@ class StatePersistenceTests(unittest.TestCase):
             self.assertEqual(write.call_count, 1)
             b.handle_message(note_delta({"state": "alarm"}))
             self.assertEqual(write.call_count, 1)
+
+    # -- write-rate bound: only removals are coalesced -----------------------------
+    def coalescing_bridge(self):
+        """A bridge whose file already holds the live instrument alarm; returns it with the write spy's patcher."""
+        b, _ = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b.handle_message(self.sog(1 * KN))
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        return b
+
+    def test_a_removal_is_not_written_before_the_interval_and_is_written_after_it(self):
+        b = self.coalescing_bridge()
+        seq = b._alarm_seq
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            b.handle_message(self.sog(10 * KN))                 # the alarm clears: removal only
+            self.assertEqual(write.call_count, 0)
+            self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+            b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S - 1
+            b._tick()
+            self.assertEqual(write.call_count, 0)
+            b.clock.now += 2
+            b._tick()
+            self.assertEqual(write.call_count, 1)
+            b._tick()
+            b.clock.now += 1
+            b._tick()
+            self.assertEqual(write.call_count, 1)
+        self.assertEqual(self.state()["live"]["instruments"], [])
+        self.assertEqual(self.state()["seq"], seq)
+
+    def test_a_new_id_during_a_pending_removal_writes_at_once_and_the_file_equals_the_state(self):
+        b = self.coalescing_bridge()
+        b.has.source_state(True, b.clock())
+        b.handle_message(self.sog(10 * KN))                     # pending removal of sog
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        b.has.set_state("binary_sensor.high_water", "HIGH", "t", b.clock())     # a new id
+        b._publish_summary(b.clock())
+        data = self.state()
+        self.assertEqual(data["live"], {"instruments": [], "notifications": [], "ha": ["high"]})
+        self.assertEqual(data["seq"], b._alarm_seq)
+
+    def test_a_seq_increase_writes_at_once(self):
+        b = self.coalescing_bridge()
+        b.handle_message(self.sog(10 * KN))                     # pending removal
+        before = self.state()["seq"]
+        b.handle_message(self.sog(1 * KN))                      # the same id re-appears: seq moves
+        self.assertNotEqual(b._alarm_seq, before)
+        self.assertEqual(self.state()["seq"], b._alarm_seq)
+
+    def test_shutdown_flushes_a_pending_removal(self):
+        b = self.coalescing_bridge()
+        b.handle_message(self.sog(10 * KN))
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        b.shutdown()
+        self.assertEqual(self.state()["live"]["instruments"], [])
+
+    def test_ten_oscillations_in_one_interval_write_the_ten_rising_crossings_and_one_removal(self):
+        b, _ = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b.handle_message(self.sog(10 * KN))                     # the initial file
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            for _ in range(10):
+                b.handle_message(self.sog(1 * KN))              # rising: seq moves, written at once
+                b.handle_message(self.sog(10 * KN))             # falling: coalesced
+            self.assertEqual(write.call_count, 10)
+            b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S + 1
+            b._tick()
+            self.assertEqual(write.call_count, 11)
+        self.assertEqual(self.state()["live"]["instruments"], [])
+
+    def test_a_crash_with_a_pending_removal_restores_the_cleared_alarm_as_lost_and_the_next_reading_clears_it(self):
+        b = self.coalescing_bridge()
+        seq = b._alarm_seq
+        b.handle_message(self.sog(10 * KN))                     # cleared in memory, still in the file; then kill -9
+        second, pub = self.make()
+        second._publish_summary(second.clock())
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["nl"], body["lost"], body["seq"]), ("alarm", 1, ["sog"], seq))
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(10 * KN))                # the first non-alarm reading
+        self.assertEqual(self.last(pub).get("seq"), seq)
+        self.assertEqual(self.last(pub).get("nl", 0), 0)
+        self.assertEqual(second._alarm_seq, seq)
 
     def test_the_file_is_private_and_no_temporary_file_is_left(self):
         b, _ = self.make()

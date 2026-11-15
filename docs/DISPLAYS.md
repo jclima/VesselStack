@@ -240,7 +240,7 @@ sudo vesselstackctl display remove helm --yes
 | `restore-config STAMP [--if-revision SHA]` | Root. Puts the backup `STAMP` back as `displays.json` (validated; the file it replaces is backed up first) and prints a JSON result. |
 | `serial-ports [--json]` | Nothing. Validated USB serial devices that `flash --serial` would accept. Prefers stable `/dev/serial/by-id` aliases, with `/dev/ttyACM*` and `/dev/ttyUSB*` fallback. JSON reports discovery errors separately. |
 | `wifi [--open] [--clear]` | Reads the SSID and password from the terminal (password hidden) or, when stdin is not a terminal, from two lines on stdin (for automation); they are never accepted as command-line arguments. SSID: 1-32 bytes of printable UTF-8. Password: 8-63 printable ASCII characters; an empty password (open network) is accepted only with `--open`. Stored once for all displays as `"wifi": {"ssid", "password"}` in `displays.secrets.json` (mode 0600, inside `config/`, so **included in `vesselstackctl backup`**; keep archives private). `--clear` removes it and also deletes `secrets.yaml` from every already rendered tree of every display id under `build/displays/` (`ID/project`, `ID/project.new`, `ID/project.prev`, an old-layout `ID/secrets.yaml`, and the old siblings `ID.new/` and `ID.prev/`), each under that display's build lock without following symlinks (a display whose build is running is skipped with a warning); it does this even when no Wi-Fi credentials were stored, so a rerun after a failed or partial clear still cleans up; a changed password prints a notice instead. In both cases projects rendered and firmware built earlier still contain the old Wi-Fi credentials until `render`/`build` runs again (the firmware cannot be scrubbed; `flash` refuses it without `--force`). Nothing is echoed. |
-| `status` | Reads the retained topics `vesselstack/v1/bridge/service`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state with the age of its report (`online (reported 12 s ago)`; `last reported online 3 days ago; the bridge may not be running` when the report is older than 3 x `heartbeat_s`, because the retained record survives a crash or power loss; `offline (reported 5 min ago)` after a clean stop; `unknown (no report)` when the topic is absent), the Signal K link state and each display's last retained state (`online`/`offline` as published by the device; `unknown`/`never seen` means no retained message exists, so the device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
+| `status` | Reads the retained topics `vesselstack/v1/bridge/service`, `vesselstack/v1/bridge/signalk` and `vesselstack/v1/displays/vsdisp-ID/status` through the running Mosquitto container and prints the bridge state with the age of its report (`online (reported 12 s ago)`; `last reported online 3 days ago; the bridge may not be running` when the report is older than the link limit, `max(3 x heartbeat_s, heartbeat_s + 15)` seconds, because the retained record survives a crash or power loss; `offline (reported 5 min ago)` after a clean stop; `unknown (no report)` when the topic is absent), the Signal K link state and each display's last retained state (`online`/`offline` as published by the device; `unknown`/`never seen` means no retained message exists, so the device has not connected since the broker's data was last cleared). It exits 1 if the broker container is not running. |
 
 Behaviour that applies to the changing commands (`add`, `remove`, `rotate`,
 `wifi`):
@@ -878,7 +878,10 @@ are rejected):
 - Hysteresis applies only when the severity gets less severe: leaving `alarm`
   (or `warn`) needs the value to clear the bound by `hysteresis`. With
   `alarm_below: 11.8` and `hysteresis: 0.1` an `alarm` ends at 11.9 or above
-  (not at 11.8), judged on the unrounded value. Getting more severe is immediate. After the value was
+  (not at 11.8), judged on the unrounded value. Set a `hysteresis` on alarm thresholds
+  for noisy values. Without it a value hovering at the threshold raises the alarm
+  on every rising crossing, which re-arms a dismissed banner each time and writes
+  the bridge's state file each time (see [Bridge state](#bridge-state)). Getting more severe is immediate. After the value was
   `stale` or `missing` there is no memory: the first value is judged on the
   bounds alone.
 - `alarm` (boolean, meaning "this instrument may raise an alarm", default true
@@ -956,7 +959,8 @@ Topic: each notification is published retained to
 while Signal K is connected, `stale` once it disconnects (everything heard is
 forgotten and Signal K re-sends active notifications on reconnect) and `missing`
 before the first connection. Items are republished every `heartbeat_s`; the
-display blanks a cell (grey `--`) after 3 x `heartbeat_s` without a message,
+display blanks a cell (grey `--`) after the link limit,
+`max(3 x heartbeat_s, heartbeat_s + 15)` seconds, without a message,
 when the bridge link is not live (see "Bridge link" below), or when MQTT is disconnected. The bridge subscribes
 to these paths with a 1000 ms period; instruments still only publish numeric
 values. The bridge needs the `notifications/#` ACL rule (see [MQTT access
@@ -1013,6 +1017,27 @@ screen with a flashing banner.
   (`max` stays `alarm`, `seq` is unchanged). If its data returns still in alarm it
   is live again and `seq` does not move, because it is not a new alarm. If it
   returns without an alarm it clears.
+- **A lost alarm that can never get data again.** After a power cut or a bridge
+  crash, an alarm that was live comes back as lost. If its source never sends
+  again, it stays lost with no time limit. Two cases: a Signal K notification
+  that Signal K no longer sends (Signal K restarted with an empty notification
+  tree), and a Home Assistant entity that no longer exists. Every display shows
+  `NO DATA` for it. A tap dismisses it on that display only, and a display that
+  restarts shows it again. To make the bridge forget it, stop the bridge, delete
+  the state file and start the bridge, in this order:
+
+  ```bash
+  sudo systemctl stop vesselstack-displays-bridge
+  sudo rm /opt/vesselstack-data/displays-bridge/state.json
+  sudo systemctl start vesselstack-displays-bridge
+  ```
+
+  The path is `<VESSELSTACK_DATA>/displays-bridge/state.json`; `/opt/vesselstack-data`
+  is the default `VESSELSTACK_DATA`, so use your value if you changed it. The order
+  matters. A plain `sudo systemctl restart` does not work: the bridge writes the
+  lost alarm back to the file while it stops. Deleting the file also forgets every
+  other lost alarm, and `seq` restarts at a random value, so every display re-arms
+  its banner once if an alarm is showing.
 - `seq` is an unsigned 32-bit counter (wrapping at 2^32). It starts from a random
   value when the bridge has no saved state and otherwise continues from the saved
   value across restarts. A lost or live alarm restored after a restart counts as
@@ -1555,7 +1580,7 @@ instrument id rules and are unique across instruments, notifications and `ha`:
   `match` or `prefix`. An unmatched state is not missing: it takes `default`.
 - Freshness: while the bridge is connected to HA the item is `ok` (or `missing`);
   when the connection drops every item becomes `stale` and everything heard is
-  forgotten. A display greys a cell after 3 x `heartbeat_s` without a message, when the
+  forgotten. A display greys a cell after the link limit (`max(3 x heartbeat_s, heartbeat_s + 15)` seconds) without a message, when the
   bridge link is not live or when MQTT is disconnected, like notifications.
 - Binary and state items are only accepted on `status-grid` and, for `binary` items, in
   the `shore` slot of an `electrical` page, where the text appears in the pill. The
@@ -1798,8 +1823,13 @@ mode 0700, owned by the service account, and the only path the unit may write):
 - The file is replaced atomically (temporary file in the same directory, `fsync`,
   rename, `fsync` of the directory), has mode 0600, and is written only when the
   lost set, the live set or `seq` changed, at most once per evaluation. It is not
-  written on every tick or heartbeat. An item that crosses its alarm threshold back
-  and forth causes one write per crossing. It holds ids only: no
+  written on every tick or heartbeat. A change that adds an alarm id or moves
+  `seq` is written at once. A change that only removes ids (an alarm clears, or a live
+  alarm becomes lost) waits until `STATE_MIN_WRITE_INTERVAL_S` (5 s) after the last
+  write, is written by a later tick, and is always written when the bridge stops.
+  An item that crosses its alarm threshold back and forth therefore causes one write
+  per rising crossing (each moves `seq`), and its falling crossings are coalesced.
+  Use `hysteresis` to avoid this (see "Thresholds and severity colours"). It holds ids only: no
   readings, labels, positions or message text.
 - On start, before the first summary, an id that is still in `displays.json` and
   still counts for the summary is marked lost (it has no reading yet, so it stays
@@ -1823,11 +1853,15 @@ mode 0700, owned by the service account, and the only path the unit may write):
   crash (`kill -9`, power loss) the live set is what the last evaluation wrote, so the
   alarm comes back as lost and is not forgotten. The file keeps the state of the
   last evaluation: an alarm that went live in the final moments before a power cut
-  may not have reached the SD card.
+  may not have reached the SD card. A removal can be up to 5 s behind: if the bridge
+  crashes then, the file still lists an alarm that had cleared. That alarm is
+  restored as lost and clears with its first non-alarm reading, with `seq`
+  unchanged. This errs towards showing an alarm, never towards hiding one.
 - The directory is inside the data tree, so backups include it. Restoring an old
   backup restores an old lost set and `seq`: that can only err towards showing an
   alarm until fresh data arrives (and a `seq` that a display may see go backwards
-  once), never towards hiding one. Delete `state.json` to forget it.
+  once), never towards hiding one. To forget it, delete `state.json` with the bridge
+  stopped (see "Lost alarms" above).
 - Rollback: older releases ignore the variable. A bridge from before the `live` key
   reads the new file without trouble and ignores the key, so a live alarm at the
   moment of a crash is then forgotten, as before. The extra unit lines are only

@@ -67,6 +67,7 @@ HA_MAX_MESSAGE_BYTES = 2 * 1024 * 1024     # one websocket message from Home Ass
 STATE_DIR_ENV = "VESSELSTACK_DISPLAYS_STATE_DIR"
 STATE_FILE = "state.json"
 STATE_FORMAT = 1
+STATE_MIN_WRITE_INTERVAL_S = 5.0    # a change that only removes alarm ids waits this long since the last write
 
 
 class SettingsError(Exception):
@@ -90,6 +91,7 @@ class StateStore:
     def __init__(self, directory):
         self.path = None
         self._written = None            # the content last known to be in the file; None: unknown/different
+        self._written_at = None         # clock time of the last write attempt by this process
         self._warned = False
         text = (directory or "").strip() if isinstance(directory, str) else ""
         if not (text and os.path.isdir(text) and os.access(text, os.W_OK | os.X_OK)):
@@ -139,8 +141,13 @@ class StateStore:
             parsed.append(tuple(out))
         return data["seq"], parsed[0], parsed[1]
 
-    def save(self, seq, latched, live=None):
-        """Write when the content differs from the file's; a failure warns once and is not retried until it changes."""
+    def save(self, seq, latched, live=None, now=None, force=False):
+        """Write when the content differs from the file's; a failure warns once and is not retried until it changes.
+
+        A change that only removes alarm ids (same ``seq``, no id added to lost + live) is held back until
+        STATE_MIN_WRITE_INTERVAL_S after the last write, or until ``force``: it is written by a later call
+        with the then-current content. Any other change is written at once.
+        """
         if self.path is None:
             return
         live = live or {}
@@ -148,6 +155,10 @@ class StateStore:
                    tuple((kind, tuple(live.get(kind, ()))) for kind in self.KINDS))
         if content == self._written:
             return
+        if (not force and now is not None and self._written_at is not None
+                and now - self._written_at < STATE_MIN_WRITE_INTERVAL_S and self._only_removes(content)):
+            return
+        self._written_at = now
         self._written = content
         body = json.dumps({"format": STATE_FORMAT, "seq": seq, "latched": {k: list(v) for k, v in content[1]},
                            "live": {k: list(v) for k, v in content[2]}}, separators=(",", ":"))
@@ -157,6 +168,16 @@ class StateStore:
             if not self._warned:
                 self._warned = True
                 LOG.warning("cannot write %s: %s", STATE_FILE, type(exc).__name__)
+
+    def _only_removes(self, content):
+        """True when ``content`` has the file's ``seq`` and no id in lost + live that the file lacks."""
+        if self._written is None or content[0] != self._written[0]:
+            return False
+        for kind_index in range(len(self.KINDS)):
+            old = set(self._written[1][kind_index][1]) | set(self._written[2][kind_index][1])
+            if not (set(content[1][kind_index][1]) | set(content[2][kind_index][1])) <= old:
+                return False
+        return True
 
     def _write(self, body):
         directory = os.path.dirname(self.path)
@@ -345,8 +366,11 @@ class Bridge:
         if restored:
             LOG.info("restored %d lost alarm(s) from %s", len(restored), STATE_FILE)
 
-    def _persist(self, now):
+    def _persist(self, now, force=False):
         """Write the lost and the live alarm ids and the counter; the store only writes when they changed.
+
+        Removals alone are coalesced (at most one write per STATE_MIN_WRITE_INTERVAL_S, flushed by a later
+        call or by ``force``); a new id or a new ``seq`` is written at once.
 
         The live ids come from the engines (not from a summary that shutdown rewrites as lost), so a
         crash while an alarm is live restarts with that alarm as lost instead of forgetting it.
@@ -359,7 +383,7 @@ class Bridge:
                           "ha": self.has.latched_ids()},
                          {"instruments": live(self.engine.summary_items()),
                           "notifications": live(self.events.summary_items(now)),
-                          "ha": live(self.has.summary_items())})
+                          "ha": live(self.has.summary_items())}, now=now, force=force)
 
     # -- publishing -------------------------------------------------------
     def _send(self, messages):
@@ -633,6 +657,7 @@ class Bridge:
         self._publish_summary(now, [(i, "lost" if sev in ("alarm", "lost") else "unknown") for i, sev in
                                     self.engine.summary_items() + self.events.summary_items(now)
                                     + self.has.summary_items()], force=True)
+        self._persist(now, force=True)      # flush a pending removal
         self.publisher.publish(topics.BRIDGE_SERVICE_TOPIC,
                                topics.service_payload(STATUS_OFFLINE, self._summary_ts()), True, qos=1)
         self.publisher.publish(topics.BRIDGE_STATUS_TOPIC, STATUS_OFFLINE, False, qos=0)

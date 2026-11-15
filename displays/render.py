@@ -401,9 +401,13 @@ def item_topic(config: dict, iid: str) -> str:
 
 
 def item_limit_ms(config: dict, iid: str, heartbeat_s: int) -> int:
-    """How long without a message before an item's tile is blanked (milliseconds)."""
+    """How long without a message before an item's tile is blanked (milliseconds).
+
+    A word item (notification, Home Assistant) is republished by the bridge on its tick, like the summary,
+    so it gets the bridge link limit; an instrument is judged by its own staleness rule.
+    """
     if is_word(config, iid):
-        return 3 * heartbeat_s * 1000
+        return summary_stale_ms(heartbeat_s)
     return stale_threshold_s(config["instruments"][iid], heartbeat_s) * 1000
 
 

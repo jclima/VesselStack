@@ -38,6 +38,18 @@ Semantic Versioning.
   switch; when it returns without an alarm it clears. The file is written only when the live set,
   the lost set or `seq` change, not on every heartbeat. This replaces the known limit in 0.9.0 that
   a live alarm at the moment of a crash counts as new afterwards.
+- The bridge now writes `state.json` at most once every 5 s when the only change is that alarm ids
+  are removed (an alarm clears, or a live alarm becomes lost). A new alarm and every `seq` change
+  are still written at once, and a clean stop writes whatever is pending. If the bridge is killed
+  within 5 s of an alarm clearing, the file still lists that alarm; it comes back as lost and
+  clears with its first non-alarm reading. Set `hysteresis` on alarm thresholds of noisy values:
+  without it, a value that hovers at the threshold re-arms the banner and writes the file on every
+  rising crossing.
+- Notification and Home Assistant tiles now go to `--` after the same link limit as the bridge,
+  `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5),
+  not after 3 × `heartbeat_s`. With a 1 s heartbeat they blanked after 3 s while the bridge can be
+  blocked for about 13 s. Instrument tiles are unchanged. `vesselstackctl display status` uses the
+  same limit before it says the bridge may not be running.
 - A display now compares the unit tag (`cu`) in each reading with the one it was built for. If you
   change a unit, conversion or precision on the Pi, that tile shows `--` and the display logs one
   warning, instead of a number under the old label. Reflash to get the number back.
@@ -53,7 +65,15 @@ Semantic Versioning.
   display would show `--` after the link limit. If you roll the Pi back below 0.9.0, reflash the
   displays with the previous firmware. After you change a unit on the Pi, tiles show `--` until
   you reflash. There is no change to `displays.json`. Displays you do not reflash keep the old
-  behaviour, and keep working with the new bridge.
+  behaviour, and keep working with the new bridge. After a power cut or a bridge crash, an alarm
+  that was live comes back as lost. If its source never sends again (Signal K restarted with an
+  empty notification tree, or a Home Assistant entity that no longer exists), it stays `NO DATA`
+  with no time limit, and a tap dismisses it on that display only. To forget it, run
+  `sudo systemctl stop vesselstack-displays-bridge`, then
+  `sudo rm /opt/vesselstack-data/displays-bridge/state.json`, then
+  `sudo systemctl start vesselstack-displays-bridge`, in this order: a plain restart writes the
+  alarm back while stopping. This also forgets every other lost alarm, and `seq` restarts at a
+  random value, so every display re-arms its banner once.
 - **Verify:** `sudo vesselstackctl display build ID`, then `sudo vesselstackctl display flash ID`.
   Raise an alarm, tap the banner away, then clear that alarm and raise another one: the banner
   returns. During an alarm stop the bridge: within 20 s (with the example `heartbeat_s` of 5) the

@@ -694,90 +694,90 @@ script:
             return fresh ? id(ins_solar_a_val) : std::string("--");
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 3;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 3;'
           then:
             - lvgl.label.update:
                 id: p2_anchor_value
                 text: !literal "ALARM"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 2;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 2;'
           then:
             - lvgl.label.update:
                 id: p2_anchor_value
                 text: !literal "WARN"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 1;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 1;'
           then:
             - lvgl.label.update:
                 id: p2_anchor_value
                 text: !literal "OK"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 0;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 0;'
           then:
             - lvgl.label.update:
                 id: p2_anchor_value
                 text: !literal "--"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 3;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 3;'
           then:
             - lvgl.label.update:
                 id: p3_anchor_value
                 text: !literal "ALARM"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 2;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 2;'
           then:
             - lvgl.label.update:
                 id: p3_anchor_value
                 text: !literal "WARN"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 1;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 1;'
           then:
             - lvgl.label.update:
                 id: p3_anchor_value
                 text: !literal "OK"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL) ? id(ins_anchor_sev) : 0) == 0;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL) ? id(ins_anchor_sev) : 0) == 0;'
           then:
             - lvgl.label.update:
                 id: p3_anchor_value
                 text: !literal "--"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 15000UL) ? id(ins_shore_sev) : 0) == 3;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 20000UL) ? id(ins_shore_sev) : 0) == 3;'
           then:
             - lvgl.label.update:
                 id: p6_shore_value
                 text: !literal "ALARM"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 15000UL) ? id(ins_shore_sev) : 0) == 2;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 20000UL) ? id(ins_shore_sev) : 0) == 2;'
           then:
             - lvgl.label.update:
                 id: p6_shore_value
                 text: !literal "WARN"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 15000UL) ? id(ins_shore_sev) : 0) == 1;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 20000UL) ? id(ins_shore_sev) : 0) == 1;'
           then:
             - lvgl.label.update:
                 id: p6_shore_value
                 text: !literal "OK"
       - if:
           condition:
-            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 15000UL) ? id(ins_shore_sev) : 0) == 0;'
+            lambda: 'return (((id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 20000UL) ? id(ins_shore_sev) : 0) == 0;'
           then:
             - lvgl.label.update:
                 id: p6_shore_value
                 text: !literal "--"
       - lambda: |-
-          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 15000UL;
+          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_anchor_ok) && (millis() - id(ins_anchor_seen)) < 20000UL;
           uint8_t sev = fresh ? id(ins_anchor_sev) : 0;
           if (sev != id(ins_anchor_drawn_sev)) {
             id(ins_anchor_drawn_sev) = sev;
@@ -979,7 +979,7 @@ script:
                 id: p6_batt_a_word
                 text: !literal ""
       - lambda: |-
-          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 15000UL;
+          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_shore_ok) && (millis() - id(ins_shore_seen)) < 20000UL;
           uint8_t sev = fresh ? id(ins_shore_sev) : 0;
           if (sev != id(ins_shore_drawn_sev)) {
             id(ins_shore_drawn_sev) = sev;

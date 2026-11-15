@@ -499,17 +499,20 @@ class StatusGrid(Base):
         # the gated severity is used, so stale/unknown/disconnected can only ever read "--"
         branch = text.split("id(ins_anchor_sev) : 0) == 1;")[0].splitlines()[-1]
         for gate in ("id(bridge_online)", "mqtt::global_mqtt_client->is_connected()", "id(ins_anchor_ok)",
-                     "(millis() - id(ins_anchor_seen)) < 15000UL"):
+                     "(millis() - id(ins_anchor_seen)) < 20000UL"):
             self.assertIn(gate, branch)
 
-    def test_notification_gate_is_three_heartbeats(self):
+    def test_notification_gate_is_the_bridge_link_limit(self):
         def mutate(cfg):
             cfg["heartbeat_s"] = 7
             for inst in cfg["instruments"].values():
                 inst["stale_after_s"] = 14
         text = self.status_device(mutate=mutate)
-        self.assertIn("(millis() - id(ins_anchor_seen)) < 21000UL", text)
-        self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", 5), 15000)
+        self.assertIn("(millis() - id(ins_anchor_seen)) < 22000UL", text)   # max(3 x 7, 7 + 15) s
+        for beats in (1, 5, 7):
+            self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", beats),
+                             render.summary_stale_ms(beats))
+        self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", 5), 20000)
         self.assertIn("id(ins_sog_seen)) < 28000UL", text)  # instruments keep stale_after_s + 2 heartbeats
 
     def test_notification_message_handler_and_globals(self):
@@ -3014,7 +3017,7 @@ class HomeAssistantItems(Base):
         self.assertTrue(selector)
         for line in selector:
             self.assertIn(f"{render._link_expr(5)} && id(ins_engine_ok)", line)
-            self.assertIn("< 15000UL", line)   # 3 x the example 5 s heartbeat
+            self.assertIn("< 20000UL", line)   # max(3 x 5, 5 + 15) s, the example heartbeat
 
     def test_severity_colours_use_the_guarded_mechanism_in_both_palettes(self):
         text = self.ha_device()
