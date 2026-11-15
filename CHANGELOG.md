@@ -3,6 +3,26 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Restore
+
+- The restore journal now records which boot last wrote it (`boot_id`, read from
+  `/proc/sys/kernel/random/boot_id`, left out when that is unavailable) and, after a failed
+  rollback, whether trying again can help (`last_error_kind`: retry, manual or previous).
+  `vesselstackctl restore --status` and `recover status` say so on the `Last error` line. This
+  prepares an automatic rollback check at boot; nothing acts on it yet.
+
+**Operational impact:** none for a running system. Journals written by 0.9.0 have neither key and
+stay valid; rollback decisions, phases and the by-hand steps are unchanged.
+
+**Verify:** start a restore that fails, then run `sudo vesselstackctl restore --status`; the
+journal's `state` file contains a `boot_id=` line (the same value as
+`cat /proc/sys/kernel/random/boot_id`), and a failed rollback adds `last_error_kind=`.
+
+**Rollback:** reinstall the previous release. A journal that already has the new keys stays
+readable by 0.9.0, which ignores them.
+
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,

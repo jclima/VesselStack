@@ -3489,14 +3489,14 @@ restore_state_load() {
     local journal=$1 dump line key
     st_format='' st_id='' st_stamp='' st_root='' st_data='' st_system_root='' st_stage='' st_archive='' st_started=''
     st_root_live='' st_data_live='' st_root_new='' st_data_new='' st_phase='' st_rollback_from=''
-    st_last_error='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_keys=$'\n'
+    st_last_error='' st_last_error_kind='' st_boot_id='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_keys=$'\n'
     dump=$(python3 -I "$journal/restore_journal.py" dump "$journal") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         key=${line%%=*}
         st_keys="$st_keys$key"$'\n'
         case "$key" in
-            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|firewall_enabled|firewall_active|abandoned_from)
+            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|last_error_kind|boot_id|firewall_enabled|firewall_active|abandoned_from)
                 printf -v "st_$key" '%s' "${line#*=}" ;;
         esac
     done <<< "$dump"
@@ -3579,6 +3579,15 @@ restore_validate_state() {
             *) restore_validate_error="its record of the firewall state is \"${value//[![:print:]]/?}\", not yes or no"; return 1 ;;
         esac
     done
+    # The boot id and the failure kind are optional too (a journal written by 0.9.0 has neither).
+    if [ -n "${st_boot_id:-}" ] && [[ ! $st_boot_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        restore_validate_error="its record of the boot is \"${st_boot_id//[![:print:]]/?}\", not a boot id"
+        return 1
+    fi
+    case "${st_last_error_kind:-}" in
+        ''|retry|manual|previous) ;;
+        *) restore_validate_error="its record of the kind of failure is \"${st_last_error_kind//[![:print:]]/?}\", not retry, manual or previous"; return 1 ;;
+    esac
     for value in "$st_root_live" "$st_data_live" "$st_root_new" "$st_data_new"; do
         if [[ ! $value =~ $ino_re ]]; then
             restore_validate_error="it does not record the identity of the application and data trees"
@@ -3641,7 +3650,7 @@ restore_abort() {
     local journal=$1 reason=$2 rc
     restore_exit_status=1
     restore_failure_notice "$journal" "$reason"
-    restore_state_set "$journal" "last_error=${reason//[$'\n\r']/ }" || true
+    restore_state_set "$journal" "last_error=${reason//[$'\n\r']/ }" last_error_kind= || true
     restore_reconcile "$journal" && rc=0 || rc=$?
     case "$rc" in
         0)
@@ -3698,7 +3707,7 @@ restore_reconcile_fail() {
     # Remember where the rollback started from, so that a retry after the cause is fixed does not treat it as
     # a rollback from "starting". An origin that is already recorded is never overwritten.
     if [ -z "${st_rollback_from:-}" ] && [ -n "${restore_fail_origin:-}" ]; then origin=("rollback_from=$restore_fail_origin"); fi
-    restore_note "$journal" phase=rollback-failed ${origin[@]+"${origin[@]}"} "last_error=${message//[$'\n\r']/ }" || true
+    restore_note "$journal" phase=rollback-failed ${origin[@]+"${origin[@]}"} "last_error=${message//[$'\n\r']/ }" "last_error_kind=$kind" || true
     restore_outcome=rollback-failed
     echo "RECOVERY ERROR: $message" >&2
     if [ -n "${restore_stopped_units:-}" ]; then echo "Units stopped during the recovery (not started again):$restore_stopped_units" >&2; fi
@@ -4236,7 +4245,7 @@ restore_reconcile_run() {
         case "$phase" in
             committed|rolled-back)
                 # Only cleanup was left: do not turn a finished restore into a failed rollback.
-                restore_note "$journal" "last_error=the restore journal $restore_validate_error" || true
+                restore_note "$journal" "last_error=the restore journal $restore_validate_error" last_error_kind= || true
                 restore_outcome=rollback-failed
                 echo "RECOVERY ERROR: the restore journal $restore_validate_error; nothing was changed" >&2 ;;
             abandoned)
@@ -4304,7 +4313,7 @@ restore_reconcile_run() {
     esac
     # The decisions below come from the trees, not from the phase, so a journal that cannot be
     # written (a full disk) must not stop the rollback.
-    if ! restore_state_set "$journal" phase=rolling-back "rollback_from=$from"; then
+    if ! restore_state_set "$journal" phase=rolling-back "rollback_from=$from" last_error_kind=; then
         restore_journal_ok=0
         echo "WARN the journal $journal could not be updated (is the disk full?); the recovery goes on and decides from the folders themselves" >&2
     fi
@@ -4374,9 +4383,9 @@ restore_reconcile_run() {
         restore_start_containers "$journal/quiesced-containers"
     fi
     if [ -n "$start_error" ]; then
-        restore_note "$journal" phase=rolled-back "last_error=${start_error//[$'\n\r']/ }" || true
+        restore_note "$journal" phase=rolled-back "last_error=${start_error//[$'\n\r']/ }" last_error_kind= || true
     else
-        restore_note "$journal" phase=rolled-back || true
+        restore_note "$journal" phase=rolled-back last_error_kind= || true
     fi
     restore_outcome=rolled-back
     restore_remove_stage "$journal"
@@ -4466,7 +4475,14 @@ restore_recover_status() {
             printf '  the restored one that was set aside is %s\n' "$path.failed-restore-$st_stamp"
         fi
     done
-    if [ -n "$st_last_error" ]; then printf 'Last error: %s\n' "$st_last_error"; fi
+    if [ -n "$st_last_error" ]; then
+        case "${st_last_error_kind:-}" in
+            retry) printf 'Last error: %s (this can be retried once the cause is fixed)\n' "$st_last_error" ;;
+            manual) printf 'Last error: %s (a retry will not help; do the steps by hand that were printed with the error)\n' "$st_last_error" ;;
+            previous) printf 'Last error: %s (a retry will not help; use one of the two ways out that were printed with the error)\n' "$st_last_error" ;;
+            *) printf 'Last error: %s\n' "$st_last_error" ;;
+        esac
+    fi
     case "$st_phase" in
         committed|rolled-back)
             echo "The restore itself is done; only leftovers remain. This finishes the cleanup and does not undo anything:" ;;
@@ -4608,7 +4624,7 @@ restore_recover_abandon() {
     fi
     restore_remove_stage "$journal"
     # The phase it is abandoned from is recorded, so that a reconcile of this journal knows whether system files were touched.
-    restore_state_set "$journal" phase=abandoned "abandoned_from=${st_phase:-unknown}" || true
+    restore_state_set "$journal" phase=abandoned "abandoned_from=${st_phase:-unknown}" last_error_kind= || true
     restore_keep_snapshot=0
     if [ "$touched" -ne 0 ]; then restore_keep_snapshot=1; fi
     restore_archive_journal "$journal" abandoned || {

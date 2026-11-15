@@ -46,6 +46,22 @@ def create_journal_source():
     a = text.index("restore_create_journal() {")
     return text[a:text.index("restore_stack() {", a)]
 
+BOOT_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+_BOOT_FILE = None
+
+def setUpModule():
+    # A fixed boot id for every journal write, so the tests give the same result on macOS and Linux.
+    global _BOOT_FILE
+    handle = tempfile.NamedTemporaryFile("w", suffix=".boot_id", delete=False)
+    handle.write(BOOT_ID + "\n"); handle.close()
+    _BOOT_FILE = handle.name
+    os.environ["VESSELSTACK_BOOT_ID_FILE"] = _BOOT_FILE
+
+def tearDownModule():
+    os.environ.pop("VESSELSTACK_BOOT_ID_FILE", None)
+    if _BOOT_FILE:
+        os.unlink(_BOOT_FILE)
+
 STAMP = "20260102T030405Z-1-1"
 STAGE_NAME = ".vesselstack-restore.AbC123"
 
@@ -75,6 +91,10 @@ def make_journal(base, root, data, stage, phase="prepared", stamp=STAMP):
 def phase_of(directory):
     for line in (Path(directory) / "state").read_text().splitlines():
         if line.startswith("phase="): return line[6:]
+
+def state_value(directory, key):
+    for line in (Path(directory) / "state").read_text().splitlines():
+        if line.startswith(key + "="): return line[len(key) + 1:]
 
 def controller_function_source(name, end_marker):
     text = CONTROLLER.read_text()
@@ -1036,6 +1056,84 @@ exit "$rc"
         seen = (self.base / "restore/current.phases").read_text().split()
         self.assertEqual(seen, ["data-swap", "data-swap", "root-swap", "root-swap"])
 
+    def test_every_phase_is_written_with_the_boot_id(self):
+        hook = 'echo "$(sed -n s/^boot_id=//p "@JOURNAL@/state")" >> "@JOURNAL@.boots"'
+        hook = hook.replace('@JOURNAL@', '$(dirname @ACTIVE@)/restore/current')
+        td, result, root, data = self.run_transaction("success", mv_hook=hook); self.addCleanup(td.cleanup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = (self.base / "restore/current.boots").read_text().split()
+        self.assertEqual(seen, [BOOT_ID] * 4)
+        self.assertEqual(phase_of(self.journal), "committed")
+        self.assertEqual(state_value(self.journal, "boot_id"), BOOT_ID)
+
+    def test_a_rolled_back_journal_keeps_the_boot_id_and_no_failure_kind(self):
+        td, result, root, data = self.run_transaction("new_start_fail", quiesce=True); self.addCleanup(td.cleanup)
+        text = (self.archived("rolled-back") / "state").read_text()
+        self.assertIn(f"boot_id={BOOT_ID}\n", text)
+        self.assertNotRegex(text, r"last_error_kind=(retry|manual|previous)")
+
+    def test_a_failed_rollback_stores_its_kind_and_the_boot_id(self):
+        # retry: the trees are back but systemd cannot reload
+        lay = self.layout("externals", "swapped", "swapped", True)
+        self.reconcile(lay, extra="export FAIL_RELOAD=1")
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+        self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+        self.assertTrue(state_value(lay["journal"], "last_error"))
+        # manual: the journal itself cannot be used
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.set_state(lay["journal"], "stamp=S")
+        self.reconcile(lay)
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "manual")
+        self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+        # previous: the previous folder is a symbolic link
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        pre = Path(f"{lay['root']}.pre-restore-{STAMP}"); moved = Path(f"{pre}.real")
+        os.rename(pre, moved); pre.symlink_to(moved, target_is_directory=True)
+        self.reconcile(lay)
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "previous")
+        self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+
+    def test_a_retried_rollback_that_succeeds_leaves_no_failure_kind(self):
+        lay = self.layout("externals", "swapped", "swapped", True)
+        self.reconcile(lay, extra="export FAIL_RELOAD=1")
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+        self.reconcile(lay)
+        self.assertEqual(lay["result"].returncode, 0, lay["result"].stderr)
+        text = (self.archive(lay, "rolled-back") / "state").read_text()
+        self.assertIn(f"boot_id={BOOT_ID}\n", text)
+        self.assertNotRegex(text, r"last_error_kind=(retry|manual|previous)")
+
+    def test_the_validator_accepts_a_journal_without_boot_id_and_rejects_bad_ones(self):
+        def write(lay, **changes):
+            path = lay["journal"] / "state"
+            lines = [l for l in path.read_text().splitlines() if not l.startswith(("boot_id=", "last_error_kind="))]
+            lines += [f"{k}={v}" for k, v in changes.items()]
+            path.write_text("\n".join(lines) + "\n")
+        for name, changes, outcome in (
+            ("no boot id (0.9.0 journal)", {}, "rolled-back"),
+            ("valid boot id", {"boot_id": BOOT_ID}, "rolled-back"),
+            ("empty failure kind", {"last_error_kind": ""}, "rolled-back"),
+            ("malformed boot id", {"boot_id": "not-a-boot-id"}, "rollback-failed"),
+            ("upper-case boot id", {"boot_id": BOOT_ID.upper()}, "rollback-failed"),
+            ("bad failure kind", {"last_error_kind": "sometimes"}, "rollback-failed"),
+        ):
+            with self.subTest(name):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                write(lay, **changes)
+                self.reconcile(lay)
+                self.assertIn(f"outcome={outcome}", lay["result"].stdout, lay["result"].stderr)
+
+    def test_recover_status_says_what_the_failure_kind_means(self):
+        lay = self.layout("root-swap", "swapped", "away", False)
+        self.set_state(lay["journal"], "last_error=boom")
+        self.assertIn("Last error: boom\n", self.status_harness(lay).stdout)
+        for kind, words in (("retry", "(this can be retried once the cause is fixed)"),
+                            ("manual", "(a retry will not help; do the steps by hand that were printed with the error)"),
+                            ("previous", "(a retry will not help; use one of the two ways out that were printed with the error)")):
+            with self.subTest(kind):
+                self.set_state(lay["journal"], f"last_error_kind={kind}")
+                self.assertIn(f"Last error: boom {words}\n", self.status_harness(lay).stdout)
+
     # ---- recover status, with the application folder gone ----
     def status_harness(self, lay, action="status"):
         body = pending_source() + transaction_source() + f"""
@@ -1334,12 +1432,12 @@ check_restore_leftovers
         self.reconcile(lay, extra="export STUCK_UNITS=vesselstack-chat.service")
         self.assertNotEqual(lay["result"].returncode, 0)
         self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
-        self.assertEqual(self.state_value(lay["journal"], "rollback_from"), "data-swap")
+        self.assertEqual(state_value(lay["journal"], "rollback_from"), "data-swap")
         # a failure before the phase is rewritten (here: validation) also records it, and never overwrites it
         lay2 = self.layout("data-swap", "swapped", "none", False)
         self.set_state(lay2["journal"], "root=relative/path")
         self.reconcile(lay2)
-        self.assertEqual(self.state_value(lay2["journal"], "rollback_from"), "data-swap")
+        self.assertEqual(state_value(lay2["journal"], "rollback_from"), "data-swap")
         # the cause is fixed: the retry rolls back without restoring the system files from the snapshot
         lay["calls"].clear()
         lay["log"].write_text("")
@@ -1526,7 +1624,7 @@ restore_validate_state && echo VALID || echo "INVALID $restore_validate_error"
         lay = self.layout("root-swap", "swapped", "swapped", False)
         changes = []
         for key in ("root_live", "data_live", "root_new", "data_new"):
-            changes.append(f"{key}=4242:{self.state_value(lay['journal'], key).split(':')[1]}")
+            changes.append(f"{key}=4242:{state_value(lay['journal'], key).split(':')[1]}")
         self.set_state(lay["journal"], *changes)
         self.reconcile(lay)
         self.assert_rolled_back(lay)
@@ -2128,7 +2226,7 @@ restore_recover_command {arguments}
             self.assertFalse([c for c in lay["calls"] if c.startswith(("controller ", "systemctl", "docker"))], lay["calls"])
             self.assertEqual((lay["root"] / "marker").read_text(), "old-root")
             self.assertEqual((lay["data"] / "marker").read_text(), "old-data")
-            self.assertIsNone(self.state_value(lay["journal"], "rollback_from"))
+            self.assertIsNone(state_value(lay["journal"], "rollback_from"))
 
     def test_without_a_running_systemd_every_unit_is_idle_and_with_one_a_failed_answer_is_not(self):
         with tempfile.TemporaryDirectory() as td:

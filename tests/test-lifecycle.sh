@@ -2253,6 +2253,10 @@ assert_back_after_installer_kill
 rolled_back_records=("$RESTORE_RECORDS"/rolled-back-*)
 grep -qx 'phase=rolled-back' "${rolled_back_records[0]}/state"
 grep -q '^last_error=.*could not be started' "${rolled_back_records[0]}/state"
+# The journal records the boot that wrote it (this host has a kernel boot id).
+if [ -r /proc/sys/kernel/random/boot_id ]; then
+    grep -Eq '^boot_id=[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' "${rolled_back_records[0]}/state"
+fi
 # Nothing is locked: the very next start is accepted and the status no longer reports a restore.
 run_ctl start > "$TEST_ROOT/start-after.out" 2>&1 || { echo 'start was refused after a rolled-back restore' >&2; cat "$TEST_ROOT/start-after.out" >&2; exit 1; }
 status_after=$(run_ctl status 2>&1 || true)

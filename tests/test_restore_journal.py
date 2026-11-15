@@ -18,6 +18,19 @@ def load_module():
     return module
 
 
+def setUpModule():
+    # The older tests compare whole state files: point the helper at a boot id file that does not exist
+    # (so no boot_id is written) instead of the host's /proc. BootIdTests choose their own file.
+    global _MISSING
+    _MISSING = tempfile.TemporaryDirectory()
+    os.environ["VESSELSTACK_BOOT_ID_FILE"] = str(Path(_MISSING.name) / "no-such-boot-id")
+
+
+def tearDownModule():
+    os.environ.pop("VESSELSTACK_BOOT_ID_FILE", None)
+    _MISSING.cleanup()
+
+
 def run(*args):
     return subprocess.run([sys.executable, "-I", str(HELPER), *args], capture_output=True, text=True)
 
@@ -310,6 +323,66 @@ class RestoreJournalTests(unittest.TestCase):
         self.assertEqual(run().returncode, 2)
         self.assertEqual(run("set", str(self.dir)).returncode, 2)
         self.assertEqual(run("frobnicate").returncode, 2)
+
+class BootIdTests(unittest.TestCase):
+    BOOT_A = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+    BOOT_B = "11111111-2222-4333-8444-555555555555"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.dir = Path(self.td.name) / "journal"
+        self.dir.mkdir()
+        self.boot_file = Path(self.td.name) / "boot_id"
+        self.boot_file.write_text(self.BOOT_A + "\n")
+
+    def run_set(self, *assignments):
+        env = dict(os.environ, VESSELSTACK_BOOT_ID_FILE=str(self.boot_file))
+        return subprocess.run([sys.executable, "-I", str(HELPER), "set", str(self.dir), *assignments],
+                              capture_output=True, text=True, env=env)
+
+    def state(self):
+        return (self.dir / "state").read_text()
+
+    def test_set_records_the_boot_id_and_leaves_other_keys_alone(self):
+        self.assertEqual(self.run_set("phase=prepared", "last_error=").returncode, 0)
+        self.assertEqual(self.state(), f"phase=prepared\nlast_error=\nboot_id={self.BOOT_A}\n")
+
+    def test_a_new_boot_rewrites_the_boot_id(self):
+        self.run_set("phase=prepared")
+        self.boot_file.write_text(self.BOOT_B + "\n")
+        self.run_set("phase=stopping")
+        self.assertEqual(self.state(), f"phase=stopping\nboot_id={self.BOOT_B}\n")
+
+    def test_a_missing_or_malformed_boot_id_file_removes_the_key(self):
+        for name, content in (("missing", None), ("empty", ""), ("not a uuid", "hello\n"),
+                              ("upper case", self.BOOT_A.upper() + "\n"), ("two lines", self.BOOT_A + "\nx\n")):
+            with self.subTest(name):
+                self.boot_file.write_text(self.BOOT_A + "\n")
+                self.assertEqual(self.run_set("phase=prepared").returncode, 0)
+                self.assertIn("boot_id=", self.state())
+                if content is None:
+                    self.boot_file.unlink()
+                else:
+                    self.boot_file.write_text(content)
+                self.assertEqual(self.run_set("phase=stopping").returncode, 0)
+                self.assertEqual(self.state(), "phase=stopping\n")
+
+    def test_an_explicit_boot_id_is_refused_and_changes_nothing(self):
+        self.run_set("phase=prepared")
+        before = self.state()
+        result = self.run_set(f"boot_id={self.BOOT_B}", "phase=stopping")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("boot_id", result.stderr)
+        self.assertEqual(self.state(), before)
+
+    def test_the_default_source_is_the_kernel_file(self):
+        module = load_module()
+        self.assertEqual(module.BOOT_ID_FILE, "/proc/sys/kernel/random/boot_id")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VESSELSTACK_BOOT_ID_FILE", None)
+            with mock.patch("builtins.open", side_effect=FileNotFoundError):
+                self.assertIsNone(module.current_boot_id())
 
 
 if __name__ == "__main__":

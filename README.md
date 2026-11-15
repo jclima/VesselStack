@@ -2198,6 +2198,12 @@ validated the same way before anything is stopped, so a restore that the recover
 refuses to start. A restore that had already completed is never rolled back;
 `rollback` then only finishes the cleanup.
 
+The journal records which boot last wrote it (`boot_id`, left out where the system does not
+provide one) and, after a failed rollback, whether trying again can help. `recover status`
+puts that on the `Last error` line: "can be retried" once you fix the cause, or "a retry will
+not help" when the by-hand steps or the two ways out that were printed with the error are
+the way forward. Journals written by 0.9.0 have neither and work as before.
+
 If the previous system is back in place but cannot be started, the journal is closed anyway
 and the message says "The previous system is back in place, but it could not be started"
 (exit status 3). Run `sudo vesselstackctl start`, then `sudo vesselstackctl doctor`. A start
