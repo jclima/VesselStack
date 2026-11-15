@@ -1563,17 +1563,18 @@ restore_validate_state && echo VALID || echo "INVALID $restore_validate_error"
         self.assertIn("shows inactive or failed", err); self.assertIn("repeat the stop", err)
         self.assertIn("sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'", err)
         self.assertIn("/usr/local/sbin/vesselstackctl may belong to the restored release", err)
-        self.assertIn("a folder that contains them (such as / or /opt) read-write", err)
+        self.assertIn("a folder that contains them (such as / or /opt). List the containers", err)
+        self.assertNotIn("read-write", err); self.assertNotIn("read-only", err)
         self.assertIn("go on only when no such container is left", err)
         self.assertIn("is expected and harmless", err)
         self.assertIn("sudo mv -T ", err); self.assertIn("(if it says the target exists, use another name)", err)
-        self.assertIn(f".failed-restore-{STAMP} folder does not exist either, stop and get help.", err)
+        self.assertIn(f".failed-restore-{STAMP} folder does not exist either, stop and get help.\n      Otherwise, restore again from a backup, which replaces both folders together:", err)
         self.assertNotIn("To resolve this by hand", err)
 
     def assert_way_b_folders(self, err, lay):
         for which in ("root", "data"):
             folder = lay[which]
-            self.assertIn(f"sudo mv {folder}.failed-restore-{STAMP} {folder}   (only if {folder} is missing)", err)
+            self.assertIn(f"sudo mv -T {folder}.failed-restore-{STAMP} {folder}   (only if {folder} is missing)", err)
         self.assertIn("If the application folder or the data folder is missing at its", err)
 
     def test_a_missing_pre_restore_tree_is_refused_before_anything_moves_and_every_retry_says_the_same(self):
@@ -2301,19 +2302,20 @@ restore_probe_renames "'''.format(base / "opt"), 1)
         self.assertIn("sudo docker stop NAME", first)
         self.assertIn("vesselstack-firewall", first); self.assertIn("vesselstack-socketcan", first)
         self.assertIn("sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop", first)
-        self.assertIn("a folder that contains them (such as / or /opt) read-write", first)
-        self.assertIn("a parent mounted read-only is", first)
+        self.assertIn("a folder that contains them (such as / or /opt). List the containers", first)
+        self.assertNotIn("read-write", first); self.assertNotIn("read-only", first)
+        self.assertIn("make each move with sudo mv -T, so that a move onto an existing folder fails instead of nesting it", procedure)
         self.assertIn("again and go on only when no such container is left", first)
         self.assertIn("Unit ... not loaded", first)
         self.assertIn("sudo mv -T ", procedure); self.assertIn("(if it says the target exists, use another name)", procedure)
         start = procedure[procedure.index("5) start the stack"):]
         self.assertNotIn("grep -E", procedure); self.assertNotIn("rollback_from", procedure); self.assertNotIn("abandoned_from", procedure)
         self.assertIn(f"sudo {lay['root']}/installer/install.sh --config {lay['root']}/config/vesselstack.env --start", start)
-        self.assertIn("If the installer refuses, it says why and changes nothing", start)
+        self.assertIn("If the installer stops, it says why: fix what it names and run it again.", start)
         self.assertIn("Only if it\n     cannot be run at all", start)
         self.assertIn("sudo vesselstackctl start", start)
         self.assertLess(start.index("install.sh --config"), start.index("sudo vesselstackctl start"))
-        self.assertIn("backup\n     and alert timers stay stopped until the installer has been run", start)
+        self.assertIn("the timers\n     (backups, alerts, telemetry) stay stopped until the installer has been run", start)
         self.assertIn("the moved-aside journal", start)
         self.assertIn("sudo vesselstackctl doctor", start)
         # a root that cannot be read still gives an instruction that makes sense

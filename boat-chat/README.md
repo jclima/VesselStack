@@ -4,8 +4,8 @@ First-run access, settings, telemetry refresh, units and timezone are in [Boat C
 
 Local read-only diagnostic chatbot for VesselStack.
 
-This guide follows current `main`. Release 0.6.0 includes selectable unit
-presentation and separate telemetry sampling and indexing timers.
+This guide follows current `main`. Selectable unit presentation and separate telemetry sampling and indexing
+timers are available since 0.6.0; 0.9.0 adds data-age labels and a single Signal K unit table.
 
 ## Run
 

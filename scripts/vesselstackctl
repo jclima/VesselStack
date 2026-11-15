@@ -101,8 +101,7 @@ To resolve this by hand:
        systemctl list-units 'vesselstack-*' --all --plain --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
        sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
      Other containers are not found by that command. A container counts when it mounts either folder, a folder
-     inside them, or a folder that contains them (such as / or /opt) read-write (a parent mounted read-only is
-     left alone). List the containers with the first line below and stop each one that counts with the second:
+     inside them, or a folder that contains them (such as / or /opt). List the containers with the first line below and stop each one that counts with the second:
        sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'
        sudo docker stop NAME
      "Unit ... not loaded" printed by the stop for a unit that is not running is expected and harmless.
@@ -114,6 +113,7 @@ To resolve this by hand:
      - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
        move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
      - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
+     - make each move with sudo mv -T, so that a move onto an existing folder fails instead of nesting it;
      - do not delete anything;
      $note
   3) both folders must come from the same side (both the previous ones) before you go on;
@@ -122,11 +122,11 @@ To resolve this by hand:
   5) start the stack with the installer of the application folder. It also puts the unit files,
      /usr/local/sbin/vesselstackctl and the helpers back in line with that folder and starts the timers:
        sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
-     If the installer refuses, it says why and changes nothing: fix what it names and run it again. Only if it
+     If the installer stops, it says why: fix what it names and run it again. Only if it
      cannot be run at all (the file $app/installer/install.sh is missing, or it needs something not available at
      sea, such as a network or a device that is unplugged), run: sudo vesselstackctl start
-     That starts what is installed, but the system files may then belong to the restored release and the backup
-     and alert timers stay stopped until the installer has been run: run it as soon as you can. The snapshot of
+     That starts what is installed, but the system files may then belong to the restored release and the timers
+     (backups, alerts, telemetry) stay stopped until the installer has been run: run it as soon as you can. The snapshot of
      the previous system files stays in the moved-aside journal.
      Either way, finish with: sudo vesselstackctl doctor
 EOF
@@ -3683,10 +3683,10 @@ restore_previous_ways_out() {
         echo "      (if it says the target exists, use another name)."
         echo "      The restore needs both folders present. If the application folder or the data folder is missing at its"
         echo "      normal path, first move the restored copy this recovery set aside back (the new restore replaces it):"
-        echo "        sudo mv $st_root.failed-restore-$st_stamp $st_root   (only if $st_root is missing)"
-        echo "        sudo mv $st_data.failed-restore-$st_stamp $st_data   (only if $st_data is missing)"
+        echo "        sudo mv -T $st_root.failed-restore-$st_stamp $st_root   (only if $st_root is missing)"
+        echo "        sudo mv -T $st_data.failed-restore-$st_stamp $st_data   (only if $st_data is missing)"
         echo "      If that .failed-restore-$st_stamp folder does not exist either, stop and get help."
-        echo "      and restore again from a backup, which replaces both folders together:"
+        echo "      Otherwise, restore again from a backup, which replaces both folders together:"
         echo "        sudo vesselstackctl restore /path/to/vesselstack-<time>.tar.gz --yes"
         echo "      /usr/local/sbin/vesselstackctl may belong to the restored release if the restore had begun publishing system files."
     } >&2
@@ -4838,8 +4838,7 @@ To resolve this by hand:
        systemctl list-units 'vesselstack-*' --all --plain --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
        sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
      Other containers are not found by that command. A container counts when it mounts either folder, a folder
-     inside them, or a folder that contains them (such as / or /opt) read-write (a parent mounted read-only is
-     left alone). List the containers with the first line below and stop each one that counts with the second:
+     inside them, or a folder that contains them (such as / or /opt). List the containers with the first line below and stop each one that counts with the second:
        sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'
        sudo docker stop NAME
      "Unit ... not loaded" printed by the stop for a unit that is not running is expected and harmless.
@@ -4851,6 +4850,7 @@ To resolve this by hand:
      - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
        move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
      - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
+     - make each move with sudo mv -T, so that a move onto an existing folder fails instead of nesting it;
      - do not delete anything;
      $note
   3) both folders must come from the same side (both the previous ones) before you go on;
@@ -4859,11 +4859,11 @@ To resolve this by hand:
   5) start the stack with the installer of the application folder. It also puts the unit files,
      /usr/local/sbin/vesselstackctl and the helpers back in line with that folder and starts the timers:
        sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
-     If the installer refuses, it says why and changes nothing: fix what it names and run it again. Only if it
+     If the installer stops, it says why: fix what it names and run it again. Only if it
      cannot be run at all (the file $app/installer/install.sh is missing, or it needs something not available at
      sea, such as a network or a device that is unplugged), run: sudo vesselstackctl start
-     That starts what is installed, but the system files may then belong to the restored release and the backup
-     and alert timers stay stopped until the installer has been run: run it as soon as you can. The snapshot of
+     That starts what is installed, but the system files may then belong to the restored release and the timers
+     (backups, alerts, telemetry) stay stopped until the installer has been run: run it as soon as you can. The snapshot of
      the previous system files stays in the moved-aside journal.
      Either way, finish with: sudo vesselstackctl doctor
 MANUAL

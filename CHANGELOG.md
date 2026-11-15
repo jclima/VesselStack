@@ -3,135 +3,219 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
+## 0.9.0 - 2026-11-15
 
-- Restore safety review, sixth round. The by-hand procedure printed when the restore journal cannot be used now starts by stopping everything that uses the two folders (after a reboot the stack and its `unless-stopped` containers start again and keep writing into a renamed folder, and `vesselstackctl stop` is refused while the journal is pending): copy-pasteable `systemctl` and `docker` commands stop every `vesselstack-*` unit (`list-units --all --plain --no-legend`, so oneshot services still starting and units waiting to restart are included) except `vesselstack-firewall` and `vesselstack-socketcan` and the containers of the `vesselstack` compose project; `docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` finds other containers that mount the folders; and the procedure goes on only when every other unit shows `inactive` or `failed`. It names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>`) and says that folders with other stamps were left by earlier restores. When the quiet read of the journal fails (for example a repeated key), the stamp is read from the `stamp=` line of the state file, and only a value of the expected shape is printed. When the stamp cannot be read, the old advice (newest stamp, modification times with `ls -ld`) is gone, because renaming a folder does not change its modification time and a `.pre-restore-*` folder left by an earlier restore would be mistaken for this one: it now says a `.pre-restore-*` folder whose stamp names an archived journal (`done-`, `rolled-back-` or `abandoned-` plus the stamp) belongs to an earlier restore, and that any other `.pre-restore-*` folder means this restore may have moved a folder: leave the journal, move nothing and get help (only when none exists and both folders are present are the stop, journal and start steps done). The last step always starts the stack with the installer of the application folder (`sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start`), which also puts the unit files, `/usr/local/sbin/vesselstackctl` and the helpers back in line with that folder and starts the timers; if the installer refuses it says why and changes nothing, so fix what it names and run it again; only when it cannot be run at all (the file is missing, or it needs a network or an unplugged device) does the procedure give `sudo vesselstackctl start`, with the warning that the system files may then belong to the restored release and the backup and alert timers stay stopped until the installer has been run; it finishes with `sudo vesselstackctl doctor` (the old rule that read the state file to choose between the two could fail open and is gone). The container check counts a container that mounts either folder, a folder inside them, or a folder that contains them (such as `/` or `/opt`) read-write (a parent mounted read-only is left alone), is repeated after the stop, and notes that `Unit ... not loaded` for a unit that is not running is harmless. The journal is moved aside with `sudo mv -T`, so a second by-hand resolution on the same day fails instead of moving the journal inside the older `.manual-DATE` directory (use another name). `recover abandon` now decides whether the system files were touched exactly as the reconcile of an abandoned journal does, so `phase=rollback-failed` with an empty or unknown `rollback_from` keeps the snapshot and shows the warning in the dry run and with `--yes`. The commands of the procedure have been checked by tests as text and have not yet been exercised on a boat computer with running services. Folder paths are printed with control characters replaced by `?`. The text is the same in `vesselstackctl`, `install.sh` and the journal's `recover` command. A missing `<folder>.pre-restore-<stamp>` is now refused before anything is moved (it used to be found after the restored folder was set aside, and every retry repeated it), and a previous folder that is missing, a different folder or a symbolic link ends with two ways out (move the real folder back with `mv` and run the rollback again, or stop the stack by hand with the same stop and check instructions, move the journal aside with `sudo mv -T` and restore again from a backup with the complete command `vesselstackctl restore /path/to/vesselstack-<time>.tar.gz --yes`, after moving a missing folder's `.failed-restore-<stamp>` back to its normal path, and stopping to get help if that folder does not exist either; the real paths are printed, with a note that `/usr/local/sbin/vesselstackctl` may belong to the restored release) instead of a retry or the by-hand procedure. The full-disk container warning says the containers "may not" be started again and suggests `docker start` only for containers outside the `vesselstack` compose project. An unknown `abandoned_from` counts as possibly having touched system files, and `abandoned_from=rollback-failed` with an empty `rollback_from` is treated like `starting`, while one with a `rollback_from` that is not a known phase keeps the snapshot and shows the warning. Operational impact: only the text printed on a damaged journal and on rollback refusals changed. Rollback: revert the commit.
-- Restore safety review, fifth round. The by-hand procedure is now printed only when the restore journal itself cannot be used; a refusal a retry can fix (units or containers still running, a folder in the way, a failed filesystem check) ends with the one command to run again, `recover rollback`. The procedure text is rewritten to be safe after a failed forward restore (where the folders at the normal paths are the restored ones). Containers are named as stopped only after they really stopped; a rollback no longer refuses when the containers cannot be recorded on a full disk (it warns and gives the `docker start` command). A rollback from a system without running systemd (a rescue system) puts the folders back and ends with exit status 3 instead of failing forever. An abandon records the phase it came from, so the system-files warning is not shown falsely. The `recover` script explains exactly why a journal cannot be read and prints the procedure when a journal file is missing. The firewall notice is also given when the firewall is enabled but was already not running, and after a completed restore that left it stopped. The rename check removes stale empty test folders and gives a clearer error. A compose project label containing `|` no longer corrupts the recorded container name.
-- Restore safety review, fourth round. A restore now also stops, and a rollback, abort, commit or abandon starts again, Docker containers outside the `vesselstack` compose project that mount the application or data folder or a parent of them (for example `/` or `/opt`) read-write; a container that only mounts a parent read-only is left alone. The containers it stops are recorded in `quiesced-containers` in the journal before they are stopped, are started again with `docker start`, and any that fail to start are named without failing the restore; paths are compared as recorded and with symbolic links resolved. The journal records whether the firewall was enabled and running before the restore (`firewall_enabled`, `firewall_active`; a journal without them is still accepted), and a failed or refused rollback, a successful rollback, `recover status`, status 3 and `abandon` say plainly when the firewall was running and is not now; a failed firewall restart is reported as the firewall being down. Reconciling a journal already marked `abandoned` now starts the stopped units and containers and prints the same notices and warning as the abandon command, and an abandoned journal that no longer validates ends with the manual procedure instead of falling into a rollback. A host without a running systemd (no `/run/systemd/system`) treats every unit as stopped. A refused rollback prints the manual procedure. Before the journal is written, restore proves the swap renames work by renaming an empty probe folder (`.vesselstack-restore-probe.<pid>`) into the parent of each tree and back, and refuses with nothing changed when a parent is, for example, a bind mount of the same disk. A file where a folder should be is reported as in the way instead of "could not check which filesystem". The `recover` script prints the manual procedure when `python3` is missing. The unused `swap_in` function is removed. Operational impact: a restore may briefly stop more containers (read-write mounts of a parent) and starts them again; one extra empty folder is created and removed next to the application and data folders before the restore starts. Rollback: revert the commit.
-- Restore safety review, third round. A symbolic link in a parent path that points to another disk no longer makes a restore start that the recovery then refuses forever: the filesystem check compares each folder with its real parent directory, restore applies the same check before it writes anything, and it refuses when the application folder, the data folder and the staging area are not on one filesystem. Folder swaps are plain renames that fail on a different filesystem; they never copy and delete. Right before the first folder moves, restore stops and verifies units and containers the same way a rollback does (a unit that cannot be stopped or a container that mounts the application or data folder ends the restore with nothing moved, and what was stopped is started again). A unit whose state cannot be read is treated as running. After a rollback puts the system files back, an enabled firewall is restarted so its previous rules apply, and the messages say when it is not running; it is never stopped. A journal left in phase `abandoned` is only archived by `recover rollback`. The journal is validated while it is still being built, and one that fails after being renamed into place is removed or reported as pending. Restore and `recover` use the same lock file, the journal's controller is always a regular file, a failed rollback lists the units it stopped, and the installer prints the same by-hand procedure as `vesselstackctl` when the journal cannot be read.
-- Restore: `vesselstackctl restore` now keeps a durable, self-contained journal at `/var/lib/vesselstack/restore/current` (mode 0700): a state file written atomically before each step (phases `prepared`, `stopping`, `stopped`, `data-swap`, `root-swap`, `externals`, `reloaded`, `starting`, `committed`, and `rolling-back`, `rolled-back`, `rollback-failed` during a rollback; a failed attempt keeps the phase it started from), copies of the running controller, the lifecycle-lock helper and the journal helper, a `recover` script and the snapshot of the system files. A restore refuses up front, with nothing changed, when the application or data folder is not a clean absolute path, is `/`, or one is equal to or inside the other; the extracted backup and the journal are flushed to disk before the first change (on an SD card this can take several minutes, and it says so), the journal just written is validated with the recovery's own validator before anything is stopped, and each tree rename is followed by a directory flush. After an interruption (lost SSH session, power loss, kill) `sudo /var/lib/vesselstack/restore/current/recover status` shows how far it got and `sudo /var/lib/vesselstack/restore/current/recover rollback` puts the previous folders and system files back and starts the previous stack; the same are `sudo vesselstackctl restore-recover status|rollback` and `sudo vesselstackctl restore --status` (short form of `status`). Only the `recover` script is independent of the application folder: `vesselstackctl restore-recover` runs the installed controller, which after an interrupted restore may be the restored, possibly older, release's. Rollback decides per folder by identity (inode) and puts back only the recorded folder; it removes an unrecognised directory in the way only if it is empty (`rmdir`) and otherwise stops, names the path and changes nothing; before moving folders it stops every writer unit (even one restarting by itself) and the Docker containers of the `vesselstack` project or with a mount under the application or data folder, verifies they are gone (otherwise `rollback-failed`, nothing moved, and they are named), and leaves `vesselstack-firewall.service` and `vesselstack-socketcan.service` running; it restores the system files from the snapshot only if the restore had begun to change them (also after a failed attempt), refuses a damaged snapshot, and records `rolled-back` only with both originals in place. A restore that had already completed is never rolled back (`rollback` then only finishes the cleanup). If the previous system is back but cannot be started, the journal is closed anyway and the message points to `sudo vesselstackctl start` and `sudo vesselstackctl doctor` (exit status 3). While a restore is unfinished, every command that changes the system and the installer refuse to run, `status` and `doctor` report it, and `doctor` warns about leftover restore directories, which hold a copy of the backup including secrets. Way out of a stuck restore: `recover abandon --yes` closes the journal without rolling back, allowed only when both original folders are in place; it starts the units the restore had stopped again (including the backup and alerts timers, which `vesselstackctl start` does not start) and says which could not be started, keeps the system-file snapshot in the record and warns, with the installer command, when system files had already been published (they may be the restored release's), and lists the `*.pre-restore-*`, `*.failed-restore-*` and stage directories it leaves behind. An unreadable or rejected journal state makes every recovery command refuse with one short procedure to resolve it by hand; no command deletes the journal. A finished restore leaves a small record under `/var/lib/vesselstack/restore/done-*`, a rolled-back one `rolled-back-*`, an abandoned one `abandoned-*` (newest three of each kept). The installer installs `/usr/local/libexec/vesselstack/restore_journal.py` and refuses to run while a restore is pending. **Operational impact and limits:** restore still runs in the terminal session and nothing recovers automatically at boot yet (run `recover status`, then `recover rollback`); detaching from the terminal and boot-time recovery come in following changes; after the system files have been published the installed `vesselstackctl` is the restored release's, and if that release is older than this change it does not know about a pending journal and will not refuse to run, so use the `recover` script in the journal directory; the previous folders kept as `*.pre-restore-*` and any `*.failed-restore-*` and stage directories are not pruned automatically. **Rollback:** revert the commit; the journal and record directories under `/var/lib/vesselstack/restore` can be deleted once no restore is pending.
-- Displays bridge: the lost-alarm latch and the alarm counter (`seq`) now survive bridge restarts, crashes and reboots, kept as ids only in `<data>/displays-bridge/state.json` (mode 0600, written atomically and only when it changes). A restart, including the one after every Control Panel save that adds instruments, no longer forgets which alarms were lost or resets `seq`. The installer creates the `displays-bridge` state directory and the unit gains `VESSELSTACK_DISPLAYS_STATE_DIR` and an optional `ReadWritePaths` entry, so this takes effect after the installer has run for this release; if the directory is missing or not writable the bridge logs one warning and behaves as before. Only an alarm that was already lost is saved: a live alarm at the moment of a crash or power cut is not, and counts as new afterwards if the sensor still reports it. Backups include the file, and a restored old file can only show an alarm until fresh data arrives. Rollback: revert the commit; older releases ignore the file.
-- Displays bridge: a Signal K value that repeats the exact source timestamp of the last accepted one is no longer treated as fresh, so a dead sensor whose cached value the server keeps re-sending goes stale on schedule and stays stale. The first value after a bridge restart is still accepted once (the last timestamp is kept in memory only), and a source that stamps different values with an identical timestamp has the later ones ignored. The catalog now offers Fire and Flooding as `--` until a source reports, instead of a green OK on boats with no such sensor (existing `displays.json` files keep their value), and `vesselstackctl display validate` warns about a fire or flooding notification set to read OK when nothing is reported. Operational impact: bridge only, no reflash; boats that add Fire or Flooding from the catalog see a grey summary dot until a source reports. Rollback: revert the commit.
-- Displays bridge: numeric instrument and Home Assistant numeric payloads carry a new `cu` unit tag (a short hash of conversion, unit and precision), reserved for a later firmware check that will blank a tile whose compiled-in unit no longer matches the bridge. Bridge only, no reflash; current firmware ignores it. Rollback: revert the commit.
-- Control Panel: an installation that did not finish (for example the network dropped while images downloaded) is now shown on every page ("The update to X did not finish...") instead of the misleading "A newer Control Panel is installed" note, and the Updates tab lists that release again with a **Finish this update** button that reruns the normal update, including the backup choice. Previously the release disappeared from Updates and could only be finished over SSH. The panel reads the installer's `config/install-in-progress` marker (parsed and validated server-side, never evaluated; values are escaped in the page), and a release equal to the installed version is offered only while the marker names exactly that version. When the panel makes the pre-update backup it passes the archive path to the installer in `VESSELSTACK_PREUPDATE_BACKUP`, so the notice can name the backup and the `sudo vesselstackctl restore <backup> --yes` command. `/api/status` gains `install_incomplete`. Operational impact: none beyond the notice and the extra button. The very first update into this release is run by the previous Control Panel, which knows nothing about the marker, so the notice and the retry apply from the next update on. Rollback: revert the commit.
-- `vesselstackctl doctor`, `status` and `version` now report an installation that did not finish (the `config/install-in-progress` marker): `doctor` prints `FAIL installation of X did not finish` with the exact command to continue and, when the pre-update backup is recorded, the command to go back; `status` shows an `Installation INCOMPLETE` line and exits non-zero while the marker exists; `version` adds a note. A failed `vesselstackctl update` now prints that the update did not finish and your data is kept, the command to retry, and the exact `vesselstackctl restore ARCHIVE --yes` for the backup it just made, and it passes that archive to the installer in `VESSELSTACK_PREUPDATE_BACKUP` so the marker records it. Operational impact: the exit status of `status` changes only while an installation is unfinished (a script of your own that checks it will see a failure in that state); nothing changes for a finished installation. Rollback: revert the commit.
-- Boat Chat: answers built in code now say how old their data is and no longer report missing data as "nothing happened". The briefing shows a reading older than 10 minutes as "SOC: no recent data (last 85%, 2 days ago)" instead of "SOC unavailable", and engines with no recent data as "Engine data is not reporting (normal when engines and their gateway are off); last reading port 1800 RPM, 2 days ago", never a stale or zero RPM as current. Battery-voltage history shows "latest 12.9 V (hourly mean, <time>)" and adds "No samples since <time>; the readings above are not current." when the newest sample is over 2 hours old; voltage thresholds and the resting-voltage (AGM) estimate are shown only for banks whose readings lie between 9 and 16 V, and other banks (for example 24 V) get the numbers plus a note instead of 12 V guidance. Fuel usage answers "No engine or fuel data was recorded for <window> ... so fuel use cannot be determined." when telemetry returned nothing (previously "found no engine-running fuel samples"), "Engines were not running during <window> (<n> minutes of engine data recorded ...)" when data was present but idle, and adds "About <n> minutes of data are missing inside the running period, so the total is a minimum." when logging gaps of more than 5 minutes exist. Generic history "latest" values carry their time. Operational impact: owners see different wording in these answers; cached summaries without the new fields keep the old text until they refresh. The engine run-history answer is unchanged. Rollback: revert the commit and restart Boat Chat.
-- Restore now leaves the system files consistent with the restored release. Restoring an older backup turns off the managed VesselStack features that version does not have (for example scheduled backups and Telegram alerts when a 0.8.0 archive is restored onto a newer install): their unit files and enable links are removed, and restore names each one after "Restore completed" under "Turned off because the restored version does not have them:". It also reinstalls `vesselstack-update` and the libexec helpers from the restored release's installer scripts and removes any that release did not ship. Units you created yourself and units the restored release has are not touched, and if the backup contains no VesselStack unit files at all nothing is removed (a warning is printed). Every unit file and enable link is journaled first, so a restore that fails after this step puts them back exactly (links as links) and restarts the units that were running. The backup format and `verify-backup` are unchanged, so older releases can still verify archives made by this one. Operational impact: after restoring an older backup, the listed features are off until you update to a release that has them; before this change they stayed enabled and failed against the older command (for example the nightly backup timer). Rollback: revert the commit; after a completed restore, running the installer for the newer release brings the removed units back.
-- Installer bootstrap (`get-vesselstack.sh`): re-running it after an install or update that stopped part-way (for example the network dropped while images were downloading) now continues that installation instead of reporting "nothing to do". It reads the installer's `config/install-in-progress` marker (parsed, never sourced; a symlinked or oversized marker is ignored with a warning), reuses the installed configuration with no wizard and no new backup, runs the installer's preflight and start again, and reports "nothing to do" only once the marker is gone. It asks before continuing unless `--yes` or `--defaults` is given. An unfinished newer version blocks installing an older one and names how to finish or go back; a failed update names the backup recorded in the marker with the exact `vesselstackctl restore` command. The bootstrap also finds an installation at a custom install root by reading (not running) the installed `vesselstackctl`, which `sudo` previously hid, so such an install is no longer treated as a fresh one. Operational impact: a rerun after a failed start now does real work (installer plus service start) where it used to exit; printed rerun commands carry `--version` and the offline options but not other options you passed. `vesselstackctl doctor`/`status` and the Control Panel do not read the marker yet. Rollback: revert the commit; nothing is stored beyond the existing marker.
-- Displays bridge: `vesselstack/v1/bridge/status` is no longer retained. The bridge publishes `online` (QoS 0, not retained) on each MQTT connect and every `heartbeat_s`, and `offline` (not retained) on a clean stop or through its last will. Previously a retained `online` outlived a power cut: the broker restored it, together with retained item values up to 30 minutes old, from its last autosave, and displays showed those values as live until a bridge started (or indefinitely if it never did). On connect the bridge deletes any retained `bridge/status` left by an older version. A new retained `vesselstack/v1/bridge/service` (`{"state","ts"}`, refreshed every `heartbeat_s`) is for tools; after a crash or power cut it can still say `online` with an old `ts`, so judge it by `ts`. `vesselstackctl display status` now reads it and shows the report's age. Operational impact: bridge only, no display rebuild or reflash and no broker configuration change; takes effect when the bridge restarts. Displays show `--` and hold back the alarm banner for up to one `heartbeat_s` (5 s by default) after they connect or reconnect. Anything outside VesselStack that reads the retained `bridge/status` (for example an owner's Node-RED flow) must switch to `bridge/service` or listen for the heartbeat. The retained `bridge/clock` night flag is still applied by display firmware without this check. Rollback: revert the commit and restart the bridge.
-- Boat Chat: live readings now reach the model with their age and the request time. If a battery shunt stopped reporting on Monday, "how are the batteries?" on Wednesday is answered along the lines of "No recent battery data; last reading 85% on Mon 14:02, 2 days ago" instead of "85%, 13.1 V" as if current. Readings older than 10 minutes, or with a missing, invalid or future timestamp, are given to the model as `stale_values` with an age and local time, not as `values`; engine RPM that is not reporting is described as not reporting, never as the current RPM or 0. A boat-clock status (`ok`/`unverified`/`suspect`, checked against GPS time when that is itself fresh) tells the model when ages may be inaccurate, and the prompt carries the request time in local time and UTC. `navigation.attitude` now arrives as three labelled degree values. The 10-minute freshness rule is one shared module (`boat-chat/data_age.py`) used by status cards, the telemetry indexer and the briefing, with unchanged thresholds. The Telegram bot uses the same path. Operational impact: answers say when data is old and stop presenting it as current; the prompt grows by about 1 kB plus a short list of stale readings. Deterministic answers (briefing, battery, fuel and history wording) are not changed yet. Rollback: revert the commit; stored snapshots only gained fields.
-- Installer: `install.sh` now writes `config/install-in-progress` (root-owned, mode 0644, plain `KEY=VALUE` lines: `version`, `from`, `started`, `start`, `source`, `backup`) from the first change it makes to the system, and removes it once the start phase has succeeded, or at the end of a run without `--start` when no earlier `--start` run failed. `installed-version` is still written before the services are started, so a run that died while starting services used to look finished; a leftover marker now records that it did not. Nothing reads the marker yet: the bootstrap, `vesselstackctl` and the Control Panel learn to use it in following changes, and until then a rerun of the bootstrap for the same version still reports "nothing to do". A marker left behind is harmless to older code, and installs without one are treated as finished, so no migration is needed. Rollback: revert the commit; delete `config/install-in-progress` if one is left over.
-- Displays bridge: an alarm no longer clears because its data stopped. An instrument, Signal K notification or Home Assistant item that was in alarm when its data stopped (stale, null or invalid value, Signal K or Home Assistant disconnect, unavailable entity, clean bridge stop) is reported as lost in `vesselstack/v1/alarms/summary`: it still counts in `max` (`alarm`), `na` and `ids`, and is also listed in the new fields `nl` and `lost`. It stays lost until a fresh reading that is not an alarm, an explicit cleared or normal notification, or removal from `displays.json`; a silent notification's settle timeout never clears it, and its own tile shows unknown rather than OK. The summary also carries a new `seq` counter that rises once for each new alarm, so one alarm clearing while another raises is no longer invisible; a clean bridge stop keeps alarms as lost instead of publishing all-unknown. Operational impact: bridge only, no rebuild or reflash; takes effect when the displays bridge restarts. Display firmware already in use ignores the new fields, so its banner now stays up showing the alarm for a lost item instead of disappearing (distinct "no data" wording and re-arming on `seq` come with a later firmware change). The latch is held in memory only: restarting the bridge while an alarmed sensor is silent forgets it until a later change persists it. The summary payload can be up to about 1.25 kB with many simultaneous alarms. Rollback: revert the commit and restart the bridge.
-- Boat Chat now converts Signal K values and labels their units from one table (`boat-chat/signalk_units.py`), so a number and its unit can no longer disagree. Before and after: `propulsion.port.oilTemperature` at 358.15 K was shown as "358.15 F" and is now 185.0 F (85.0 °C in metric mode); `navigation.headingTrue` in radians was labelled "deg" and is now 90 deg; `tanks.fuel.0.capacity` (m3) was labelled "%" and is now in US gal (L in metric mode); non-fuel tank levels and humidity are now percent (0.25 shows as 25 %); wind speeds are in kn; `environment.current.drift` is no longer labelled "A". Live snapshots add `unit_schema: 2`, `unknown_unit_paths` and `unit_conflicts`; every numeric value has a `units` entry, and an empty one means the unit is unknown, so such values are shown unconverted with no assumed unit instead of being guessed from the path. A device unit that disagrees with the expected one (for example a temperature in C) is left unconverted and listed in `unit_conflicts`. The "value greater than 2000" heuristic for engine and barometric pressure is gone, so a device sending hPa as Pa is now converted like any other value. `navigation.attitude` (an object of radians) is no longer mislabelled "deg" but is not yet converted. Operational impact: owners will see the changed values and labels above in answers, charts and history summaries; the cached status snapshot refreshes on the next indexer run. Rollback: revert the commit.
-- Make `vesselstackctl restore` fail closed in more cases. Tree renames now use `mv -T`, so a directory that appears at a destination can no longer end up with the restored tree nested inside it. The recovery journal is removed when restore stops before the swap starts. If the swap fails and the rollback succeeds, the staged copy of the backup (`.vesselstack-restore.*`, which contains secrets) is removed; if the rollback fails, the stage and the journal are kept and both paths are printed with a reminder to remove them after recovery. During the swap, restore now also stops the Control Panel, `vesselstack-homepage-refresh.service` and the active VesselStack timers and their services (not stopped by `stop`), records them in `quiesced-units` in the journal, and starts exactly those again after a rollback or, once the restored installer or controller start has finished, after success. `restore --skip-installer` now prints a WARN with the exact `sudo <root>/installer/install.sh --config <root>/config/vesselstack.env --start` command, because the Boat Chat and displays Python environments are not in a backup. Operational impact: the Control Panel is unreachable and timers (alerts, backup, telemetry) do not run for the duration of the swap. Rollback: revert the commit. This does not yet make restore crash-safe or safe against a dropped SSH session; there is still no durable journal, detached worker or boot recovery.
-- Displays bridge: three fixes so an unknown value never looks fine on the helm. An explicit null, NaN, infinite, non-numeric or unconvertible Signal K value now shows `--` (state `missing`) at once instead of keeping the last reading until `stale_after_s`. Losing the Signal K connection marks every numeric instrument `stale` at once instead of after `stale_after_s`. Severity (`ok`/`warn`/`alarm`) is now evaluated on the converted value before display rounding, so a tile can show a rounded number equal to a limit while already in `warn` or `alarm` (for example a depth of 2.5 with `alarm_below` 3 and precision 0 shows 3 in alarm); Home Assistant numeric items behave the same. Bridge only: takes effect when the displays bridge restarts after the update; the MQTT payload shape and generated firmware are unchanged, so no rebuild or reflash is needed. Operational impact: tiles near a limit can turn amber or red one rounding step earlier, and after a Signal K outage the alarm summary goes to `unknown` immediately rather than holding the last severity until the value went stale, so the alarm banner also clears at that moment; keeping an alarm visible when its data stops is a separate change that must ship in the same release. (done in the entry above) Rollback: revert the commit and restart the bridge.
-- Added `boat-chat/signalk_units.py`, a single table that gives both the stored-value conversion and the unit label for each Signal K path from one lookup (SI input; unknown paths get the unit Signal K reports or no label, never a guessed US-customary one), with tests in `tests/test_signalk_units.py` and the file added to the release package list. This change only adds the module and tests and does not change behaviour yet; the next change wires it into Boat Chat so a value and its label can no longer disagree (today, for example, an oil temperature in kelvin is labelled F and a true heading in radians is labelled deg). Operational impact: none. Rollback: revert the commit.
-- Fix alerting going silent without a Home Assistant or InfluxDB credential: when `ALERT_BILGE_ENTITY` or `ALERT_SHORE_POWER_ENTITY` is set and `HOME_ASSISTANT_TOKEN` is empty or Home Assistant answers 401/403, a Telegram message "Bilge alert is not working: Home Assistant token is missing or was rejected, ..." (likewise "Shore power") is now sent after a 5 minute hold, repeats every `ALERT_REPEAT_MINUTES`, is followed by "alert is working again" once the entity is readable, and makes the `ALERT_HEARTBEAT_URL` ping go to `/fail` while held. An active bilge or shore power alert is not cleared by a token failure; network errors and 5xx behave as before. InfluxDB 401/403 with a low-battery threshold or the stale-data check active sends "Battery and stale-data alerts are not working: InfluxDB rejected the read token." Operational impact: owners with an entity configured but no valid token start receiving this message and `/fail` heartbeats after upgrading; set the token in Control Panel settings. No new settings. Rollback: revert the commit.
-- Fix the Control Panel wording of `TELEGRAM_ENABLE`: it was labelled "Send alerts to Telegram" but runs the Telegram chat bot. It is now "Ask Boat Chat from Telegram" with a description pointing to "Boat alerts to Telegram" (`ALERTS_ENABLE`) for real alerts; the component card is now "Telegram chat bot" and the bot token help says it is used by both. Wording only; keys and behaviour are unchanged. Operational impact: an owner who enabled the old switch expecting boat alerts was not receiving any and must turn on "Boat alerts to Telegram". Rollback: revert the commit.
-- Control Panel "Back up now" now asks for confirmation and lists what goes dark, because a backup stops every service until it finishes; on Home the button is no longer the highlighted primary button. The update flow's own backup dialog is unchanged. Rollback: revert the commit.
-- Control Panel reconnect: after losing contact the page keeps retrying while signed in (2, 4, 6 and 8 s, then every 15 s) instead of stopping after five attempts, and retries at once when the page becomes visible again (phone wake) or the browser comes back online. **Retry now** still works. Rollback: revert the commit.
-- Displays: the full-screen alarm takeover banner is now on by default. `ui.alarm_takeover` defaults to on when any instrument, notification or Home Assistant item counts towards the alarm summary and stays off when nothing does; an explicit `"alarm_takeover": false` keeps it off and an explicit `true` is still rejected when nothing counts. `display add`, the Control Panel and the wizard write no `ui` block, so displays created the supported way previously showed alarms only as a coloured tile. No config is migrated; the default lives in code. Operational impact: the generated firmware changes (banner, summary subscription and banner fonts) for every display with alarm sources and no explicit setting, so those displays show as needing a rebuild and must be rebuilt and reflashed (`vesselstackctl display build ID`, then `display flash ID`, or "Apply to screen" in the Control Panel) to get the banner. Rollback: set `"ui": {"alarm_takeover": false}` for the display in `displays.json` (or revert the commit), then rebuild and reflash. `tests/test-displays-esphome-config.sh` now expects the banner by default for configurations with alarm sources and its absence when nothing counts, and validates the explicit `false` opt-out.
-- Security: require the `crew` sign-in on the Node-RED Dashboard 2.0 live channel. `httpNodeAuth` never covered `/dashboard/socket.io/`, so unauthenticated clients received `ui-config` and widget data; `settings.js` now sets `dashboard.ioMiddleware`, which keeps the dashboard's no-direct-websocket and no-cross-origin checks and checks the Basic `crew` credentials against the bcrypt hash (refused with `no bcrypt module found` logged if none loads). The first polling request still returns 200 with an empty session. New Docker test `tests/test-nodered-dashboard-auth.sh` runs in the CI `service-integration` job (needs internet). Operational impact: dashboards keep working in browsers that resend the cached sign-in; `settings.js` is seeded only when absent, so an existing install must delete `config/node-red/settings.js` as root and rerun the installer. Rollback: remove the `dashboard: { ioMiddleware: ... }` line and run `sudo vesselstackctl restart`. Node-RED is not in a release yet.
-- Clean up ShellCheck findings so `tests/test-distribution.sh` passes on newer ShellCheck (0.9.0 and 0.11.0, default options): rewrite `A && B || C` as `if ! { A && B; }; then C; fi` in `scripts/vesselstackctl`, rename an unused `read` field to `_size`, and add reasoned `disable` directives for the unfollowed `source` of `scripts/lib/remediate.sh` and the cross-file `VS_PROMPT_OWNED`. No behaviour change; rollback by reverting the commit.
-- Fix CI: the "Validate optional Compose profiles" step now passes `--no-env-resolution` to `docker compose config`, so it no longer fails on the installed-only `config/nodered.env` (the Node-RED `env_file` stays `required: true`). CI-only change; no runtime impact or rollback needed.
-- Warn instead of silently skipping when the Signal K data path helper cannot read an installed plugin's `package.json` (for example `permission denied` on `node_modules`): the InfluxDB writer plugin or a marine essentials plugin is still left alone, but the installer output now names the package, the path and the error. No change to exit codes or other behaviour. Rollback: revert the commit; see README "Signal K plugin skipped (WARN: skipped ...)".
-- Fix CI: `tests/test-get-vesselstack.sh` scripted wizard answers now include the new "Send boat alerts to Telegram?" prompt (and assert `ALERTS_ENABLE=false`), so later answers no longer shift onto the wrong questions. Test-only change; no runtime impact or rollback needed.
-- Fix CI: the fake npm container in `tests/test-clean-install.sh` now runs under `umask 022`, so the marine bundle check passes on Ubuntu 26.04 runners (uutils `install -d` honours `install.sh`'s umask 077 and left `node_modules` unreadable to the unprivileged helper). Test-only change; no runtime impact or rollback needed.
-- Fix CI: `tests/test-distribution.sh` now expects the `--scheduled` option in the `vesselstackctl backup` usage line. Test-only change; no runtime impact or rollback needed.
-- Add optional marine essentials bundle, off by default (`SIGNALK_MARINE_BUNDLE`, managed Docker/native modes only):
-  NMEA 0183 on TCP 10110 (the converter, KIP 4.8.0 and Freeboard-SK 2.22.1 ship inside Signal K v2.27.0), pinned
-  `signalk-anchoralarm-plugin` 2.0.1, `@meri-imperiumi/signalk-logbook` 0.15.1 and `@meri-imperiumi/signalk-autostate`
-  0.6.4 installed with the data path helper (`--ignore-scripts`, prune guard), plugin configurations written only when
-  absent, KIP/Freeboard/Logbook/Anchor alarm Homepage tiles, port 10110 dropped on the untrusted interface, WARN-only
-  `doctor` check. Operational impact: about 64 MB of npm packages with unpinned sub-dependencies; needs internet.
-  Rollback: `SIGNALK_MARINE_BUNDLE=false`, see README "Marine essentials (optional)".
-- Add optional Node-RED, off by default (`NODERED_ENABLE`, `NODERED_PORT`, `NODERED_BIND_ADDRESS`): pinned
-  `nodered/node-red:5.0.9-debian` with a bcrypt-protected editor (`admin`, generated passphrase in `vesselstack.env`),
-  encrypted credential store, a dedicated Mosquitto account `vesselstack-nodered`, a read-only InfluxDB token, pinned
-  palette preinstall (skipped offline), importable example flows, a homepage tile, a WARN-only `doctor` check, firewall
-  drop on the untrusted interface and backup coverage. Operational impact: one more container (384 MB limit); the editor
-  can run code, so keep it on a trusted LAN or Tailscale. Rollback: `NODERED_ENABLE=false` and rerun the installer
-  (data in `${VESSELSTACK_DATA}/node-red` is kept).
-- Harden Node-RED: `settings.js` is now root-owned at `config/node-red/settings.js`, mounted read-only and passed with
-  `--settings`, so a missing file stops the container instead of starting unauthenticated defaults (an old
-  `${VESSELSTACK_DATA}/node-red/settings.js` is kept but unused); it starts only when enabled, `nodered.env` is non-empty
-  and `settings.js` exists; `NODERED_BIND_ADDRESS` now defaults to `127.0.0.1` and no longer follows the dashboards; a
-  separate generated dashboard passphrase (`NODERED_DASHBOARD_PASSWORD`, user `crew`) and a 16-character minimum for
-  owner-set passphrases; `remote enable|disable|status` also manage a tailnet-only Node-RED handler on 1880; the firewall
-  always drops the Node-RED port and is restarted on install; `doctor` requires 401 from `/flows`. Known limitation:
-  the Dashboard 2.0 socket.io endpoint is not covered by `httpNodeAuth`; keep the default bind. Rollback: set
-  `NODERED_BIND_ADDRESS` explicitly to restore the previous exposure.
-- Add optional Tailscale remote access, off by default (`REMOTE_ACCESS=off|tailscale`, `REMOTE_PANEL_SERVE=true`):
-  `sudo vesselstackctl remote enable [--dry-run] [--auth-key-stdin] | status [--json] | disable [--purge]`
-  installs Tailscale from Tailscale's signed apt repository (internet needed; not in the offline bundle), joins the
-  tailnet with the printed sign-in link, and publishes the Control Panel (still on `127.0.0.1`) to the tailnet only
-  with `tailscale serve --https=8780`, adding its name to `CONTROL_PANEL_ALLOWED_HOSTS` (now preserved across
-  reinstalls). No inbound ports are opened; no auth key is stored or logged (`--auth-key-stdin` works only when the
-  installed Tailscale reads keys from a file). The panel's Origin check stays strict (`Host` must equal `Origin`; `tailscale serve` passes the original
-  `Host`, otherwise tailnet writes fail with 403). Default tailnet host name is `vesselstack` (`--hostname NAME` to change;
-  HTTPS publishes it in Certificate Transparency logs), `--accept-dns=false`, curl limited to https; `disable` runs only
-  `tailscale serve --https=8780 off`, removes only the recorded allowlist entry and runs `tailscale down` last, only for a
-  Tailscale VesselStack installed. `/api/status` gains read-only `remote`, shown on the Home tab; `doctor` warns
-  (never fails) on a missing or signed-out Tailscale; `uninstall` disables it. Operational impact: every tailnet device
-  can reach services bound to `0.0.0.0` (use Tailscale ACLs) and tailnet sign-in failures share the panel's 127.0.0.1
-  lockout bucket. Rollback: `sudo vesselstackctl remote disable --purge`.
-- Make alerts safer: an offline bilge or shore sensor is never an all-clear (separate "sensor not reporting" alerts after 5 minutes), bilge alerts on the first poll, the heartbeat pings `/fail` only for a real problem (also when Telegram delivery fails), per-run 90 s deadline, clock-backwards and reboot handling, orphaned entries pruned, dispatcher health in `doctor`, the script refuses to run as root, and more unit hardening. Rollback: set `ALERTS_ENABLE=false`.
-- Add opt-in Telegram alerts (`ALERTS_ENABLE`, default `false`; `ALERT_TELEGRAM_CHAT_IDS`,
-  `ALERT_BATTERY_LOW_V`, `ALERT_BILGE_ENTITY`, `ALERT_SHORE_POWER_ENTITY`, `ALERT_HEARTBEAT_URL`,
-  `ALERT_REPEAT_MINUTES`, `ALERT_STALE_DATA_MINUTES`): a one-minute systemd timer runs a sandboxed
-  one-shot dispatcher that uses the Boat Chat bot token with `sendMessage` only and alerts on low
-  battery, stale Signal K data, bilge and shore-power entities, stack components down, boat computer
-  restarts and failed or stale backups, with an optional healthchecks.io-style heartbeat. No threshold is
-  assumed (blank = off). New `vesselstackctl alerts test|status`; `doctor` warns only. Operational
-  impact: one small process per minute and outbound HTTPS to `api.telegram.org`; reads InfluxDB with the
-  existing admin token. Rollback: `ALERTS_ENABLE=false` and rerun the installer, or
-  `systemctl disable --now vesselstack-alerts.timer`.
-- The Home Assistant blueprints now default `notification_actions` to a persistent notification so they
-  work without choosing a notify action (a `notify.mobile_app_*` example is included as a comment).
+This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,
+Tailscale remote access, Node-RED and a marine essentials bundle. It is published as a
+pre-release.
 
-- Configure the Signal K data path automatically in Docker and native modes
-  (`SIGNALK_DATAPATH_AUTOCONFIG`, default `true`; existing mode is never modified): the installer installs
-  `signalk-to-influxdb2` 2.3.0 into the Signal K data directory, adds a `vesselstack-n2k-<interface>` NMEA 2000
-  provider when SocketCAN is enabled (after a `settings.json.vesselstack-<time>.bak` copy) and writes the
-  plugin configuration only when it does not exist. The plugin gets its own `vesselstack-signalk-writer`
-  InfluxDB token: read this organization, read and write the raw bucket only, read DBRP mappings (a missing
-  DBRP mapping is created first). Signal K is stopped and started once on the first run; an npm prune guard
-  (`npm install --dry-run`) skips the install, with a warning, if npm would delete packages that
-  `package.json` does not list; `--offline` installs skip the step. The token can read the raw bucket,
-  including position data, and is stored in the plugin configuration (mode 0600).
-  All file work inside the Signal K data directory runs in a child that has dropped to the Signal K
-  uid/gid (no root `chown` or link-following there; the token travels over a pipe), refusals are found
-  before a token is created, InfluxDB requests never follow redirects, a timed-out Docker `npm` container
-  is removed, Signal K is restarted in native mode too without ever failing the installation, a malformed
-  `settings.json` skips only the provider step, and `vesselstackctl doctor` reports a rejected writer token.
-- Add the **VesselStack Boat Overview** Grafana dashboard (batteries, tanks, engine, navigation without
-  position, environment) reading `INFLUXDB_RAW_BUCKET`; the installer rejects a bucket name that is not
-  1 to 64 letters, digits, dots, hyphens or underscores.
-- `vesselstackctl doctor` reports whether Signal K data reaches InfluxDB (warnings only).
-- Rollback: set `SIGNALK_DATAPATH_AUTOCONFIG=false`, delete
-  `signalk/plugin-config-data/signalk-to-influxdb2.json`, restore `settings.json` from its `.bak`, delete the
-  `vesselstack-signalk-writer` token and `npm uninstall signalk-to-influxdb2` (README, "Signal K and InfluxDB").
-- Add unattended-operation settings: a hardware watchdog (`VESSELSTACK_WATCHDOG`, default `auto`,
-  enabled only on a Raspberry Pi that has `/dev/watchdog`; `true` enables it on any computer with the
-  device) and a journal size cap (`VESSELSTACK_JOURNAL_MAX_USE`, default `200M`, or `off` for no
-  VesselStack drop-in), both applied by the installer through systemd drop-ins. The watchdog timeout
-  is `min(10, max_timeout - 1)` seconds and is skipped below 5; it is also skipped (and VesselStack's
-  drop-in removed) when `watchdog.service` is active or enabled.
-- Upgrading on a Raspberry Pi arms the hardware watchdog by default (`auto`). Opt out with
-  `VESSELSTACK_WATCHDOG="false"` and rerun the installer.
-- Add opt-in scheduled backups (`VESSELSTACK_BACKUP_SCHEDULE` off/daily/weekly, default off) with
-  retention (`VESSELSTACK_BACKUP_KEEP`, default 8, whole number 1 to 365) and `vesselstackctl backup --scheduled`, which
-  needs a mounted backup drive. Scheduled archives are named `vesselstack-scheduled-<stamp>.tar.gz`
-  and only those are pruned; manual and pre-update backups never are. The drive needs room for
-  `KEEP`+1 archives. A failed run removes its partial archive. A scheduled backup stops the whole stack while it runs. The last result is
-  recorded in `/var/lib/vesselstack/backup-last.json` and shown in `doctor` and the Control Panel.
-- `vesselstackctl doctor` reports the watchdog, journal cap, scheduled backups, Raspberry Pi
-  under-voltage/throttling (`vcgencmd get_throttled`), a configured GPIO shutdown overlay and whether
-  the previous boot ended cleanly. Only a failed scheduled backup makes `doctor` fail.
-- The lifecycle lock helper now exits with status 75 (instead of 1) when the lock is busy
-  (`run` only); a busy scheduled backup leaves its unit in the failed state until the next success.
-- Rollback: set `VESSELSTACK_WATCHDOG=false`, `VESSELSTACK_JOURNAL_MAX_USE=off` and
-  `VESSELSTACK_BACKUP_SCHEDULE=off` and rerun the installer (README, "Unattended operation and power").
+### Highlights
+
+- Restore keeps a durable journal, so an interrupted restore can be inspected and rolled back
+  (see Safer restore).
+- Unattended operation: a hardware watchdog, a cap on the journal size, and optional scheduled
+  backups with retention. `vesselstackctl doctor` reports them, Raspberry Pi under-voltage and
+  throttling, a configured GPIO shutdown overlay and whether the previous boot ended cleanly.
+- Telegram alerts, off by default: low battery, stale Signal K data, bilge and shore power,
+  components down, boat computer restarts and failed or stale backups, with an optional heartbeat.
+- Tailscale remote access, off by default: `vesselstackctl remote` publishes the Control Panel to
+  your tailnet only, and opens no inbound port.
+- Node-RED, off by default, with a protected editor and example flows.
+- A marine essentials bundle, off by default: NMEA 0183 on TCP 10110, KIP, Freeboard-SK, an
+  anchor alarm, a logbook and automatic boat state.
+- Signal K data reaches InfluxDB without manual setup, and a new Grafana dashboard, **VesselStack
+  Boat Overview**, shows batteries, tanks, engine, navigation (no position) and environment.
+- An install or update that stopped part-way is now reported and can be finished: by
+  `vesselstackctl`, the Control Panel and a rerun of `get-vesselstack.sh`.
+
+### Safer restore
+
+- `vesselstackctl restore` writes a journal to `/var/lib/vesselstack/restore/current` (mode 0700)
+  before each step. After a lost SSH session or a power cut, run
+  `sudo /var/lib/vesselstack/restore/current/recover status` to see how far it got, then
+  `recover rollback` to put the previous folders and system files back and start the previous
+  stack. `sudo vesselstackctl restore-recover status|rollback` and `sudo vesselstackctl restore
+  --status` do the same through the installed controller. After an interrupted restore that
+  controller may belong to the restored, older release; the `recover` script does not.
+- Restore refuses up front, with nothing changed, when the application or data folder is not a
+  clean absolute path, is `/`, or is inside the other. It also refuses when the application
+  folder, the data folder and the staging area are not on one filesystem, or when it cannot
+  rename an empty probe folder into and out of each parent (for example a bind mount of the same
+  disk). Before the first change it flushes the backup and the journal to disk; on an SD card
+  this can take several minutes. Do not interrupt it.
+- Restore stops the units and containers that use the two folders, and starts them again after a
+  rollback, an abandon or a completed restore. This includes Docker containers outside the
+  `vesselstack` compose project that mount either folder, or a parent such as `/` or `/opt`,
+  read-write. A parent mounted read-only is left alone. Containers that fail to start are named.
+  The firewall and SocketCAN units keep running. Restore tells you when the firewall was running
+  before and is not now.
+- A rollback that puts everything back but cannot start the stack closes the journal and exits
+  with status 3. Run `sudo vesselstackctl start`, then `sudo vesselstackctl doctor`.
+- `recover abandon --yes` closes the journal without rolling back. It is allowed only when both
+  original folders are in place. It starts the stopped units again, warns if system files may
+  already be the restored release's, and lists what it leaves behind.
+- Restoring an older backup now turns off the managed features that version does not have, for
+  example scheduled backups and Telegram alerts when a 0.8.0 archive is restored. Restore
+  lists them after "Restore completed". It also reinstalls `vesselstack-update` and the helpers
+  from the restored release. Your own units are not touched.
+- When the journal itself cannot be used, the commands print a by-hand procedure. It first stops
+  every `vesselstack-*` unit (except the firewall and SocketCAN) and the stack's containers, and
+  checks for other containers that mount the folders. It names this restore's own
+  `<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>`, moves the journal aside
+  with `sudo mv -T`, and always ends by starting the stack with the installer of the application
+  folder. Refusals that a retry can fix end with the one command to run again instead.
+- If the previous folder cannot be put back (missing, a different folder, or a symbolic link), the
+  rollback stops and names two ways out. Move the real folder back and run the rollback again. Or
+  stop the stack by hand, move the journal aside and restore again from a backup with
+  `vesselstackctl restore /path/to/vesselstack-<time>.tar.gz --yes`.
+- Leftover `*.pre-restore-*`, `*.failed-restore-*` and stage directories are never pruned. They
+  hold a copy of your data, including secrets. `doctor` warns about them. Delete them yourself
+  when you no longer need them. Finished, rolled-back and abandoned restores leave a small record
+  under `/var/lib/vesselstack/restore` (the newest three of each are kept).
+
+### Displays and alarms
+
+- The full-screen alarm banner is now on by default for any display that has alarm sources. An
+  explicit `"alarm_takeover": false` for the display in `displays.json` keeps it off.
+- An alarm no longer clears because its data stopped. An item in alarm whose data goes stale,
+  invalid or missing, or whose source disconnects, is reported as lost and stays lost until a
+  fresh reading that is not an alarm, an explicit clear, or removal from `displays.json`. The
+  lost list and the alarm counter (`seq`) are saved in `<data>/displays-bridge/state.json`, so a
+  bridge restart or power cut does not forget them.
+- A missing, null or invalid value shows `--` at once. Losing the Signal K connection marks
+  numeric instruments stale at once. A value that repeats the last source timestamp is no longer
+  treated as fresh, so a dead sensor goes stale on schedule.
+- Severity is judged on the converted value before rounding, so a tile can turn amber or red one
+  rounding step earlier.
+- Fire and Flooding in the catalog show `--` until a source reports. `vesselstackctl display
+  validate` warns about a fire or flooding notification set to read OK when nothing is reported.
+- `vesselstack/v1/bridge/status` is no longer retained. The bridge publishes `online` on connect
+  and every `heartbeat_s`, and `offline` on a clean stop or through its last will. A retained
+  `vesselstack/v1/bridge/service` is for tools; judge it by its `ts`. `vesselstackctl display
+  status` reads it. After connecting, displays show `--` for up to one `heartbeat_s` (5 s by
+  default). Numeric payloads also carry a `cu` unit tag that current firmware ignores.
+
+### Boat Chat
+
+- Answers now say how old their data is. A reading older than 10 minutes is given as stale, with
+  its age and local time, and is never presented as current. Engines that are not reporting are
+  described that way, not as 0 RPM. The request time and a boat-clock status are included.
+- One table (`boat-chat/signalk_units.py`) converts each Signal K value and labels its unit, so a
+  number and its unit cannot disagree. For example, an oil temperature of 358.15 K was shown as
+  "358.15 F" and is now 185.0 F (85.0 C in metric mode). Headings in radians show as degrees and
+  fuel tank capacity is no longer labelled "%". Unknown units are shown unconverted with no
+  unit. `navigation.attitude` arrives as three labelled degree values.
+- Battery history and fuel answers state when there is no recent data or when logging gaps make
+  a total a minimum. Voltage guidance is given only for banks reading 9 to 16 V.
+- Telegram chat uses the same data-age rules.
+
+### Fixes
+
+- Alerts: a missing or rejected Home Assistant or InfluxDB token no longer makes alerting go
+  silent. You get a message after 5 minutes, and the heartbeat reports a failure.
+- An offline bilge or shore sensor is never an all-clear. Alerts also handle clock changes and
+  reboots, and the heartbeat reports a failure only for a real problem.
+- The Control Panel switch `TELEGRAM_ENABLE` is now labelled "Ask Boat Chat from Telegram". It
+  runs the chat bot. Boat alerts are "Boat alerts to Telegram" (`ALERTS_ENABLE`).
+- Control Panel: **Back up now** asks for confirmation and lists what goes dark. After losing
+  contact the page keeps retrying and reconnects when the phone wakes.
+- The Home Assistant blueprints default `notification_actions` to a persistent notification.
+- The installer warns, with the package, path and error, when it cannot read a Signal K plugin's
+  `package.json`.
+
+### Security
+
+- Node-RED: the editor is protected by a bcrypt passphrase (user `admin`, generated). The
+  dashboards use a separate generated passphrase (user `crew`). `settings.js` is root-owned,
+  mounted read-only, and a missing file stops the container. `NODERED_BIND_ADDRESS` defaults to
+  `127.0.0.1`. The firewall drops the port on the untrusted interface. `doctor` requires 401 from
+  `/flows`.
+- The Dashboard 2.0 live channel requires the `crew` sign-in. Browsers keep working if they resend
+  the cached sign-in.
+- Tailscale: no auth key is stored or logged. The Control Panel's Origin check stays strict.
+- The Signal K writer token (`vesselstack-signalk-writer`) can read the raw bucket, including
+  position data. It is stored in the plugin configuration with mode 0600.
+
+### Upgrade notes
+
+- Run the full installer to get the new settings and units. An application-only update is not
+  enough.
+- On a Raspberry Pi the hardware watchdog is armed by default (`VESSELSTACK_WATCHDOG=auto`). Set
+  `VESSELSTACK_WATCHDOG="false"` and rerun the installer to opt out. The journal cap defaults to
+  `200M`.
+- `vesselstackctl status` exits non-zero while an installation or restore is unfinished. A script
+  of your own that checks it will see a failure in that state. While a restore is unfinished,
+  commands that change the system and the installer refuse to run.
+- New alert messages and `/fail` heartbeats appear if `ALERT_BILGE_ENTITY` or
+  `ALERT_SHORE_POWER_ENTITY` is set without a valid `HOME_ASSISTANT_TOKEN`. Set the token in
+  Control Panel settings.
+- If you turned on the old "Send alerts to Telegram" switch expecting boat alerts, you were not
+  receiving any. Turn on "Boat alerts to Telegram".
+- A scheduled backup stops the whole stack while it runs. The backup drive needs room for
+  `VESSELSTACK_BACKUP_KEEP` plus one archives.
+- Anything outside VesselStack that reads the retained `bridge/status` (for example a Node-RED
+  flow) must read `bridge/service` or listen for the heartbeat.
+- Displays need a rebuild and reflash to get the alarm banner: `vesselstackctl display build ID`,
+  then `display flash ID`, or **Apply to screen** in the Control Panel. The other display changes
+  take effect when the bridge restarts.
+- Boat Chat answers use new wording and units. Cached summaries keep the old text until they
+  refresh.
+- The first update into 0.9.0 is run by the old Control Panel, so the unfinished-update notice and
+  **Finish this update** button apply from the next update on.
+- After restoring a pre-0.9.0 backup, the features listed under "Turned off because the restored
+  version does not have them" stay off until you update again.
+- The marine bundle downloads about 64 MB of npm packages and needs internet. `--offline` installs
+  skip the Signal K data path step. Tailscale is installed from Tailscale's apt repository and is
+  not in the offline bundle.
+- If you ran an unreleased `main` build, delete `config/node-red/settings.js` as root and rerun the
+  installer to pick up the dashboard sign-in.
+
+### Rollback
+
+The installer refuses downgrades. To go back to the previous release, restore the verified
+pre-update backup with `sudo vesselstackctl restore <backup-file> --yes`.
+
+To turn off a feature without restoring, change its setting and rerun the installer:
+
+- `ALERTS_ENABLE=false` (or `systemctl disable --now vesselstack-alerts.timer`).
+- `NODERED_ENABLE=false` (data in `${VESSELSTACK_DATA}/node-red` is kept).
+- `SIGNALK_MARINE_BUNDLE=false`.
+- `VESSELSTACK_WATCHDOG=false`, `VESSELSTACK_JOURNAL_MAX_USE=off` and
+  `VESSELSTACK_BACKUP_SCHEDULE=off`.
+- `SIGNALK_DATAPATH_AUTOCONFIG=false`, then follow README "Signal K and InfluxDB" to remove the
+  plugin configuration and the `vesselstack-signalk-writer` token.
+- `sudo vesselstackctl remote disable --purge` for Tailscale.
+- `"ui": {"alarm_takeover": false}` for a display in `displays.json`, then rebuild and reflash it.
+
+### Known limits
+
+- Restore still runs in the terminal session. There is no detached worker and nothing recovers
+  automatically at boot. Keep it on a stable connection or inside `screen` or `tmux`, and after
+  an interruption run `recover status`, then `recover rollback`.
+- The by-hand recovery commands printed when the journal cannot be used are checked by tests as
+  text. They have not yet been run on a boat computer with running services.
+- Only a lost alarm is saved. A live alarm at the moment of a crash or power cut counts as new
+  afterwards. The first value after a bridge restart is accepted once.
+- Current display firmware keeps its banner up for a lost item without separate "no data" wording.
+  It ignores the `cu` tag. Both need a later firmware change.
+- Tailscale: every tailnet device can reach services bound to `0.0.0.0` (use Tailscale ACLs), and
+  tailnet sign-in failures share the panel's lockout bucket. `--auth-key-stdin` works only when
+  the installed Tailscale reads keys from a file. HTTPS publishes the host name in Certificate
+  Transparency logs.
+- Node-RED can run code: keep it on a trusted LAN or Tailscale.
+
+### Release status
+
+Published as a pre-release. Automated CI passes; physical Raspberry Pi and display acceptance
+are pending. It is not marked Latest until the documented lab checks pass.
+
+### For contributors
+
+- Tests and CI: the optional Compose profiles check passes `--no-env-resolution`, the scripted
+  wizard answers cover the alerts prompt, the fake npm container runs under `umask 022`, and
+  `tests/test-nodered-dashboard-auth.sh` runs in the `service-integration` job (needs internet).
+- ShellCheck findings in `scripts/vesselstackctl` are fixed for ShellCheck 0.9.0 and 0.11.0. No
+  behaviour change.
 
 ## 0.8.0 - 2026-11-12
 
