@@ -236,7 +236,12 @@ client mosquitto_pub -h "$BROKER" -u "$ADMIN_USER" -P "$ADMIN_PASS" \
     -t vesselstack/v1/bridge/status -m online -r -q 1 >/dev/null 2>&1 || fail "could not plant the legacy status"
 [ "$(retained_only vesselstack/v1/bridge/status)" = "1 online" ] || fail "the legacy retained status was not planted"
 run_bridge
-wait_for vesselstack/v1/bridge/status '^online$' 20
+# The planted retained "online" satisfies a plain wait_for at once, before the bridge has connected,
+# so wait for the deletion itself instead of sampling the retained value once.
+end=$((SECONDS + 20))
+while [ "$SECONDS" -lt "$end" ] && [ -n "$(retained_only vesselstack/v1/bridge/status)" ]; do
+    sleep 1
+done
 [ -z "$(retained_only vesselstack/v1/bridge/status)" ] \
     || fail "a retained bridge/status remains (legacy value not deleted, or the bridge retained its own)"
 [ "$(client mosquitto_sub -h "$BROKER" -u "$HELM" -P "$HELM_PASS" -t vesselstack/v1/bridge/status \

@@ -17,6 +17,8 @@ install -d "$APP_ROOT/config" "$APP_ROOT/installer/scripts" "$DATA_ROOT" "$FAKE_
     "$APP_ROOT/common" \
     "$SYSTEM_ROOT/etc/systemd/system" "$SYSTEM_ROOT/usr/local/sbin" \
     "$DATA_ROOT/grafana" "$DATA_ROOT/influxdb"
+# A running systemd for the restore's unit checks (restore treats every unit as idle without this folder).
+install -d "$SYSTEM_ROOT/run/systemd/system"
 
 cat > "$APP_ROOT/config/vesselstack.env" <<EOF
 VESSELSTACK_ROOT=$APP_ROOT
@@ -1073,7 +1075,9 @@ fi
 # Boat Chat memory index: `reindex` builds it as the service user, the helper is idempotent
 # and a damaged environment is reported with the one-line fix. Done before the first doctor
 # run because an empty index is a doctor failure.
-run_ctl help | grep -q 'reindex  *Rebuild Boat Chat'
+# Captured first: grep -q closing the pipe early would kill the writer with SIGPIPE under pipefail.
+help_text=$(run_ctl help)
+grep -q 'reindex  *Rebuild Boat Chat' <<< "$help_text"
 if run_ctl reindex extra >/dev/null 2>&1; then
     echo 'reindex accepted an extra argument' >&2
     exit 1

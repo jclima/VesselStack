@@ -224,6 +224,21 @@ class RestoreJournalTests(unittest.TestCase):
             self.assertEqual(module.same_fs(str(self.dir / "tree")), "different")
             self.assertEqual(module.same_fs(parent), "same")
 
+    def test_a_regular_file_in_the_way_is_reported_as_notdir_not_as_an_error(self):
+        (self.dir / "afile").write_text("x")
+        self.assertEqual(run("same-fs", str(self.dir / "afile")).stdout, "notdir\n")
+        result = run("inspect", str(self.dir / "afile"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split()[1], "notdir")
+        self.assertEqual(result.stderr, "")
+
+    def test_resolve_follows_symbolic_links_and_accepts_missing_paths(self):
+        real = self.dir / "real"; real.mkdir()
+        (self.dir / "link").symlink_to(real, target_is_directory=True)
+        result = run("resolve", str(self.dir / "link" / "x"), str(self.dir / "nothing"))
+        self.assertEqual(result.stdout.splitlines(), [os.path.realpath(real / "x"), os.path.realpath(self.dir / "nothing")])
+        self.assertEqual(run("resolve").returncode, 2)
+
     def test_inspect_gives_the_inode_and_the_filesystem_check_in_one_call(self):
         (self.dir / "tree").mkdir()
         st = os.lstat(self.dir / "tree")

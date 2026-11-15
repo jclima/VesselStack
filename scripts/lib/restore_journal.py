@@ -19,7 +19,10 @@ that are read and written here and are never sourced or evaluated by a shell.
                                      same-fs of PATH in one call
   same-fs PATH                       print "same" when PATH is on the same filesystem as its real parent
                                      directory (PATH/.., so a symbolic link in an ancestor does not
-                                     matter), "different" when not (a mount point), or "absent"
+                                     matter), "different" when not (a mount point), "absent", or
+                                     "notdir" when PATH is something other than a directory or a link
+  resolve PATH [PATH ...]            print the fully resolved form of each PATH (symbolic links followed,
+                                     the path need not exist), one per line
   rename FROM TO                     rename(2) with the semantics of "mv -T": TO must not exist or be
                                      an empty directory, otherwise it fails. Never copies: a rename
                                      across filesystems fails with an error
@@ -163,6 +166,8 @@ def same_fs(path: str) -> str:
         st = os.lstat(path)
     except FileNotFoundError:
         return "absent"
+    if not stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+        return "notdir"  # a file (or other non-directory) is in the way
     if stat.S_ISLNK(st.st_mode):
         # a link is not a tree to swap; compare the link itself with the directory that holds it
         parent = os.stat(os.path.dirname(os.path.abspath(path)) or "/")
@@ -230,6 +235,9 @@ def main(argv: list[str]) -> int:
             print(inspect_path(args[0]))
         elif command == "rename" and len(args) == 2:
             rename_tree(args[0], args[1])
+        elif command == "resolve" and args:
+            for path in args:
+                print(os.path.realpath(path))
         elif command == "same-fs" and len(args) == 1:
             print(same_fs(args[0]))
         else:
