@@ -2,7 +2,7 @@
 
 Current automated gates come first. The 0.3.0 record that follows is kept for history.
 
-## 0.6.0 automated gates
+## Current automated gates
 
 GitHub Actions (`.github/workflows/ci.yml`) runs these on every pull request; the release
 workflow reruns the whole CI workflow on the tagged commit. None of them replaces
@@ -12,8 +12,8 @@ commissioning on the boat.
 - Privacy check (`scripts/check-public-tree.py`) and static distribution checks
   (`tests/test-distribution.sh`, including ShellCheck and that `DEFAULT_VERSION` equals `VERSION`).
 - Lifecycle backup, verify and restore; versioned migrations; clean installation; offline and
-  transactional installation; the update launcher's root-trust checks; the guided
-  `get-vesselstack.sh` bootstrap; SocketCAN unit rendering; release package contents.
+  transactional installation; remote access (`tests/test-remote.sh`); the update launcher's root-trust checks; the guided
+  `get-vesselstack.sh` bootstrap; SocketCAN unit rendering; release package contents; release tag signature verification (`tests/test-verify-release-tag.sh`).
 - A real systemd browser-update acceptance run, and the Signal K VesselTwin preload security tests as root.
 - Docker Compose validation with the default and optional profiles, and a check that every
   pinned image publishes Linux ARM64.
@@ -23,11 +23,11 @@ commissioning on the boat.
 - Disposable InfluxDB, Prometheus and Grafana startup, the Mosquitto access list and display
   accounts, the Mosquitto upgrade path, the Signal K to MQTT displays bridge, and its
   EnvironmentFile under real systemd.
+- The Node-RED dashboard live channel requires the crew sign-in (`tests/test-nodered-dashboard-auth.sh`).
 - The generated display projects are validated with the pinned ESPHome image.
 
 Not covered by CI: SocketCAN and NMEA 2000 wiring, SDR/AIS reception, real Raspberry Pi
-hardware and upgrades, and vessel-specific alarm thresholds. 0.6.0 release status: recorded
-in the CHANGELOG at release time.
+hardware and upgrades, and vessel-specific alarm thresholds. Release status for each version is recorded in the CHANGELOG.
 
 ## Historical 0.3.0 validation (schema 1.3)
 

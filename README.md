@@ -144,7 +144,7 @@ timers (and their services) are stopped and started again afterwards. The restor
 keeps a durable journal in `/var/lib/vesselstack/restore/current`, so an interrupted
 restore (a lost SSH session, a power loss) can be undone with
 `sudo /var/lib/vesselstack/restore/current/recover status` and then `recover rollback`
-(see [If a restore is interrupted](#if-a-restore-is-interrupted)). If the journal itself is damaged and the commands refuse to use it, they print a short procedure to resolve it by hand (see below). The procedure starts by stopping everything that uses the two folders, because after a reboot the stack and its `unless-stopped` containers start again and keep writing into a folder even after it is renamed (`vesselstackctl stop` is refused while the journal is pending): it gives plain `systemctl` and `docker` commands that stop every `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan` (`systemctl list-units 'vesselstack-*' --all --plain --no-legend`, so oneshot services that are still starting and units waiting to restart are included, and a unit whose file is gone does not shift the columns) and every container of the `vesselstack` compose project, gives `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` to find any other container that mounts either folder (stop it with `sudo docker stop NAME`), and says to go on only when the same `list-units` command shows every line except those two as `inactive` or `failed` (not `active`, `activating`, `deactivating` or `reloading`), repeating the stop otherwise. It is safe after a failed forward restore too: for each of the two folders, a `<folder>.pre-restore-<stamp>` next to it means the folder at the normal path is the restored copy, which you move to `<folder>.failed-restore-<stamp>` before moving the previous one back; both folders must come from the same side before the journal is moved aside. The procedure names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>` with the real value from the journal) and says to leave `.pre-restore-*` and `.failed-restore-*` folders with other stamps alone, because earlier restores can leave such folders behind. If the usual read of the journal fails (for example a repeated key), the stamp is read from the `stamp=` line of the state file; only a value of the expected shape is ever printed. When the stamp cannot be read at all, it keeps the generic `<stamp>` wording and says that these steps cannot tell this restore's folders from ones left by earlier restores: a `.pre-restore-*` folder whose stamp also names an archived journal next to the journal directory (`done-<stamp>`, `rolled-back-<stamp>` or `abandoned-<stamp>`) belongs to that earlier restore and is ignored, and if any `<folder>.pre-restore-*` exists next to either folder that no archived journal claims, this restore may have moved a folder and the steps cannot tell which: leave the journal in place, move nothing, and get help. Only when there is no such folder (this restore moved nothing) and both folders are present do you do the stop step, skip the folder step, and go on with the journal step and the start step; if a folder is missing, get help. Modification times are not used, because renaming a folder does not change them. The last step starts the stack with the installer of the application folder, always: `sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start`. It also puts the unit files, `/usr/local/sbin/vesselstackctl` and the helpers back in line with that folder and starts the timers. If the installer refuses, it says why and changes nothing: fix what it names and run it again. Only if it cannot be run at all (the file is missing, or it needs something not available at sea, such as a network or a device that is unplugged) does the procedure give `sudo vesselstackctl start`, which starts what is installed; the system files may then belong to the restored release and the backup and alert timers stay stopped until the installer has been run, so run it as soon as you can. The snapshot of the previous system files stays in the moved-aside journal. It finishes with `sudo vesselstackctl doctor`. The stop step counts a container when it mounts either folder, a folder inside them, or a folder that contains them (such as `/` or `/opt`) read-write (a parent mounted read-only is left alone), runs the `docker ps` command again after the stop and goes on only when no such container is left, and says that `Unit ... not loaded` printed for a unit that is not running is expected and harmless. The journal is moved aside with `sudo mv -T`, so a second resolution on the same day fails instead of moving the journal inside the older `.manual-DATE` directory; if it says the target exists, use another name. The commands in this by-hand procedure have been checked by tests as text and have not yet been exercised on a boat computer with running services. Folder paths read from the journal are printed with control characters replaced by `?`. The restore still
+(see [If a restore is interrupted](#if-a-restore-is-interrupted)). If the journal itself is damaged and the commands refuse to use it, they print a short procedure to resolve it by hand (see below). The procedure starts by stopping everything that uses the two folders, because after a reboot the stack and its `unless-stopped` containers start again and keep writing into a folder even after it is renamed (`vesselstackctl stop` is refused while the journal is pending): it gives plain `systemctl` and `docker` commands that stop every `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan` (`systemctl list-units 'vesselstack-*' --all --plain --no-legend`, so oneshot services that are still starting and units waiting to restart are included, and a unit whose file is gone does not shift the columns) and every container of the `vesselstack` compose project, gives `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` to find any other container that mounts either folder (stop it with `sudo docker stop NAME`), and says to go on only when the same `list-units` command shows every line except those two as `inactive` or `failed` (not `active`, `activating`, `deactivating` or `reloading`), repeating the stop otherwise. It is safe after a failed forward restore too: for each of the two folders, a `<folder>.pre-restore-<stamp>` next to it means the folder at the normal path is the restored copy, which you move to `<folder>.failed-restore-<stamp>` before moving the previous one back; both folders must come from the same side before the journal is moved aside. The procedure names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>` with the real value from the journal) and says to leave `.pre-restore-*` and `.failed-restore-*` folders with other stamps alone, because earlier restores can leave such folders behind. If the usual read of the journal fails (for example a repeated key), the stamp is read from the `stamp=` line of the state file; only a value of the expected shape is ever printed. When the stamp cannot be read at all, it keeps the generic `<stamp>` wording and says that these steps cannot tell this restore's folders from ones left by earlier restores: a `.pre-restore-*` folder whose stamp also names an archived journal next to the journal directory (`done-<stamp>`, `rolled-back-<stamp>` or `abandoned-<stamp>`) belongs to that earlier restore and is ignored, and if any `<folder>.pre-restore-*` exists next to either folder that no archived journal claims, this restore may have moved a folder and the steps cannot tell which: leave the journal in place, move nothing, and get help. Only when there is no such folder (this restore moved nothing) and both folders are present do you do the stop step, skip the folder step, and go on with the journal step and the start step; if a folder is missing, get help. Modification times are not used, because renaming a folder does not change them. The last step starts the stack with the installer of the application folder, always: `sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start`. It also puts the unit files, `/usr/local/sbin/vesselstackctl` and the helpers back in line with that folder and starts the timers. If the installer stops, it says why: fix what it names and run it again. Only if it cannot be run at all (the file is missing, or it needs something not available at sea, such as a network or a device that is unplugged) does the procedure give `sudo vesselstackctl start`, which starts what is installed; the system files may then belong to the restored release and the timers (backups, alerts, telemetry) stay stopped until the installer has been run, so run it as soon as you can. The snapshot of the previous system files stays in the moved-aside journal. It finishes with `sudo vesselstackctl doctor`. The stop step counts a container when it mounts either folder, a folder inside them, or a folder that contains them (such as `/` or `/opt`), however it is mounted, runs the `docker ps` command again after the stop and goes on only when no such container is left, and says that `Unit ... not loaded` printed for a unit that is not running is expected and harmless. The folder moves are made with `sudo mv -T` too, so a move onto an existing folder fails instead of nesting it. The journal is moved aside with `sudo mv -T`, so a second resolution on the same day fails instead of moving the journal inside the older `.manual-DATE` directory; if it says the target exists, use another name. The commands in this by-hand procedure have been checked by tests as text and have not yet been exercised on a boat computer with running services. Folder paths read from the journal are printed with control characters replaced by `?`. The restore still
 runs in your terminal session and nothing recovers automatically at boot yet, so keep
 it on a stable connection or run it inside `screen` or `tmux`. If stopping the
 running stack fails, no rollback is attempted under live services. Unrelated
@@ -240,22 +240,23 @@ session), run the pinned release installer and answer the questions in the same 
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
 ```
 
-The same release is also selected by `VESSELSTACK_VERSION=0.8.0` or `--version 0.8.0`:
+The same release is also selected by `VESSELSTACK_VERSION=0.9.0` or `--version 0.9.0`:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.8.0 bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash -s -- --version 0.8.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.9.0 bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash -s -- --version 0.9.0
 ```
 
 > [!NOTE]
-> The pinned URL names the release explicitly, so it installs exactly 0.8.0 whatever
+> The pinned URL names the release explicitly, so it installs exactly 0.9.0 whatever
 > GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a prerelease, so that URL kept serving
-> 0.4.4). Use it only when you want exactly that.
+> 0.4.4). While 0.9.0 is a pre-release, the `releases/latest` URL still serves 0.8.0.
+> Use it only when you want exactly that.
 
 The installer checks the host before changing it. It may install Debian
 prerequisites and, after asking, Docker Engine and Compose v2 from Docker's
@@ -298,10 +299,10 @@ that does not point at the exact commit being built, before building anything. T
 
 ```bash
 # defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 # every question's own default answer, nothing asked
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash -s -- --defaults
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash -s -- --defaults
 # a ready-made vesselstack.env (optionally with --set overrides)
 sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
 ```
@@ -444,8 +445,8 @@ script is wrapped in functions and ends with a single `main "$@"` call, so a
 truncated download cannot half-run. If you prefer to read it first (recommended):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -467,7 +468,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.8.0
+git checkout v0.9.0
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the optional browser wizard
 ```
@@ -512,10 +513,10 @@ backups with `VESSELSTACK_BACKUP_SCHEDULE`, see [Scheduled backups](#scheduled-b
 `sudo vesselstackctl backup` yourself), and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
-VesselStack 0.8.0 includes configurable Homepage branding and fixes for the Displays editor. Upgrade from 0.7.0 or 0.7.1 with the
+VesselStack 0.9.0 adds the restore recovery journal, unattended-operation settings, Telegram alerts, Tailscale remote access, Node-RED and the marine essentials bundle. Upgrade from 0.8.0 (or 0.7.x) with the
 full installer or `vesselstackctl update` so shared modules, configuration and
 services are updated together; the application-only updater is not sufficient for
-this release. The installer takes a verified backup first. If rollback is needed,
+this release. 0.9.0 is published as a pre-release; physical Raspberry Pi acceptance is pending. Do not deploy it to a boat until the documented lab checks pass. The installer takes a verified backup first. If rollback is needed,
 verify and restore that backup rather than downgrading. Database changes are
 additive columns only; historical samples without verified source timestamps remain
 excluded from inferred-energy calculations. The 0.7.0 reliability-validation runbook
@@ -821,25 +822,25 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-To work from the 0.8.0 release, check out its tag:
+To work from the 0.9.0 release, check out its tag:
 
 ```bash
 git fetch --tags
-git checkout v0.8.0
+git checkout v0.9.0
 ```
 
-`v0.8.0` includes the Homepage and Displays updates; see the [CHANGELOG](CHANGELOG.md). Once
+`v0.9.0` adds the restore recovery journal, unattended-operation settings, Telegram alerts, Tailscale remote access, Node-RED and the marine essentials bundle; see the [CHANGELOG](CHANGELOG.md). Once
 the signed release tag exists, verify it yourself (needs `ssh-keygen`, which ships
 with OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.7.0
+scripts/verify-release-tag.sh v0.9.0
 # maintainers and owners: also bind the tag to the commit you recorded when it was built
 # (the full 40-character SHA from your release notes, not one read back from the tag itself)
-scripts/verify-release-tag.sh v0.7.0 .github/allowed_signers "$RECORDED_COMMIT"
+scripts/verify-release-tag.sh v0.9.0 .github/allowed_signers "$RECORDED_COMMIT"
 # equivalent plain git command:
-git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.7.0
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.9.0
 ```
 
 The script prints the signer and key fingerprint, and exits non-zero for an unsigned,
@@ -2354,20 +2355,20 @@ lists the same.
 If the state file of the journal is unreadable, has a repeated key or fails validation, every
 recovery command refuses, changes nothing, and ends with the same procedure: 1) stop every
 active `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan`, and the
-containers of the `vesselstack` project and any other container that mounts the two folders, a folder inside them, or a folder that contains them (such as `/` or `/opt`) read-write (found
+containers of the `vesselstack` project and any other container that mounts the two folders, a folder inside them, or a folder that contains them (such as `/` or `/opt`) (found
 with `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'`, run again after the stop; go on only when none is left), with the `systemctl` and `docker`
 commands it prints (`list-units ... --all --plain --no-legend`), and go on only when the same list shows
 every other unit as `inactive` or `failed`; 2) check that
 the application and data folders (printed when they can be read from the journal) are the ones you
 expect; if one is missing, or was swapped, its previous copy is next to it as
-`<name>.pre-restore-STAMP` (delete nothing; with an unreadable stamp it tells you to move no folder
+`<name>.pre-restore-STAMP` (delete nothing; make each move with `sudo mv -T`, so a move onto an existing folder fails instead of nesting it; with an unreadable stamp it tells you to move no folder
 if any unclaimed `<name>.pre-restore-*` exists it tells you to leave the journal, move nothing and get help); 3) both folders must come from the
 same side; 4) move the journal aside
 with `sudo mv -T /var/lib/vesselstack/restore/current /var/lib/vesselstack/restore/current.manual-DATE` (if it says the target exists, use another name);
 5) start the stack with the installer of the application folder (`--start`), which also puts the unit
-files, `/usr/local/sbin/vesselstackctl` and the helpers back in line and starts the timers; if it refuses,
-fix what it names and run it again; only if it cannot be run at all, use `sudo vesselstackctl start` (the
-system files may then belong to the restored release and the backup and alert timers stay stopped until the
+files, `/usr/local/sbin/vesselstackctl` and the helpers back in line and starts the timers; if it stops,
+it says why: fix what it names and run it again; only if it cannot be run at all, use `sudo vesselstackctl start` (the
+system files may then belong to the restored release and the timers (backups, alerts, telemetry) stay stopped until the
 installer has been run); then run `sudo vesselstackctl doctor`. The commands in this by-hand procedure have
 been checked by tests as text and have not yet been exercised on a boat computer with running services. There is deliberately no command that deletes or clears the
 journal. The `recover` script prints the same procedure, with the folders shown as unreadable, when
@@ -2387,10 +2388,10 @@ be rolled back: stop the stack units and containers by hand (the same commands a
 nothing is left" instruction as step 1 of the by-hand procedure), move the journal aside (`sudo mv -T
 /var/lib/vesselstack/restore/current /var/lib/vesselstack/restore/current.manual-YYYYMMDD`) and restore
 again from a backup with `sudo vesselstackctl restore /path/to/vesselstack-<time>.tar.gz --yes`, which
-replaces both folders together. If that `.failed-restore-<stamp>` folder does not exist either, stop and get help. The restore needs both folders present, so if the application folder or
+replaces both folders together. The restore needs both folders present, so if the application folder or
 the data folder is missing at its normal path, first move its `<folder>.failed-restore-<stamp>` (the restored
-copy this recovery set aside; the new restore replaces it anyway) back to the normal path (the text prints the
-real paths). `/usr/local/sbin/vesselstackctl` may belong to the restored release if the restore had begun
+copy this recovery set aside; the new restore replaces it anyway) back to the normal path with `sudo mv -T` (the text prints the
+real paths). If that `.failed-restore-<stamp>` folder does not exist either, stop and get help; otherwise restore again as above. `/usr/local/sbin/vesselstackctl` may belong to the restored release if the restore had begun
 publishing system files. On a full disk, when the
 containers that had to be stopped could not be recorded in the journal, the warning says they "may not be
 started again automatically" and suggests `docker start` only for containers outside the `vesselstack`
@@ -2492,7 +2493,7 @@ not mounted (see [Backups](#backups)).
 2. **Re-run the pinned release installer.** On the Pi, over `ssh -t`:
 
    ```bash
-   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
    ```
 
    The installer finds the installed system, never overwrites it silently, and offers
@@ -2505,7 +2506,7 @@ not mounted (see [Backups](#backups)).
    before anything is stopped, whether to mount it, pick a USB drive, check again, or back up
    to the system disk once (see [Backups](#backups)); `--yes` and `--defaults` never choose and
    the update stops with the reason. Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
-   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.8.0`.
+   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.9.0`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
 
@@ -2523,17 +2524,20 @@ not mounted (see [Backups](#backups)).
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
    backed up; configuration and data are.
 
-| Installed version | Update to 0.8.0 |
+| Installed version | Update to 0.9.0 |
 |---|---|
+| 0.8.0 | Control Panel or the pinned installer |
 | 0.7.0 to 0.7.1 | Control Panel or the pinned installer |
 | 0.6.0 to 0.6.4 | Control Panel or the pinned installer |
 | 0.5.7 | Control Panel or the pinned installer |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
 
-A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.8.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+While 0.9.0 is a pre-release the Control Panel lists it only with **Include early test releases** ticked. The first update into 0.9.0 is run by the previous Control Panel, so **Finish this update** applies from the next update on.
 
-Updating to 0.8.0 uses the full installer and preserves the verified-backup rollback path. The 0.6.4 installer replaced the `vesselstackctl` command atomically; retain that historical note when diagnosing an older upgrade.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.9.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+
+Updating to 0.9.0 uses the full installer and preserves the verified-backup rollback path. The 0.6.4 installer replaced the `vesselstackctl` command atomically; retain that historical note when diagnosing an older upgrade.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:
@@ -2549,7 +2553,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on a connected machine, carry it to the boat, and install with
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.8.0.tar.gz`.
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.9.0.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
 The bundle does not include Tailscale: [remote access](#remote-access-with-tailscale) needs internet to install, so run `sudo vesselstackctl remote enable` before going offline.
 
