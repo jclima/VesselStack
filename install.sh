@@ -87,6 +87,101 @@ source "$CONFIG_FILE"
 # read-only and deliberately skip this block.
 if [ "$DRY_RUN" -eq 0 ]; then
     [ "$(id -u)" -eq 0 ] || { echo "Installation requires root" >&2; exit 1; }
+    # An unfinished restore must be resolved first (vesselstackctl restore-recover). The restore itself runs
+    # the restored installer and identifies it with the journal's id. A restore that already committed (or was
+    # rolled back) and only left its journal behind does not block anything.
+    RESTORE_PENDING_DIR="$SYSTEM_ROOT/var/lib/vesselstack/restore/current"
+    # The way out of a journal that cannot be read: the same text as restore_manual_procedure in
+    # vesselstackctl (a test keeps the two identical; this script cannot source vesselstackctl).
+    restore_manual_procedure() {
+        local dir=$1 root data app stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
+        root=$(python3 -I "$dir/restore_journal.py" get "$dir" root 2>/dev/null || true)
+        data=$(python3 -I "$dir/restore_journal.py" get "$dir" data 2>/dev/null || true)
+        root=${root//[![:print:]]/?}
+        data=${data//[![:print:]]/?}
+        app=$root
+        [ -n "$root" ] || root='(not readable from the journal)'
+        [ -n "$data" ] || data='(not readable from the journal)'
+        [ -n "$app" ] || app='<application folder>'
+        stamp=$(python3 -I "$dir/restore_journal.py" get "$dir" stamp 2>/dev/null || true)
+        # A repeated key of another name makes the quiet read fail for every key: look at the stamp= lines directly.
+        if ! [[ $stamp =~ $stamp_re ]]; then
+            stamp=$(sed -n 's/^stamp=//p' "$dir/state" 2>/dev/null | sort -u 2>/dev/null || true)
+        fi
+        # Only a stamp of the shape the validator accepts is ever printed (anything else counts as not readable).
+        if [[ $stamp =~ $stamp_re ]]; then
+            suffix=$stamp
+            note="Only folders carrying the stamp $stamp belong to this restore. Any other <folder>.pre-restore-* or
+     <folder>.failed-restore-* folder with a different stamp was left by an earlier restore: leave it alone."
+        else
+            suffix='<stamp>'
+            note="The stamp could not be read from the journal, so these steps cannot tell this restore's folders from
+     ones left by earlier restores. A <folder>.pre-restore-* folder whose stamp also names an archived journal
+     next to the journal directory (${dir%/*}/done-<stamp>, rolled-back-<stamp> or abandoned-<stamp>)
+     belongs to that earlier restore: ignore it. If you cannot tell for certain which folder belongs to this
+     restore, look for any <folder>.pre-restore-* next to either folder that no archived journal claims. If
+     there is one, this restore may have moved a folder and these steps cannot tell which: leave the journal in
+     place, move nothing, and get help. Only when there is no such folder (this restore moved nothing) and both
+     folders are present, do step 1, skip this folder step, and go on with step 4 (the journal) and step 5 (the
+     start). If a folder is missing, stop and get help."
+        fi
+        cat >&2 <<EOF
+To resolve this by hand:
+  1) stop everything that uses the two folders. After a reboot the stack starts again by itself and keeps
+     writing into a folder even after it is renamed, and vesselstackctl stop is refused while this restore is
+     pending. These commands need no vesselstackctl (never stop vesselstack-firewall or vesselstack-socketcan):
+       systemctl list-units 'vesselstack-*' --all --plain --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
+       sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
+     Other containers are not found by that command. A container counts when it mounts either folder, a folder
+     inside them, or a folder that contains them (such as / or /opt) read-write (a parent mounted read-only is
+     left alone). List the containers with the first line below and stop each one that counts with the second:
+       sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'
+       sudo docker stop NAME
+     "Unit ... not loaded" printed by the stop for a unit that is not running is expected and harmless.
+     Then check that nothing is left: run systemctl list-units 'vesselstack-*' --all --plain --no-legend and go on
+     only when every line except vesselstack-firewall and vesselstack-socketcan shows inactive or failed (not
+     active, activating, deactivating or reloading), and run sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'
+     again and go on only when no such container is left; if not, repeat the stop;
+  2) the two folders are the application folder $root and the data folder $data. For each one:
+     - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
+       move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
+     - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
+     - do not delete anything;
+     $note
+  3) both folders must come from the same side (both the previous ones) before you go on;
+  4) then move the journal aside: sudo mv -T $dir $dir.manual-$(date +%Y%m%d)
+     (if it says the target exists, use another name);
+  5) start the stack with the installer of the application folder. It also puts the unit files,
+     /usr/local/sbin/vesselstackctl and the helpers back in line with that folder and starts the timers:
+       sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
+     If the installer refuses, it says why and changes nothing: fix what it names and run it again. Only if it
+     cannot be run at all (the file $app/installer/install.sh is missing, or it needs something not available at
+     sea, such as a network or a device that is unplugged), run: sudo vesselstackctl start
+     That starts what is installed, but the system files may then belong to the restored release and the backup
+     and alert timers stay stopped until the installer has been run: run it as soon as you can. The snapshot of
+     the previous system files stays in the moved-aside journal.
+     Either way, finish with: sudo vesselstackctl doctor
+EOF
+    }
+    if [ -f "$RESTORE_PENDING_DIR/state" ]; then
+        if ! python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" dump "$RESTORE_PENDING_DIR" >/dev/null 2>&1; then
+            echo "A restore did not finish and its journal state cannot be read (damaged, a repeated key, or no helper). Nothing else can change this system until it is resolved." >&2
+            restore_manual_procedure "$RESTORE_PENDING_DIR"
+            echo "See: sudo $RESTORE_PENDING_DIR/recover status" >&2
+            exit 1
+        fi
+        RESTORE_PENDING_ID=$(python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" get "$RESTORE_PENDING_DIR" id || true)
+        RESTORE_PENDING_PHASE=$(python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" get "$RESTORE_PENDING_DIR" phase || true)
+        case "$RESTORE_PENDING_PHASE" in
+            committed|rolled-back) ;;
+            *)
+                if [ -z "${VESSELSTACK_RESTORE_ID:-}" ] || [ "${VESSELSTACK_RESTORE_ID}" != "$RESTORE_PENDING_ID" ]; then
+                    echo "A restore did not finish (phase: ${RESTORE_PENDING_PHASE:-unknown}). Nothing else can change this system until it is resolved." >&2
+                    echo "See: sudo $RESTORE_PENDING_DIR/recover status" >&2
+                    exit 1
+                fi ;;
+        esac
+    fi
     LIFECYCLE_LOCK_HELPER="$SOURCE_ROOT/common/lifecycle_lock.py"
     [ -r "$LIFECYCLE_LOCK_HELPER" ] || { echo "Missing lifecycle lock helper: $LIFECYCLE_LOCK_HELPER" >&2; exit 1; }
     if [ -n "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
@@ -1676,6 +1771,7 @@ fi
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/deploy-chat.py" "$LIBEXEC_DIR/deploy-chat.py"
 install -m 0644 -o root -g root "$SCRIPT_DIR/scripts/lib/remediate.sh" "$LIBEXEC_DIR/remediate.sh"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/record-backup-result" "$LIBEXEC_DIR/record-backup-result"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/restore_journal.py" "$LIBEXEC_DIR/restore_journal.py"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/vesselstack-alerts.py" "$LIBEXEC_DIR/vesselstack-alerts.py"
 sed "s|@VESSELSTACK_ROOT@|$VESSELSTACK_ROOT|g" \
     "$SCRIPT_DIR/systemd/vesselstack-firewall.service.in" \
