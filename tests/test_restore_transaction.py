@@ -2091,6 +2091,47 @@ restore_probe_renames "'''.format(base / "opt"), 1)
         self.assertIn("move the journal aside", err)
         self.assertNotIn("run the recovery again:", err)
 
+    def test_the_manual_procedure_names_this_restores_stamp_when_it_can_be_read(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.set_state(lay["journal"], "format=2")  # rejected by the validator; the stamp stays valid
+        self.reconcile(lay)
+        err = lay["result"].stderr
+        self.assertIn("To resolve this by hand", err)
+        self.assertIn(f"<folder>.pre-restore-{STAMP} exists next to it", err)
+        self.assertIn(f"move it to <folder>.failed-restore-{STAMP}, then move the .pre-restore-{STAMP} one back", err)
+        self.assertIn(f"Only folders carrying the stamp {STAMP} belong to this restore", err)
+        self.assertIn("with a different stamp was left by an earlier restore: leave it alone", err)
+        self.assertNotIn("<stamp>", err)
+        self.assertNotIn("modification times", err)
+        # the recover wrapper reads the stamp the same way (here the state lacks a key but still has its stamp)
+        lay = self.layout("stopped")
+        state = lay["journal"] / "state"
+        state.write_text("".join(l for l in state.read_text().splitlines(True) if not l.startswith("system_root=")))
+        result = self.recover_harness(lay, "status")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"<folder>.pre-restore-{STAMP} exists next to it", result.stderr)
+        self.assertIn(f"Only folders carrying the stamp {STAMP} belong to this restore", result.stderr)
+        self.assertNotIn("<stamp>", result.stderr)
+
+    def test_the_manual_procedure_says_how_to_choose_the_folder_when_the_stamp_cannot_be_read(self):
+        for bad in ("bogus", "20260102T030405Z-1-1\x01"):
+            with self.subTest(stamp=repr(bad)):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                self.set_state(lay["journal"], f"stamp={bad}")
+                self.reconcile(lay)
+                err = lay["result"].stderr
+                self.assertIn("<folder>.pre-restore-<stamp> exists next to it", err)
+                self.assertIn("<folder>.failed-restore-<stamp>", err)
+                self.assertIn("The stamp could not be read from the journal", err)
+                self.assertIn("normally the one with the newest stamp", err)
+                self.assertIn("modification times (ls -ld)", err)
+                self.assertIn("stop and move nothing", err)
+                # the validator's own error line may quote the value; the procedure itself never does
+                procedure = err[err.index("To resolve this by hand"):]
+                self.assertNotIn("bogus", procedure)
+                self.assertNotIn("\x01", procedure)
+                self.assertNotIn("earlier restore", procedure)
+
     def test_the_manual_procedure_text_is_the_same_in_the_recover_wrapper(self):
         def heredoc(text, marker, end):
             a = text.index(marker); start = text.index("\n", a) + 1

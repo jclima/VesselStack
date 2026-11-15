@@ -94,18 +94,32 @@ if [ "$DRY_RUN" -eq 0 ]; then
     # The way out of a journal that cannot be read: the same text as restore_manual_procedure in
     # vesselstackctl (a test keeps the two identical; this script cannot source vesselstackctl).
     restore_manual_procedure() {
-        local dir=$1 root data
+        local dir=$1 root data stamp suffix note stamp_re='^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$'
         root=$(python3 -I "$dir/restore_journal.py" get "$dir" root 2>/dev/null || true)
         data=$(python3 -I "$dir/restore_journal.py" get "$dir" data 2>/dev/null || true)
         [ -n "$root" ] || root='(not readable from the journal)'
         [ -n "$data" ] || data='(not readable from the journal)'
+        stamp=$(python3 -I "$dir/restore_journal.py" get "$dir" stamp 2>/dev/null || true)
+        # Only a stamp of the shape the validator accepts is ever printed (anything else counts as not readable).
+        if [[ $stamp =~ $stamp_re ]]; then
+            suffix=$stamp
+            note="Only folders carrying the stamp $stamp belong to this restore. Any other <folder>.pre-restore-* or
+     <folder>.failed-restore-* folder with a different stamp was left by an earlier restore: leave it alone."
+        else
+            suffix='<stamp>'
+            note="The stamp could not be read from the journal. If more than one <folder>.pre-restore-* exists next to a
+     folder, this restore's is normally the one with the newest stamp (the stamp is a UTC time). A boat
+     computer's clock can be wrong, so also compare the folders' modification times (ls -ld) and, if still
+     unsure, stop and move nothing."
+        fi
         cat >&2 <<EOF
 To resolve this by hand:
   1) the two folders are the application folder $root and the data folder $data. For each one:
-     - if <folder>.pre-restore-<stamp> exists next to it, the folder at the normal path is the RESTORED copy:
-       move it to <folder>.failed-restore-<stamp>, then move the .pre-restore-<stamp> one back to the normal path;
-     - if the folder is missing and <folder>.pre-restore-<stamp> exists, move that one back;
+     - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
+       move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
+     - if the folder is missing and <folder>.pre-restore-$suffix exists, move that one back;
      - do not delete anything;
+     $note
   2) both folders must come from the same side (both the previous ones) before you go on;
   3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
   4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
