@@ -119,18 +119,29 @@ if [ "$DRY_RUN" -eq 0 ]; then
      ones left by earlier restores. A <folder>.pre-restore-* folder whose stamp also names an archived journal
      next to the journal directory (${dir%/*}/done-<stamp>, rolled-back-<stamp> or abandoned-<stamp>)
      belongs to that earlier restore: ignore it. If you cannot tell for certain which folder belongs to this
-     restore, move no folder: do step 1 and step 4 only if both folders are present, and otherwise stop and
-     get help."
+     restore, look for any <folder>.pre-restore-* next to either folder that no archived journal claims. If
+     there is one, this restore may have moved a folder and these steps cannot tell which: leave the journal in
+     place, move nothing, and get help. Only when there is no such folder (this restore moved nothing) and both
+     folders are present, do step 1, skip this folder step, and go on with step 4 (the journal) and step 5 (the
+     start). If a folder is missing, stop and get help."
         fi
         cat >&2 <<EOF
 To resolve this by hand:
   1) stop everything that uses the two folders. After a reboot the stack starts again by itself and keeps
      writing into a folder even after it is renamed, and vesselstackctl stop is refused while this restore is
      pending. These commands need no vesselstackctl (never stop vesselstack-firewall or vesselstack-socketcan):
-       systemctl list-units 'vesselstack-*' --state=active --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
+       systemctl list-units 'vesselstack-*' --all --plain --no-legend | awk '{print \$1}' | grep -vx -e vesselstack-firewall.service -e vesselstack-socketcan.service | xargs -r sudo systemctl stop
        sudo docker ps -q --filter label=com.docker.compose.project=vesselstack | xargs -r sudo docker stop
-     Look at sudo docker ps too and stop any other container that mounts either folder. Then run the first
-     command again without its last part (the xargs) and sudo docker ps, and go on only when nothing is left;
+     Other containers are not found by that command. A container counts when it mounts either folder, a folder
+     inside them, or a folder that contains them (such as / or /opt) read-write (a parent mounted read-only is
+     left alone). List the containers with the first line below and stop each one that counts with the second:
+       sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'
+       sudo docker stop NAME
+     "Unit ... not loaded" printed by the stop for a unit that is not running is expected and harmless.
+     Then check that nothing is left: run systemctl list-units 'vesselstack-*' --all --plain --no-legend and go on
+     only when every line except vesselstack-firewall and vesselstack-socketcan shows inactive or failed (not
+     active, activating, deactivating or reloading), and run sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'
+     again and go on only when no such container is left; if not, repeat the stop;
   2) the two folders are the application folder $root and the data folder $data. For each one:
      - if <folder>.pre-restore-$suffix exists next to it, the folder at the normal path is the RESTORED copy:
        move it to <folder>.failed-restore-$suffix, then move the .pre-restore-$suffix one back to the normal path;
@@ -138,13 +149,17 @@ To resolve this by hand:
      - do not delete anything;
      $note
   3) both folders must come from the same side (both the previous ones) before you go on;
-  4) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  5) start the stack and check it. If the moved-aside journal ($dir.manual-...) contains both files/ and
-     manifest, the restore had begun publishing system files and the unit files, /usr/local/sbin/vesselstackctl
-     and the helpers may belong to the restored release: run the installer of the application folder instead:
+  4) then move the journal aside: sudo mv -T $dir $dir.manual-$(date +%Y%m%d)
+     (if it says the target exists, use another name);
+  5) start the stack with the installer of the application folder. It also puts the unit files,
+     /usr/local/sbin/vesselstackctl and the helpers back in line with that folder and starts the timers:
        sudo $app/installer/install.sh --config $app/config/vesselstack.env --start
-     (the snapshot of the previous system files stays in the moved-aside journal). Otherwise run:
-       sudo vesselstackctl start
+     If the installer refuses, it says why and changes nothing: fix what it names and run it again. Only if it
+     cannot be run at all (the file $app/installer/install.sh is missing, or it needs something not available at
+     sea, such as a network or a device that is unplugged), run: sudo vesselstackctl start
+     That starts what is installed, but the system files may then belong to the restored release and the backup
+     and alert timers stay stopped until the installer has been run: run it as soon as you can. The snapshot of
+     the previous system files stays in the moved-aside journal.
      Either way, finish with: sudo vesselstackctl doctor
 EOF
     }

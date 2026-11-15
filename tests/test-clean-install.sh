@@ -437,7 +437,7 @@ if run_pending_install > "$TEST_ROOT/pending.out" 2> "$TEST_ROOT/pending.err"; t
     exit 1
 fi
 grep -q 'To resolve this by hand:' "$TEST_ROOT/pending.err"
-grep -q "sudo mv $PENDING_DIR $PENDING_DIR.manual-" "$TEST_ROOT/pending.err"
+grep -q "sudo mv -T $PENDING_DIR $PENDING_DIR.manual-" "$TEST_ROOT/pending.err"
 grep -q 'finish with: sudo vesselstackctl doctor' "$TEST_ROOT/pending.err"
 rm -rf -- "${PENDING_DIR:?}"
 test ! -e "$APP_ROOT/config/displays-bridge.env"
