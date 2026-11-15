@@ -82,6 +82,7 @@ mqtt:
             id(bridge_online) = (x == "online");
             if (id(bridge_online)) id(bridge_seen) = millis();
         - script.execute: render_tiles
+        - script.execute: render_alarm
   on_json_message:
     - topic: vesselstack/v1/instruments/sog
       then:
@@ -231,25 +232,25 @@ script:
       - lvgl.label.update:
           id: p0_sog_value
           text: !lambda |-
-            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_sog_ok) && (millis() - id(ins_sog_seen)) < 20000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_sog_ok) && (millis() - id(ins_sog_seen)) < 20000UL;
             return fresh ? id(ins_sog_val) : std::string("--");
       - lvgl.label.update:
           id: p0_depth_value
           text: !lambda |-
-            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_depth_ok) && (millis() - id(ins_depth_seen)) < 20000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_depth_ok) && (millis() - id(ins_depth_seen)) < 20000UL;
             return fresh ? id(ins_depth_val) : std::string("--");
       - lvgl.label.update:
           id: p0_awa_value
           text: !lambda |-
-            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_awa_ok) && (millis() - id(ins_awa_seen)) < 20000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_awa_ok) && (millis() - id(ins_awa_seen)) < 20000UL;
             return fresh ? id(ins_awa_val) : std::string("--");
       - lvgl.label.update:
           id: p0_house_v_value
           text: !lambda |-
-            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 40000UL;
+            bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 40000UL;
             return fresh ? id(ins_house_v_val) : std::string("--");
       - lambda: |-
-          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_depth_ok) && (millis() - id(ins_depth_seen)) < 20000UL;
+          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_depth_ok) && (millis() - id(ins_depth_seen)) < 20000UL;
           uint8_t sev = fresh ? id(ins_depth_sev) : 0;
           if (sev != id(ins_depth_drawn_sev)) {
             id(ins_depth_drawn_sev) = sev;
@@ -261,7 +262,7 @@ script:
             lv_obj_set_style_text_color(id(p0_depth_value), lv_color_hex(fg), LV_PART_MAIN);
           }
       - lambda: |-
-          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 40000UL;
+          bool fresh = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected()) && id(ins_house_v_ok) && (millis() - id(ins_house_v_seen)) < 40000UL;
           uint8_t sev = fresh ? id(ins_house_v_sev) : 0;
           if (sev != id(ins_house_v_drawn_sev)) {
             id(ins_house_v_drawn_sev) = sev;
@@ -276,8 +277,8 @@ script:
     mode: restart
     then:
       - lambda: |-
-          bool fresh = (millis() - id(summary_seen)) < 15000UL;
-          bool link = (id(bridge_online) && (millis() - id(bridge_seen)) < 15000UL && mqtt::global_mqtt_client->is_connected());
+          bool fresh = (millis() - id(summary_seen)) < 20000UL;
+          bool link = (id(bridge_online) && (millis() - id(bridge_seen)) < 20000UL && mqtt::global_mqtt_client->is_connected());
           int mode = vs_banner_mode(id(summary_valid), fresh, link, id(summary_max), id(summary_na), id(summary_nl), id(alarm_dismissed));
           bool show = mode != VS_BANNER_HIDDEN;
           id(alarm_idx) = show ? id(summary_first) : -1;
@@ -335,6 +336,8 @@ script:
 interval:
   - interval: 1s
     then:
+      - lambda: |-
+          if (id(bridge_online) && (millis() - id(bridge_seen)) >= 20000UL) id(bridge_online) = false;
       - script.execute: render_tiles
       - script.execute: render_alarm
   - interval: 500ms

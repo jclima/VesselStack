@@ -76,7 +76,10 @@ class SettingsError(Exception):
 class StateStore:
     """The latch and the alarm counter across restarts: ``<dir>/state.json``, written atomically.
 
-    ``{"format":1,"seq":<uint32>,"latched":{"instruments":[ids],"notifications":[ids],"ha":[ids]}}``.
+    ``{"format":1,"seq":<uint32>,"latched":{"instruments":[ids],"notifications":[ids],"ha":[ids]},
+    "live":{"instruments":[ids],"notifications":[ids],"ha":[ids]}}``. ``live`` (alarms that were live at the
+    last evaluation) is optional: a file without it loads as before, and an older bridge ignores it. After a
+    crash the live ids are restored as lost, so a restart is neither a hidden alarm nor a new one.
     Without a usable directory the bridge runs as it always did (one warning, nothing written). A
     missing, corrupt or unknown-format file reads as "nothing persisted" and is overwritten by the
     next change. Nothing here ever raises into the bridge.
@@ -96,7 +99,7 @@ class StateStore:
         self.path = os.path.join(text, STATE_FILE)
 
     def load(self):
-        """``(seq, {kind: [ids]})`` from the file, or None when there is nothing usable."""
+        """``(seq, {kind: [ids]})`` from the file (latched and live ids merged), or None when nothing is usable."""
         if self.path is None:
             return None
         try:
@@ -108,37 +111,46 @@ class StateStore:
             LOG.warning("ignoring unreadable %s (%s); starting without a persisted latch", STATE_FILE,
                         type(exc).__name__)
             return None
-        seq, latched = self._parse(data)
+        seq, latched, live = self._parse(data)
         if seq is None:
             LOG.warning("ignoring %s with an unknown format or invalid content; starting without a persisted "
                         "latch", STATE_FILE)
             return None
-        self._written = (seq, latched)
-        return seq, {kind: list(ids) for kind, ids in latched}
+        self._written = (seq, latched, live)
+        lost_ids, live_ids = dict(latched), dict(live)
+        return seq, {kind: list(dict.fromkeys(lost_ids.get(kind, ()) + live_ids.get(kind, ())))
+                     for kind in self.KINDS}
 
     def _parse(self, data):
         latched = data.get("latched") if isinstance(data, dict) else None
+        live = data.get("live", {}) if isinstance(data, dict) else None
         if not (isinstance(data, dict) and type(data.get("format")) is int and data["format"] == STATE_FORMAT
-                and type(data.get("seq")) is int and 0 <= data["seq"] < 2 ** 32 and isinstance(latched, dict)):
-            return None, None
-        out = []
-        for kind in self.KINDS:
-            ids = latched.get(kind, [])
-            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
-                return None, None
-            out.append((kind, tuple(ids)))
-        return data["seq"], tuple(out)
+                and type(data.get("seq")) is int and 0 <= data["seq"] < 2 ** 32 and isinstance(latched, dict)
+                and isinstance(live, dict)):
+            return None, None, None
+        parsed = []
+        for source in (latched, live):
+            out = []
+            for kind in self.KINDS:
+                ids = source.get(kind, [])
+                if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                    return None, None, None
+                out.append((kind, tuple(ids)))
+            parsed.append(tuple(out))
+        return data["seq"], parsed[0], parsed[1]
 
-    def save(self, seq, latched):
+    def save(self, seq, latched, live=None):
         """Write when the content differs from the file's; a failure warns once and is not retried until it changes."""
         if self.path is None:
             return
-        content = (seq, tuple((kind, tuple(latched.get(kind, ()))) for kind in self.KINDS))
+        live = live or {}
+        content = (seq, tuple((kind, tuple(latched.get(kind, ()))) for kind in self.KINDS),
+                   tuple((kind, tuple(live.get(kind, ()))) for kind in self.KINDS))
         if content == self._written:
             return
         self._written = content
-        body = json.dumps({"format": STATE_FORMAT, "seq": seq, "latched": {k: list(v) for k, v in content[1]}},
-                          separators=(",", ":"))
+        body = json.dumps({"format": STATE_FORMAT, "seq": seq, "latched": {k: list(v) for k, v in content[1]},
+                           "live": {k: list(v) for k, v in content[2]}}, separators=(",", ":"))
         try:
             self._write(body)
         except OSError as exc:
@@ -333,10 +345,21 @@ class Bridge:
         if restored:
             LOG.info("restored %d lost alarm(s) from %s", len(restored), STATE_FILE)
 
-    def _persist(self):
-        self._store.save(self._alarm_seq, {"instruments": self.engine.latched_ids(),
-                                           "notifications": self.events.latched_ids(),
-                                           "ha": self.has.latched_ids()})
+    def _persist(self, now):
+        """Write the lost and the live alarm ids and the counter; the store only writes when they changed.
+
+        The live ids come from the engines (not from a summary that shutdown rewrites as lost), so a
+        crash while an alarm is live restarts with that alarm as lost instead of forgetting it.
+        """
+        def live(items):
+            return [iid for iid, sev in items if sev == "alarm"]
+
+        self._store.save(self._alarm_seq,
+                         {"instruments": self.engine.latched_ids(), "notifications": self.events.latched_ids(),
+                          "ha": self.has.latched_ids()},
+                         {"instruments": live(self.engine.summary_items()),
+                          "notifications": live(self.events.summary_items(now)),
+                          "ha": live(self.has.summary_items())})
 
     # -- publishing -------------------------------------------------------
     def _send(self, messages):
@@ -446,7 +469,7 @@ class Bridge:
         live = {iid for iid, sev in items if sev == "alarm"}
         self._alarm_seq = (self._alarm_seq + len(live - self._alarm_prev)) % 2 ** 32
         self._alarm_prev = frozenset(live | {iid for iid, sev in items if sev == "lost"})
-        self._persist()
+        self._persist(now)
         payload = topics.alarm_summary(items, self._summary_ts(), self._alarm_seq)
         if payload is None:
             return

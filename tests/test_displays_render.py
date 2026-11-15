@@ -708,7 +708,7 @@ class AlarmTakeover(Base):
         self.assertIn('bool has_seq = x["seq"].is<uint32_t>();', text)
         self.assertNotIn("id(summary_max) = 0;", text)   # a stale summary keeps the last known state
         self.assertNotIn("id(summary_na) = 0;", text)
-        self.assertIn("(millis() - id(summary_seen)) < 15000UL", text)   # 3 x heartbeat_s (5 s)
+        self.assertIn("(millis() - id(summary_seen)) < 20000UL", text)   # max(3 x heartbeat_s, heartbeat_s + 15 s) = 20 s
         show = re.search(r"bool show = (.*);", text).group(1)
         self.assertTrue(show.startswith("mode != VS_BANNER_HIDDEN"), show)
         mode = re.search(r"int mode = (.*);", text).group(1)
@@ -716,7 +716,7 @@ class AlarmTakeover(Base):
         for guard in ("id(summary_max)", "id(summary_na)", "id(summary_nl)", "id(alarm_dismissed)"):
             self.assertIn(guard, mode)
         self.assertIn(f"bool link = {render._link_expr(5)};", text)
-        self.assertIn("bool fresh = (millis() - id(summary_seen)) < 15000UL;", text)
+        self.assertIn("bool fresh = (millis() - id(summary_seen)) < 20000UL;", text)
         self.assertIn("on_click:\n            - lambda: 'id(alarm_dismissed) = true;'", text)
         self.assertNotIn("mqtt.publish", text)
 
@@ -725,7 +725,7 @@ class AlarmTakeover(Base):
             cfg["heartbeat_s"] = 7
             for inst in cfg["instruments"].values():
                 inst["stale_after_s"] = 14
-        self.assertIn("< 21000UL;", self.alarm_device(mutate).split("id: render_alarm")[1][:400])
+        self.assertIn("< 22000UL;", self.alarm_device(mutate).split("id: render_alarm")[1][:400])
 
     def test_hostile_labels_stay_literal_and_out_of_lambdas(self):
         hostile = {"anchor": '$x ${y} "q" \\ #:', "depth": "<% 1+1 %>"}
@@ -1002,7 +1002,7 @@ class DashboardUi(Base):
         self.assertIn("if (h > 23 || m > 59) { h = -1; m = -1; }", handler)
         script = text.split("id: render_header")[1].split("\n  - id:")[0].split("\ninterval:")[0]
         self.assertIn('snprintf(buf, sizeof(buf), "%02d:%02d", hm / 60, hm % 60);', script)
-        self.assertIn("(millis() - id(clock_seen)) < 15000UL", script)
+        self.assertIn("(millis() - id(clock_seen)) < 20000UL", script)
         self.assertIn(f"bool online = {render._link_expr(5)};", script)
         self.assertEqual(script.count("lv_label_set_text("), 3)
         self.assertNotIn("hm)", script.replace("hm / 60", "").replace("hm % 60", "").replace(
@@ -1017,7 +1017,7 @@ class DashboardUi(Base):
             for inst in cfg["instruments"].values():
                 inst["stale_after_s"] = 30
         self.set_config(mutate)
-        self.assertIn("< 21000UL", self.device(allow_missing_wifi=True).split("id: render_header")[1][:600])
+        self.assertIn("< 22000UL", self.device(allow_missing_wifi=True).split("id: render_header")[1][:600])
 
     def test_dots_are_good_only_when_everything_behind_them_is(self):
         script = self.ui_device().split("id: render_header")[1].split("\n  - id:")[0]
@@ -2320,10 +2320,14 @@ class BridgeLink(Base):
         return out
 
     def test_the_link_expression_is_one_helper_and_its_limit_is_the_summary_staleness(self):
-        for beats in (5, 7, 30):
+        for beats in (1, 5, 7, 30):
             expr = render._link_expr(beats)
             self.assertIn(f"(millis() - id(bridge_seen)) < {render.summary_stale_ms(beats)}UL", expr)
-            self.assertEqual(render.summary_stale_ms(beats), 3 * beats * 1000)
+            self.assertEqual(render.summary_stale_ms(beats), max(3 * beats, beats + 15) * 1000)
+        # the bridge's loop can block ~13 s in a connection attempt: a short heartbeat keeps a 15 s margin
+        self.assertEqual([render.summary_stale_ms(b) for b in (1, 5, 7, 30)], [16000, 20000, 22000, 90000])
+        for beats in (1, 5, 7, 30):
+            expr = render._link_expr(beats)
             self.assertIn("mqtt::global_mqtt_client->is_connected()", expr)
             self.assertTrue(expr.startswith("(id(bridge_online) && ") and expr.endswith(")"))
 
@@ -2344,7 +2348,25 @@ class BridgeLink(Base):
                 self.assertTrue(line.lstrip().startswith(('return (f"(id(bridge_online)', "'            id(bridge_online)",
                                                           "\"            if (id(bridge_online))",
                                                           "'  - {id: bridge_online", "\"        - lambda: |-")) or
-                                "id(bridge_online) = false" in line, line)
+                                "id(bridge_online) = false" in line
+                                or line.lstrip().startswith('f"          if (id(bridge_online) && (millis()'), line)
+
+    def test_a_hung_bridge_cannot_look_live_again_after_the_millis_wrap(self):
+        for name, text in self.configs().items():
+            interval = text.split("\ninterval:\n")[1]
+            first = interval.split("- script.execute: render_tiles")[0]
+            self.assertIn("if (id(bridge_online) && (millis() - id(bridge_seen)) >= 20000UL) "
+                          "id(bridge_online) = false;", first, name)
+            self.assertIn('  - {id: bridge_online, type: bool, initial_value: "false"}', text)
+
+    def test_the_status_handler_refreshes_the_banner_only_where_there_is_one(self):
+        for name, text in self.configs().items():
+            handler = text.split("topic: vesselstack/v1/bridge/status")[1].split("  on_json_message:")[0]
+            has_banner = "  - id: render_alarm" in text
+            self.assertEqual("- script.execute: render_alarm" in handler, has_banner, name)
+            if has_banner:
+                self.assertLess(handler.index("render_tiles"), handler.index("render_alarm"))
+        self.assertTrue(any("  - id: render_alarm" in t for t in self.configs().values()))
 
     def test_the_handler_stamps_seen_only_for_online(self):
         text = self.device()
@@ -2363,7 +2385,7 @@ class BridgeLink(Base):
         self.set_config(mutate)
         text = self.device(allow_missing_wifi=True)
         expr = render._link_expr(7)
-        self.assertIn("< 21000UL", expr)
+        self.assertIn("< 22000UL", expr)
         self.assertNotIn("id(bridge_seen)) < 15000UL", text)
         for marker in ("bool fresh = " + expr, "bool online = " + expr, "bool link = " + expr,
                        "if (!" + expr + ") return;"):

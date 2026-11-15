@@ -1658,8 +1658,13 @@ def alarm_page_index(display: dict) -> int:
 
 
 def summary_stale_ms(heartbeat: int) -> int:
-    """The alarm summary is republished every heartbeat; three missed ones make it stale."""
-    return 3 * heartbeat * 1000
+    """How long the bridge's liveness and alarm summary stay trusted, in ms: max(3 x heartbeat, heartbeat + 15 s).
+
+    Both are only (re)published from the bridge's tick, and its loop can block for about 13 s in a
+    connection attempt (open_timeout 10 s, close_timeout 3 s), so a short heartbeat needs the 15 s
+    margin: three missed beats are not enough when the heartbeat is 1 s.
+    """
+    return max(3 * heartbeat, heartbeat + 15) * 1000
 
 
 def _link_expr(heartbeat: int) -> str:
@@ -2137,6 +2142,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
               '            id(bridge_online) = (x == "online");',
               "            if (id(bridge_online)) id(bridge_seen) = millis();",
               "        - script.execute: render_tiles"]
+    if takeover:
+        lines.append("        - script.execute: render_alarm")     # the banner follows the link at once
     if header_enabled(display):
         lines += ["        - script.execute: render_header", *_signalk_message(display)]
         if has_ha(config):
@@ -2191,7 +2198,13 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         lines += _night_script(config, display, used, pal=pal)
     if power_enabled(display):
         lines += _power_script(display, config)
-    lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles"]
+    # A hung bridge with MQTT still up never sends offline: drop the flag once the window has passed, so
+    # the unsigned age cannot wrap (after 49.7 days) and make the link look live again.
+    lines += ["", "interval:", "  - interval: 1s", "    then:",
+              "      - lambda: |-",
+              f"          if (id(bridge_online) && (millis() - id(bridge_seen)) >= {summary_stale_ms(heartbeat)}UL)"
+              " id(bridge_online) = false;",
+              "      - script.execute: render_tiles"]
     if takeover:
         lines.append("      - script.execute: render_alarm")
     lines += _after_ui_change(display, "      ")

@@ -37,7 +37,9 @@ enum VsBannerMode : int {
 // What the banner shows. An alarm the display has seen is never cleared by losing data or the
 // link: it turns into NO DATA until the bridge reports again, the alarm is dismissed, or a fresh
 // summary says it is over.
-//   valid      a summary has arrived since boot (a display that boots while the link is down knows nothing)
+//   valid      a summary has arrived since boot. The broker keeps the last summary (retained), so a display
+//              that boots while the bridge is down still gets it: an alarm in it shows as NO DATA until
+//              a tap or a fresh summary. Only a broker with no stored summary leaves the display blank.
 //   fresh      the last summary is recent
 //   link_ok    the bridge link is live
 //   na, nl     alarms counted, and the lost ones among them; a bridge older than 0.9.0 sends no nl,
