@@ -230,6 +230,67 @@ class RestoreJournalTests(unittest.TestCase):
         self.assertEqual(run("inspect", str(self.dir / "tree")).stdout, f"{st.st_dev}:{st.st_ino} same\n")
         self.assertEqual(run("inspect", str(self.dir / "missing")).stdout, "absent absent\n")
 
+    def test_same_fs_uses_the_real_parent_not_the_one_named_in_the_path(self):
+        # /srv -> /mnt/ssd/srv: the tree is compared with the directory that really holds it (PATH/..)
+        real = self.dir / "real"; (real / "tree").mkdir(parents=True)
+        (self.dir / "link").symlink_to(real, target_is_directory=True)
+        self.assertEqual(run("same-fs", str(self.dir / "link" / "tree")).stdout, "same\n")
+        self.assertEqual(run("inspect", str(self.dir / "link" / "tree")).stdout.split()[1], "same")
+        module = load_module()
+        real_stat = os.stat
+        seen = []
+        def fake(path, *args, **kwargs):
+            seen.append(str(path))
+            st = real_stat(path, *args, **kwargs)
+            if str(path).endswith("/.."):
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, st.st_nlink, st.st_uid, st.st_gid, st.st_size, 0, 0, 0))
+            return st
+        with mock.patch.object(module.os, "stat", side_effect=fake):
+            self.assertEqual(module.same_fs(str(self.dir / "link" / "tree")), "different")
+        self.assertIn(str(self.dir / "link" / "tree" / ".."), seen)
+
+    # ---- rename: "mv -T" without the copy fallback ----
+    def test_rename_moves_to_a_new_name_or_onto_an_empty_directory(self):
+        (self.dir / "a").mkdir(); (self.dir / "a" / "f").write_text("x")
+        self.assertEqual(run("rename", str(self.dir / "a"), str(self.dir / "b")).returncode, 0)
+        self.assertEqual((self.dir / "b" / "f").read_text(), "x"); self.assertFalse((self.dir / "a").exists())
+        (self.dir / "empty").mkdir()
+        self.assertEqual(run("rename", str(self.dir / "b"), str(self.dir / "empty")).returncode, 0)
+        self.assertEqual((self.dir / "empty" / "f").read_text(), "x")
+        self.assertFalse((self.dir / "empty" / "b").exists(), "must not be nested into the directory")
+
+    def test_rename_refuses_a_destination_that_is_not_absent_or_an_empty_directory(self):
+        (self.dir / "a").mkdir()
+        (self.dir / "full").mkdir(); (self.dir / "full" / "f").write_text("keep")
+        (self.dir / "file").write_text("keep")
+        (self.dir / "target").mkdir(); (self.dir / "link").symlink_to(self.dir / "target", target_is_directory=True)
+        for name in ("full", "file", "link"):
+            with self.subTest(name):
+                result = run("rename", str(self.dir / "a"), str(self.dir / name))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue((self.dir / "a").is_dir(), "the source stays")
+        self.assertEqual((self.dir / "full" / "f").read_text(), "keep")
+        self.assertEqual((self.dir / "file").read_text(), "keep")
+        self.assertEqual(os.listdir(self.dir / "target"), [])
+        self.assertEqual(run("rename", str(self.dir / "missing"), str(self.dir / "x")).returncode, 1)
+        (self.dir / "plain").write_text("p"); (self.dir / "emptydir").mkdir()
+        self.assertEqual(run("rename", str(self.dir / "plain"), str(self.dir / "emptydir")).returncode, 1)
+        self.assertEqual(run("rename", str(self.dir / "a")).returncode, 2)
+
+    def test_rename_across_filesystems_fails_and_never_copies(self):
+        module = load_module()
+        (self.dir / "a").mkdir(); (self.dir / "a" / "f").write_text("x")
+        def exdev(src, dst):
+            raise OSError(module.errno.EXDEV, "Invalid cross-device link", src)
+        with mock.patch.object(module.os, "rename", side_effect=exdev):
+            with self.assertRaises(OSError) as caught:
+                module.rename_tree(str(self.dir / "a"), str(self.dir / "b"))
+            self.assertEqual(caught.exception.errno, module.errno.EXDEV)
+            self.assertEqual(module.main(["x", "rename", str(self.dir / "a"), str(self.dir / "b")]), 1)
+        self.assertEqual((self.dir / "a" / "f").read_text(), "x", "the source is untouched")
+        self.assertFalse((self.dir / "b").exists(), "nothing was copied")
+        self.assertNotIn("shutil", HELPER.read_text(), "the helper has no copy code to fall back on")
+
     def test_usage_errors(self):
         self.assertEqual(run().returncode, 2)
         self.assertEqual(run("set", str(self.dir)).returncode, 2)

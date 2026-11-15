@@ -17,8 +17,12 @@ that are read and written here and are never sourced or evaluated by a shell.
                                      (the device number can change across a reboot)
   inspect PATH                       print "<dev:ino|absent> <same|different|absent>": inode and
                                      same-fs of PATH in one call
-  same-fs PATH                       print "same" when PATH is on the same filesystem as its parent
-                                     directory, "different" when not (a mount point), or "absent"
+  same-fs PATH                       print "same" when PATH is on the same filesystem as its real parent
+                                     directory (PATH/.., so a symbolic link in an ancestor does not
+                                     matter), "different" when not (a mount point), or "absent"
+  rename FROM TO                     rename(2) with the semantics of "mv -T": TO must not exist or be
+                                     an empty directory, otherwise it fails. Never copies: a rename
+                                     across filesystems fails with an error
 
 A state file with a repeated key is corrupt: get, dump and set refuse it.
 
@@ -159,8 +163,28 @@ def same_fs(path: str) -> str:
         st = os.lstat(path)
     except FileNotFoundError:
         return "absent"
-    parent = os.lstat(os.path.dirname(os.path.abspath(path)) or "/")
+    if stat.S_ISLNK(st.st_mode):
+        # a link is not a tree to swap; compare the link itself with the directory that holds it
+        parent = os.stat(os.path.dirname(os.path.abspath(path)) or "/")
+    else:
+        # PATH/.. is the real parent directory, even when an ancestor is a symbolic link to another disk
+        parent = os.stat(os.path.join(path, ".."))
     return "same" if st.st_dev == parent.st_dev else "different"
+
+
+def rename_tree(src: str, dst: str) -> None:
+    """os.rename with "mv -T" semantics: DST must not exist or be an empty directory. No copy fallback."""
+    try:
+        dst_mode = os.lstat(dst).st_mode
+    except FileNotFoundError:
+        dst_mode = None
+    if dst_mode is not None:
+        if not stat.S_ISDIR(dst_mode):
+            raise OSError(errno.EEXIST, "the destination exists and is not a directory", dst)
+        if not stat.S_ISDIR(os.lstat(src).st_mode):
+            raise OSError(errno.ENOTDIR, "cannot replace a directory with a non-directory", dst)
+        # rename(2) onto a directory succeeds only when it is empty (ENOTEMPTY otherwise)
+    os.rename(src, dst)
 
 
 def inspect_path(path: str) -> str:
@@ -204,6 +228,8 @@ def main(argv: list[str]) -> int:
             print(ino_of(args[0]))
         elif command == "inspect" and len(args) == 1:
             print(inspect_path(args[0]))
+        elif command == "rename" and len(args) == 2:
+            rename_tree(args[0], args[1])
         elif command == "same-fs" and len(args) == 1:
             print(same_fs(args[0]))
         else:

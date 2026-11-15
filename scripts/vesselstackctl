@@ -117,12 +117,14 @@ restore_pending_check() {
 
 ensure_lifecycle_lock() {
     command_needs_lifecycle_lock "$@" || return 0
-    local helper="$ROOT/common/lifecycle_lock.py" system_root=${VESSELSTACK_SYSTEM_ROOT:-}
+    local helper="$ROOT/common/lifecycle_lock.py" system_root=${VESSELSTACK_SYSTEM_ROOT:-} lock_root=$ROOT
+    # restore records the normalised root in its journal and `recover` locks with that value: use it here too.
+    if [ "$1" = restore ]; then lock_root=$(restore_normalize_path "$ROOT"); fi
     [ -r "$helper" ] || { echo "Missing lifecycle lock helper: $helper (rerun the installer)" >&2; exit 1; }
     if [ -n "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
-        python3 -I "$helper" check --root "$ROOT" --system-root "$system_root" || exit $?
+        python3 -I "$helper" check --root "$lock_root" --system-root "$system_root" || exit $?
     else
-        exec python3 -I "$helper" run --root "$ROOT" --system-root "$system_root" -- "$0" "$@"
+        exec python3 -I "$helper" run --root "$lock_root" --system-root "$system_root" -- "$0" "$@"
     fi
 }
 
@@ -3338,14 +3340,19 @@ restore_sync_system_files() {
 # Units that read or write ROOT or DATA and are not stopped by stop_stack. They are
 # stopped for the swap only, and the ones actually stopped are recorded in
 # $journal/quiesced-units and the restore_quiesced variable (one unit per line).
+restore_record_quiesced() {
+    local journal=$1 unit=$2
+    case $'\n'"$restore_quiesced" in *$'\n'"$unit"$'\n'*) return 0 ;; esac
+    restore_quiesced="$restore_quiesced$unit"$'\n'
+    printf '%s\n' "$unit" >> "$journal/quiesced-units" || return 1
+    restore_sync_file "$journal" "$journal/quiesced-units" || return 1
+}
 restore_quiesce_unit() {
     local journal=$1 unit=$2
     case $'\n'"$restore_quiesced" in *$'\n'"$unit"$'\n'*) return 0 ;; esac
     systemctl is-active --quiet "$unit" 2>/dev/null || return 0
     # Record first: a stop that fails half way must still be undone by a start.
-    restore_quiesced="$restore_quiesced$unit"$'\n'
-    printf '%s\n' "$unit" >> "$journal/quiesced-units" || return 1
-    restore_sync_file "$journal" "$journal/quiesced-units" || return 1
+    restore_record_quiesced "$journal" "$unit" || return 1
     systemctl stop "$unit" || return 1
 }
 restore_quiesce_writers() {
@@ -3525,6 +3532,10 @@ restore_validate_state() {
     done
     return 0
 }
+# The device number of the filesystem PATH is on, symbolic links followed. A function so that tests can replace it.
+restore_device() {
+    stat -L -c %d -- "$1"
+}
 # dev:ino of PATH itself, or "absent".
 restore_inode() {
     python3 -I "$1/restore_journal.py" inode "$2"
@@ -3539,11 +3550,17 @@ restore_same_ino() {
 restore_note() {
     restore_state_set "$@" || { restore_journal_ok=0; return 1; }
 }
+# rename(2) only, with the semantics of "mv -T" (the destination must not exist or be an empty directory).
+# Never "mv": GNU mv silently falls back to copy-then-delete across filesystems, which a restore must not do.
+# A function so that the tests can replace it.
+restore_rename_tree() {
+    python3 -I "$1/restore_journal.py" rename "$2" "$3"
+}
 # Rename a tree, then make the rename durable in both parent directories.
 restore_mv_tree() {
     local journal=$1 from=$2 to=$3 from_parent to_parent
     from_parent=${from%/*} to_parent=${to%/*}
-    mv -T -- "$from" "$to" || return 1
+    restore_rename_tree "$journal" "$from" "$to" || return 1
     python3 -I "$journal/restore_journal.py" fsync-dir "${from_parent:-/}" "${to_parent:-/}"
 }
 # Record the phase the transaction is about to enter; a journal that cannot be written ends the restore.
@@ -3593,6 +3610,7 @@ restore_reconcile_fail() {
     restore_note "$journal" phase=rollback-failed ${origin[@]+"${origin[@]}"} "last_error=${message//[$'\n\r']/ }" || true
     restore_outcome=rollback-failed
     echo "RECOVERY ERROR: $message" >&2
+    if [ -n "${restore_stopped_units:-}" ]; then echo "Units stopped during the recovery (not started again):$restore_stopped_units" >&2; fi
     return 1
 }
 # Remove the staged copy named by the journal, only when the state validates (see restore_validate_state).
@@ -3651,19 +3669,29 @@ restore_finish_committed() {
         return 1
     fi
 }
+# The one filesystem rule of a restore, used both before the journal is created and by the recovery:
+# a tree must be on the same filesystem as its real parent directory (a symbolic link in an ancestor does
+# not matter; a mount point does). HELPER is the state helper. Sets restore_current (dev:ino or absent) and,
+# when the rule is broken, restore_fs_error (without the "nothing was changed" ending); fails then.
+restore_fs_check() {
+    local helper=$1 label=$2 path=$3 fs
+    restore_fs_error='' restore_current=''
+    read -r restore_current fs <<< "$(python3 -I "$helper" inspect "$path")" || fs=unknown
+    case "$fs" in
+        same|absent) return 0 ;;
+        different) restore_fs_error="the $label folder $path is not on the same filesystem as its parent directory (a mount point?)" ;;
+        *) restore_fs_error="could not check which filesystem the $label folder $path is on" ;;
+    esac
+    return 1
+}
 # Nothing has changed yet: refuse here what the tree steps would only find out after moving something.
 restore_tree_preflight() {
-    local journal=$1 label=$2 path=$3 live=$4 stamp=$5 current fs
-    read -r current fs <<< "$(python3 -I "$journal/restore_journal.py" inspect "$path")" || fs=unknown
-    case "$fs" in
-        same|absent) ;;
-        different)
-            restore_reconcile_fail "$journal" "the $label folder $path is not on the same filesystem as its parent directory (a mount point?); nothing was changed"
-            return 1 ;;
-        *)
-            restore_reconcile_fail "$journal" "could not check which filesystem the $label folder $path is on; nothing was changed"
-            return 1 ;;
-    esac
+    local journal=$1 label=$2 path=$3 live=$4 stamp=$5 current
+    if ! restore_fs_check "$journal/restore_journal.py" "$label" "$path"; then
+        restore_reconcile_fail "$journal" "$restore_fs_error; nothing was changed"
+        return 1
+    fi
+    current=$restore_current
     if ! restore_same_ino "$current" "$live" && [ -L "$path.pre-restore-$stamp" ]; then
         restore_reconcile_fail "$journal" "the previous $label tree $path.pre-restore-$stamp is a symbolic link; refusing to move it into place. Nothing was changed"
         return 1
@@ -3689,11 +3717,12 @@ restore_writer_units() {
     done < <(restore_known_units)
 }
 # True when the unit is inactive or failed. A unit that is activating (auto-restart), deactivating or
-# reloading is not idle; a unit systemd does not know reports "inactive".
+# reloading is not idle; a unit systemd does not know reports "inactive". Fails closed: when systemctl
+# fails or says nothing, the unit is NOT idle.
 restore_unit_idle() {
     local state
-    state=$(systemctl show -p ActiveState --value "$1" 2>/dev/null) || state=''
-    case "${state:-inactive}" in inactive|failed) return 0 ;; *) return 1 ;; esac
+    state=$(systemctl show -p ActiveState --value "$1" 2>/dev/null) || return 1
+    case "$state" in inactive|failed) return 0 ;; *) return 1 ;; esac
 }
 # Docker daemon or container runtime processes; a function so that it can be replaced in tests.
 restore_docker_processes() {
@@ -3746,28 +3775,38 @@ restore_find_containers() {
 # any tree is moved, then check. A failing controller stop is only a warning: the unit and container
 # checks decide. Every writer unit gets "systemctl stop" whatever it reports (that also cancels the
 # auto-restart of a crash-looping unit), and must then be inactive or failed.
-restore_stop_before_moving() {
-    local journal=$1 root=$2 root_live=$3 root_new=$4 data=$5 pass unit current active='' rc
+# The stop-and-verify shared by the rollback and the forward path, in two steps. restore_stop_writers gives
+# every writer unit "systemctl stop" (timers first); units that were not idle are added to
+# restore_stopped_units, and with RECORD=1 also written to $journal/quiesced-units first, so that a later
+# rollback, abandon or commit starts them again. restore_verify_stopped then requires every writer unit to be
+# idle, stops running containers that belong to the stack or mount ROOT/DATA and requires that none remain.
+# Both fail with restore_verify_error (the cause) and restore_verify_suffix (what the rollback adds to it) set.
+restore_stop_writers() {
+    local journal=$1 record=$2 pass unit
+    restore_verify_error='' restore_verify_suffix=''
     for pass in timer service; do
         while IFS= read -r unit; do
             case "$unit" in *".$pass") ;; *) continue ;; esac
-            if ! restore_unit_idle "$unit"; then restore_stopped_units="$restore_stopped_units $unit"; fi
+            if ! restore_unit_idle "$unit"; then
+                restore_stopped_units="$restore_stopped_units $unit"
+                if [ "$record" = 1 ] && ! restore_record_quiesced "$journal" "$unit"; then
+                    restore_verify_error="could not record in the journal that $unit was stopped"
+                    return 1
+                fi
+            fi
             systemctl stop "$unit" >/dev/null 2>&1 || true
         done < <(restore_writer_units)
     done
-    current=$(restore_inode "$journal" "$root")
-    if restore_same_ino "$current" "$root_new"; then
-        restore_run_controller "$journal" "$journal/new-controller" stop || \
-            echo "WARN the restored stack could not be stopped (new-controller stop); checking the units instead" >&2
-    elif restore_same_ino "$current" "$root_live"; then
-        restore_run_controller "$journal" "$journal/controller" stop || \
-            echo "WARN the stack could not be stopped (controller stop); checking the units instead" >&2
-    fi
+}
+restore_verify_stopped() {
+    local root=$1 data=$2 unit active='' rc
+    restore_verify_error='' restore_verify_suffix=''
     while IFS= read -r unit; do
         restore_unit_idle "$unit" || active="$active $unit"
     done < <(restore_writer_units)
     if [ -n "$active" ]; then
-        restore_reconcile_fail "$journal" "these units are still running and may be using the folders:$active; nothing was moved. Stop them (sudo systemctl stop ...) and run the recovery again"
+        restore_verify_error="these units are still running and may be using the folders:$active"
+        restore_verify_suffix="; nothing was moved. Stop them (sudo systemctl stop ...) and run the recovery again"
         return 1
     fi
     rc=0
@@ -3780,12 +3819,35 @@ restore_stop_before_moving() {
     case "$rc" in
         0) ;;
         1)
-            restore_reconcile_fail "$journal" "Containers are still running and using the application or data folder:$restore_container_names. Stop them (sudo docker stop${restore_container_names}) and run the recovery again."
+            restore_verify_error="Containers are still running and using the application or data folder:$restore_container_names"
+            restore_verify_suffix=". Stop them (sudo docker stop${restore_container_names}) and run the recovery again."
             return 1 ;;
         *)
-            restore_reconcile_fail "$journal" "could not check for running containers ($restore_container_error); nothing was moved. Stop Docker or its containers and run the recovery again"
+            restore_verify_error="could not check for running containers ($restore_container_error)"
+            restore_verify_suffix="; nothing was moved. Stop Docker or its containers and run the recovery again"
             return 1 ;;
     esac
+}
+# From phase "stopped" onward the stack was stopped, but a reboot or a late start can have brought
+# units (and containers) back, and they may be using whichever tree is at ROOT now. Stop them all BEFORE
+# any tree is moved, then check. A failing controller stop is only a warning: the unit and container
+# checks decide. Every writer unit gets "systemctl stop" whatever it reports (that also cancels the
+# auto-restart of a crash-looping unit), and must then be inactive or failed.
+restore_stop_before_moving() {
+    local journal=$1 root=$2 root_live=$3 root_new=$4 data=$5 current
+    restore_stop_writers "$journal" 0 || { restore_reconcile_fail "$journal" "$restore_verify_error"; return 1; }
+    current=$(restore_inode "$journal" "$root")
+    if restore_same_ino "$current" "$root_new"; then
+        restore_run_controller "$journal" "$journal/new-controller" stop || \
+            echo "WARN the restored stack could not be stopped (new-controller stop); checking the units instead" >&2
+    elif restore_same_ino "$current" "$root_live"; then
+        restore_run_controller "$journal" "$journal/controller" stop || \
+            echo "WARN the stack could not be stopped (controller stop); checking the units instead" >&2
+    fi
+    if ! restore_verify_stopped "$root" "$data"; then
+        restore_reconcile_fail "$journal" "$restore_verify_error$restore_verify_suffix"
+        return 1
+    fi
 }
 # One tree (ROOT, then DATA), decided by inode, not by phase: after any crash the live path holds the
 # original tree, the staged one, nothing, or something this restore never made.
@@ -3833,6 +3895,24 @@ restore_reconcile_tree() {
         return 1
     fi
 }
+# The firewall is never stopped by a rollback or an abandon. After the system files were put back from the
+# snapshot it is restarted (when it is enabled), so that the rules of the previous release are applied again.
+# A restart that fails is said plainly (restore_firewall_warning) and does not fail the rollback.
+restore_reapply_firewall() {
+    restore_firewall_warning=''
+    systemctl is-enabled --quiet vesselstack-firewall.service 2>/dev/null || return 0
+    if ! systemctl restart vesselstack-firewall.service; then
+        restore_firewall_warning="the firewall (vesselstack-firewall.service) could not be restarted after the system files were put back, so the previous firewall rules may not be applied"
+        echo "WARN $restore_firewall_warning. Run: sudo systemctl restart vesselstack-firewall.service" >&2
+    fi
+    return 0
+}
+# Says so when the firewall is enabled but not running; says nothing when it is running (or not in use).
+restore_firewall_notice() {
+    systemctl is-enabled --quiet vesselstack-firewall.service 2>/dev/null || return 0
+    systemctl is-active --quiet vesselstack-firewall.service 2>/dev/null && return 0
+    printf '%s\n' "The firewall (vesselstack-firewall.service) is NOT running. Start it with: sudo systemctl start vesselstack-firewall.service"
+}
 # The single decision function, idempotent, used by the in-process failure path and by
 # `restore-recover rollback`. It reads root, data, stamp and the inodes from the journal state
 # and never from $ROOT/config. Sets restore_outcome (rolled-back, committed or rollback-failed).
@@ -3845,7 +3925,8 @@ restore_reconcile_tree() {
 # restore, so it must never leave the journal pending (that would lock the owner out of every command).
 restore_reconcile_run() {
     local journal=$1 phase from stamp root data root_live root_new data_live data_new
-    local controller="$1/controller" need_start=0 start_error=''
+    local controller="$1/controller" need_start=0 start_error='' externals_restored=0
+    restore_firewall_warning=''
     restore_outcome='' restore_archived='' restore_stopped_units='' restore_journal_ok=1 restore_validated='' restore_fail_origin=''
     if ! restore_state_load "$journal"; then
         echo "RECOVERY ERROR: the journal state $journal/state cannot be read (damaged, a repeated key, or no helper); nothing was changed" >&2
@@ -3884,6 +3965,20 @@ restore_reconcile_run() {
                 echo "WARN could not archive the journal; run: sudo $journal/recover rollback" >&2
                 return 1
             }
+            return 0 ;;
+        abandoned)
+            # Archive only: the abandon had already decided that the folders stay as they are. Nothing is
+            # moved, no system file is touched, and nothing is recorded as a failed rollback. The snapshot
+            # of the system files stays in the record, as an abandon keeps it.
+            restore_outcome=abandoned
+            restore_remove_stage "$journal"
+            restore_keep_snapshot=1
+            if ! restore_archive_journal "$journal" abandoned; then
+                restore_keep_snapshot=0
+                echo "WARN could not archive the journal; run: sudo $journal/recover rollback" >&2
+                return 1
+            fi
+            restore_keep_snapshot=0
             return 0 ;;
         rolling-back|rollback-failed)
             from=$st_rollback_from
@@ -3938,13 +4033,15 @@ restore_reconcile_run() {
                     restore_restore_externals "$journal" || {
                         restore_reconcile_fail "$journal" "the system files could not be restored from the journal snapshot: ${restore_externals_error:-unknown error}"
                         return 1
-                    } ;;
+                    }
+                    externals_restored=1 ;;
             esac
             rm -f -- "$journal/removed-units"
             systemctl daemon-reload || {
                 restore_reconcile_fail "$journal" "systemd could not be reloaded after the rollback"
                 return 1
             }
+            if [ "$externals_restored" -eq 1 ]; then restore_reapply_firewall; fi
             need_start=1 ;;
     esac
     if [ "$need_start" -eq 1 ]; then
@@ -3972,6 +4069,7 @@ restore_reconcile_run() {
     if [ -n "$start_error" ]; then
         echo "The previous system is back in place, but it could not be started: $start_error. Run: sudo vesselstackctl start, then sudo vesselstackctl doctor" >&2
         if [ -n "$restore_stopped_units" ]; then echo "Units stopped during the recovery:$restore_stopped_units" >&2; fi
+        restore_firewall_notice >&2
         return 3
     fi
     return 0
@@ -4098,6 +4196,7 @@ restore_recover_rollback() {
         0)
             case "$restore_outcome" in
                 committed) echo "The restore had already completed, so nothing was rolled back. Its leftovers were removed." ;;
+                abandoned) echo "The restore had been abandoned: nothing was moved or rolled back. Its record was archived." ;;
                 *) echo "Rollback completed: the previous application and data folders and the system files are back and the stack was started." ;;
             esac
             if [ -n "${restore_archived:-}" ]; then echo "Record kept in $restore_archived"; fi
@@ -4187,6 +4286,7 @@ restore_recover_abandon() {
         if [ -n "$started" ]; then echo "Units started again:$started"; fi
         if [ -n "$restore_unstarted" ]; then echo "Units that could not be started:$restore_unstarted (run: sudo systemctl start <unit>)"; fi
     fi
+    restore_firewall_notice
     if [ "$touched" -eq 1 ]; then
         echo "WARNING: the restore had begun publishing system files. The unit files, /usr/local/sbin/vesselstackctl and the helpers in $LIBEXEC_DIR may belong to the RESTORED release."
         echo "The snapshot of the previous system files is kept in $restore_archived (files/ and manifest)."
@@ -4261,6 +4361,15 @@ restore_commit_transaction() {
     fi
     if ! restore_quiesce_writers "$journal"; then
         restore_abort "$journal" "could not stop the Control Panel and timers"
+        return 1
+    fi
+    # The same stop-and-verify the rollback does, before anything is moved: a unit that is restarting by
+    # itself or a container that mounts a folder would otherwise write into a tree while it is swapped.
+    # Units stopped here are recorded, so that the abort and the commit start them again. Phase "stopping"
+    # is still on record: a failure is a plain abort that restarts what was stopped.
+    restore_stopped_units=''
+    if ! restore_stop_writers "$journal" 1 || ! restore_verify_stopped "$root" "$data"; then
+        restore_abort "$journal" "$restore_verify_error; nothing was moved"
         return 1
     fi
     restore_enter "$journal" stopped || return 1
@@ -4346,7 +4455,8 @@ restore_populate_journal() {
     cp -- "$LIBEXEC_DIR/restore_journal.py" "$helper" || return 1
     cp -- "$ROOT/common/lifecycle_lock.py" "$building/lifecycle_lock.py" || return 1
     # The complete running controller; recovery runs it without the installed copy or $ROOT.
-    cp -a -- "$0" "$building/controller" || return 1
+    # Dereferenced and with its mode: the journal's controller is always a regular file, even when $0 is a link.
+    cp -L -p -- "$0" "$building/controller" || return 1
     cat > "$building/recover" <<'RECOVER'
 #!/bin/bash
 # Recovery entry point for an interrupted VesselStack restore. It needs neither the application folder
@@ -4401,6 +4511,7 @@ RECOVER
 # always means "complete, nothing changed yet or later".
 restore_create_journal() {
     local building path
+    restore_journal_pending=0
     # Only the restore directory is private: /var/lib/vesselstack keeps the mode the installer gave it
     # (0755; the alerts service reads backup-last.json there) and GNU "install -d -m" would change it.
     [ -d "$SYSTEM_ROOT/var/lib/vesselstack" ] || install -d -m 0755 "$SYSTEM_ROOT/var/lib/vesselstack" || return 1
@@ -4413,12 +4524,24 @@ restore_create_journal() {
         rm -rf -- "$building"
         return 1
     fi
+    # A journal the recovery would not accept is found here, while it is still only being built.
+    if ! restore_state_load "$building" || ! restore_validate_state; then
+        echo "The recovery journal would not be accepted by the recovery (${restore_validate_error:-it cannot be read})." >&2
+        rm -rf -- "$building"
+        return 1
+    fi
     # Every file is flushed before the rename that makes the journal "current".
     echo "Writing the recovery journal to disk."
     if ! python3 -I "$building/restore_journal.py" fsync-tree "$building" || \
-       ! mv -T -- "$building" "$RESTORE_CURRENT" || \
-       ! python3 -I "$RESTORE_CURRENT/restore_journal.py" fsync-dir "$RESTORE_DIR"; then
+       ! mv -T -- "$building" "$RESTORE_CURRENT"; then
         rm -rf -- "$building"
+        return 1
+    fi
+    if ! python3 -I "$RESTORE_CURRENT/restore_journal.py" fsync-dir "$RESTORE_DIR"; then
+        # The journal is in place under its final name. Nothing else has been changed yet, so it can go;
+        # if it cannot, it is pending and the owner must be told.
+        rm -rf -- "$RESTORE_CURRENT" 2>/dev/null || true
+        if [ -e "$RESTORE_CURRENT" ] || [ -L "$RESTORE_CURRENT" ]; then restore_journal_pending=1; fi
         return 1
     fi
 }
@@ -4449,7 +4572,7 @@ restore_stack() {
         echo "See: sudo $RESTORE_CURRENT/recover status" >&2
         exit 1
     fi
-    local root data path
+    local root data path label
     root=$(restore_normalize_path "$VESSELSTACK_ROOT")
     data=$(restore_normalize_path "$VESSELSTACK_DATA")
     if ! restore_layout_ok "$root" "$data"; then
@@ -4463,7 +4586,7 @@ restore_stack() {
             exit 1
         fi
     done
-    local stage_parent stamp stage need_kib free_kib
+    local stage_parent stamp stage need_kib free_kib stage_dev parent_dev
     stage_parent=${data%/*}
     [ -n "$stage_parent" ] || stage_parent=/
     for path in "$root" "$data"; do
@@ -4472,10 +4595,6 @@ restore_stack() {
             exit 1
         fi
     done
-    [ "$(stat -c %d "$stage_parent")" = "$(stat -c %d "$(dirname "$root")")" ] || {
-        echo "Refusing to restore: application and data trees are on different filesystems from their parent directories" >&2
-        exit 1
-    }
     stamp=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
     while [ -e "$root.pre-restore-$stamp" ] || [ -L "$root.pre-restore-$stamp" ] || \
           [ -e "$data.pre-restore-$stamp" ] || [ -L "$data.pre-restore-$stamp" ] || \
@@ -4498,6 +4617,18 @@ PY
     fi
     stage=$(mktemp -d "${stage_parent%/}/.vesselstack-restore.XXXXXX")
     chmod 0700 "$stage"
+    # The restored trees are renamed from the stage into place, so the stage must be on the real filesystem
+    # of both parent directories (symbolic links followed). Otherwise a rename would fail half way, or, worse,
+    # could never be undone by the recovery.
+    stage_dev=$(restore_device "$stage") || stage_dev=''
+    for path in "$root" "$data"; do
+        parent_dev=$(restore_device "${path%/*}/") || parent_dev=''
+        if [ -z "$stage_dev" ] || [ "$stage_dev" != "$parent_dev" ]; then
+            rm -rf -- "$stage"
+            echo "Refusing to restore: the application folder and the data folder must be on the same filesystem (the folders that hold them cannot be on different disks or partitions), because a restore swaps them by renaming. Nothing was changed." >&2
+            exit 1
+        fi
+    done
     # Extract as root with recorded numeric owners (InfluxDB/Grafana/service user data must
     # keep their uid/gid); setuid/setgid/sticky members were already rejected above.
     if ! tar -xzf "$archive" -C "$stage" --numeric-owner --same-owner --preserve-permissions; then
@@ -4528,6 +4659,17 @@ PY
         echo "Missing $LIBEXEC_DIR/restore_journal.py (rerun the installer); nothing was changed" >&2
         exit 1
     fi
+    # The recovery refuses a folder on another filesystem than its real parent; refuse the same thing now,
+    # before anything is written, so that no restore starts that the recovery could not undo.
+    for path in "$root" "$data"; do
+        label=application
+        [ "$path" != "$data" ] || label=data
+        if ! restore_fs_check "$LIBEXEC_DIR/restore_journal.py" "$label" "$path"; then
+            rm -rf -- "$stage"
+            echo "Refusing to restore: $restore_fs_error. Nothing was changed." >&2
+            exit 1
+        fi
+    done
     echo "Writing the extracted backup to disk before changing anything; on an SD card this can take several minutes. Do not interrupt."
     if ! python3 -I "$LIBEXEC_DIR/restore_journal.py" fsync-tree "$stage"; then
         rm -rf -- "$stage"
@@ -4535,6 +4677,11 @@ PY
         exit 1
     fi
     restore_create_journal "$stage" "$root" "$data" "$stamp" "$archive" "$skip_installer" || {
+        if [ "${restore_journal_pending:-0}" = 1 ]; then
+            echo "The recovery journal could not be completed and could not be removed: it is pending in $RESTORE_CURRENT. The application and data folders were not changed." >&2
+            echo "Run: sudo $RESTORE_CURRENT/recover rollback" >&2
+            exit 1
+        fi
         rm -rf -- "$stage"
         echo "Could not create the recovery journal; nothing was changed" >&2
         exit 1

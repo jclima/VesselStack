@@ -430,6 +430,15 @@ if run_pending_install VESSELSTACK_RESTORE_ID=other >/dev/null 2>&1; then
     echo "The installer accepted another restore's id" >&2
     exit 1
 fi
+# A journal whose state cannot be read (a repeated key) gets the manual procedure, like vesselstackctl prints.
+printf 'phase=starting\nphase=starting\n' > "$PENDING_DIR/state"
+if run_pending_install > "$TEST_ROOT/pending.out" 2> "$TEST_ROOT/pending.err"; then
+    echo "The installer ran with an unreadable restore journal" >&2
+    exit 1
+fi
+grep -q 'To resolve this by hand:' "$TEST_ROOT/pending.err"
+grep -q "sudo mv $PENDING_DIR $PENDING_DIR.manual-" "$TEST_ROOT/pending.err"
+grep -q 'run: sudo vesselstackctl doctor' "$TEST_ROOT/pending.err"
 rm -rf -- "${PENDING_DIR:?}"
 test ! -e "$APP_ROOT/config/displays-bridge.env"
 test ! -e "$APP_ROOT/config/displays.json"

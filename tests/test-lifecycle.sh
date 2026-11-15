@@ -2061,7 +2061,7 @@ grep -qxF "sudo $APP_ROOT/installer/install.sh --config $APP_ROOT/config/vessels
 }
 rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
 
-# A restore that is killed part-way (no hooks in the product: a test double for mv kills the restore
+# A restore that is killed part-way (no hooks in the product: test doubles for python3 and mv kill the restore
 # process at the chosen tree rename) can be inspected and undone with the journal's own recover command,
 # without help from the application folder, and a later restore then works.
 KILL_BIN="$TEST_ROOT/kill-bin"
@@ -2086,6 +2086,31 @@ fi
 exec "$real_mv" "$@"
 EOF
 chmod +x "$KILL_BIN/mv"
+# The tree swaps go through the journal helper (python3 -I .../restore_journal.py rename SRC DST), so the same
+# counting is done by a python3 double that kills the caller around that subcommand and otherwise runs the
+# real interpreter with its arguments unchanged.
+REAL_PYTHON3=$(command -v python3)
+cat > "$KILL_BIN/python3" <<EOF
+#!/bin/bash
+real_python3='$REAL_PYTHON3'
+EOF
+cat >> "$KILL_BIN/python3" <<'EOF'
+if [ -n "${KILL_AT:-}" ] && [ "${1:-}" = -I ] && [ "${3:-}" = rename ] && [ "$#" -eq 5 ]; then
+    dest=$5
+    case "$dest" in
+        "$KILL_APP_ROOT"|"$KILL_DATA_ROOT"|*.pre-restore-*)
+            n=$(( $(cat "$KILL_COUNT" 2>/dev/null || echo 0) + 1 ))
+            echo "$n" > "$KILL_COUNT"
+            echo "rename $n: $4 -> $5" >> "$KILL_COUNT.log"
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = before ]; then kill -KILL "$PPID"; exit 137; fi
+            "$real_python3" "$@" || exit $?
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = after ]; then kill -KILL "$PPID"; exit 137; fi
+            exit 0 ;;
+    esac
+fi
+exec "$real_python3" "$@"
+EOF
+chmod +x "$KILL_BIN/python3"
 run_ctl_killed() {
     local at=$1 when=$2
     shift 2
@@ -2107,10 +2132,10 @@ for point in "1 before data-swap" "2 before data-swap" "3 before root-swap" "4 a
     live_app_inode=$(stat -c %i "$APP_ROOT")
     live_data_inode=$(stat -c %i "$DATA_ROOT")
     : > "$FAKE_BIN/calls.log"
-    rm -f -- "$TEST_ROOT/kill-count"
+    rm -f -- "$TEST_ROOT/kill-count" "$TEST_ROOT/kill-count.log"
     killed_rc=0
     run_ctl_killed "$kill_at" "$kill_when" restore "$archive" --yes > "$TEST_ROOT/killed.out" 2>&1 || killed_rc=$?
-    [ "$killed_rc" -ge 128 ] || { echo "The restore was not killed at rename $kill_at (exit $killed_rc)" >&2; cat "$TEST_ROOT/killed.out" >&2; exit 1; }
+    [ "$killed_rc" -ge 128 ] || { echo "The restore was not killed at rename $kill_at (exit $killed_rc)" >&2; cat "$TEST_ROOT/killed.out" "$TEST_ROOT/kill-count.log" >&2; exit 1; }
     [ -f "$RESTORE_CURRENT/state" ] || { echo "No journal was left after a restore killed at rename $kill_at" >&2; exit 1; }
     [ -x "$RESTORE_CURRENT/recover" ] || { echo 'The journal has no recover command' >&2; exit 1; }
     grep -qx "phase=$kill_phase" "$RESTORE_CURRENT/state" || { echo "Unexpected phase after a kill at rename $kill_at" >&2; cat "$RESTORE_CURRENT/state" >&2; exit 1; }

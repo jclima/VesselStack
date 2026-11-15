@@ -91,9 +91,26 @@ if [ "$DRY_RUN" -eq 0 ]; then
     # the restored installer and identifies it with the journal's id. A restore that already committed (or was
     # rolled back) and only left its journal behind does not block anything.
     RESTORE_PENDING_DIR="$SYSTEM_ROOT/var/lib/vesselstack/restore/current"
+    # The way out of a journal that cannot be read: the same text as restore_manual_procedure in
+    # vesselstackctl (a test keeps the two identical; this script cannot source vesselstackctl).
+    restore_manual_procedure() {
+        local dir=$1 root data
+        root=$(python3 -I "$dir/restore_journal.py" get "$dir" root 2>/dev/null || true)
+        data=$(python3 -I "$dir/restore_journal.py" get "$dir" data 2>/dev/null || true)
+        [ -n "$root" ] || root='(not readable from the journal)'
+        [ -n "$data" ] || data='(not readable from the journal)'
+        cat >&2 <<EOF
+To resolve this by hand:
+  1) check that the application folder $root and the data folder $data are the ones you expect (ls -ld);
+  2) if a folder is missing, its previous copy is next to it as <name>.pre-restore-<stamp> (do not delete anything);
+  3) once both folders are in place, move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  4) run: sudo vesselstackctl doctor
+EOF
+    }
     if [ -f "$RESTORE_PENDING_DIR/state" ]; then
         if ! python3 -I "$RESTORE_PENDING_DIR/restore_journal.py" dump "$RESTORE_PENDING_DIR" >/dev/null 2>&1; then
             echo "A restore did not finish and its journal state cannot be read (damaged, a repeated key, or no helper). Nothing else can change this system until it is resolved." >&2
+            restore_manual_procedure "$RESTORE_PENDING_DIR"
             echo "See: sudo $RESTORE_PENDING_DIR/recover status" >&2
             exit 1
         fi
