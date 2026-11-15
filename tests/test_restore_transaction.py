@@ -294,7 +294,7 @@ docker() {
             line=$(grep "^$id|" "@BASE@/containers") || return 1
             IFS='|' read -r _ name project mounts <<< "$line"
             case "$fmt" in *Mounts*) tr ';' '\\n' <<< "$mounts" | while IFS= read -r m; do case "$m" in ro:*) echo "false|${m#ro:}" ;; *) echo "true|$m" ;; esac; done ;;
-                *) printf '%s|/%s\\n' "$project" "$name" ;; esac ;;
+                *) printf '/%s|%s\\n' "$name" "$project" ;; esac ;;
         start) case " ${DOCKER_START_FAIL:-} " in *" ${@: -1} "*) return 1 ;; esac ;;
         stop) for a in "${@:2}"; do
                   case "$a" in -t|30) continue ;; esac
@@ -748,7 +748,7 @@ docker() {
             line=$(grep "^$id|" "@CONT@") || return 1
             IFS='|' read -r _ name project mounts <<< "$line"
             case "$fmt" in *Mounts*) tr ';' '\n' <<< "$mounts" | while IFS= read -r m; do case "$m" in ro:*) echo "false|${m#ro:}" ;; *) echo "true|$m" ;; esac; done ;;
-                *) printf '%s|/%s\n' "$project" "$name" ;; esac ;;
+                *) printf '/%s|%s\n' "$name" "$project" ;; esac ;;
         start) case " ${DOCKER_START_FAIL:-} " in *" ${@: -1} "*) return 1 ;; esac ;;
         stop) for a in "${@:2}"; do
                   case "$a" in -t|30) continue ;; esac
@@ -1868,7 +1868,8 @@ restore_recover_command {arguments}
         self.containers(lay, "c2|other-app|other|%s/influx" % lay["data"], "c3|stuck|other|%s/y" % lay["data"])
         self.reconcile(lay, extra="export DOCKER_STUCK=c3")
         self.assertNotEqual(lay["result"].returncode, 0)
-        self.assertIn("Containers stopped during the recovery (not started again): other-app stuck", lay["result"].stderr)
+        # the one that stayed running is not claimed as stopped
+        self.assertIn("Containers stopped during the recovery (not started again): other-app\n", lay["result"].stderr)
 
     def test_a_container_is_started_again_after_a_commit_and_after_an_abort(self):
         pre = self.FAKE_DOCKER + 'printf "c1|plain|none|@DATA@/sub\\n" > "@BASE@/containers"'
@@ -1903,6 +1904,13 @@ restore_recover_command {arguments}
         self.set_state(lay["journal"], "firewall_enabled=yes", "firewall_active=no")
         self.reconcile(lay)
         self.assert_rolled_back(lay)
+        self.assertIn("NOT running", lay["result"].stderr)
+        self.assertIn("already not running before the restore", lay["result"].stderr)
+        # neither enabled nor running before: nothing to say
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.set_state(lay["journal"], "firewall_enabled=no", "firewall_active=no")
+        self.reconcile(lay)
+        self.assert_rolled_back(lay)
         self.assertNotIn("NOT running", lay["result"].stderr)
         # it is running now: nothing to say
         lay = self.layout("root-swap", "swapped", "swapped", False)
@@ -1917,15 +1925,16 @@ restore_recover_command {arguments}
         self.assert_rolled_back(lay)
         self.assertIn("NOT running", lay["result"].stderr)
 
-    def test_a_refused_rollback_says_the_firewall_is_down_and_prints_the_manual_procedure(self):
+    def test_a_refused_rollback_says_the_firewall_is_down_and_gives_the_retry_command(self):
         lay = self.layout("root-swap", "swapped", "swapped", False)
         self.set_state(lay["journal"], "firewall_enabled=yes", "firewall_active=yes")
         lay["active"].write_text("vesselstack-chat.service\n")
         self.reconcile(lay, extra="export STUCK_UNITS=vesselstack-chat.service")
         self.assertNotEqual(lay["result"].returncode, 0)
         self.assertIn("is NOT running", lay["result"].stderr)
-        self.assertIn("To resolve this by hand:", lay["result"].stderr)
-        self.assertIn(f"application folder {lay['root']} and the data folder {lay['data']}", lay["result"].stderr)
+        self.assertNotIn("move the journal aside", lay["result"].stderr)
+        self.assertNotIn("To resolve this by hand", lay["result"].stderr)
+        self.assertIn(f"run the recovery again: sudo {lay['journal']}/recover rollback", lay["result"].stderr)
 
     def test_recover_status_says_when_the_firewall_is_not_running(self):
         lay = self.layout("root-swap", "swapped", "swapped", False)
@@ -2012,15 +2021,23 @@ restore_recover_command {arguments}
 LIBEXEC_DIR="{helper_dir}"
 restore_probe_renames "{stage}" "{lay['root']}" "{lay['data']}" && echo PROBED || echo "REFUSED $restore_probe_error"
 '''
+        # empty probe folders an interrupted run left in the parents are removed; one with content is not touched
+        (base / "opt/.vesselstack-restore-probe.111").mkdir(); (base / "opt/.vesselstack-restore-probe.222").mkdir()
+        (base / "opt/.vesselstack-restore-probe.222/keep").write_text("x")
         result = self.run_harness(harness, base, real_rename=True)
         self.assertEqual(result.stdout.strip(), "PROBED", result.stderr)
+        self.assertFalse((base / "opt/.vesselstack-restore-probe.111").exists())
+        self.assertTrue((base / "opt/.vesselstack-restore-probe.222/keep").exists())
+        shutil.rmtree(base / "opt/.vesselstack-restore-probe.222")
         self.assertEqual(sorted(p.name for p in (base / "opt").glob(".vesselstack-restore-probe.*")), [])
         self.assertEqual(sorted(p.name for p in stage.glob(".vesselstack-restore-probe.*")), [])
         # a parent that refuses the rename (a bind mount of the same disk gives EXDEV): refused, nothing left behind
         failing = harness.replace("restore_probe_renames \"", '''python3() {{ if [ "${{3:-}}" = rename ] && [[ "${{5:-}}" == "{0}"/.vesselstack-restore-probe.* ]]; then echo "[Errno 18] Invalid cross-device link" >&2; return 1; fi; command python3 "$@"; }}
 restore_probe_renames "'''.format(base / "opt"), 1)
         result = self.run_harness(failing, base, real_rename=True)
-        self.assertTrue(result.stdout.startswith("REFUSED a folder cannot be renamed into"), result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("REFUSED a folder could not be renamed into"), result.stdout + result.stderr)
+        self.assertIn("Invalid cross-device link", result.stdout)
+        self.assertIn("not writable", result.stdout); self.assertIn("separate mount", result.stdout)
         self.assertEqual(sorted(p.name for p in (base / "opt").glob(".vesselstack-restore-probe.*")), [])
         self.assertEqual(sorted(p.name for p in stage.glob(".vesselstack-restore-probe.*")), [])
         text = CONTROLLER.read_text()
@@ -2058,6 +2075,132 @@ restore_probe_renames "'''.format(base / "opt"), 1)
         result = subprocess.run(["/bin/bash", str(lay["journal"] / "recover"), "status"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("To resolve this by hand:", result.stderr)
+
+    # ---- fifth review ----
+
+    def test_a_journal_that_cannot_be_used_gets_the_safe_manual_procedure_and_a_retryable_refusal_does_not(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.set_state(lay["journal"], "stamp=bogus")
+        self.reconcile(lay)
+        err = lay["result"].stderr
+        self.assertNotEqual(lay["result"].returncode, 0)
+        self.assertIn("To resolve this by hand", err)
+        self.assertIn("is the RESTORED copy", err)
+        self.assertIn("<folder>.failed-restore-<stamp>", err)
+        self.assertIn("both folders must come from the same side", err)
+        self.assertIn("move the journal aside", err)
+        self.assertNotIn("run the recovery again:", err)
+
+    def test_the_manual_procedure_text_is_the_same_in_the_recover_wrapper(self):
+        def heredoc(text, marker, end):
+            a = text.index(marker); start = text.index("\n", a) + 1
+            return text[start:text.index(end, start)]
+        text = CONTROLLER.read_text()
+        func = heredoc(text[text.index("restore_manual_procedure() {"):], "<<EOF", "\nEOF\n")
+        wrapper = heredoc(text[text.index("cannot_read() {"):], "<<MANUAL", "\nMANUAL\n")
+        self.assertEqual(func, wrapper)
+
+    def test_a_container_stopped_by_the_recovery_is_named_only_when_it_really_stopped(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.containers(lay, "c1|vesselstack-grafana|vesselstack|/elsewhere", "c2|mine|other|%s/x" % lay["root"])
+        self.reconcile(lay, extra="export DOCKER_STUCK=c1")
+        err = lay["result"].stderr
+        self.assertNotEqual(lay["result"].returncode, 0)
+        self.assertIn("Containers stopped during the recovery (not started again): mine", err)
+        self.assertNotIn("not started again): vesselstack-grafana", err); self.assertNotIn("mine vesselstack-grafana", err)
+        self.assertNotIn("again): mine vesselstack-grafana", err)
+
+    def test_a_rollback_goes_on_when_the_containers_cannot_be_recorded_and_says_so(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.containers(lay, "c1|mine|other|%s/x" % lay["root"])
+        self.reconcile(lay, extra='restore_sync_file() { case "$2" in *quiesced-containers) return 1 ;; *) return 0 ;; esac; }')
+        self.assert_rolled_back(lay)
+        err = lay["result"].stderr
+        self.assertIn("could not be recorded", err); self.assertIn("will NOT be started again automatically: mine", err)
+        self.assertIn("sudo docker start mine", err)
+        self.assertTrue([c for c in lay["calls"] if c.startswith("docker stop")], lay["calls"])
+
+    def test_a_rollback_from_a_rescue_system_without_systemd_ends_rolled_back_with_status_3(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.reconcile(lay, extra='rmdir "$SYSTEM_ROOT/run/systemd/system"')
+        result = lay["result"]
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("outcome=rolled-back", result.stdout)
+        self.assertEqual((lay["root"] / "marker").read_text(), "old-root"); self.assertEqual((lay["data"] / "marker").read_text(), "old-data")
+        self.assertIn("systemd is not running here", result.stderr)
+        self.assertIn("sudo vesselstackctl start", result.stderr)
+        self.assertNotIn("systemctl daemon-reload", lay["calls"])
+        self.assertFalse([c for c in lay["calls"] if c.startswith(("systemctl start", "systemctl restart")) or c.endswith(" start") and c.startswith("controller")], lay["calls"])
+        self.assertFalse(lay["journal"].exists())
+        self.assertEqual(phase_of(self.archive(lay, "rolled-back")), "rolled-back")
+
+    def test_an_abandon_records_where_it_came_from_and_the_warning_follows_it(self):
+        lay = self.layout("stopped")
+        done = self.recover_harness(lay, "abandon --yes")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("publishing system files", done.stdout)
+        self.assertIn("abandoned_from=stopped", (self.archive(lay, "abandoned") / "state").read_text())
+        for source, expected, unexpected in (("stopping", None, "publishing system files"), ("externals", "had begun publishing system files", "may have"),
+                                             (None, "may have begun publishing system files", "had begun")):
+            with self.subTest(source=source):
+                lay = self.layout("abandoned")
+                if source: self.set_state(lay["journal"], f"abandoned_from={source}")
+                self.reconcile(lay)
+                self.assertEqual(lay["result"].returncode, 0, lay["result"].stderr)
+                if expected: self.assertIn(expected, lay["result"].stdout)
+                self.assertNotIn(unexpected, lay["result"].stdout)
+        lay = self.layout("rollback-failed")
+        self.set_state(lay["journal"], "rollback_from=externals")
+        self.assertEqual(self.recover_harness(lay, "abandon --yes").returncode, 0)
+        self.assertIn("abandoned_from=rollback-failed", (self.archive(lay, "abandoned") / "state").read_text())
+
+    def test_the_recover_wrapper_explains_each_way_the_journal_can_be_unreadable(self):
+        text = CONTROLLER.read_text()
+        a = text.index("<<'RECOVER'\n") + len("<<'RECOVER'\n"); wrapper = text[a:text.index("\nRECOVER\n", a) + 1]
+        def run(lay):
+            (lay["journal"] / "recover").write_text(wrapper); (lay["journal"] / "recover").chmod(0o700)
+            return subprocess.run(["/bin/bash", str(lay["journal"] / "recover"), "status"], capture_output=True, text=True)
+        lay = self.layout("root-swap", "swapped", "away", False)
+        (lay["journal"] / "state").write_text("")
+        result = run(lay)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("is missing or empty", result.stderr); self.assertIn("To resolve this by hand", result.stderr)
+        lay = self.layout("root-swap", "swapped", "away", False)
+        state = lay["journal"] / "state"
+        state.write_text("".join(l for l in state.read_text().splitlines(True) if not l.startswith("system_root=")))
+        result = run(lay)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('the state does not record "system_root"', result.stderr)
+        self.assertNotIn("python3 is missing", result.stderr); self.assertIn("To resolve this by hand", result.stderr)
+        self.assertIn(f"application folder {lay['root']} and the data folder {lay['data']}", result.stderr)
+
+    def test_the_firewall_notice_after_a_commit_when_the_restored_release_stopped_it(self):
+        set_fw = 'python3 -I "@BASE@/restore/current/restore_journal.py" set "@BASE@/restore/current" %s'
+        td, result, root, data = self.run_transaction("success", pre=set_fw % "firewall_enabled=yes firewall_active=yes"); self.addCleanup(td.cleanup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("The firewall (vesselstack-firewall.service) is NOT running", result.stderr)
+        td, result, root, data = self.run_transaction("success", pre=set_fw % "firewall_enabled=yes firewall_active=no"); self.addCleanup(td.cleanup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("NOT running", result.stderr)
+
+    def test_a_compose_label_with_a_separator_does_not_corrupt_the_recorded_name(self):
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        body = transaction_source() + f'''
+docker() {{ case "$1" in info) return 0 ;; ps) echo c1 ;;
+    inspect) case "$3" in *Mounts*) echo "true|{lay['root']}/x" ;; *) echo "/mine|we|ird proj" ;; esac ;; esac; }}
+restore_docker_processes() {{ return 1; }}
+restore_find_containers "{lay['root']}" "{lay['data']}" "{lay['journal']}/restore_journal.py" || true
+restore_record_containers "{lay['journal']}"
+echo "name=${{restore_container_name_list[0]}} label=${{restore_container_label_list[0]}}"
+cat "{lay['journal']}/quiesced-containers"
+'''
+        result = self.run_harness(body, lay["base"])
+        self.assertIn("name=mine label=we|ird_proj", result.stdout, result.stderr)
+        self.assertIn("c1 mine we|ird_proj", result.stdout)
+        # a file written by the previous format is still read
+        (lay["journal"] / "quiesced-containers").write_text("c2 other-app other\nc1 vesselstack-grafana vesselstack\n")
+        started = self.run_harness(transaction_source() + f'docker() {{ echo "docker $*"; }}\nrestore_start_containers "{lay["journal"]}/quiesced-containers"\n', lay["base"])
+        self.assertIn("Containers started again: other-app", started.stdout, started.stderr)
 
     def test_the_unused_swap_in_function_is_gone(self):
         self.assertNotIn("\nswap_in() {", CONTROLLER.read_text())

@@ -101,10 +101,14 @@ if [ "$DRY_RUN" -eq 0 ]; then
         [ -n "$data" ] || data='(not readable from the journal)'
         cat >&2 <<EOF
 To resolve this by hand:
-  1) check that the application folder $root and the data folder $data are the ones you expect (ls -ld);
-  2) if a folder is missing, its previous copy is next to it as <name>.pre-restore-<stamp> (do not delete anything);
-  3) once both folders are in place, move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  4) run: sudo vesselstackctl doctor
+  1) the two folders are the application folder $root and the data folder $data. For each one:
+     - if <folder>.pre-restore-<stamp> exists next to it, the folder at the normal path is the RESTORED copy:
+       move it to <folder>.failed-restore-<stamp>, then move the .pre-restore-<stamp> one back to the normal path;
+     - if the folder is missing and <folder>.pre-restore-<stamp> exists, move that one back;
+     - do not delete anything;
+  2) both folders must come from the same side (both the previous ones) before you go on;
+  3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
 EOF
     }
     if [ -f "$RESTORE_PENDING_DIR/state" ]; then

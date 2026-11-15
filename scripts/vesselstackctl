@@ -69,10 +69,14 @@ restore_manual_procedure() {
     [ -n "$data" ] || data='(not readable from the journal)'
     cat >&2 <<EOF
 To resolve this by hand:
-  1) check that the application folder $root and the data folder $data are the ones you expect (ls -ld);
-  2) if a folder is missing, its previous copy is next to it as <name>.pre-restore-<stamp> (do not delete anything);
-  3) once both folders are in place, move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  4) run: sudo vesselstackctl doctor
+  1) the two folders are the application folder $root and the data folder $data. For each one:
+     - if <folder>.pre-restore-<stamp> exists next to it, the folder at the normal path is the RESTORED copy:
+       move it to <folder>.failed-restore-<stamp>, then move the .pre-restore-<stamp> one back to the normal path;
+     - if the folder is missing and <folder>.pre-restore-<stamp> exists, move that one back;
+     - do not delete anything;
+  2) both folders must come from the same side (both the previous ones) before you go on;
+  3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
 EOF
 }
 # Prints the one-line "Restore ..." status; fails when the restore blocks other commands. A restore
@@ -3433,14 +3437,14 @@ restore_state_load() {
     local journal=$1 dump line key
     st_format='' st_id='' st_stamp='' st_root='' st_data='' st_system_root='' st_stage='' st_archive='' st_started=''
     st_root_live='' st_data_live='' st_root_new='' st_data_new='' st_phase='' st_rollback_from=''
-    st_last_error='' st_firewall_enabled='' st_firewall_active='' st_keys=$'\n'
+    st_last_error='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_keys=$'\n'
     dump=$(python3 -I "$journal/restore_journal.py" dump "$journal") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         key=${line%%=*}
         st_keys="$st_keys$key"$'\n'
         case "$key" in
-            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|firewall_enabled|firewall_active)
+            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|firewall_enabled|firewall_active|abandoned_from)
                 printf -v "st_$key" '%s' "${line#*=}" ;;
         esac
     done <<< "$dump"
@@ -3601,8 +3605,10 @@ restore_abort() {
     esac
     return 1
 }
+# A third argument "manual" says the journal itself cannot be used (retrying cannot help): then the way out by hand is
+# printed. Every other refusal names its cause and ends with the one command to run again once it is fixed.
 restore_reconcile_fail() {
-    local journal=$1 message=$2 origin=()
+    local journal=$1 message=$2 kind=${3:-retry} origin=()
     # Remember where the rollback started from, so that a retry after the cause is fixed does not treat it as
     # a rollback from "starting". An origin that is already recorded is never overwritten.
     if [ -z "${st_rollback_from:-}" ] && [ -n "${restore_fail_origin:-}" ]; then origin=("rollback_from=$restore_fail_origin"); fi
@@ -3612,8 +3618,11 @@ restore_reconcile_fail() {
     if [ -n "${restore_stopped_units:-}" ]; then echo "Units stopped during the recovery (not started again):$restore_stopped_units" >&2; fi
     if [ -n "${restore_stopped_containers:-}" ]; then echo "Containers stopped during the recovery (not started again):$restore_stopped_containers" >&2; fi
     restore_firewall_notice >&2
-    # The rollback was refused: say how to get out of it by hand.
-    restore_manual_procedure "$journal"
+    if [ "$kind" = manual ]; then
+        restore_manual_procedure "$journal"
+    else
+        echo "Fix the cause above, then run the recovery again: sudo $journal/recover rollback" >&2
+    fi
     return 1
 }
 # Remove the staged copy named by the journal, only when the state validates (see restore_validate_state).
@@ -3712,8 +3721,14 @@ restore_tree_preflight() {
 # no device comparison can see. The probe is removed on every path. Fails with restore_probe_error.
 restore_probe_renames() {
     local stage=$1 root=$2 data=$3 path parent probe dest rc=0 name=".vesselstack-restore-probe.$$"
-    restore_probe_error=''
+    restore_probe_error='' restore_rename_error=''
     probe="$stage/$name"
+    # Empty test folders that an earlier, interrupted probe left behind; rmdir only, so nothing with content is touched.
+    for path in "$root" "$data"; do
+        for dest in "${path%/*}"/.vesselstack-restore-probe.*; do
+            if [ -d "$dest" ] && [ ! -L "$dest" ]; then rmdir -- "$dest" 2>/dev/null || true; fi
+        done
+    done
     mkdir -- "$probe" || { restore_probe_error="could not make a test folder in $stage"; return 1; }
     for path in "$root" "$data"; do
         parent=${path%/*}
@@ -3721,8 +3736,9 @@ restore_probe_renames() {
         if [ -e "$dest" ] || [ -L "$dest" ]; then
             restore_probe_error="$dest is in the way; move it away"
             rc=1
-        elif ! restore_rename_tree "$LIBEXEC_DIR" "$probe" "$dest"; then
-            restore_probe_error="a folder cannot be renamed into ${parent:-/} (is it a separate mount of the same disk?)"
+        elif ! restore_rename_error=$(restore_rename_tree "$LIBEXEC_DIR" "$probe" "$dest" 2>&1); then
+            restore_rename_error=${restore_rename_error//[$'\n\r']/ }
+            restore_probe_error="a folder could not be renamed into ${parent:-/}: ${restore_rename_error:-unknown error}. Either that folder is not writable (or the disk is read-only), or it is a separate mount of the same disk"
             rc=1
         elif ! restore_rename_tree "$LIBEXEC_DIR" "$dest" "$probe"; then
             restore_probe_error="a test folder renamed into ${parent:-/} cannot be renamed back; it is left at $dest, remove it"
@@ -3747,6 +3763,10 @@ restore_writer_units() {
         esac
     done < <(restore_known_units)
 }
+# True when systemd is the running init system (a rescue system, a chroot or a container has none).
+restore_systemd_running() {
+    [ -d "$SYSTEM_ROOT/run/systemd/system" ]
+}
 # True when the unit is inactive or failed. A unit that is activating (auto-restart), deactivating or
 # reloading is not idle; a unit systemd does not know reports "inactive". Without a running systemd
 # ($SYSTEM_ROOT/run/systemd/system absent) every unit is idle. Fails closed otherwise: when systemctl
@@ -3754,7 +3774,7 @@ restore_writer_units() {
 restore_unit_idle() {
     local state
     # Without a running systemd there is no unit to be running (a container, a chroot): every unit is idle.
-    [ -d "$SYSTEM_ROOT/run/systemd/system" ] || return 0
+    restore_systemd_running || return 0
     state=$(systemctl show -p ActiveState --value "$1" 2>/dev/null) || return 1
     case "$state" in inactive|failed) return 0 ;; *) return 1 ;; esac
 }
@@ -3806,11 +3826,13 @@ restore_find_containers() {
     targets=("$root" "$data" "${rroot:-$root}" "${rdata:-$data}")
     while IFS= read -r id; do
         [ -n "$id" ] || continue
-        if ! info=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}|{{.Name}}' "$id" 2>/dev/null); then
+        if ! info=$(docker inspect --format '{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null); then
             restore_container_error="container $id could not be inspected"
             return 2
         fi
-        label=${info%%|*} name=${info#*|} name=${name#/} hit=0
+        # The name comes first and cannot hold "|"; the label is everything after the first "|" (it may hold one).
+        name=${info%%|*} label=${info#*|} name=${name#/} hit=0
+        label=${label//[$'\n\r\t ']/_}
         [ "$label" != vesselstack ] || hit=1
         if [ "$hit" -eq 0 ]; then
             if ! mounts=$(docker inspect --format '{{range .Mounts}}{{.RW}}|{{println .Source}}{{end}}' "$id" 2>/dev/null); then
@@ -3855,7 +3877,6 @@ restore_record_containers() {
             printf '%s %s %s\n' "${restore_container_ids[i]}" "${restore_container_name_list[i]}" "${restore_container_label_list[i]:--}" \
                 >> "$journal/quiesced-containers" || return 1
         fi
-        case " $restore_stopped_containers " in *" ${restore_container_name_list[i]} "*) ;; *) restore_stopped_containers="$restore_stopped_containers ${restore_container_name_list[i]}" ;; esac
     done
     restore_sync_file "$journal" "$journal/quiesced-containers"
 }
@@ -3902,8 +3923,11 @@ restore_stop_writers() {
         done < <(restore_writer_units)
     done
 }
+# A fourth argument "rollback" makes a failure to record the containers a warning instead of a refusal: a rollback
+# must work on a full disk, and a container that was not recorded is simply not started again by itself.
 restore_verify_stopped() {
-    local root=$1 data=$2 journal=$3 unit active='' rc helper="$3/restore_journal.py"
+    local root=$1 data=$2 journal=$3 mode=${4:-forward} unit active='' rc helper="$3/restore_journal.py" name
+    local -a tried=()
     restore_verify_error='' restore_verify_suffix=''
     while IFS= read -r unit; do
         restore_unit_idle "$unit" || active="$active $unit"
@@ -3918,13 +3942,24 @@ restore_verify_stopped() {
     if [ "$rc" -eq 1 ]; then
         # Written down first: whatever happens next, the containers that are stopped here are started again.
         if ! restore_record_containers "$journal"; then
-            restore_verify_error="could not record in the journal which containers were stopped:$restore_container_names"
-            restore_verify_suffix="; nothing was moved"
-            return 1
+            if [ "$mode" != rollback ]; then
+                restore_verify_error="could not record in the journal which containers were stopped:$restore_container_names"
+                restore_verify_suffix="; nothing was moved"
+                return 1
+            fi
+            echo "WARN these containers could not be recorded in the journal (is the disk full?), so they will NOT be started again automatically:$restore_container_names. They are stopped now so the recovery can go on; start them yourself afterwards: sudo docker start${restore_container_names}" >&2
         fi
+        tried=("${restore_container_name_list[@]}")
         docker stop -t 30 "${restore_container_ids[@]}" >/dev/null 2>&1 || true
         rc=0
         restore_find_containers "$root" "$data" "$helper" || rc=$?
+        # Named only once docker stop has run and the container is no longer running (when that can be told).
+        if [ "$rc" -ne 2 ]; then
+            for name in "${tried[@]}"; do
+                case " $restore_container_names " in *" $name "*) continue ;; esac
+                case " $restore_stopped_containers " in *" $name "*) ;; *) restore_stopped_containers="$restore_stopped_containers $name" ;; esac
+            done
+        fi
     fi
     case "$rc" in
         0) ;;
@@ -3954,7 +3989,7 @@ restore_stop_before_moving() {
         restore_run_controller "$journal" "$journal/controller" stop || \
             echo "WARN the stack could not be stopped (controller stop); checking the units instead" >&2
     fi
-    if ! restore_verify_stopped "$root" "$data" "$journal"; then
+    if ! restore_verify_stopped "$root" "$data" "$journal" rollback; then
         restore_reconcile_fail "$journal" "$restore_verify_error$restore_verify_suffix"
         return 1
     fi
@@ -3965,7 +4000,7 @@ restore_reconcile_tree() {
     local journal=$1 label=$2 path=$3 live_ino=$4 new_ino=$5 stamp=$6 current
     local failed="$path.failed-restore-$stamp" pre="$path.pre-restore-$stamp"
     if [ -z "$live_ino" ] || [ -z "$new_ino" ] || [ "$live_ino" = absent ] || [ "$new_ino" = absent ]; then
-        restore_reconcile_fail "$journal" "the journal has no inode recorded for the $label tree $path"
+        restore_reconcile_fail "$journal" "the journal has no inode recorded for the $label tree $path" manual
         return 1
     fi
     current=$(restore_inode "$journal" "$path")
@@ -4017,17 +4052,26 @@ restore_reapply_firewall() {
     fi
     return 0
 }
-# Says so when the firewall was running before the restore (the journal records it at "prepared") and is not
-# running now; says nothing otherwise. A journal without that record (written by an earlier release) falls back
-# to the live state: the firewall is enabled but not running. Needs restore_state_load. Prints on stdout.
+# Says so when the firewall is not running now but should be: it was running before the restore (the journal records
+# it at "prepared"), or it is enabled (then it is also said when it was already not running before the restore).
+# With the argument "commit" (a restore that finished) only the first case counts. A journal without a record
+# (written by an earlier release) falls back to the live state: the firewall is enabled but not running.
+# Needs restore_state_load. Prints on stdout.
 restore_firewall_notice() {
+    local before=''
     if [ -n "${st_firewall_active:-}" ]; then
-        [ "$st_firewall_active" = yes ] || return 0
+        before=$st_firewall_active
+        if [ "$before" != yes ]; then
+            [ "${1:-}" != commit ] || return 0
+            [ "${st_firewall_enabled:-}" = yes ] || return 0
+        fi
     else
+        [ "${1:-}" != commit ] || return 0
         systemctl is-enabled --quiet vesselstack-firewall.service 2>/dev/null || return 0
     fi
     systemctl is-active --quiet vesselstack-firewall.service 2>/dev/null && return 0
     printf '%s\n' "The firewall (vesselstack-firewall.service) is NOT running, so the boat's network is not protected by it. Start it with: sudo systemctl start vesselstack-firewall.service"
+    if [ "$before" = no ]; then printf '%s\n' "(It was already not running before the restore.)"; fi
 }
 # What follows an abandon, whether the abandon command or the reconcile of an abandoned journal archived it:
 # start again the units and containers this restore had stopped (vesselstackctl start does not start the backup
@@ -4048,8 +4092,12 @@ restore_abandon_followup() {
     fi
     restore_start_containers "$archived/quiesced-containers"
     restore_firewall_notice
-    if [ "$touched" -eq 1 ]; then
-        echo "WARNING: the restore had begun publishing system files. The unit files, /usr/local/sbin/vesselstackctl and the helpers in $LIBEXEC_DIR may belong to the RESTORED release."
+    if [ "$touched" -ne 0 ]; then
+        if [ "$touched" -eq 2 ]; then
+            echo "WARNING: the restore may have begun publishing system files (the journal does not say). The unit files, /usr/local/sbin/vesselstackctl and the helpers in $LIBEXEC_DIR may belong to the RESTORED release."
+        else
+            echo "WARNING: the restore had begun publishing system files. The unit files, /usr/local/sbin/vesselstackctl and the helpers in $LIBEXEC_DIR may belong to the RESTORED release."
+        fi
         echo "The snapshot of the previous system files is kept in $archived (files/ and manifest)."
         if [ -f "$installer" ]; then
             echo "To bring the system files back to the installed release, run: sudo $installer --config $st_root/config/vesselstack.env --start"
@@ -4069,19 +4117,21 @@ restore_abandon_followup() {
 # Starting the previous stack after that point can fail for reasons that have nothing to do with the
 # restore, so it must never leave the journal pending (that would lock the owner out of every command).
 restore_reconcile_run() {
-    local journal=$1 phase from stamp root data root_live root_new data_live data_new
-    local controller="$1/controller" need_start=0 start_error='' externals_restored=0
+    local journal=$1 phase from stamp root data root_live root_new data_live data_new touched=0
+    local controller="$1/controller" need_start=0 start_error='' externals_restored=0 no_systemd=0
     restore_firewall_warning=''
     restore_outcome='' restore_archived='' restore_stopped_units='' restore_stopped_containers='' restore_journal_ok=1 restore_validated='' restore_fail_origin=''
     if ! restore_state_load "$journal"; then
         echo "RECOVERY ERROR: the journal state $journal/state cannot be read (damaged, a repeated key, or no helper); nothing was changed" >&2
         restore_outcome=rollback-failed
+        restore_manual_procedure "$journal"
         return 1
     fi
     phase=$st_phase
     if [ -z "$phase" ]; then
         echo "RECOVERY ERROR: $journal/state has no phase" >&2
         restore_outcome=rollback-failed
+        restore_manual_procedure "$journal"
         return 1
     fi
     case "$phase" in prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) restore_fail_origin=$phase ;; esac
@@ -4098,7 +4148,7 @@ restore_reconcile_run() {
                 restore_outcome=rollback-failed
                 echo "RECOVERY ERROR: the restore journal $restore_validate_error; the restore had been abandoned, so nothing was rolled back or changed" >&2
                 restore_manual_procedure "$journal" ;;
-            *) restore_reconcile_fail "$journal" "the restore journal $restore_validate_error; nothing was changed" ;;
+            *) restore_reconcile_fail "$journal" "the restore journal $restore_validate_error; nothing was changed" manual ;;
         esac
         return 1
     fi
@@ -4123,7 +4173,12 @@ restore_reconcile_run() {
             # of the system files stays in the record, as an abandon keeps it.
             restore_outcome=abandoned
             restore_remove_stage "$journal"
-            restore_keep_snapshot=1
+            touched=2
+            if [ -n "$st_abandoned_from" ]; then
+                touched=0
+                if restore_abandoned_touched "$st_abandoned_from"; then touched=1; fi
+            fi
+            if [ "$touched" -ne 0 ]; then restore_keep_snapshot=1; fi
             if ! restore_archive_journal "$journal" abandoned; then
                 restore_keep_snapshot=0
                 echo "WARN could not archive the journal; run: sudo $journal/recover rollback" >&2
@@ -4132,20 +4187,20 @@ restore_reconcile_run() {
             restore_keep_snapshot=0
             # The abandon had stopped here before its follow-up: do it now (the snapshot is kept, so the
             # warning about the system files is repeated whether or not they had been touched).
-            restore_abandon_followup "$restore_archived" 1
+            restore_abandon_followup "$restore_archived" "$touched"
             return 0 ;;
         rolling-back|rollback-failed)
             from=$st_rollback_from
             [ -n "$from" ] || from=starting ;;
         prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) from=$phase ;;
         *)
-            restore_reconcile_fail "$journal" "the journal has an unknown phase: $phase"
+            restore_reconcile_fail "$journal" "the journal has an unknown phase: $phase" manual
             return 1 ;;
     esac
     case "$from" in
         prepared|stopping|stopped|data-swap|root-swap|externals|reloaded|starting) ;;
         *)
-            restore_reconcile_fail "$journal" "the journal has an unknown rollback phase: $from"
+            restore_reconcile_fail "$journal" "the journal has an unknown rollback phase: $from" manual
             return 1 ;;
     esac
     # The decisions below come from the trees, not from the phase, so a journal that cannot be
@@ -4165,7 +4220,7 @@ restore_reconcile_run() {
                 externals|reloaded|starting)
                     # A damaged snapshot is found now, while nothing has been moved.
                     restore_check_externals "$journal" || {
-                        restore_reconcile_fail "$journal" "the system file snapshot in the journal is damaged: ${restore_externals_error:-unknown error}; nothing was changed"
+                        restore_reconcile_fail "$journal" "the system file snapshot in the journal is damaged: ${restore_externals_error:-unknown error}; nothing was changed" manual
                         return 1
                     } ;;
             esac
@@ -4191,20 +4246,30 @@ restore_reconcile_run() {
                     externals_restored=1 ;;
             esac
             rm -f -- "$journal/removed-units"
-            systemctl daemon-reload || {
-                restore_reconcile_fail "$journal" "systemd could not be reloaded after the rollback"
-                return 1
-            }
-            if [ "$externals_restored" -eq 1 ]; then restore_reapply_firewall; fi
+            if restore_systemd_running; then
+                systemctl daemon-reload || {
+                    restore_reconcile_fail "$journal" "systemd could not be reloaded after the rollback"
+                    return 1
+                }
+                if [ "$externals_restored" -eq 1 ]; then restore_reapply_firewall; fi
+            else
+                # A rescue system: the folders are back, which is what the rollback is for. Nothing can be reloaded
+                # or started here; this ends like a rollback whose previous system could not be started.
+                no_systemd=1
+                echo "NOTE systemd is not running here, so the services were not reloaded or started and the firewall was not restarted. After booting normally run: sudo systemctl daemon-reload; sudo vesselstackctl start; sudo vesselstackctl doctor" >&2
+                start_error="systemd is not running (see the note above)"
+            fi
             need_start=1 ;;
     esac
     if [ "$need_start" -eq 1 ]; then
-        if ! restore_run_controller "$journal" "$controller" start; then
-            start_error="the previous stack could not be started ($controller start)"
-        fi
-        restore_quiesced=$(cat "$journal/quiesced-units" 2>/dev/null || true)
-        if ! restore_start_quiesced; then
-            start_error="${start_error:+$start_error; }could not start:$restore_unstarted"
+        if [ "$no_systemd" -eq 0 ]; then
+            if ! restore_run_controller "$journal" "$controller" start; then
+                start_error="the previous stack could not be started ($controller start)"
+            fi
+            restore_quiesced=$(cat "$journal/quiesced-units" 2>/dev/null || true)
+            if ! restore_start_quiesced; then
+                start_error="${start_error:+$start_error; }could not start:$restore_unstarted"
+            fi
         fi
         # Containers that are not part of the stack and were stopped for the swap; a failure is said, not fatal.
         restore_start_containers "$journal/quiesced-containers"
@@ -4390,6 +4455,11 @@ restore_system_files_touched() {
     esac
     return 1
 }
+# Like restore_system_files_touched, for the phase the restore was in (or abandoned from).
+restore_abandoned_touched() {
+    local st_phase=$1
+    restore_system_files_touched
+}
 # Give up on the rollback: allowed only when both original trees are in place. Archives the journal as
 # abandoned-<stamp> and says what was not done. Without --yes it only says what it would do.
 restore_recover_abandon() {
@@ -4422,7 +4492,8 @@ restore_recover_abandon() {
         return 0
     fi
     restore_remove_stage "$journal"
-    restore_state_set "$journal" phase=abandoned || true
+    # The phase it is abandoned from is recorded, so that a reconcile of this journal knows whether system files were touched.
+    restore_state_set "$journal" phase=abandoned "abandoned_from=${st_phase:-unknown}" || true
     restore_keep_snapshot=$touched
     restore_archive_journal "$journal" abandoned || {
         restore_keep_snapshot=0
@@ -4535,6 +4606,8 @@ restore_commit_transaction() {
     fi
     restore_resume_quiesced
     restore_start_containers "$journal/quiesced-containers"
+    # The restored release may not ship the firewall unit (restore_sync_system_files stops what it removes): say so.
+    if restore_state_load "$journal" 2>/dev/null; then restore_firewall_notice commit >&2; fi
     restore_enter "$journal" committed || return 1
     return 0
 }
@@ -4605,34 +4678,55 @@ restore_populate_journal() {
 #   recover abandon --yes    give up on the rollback when both original folders are in place
 set -euo pipefail
 dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-# A journal that was not fully written (a power loss) must not "recover" by doing nothing.
-for file in controller restore_journal.py state; do
-    if [ ! -s "$dir/$file" ]; then
-        echo "recover: $dir/$file is missing or empty; the restore journal in $dir is damaged and cannot be used" >&2
-        exit 1
-    fi
-done
-journal_get() { python3 -I "$dir/restore_journal.py" get "$dir" "$1"; }
-# Without python3 or a helper that runs, the controller cannot read the journal either: say how to resolve it by hand.
+# Quiet reads, used only to fill in the folders in the text below.
+journal_peek() { python3 -I "$dir/restore_journal.py" get "$dir" "$1" 2>/dev/null || true; }
+# A journal that cannot be used: say why, then how to resolve it by hand.
 cannot_read() {
     local root data
-    root=$(journal_get root 2>/dev/null || true)
-    data=$(journal_get data 2>/dev/null || true)
+    root=$(journal_peek root)
+    data=$(journal_peek data)
     [ -n "$root" ] || root='(not readable from the journal)'
     [ -n "$data" ] || data='(not readable from the journal)'
-    echo "Cannot read the restore journal in $dir (python3 is missing or the journal's helper does not run)" >&2
+    echo "Cannot read the restore journal in $dir: $1" >&2
     cat >&2 <<MANUAL
 To resolve this by hand:
-  1) check that the application folder $root and the data folder $data are the ones you expect (ls -ld);
-  2) if a folder is missing, its previous copy is next to it as <name>.pre-restore-<stamp> (do not delete anything);
-  3) once both folders are in place, move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
-  4) run: sudo vesselstackctl doctor
+  1) the two folders are the application folder $root and the data folder $data. For each one:
+     - if <folder>.pre-restore-<stamp> exists next to it, the folder at the normal path is the RESTORED copy:
+       move it to <folder>.failed-restore-<stamp>, then move the .pre-restore-<stamp> one back to the normal path;
+     - if the folder is missing and <folder>.pre-restore-<stamp> exists, move that one back;
+     - do not delete anything;
+  2) both folders must come from the same side (both the previous ones) before you go on;
+  3) then move the journal aside: sudo mv $dir $dir.manual-$(date +%Y%m%d);
+  4) start the stack (sudo vesselstackctl start) and run: sudo vesselstackctl doctor
 MANUAL
     exit 1
 }
-VESSELSTACK_ROOT=$(journal_get root) || cannot_read
-VESSELSTACK_SYSTEM_ROOT=$(journal_get system_root) || cannot_read
-VESSELSTACK_DATA=$(journal_get data) || cannot_read
+# A journal that was not fully written (a power loss) must not "recover" by doing nothing.
+for file in controller restore_journal.py state; do
+    if [ ! -s "$dir/$file" ]; then
+        cannot_read "$dir/$file is missing or empty; the journal is damaged"
+    fi
+done
+# Sets journal_value to the value of KEY, or says exactly which of the causes it is.
+journal_get() {
+    local rc=0
+    journal_value=$(python3 -I "$dir/restore_journal.py" get "$dir" "$1" 2>/dev/null) || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1)
+            # Exit status 1 is also what a helper that fails gives: tell an absent key from a helper that does not work.
+            if python3 -I "$dir/restore_journal.py" dump "$dir" >/dev/null 2>&1; then
+                cannot_read "the state does not record \"$1\""
+            fi
+            cannot_read "the journal's helper does not run or its state is damaged" ;;
+        2) cannot_read "the state is damaged or repeats a key" ;;
+        127) cannot_read "python3 is not installed" ;;
+        *) cannot_read "python3 or the journal's helper does not run (status $rc)" ;;
+    esac
+}
+journal_get root; VESSELSTACK_ROOT=$journal_value
+journal_get system_root; VESSELSTACK_SYSTEM_ROOT=$journal_value
+journal_get data; VESSELSTACK_DATA=$journal_value
 unset VESSELSTACK_ENV
 export VESSELSTACK_ROOT VESSELSTACK_SYSTEM_ROOT VESSELSTACK_DATA
 exec bash "$dir/controller" restore-recover "$@"
