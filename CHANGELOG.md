@@ -122,6 +122,8 @@ pre-release.
 - The Home Assistant blueprints default `notification_actions` to a persistent notification.
 - The installer warns, with the package, path and error, when it cannot read a Signal K plugin's
   `package.json`.
+- The installer's "settings cannot be written safely" message now points to the README section that
+  explains the value rules ("4. Configure the vessel").
 
 ### Security
 

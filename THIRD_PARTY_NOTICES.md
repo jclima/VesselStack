@@ -3,7 +3,7 @@
 VesselStack orchestrates and integrates third-party software but does not
 relicense those projects. Each component remains subject to its own license.
 
-Key runtime components include Home Assistant, SignalK, InfluxDB, Grafana,
+Key runtime components include Home Assistant, Signal K, InfluxDB, Grafana,
 Prometheus, Eclipse Mosquitto, Homepage (gethomepage.dev, GPL-3.0; separately distributed container image, not bundled), Docker, Python, sqlite-vec, and, when
 the opt-in displays bridge is enabled, paho-mqtt (Eclipse Public License 2.0 /
 Eclipse Distribution License 1.0) and websockets (BSD-3-Clause). Image and Python
@@ -45,7 +45,7 @@ upstream font.
 
 ## signalk-vesseltwin
 
-Managed SignalK installs may preload `signalk-vesseltwin` 0.2.3 from npm using
+Managed Signal K installs may preload `signalk-vesseltwin` 0.2.3 from npm using
 an immutable SHA-512 pin. It is an optional third-party plugin; upstream
 license and notices remain authoritative. See the [upstream repository](https://github.com/jclima/signalk-vesseltwin)
 and its Apache-2.0 license. The pinned package declares no runtime dependencies.
@@ -58,3 +58,39 @@ version 1.8.0, vendored unmodified with its MIT license header intact
 It renders the pairing QR codes printed by `vesselstackctl panel-link` and shown in
 the Control Panel; it has no dependencies. The license permits copying, modification
 and redistribution provided the copyright and permission notice stay with the file.
+
+## Optional images and packages pulled at install time
+
+VesselStack does not include any component in this section in its release archive.
+Each is pulled when you enable the matching feature, so its own license and notices
+apply. Licenses below are taken from the package metadata on npm or from the upstream
+repository's license file; the container images may also carry other software, so read
+the notices shipped in the image you run.
+
+| Component | Pinned version | Pinned in | License | How it arrives |
+| --- | --- | --- | --- | --- |
+| Node-RED (`nodered/node-red` image) | `5.0.9-debian` | `templates/compose.yml` | Apache-2.0 | Docker image, when `NODERED_ENABLE=true` |
+| `@flowfuse/node-red-dashboard` | 1.36.1 | `scripts/configure-nodered.py` | Apache-2.0 | npm, preinstalled into the Node-RED data folder |
+| `node-red-contrib-home-assistant-websocket` | 0.83.0 | `scripts/configure-nodered.py` | MIT | npm, preinstalled into the Node-RED data folder |
+| Prometheus (`prom/prometheus` image) | `v2.55.0` | `templates/compose.yml` | Apache-2.0 | Docker image |
+| node-exporter (`quay.io/prometheus/node-exporter` image) | `v1.10.2` | `templates/compose.yml` | Apache-2.0 | Docker image |
+| AIS-catcher (`ghcr.io/jvde-github/ais-catcher` image) | `v0.70` | `vesselstack.example.env` and `install.sh` (`AIS_IMAGE`) | GPL-3.0 | Docker image, when `AIS_ENABLE=true` |
+| `signalk-to-influxdb2` | 2.3.0 | `scripts/configure-signalk-datapath.py` | Apache-2.0 | npm, into the Signal K data folder |
+| `signalk-anchoralarm-plugin` | 2.0.1 | `scripts/configure-signalk-datapath.py` | ISC | npm, marine essentials bundle |
+| `@meri-imperiumi/signalk-logbook` | 0.15.1 | `scripts/configure-signalk-datapath.py` | MIT | npm, marine essentials bundle |
+| `@meri-imperiumi/signalk-autostate` | 0.6.4 | `scripts/configure-signalk-datapath.py` | MIT | npm, marine essentials bundle |
+
+KIP, Freeboard-SK and the NMEA 0183 converter (`sk-to-nmea0183`) are not installed by
+VesselStack. They ship inside the Signal K server image, which VesselStack configures
+(`scripts/configure-signalk-datapath.py`) but does not modify. The Signal K server
+itself (image tag `SIGNALK_VERSION`, `v2.27.0` in `vesselstack.example.env`) is pulled
+as a Docker image and is distributed under Apache-2.0 by its authors.
+
+## Tailscale
+
+Remote access is off by default. Only if you run `sudo vesselstackctl remote enable`
+does VesselStack install the `tailscale` package from Tailscale's own apt repository
+(see `scripts/vesselstackctl`). VesselStack does not bundle or redistribute it. The
+Tailscale client source repository (<https://github.com/tailscale/tailscale>) declares
+BSD-3-Clause; the package you install and the Tailscale service remain subject to
+Tailscale's own terms.

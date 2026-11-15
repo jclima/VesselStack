@@ -204,6 +204,8 @@ updates and settings changes wait until it ends.
 It runs `display list --json`, `show ID --json`, `themes --json`, `catalog [--live] --json` and
 `serial-ports --json`. Editing, saving, applying and restoring from the tab run `set-pages`, `deploy`, `restore-config` and `flash --previous`; only `display add` and `display wifi` stay on the command line. The commands below are the same ones you can run yourself.
 
+For the code layout of `displays/`, see [displays/README.md](../displays/README.md).
+
 `vesselstackctl display COMMAND ...` (root, uses the installed configuration)
 and `python3 displays/displayctl.py COMMAND ...` (with `VESSELSTACK_ROOT` set;
 `MQTT_USERNAME`/`MQTT_PASSWORD` from `vesselstack.env` for commands that touch
@@ -228,6 +230,7 @@ sudo vesselstackctl display remove helm --yes
 | `render ID`, `export ID` | Generate the ESPHome project for a display; see [Firmware: generate, build and flash](#firmware-generate-build-and-flash). Root. |
 | `build ID` | Optional. Renders, then compiles the firmware on this machine in a one-shot container of the pinned ESPHome image and stores it with a manifest; see [Building and flashing on the Pi](#building-and-flashing-on-the-pi). Root. |
 | `flash ID (--serial DEVICE \| --ota HOST) [--previous] [--force]` | Optional. Uploads the stored firmware (never compiles) over USB serial or Wi-Fi; `--previous` rolls back; refuses firmware built with credentials that are no longer current unless `--force`. Root. |
+| `deploy ID (--ota HOST \| --serial DEVICE) [--progress]` | Optional. Builds only when the stored firmware is out of date, then uploads it, under one lock. This is what **Apply to screen** runs. Root. See [Deploy and rollback](#deploy-and-rollback). |
 | `themes [--json]` | Nothing. Lists the display themes with a one-line description; `--json` prints the full palettes. `displayctl.py themes` itself needs no root; through `vesselstackctl` run it with `sudo` like the other `display` commands. See [Themes](#themes). |
 | `set-theme ID THEME` | Root. Sets `displays.ID.ui.theme` in `displays.json` (validated and written atomically like the other changing commands); `classic` deletes the key instead (and the `ui` object when that leaves it empty), so the file stays readable by older versions. An unknown theme or display is refused with exit status 2 and the valid ids. It takes the per-display build lock first and the configuration lock inside it (see the lock table below), so it waits for a running build or flash of that display (30 s). It changes nothing on the device: it prints the next steps, `display build ID` then `display flash ID ...`. Setting the theme a display already has changes nothing. |
 | `catalog [--live] [--json]` | Nothing. The data list a page can pick from: about forty common Signal K values (see [Data catalog](#data-catalog)), each with the right unit for `BOAT_UNITS`, merged with what is already in `displays.json`. `--live` also asks the configured `SIGNALK_URL` once which values really have data. `--json` is what the Control Panel reads. Needs no root if `displays.json` is readable. |
@@ -369,6 +372,38 @@ Without root the build folder is unreadable and the status is `unknown`. `readin
 address or host name; a USB device path, a URL or anything else is never passed on) and `credentials_changed` (the credentials
 differ from those compiled into the image that was flashed; `null` when unknown). `readiness.firmware.rollback_possible` is true
 when `firmware.prev/` holds the image that ran before the last upload.
+
+### Editing and applying in the Control Panel
+
+In the Control Panel, open **Displays**, then **Edit theme and pages**, choose a page, and use its data
+picker to add instruments. Pick a source from the values Signal K is sending, or select the catalog's
+suggested source when no live reading is available. Values you configured earlier stay selectable when
+Signal K is offline. Gauges and tank bars use the range defined for the value (the catalog `range`).
+The preview follows the draft as you change the layout or items. The editor reloads the saved settings
+after a save, including when an earlier refresh is still running.
+
+- **Save** stores the settings on the boat computer and keeps a backup (see **Backups** above).
+- **Apply to screen** opens the upload dialog. If you have unsaved edits, **Save and upload** commits
+  them before uploading, and cancelling keeps the draft open.
+- For a first upload, connect the screen to the boat computer with a USB data cable. The picker prefers
+  stable device names and can list validated USB serial devices that have none (`serial-ports`).
+- Wi-Fi updates remain unverified on hardware. Sending firmware to a new address needs explicit
+  confirmation.
+- **Save** and **History, Restore** share the lifecycle lock with the display command, so either can
+  finish when the boat computer is idle, and both are refused during another lifecycle operation.
+  Backups, updates and settings changes wait while an upload holds the lifecycle slot.
+
+**Verify.** After **Save**, refresh the Displays tab and check that the edited page is still there. After
+uploading, check the updated pages and live readings on the physical screen. **Firmware sent** records
+the successful upload of the saved settings. Live readings also need the displays bridge, an MQTT broker
+reachable on the LAN (see Network and offline requirements above) and a working connection from the
+screen. A first build may need internet access and extra disk space.
+
+**Rollback.** Use **History, Restore**, then **Put previous firmware back**, once the settings and
+credentials match the previous image (the same steps as the command line under
+[Deploy and rollback](#deploy-and-rollback)). Before reverting to an older VesselStack version without
+theme support, run `set-theme ID classic`. See the
+[Control Panel Displays guide](CONTROL_PANEL.md#displays).
 
 ## Firmware: generate, build and flash
 
@@ -1538,6 +1573,15 @@ Night mode is the same on every theme in this version: the red night palette of 
 vision survives whatever the day theme. A themed display repaints to it when night starts, including
 the page background of the light themes and the tile border (which turns dark red at night, so a
 bright border never defeats night mode). The alarm banner is never themed.
+
+**Example.** Pick a theme for one display, then build and upload in one step (`deploy` builds only when the
+stored firmware is out of date; use `--serial DEVICE` instead of `--ota HOST` for USB):
+
+```bash
+sudo vesselstackctl display themes                  # list the themes (--json for the full palettes)
+sudo vesselstackctl display set-theme helm daylight
+sudo vesselstackctl display deploy helm --ota 192.0.2.50
+```
 
 **Applying a theme.** `set-theme` only edits `displays.json`. The theme is compiled into the
 firmware: run `display build ID` and `display flash ID ...` for the display to change. Until then the

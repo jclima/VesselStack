@@ -7,18 +7,42 @@ boat data, dashboards, automation, and diagnostics together on a Raspberry Pi
 you control—at home, in the lab, or aboard. It is designed to keep working on
 the boat's local network when the internet is unavailable.
 
+> [!WARNING]
+> VesselStack is monitoring and diagnostics software.
+> VesselStack is not certified navigation, collision-avoidance, engine-control,
+> alarm, or life-safety equipment. Maintain independent marine instruments and
+> alarms. Never depend on this software as the sole source of safety data.
+
+> [!NOTE]
+> **Status: 0.9.0 is a pre-release.** Automated tests pass; physical Raspberry Pi acceptance is
+> pending. For a boat, install or stay on 0.8.0, the stable release:
+>
+> ```bash
+> curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
+> ```
+>
+> For a lab Pi, use the [quick start](#quick-start-one-command-on-the-raspberry-pi) below to try
+> 0.9.0. Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
+
 ## Contents
+
+**Get started**
 
 - [What it looks like](#what-it-looks-like), [what you need](#what-you-need) and [where to go next](#where-to-go-next)
 - [What you get](#what-you-get) and [optional integrations](#optional-integrations): VesselTwin and instrument displays
 - [Quick start: one command on the Raspberry Pi](#quick-start-one-command-on-the-raspberry-pi), [before and after installation](#before-and-after-installation) and [manual guided installation](#advanced-manual-guided-installation)
-- [Upgrading to 0.6.0](#upgrading-to-060)
+- [Upgrading to 0.9.0](#upgrading-to-090)
 - [First-run setup](#9-complete-first-run-setup): Home Assistant, Signal K, InfluxDB, Grafana, Boat Chat, Control Panel
+
+**Reference**
+
 - [MQTT access control](#mqtt-access-control), [network access](#reaching-vesselstack-from-other-devices) and [network security](#network-security)
 - [Unattended operation and power](#unattended-operation-and-power): hardware watchdog, journal size cap, under-voltage warnings
-- [Marine essentials](#marine-essentials-optional): optional NMEA 0183 on port 10110, anchor alarm, logbook, KIP and Freeboard
+- [Marine essentials](#marine-essentials-optional): optional NMEA 0183 on port 10110, anchor alarm, logbook, KIP and Freeboard-SK
+- [Node-RED](#node-red-optional): optional flow editor with a protected sign-in
+- [Remote access with Tailscale](#remote-access-with-tailscale): optional, tailnet only, no inbound port
 - [Alerts](#alerts): opt-in Telegram push for battery, stale data, stack failures, restarts and backups; Home Assistant blueprints
-- [Backups](#backups) (including [scheduled backups](#scheduled-backups)), [Updating](#updating), [Stopping or removing services](#stopping-or-removing-services)
+- [Backups](#backups), [Scheduled backups](#scheduled-backups), [Updating](#updating) and [Stopping or removing services](#stopping-or-removing-services)
 - [Boat profile](docs/BOAT_PROFILE.md) for shared engine, battery, and tank configuration
 - [Troubleshooting](#troubleshooting)
 - [Developer validation](#developer-validation), [Documentation policy](#documentation-policy), [License and security](#license-and-security), [Moved sections](#moved-sections)
@@ -76,6 +100,12 @@ network without it.
 | Connect VesselTwin | [VesselTwin integration](docs/VESSELTWIN.md) |
 | Add ESP32 instrument displays | [Instrument displays (preview)](docs/DISPLAYS.md) |
 | Develop, test, or cut a release | [Development guide](docs/DEVELOPMENT.md) |
+| Upgrade an installed boat to 0.9.0 | [Upgrading to 0.9.0](#upgrading-to-090) |
+| Get Telegram alerts | [Alerts](#alerts) |
+| Reach the Control Panel from anywhere | [Remote access with Tailscale](#remote-access-with-tailscale) |
+| Automate with flows | [Node-RED (optional)](#node-red-optional) |
+| Add NMEA 0183, an anchor alarm, a logbook, KIP and Freeboard-SK | [Marine essentials](#marine-essentials-optional) |
+| Back up and restore | [Backups](#backups) |
 | See every document | [Documentation index](docs/README.md) |
 
 Power sources and instrument-reading coverage for Boat Chat are in
@@ -90,9 +120,13 @@ Power sources and instrument-reading coverage for Boat Chat are in
 - History and dashboards through InfluxDB, Grafana, MQTT, and Home Assistant.
 - Boat Chat, a local diagnostic assistant with an optional provider you choose.
 - A guided installer, backups, health checks, and an offline release path.
-
-VesselStack is monitoring and diagnostics software. It is not certified
-navigation, collision avoidance, engine control, or a sole alarm system.
+- Optional, all off by default: [Telegram alerts](#alerts) (`ALERTS_ENABLE=true`),
+  [Tailscale remote access](#remote-access-with-tailscale) (`sudo vesselstackctl remote enable`),
+  [Node-RED](#node-red-optional) (`NODERED_ENABLE=true`), the
+  [marine essentials bundle](#marine-essentials-optional) (`SIGNALK_MARINE_BUNDLE=true`) and
+  [scheduled backups](#scheduled-backups) (`VESSELSTACK_BACKUP_SCHEDULE`).
+- A [hardware watchdog](#unattended-operation-and-power), armed by default on a Raspberry Pi that has
+  `/dev/watchdog`. Set `VESSELSTACK_WATCHDOG="false"` to opt out.
 
 ![VesselStack local data flow](docs/images/vesselstack-map.svg)
 
@@ -111,10 +145,7 @@ navigation, collision avoidance, engine control, or a sole alarm system.
 Boat Chat defaults to a local provider. Other providers are optional and may
 need internet access or their own credentials; VesselStack does not promise
 that every provider works offline. The optional [instrument displays preview](docs/DISPLAYS.md)
-is another separately enabled local feature. Displays show a full-screen alarm banner by default when anything
-counts towards the alarm summary; set `"ui": {"alarm_takeover": false}` in `displays.json` to turn it off, then
-rebuild and reflash (`vesselstackctl display build ID`, `display flash ID`).
-A null or invalid Signal K value, or a lost Signal K connection, turns the tile to a grey `--` at once, and warning and alarm colours are judged on the reading before it is rounded for display. An alarm never clears because its data stopped: the bridge keeps counting an item that was in alarm when its sensor went silent as a lost alarm in the alarm summary, so the banner stays up until a fresh reading or an explicit all-clear says otherwise. The bridge remembers lost alarms and its alarm counter across restarts in a small private state file under the data directory, a repeated old Signal K reading no longer keeps a dead sensor looking fresh, and the Fire and Flooding catalog entries show `--` until a source reports.
+is another separately enabled local feature.
 
 ### Component lifecycle
 
@@ -127,49 +158,6 @@ or use the corresponding `vesselstackctl` commands. Hardware and systemd
 services remain configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
 for acceptance steps.
 
-### Lifecycle recovery
-
-Applying a restore is a bounded transaction. VesselStack stages and validates
-both application and data trees, journals the managed
-systemd units, launchers, libexec helpers, update environment, and enable links
-outside those trees, then stops the writers before swapping anything: the Control Panel, the homepage refresh, the active timers and their services, and the stack. Right before the first folder is renamed it checks again, exactly as a rollback does: every writer unit gets a stop (including one that is restarting by itself) and must be inactive, and the Docker containers of the `vesselstack` compose project, or that mount the application or data folder (or a folder inside them) at all, or a parent of them read-write (for example `/` or `/opt`), are stopped and must be gone. A container that only mounts a parent read-only (a monitoring agent's `/:/host:ro`, for example) is left running. The containers that are not part of the `vesselstack` compose project are written to `quiesced-containers` in the journal before they are stopped, and are started again with `docker start` when the restore completes, is rolled back or is abandoned; the restore says which ones it started and names any that did not start, without failing for it (the stack's own containers come back with the stack). If one cannot be stopped, nothing has moved: the restore ends, starts again what it stopped, and names the unit or container. Before the journal is written, the restore also proves that the swap renames will work, by renaming an empty test folder into the parent folder of each tree and back, and refuses (changing nothing) when that fails, giving the system error and the two likely causes (the parent folder is not writable or read-only, or it is a separate mount of the same disk); empty test folders (`.vesselstack-restore-probe.*`) left by an interrupted earlier check are removed first, with `rmdir` only. A restore refuses up front, with nothing changed, when the application or data folder is not a clean absolute path (after normalisation), is `/`, or when one is equal to or inside the other. Before it changes anything it flushes the extracted backup and the journal to disk, which on an SD card can take several minutes (it says so; do not interrupt it). Every VesselStack unit file and enable link that exists is journaled too, because restoring an older release removes the managed units it does not have. After the trees are swapped, restore turns off the managed units that the restored version does not have (it removes their unit files and enable links, never touching other `vesselstack-*` units you created), reinstalls `vesselstack-update` and the libexec helpers from the restored release's installer scripts (removing ones that release does not ship, and leaving them alone if the tree has no installer scripts), and lists what it turned off after "Restore completed". If a later
-swap, daemon reload, installer, or start fails, the old trees and journaled
-managed paths are restored and a best-effort daemon reload/start is attempted;
-failed trees and recovery materials are retained for inspection. Before a rollback moves any folder it stops every writer unit (including one that is restarting by itself) and the Docker containers of the `vesselstack` compose project or with a mount under the application or data folder, and checks that they are gone; if one cannot be stopped nothing is moved and it is named. The firewall (`vesselstack-firewall.service`) and the CAN link units (`vesselstack-socketcan.service`) are deliberately never stopped by a restore, a rollback or an abandon. When a rollback has put the system files back from the snapshot and the firewall is enabled, the firewall is restarted so that the previous rules are applied again; if that fails it says so, and the message that the stack could not be started, a failed or refused rollback, `recover status` and `abandon` all tell you plainly when the firewall was running before the restore and is not running now, and how to start it (the journal records at the start whether the firewall was enabled and running; the notice is also given when the firewall is enabled but not running, and then says it was already not running before the restore; a journal from an earlier release has no such record, and the notice then follows the current state). A restore that completes also says so when the firewall was running before and is not now (for example because the restored release does not ship the unit). A firewall restart that fails means the firewall is DOWN, because the restart removes the rules before applying them. If the rollback
-succeeds, the staged copy of the backup is removed; if it fails, the stage directory
-and the recovery journal are kept (their paths are printed) and contain a copy of the
-backup including secrets, so remove them after recovery. While the trees are swapped,
-the Control Panel, `vesselstack-homepage-refresh.service` and the active VesselStack
-timers (and their services) are stopped and started again afterwards. The restore
-keeps a durable journal in `/var/lib/vesselstack/restore/current`, so an interrupted
-restore (a lost SSH session, a power loss) can be undone with
-`sudo /var/lib/vesselstack/restore/current/recover status` and then `recover rollback`
-(see [If a restore is interrupted](#if-a-restore-is-interrupted)). If the journal itself is damaged and the commands refuse to use it, they print a short procedure to resolve it by hand (see below). The procedure starts by stopping everything that uses the two folders, because after a reboot the stack and its `unless-stopped` containers start again and keep writing into a folder even after it is renamed (`vesselstackctl stop` is refused while the journal is pending): it gives plain `systemctl` and `docker` commands that stop every `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan` (`systemctl list-units 'vesselstack-*' --all --plain --no-legend`, so oneshot services that are still starting and units waiting to restart are included, and a unit whose file is gone does not shift the columns) and every container of the `vesselstack` compose project, gives `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` to find any other container that mounts either folder (stop it with `sudo docker stop NAME`), and says to go on only when the same `list-units` command shows every line except those two as `inactive` or `failed` (not `active`, `activating`, `deactivating` or `reloading`), repeating the stop otherwise. It is safe after a failed forward restore too: for each of the two folders, a `<folder>.pre-restore-<stamp>` next to it means the folder at the normal path is the restored copy, which you move to `<folder>.failed-restore-<stamp>` before moving the previous one back; both folders must come from the same side before the journal is moved aside. The procedure names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>` with the real value from the journal) and says to leave `.pre-restore-*` and `.failed-restore-*` folders with other stamps alone, because earlier restores can leave such folders behind. If the usual read of the journal fails (for example a repeated key), the stamp is read from the `stamp=` line of the state file; only a value of the expected shape is ever printed. When the stamp cannot be read at all, it keeps the generic `<stamp>` wording and says that these steps cannot tell this restore's folders from ones left by earlier restores: a `.pre-restore-*` folder whose stamp also names an archived journal next to the journal directory (`done-<stamp>`, `rolled-back-<stamp>` or `abandoned-<stamp>`) belongs to that earlier restore and is ignored, and if any `<folder>.pre-restore-*` exists next to either folder that no archived journal claims, this restore may have moved a folder and the steps cannot tell which: leave the journal in place, move nothing, and get help. Only when there is no such folder (this restore moved nothing) and both folders are present do you do the stop step, skip the folder step, and go on with the journal step and the start step; if a folder is missing, get help. Modification times are not used, because renaming a folder does not change them. The last step starts the stack with the installer of the application folder, always: `sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start`. It also puts the unit files, `/usr/local/sbin/vesselstackctl` and the helpers back in line with that folder and starts the timers. If the installer stops, it says why: fix what it names and run it again. Only if it cannot be run at all (the file is missing, or it needs something not available at sea, such as a network or a device that is unplugged) does the procedure give `sudo vesselstackctl start`, which starts what is installed; the system files may then belong to the restored release and the timers (backups, alerts, telemetry) stay stopped until the installer has been run, so run it as soon as you can. The snapshot of the previous system files stays in the moved-aside journal. It finishes with `sudo vesselstackctl doctor`. The stop step counts a container when it mounts either folder, a folder inside them, or a folder that contains them (such as `/` or `/opt`), however it is mounted, runs the `docker ps` command again after the stop and goes on only when no such container is left, and says that `Unit ... not loaded` printed for a unit that is not running is expected and harmless. The folder moves are made with `sudo mv -T` too, so a move onto an existing folder fails instead of nesting it. The journal is moved aside with `sudo mv -T`, so a second resolution on the same day fails instead of moving the journal inside the older `.manual-DATE` directory; if it says the target exists, use another name. The commands in this by-hand procedure have been checked by tests as text and have not yet been exercised on a boat computer with running services. Folder paths read from the journal are printed with control characters replaced by `?`. The restore still
-runs in your terminal session and nothing recovers automatically at boot yet, so keep
-it on a stable connection or run it inside `screen` or `tmux`. If stopping the
-running stack fails, no rollback is attempted under live services. Unrelated
-`/etc` files, Docker services, AIS devices, and SocketCAN interfaces are not
-removed. A restore still requires `--yes`, sufficient same-filesystem space,
-and a verified archive; inspect and remove `*.pre-restore-*` only after health
-checks pass.
-
-### Shared lifecycle lock
-
-`common/lifecycle_lock.py` provides the shared, non-blocking lock used by the
-mutating installer, `vesselstackctl`, Control Panel operation slot, and detached
-browser-update worker. It keeps the lock outside the application and data trees
-and supports validated descriptor handoff to child processes. Read-only
-`vesselstackctl` commands remain unlocked.
-Direct boat-profile `set` and `init` commands use the same lock; in-process
-profile-library writes remain the caller's responsibility.
-Direct `deploy-chat.py` apply/rollback operations also use the shared lock;
-read-only preview operations remain unlocked.
-The real-systemd browser-update acceptance fixture copies these shared modules
-alongside the panel so its service-start check exercises the same import set as
-an installed release. The panel releases the shared lifecycle lock before handing
-off its browser-update lock, so a detached updater cannot wake between those two
-steps and report a spurious busy state.
-
 ## Optional integrations
 
 These features are off or inert until you deliberately enable them. Neither is needed for the core stack.
@@ -178,7 +166,7 @@ These features are off or inert until you deliberately enable them. Neither is n
 
 An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
 and explicit reading opt-ins. Managed Docker/native Signal K modes preload the pinned
-plugin by default (0.5.x lab prerelease); VesselStack does not enable, pair, or authorize readings for you.
+plugin (version 0.2.3) by default; VesselStack does not enable, pair, or authorize readings for you.
 See the [VesselTwin integration guide](docs/VESSELTWIN.md)
 for setup and [VesselTwin](https://www.vesseltwin.io/) for maintenance documents,
 equipment and logbook records.
@@ -198,38 +186,23 @@ sudo vesselstackctl display status
 Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports`.
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
 
-Display colours come from `displays/themes.json`, which offers four themes: `classic` (the default and the original look), `high-contrast` (black with white values and a light tile border, for sunlight), `daylight` (light tiles with dark text) and `ocean` (navy tiles). Pick one per display:
+Displays show a full-screen alarm banner by default when anything
+counts towards the alarm summary; set `"ui": {"alarm_takeover": false}` in `displays.json` to turn it off, then
+rebuild and reflash (`vesselstackctl display build ID`, `display flash ID`).
+
+A null or invalid Signal K value, or a lost Signal K connection, turns the tile to a grey `--` at once, and warning and alarm colours are judged on the reading before it is rounded for display. An alarm never clears because its data stopped: the bridge keeps counting an item that was in alarm when its sensor went silent as a lost alarm in the alarm summary, so the banner stays up until a fresh reading or an explicit all-clear says otherwise. The bridge remembers lost alarms and its alarm counter across restarts in a small private state file under the data directory, a repeated old Signal K reading no longer keeps a dead sensor looking fresh, and the Fire and Flooding catalog entries show `--` until a source reports.
+
+Four colour themes are available for each display: `classic` (the default), `high-contrast`, `daylight` and `ocean`. Pick one, then upload the firmware over Wi-Fi or USB:
 
 ```bash
-sudo vesselstackctl display themes                  # list the themes (--json for the full palettes)
+sudo vesselstackctl display themes                  # list the themes
 sudo vesselstackctl display set-theme helm daylight
-sudo vesselstackctl display deploy helm --ota 192.0.2.50   # build if needed and upload in one step (or --serial DEVICE)
+sudo vesselstackctl display deploy helm --ota 192.0.2.50   # or --serial DEVICE
 ```
 
-`display deploy ID (--ota HOST | --serial DEVICE)` builds only when the stored firmware is out of date and uploads it under one lock; it prints `STAGE:` lines with `--progress` and `To fix:` lines for known failures, and hides Wi-Fi and MQTT/OTA/API secrets in everything it prints. After every successful upload `build/displays/ID/last-flash.json` (root-only, never committed) records when, how and which image went to the screen. **Operational impact:** a deploy can take 3-6 minutes (10-15 minutes the first time, about 3 GB free disk). **Wi-Fi (OTA) updates have not been verified on hardware yet**; the first flash of a new display must be over USB, and USB is an equal option. To put the previous firmware back: `display restore-config STAMP` (see `display history`), then `display flash ID --previous --ota HOST` (or `--serial DEVICE`); see [Deploy and rollback](docs/DISPLAYS.md#deploy-and-rollback).
+**Wi-Fi (OTA) updates have not been verified on hardware yet**; the first flash of a new display must be over USB, and USB is an equal option. A deploy can take 3-6 minutes (10-15 minutes the first time, about 3 GB free disk). **Before downgrading VesselStack, run `set-theme ID classic` on every display that has a theme:** older versions reject the unknown `theme` key and the displays bridge then exits. To put the previous firmware back, see [Deploy and rollback](docs/DISPLAYS.md#deploy-and-rollback).
 
-In the Control Panel, open **Displays → Edit theme and pages**, choose a page, and use its data picker to add instruments. Pick a source from the values Signal K is sending or select the catalog’s suggested source when no live reading is available. Gauges and tank bars use the range defined for the value. Previously configured values remain selectable when Signal K is offline. The editor reloads saved settings after a save, including when an earlier refresh is still running. The preview follows the draft as you change the layout or items. **Save** stores settings on the boat computer and keeps a backup. **Apply to screen** opens the upload dialog. If you have unsaved edits, **Save and upload** commits them before uploading, and cancelling keeps the draft open. For a first upload, connect the screen to the boat computer with a USB data cable. The picker prefers stable device names and can list validated USB serial devices without one. Wi-Fi updates remain unverified on hardware and sending firmware to a new address requires explicit confirmation.
-
-**Verify** that **Save** keeps an edited page after refreshing the Displays tab. **Save** and **History → Restore** share the lifecycle lock with the display command, so either can finish when the boat computer is idle and both are refused during another lifecycle operation. After uploading, verify the updated pages and live readings on the physical screen. **Firmware sent** records the successful upload of the saved settings. Live readings also require the display bridge, a LAN-accessible MQTT broker, and a working connection from the screen. Backups, updates, and settings changes wait while the upload holds the lifecycle slot. A first build may need internet access and additional disk space.
-
-**Rollback** through **History → Restore** and **Put previous firmware back** once the settings and credentials match the previous image. Before reverting to an older VesselStack version without theme support, run `set-theme ID classic`. See the [Control Panel Displays guide](docs/CONTROL_PANEL.md#displays).
-
-`set-theme` writes `ui.theme` in `displays.json`; the change reaches the screen only after you rebuild and reflash that display. Night mode uses the same red palette on every theme and the alarm banner is never themed. `set-theme ID classic` removes the key and returns to the original colours. **Before downgrading VesselStack, run `set-theme ID classic` on every display that has a theme:** older versions reject the unknown `theme` key and the displays bridge then exits. A display left on `classic` generates exactly the firmware it did before, so nothing needs reflashing. The `high-contrast` warning tile is dark amber with white text (the old bright amber made its label unreadable); rebuild and reflash a display on that theme to get it. Details and limits are in [Themes](docs/DISPLAYS.md#themes).
-
-**Choosing what a page shows.** The Control Panel's **Displays** tab lists your displays, shows whether the latest changes are on each screen (On screen, Changes not on screen, Never flashed, Not built, Unknown), a readiness checklist with the exact fix command for anything missing, each page's layout and items, an approximate preview of every page in the display's theme (Day/Night and severity switches, live values when Signal K has them), and a searchable list of the data a page can show. The tab also edits the theme and pages, saves, applies to the screen and restores older settings (see above); it runs the commands below (all JSON output, root for the ones that change anything), which you can also run yourself. Only `display add` and `display wifi` stay on the command line.
-
-```bash
-sudo vesselstackctl display list --json              # id, name, board and page count of every display
-sudo vesselstackctl display catalog --live --json    # ~40 common values for your BOAT_UNITS, marked live or no_live_data
-sudo vesselstackctl display show helm --json         # pages, layouts, preview boxes, revision, readiness (no secrets)
-echo '{"pages":[{"title":"Nav","layout":"grid-2x2","items":["sog","depth"]}]}' | \
-  sudo vesselstackctl display set-pages helm --if-revision "$(sudo sha256sum /opt/vesselstack/config/displays.json | cut -d' ' -f1)" --stdin
-sudo vesselstackctl display history                  # backups of displays.json (newest 20)
-sudo vesselstackctl display restore-config 20260101T120000Z
-sudo vesselstackctl display serial-ports             # USB serial devices that `flash --serial` accepts
-```
-
-The data list (`displays/catalog.json`) offers 38 common Signal K values and 4 notifications with the right unit for `BOAT_UNITS` (`metric` or `us_customary`; the legacy `nautical` reads as metric). With `--live`, `catalog` makes one read-only request to your configured `SIGNALK_URL` (Bearer token only if `DISPLAYS_SIGNALK_TOKEN` is set, no redirects, 10 s in total, 4 MiB) to mark which values have data and to list other numeric values under "Uncatalogued"; it keeps only path, units, age and value of numeric leaves and never reads positions, destinations, MMSI, names, UUIDs or call signs, and it stores nothing. **Suggested alarm limits are shown but never applied by default**: an instrument with limits counts in the boat-wide alarm summary and can raise the alarm banner. `set-pages` refuses (exit 3) if `displays.json` changed since you read it (`--if-revision` is the sha256 of the file), refuses (exit 4) while a build or flash of that display runs, validates everything before writing, copies the previous file to `config/displays-backups/` (root-only, newest 20 kept, included in `vesselstackctl backup`) and restarts the displays bridge only when it reads something that changed. **Rollback:** `display history`, then `display restore-config STAMP` (refused with exit 2 if the backup has a different set of displays than the current `displays.json`: match them with `display add` / `display remove` first, then restore again, because restore does not touch MQTT accounts); rebuild and reflash the displays the command lists in `rebuild_needed`. Exit codes, JSON shapes and limits are in [Data catalog](docs/DISPLAYS.md#data-catalog) and [Editing pages, backups and restore](docs/DISPLAYS.md#editing-pages-backups-and-restore).
+The Control Panel's **Displays** tab edits themes and pages, saves, applies to the screen and restores older settings ([Control Panel Displays guide](docs/CONTROL_PANEL.md#displays)). Suggested alarm limits are shown but never applied by default. For themes see [Themes](docs/DISPLAYS.md#themes), and for the command-line catalog, `set-pages`, history and restore see [Data catalog](docs/DISPLAYS.md#data-catalog) and [Editing pages, backups and restore](docs/DISPLAYS.md#editing-pages-backups-and-restore).
 
 ## Quick start: one command on the Raspberry Pi
 
@@ -251,12 +224,12 @@ curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-ve
 ```
 
 > [!NOTE]
-> The pinned URL names the release explicitly, so it installs exactly 0.9.0 whatever
-> GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
+> The pinned URL names the release explicitly, so it installs exactly the version in the URL,
+> whatever GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
-> one (every 0.5.x release was published as a prerelease, so that URL kept serving
+> one (every 0.5.x release was published as a pre-release, so that URL kept serving
 > 0.4.4). While 0.9.0 is a pre-release, the `releases/latest` URL still serves 0.8.0.
-> Use it only when you want exactly that.
+> Use it only when you want exactly that. For a boat, see the status note at the top of this page.
 
 The installer checks the host before changing it. It may install Debian
 prerequisites and, after asking, Docker Engine and Compose v2 from Docker's
@@ -284,16 +257,8 @@ opened for you.
 For a boat with no internet, prepare the release and offline bundle in the lab and follow the
 [offline deployment path](docs/DEPLOYMENT.md#simple-path-one-command).
 
-Releases are built by the tag-triggered GitHub workflow (read-only build job, separate
-write-only publish job, draft first, reproducible tarball on Linux); maintainers follow the
-release checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#release-checklist). The recommended
-way to sign release tags (key held in 1Password) is in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#1-release-signing-with-an-ssh-signing-key).
-Release tags must be SSH-signed annotated tags: the release workflow runs
-`scripts/verify-release-tag.sh` against `.github/allowed_signers` and refuses an unsigned,
-lightweight or wrongly signed tag, a tag object whose own name differs from its ref, and a tag
-that does not point at the exact commit being built, before building anything. To rotate the release key, change
-`.github/allowed_signers` in a reviewed pull request to `main` first, then tag.
+Maintainers: how releases are built and signed is in the
+[release checklist](docs/DEVELOPMENT.md#release-checklist).
 
 **No prompts at all** (scripts, a Pi without a terminal, repeatable installs):
 
@@ -413,27 +378,34 @@ does anything beyond installing ordinary Debian packages:
    (information only), where the generated tokens are stored and the next steps.
    It ends with a list of everything it changed.
 
-Options (`sudo bash get-vesselstack.sh --help`): `--yes` (ask nothing, answer yes),
-`--defaults` (ask nothing, each question's default), `--panel-lan` (share only the
-panel listener on a fresh install), `--set KEY=VALUE` (repeatable;
-avoid secrets here, they would show in the process list: leave them to be generated),
-`--config FILE` (use an existing `vesselstack.env`; `--no-wizard --config FILE` is the
-same), `--cli` / `--terminal` (the default terminal questions), `--web-wizard` (optional
-browser wizard), `--version X.Y.Z`,
-`--offline --bundle DIR [--tarball FILE]` (no internet, see
-[Offline install](#offline-install-no-internet-on-the-boat)), `--sha256 HASH`
-(pin the tarball to a checksum you obtained elsewhere), `--dir DIR`,
-`--wizard-port N` (browser wizard only). `--set` values are checked early for shape and
+Options (`sudo bash get-vesselstack.sh --help`):
+
+- `--yes`: ask nothing, answer yes.
+- `--defaults`: ask nothing, use each question's default.
+- `--panel-lan`: share only the panel listener on a fresh install.
+- `--set KEY=VALUE` (repeatable): set one setting. Avoid secrets here, they would show in the
+  process list: leave them to be generated.
+- `--config FILE`: use an existing `vesselstack.env` (`--no-wizard --config FILE` is the same).
+- `--cli` / `--terminal`: the default terminal questions.
+- `--web-wizard`: the optional browser wizard.
+- `--version X.Y.Z`: the release to install.
+- `--offline --bundle DIR [--tarball FILE]`: no internet, see
+  [Offline install](#offline-install-no-internet-on-the-boat).
+- `--sha256 HASH`: pin the tarball to a checksum you obtained elsewhere.
+- `--dir DIR`: where releases are unpacked.
+- `--wizard-port N`: the port for the browser wizard (browser wizard only).
+
+`--set` values are checked early for shape and
 fully (key, characters, enum, ranges) by the wizard before `install.sh` runs; an unknown
 key or invalid value stops the installer without installing anything (Debian packages
 and Docker may already have been installed by the earlier steps; re-running is safe).
 `--set` cannot change the configuration of an installed system (an upgrade keeps it).
 With a saved configuration from an earlier run, `--yes` and `--defaults` reuse it and
-`--set` is applied on top of it (the old file is kept as `vesselstack.env.previous`). Re-running is safe: finished steps are reported
-and skipped, an already installed version reports "nothing to do", and an installation or update that did not finish is continued from where it stopped (see below). The bootstrap also finds an installation at a custom root by reading the installed `vesselstackctl` (`sudo` does not pass `VESSELSTACK_ROOT`). Rollback of this
-installer change: use the previous release's `get-vesselstack.sh`; nothing else changed.
+`--set` is applied on top of it (the old file is kept as `vesselstack.env.previous`).
 
-While an installation or update is running, the installer keeps `config/install-in-progress`; it is removed once the services have started (or, for a run without `--start`, when no earlier `--start` run failed), so a leftover file means the last run did not finish. `installed-version` is written before the services are started and does not by itself show that they were. `get-vesselstack.sh` reads the marker: a rerun for the same version continues the unfinished installation with the installed configuration, no wizard and no new backup (it asks first, unless `--yes` or `--defaults`); an older version is refused while a newer update is unfinished; and a failed update names the backup recorded in the marker. `vesselstackctl doctor`, `status` and `version` report the marker: `doctor` prints `FAIL installation of VERSION did not finish` with the command to continue and, when a backup is recorded, the command to restore it; `status` shows an `Installation INCOMPLETE` line and exits non-zero; and `vesselstackctl update` passes its backup to the installer in `VESSELSTACK_PREUPDATE_BACKUP`, so the marker records it and a failed update prints the exact restore command.
+Re-running is safe: finished steps are reported
+and skipped, an already installed version reports "nothing to do", and an installation or update that did not finish is continued from where it stopped (see [An installation or update did not finish](#an-installation-or-update-did-not-finish)). The bootstrap also finds an installation at a custom root by reading the installed `vesselstackctl` (`sudo` does not pass `VESSELSTACK_ROOT`). Rollback of this
+installer change: use the previous release's `get-vesselstack.sh`; nothing else changed.
 
 **What `curl | sudo bash` trusts.** It runs a script downloaded from GitHub as
 root. You are trusting GitHub, TLS (the script enforces HTTPS with TLS 1.2+ for the
@@ -513,202 +485,77 @@ backups with `VESSELSTACK_BACKUP_SCHEDULE`, see [Scheduled backups](#scheduled-b
 `sudo vesselstackctl backup` yourself), and test restoring one before relying on the system. Read the deployment guide
 before carrying an update to a boat without internet access.
 
-VesselStack 0.9.0 adds the restore recovery journal, unattended-operation settings, Telegram alerts, Tailscale remote access, Node-RED and the marine essentials bundle. Upgrade from 0.8.0 (or 0.7.x) with the
-full installer or `vesselstackctl update` so shared modules, configuration and
-services are updated together; the application-only updater is not sufficient for
-this release. 0.9.0 is published as a pre-release; physical Raspberry Pi acceptance is pending. Do not deploy it to a boat until the documented lab checks pass. The installer takes a verified backup first. If rollback is needed,
-verify and restore that backup rather than downgrading. Database changes are
-additive columns only; historical samples without verified source timestamps remain
-excluded from inferred-energy calculations. The 0.7.0 reliability-validation runbook
-below is retained as historical release context; 0.6.3 was promoted after physical
-Pi acceptance, while 0.6.2 was marked Latest directly.
+## Upgrading to 0.9.0
 
-## Upgrading to 0.6.0
+Read this before updating an installed system. Update from [Updating](#updating) with a backup on a
+mounted external drive, not while underway. The installer takes a verified backup first. 0.9.0 is a
+pre-release and physical Raspberry Pi acceptance is pending: do not deploy it to a boat until the
+documented lab checks pass. The stable release is 0.8.0.
 
-Read this before updating an installed system. Update from [Updating](#updating) with a backup
-on a mounted external drive, not while underway. This section applies to 0.6.0, 0.6.1, 0.6.2, 0.6.3 and 0.6.4.
+**What you must know or do**
 
-**Settings that say `BOAT_UNITS=nautical` (fixed in 0.6.1).** Older setup wizards offered
-"nautical" as a units choice, and installers before 0.5.7 did not check it, so such a
-`vesselstack.env` may exist. 0.6.0 refused it with `BOAT_UNITS must be us_customary or metric`
-and stopped the update before changing anything. From 0.6.1 the installer reads `nautical` as
-`metric` (metres for depth; knots and nautical miles are kept in both systems), prints one
-`Note:` line, and a real install or update rewrites `vesselstack.env` with `BOAT_UNITS=metric`
-(a dry run only prints the note). The setup wizard and the Control Panel also show it as Metric
-without changing it. Any other unsupported value is still refused before anything is changed,
-now with a message naming the file and the fix. If you are stuck on 0.6.0, change the value
-by hand and run the update again:
+- **Use the full installer.** Upgrade from 0.8.0 (or 0.7.x) with `get-vesselstack.sh` or
+  `vesselstackctl update`, so shared modules, configuration and services are updated together. The
+  application-only updater is not enough for this release.
+- **The hardware watchdog is armed by default on a Raspberry Pi** that has `/dev/watchdog`
+  (`VESSELSTACK_WATCHDOG=auto`). To opt out, set `VESSELSTACK_WATCHDOG="false"` in `vesselstack.env`
+  and rerun the installer. The journal size cap defaults to `200M`. See
+  [Unattended operation and power](#unattended-operation-and-power).
+- **`vesselstackctl status` exits non-zero while an installation or restore is unfinished.** A script of
+  your own that checks it sees a failure in that state. While a restore is unfinished, commands that
+  change the system and the installer refuse to run (see [If a restore is interrupted](#if-a-restore-is-interrupted)).
+- **The first update into 0.9.0 runs on the old Control Panel.** The unfinished-update notice and the
+  **Finish this update** button apply from the next update on.
+- **Restoring a backup made before 0.9.0** turns off the features that version does not have, for
+  example scheduled backups and Telegram alerts, and lists them after "Restore completed". They stay
+  off until you update again.
+- **The marine essentials bundle needs internet.** It downloads about 64 MB of npm packages.
+  `--offline` installs skip the Signal K data path step. Tailscale is installed from Tailscale's apt
+  repository and is not in the offline bundle.
+- **A scheduled backup stops the whole stack while it runs.** The backup drive needs room for
+  `VESSELSTACK_BACKUP_KEEP` plus one archives. Scheduled backups stay off when you upgrade.
+- **Telegram alerts.** If you turned on the old "Send alerts to Telegram" switch expecting boat
+  alerts, you were not receiving any: turn on "Boat alerts to Telegram" (`ALERTS_ENABLE`). If
+  `ALERT_BILGE_ENTITY` or `ALERT_SHORE_POWER_ENTITY` is set without a valid `HOME_ASSISTANT_TOKEN`,
+  new alert messages and `/fail` heartbeats appear: set the token in Control Panel settings.
+- **Displays** need a rebuild and reflash to get the alarm banner: `vesselstackctl display build ID`,
+  then `display flash ID`, or **Apply to screen** in the Control Panel. The other display changes
+  take effect when the bridge restarts. Anything outside VesselStack that reads the retained
+  `bridge/status` (for example a Node-RED flow) must read `bridge/service` or listen for the heartbeat.
+- **Boat Chat** answers use new wording and units. Cached summaries keep the old text until they
+  refresh.
+- **If you ran an unreleased `main` build,** delete `config/node-red/settings.js` as root and rerun the
+  installer to pick up the dashboard sign-in.
 
-```bash
-sudo sed -i 's/^BOAT_UNITS=.*/BOAT_UNITS=metric/' /opt/vesselstack/config/vesselstack.env
-```
+Database changes are additive columns only; historical samples without verified source timestamps
+remain excluded from inferred-energy calculations. The [changelog](CHANGELOG.md#090---2026-11-15)
+lists everything else that changed.
 
-**Backup drive not mounted (0.6.1).** When the backup folder is under `/media` or `/mnt` and the
-drive is not mounted, `get-vesselstack.sh` and (from an installed 0.6.1) `vesselstackctl update` and
-`vesselstackctl backup` no longer just stop: before anything is stopped or changed they ask
-whether to mount the drive from `/etc/fstab`, pick a connected USB drive, check again, or back up
-to the system disk once. See [Backups](#backups). A direct `sudo vesselstackctl update <dir>` run
-from an installed 0.6.0 or earlier controller does not show this menu (that controller is older
-than the fix); use `get-vesselstack.sh`, or mount the drive first, or run
-`sudo env VESSELSTACK_BACKUP_ALLOW_UNMOUNTED=true vesselstackctl update <dir>` to back up to
-the system disk once.
-
-**Backup drive not mounted, from the Control Panel (0.6.2).** The Control Panel can now resolve this
-itself, for that one request: **Back up & install** and **Back up & update from folder** check the
-backup folder first and, when the drive is not mounted, show a dialog to mount it from `/etc/fstab`,
-mount a listed USB drive, back up to the system disk once, use a different backup folder, or install
-without a backup. See [Backups](#backups). This cannot help the upgrade that delivers it: the
-worker uses the controller that is already installed, so for the upgrade to 0.6.2 mount the drive by
-hand or run the update from a terminal. Rollback: unmount with `umount`; nothing is written to
-`/etc/fstab` or `vesselstack.env`.
-
-**Instrument displays (0.6.2, preview, optional).** The Control Panel **Displays** tab can edit pages
-and themes and apply them to a screen over USB or Wi-Fi (see [Instrument displays](#instrument-displays-preview)).
-An install that does not enable displays is unaffected. Wi-Fi (OTA) updates are not yet verified on
-hardware; flash each display over USB first. **Before downgrading below 0.6.2**, run
-`sudo vesselstackctl display set-theme ID classic` for every themed display, otherwise the displays
-bridge exits with status 2 on the older version (it rejects the `theme` key). Rollback of display
-settings: `sudo vesselstackctl display restore-config STAMP`, then `display flash ID --previous`.
-
-**Homepage front door and easier sign-in (0.6.3).** Homepage replaces Heimdall on port 80
-(`HOMEPAGE_PORT`; `HEIMDALL_PORT` is migrated when `HOMEPAGE_PORT` is unset). Updating stops and removes the
-`vesselstack-heimdall` container and image and prints a notice; `$VESSELSTACK_DATA/heimdall` is left on disk.
-Tiles follow the enabled components; add your own in `config/homepage-custom/`. If you restrict the firewall
-by hand, allow port 80 from trusted interfaces only; port 443 is no longer published. The Control Panel and
-Boat Chat can now be unlocked with a passphrase, optionally remembered on a device for 30 days, or by a
-pairing link or QR code (`sudo vesselstackctl panel-link [--for panel|chat]`); see the sign-in sections
-below. Existing long tokens and access/admin codes keep working. Passphrase sign-in is off until a
-passphrase is set. Rotating a token signs out the devices issued under the old value. The panel and Boat Chat
-use plain HTTP on the LAN, so a passphrase or pairing link can be seen by anyone who can watch that
-network; use a trusted LAN only. Rollback: reinstall 0.6.2 with its pinned installer (Homepage is replaced
-by Heimdall only on that reinstall; older versions ignore the sign-in store files). Before downgrading
-below 0.6.2, run `sudo vesselstackctl display set-theme ID classic` for every themed display.
-
-**Updating to 0.6.3 from an older version can end with a shell error (known issue).** Releases up to 0.6.3 rewrote `/usr/local/sbin/vesselstackctl` in place while the older `vesselstackctl update` (or the
-pinned installer, which starts it) was still running, and that older script is read from disk as it runs. When
-the installer finished, the old command carried on reading the new file from its old position and could print
-`/usr/local/sbin/vesselstackctl: line N: syntax error near unexpected token ...` after the installer's final
-`Control panel:` line. **The install has completed**; the message comes from the old command after the work is
-done. Do not restore a backup because of it. To verify:
-
-```bash
-cat /opt/vesselstack/config/installed-version     # 0.6.3
-sudo vesselstackctl doctor
-sudo vesselstackctl status
-```
-
-Restore only if one of these fails. The 0.6.4 installer writes the new file beside the
-old one and renames it into place, so a running older command keeps its own copy and the message cannot
-happen on later updates. **Operational impact:** none at runtime; only the final message of the update is affected, and the installed command is the
-correct 0.6.3 one. **Rollback:** this note changes nothing to roll back. If you need to leave 0.6.3, downgrades are refused, so restore the verified pre-update backup as described under Rollback below.
-
-Rollback: set `BOAT_UNITS` back to `us_customary` (or `metric`) in the same file. 0.6.1
-needs no other manual step.
-
-**Fix it at the prompt (0.6.1).** When you run the installer, an update or the pinned
-`get-vesselstack.sh` from a terminal (for example over `ssh -t`), an unsupported `BOAT_UNITS`
-value, or a setting in `vesselstack.env` that cannot be written safely (see below), no longer
-just stops the run. The installer asks what to do before changing anything else:
-
-```text
-BOAT_UNITS in /opt/vesselstack/config/vesselstack.env is "imperial", which is not supported.
-  [1] US customary (feet, °F, psi, US gallons)
-  [2] Metric (metres, °C, kPa, litres)
-  [c] Cancel (nothing is changed)
-Choice:
-```
-
-An unsafe value (a token or other setting with an apostrophe plus a backslash, double quote,
-dollar sign or backtick, a line break, or a control character) is offered as
-`[1] Enter a new value for <KEY>`; what you type for a token, password or key is hidden and is
-never printed or logged, and a replacement that is still unsafe is refused. Your answer is saved
-in the settings file, the installer prints `Changed <KEY> in <file> (previous copy: <file>.before-fix-<time>)`
-and starts over with the same options. The previous copy is root-only; delete the
-`*.before-fix-*` copies once the install works. `c`, an empty answer at the end of input or
-five minutes without an answer prints `Cancelled. Nothing was changed.` and leaves the file as
-it was. Limits: only settings written in the file you pass with `--config` are offered (a value
-that comes from the environment is not), generated or preserved passwords and tokens (InfluxDB,
-Grafana, MQTT, Boat Chat, Control Panel) are never offered because the running services still hold the
-old value (change it in the service first, then edit the file), and a symbolic link, a file not
-owned by root, a file in a folder (or under a parent folder) that other users can change, or a
-file whose edit cannot be verified is left untouched. For an unsupported units value the manual
-`sed` command is printed; for an unsafe value you are told to edit the setting by hand. Runs without a terminal (cron, a service, the Control Panel, `--yes`,
-`VESSELSTACK_NONINTERACTIVE=true`) never ask: they stop before changing anything and print the
-exact fix, as in 0.6.0. A dry run that you answer does save the fix you chose.
-
-**What changes for an existing boat**
-
-- **Env-file values are checked more strictly.** The installer refuses a value that holds an
-  apostrophe together with a backslash, a double quote, a dollar sign or a backtick, and any
-  multi-line value, in the settings it writes to `vesselstack.env`, `boat-chat.env` and
-  `control-panel.env`. A boat name such as `Skipper's "Dream"` is affected; `Skipper's Dream`
-  is not. The check now runs first: before anything is changed, and also under `--dry-run`, and
-  it covers preserved and generated secrets too. The installer also deletes stale
-  `.vesselstack.env.*`, `.boat-chat.env.*` and `.control-panel.env.*` temp files from `config/`
-  (left by a killed run) before writing; no other file is touched.
-- **`GET`, `HEAD` and `POST /api/settings` require the Boat Chat access code.** A bookmark,
-  script or dashboard that read or saved settings without it now receives an authentication
-  error. Where an admin code is configured, `POST` needs that too. Scripts that call `POST
-  /api/settings` must send the access code, and, when it differs from the admin code, the new
-  optional `X-Boat-Chat-Access-Token` header carries it on `GET`, `HEAD` and `POST`. The access
-  code cannot be cleared through the API (blank or `null` returns 400) unless
-  `BOAT_CHAT_ALLOW_OPEN=true`. The environment variable names
-  (`BOAT_CHAT_ACCESS_TOKEN`, `BOAT_CHAT_SETTINGS_TOKEN`) are unchanged.
-- **Unauthenticated loopback settings writes require a local `Host` name** (a defense
-  against DNS rebinding). Reach Boat Chat through `127.0.0.1` or `localhost`, or send the
-  token.
-- **The Control Panel looks different.** It now has four tabs (Home, Settings, Updates,
-  Maintenance). **Install & start** is **Reinstall & start** and **Run preflight** is **Check
-  setup**, both under Maintenance → Setup & repair, and they run the same commands as before.
-  Saving settings and applying them are two steps (**Save**, then **Apply**). The Updates tab
-  contacts GitHub only when you press **Check for updates**. Stored settings and keys are
-  unchanged. Boat Chat's credentials are labelled **Access code** and **Admin code**; the
-  variable names are unchanged.
-- **The Control Panel checks a few settings as you save.** The timezone must be a valid IANA
-  name such as `Europe/Lisbon` (some legacy aliases such as `US/Eastern` may be rejected on
-  newer systems where they moved to the `tzdata-legacy` package). Boat length must be more
-  than 0 and at most 500, beam more than 0 and at most 100 (plain numbers in metres, no
-  units), and CAN speed a whole number from 10000 to 1000000. The checks apply only to fields
-  you edit, so an existing saved value you do not touch is never rejected or cleared; errors
-  appear next to the field.
-- **Docker Signal K may restart once.** If the update newly preloads the pinned
-  `signalk-vesseltwin` 0.2.3 plugin into an already-running Signal K container, the
-  installer restarts that container so the plugin loads. An existing preloaded copy is never
-  overwritten. Plan for a short gap in Signal K data.
-- **Coming from 0.4.x:** update once from the CLI with the pinned installer. Since 0.5.0
-  Mosquitto always enforces an access list, so the first update recreates the broker once, and
-  MQTT users you added by hand to the old password file lose access unless you add them
-  through VesselStack (see [MQTT access control](docs/MQTT.md)).
-
-**Env-file values are checked before anything changes.** `sudo ./install.sh --config FILE
---dry-run`, and therefore `vesselstackctl update` and the Control Panel updater (both run a dry
-run first), refuse an unsafe value before the backup is taken, services are stopped or any file
-is touched. The installer lists each offending setting by key name only (never the value), says
-why, and exits with an error:
-
-```text
-  BOAT_NAME: a single quote combined with a backslash, double quote, dollar sign or backtick
-Refusing to continue: the settings above cannot be written safely to the environment files.
-```
-
-Edit that value (for example `BOAT_NAME` in the Control Panel or `vesselstack.env`) so it no
-longer combines an apostrophe with one of those characters or spans lines, then run the dry
-run or the update again. Env files are also written atomically (to a temporary file that
-replaces the old one only when complete), so a failed run leaves the previous file intact. If an
-older release left an update stopped on this problem, restore the pre-update backup with the
-command under Rollback below, fix the value, and update again.
+**Coming from 0.6.x or 0.7.x.** The notes for those releases (a `BOAT_UNITS=nautical` setting, a backup
+drive that is not mounted, Homepage replacing Heimdall, and a shell error after updating to 0.6.3) are
+in [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older). The Control Panel
+checks a few settings as you save. The timezone must be a valid IANA name such as `Europe/Lisbon`
+(some legacy aliases such as `US/Eastern` may be rejected on newer systems where they moved to the
+`tzdata-legacy` package). Boat length must be more than 0 and at most 500, beam more than 0 and at
+most 100 (plain numbers in metres, no units), and CAN speed a whole number from 10000 to 1000000.
+The checks apply only to fields you edit, so an existing saved value you do not touch is never
+rejected or cleared; errors appear next to the field.
+If an update newly preloads the pinned `signalk-vesseltwin` plugin into an already-running Signal K
+container, the installer restarts that container so the plugin loads; an existing preloaded copy is
+never overwritten. Plan for a short gap in Signal K data. Unauthenticated loopback settings writes
+need a local `Host` name: reach Boat Chat through `127.0.0.1` or `localhost`, or send the token.
 
 **Verify after updating**
 
 ```bash
-cat /opt/vesselstack/config/installed-version     # 0.7.0
+cat /opt/vesselstack/config/installed-version     # 0.9.0
 sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
 
 Open Boat Chat and the Control Panel, and confirm the dashboards show live values.
 
-**Rollback.** Downgrades are refused (`Downgrade from 0.7.0 to ... is not supported`). Restore the
+**Rollback.** Downgrades are refused (`Downgrade from 0.9.0 to ... is not supported`). Restore the
 verified pre-update backup instead:
 
 ```bash
@@ -717,7 +564,17 @@ sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 ```
 
 The restore keeps the previous trees as `*.pre-restore-STAMP` until you delete them (see
-[Backups](#backups)).
+[Backups](#backups)). To turn one feature off without restoring, change its setting and rerun the
+installer:
+
+- `ALERTS_ENABLE=false` (or `systemctl disable --now vesselstack-alerts.timer`).
+- `NODERED_ENABLE=false` (data in `${VESSELSTACK_DATA}/node-red` is kept).
+- `SIGNALK_MARINE_BUNDLE=false`.
+- `VESSELSTACK_WATCHDOG=false`, `VESSELSTACK_JOURNAL_MAX_USE=off` and `VESSELSTACK_BACKUP_SCHEDULE=off`.
+- `SIGNALK_DATAPATH_AUTOCONFIG=false`, then follow [Signal K and InfluxDB](#signal-k-and-influxdb) to
+  remove the plugin configuration and the `vesselstack-signalk-writer` token.
+- `sudo vesselstackctl remote disable --purge` for Tailscale.
+- `"ui": {"alarm_takeover": false}` for a display in `displays.json`, then rebuild and reflash it.
 
 ## What VesselStack installs
 
@@ -733,6 +590,10 @@ The restore keeps the previous trees as `*.pre-restore-STAMP` until you delete t
 | Control Panel | Component installation, configuration, and lifecycle | `http://127.0.0.1:8780` |
 | Displays bridge (opt-in, `DISPLAYS_ENABLE=true`) | Publishes configured Signal K instruments to MQTT for instrument displays | systemd service `vesselstack-displays-bridge`; no listener |
 | Node-RED (opt-in, `NODERED_ENABLE=true`) | Visual flow automation with the editor behind a sign-in; pre-wired to MQTT and read-only InfluxDB; see [Node-RED (optional)](#node-red-optional) | `http://HOST:1880` |
+| Signal K (opt-in, `SIGNALK_MODE=docker`, pinned `v2.27.0`; or `native`) | Boat data server | `http://HOST:3000` |
+| Marine NMEA 0183 (opt-in, `SIGNALK_MARINE_BUNDLE=true`) | Signal K data as NMEA 0183 sentences for chartplotter apps; no password | `HOST:10110` (TCP) |
+| AIS-catcher (opt-in, `AIS_ENABLE=true`) | AIS receiver with a web page and a TCP output | `http://HOST:8100` and `HOST:5011` (defaults) |
+| Node Exporter (opt-in, `NODE_EXPORTER_ENABLE=true`) | Private host metrics that Prometheus reads | no published port |
 
 The installer generates credentials, renders a pinned Docker Compose stack,
 creates a confined systemd service for Boat Chat, creates configurable InfluxDB
@@ -770,7 +631,9 @@ internet access is required.
 
 1. Back up existing Home Assistant, InfluxDB, Grafana, MQTT, and Signal K data.
 2. Confirm ports `80`, `443`, `1883`, `8086`, `8123`, `8765`, `8780`, `9090`,
-   and `43000` are free. Port `8780` binds to loopback by default.
+   and `43000` are free. Port `8780` binds to loopback by default. Two optional features add
+   `1880` (Node-RED, bound to this device only by default) and `10110` (NMEA 0183 from the
+   marine essentials bundle).
 3. If using `SIGNALK_MODE=existing`, confirm Signal K responds:
 
    ```bash
@@ -912,6 +775,32 @@ nano vesselstack.env
 
 Never commit `vesselstack.env`. Generated secrets are stored in mode-600 files
 under `/opt/vesselstack/config/` and are not printed.
+
+**Env-file values are checked before anything changes.** The installer refuses a value that holds an
+apostrophe together with a backslash, a double quote, a dollar sign or a backtick, and any
+multi-line value, in the settings it writes to `vesselstack.env`, `boat-chat.env` and
+`control-panel.env`. A boat name such as `Skipper's "Dream"` is affected; `Skipper's Dream`
+is not. The check covers preserved and generated secrets too. The installer also deletes stale
+`.vesselstack.env.*`, `.boat-chat.env.*` and `.control-panel.env.*` temp files from `config/`
+(left by a killed run) before writing; no other file is touched.
+
+**Env-file values are checked before anything changes.** `sudo ./install.sh --config FILE
+--dry-run`, and therefore `vesselstackctl update` and the Control Panel updater (both run a dry
+run first), refuse an unsafe value before the backup is taken, services are stopped or any file
+is touched. The installer lists each offending setting by key name only (never the value), says
+why, and exits with an error:
+
+```text
+  BOAT_NAME: a single quote combined with a backslash, double quote, dollar sign or backtick
+Refusing to continue: the settings above cannot be written safely to the environment files.
+```
+
+Edit that value (for example `BOAT_NAME` in the Control Panel or `vesselstack.env`) so it no
+longer combines an apostrophe with one of those characters or spans lines, then run the dry
+run or the update again. Env files are also written atomically (to a temporary file that
+replaces the old one only when complete), so a failed run leaves the previous file intact. If an
+older release left an update stopped on this problem, restore the pre-update backup (see
+[Backups](#backups)), fix the value, and update again.
 
 ## 5. Run preflight
 
@@ -1267,7 +1156,7 @@ the boat's disk, so new installs create it with a 30-day retention
 (`INFLUXDB_RAW_RETENTION`, default `30d`); the one-minute history bucket keeps one year. **Upgrades never change an existing bucket
 implicitly**, because shortening retention permanently deletes older raw data.
 To apply a window to an existing install, set `INFLUXDB_RAW_RETENTION` (for
-example `90d`, or `0` to keep forever) in `vesselstack.env` or the control panel
+example `90d`, or `0` to keep forever) in `vesselstack.env` or the Control Panel
 and run `sudo vesselstackctl restart` (or the installer with `--start`); the
 bootstrap step then runs `influx bucket update`. Back up first. Removing the
 value later does not restore deleted data and leaves the bucket's current
@@ -1279,7 +1168,7 @@ prints the size of the data directory.
 
 `INFLUXDB_PASSWORD`, `INFLUXDB_TOKEN` and `GRAFANA_ADMIN_PASSWORD` are read by
 InfluxDB and Grafana only when their data volumes are first created, so they are
-**read-only in the control panel**: editing the file alone would make the config
+**read-only in the Control Panel**: editing the file alone would make the config
 disagree with the running service. To rotate one deliberately, change it inside
 the service first, then update `config/vesselstack.env`, then re-apply:
 
@@ -1540,12 +1429,7 @@ The `config/homepage*` folders are made world-readable (`0755`, files `0644`) so
 service user can read them; they hold no secrets. The container runs with all capabilities dropped
 except `CHOWN`, `SETUID` and `SETGID`.
 
-**Heimdall was removed.** Updating stops and removes an existing `vesselstack-heimdall` container
-(only if it carries this stack's Compose project label) and its image and prints a notice. A leftover
-`heimdall` entry in `VESSELSTACK_DISABLED_COMPONENTS` is dropped (it is not turned into `homepage`),
-`HEIMDALL_PORT` becomes `HOMEPAGE_PORT` when that is unset, and `HEIMDALL_PORT` and `HEIMDALL_HTTPS_PORT`
-are no longer kept; `/opt/vesselstack-data/heimdall` is left untouched and can be deleted
-by hand. Rollback: restore the previous release from a backup. Homepage uses no data directory.
+**Heimdall was removed.** Updating removes the old Heimdall container and image and leaves `/opt/vesselstack-data/heimdall` for you to delete; see [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older).
 
 ## Marine essentials (optional)
 
@@ -2430,6 +2314,76 @@ Keep an encrypted copy off the boat and test restoration. InfluxDB needs an
 application-consistent backup or a snapshot made while stopped; blindly copying
 live database files is insufficient.
 
+### Lifecycle recovery
+
+Applying a restore is a bounded transaction. VesselStack stages and validates
+both application and data trees, journals the managed
+systemd units, launchers, libexec helpers, update environment, and enable links
+outside those trees, then stops the writers before swapping anything: the Control Panel, the homepage refresh, the active timers and their services, and the stack.
+
+Right before the first folder is renamed it checks again, exactly as a rollback does: every writer unit gets a stop (including one that is restarting by itself) and must be inactive, and the Docker containers of the `vesselstack` compose project, or that mount the application or data folder (or a folder inside them) at all, or a parent of them read-write (for example `/` or `/opt`), are stopped and must be gone. A container that only mounts a parent read-only (a monitoring agent's `/:/host:ro`, for example) is left running.
+
+The containers that are not part of the `vesselstack` compose project are written to `quiesced-containers` in the journal before they are stopped, and are started again with `docker start` when the restore completes, is rolled back or is abandoned; the restore says which ones it started and names any that did not start, without failing for it (the stack's own containers come back with the stack). If one cannot be stopped, nothing has moved: the restore ends, starts again what it stopped, and names the unit or container.
+
+Before the journal is written, the restore also proves that the swap renames will work, by renaming an empty test folder into the parent folder of each tree and back, and refuses (changing nothing) when that fails, giving the system error and the two likely causes (the parent folder is not writable or read-only, or it is a separate mount of the same disk); empty test folders (`.vesselstack-restore-probe.*`) left by an interrupted earlier check are removed first, with `rmdir` only.
+
+A restore refuses up front, with nothing changed, when the application or data folder is not a clean absolute path (after normalisation), is `/`, or when one is equal to or inside the other. Before it changes anything it flushes the extracted backup and the journal to disk, which on an SD card can take several minutes (it says so; do not interrupt it).
+
+Every VesselStack unit file and enable link that exists is journaled too, because restoring an older release removes the managed units it does not have.
+
+After the trees are swapped, restore turns off the managed units that the restored version does not have (it removes their unit files and enable links, never touching other `vesselstack-*` units you created), reinstalls `vesselstack-update` and the libexec helpers from the restored release's installer scripts (removing ones that release does not ship, and leaving them alone if the tree has no installer scripts), and lists what it turned off after "Restore completed".
+
+If a later
+swap, daemon reload, installer, or start fails, the old trees and journaled
+managed paths are restored and a best-effort daemon reload/start is attempted;
+failed trees and recovery materials are retained for inspection.
+
+Before a rollback moves any folder it stops every writer unit (including one that is restarting by itself) and the Docker containers of the `vesselstack` compose project or with a mount under the application or data folder, and checks that they are gone; if one cannot be stopped nothing is moved and it is named.
+
+The firewall (`vesselstack-firewall.service`) and the CAN link units (`vesselstack-socketcan.service`) are deliberately never stopped by a restore, a rollback or an abandon. When a rollback has put the system files back from the snapshot and the firewall is enabled, the firewall is restarted so that the previous rules are applied again; if that fails it says so, and the message that the stack could not be started, a failed or refused rollback, `recover status` and `abandon` all tell you plainly when the firewall was running before the restore and is not running now, and how to start it (the journal records at the start whether the firewall was enabled and running; the notice is also given when the firewall is enabled but not running, and then says it was already not running before the restore; a journal from an earlier release has no such record, and the notice then follows the current state). A restore that completes also says so when the firewall was running before and is not now (for example because the restored release does not ship the unit). A firewall restart that fails means the firewall is DOWN, because the restart removes the rules before applying them.
+
+If the rollback
+succeeds, the staged copy of the backup is removed; if it fails, the stage directory
+and the recovery journal are kept (their paths are printed) and contain a copy of the
+backup including secrets, so remove them after recovery.
+
+While the trees are swapped,
+the Control Panel, `vesselstack-homepage-refresh.service` and the active VesselStack
+timers (and their services) are stopped and started again afterwards.
+
+The restore
+keeps a durable journal in `/var/lib/vesselstack/restore/current`, so an interrupted
+restore (a lost SSH session, a power loss) can be undone with
+`sudo /var/lib/vesselstack/restore/current/recover status` and then `recover rollback`
+(see [If a restore is interrupted](#if-a-restore-is-interrupted)).
+
+If the journal itself is damaged and the commands refuse to use it, they print a short procedure to resolve it by hand (see below). The procedure starts by stopping everything that uses the two folders, because after a reboot the stack and its `unless-stopped` containers start again and keep writing into a folder even after it is renamed (`vesselstackctl stop` is refused while the journal is pending): it gives plain `systemctl` and `docker` commands that stop every `vesselstack-*` unit except `vesselstack-firewall` and `vesselstack-socketcan` (`systemctl list-units 'vesselstack-*' --all --plain --no-legend`, so oneshot services that are still starting and units waiting to restart are included, and a unit whose file is gone does not shift the columns) and every container of the `vesselstack` compose project, gives `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` to find any other container that mounts either folder (stop it with `sudo docker stop NAME`), and says to go on only when the same `list-units` command shows every line except those two as `inactive` or `failed` (not `active`, `activating`, `deactivating` or `reloading`), repeating the stop otherwise.
+
+It is safe after a failed forward restore too: for each of the two folders, a `<folder>.pre-restore-<stamp>` next to it means the folder at the normal path is the restored copy, which you move to `<folder>.failed-restore-<stamp>` before moving the previous one back; both folders must come from the same side before the journal is moved aside. The procedure names this restore's own stamp (`<folder>.pre-restore-<stamp>` and `<folder>.failed-restore-<stamp>` with the real value from the journal) and says to leave `.pre-restore-*` and `.failed-restore-*` folders with other stamps alone, because earlier restores can leave such folders behind. If the usual read of the journal fails (for example a repeated key), the stamp is read from the `stamp=` line of the state file; only a value of the expected shape is ever printed. When the stamp cannot be read at all, it keeps the generic `<stamp>` wording and says that these steps cannot tell this restore's folders from ones left by earlier restores: a `.pre-restore-*` folder whose stamp also names an archived journal next to the journal directory (`done-<stamp>`, `rolled-back-<stamp>` or `abandoned-<stamp>`) belongs to that earlier restore and is ignored, and if any `<folder>.pre-restore-*` exists next to either folder that no archived journal claims, this restore may have moved a folder and the steps cannot tell which: leave the journal in place, move nothing, and get help. Only when there is no such folder (this restore moved nothing) and both folders are present do you do the stop step, skip the folder step, and go on with the journal step and the start step; if a folder is missing, get help. Modification times are not used, because renaming a folder does not change them.
+
+The last step starts the stack with the installer of the application folder, always: `sudo <application folder>/installer/install.sh --config <application folder>/config/vesselstack.env --start`. It also puts the unit files, `/usr/local/sbin/vesselstackctl` and the helpers back in line with that folder and starts the timers. If the installer stops, it says why: fix what it names and run it again. Only if it cannot be run at all (the file is missing, or it needs something not available at sea, such as a network or a device that is unplugged) does the procedure give `sudo vesselstackctl start`, which starts what is installed; the system files may then belong to the restored release and the timers (backups, alerts, telemetry) stay stopped until the installer has been run, so run it as soon as you can. The snapshot of the previous system files stays in the moved-aside journal. It finishes with `sudo vesselstackctl doctor`.
+
+The stop step counts a container when it mounts either folder, a folder inside them, or a folder that contains them (such as `/` or `/opt`), however it is mounted, runs the `docker ps` command again after the stop and goes on only when no such container is left, and says that `Unit ... not loaded` printed for a unit that is not running is expected and harmless.
+
+The folder moves are made with `sudo mv -T` too, so a move onto an existing folder fails instead of nesting it.
+
+The journal is moved aside with `sudo mv -T`, so a second resolution on the same day fails instead of moving the journal inside the older `.manual-DATE` directory; if it says the target exists, use another name.
+
+The commands in this by-hand procedure have been checked by tests as text and have not yet been exercised on a boat computer with running services. Folder paths read from the journal are printed with control characters replaced by `?`.
+
+The restore still
+runs in your terminal session and nothing recovers automatically at boot yet, so keep
+it on a stable connection or run it inside `screen` or `tmux`.
+
+If stopping the
+running stack fails, no rollback is attempted under live services. Unrelated
+`/etc` files, Docker services, AIS devices, and SocketCAN interfaces are not
+removed.
+
+A restore still requires `--yes`, sufficient same-filesystem space,
+and a verified archive; inspect and remove `*.pre-restore-*` only after health
+checks pass.
+
 ### Scheduled backups
 
 Scheduled backups are **off by default** (and stay off when you upgrade). Set
@@ -2512,8 +2466,8 @@ not mounted (see [Backups](#backups)).
 
 3. **Or use the Control Panel.** An authenticated session can check the public
    `jclima/VesselStack` releases. Stable releases are shown by default; enable
-   **Include early test releases** on the Updates tab to list prereleases as well, which you need for any release
-   GitHub publishes as a prerelease. The panel shows the installed version and, for a newer release, a link to its release notes. Nothing contacts GitHub until you press
+   **Include early test releases** on the Updates tab to list pre-releases as well, which you need for any release
+   GitHub publishes as a pre-release. The panel shows the installed version and, for a newer release, a link to its release notes. Nothing contacts GitHub until you press
    **Check for updates**. **Back up & install** asks for confirmation in a dialog, verifies the downloaded SHA-256 manifest, safely extracts the
    release, runs preflight, then makes and verifies a backup on a mounted external drive
    (`/media` or `/mnt`; the browser cannot change the destination). A failed or unmounted
@@ -2531,7 +2485,7 @@ not mounted (see [Backups](#backups)).
 | 0.6.0 to 0.6.4 | Control Panel or the pinned installer |
 | 0.5.7 | Control Panel or the pinned installer |
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
-| 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading to 0.6.0](#upgrading-to-060) first |
+| 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older) first |
 
 While 0.9.0 is a pre-release the Control Panel lists it only with **Include early test releases** ticked. The first update into 0.9.0 is run by the previous Control Panel, so **Finish this update** applies from the next update on.
 
@@ -2627,7 +2581,41 @@ enter a replacement value, keeps a root-only copy of the previous file as
 `<file>.before-fix-<time>` (safe to delete once the install works), and then continues. If it
 only prints the message, the run had no terminal, `--yes` or `VESSELSTACK_NONINTERACTIVE=true`
 was set, or the value is a generated password or token or comes from the environment: edit the
-named setting in the file as printed, then run again. See [Upgrading to 0.6.0](#upgrading-to-060).
+named setting in the file as printed, then run again. See [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older).
+
+The prompt for an unsupported units value looks like this:
+
+```text
+BOAT_UNITS in /opt/vesselstack/config/vesselstack.env is "imperial", which is not supported.
+  [1] US customary (feet, °F, psi, US gallons)
+  [2] Metric (metres, °C, kPa, litres)
+  [c] Cancel (nothing is changed)
+Choice:
+```
+
+An unsafe value (a token or other setting with an apostrophe plus a backslash, double quote,
+dollar sign or backtick, a line break, or a control character) is offered as
+`[1] Enter a new value for <KEY>`; what you type for a token, password or key is hidden and is
+never printed or logged, and a replacement that is still unsafe is refused. Your answer is saved
+in the settings file, the installer prints `Changed <KEY> in <file> (previous copy: <file>.before-fix-<time>)`
+and starts over with the same options. The previous copy is root-only; delete the
+`*.before-fix-*` copies once the install works. `c`, an empty answer at the end of input or
+five minutes without an answer prints `Cancelled. Nothing was changed.` and leaves the file as
+it was.
+
+Limits: only settings written in the file you pass with `--config` are offered (a value
+that comes from the environment is not), generated or preserved passwords and tokens (InfluxDB,
+Grafana, MQTT, Boat Chat, Control Panel) are never offered because the running services still hold the
+old value (change it in the service first, then edit the file), and a symbolic link, a file not
+owned by root, a file in a folder (or under a parent folder) that other users can change, or a
+file whose edit cannot be verified is left untouched. For an unsupported units value the manual
+`sed` command is printed; for an unsafe value you are told to edit the setting by hand. Runs without a terminal (cron, a service, the Control Panel, `--yes`,
+`VESSELSTACK_NONINTERACTIVE=true`) never ask: they stop before changing anything and print the
+exact fix. A dry run that you answer does save the fix you chose.
+
+### An installation or update did not finish
+
+While an installation or update is running, the installer keeps `config/install-in-progress`; it is removed once the services have started (or, for a run without `--start`, when no earlier `--start` run failed), so a leftover file means the last run did not finish. `installed-version` is written before the services are started and does not by itself show that they were. `get-vesselstack.sh` reads the marker: a rerun for the same version continues the unfinished installation with the installed configuration, no wizard and no new backup (it asks first, unless `--yes` or `--defaults`); an older version is refused while a newer update is unfinished; and a failed update names the backup recorded in the marker. `vesselstackctl doctor`, `status` and `version` report the marker: `doctor` prints `FAIL installation of VERSION did not finish` with the command to continue and, when a backup is recorded, the command to restore it; `status` shows an `Installation INCOMPLETE` line and exits non-zero; and `vesselstackctl update` passes its backup to the installer in `VESSELSTACK_PREUPDATE_BACKUP`, so the marker records it and a failed update prints the exact restore command.
 
 ### A port is already allocated
 
@@ -2734,21 +2722,14 @@ and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
 dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
 bytecode in the source or bundled runtime tree.
 
-Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
-Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order. `tests/test-clean-install.sh` does the same for the installer's `--dry-run` output (written to a file, then searched).
-`tests/test-remote.sh` covers the Tailscale remote-access commands with fake `tailscale`, `apt-get` and `curl` binaries (run it with `sudo`, like the lifecycle test).
-`tests/test-distribution.sh` asserts the `vesselstackctl --help` backup usage line verbatim, including `[--scheduled]`; update it together with the usage text.
-The fake npm container in `tests/test-clean-install.sh` sets `umask 022`, as the real npm does when it runs as the Signal K user. Without it, `install.sh`'s umask 077 left `node_modules` root-only wherever `install -d` honours the umask (uutils coreutils, the default on Ubuntu 26.04 and so on the newer GitHub runner image), the unprivileged data path helper hit `Permission denied` and silently skipped the marine bundle packages. Test-only change; the product is unchanged. CI uses the newest Ubuntu, so also try `ubuntu:26.04` when reproducing.
-`tests/test-get-vesselstack.sh` feeds the terminal wizard scripted answers on stdin, one per prompt in wizard order (the "Send boat alerts to Telegram?" prompt follows "Run the Telegram bot worker?"); when you add a wizard prompt, add an answer there and bump the blank-answer counts, or later answers shift onto the wrong questions. Test-only change; the product is unchanged.
-To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
-
-The CI step "Validate optional Compose profiles" runs `docker compose config --quiet --no-env-resolution` with the signalk, ais, metrics and nodered profiles. The flag skips the installed-only `config/nodered.env` (required by the Node-RED service, which still refuses to start without it) so Compose syntax and interpolation are validated on a runner with no installed system. CI-only change; no runtime impact or rollback needed.
+The test-mechanics notes (directory-listing and `tar -t` assertions, `tests/test-remote.sh`, the CI profile check, scripted wizard answers and reproducing CI on a Mac) are in [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 
 ## Documentation policy
 
 Every repository change must update this README in the same pull request. CI
 enforces this for pull requests. Keep commands, versions, paths, features,
-limitations, verification, and rollback guidance synchronized with code.
+limitations, verification, and rollback guidance synchronized with code. Writing rules for
+user-facing text are in [Writing for VesselStack](brand/README.md#writing-for-vesselstack).
 
 ## License and security
 
@@ -2794,6 +2775,7 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="quick-start-for-an-internet-connected-pi"></a>[Quick start for an internet-connected Pi](#quick-start-one-command-on-the-raspberry-pi)
 - <a id="selective-core-component-lifecycle"></a>[Selective core component lifecycle](docs/DEVELOPMENT.md#selective-core-component-lifecycle)
 - <a id="settings-and-configuration-precedence"></a>[Settings and configuration precedence](docs/BOAT_CHAT.md#settings-and-configuration-precedence)
+- <a id="shared-lifecycle-lock"></a>[Shared lifecycle lock](docs/DEVELOPMENT.md#shared-lifecycle-lock)
 - <a id="signalk-and-influxdb"></a>[SignalK and InfluxDB](#signal-k-and-influxdb)
 - <a id="signalk-not-running--eacces-on-packagejson"></a>[SignalK not running / EACCES on package.json](#signal-k-not-running--eacces-on-packagejson)
 - <a id="supported-boards"></a>[Supported boards](docs/DISPLAYS.md#supported-boards)
@@ -2803,6 +2785,7 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="thresholds-and-severity-colours"></a>[Thresholds and severity colours](docs/DISPLAYS.md#thresholds-and-severity-colours)
 - <a id="touch-header-night-mode-and-dimming"></a>[Touch, header, night mode and dimming](docs/DISPLAYS.md#touch-header-night-mode-and-dimming)
 - <a id="update-from-the-control-panel-057-lab-release"></a>[Update from the Control Panel (0.5.7 lab release)](#updating)
+- <a id="upgrading-to-060"></a>[Upgrading to 0.6.0](docs/UPDATING.md#upgrading-from-06x-or-older)
 - <a id="version-10-release-scope"></a>[Version 1.0 release scope](docs/DEVELOPMENT.md#version-10-release-scope-historical)
 
 ## Development and release history

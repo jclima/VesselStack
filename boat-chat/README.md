@@ -16,7 +16,7 @@ sudo systemctl status vesselstack-chat.service
 sudo systemctl restart vesselstack-chat.service
 ```
 
-It starts on boot. The installer/control panel keep base settings in
+It starts on boot. The installer/Control Panel keep base settings in
 `/opt/vesselstack/config/boat-chat.env`; the service-user Settings page writes
 overrides to `$VESSELSTACK_DATA/boat-chat/boat-chat.env` (the default
 `BOAT_CHAT_ENV` path).
@@ -44,7 +44,7 @@ Boat Chat keeps context in tiers so common questions stay fast and small local m
 - Tier 2: InfluxDB historical summaries, fetched only for questions that need history such as engine runtime or fuel usage.
 - Tier 3: local docs and runbooks from the SQLite memory index, limited to the top matches.
 
-The same SQLite database also stores materialized telemetry summaries in `telemetry_summaries`. These are derived facts such as latest engine run, common fuel-usage windows, shore-power timing, inferred solar contribution, and a latest boat-status context snapshot. The `0.5.7` lab prerelease uses `vesselstack-telemetry-sample.timer` for latest samples every five minutes and the indexer for historical summaries every 30 minutes. InfluxDB and Home Assistant remain the source of truth; the cache is only a fast summary layer.
+The same SQLite database also stores materialized telemetry summaries in `telemetry_summaries`. These are derived facts such as latest engine run, common fuel-usage windows, shore-power timing, inferred solar contribution, and a latest boat-status context snapshot. The `0.5.7` lab pre-release uses `vesselstack-telemetry-sample.timer` for latest samples every five minutes and the indexer for historical summaries every 30 minutes. InfluxDB and Home Assistant remain the source of truth; the cache is only a fast summary layer.
 
 Forward-looking power observations are stored separately in `$VESSELSTACK_DATA/boat-chat/data/power_tracking.sqlite`. Boat Chat integrates positive SmartShunt power only across adjacent samples where the boat is underway, beyond the dock radius, or not charging, and both engines are below 200 RPM. It reports that result as inferred net solar-to-battery energy, not gross panel output. The Home Assistant shore-power entity is only a charging proxy, so dockside source attribution remains ambiguous until a physical AC-input meter is installed. Observations are retained for 400 days; gaps longer than 15 minutes are excluded. See `POWER_MONITORING.md` for instrumentation and interpretation.
 

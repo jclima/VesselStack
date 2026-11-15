@@ -976,7 +976,7 @@ CFG
 env_before=$(sha256sum "$XENV" "$X_APP/config/boat-chat.env" "$X_APP/config/control-panel.env")
 expect_unchanged_failure "dry-run with unsafe env value" xinstall "$X_APP/installer/install.sh" --config "$BADVAL" --dry-run
 grep -q "HOME_ASSISTANT_TOKEN" "$TEST_ROOT/failure.out"
-grep -q 'Upgrading to 0.6.0' "$TEST_ROOT/failure.out"
+grep -q '4. Configure the vessel' "$TEST_ROOT/failure.out"
 if grep -q 'SECRET' "$TEST_ROOT/failure.out"; then echo "the refusal printed the value" >&2; exit 1; fi
 expect_unchanged_failure "real run with unsafe env value" xinstall "$X_APP/installer/install.sh" --config "$BADVAL"
 grep -q "HOME_ASSISTANT_TOKEN" "$TEST_ROOT/failure.out"

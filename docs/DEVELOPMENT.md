@@ -64,7 +64,7 @@ Do not build and upload files by hand.
    tag object's own name to equal `TAG`, and refuses a tag that does not point directly at that
    commit. Locally, pass the commit you expect as the third argument. To rotate or add the release key, change
    `.github/allowed_signers` in a pull request to `main` and merge it before creating the tag;
-   the workflow reads the copy at the tagged commit. The `v0.5.7` lab prerelease was an
+   the workflow reads the copy at the tagged commit. The `v0.5.7` lab pre-release was an
    annotated unsigned tag because no SSH/GPG key was available; it is not signed and would now
    be refused. The `v0.5.1` tag is untouched and was not published because its release pipeline
    caught the bridge startup-status race. `v0.6.4` is an SSH-signed tag, published first as a
@@ -90,9 +90,9 @@ Do not build and upload files by hand.
    verified, `/etc/apt/sources.list.d/docker.sources` written, `docker-ce` and
    `docker-compose-plugin` installed, `docker info` answering; check `dpkg --print-architecture`
    says `arm64`), an upgrade from the previous release, and an offline
-   upgrade. The test suites use stubs and cannot cover this. For a prerelease,
+   upgrade. The test suites use stubs and cannot cover this. For a pre-release,
    publication may precede physical-Pi acceptance; record that acceptance is pending
-   (it was for `0.5.7`). Complete the pinned installer
+   (as for `0.5.7`, and now for `0.7.0`, `0.7.1`, `0.8.0` and `0.9.0`; see the status note in step 3). Complete the pinned installer
    and component lifecycle recipe in [CONTROL_PANEL_TESTING.md](CONTROL_PANEL_TESTING.md)
    before any stable promotion.
 7. Publish the draft as a **pre-release** (or otherwise not latest) first, so
@@ -403,14 +403,48 @@ wizard's output) with fake `curl`/`apt-get`/`apt-cache`/`dpkg`/`gpg`/`docker`/`s
 stubs. `tests/test_wizard.py` tests the prompt logic as functions driven by an input
 iterator, the unbuffered descriptor reader and the real wizard on a pseudo-terminal.
 
+### Test mechanics
+
+For the lifecycle and install boundary, also run `bash tests/test-clean-install.sh` and
+`bash tests/test-lifecycle.sh` in an isolated Linux container. Installer dry runs set
+`PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python bytecode in the source or bundled
+runtime tree.
+
+Test assertions on directory listings sort the result first, so they do not depend on filesystem order.
+Archive-listing assertions read `tar -t` into a variable instead of piping it into `grep -q`: under `pipefail` an early match made `tar` die of SIGPIPE, so `tests/test-lifecycle.sh` failed on some filesystems, depending on directory order. `tests/test-clean-install.sh` does the same for the installer's `--dry-run` output (written to a file, then searched).
+`tests/test-remote.sh` covers the Tailscale remote-access commands with fake `tailscale`, `apt-get` and `curl` binaries (run it with `sudo`, like the lifecycle test).
+`tests/test-distribution.sh` asserts the `vesselstackctl --help` backup usage line verbatim, including `[--scheduled]`; update it together with the usage text.
+The fake npm container in `tests/test-clean-install.sh` sets `umask 022`, as the real npm does when it runs as the Signal K user. Without it, `install.sh`'s umask 077 left `node_modules` root-only wherever `install -d` honours the umask (uutils coreutils, the default on Ubuntu 26.04 and so on the newer GitHub runner image), the unprivileged data path helper hit `Permission denied` and silently skipped the marine bundle packages. Test-only change; the product is unchanged. CI uses the newest Ubuntu, so also try `ubuntu:26.04` when reproducing.
+`tests/test-get-vesselstack.sh` feeds the terminal wizard scripted answers on stdin, one per prompt in wizard order (the "Send boat alerts to Telegram?" prompt follows "Run the Telegram bot worker?"); when you add a wizard prompt, add an answer there and bump the blank-answer counts, or later answers shift onto the wrong questions. Test-only change; the product is unchanged.
+To reproduce CI on a Mac, run `sudo tests/test-lifecycle.sh` in a privileged `ubuntu:24.04` container with `jq`, `shellcheck`, `python3` and `util-linux` installed.
+
+The CI step "Validate optional Compose profiles" runs `docker compose config --quiet --no-env-resolution` with the signalk, ais, metrics and nodered profiles. The flag skips the installed-only `config/nodered.env` (required by the Node-RED service, which still refuses to start without it) so Compose syntax and interpolation are validated on a runner with no installed system. CI-only change; no runtime impact or rollback needed.
+
+## Shared lifecycle lock
+
+`common/lifecycle_lock.py` provides the shared, non-blocking lock used by the
+mutating installer, `vesselstackctl`, Control Panel operation slot, and detached
+browser-update worker. It keeps the lock outside the application and data trees
+and supports validated descriptor handoff to child processes. Read-only
+`vesselstackctl` commands remain unlocked.
+Direct boat-profile `set` and `init` commands use the same lock; in-process
+profile-library writes remain the caller's responsibility.
+Direct `deploy-chat.py` apply/rollback operations also use the shared lock;
+read-only preview operations remain unlocked.
+The real-systemd browser-update acceptance fixture copies these shared modules
+alongside the panel so its service-start check exercises the same import set as
+an installed release. The panel releases the shared lifecycle lock before handing
+off its browser-update lock, so a detached updater cannot wake between those two
+steps and report a spurious busy state.
+
 ## Historical notes
 
-Kept for reference; these sections describe past scope and unreleased review fixes, not the current lab prerelease. See `CHANGELOG.md` for release notes.
+Kept for reference; these sections describe past scope and unreleased review fixes, not the then-current lab pre-release. See `CHANGELOG.md` for release notes.
 
 ### Version 1.0 release scope (historical)
 
 This is the historical 1.0 scope checklist, kept for reference; it is not a
-statement about the current lab prerelease.
+statement about the then-current lab pre-release.
 
 1. **Complete:** InfluxDB schema names and runtime Boat Chat branding are
    configurable, with legacy defaults retained only for 0.x upgrades.
@@ -515,7 +549,7 @@ separate reviewed work. Source facts now live in `boat_facts.example.json`; actu
 **Upgrade notes (secrets, readiness, retention, update trust).**
 
 - Re-running the installer no longer regenerates InfluxDB/Grafana/MQTT secrets;
-  the control panel shows the init-only ones as read-only (see "Rotating
+  the Control Panel shows the init-only ones as read-only (see "Rotating
   secrets"). The Mosquitto password file is no longer truncated on every start.
 - `bootstrap-influx.sh` waits for InfluxDB health and treats list errors as
   errors. The downsample task is updated once to the numeric-only version.

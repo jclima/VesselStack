@@ -25,14 +25,16 @@ Related: [INSTALLATION.md](INSTALLATION.md) (hardware and first install),
 
 0.9.0 release status: this branch prepares `v0.9.0` as a pre-release. It is not Latest and physical Raspberry Pi acceptance is pending; signing, publication and the section 7 acceptance gate remain release-owner steps.
 
-History: `v0.5.7` was published as an unsigned lab prerelease that was not marked latest, and
+History: `v0.5.7` was published as an unsigned lab pre-release that was not marked latest, and
 `v0.4.4` stayed the release GitHub marks Latest through the 0.5.x series. The `v0.5.1` tag is
 untouched; its release pipeline was blocked by the bridge startup-status race. `v0.8.0` was the
 previous release and is the update source for the rehearsal in section 3.5.1. `v0.6.3` was published
 first as a pre-release and marked Latest after physical Pi acceptance; `v0.6.2` was marked Latest
 directly rather than staying a pre-release. `v0.6.1` and `v0.6.0` were published first as
 pre-releases and marked Latest only after physical Pi acceptance. `v0.7.0`, `v0.7.1` and `v0.8.0` were published as regular releases. Published
-tags are never recreated, moved or promoted by retagging.
+tags are never recreated, moved or promoted by retagging. The acceptance check for the atomic
+`vesselstackctl` install applied to updates from 0.6.4 or earlier and was retired with 0.9.0,
+because the rehearsal now starts from `v0.8.0`, which already has it.
 
 ## Simple path: one command
 
@@ -52,7 +54,7 @@ It installs prerequisites, asks before installing Docker, verifies the release
 sha256 (compare it with the value recorded in section 2), asks the configuration
 questions in the terminal (Enter takes the default, `?` explains, a review screen at the
 end), then runs `install.sh --dry-run`, `install.sh --start` and `vesselstackctl doctor`,
-and prints the service addresses, the Boat Chat token command and the control panel SSH
+and prints the service addresses, the Boat Chat token command and the Control Panel SSH
 tunnel hint as plain text. If a VesselStack is already
 installed it offers `vesselstackctl update` (with its backup) instead of
 overwriting. You can read the script before running it: download with `curl -fsSLO`,
@@ -404,9 +406,17 @@ values, and record the `doctor` result and data-directory size each day.
 ### 3.5 Rehearsals (do all of these before the boat)
 
 1. **Update from the previous version.** On a spare lab install (or before the
-   soak), install the prior tag the normal way (`git checkout v0.3.0` in a clean
-   clone, `sudo ./install.sh --config ... --start`), then update with 0.9.0 from
-   the unpacked release directory:
+   soak), install the previous release `v0.8.0` the normal way, with its pinned
+   installer (as README [Quick start](../README.md#quick-start-one-command-on-the-raspberry-pi)
+   shows for a pinned version), then update with 0.9.0 from the unpacked release directory.
+   The update's own verified backup (below) is the one to keep for the restore
+   rehearsals in section 7:
+
+   ```bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash   # [MUTATES HOST] 0.8.0 install
+   ```
+
+   Then:
 
    ```bash
    sudo vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.0   # [MUTATES HOST]
@@ -469,7 +479,7 @@ values, and record the `doctor` result and data-directory size each day.
 
 5. **Display Wi-Fi (OTA) update test (only if you use instrument displays).** The Control
    Panel and `vesselstackctl display deploy` can update a display over Wi-Fi, but OTA updates are
-   **not yet verified on hardware** in 0.6.2 (a preview feature); the first flash must be USB. Do
+   **not yet verified on hardware** in 0.9.0 (a preview feature); the first flash must be USB. Do
    this on a lab display with `DISPLAYS_ENABLE=true`, on the lab Pi only, and skip it if the boat
    has no displays. The displays bridge dependencies (its virtualenv) are not in the offline bundle,
    so provision them online on the lab Pi first; an offline Pi cannot build or deploy displays.
@@ -499,13 +509,13 @@ values, and record the `doctor` result and data-directory size each day.
       OTA), then rerun the deploy, and finish with USB if it does not recover.
    7. Rollback: `sudo vesselstackctl display restore-config STAMP` (STAMP from
       `display history`) and then `sudo vesselstackctl display flash ID --previous --ota DISPLAY_IP`
-      (or **Put previous firmware on screen**). The previous image is only offered when it
+      (or **Put previous firmware back**). The previous image is only offered when it
       matches the restored settings and credentials. Confirm the screen shows the earlier pages.
 
    Before downgrading below 0.6.2 run `sudo vesselstackctl display set-theme ID classic` for
    every themed display, otherwise the displays bridge exits with status 2.
 
-6. **Homepage and sign-in.** On the lab Pi, with an update from 0.6.2 (section 3.5.1). Record outcomes
+6. **Homepage and sign-in.** On the lab Pi, after the update from 0.8.0 (section 3.5.1). Record outcomes
    in your private lab notes, not in the repository.
 
    1. Front door: open `http://<hostname>.local` (port 80) from a phone or laptop on the LAN. Homepage
@@ -514,8 +524,10 @@ values, and record the `doctor` result and data-directory size each day.
       `sudo vesselstackctl component add grafana` restores it.   # [MUTATES HOST]
    3. Reboot the Pi and confirm the front door still answers by name and by the Pi's current address
       (`vesselstack-homepage-refresh.service` refreshes the allowed hosts at boot).   # [MUTATES HOST]
-   4. Update from 0.6.2: confirm `docker ps -a` shows no `vesselstack-heimdall` container, the update
-      printed the Heimdall notice, and `$VESSELSTACK_DATA/heimdall` is still on disk.
+   4. Only if this lab Pi was last installed from 0.6.2 or earlier (the 0.8.0 rehearsal has no Heimdall):
+      confirm `docker ps -a` shows no `vesselstack-heimdall` container, the update printed the Heimdall
+      notice, and `$VESSELSTACK_DATA/heimdall` is still on disk. `sudo vesselstackctl homepage remove-heimdall`
+      repeats the removal.
    5. Set a Control Panel passphrase (`sudo vesselstackctl passphrase set panel`), sign in from a
       second device with **Remember this device**, confirm it stays signed in after closing the
       browser, then revoke it from the first device (Settings, Sign-in) and confirm it is signed out.
@@ -525,16 +537,6 @@ values, and record the `doctor` result and data-directory size each day.
       out only their own device and that managing others needs the admin code.
    8. Token rotation: rotate `CONTROL_PANEL_TOKEN` (panel Settings or the installer) and confirm every
       remembered device is signed out while the new token works.   # [MUTATES HOST]
-
-7. **Atomic `vesselstackctl` install.** On the lab Pi, with an update from an older release (0.6.4 or
-   earlier, section 3.5.1). Record the outcome in your private lab notes, not in the repository.
-
-   1. Run `sudo vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.7.0` from the older
-      installed command (or the pinned installer) and watch the end of the output: the update finishes
-      without `syntax error near unexpected token`.
-   2. `echo $?` after the update prints `0`.
-   3. `cat /opt/vesselstack/config/installed-version` prints `0.7.0`, and `sudo vesselstackctl doctor`
-      and `sudo vesselstackctl status` are healthy.
 
 ### 3.6 InfluxDB retention note
 
@@ -651,7 +653,7 @@ backup, the recorded sha256 and a console/Ethernet path ready.
    sudo grep '^BOAT_CHAT_ACCESS_TOKEN=' /opt/vesselstack/config/boat-chat.env
    ```
 
-7. **Control panel** (loopback-only by default, port `8780`) through an SSH
+7. **Control Panel** (loopback-only by default, port `8780`) through an SSH
    tunnel from the laptop; unlock with `CONTROL_PANEL_TOKEN` from
    `/opt/vesselstack/config/control-panel.env`:
 
@@ -701,16 +703,21 @@ them (`sudo rm -rf -- ...`, the command is printed) to free space and remove old
 secrets. `vesselstack-update --rollback BACKUP_DIRECTORY` is only for code-only
 `vesselstack-update --apply` runs, not for a release install.
 
+Since 0.9.0 a restore keeps a journal in `/var/lib/vesselstack/restore/current`. If a restore is
+interrupted, use `sudo /var/lib/vesselstack/restore/current/recover status` and `recover rollback`
+(README [If a restore is interrupted](../README.md#if-a-restore-is-interrupted)); while the journal
+is pending, commands that change the system and the installer refuse to run.
+
 ## 7. Acceptance checklist
 
 - [ ] Release `v0.9.0`: tag signature verified (`scripts/verify-release-tag.sh v0.9.0 .github/allowed_signers "$RECORDED_COMMIT"`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
 - [ ] Lab: 48 h+ soak with daily `doctor` healthy; replay data visible in Grafana.
-- [ ] Lab: update from 0.3.0, backup/verify/restore, and offline install rehearsed.
+- [ ] Lab: update from 0.8.0, backup/verify/restore, and offline install rehearsed.
 - [ ] Boat: sha256 of the carried tarball equals the recorded value.
 - [ ] Boat: verified backup exists on separate media and a copy is off the Pi.
 - [ ] Boat: `installed-version` is `0.9.0`; `doctor` healthy before and after reboot.
 - [ ] Boat: `can0` RX counter increases, error/dropped counters flat.
-- [ ] Boat: tokens are per-host; no lab secrets copied; control panel reached by tunnel only.
+- [ ] Boat: tokens are per-host; no lab secrets copied; Control Panel reached by tunnel only.
 
 If trusted-LAN panel access is intentionally required, apply it separately with
 `sudo vesselstackctl panel-access lan` after reviewing
@@ -720,9 +727,27 @@ block it. Restore loopback-only access with
 `sudo vesselstackctl panel-access local`. No firewall rule or other listener is
 changed by this command.
 - [ ] Optional, only if displays are used: lab Wi-Fi (OTA) display update rehearsed (section 3.5.5: USB first, OTA by IP and `.local`, offline device, rotated credentials, power cut, `flash --previous` rollback) with timings recorded; otherwise displays stay USB-flashed on the boat.
-- [ ] Lab: Homepage and sign-in rehearsed (section 3.5.6): front door at `http://<hostname>.local` shows the tiles, removing and re-adding a component updates its tile, the allowed hosts refresh after a reboot, and the update from 0.6.2 removed the Heimdall container and left `$VESSELSTACK_DATA/heimdall`.
+- [ ] Lab: Homepage and sign-in rehearsed (section 3.5.6): front door at `http://<hostname>.local` shows the tiles, removing and re-adding a component updates its tile, the allowed hosts refresh after a reboot, and, only when the lab Pi came from 0.6.2 or earlier, the update removed the Heimdall container and left `$VESSELSTACK_DATA/heimdall`.
 - [ ] Lab: passphrase sign-in with Remember and revoke from another device, a `panel-link --for chat` QR scanned by a phone, the Boat Chat crew passphrase, and a token rotation that signs devices out.
-- [ ] Lab: after updating from an older release (section 3.5.7), the update ends without `syntax error near unexpected token` and `vesselstackctl update` exits 0.
+- [ ] Lab, 0.9.0: **interrupted restore and rollback** (README [If a restore is interrupted](../README.md#if-a-restore-is-interrupted)). Scratch lab Pi only, with a verified backup from section 3.5.2. **[MUTATES HOST]**
+  1. In `screen` or `tmux` run `sudo vesselstackctl restore /path/to/vesselstack-STAMP.tar.gz --yes`. From a second SSH session, `kill -9` the restore process part-way (after it has stopped the stack).
+  2. `sudo /var/lib/vesselstack/restore/current/recover status` shows how far it got, then `sudo /var/lib/vesselstack/restore/current/recover rollback`. Expect the previous application and data folders back in place, the stack started, and no `*.pre-restore-*` folder left in the way.
+  3. `sudo vesselstackctl doctor` is healthy, and `sudo vesselstackctl status` no longer prints `FAIL restore did not finish` and exits 0. While the journal was pending, `status` reported it and commands that change the system refused ("A restore did not finish"): note that too.
+  4. Delete the leftover `*.pre-restore-*`, `*.failed-restore-*` and stage folders yourself when done; they hold a copy of the data including secrets.
+- [ ] Lab, 0.9.0: **by-hand recovery procedure, run once.** The procedure printed when the restore journal cannot be used has only been checked as text by tests (CHANGELOG 0.9.0 "Known limits"). On a scratch lab Pi that holds nothing you need, **[MUTATES HOST]**:
+  1. Interrupt a restore as in the previous item, but do not roll back. Then make the journal unusable in a way README lists: "the state file of the journal is unreadable, has a repeated key or fails validation". For example, append a second copy of an existing `key=value` line (a repeated key) to `/var/lib/vesselstack/restore/current/state`. README names the conditions, not an exact edit; record the edit you made.
+  2. Run `sudo /var/lib/vesselstack/restore/current/recover status`. It should refuse, change nothing and print the by-hand procedure (the same text comes from `sudo vesselstackctl restore-recover status`).
+  3. Follow the printed steps exactly, in order, in a second session, and record in your private lab notes whether each printed command worked as written. Pay particular attention to the `systemctl list-units 'vesselstack-*' --all --plain --no-legend` stop and check lines (does the list reach only `inactive` or `failed`?), the `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` line, the `sudo mv -T` folder and journal moves, and the final `install.sh --start`.
+  4. Finish with `sudo vesselstackctl doctor` and `sudo vesselstackctl status`.
+  5. File each discrepancy as an issue describing the command and the difference only. Do not attach logs, `doctor` output or paths that contain vessel data.
+- [ ] Lab, 0.9.0: **leftover units after going back.** After restoring an older-release backup (the 0.8.0 backup from section 3.5.1) or rolling back from a newer one, run `systemctl list-units 'vesselstack-*' --all --plain --no-legend` and `sudo vesselstackctl doctor`. Expect the restore to have listed the managed features the older release does not have under "Turned off because the restored version does not have them" (for example scheduled backups and Telegram alerts for a 0.8.0 archive). Record whether any `vesselstack-*` unit that the installed release does not ship is still installed or enabled (`systemctl list-unit-files 'vesselstack-*'`), and file an issue if so. **[read-only]** after the restore itself.
+- [ ] Lab, 0.9.0: **new optional features, each off by default.** Enable, check and disable each one on the lab Pi only, and leave it off afterwards. Settings go in `vesselstack.env` or the Control Panel Settings page; rerun the installer (or **Apply**) after a change. **[MUTATES HOST]**
+  - Telegram alerts ([Alerts](../README.md#alerts)): set `ALERTS_ENABLE=true` and `ALERT_TELEGRAM_CHAT_IDS`, check with `sudo vesselstackctl alerts test` and `alerts status`, disable with `ALERTS_ENABLE=false` (or `sudo systemctl disable --now vesselstack-alerts.timer`). The separate "Ask Boat Chat from Telegram" switch is `TELEGRAM_ENABLE`.
+  - Tailscale remote access ([Remote access with Tailscale](../README.md#remote-access-with-tailscale)): `sudo vesselstackctl remote enable --dry-run`, then `remote enable` (needs internet), check with `sudo vesselstackctl remote status`, disable with `sudo vesselstackctl remote disable --purge`.
+  - Node-RED ([Node-RED (optional)](../README.md#node-red-optional)): `NODERED_ENABLE=true`; `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:1880/flows` must print `401` and `sudo vesselstackctl doctor` shows no Node-RED WARN; disable with `NODERED_ENABLE=false` (flows in `${VESSELSTACK_DATA}/node-red` are kept).
+  - Marine essentials ([Marine essentials (optional)](../README.md#marine-essentials-optional)): `SIGNALK_MARINE_BUNDLE=true` (needs internet; it is skipped with a warning offline); `nc BOAT_ADDRESS 10110` shows NMEA 0183 sentences once Signal K has a position and `sudo vesselstackctl doctor` shows no new WARN; disable with `SIGNALK_MARINE_BUNDLE=false`.
+  - Scheduled backups ([Scheduled backups](../README.md#scheduled-backups)): `VESSELSTACK_BACKUP_SCHEDULE=daily` or `weekly` (the run stops the whole stack), check with `systemctl list-timers vesselstack-backup.timer` and `sudo vesselstackctl doctor`, disable with `VESSELSTACK_BACKUP_SCHEDULE=off`.
+  - Hardware watchdog ([Unattended operation and power](../README.md#unattended-operation-and-power)): on by default (`auto`) only on a Raspberry Pi with `/dev/watchdog`; check the "hardware watchdog" line of `sudo vesselstackctl doctor`; opt out with `VESSELSTACK_WATCHDOG=false`.
 - [ ] Rollback path (backup + previous release + previous offline bundle) is on board.
 
 ## 8. Remote access, secrets, and known gaps
@@ -735,7 +760,7 @@ offline bundle), publishes only the Control Panel to your tailnet with
 `tailscale serve` (the panel stays on loopback) and opens no inbound ports. It
 does not restrict other services bound to `0.0.0.0`, which the tailnet can then
 reach: use Tailscale ACLs. For any other VPN, bind/allow services on that
-interface deliberately and update the firewall policy; keep the control panel
+interface deliberately and update the firewall policy; keep the Control Panel
 on loopback plus tunnel. Rollback: `sudo vesselstackctl remote disable --purge`.
 
 **Secrets.** Secrets live in `/opt/vesselstack/config/*.env` (mode 600) and in
@@ -755,12 +780,12 @@ machine only.
 - **Real SSH signature verification** on the Pi (`vesselstack-update` against its
   allowed-signers file) has only been tested with fixtures; do the first real run on the lab
   Pi. The release workflow's tag check (`scripts/verify-release-tag.sh`) is covered by
-  `tests/test-verify-release-tag.sh` with throwaway keys; its first real run is the `v0.7.0`
-  tag push.
+  `tests/test-verify-release-tag.sh` with throwaway keys; it has verified the SSH-signed release tags since
+  `v0.6.0` (see `CHANGELOG.md`).
 - The **arm64 offline bundle** (wheels for `manylinux*_aarch64`, `linux/arm64`
   images) has not been built and installed on a real Pi; section 3.5.3 is that
   rehearsal. Image tarballs are manifest-checked but not digest-pinned.
 - Scoped read-only InfluxDB tokens for Boat Chat and Grafana are **deferred**
-  (see README and CHANGELOG); they are not part of 0.7.0.
+  (see README and CHANGELOG); they are not part of 0.9.0.
 - The tarball is integrity-checked by sha256 only on the boat (no signature
   check in `install.sh`/`vesselstackctl update`).
