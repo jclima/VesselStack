@@ -40,6 +40,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Real systemd browser update acceptance
         run: sudo env VESSELSTACK_SYSTEMD_UPDATE_TEST=true tests/test-browser-update-systemd.sh
+      - name: Real systemd background restore launch
+        run: sudo env VESSELSTACK_SYSTEMD_RESTORE_TEST=true tests/test-restore-detach-systemd.sh
       - name: Public-source privacy check
         run: python3 scripts/check-public-tree.py
       - name: Static distribution checks

@@ -3,208 +3,18 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
-
-### Displays
-
-- The alarm banner on a display now comes back for every new alarm. Before, a banner you had
-  tapped away stayed away when one alarm cleared and another raised in the same update. The
-  display now follows the `seq` counter that the bridge has published since 0.9.0.
-- A Wi-Fi or MQTT blip no longer brings a dismissed banner back. While the link is down the
-  banner stays hidden; when it returns with the same alarms, nothing is raised again.
-- When the data of every alarm has stopped, the banner says `NO DATA` (or `2 NO DATA`) instead of
-  `ALARM`. With at least one live alarm it still says `ALARM` or `ALARMS`.
-- An alarm a display has seen no longer disappears when the data or the bridge is lost. The banner
-  now says `NO DATA`, with the name of the last known alarm, when the summary is stale or the bridge
-  is lost. This reverses the earlier rule that the banner is hidden when the link is lost. Tap it
-  to dismiss it like any other banner. Losing the link does not switch the page or undo a tap.
-  A display that boots while the bridge is down still gets the stored alarm summary from the
-  broker. If it is an alarm, the display switches to the alarm page and shows plain `NO DATA` with
-  the first alarm's name until you tap it, and again after every reboot while the broker holds that
-  summary. It shows nothing only when the broker holds no summary. Start the bridge to replace a
-  summary left by a bridge that is no longer running.
-- A display now treats the bridge as lost when it has not heard `online` for
-  `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5), not
-  only when the bridge says `offline`. Before, a bridge that hung with its connection up left the
-  header dot green and the tiles trusted. Tiles show `--` and the bridge dot turns red. The 15 s
-  margin covers a bridge that is blocked for about 13 s in a connection attempt. The alarm summary
-  and the clock use the same limit. The banner is redrawn as soon as `online` arrives, and a bridge
-  that hangs for 49.7 days can no longer look live again when the millisecond counter wraps.
-- The bridge now also saves the alarms that are live, not only the lost ones, in `state.json` (the
-  existing key `latched` is unchanged, and a new optional key `live` is added). If the bridge is
-  killed (or the Pi loses power) while an alarm is live, it restarts with that alarm as lost, so
-  displays show `NO DATA` instead of hiding the banner. When the data returns in alarm the alarm is
-  live again and `seq` does not change, so a dismissed banner stays dismissed and the page does not
-  switch; when it returns without an alarm it clears. The file is written only when the live set,
-  the lost set or `seq` change, not on every heartbeat. This replaces the known limit in 0.9.0 that
-  a live alarm at the moment of a crash counts as new afterwards.
-- The bridge now writes `state.json` at most once every 5 s when the only change is that alarm ids
-  are removed (an alarm clears, or a live alarm becomes lost). A new alarm and every `seq` change
-  are still written at once, and a clean stop writes whatever is pending. If the bridge is killed
-  within 5 s of an alarm clearing, the file still lists that alarm; it comes back as lost and
-  clears with its first non-alarm reading. Set `hysteresis` on alarm thresholds of noisy values:
-  without it, a value that hovers at the threshold re-arms the banner and writes the file on every
-  rising crossing.
-- Notification and Home Assistant tiles now go to `--` after the same link limit as the bridge,
-  `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5),
-  not after 3 × `heartbeat_s`. With a 1 s heartbeat they blanked after 3 s while the bridge can be
-  blocked for about 13 s. Instrument tiles are unchanged. `vesselstackctl display status` uses the
-  same limit before it says the bridge may not be running.
-- A display now compares the unit tag (`cu`) in each reading with the one it was built for. If you
-  change a unit, conversion or precision on the Pi, that tile shows `--` and the display logs one
-  warning, instead of a number under the old label. Reflash to get the number back.
-- A display now takes the night flag from the bridge clock only while the bridge is live, so a
-  display that reboots in daytime with the bridge down no longer dims. The clock and night mode
-  appear with the first clock message after the first `online`: up to about two heartbeats after a
-  display starts or reconnects, so a display that restarts at night can be at day brightness for
-  that time.
-- **Operational impact:** this release changes the bridge as well as the display firmware. The
-  normal update or installer applies the bridge change and restarts the bridge; the first restart
-  reads the existing `state.json` as before. Rebuild and reflash every display for the firmware
-  part. This firmware needs bridge 0.9.0 or later: an older bridge sends no heartbeat, so the
-  display would show `--` after the link limit. If you roll the Pi back below 0.9.0, reflash the
-  displays with the previous firmware. After you change a unit on the Pi, tiles show `--` until
-  you reflash. There is no change to `displays.json`. Displays you do not reflash keep the old
-  behaviour, and keep working with the new bridge. After a power cut or a bridge crash, an alarm
-  that was live comes back as lost. If its source never sends again (Signal K restarted with an
-  empty notification tree, or a Home Assistant entity that no longer exists), it stays `NO DATA`
-  with no time limit, and a tap dismisses it on that display only. To forget it, run
-  `sudo systemctl stop vesselstack-displays-bridge`, then
-  `sudo rm /opt/vesselstack-data/displays-bridge/state.json`, then
-  `sudo systemctl start vesselstack-displays-bridge`, in this order: a plain restart writes the
-  alarm back while stopping. This also forgets every other lost alarm, and `seq` restarts at a
-  random value, so every display re-arms its banner once.
-- **Verify:** `sudo vesselstackctl display build ID`, then `sudo vesselstackctl display flash ID`.
-  Raise an alarm, tap the banner away, then clear that alarm and raise another one: the banner
-  returns. During an alarm stop the bridge: within 20 s (with the example `heartbeat_s` of 5) the
-  banner says `NO DATA` and the tiles show `--`. Start the bridge: the alarm shows as `NO DATA`
-  until its data returns, then as `ALARM`, with no page switch. Check the bridge with
-  `sudo systemctl status vesselstack-displays-bridge`. The full list is in the Hardware bring-up
-  checklist in `docs/DISPLAYS.md`.
-- **Rollback:** `sudo vesselstackctl display flash ID --previous`, or reflash the previous build.
-  To roll the bridge back, install the previous VesselStack version. An older bridge ignores the
-  `live` key in `state.json`; a live alarm at the moment of a crash is then forgotten again.
-
-### Restore
-
-- `vesselstackctl restore ARCHIVE --yes` now hands the swap to a background unit
-  (`run-vesselstack-restore`) when systemd is running, so a dropped SSH session or a closed terminal no
-  longer interrupts it half-way. Your terminal follows the restore and prints the same lines and exit
-  status as before; Ctrl-C or closing the terminal only stops following. New: `sudo vesselstackctl
-  restore --status --follow` re-attaches to a running restore (or shows the last result),
-  `--foreground` runs the restore in your terminal as before, and `status`, `doctor`,
-  `restore --status` and `recover status` report a restore that is running. There is no abort. The
-  journal records `runner` (`inline` or `worker`) and `launched`; phases and rollback are unchanged.
-  Without systemd the restore runs in the terminal.
-
-**Operational impact:** a restore started from an SSH session no longer needs `screen` or `tmux`. A
-shutdown before the restore has moved the first folder stops it and rolls it back at once (the
-journal records `stop_requested`; this includes a request that arrives before anything was
-stopped, which ends the restore without stopping the stack). After that, the shutdown waits up to 10 minutes for it to
-finish; after that, or after a power loss, the recovery at boot rolls it back. `status`, `doctor`
-and `recover status` call a restore running only while its worker process is alive in this boot,
-so a stale record after a power loss shows the unfinished restore and the rollback steps. If you
-roll back or abandon a restore from another terminal before it starts, the first terminal says so
-and exits 1. While it runs, other commands are refused as for any unfinished
-restore. The journal still validates for older releases' tools (the new keys are optional).
-
-**Verify:** over SSH start a restore, kill the SSH client, reconnect and run `sudo vesselstackctl
-restore --status --follow`: it prints the rest of the output and exits 0. `systemctl status
-run-vesselstack-restore` shows the unit while it runs.
-
-**Rollback:** run restores with `--foreground` (the old behaviour), or reinstall the previous release.
-
-- While a restore is unfinished, the Control Panel, a browser-started update and the boat profile
-  command now report that VesselStack is busy, as `vesselstackctl` commands already did. The
-  lifecycle lock helper (`common/lifecycle_lock.py`) refuses a new lock until the restore is
-  committed or rolled back; `recover rollback`, `recover abandon` and the recovery at boot are not
-  affected. The helper also gained `run --wait SECONDS`.
-
-**Operational impact:** a Control Panel action, a browser update or a boat profile change started
-while a restore is unfinished is refused with "a restore is unfinished" instead of running. Nothing
-changes while no restore is pending. A journal written by 0.9.0 carries the old helper, which does
-not refuse, and keeps working.
-
-**Verify:** with an unfinished restore, `sudo python3 /opt/vesselstack/common/boat_profile_cli.py
-init --root /opt/vesselstack` prints "a restore is unfinished" and exits with status 2; after
-`sudo /var/lib/vesselstack/restore/current/recover rollback` it no longer does.
-
-**Rollback:** reinstall the previous release. The journal format is unchanged, so a journal
-written by this release stays valid for 0.9.0.
-
-- The restore journal now records which boot last wrote it (`boot_id`, read from
-  `/proc/sys/kernel/random/boot_id`, left out when that is unavailable) and, after a failed
-  rollback, whether trying again can help (`last_error_kind`: retry, manual or previous).
-  `vesselstackctl restore --status` and `recover status` say so on the `Last error` line. The
-  recovery at boot (below) uses both.
-
-**Operational impact:** none for a running system. Journals written by 0.9.0 have neither key and
-stay valid; rollback decisions, phases and the by-hand steps are unchanged.
-
-**Verify:** start a restore that fails, then run `sudo vesselstackctl restore --status`; the
-journal's `state` file contains a `boot_id=` line (the same value as
-`cat /proc/sys/kernel/random/boot_id`), and a failed rollback adds `last_error_kind=`.
-
-**Rollback:** reinstall the previous release. A journal that already has the new keys stays
-readable by 0.9.0, which ignores them.
-
-### Recovery at boot
-
-- After a power loss in the middle of a restore, the boat computer now recovers by itself at the
-  next boot. The new `boot-vesselstack-restore.service` runs once per boot, only while a restore
-  journal exists, and runs the journal's own `recover rollback` when the journal was written in an
-  earlier boot. When it is not sure it holds: it changes nothing and writes down why.
-  Cleanup of a finished or rolled-back restore runs in both modes; the cleanup of an abandoned
-  restore also starts the services and containers it had stopped, so it runs only in `rollback` mode.
-- The service runs `recover rollback` at most 3 times per journal, whatever the phase (2 after a
-  failed rollback); the cleanup has the same limit. After that it holds at every boot and the
-  system stays as it is, possibly with the folders half swapped and the services stopped, until you
-  run `recover status`. It waits up to ten times 30 seconds for a busy lock.
-- `/etc/vesselstack-recovery.conf` fails closed: a bad value, a second `MODE=` line or a file that
-  is not regular means `hold`; a missing file or no `MODE=` line means `rollback`. A starting
-  restore removes the `boot-recovery` record of an earlier one.
-- A restore interrupted without a reboot (a dropped SSH session, a killed process) is not recovered
-  by the service; run `recover rollback`. A full `/var` blocks the automatic recovery; the unit then
-  ends without a failure and the restore stays pending. The unit allows 40 minutes (was 30).
-- New setting `VESSELSTACK_RESTORE_AT_BOOT` (`rollback`, the default, or `hold`), written to
-  `/etc/vesselstack-recovery.conf`.
-- The outcome is in `/var/lib/vesselstack/restore/boot-recovery` and `boot-recovery.log`, and in
-  `sudo vesselstackctl status` and `doctor`.
-- Known limits: a restore that had finished all but its last step is rolled back too (the restored
-  folders are kept as `*.failed-restore-<stamp>`); a failed automatic rollback leaves the services
-  stopped; services still start at boot before the recovery stops them; containers that Docker
-  restarts itself are stopped by the rollback, not prevented from starting.
-
-**Operational impact:** the installer adds `/usr/local/lib/vesselstack-recovery/restore-boot`, the
-unit `/etc/systemd/system/boot-vesselstack-restore.service` (enabled, not started) and
-`/etc/vesselstack-recovery.conf`. Nothing changes while no restore is pending. At the next boot with
-a pending journal from an earlier boot, the previous folders come back and the stack is started.
-A journal written by 0.9.0 has no boot id: it is held, not rolled back. Restoring an older backup
-leaves the new files in place. Uninstall removes all three.
-
-**Verify:** `systemctl is-enabled boot-vesselstack-restore.service` prints `enabled` and
-`cat /etc/vesselstack-recovery.conf` prints `MODE=rollback`. After an interrupted restore and a
-reboot: `sudo journalctl -b -u boot-vesselstack-restore`,
-`sudo cat /var/lib/vesselstack/restore/boot-recovery` and `sudo vesselstackctl status`.
-
-**Rollback:** set `VESSELSTACK_RESTORE_AT_BOOT="hold"` in `vesselstack.env` and rerun the
-installer, or run `sudo systemctl disable boot-vesselstack-restore.service`. Recovery by hand with
-`recover rollback` is unchanged.
-
-### Documentation
-
-- Reference text moved out of the README into the guides that cover it, leaving short summaries with links: the Control Panel sign-in details to `docs/CONTROL_PANEL.md` (Sign-in reference) and `docs/BOAT_CHAT.md`, the Grafana and Homepage first-run text to `docs/INSTALLATION.md`, Boat Chat unit, data-age and fuel-total notes to `docs/BOAT_CHAT.md`, the boat-profile notes to `docs/BOAT_PROFILE.md`, and the shared configuration contract and ShellCheck notes to `docs/DEVELOPMENT.md`. No behaviour changed.
-
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,
-Tailscale remote access, Node-RED and a marine essentials bundle. It is published as a
+Tailscale remote access, Node-RED and a marine essentials bundle. It also makes the alarm banner
+on instrument displays keep working when data or the bridge is lost. It is published as a
 pre-release.
 
 ### Highlights
 
-- Restore keeps a durable journal, so an interrupted restore can be inspected and rolled back
-  (see Safer restore).
+- Restore keeps a durable journal and runs in the background. It continues if your terminal
+  closes, and it is rolled back automatically at the next boot after a power loss (see Safer
+  restore).
 - Unattended operation: a hardware watchdog, a cap on the journal size, and optional scheduled
   backups with retention. `vesselstackctl doctor` reports them, Raspberry Pi under-voltage and
   throttling, a configured GPIO shutdown overlay and whether the previous boot ended cleanly.
@@ -217,16 +27,18 @@ pre-release.
   anchor alarm, a logbook and automatic boat state.
 - Signal K data reaches InfluxDB without manual setup, and a new Grafana dashboard, **VesselStack
   Boat Overview**, shows batteries, tanks, engine, navigation (no position) and environment.
+- Instrument displays (preview): the alarm banner comes back for every new alarm and says `NO DATA`
+  instead of disappearing when an alarm's data or the bridge is lost (see Displays and alarms).
 - An install or update that stopped part-way is now reported and can be finished: by
   `vesselstackctl`, the Control Panel and a rerun of `get-vesselstack.sh`.
 
 ### Safer restore
 
 - `vesselstackctl restore` writes a journal to `/var/lib/vesselstack/restore/current` (mode 0700)
-  before each step. After a lost SSH session or a power cut, run
-  `sudo /var/lib/vesselstack/restore/current/recover status` to see how far it got, then
-  `recover rollback` to put the previous folders and system files back and start the previous
-  stack. `sudo vesselstackctl restore-recover status|rollback` and `sudo vesselstackctl restore
+  before each step. After a power cut the boat computer rolls the restore back at the next boot
+  (see below). To do it yourself, run `sudo /var/lib/vesselstack/restore/current/recover status` to
+  see how far it got, then `recover rollback` to put the previous folders and system files back
+  and start the previous stack. `sudo vesselstackctl restore-recover status|rollback` and `sudo vesselstackctl restore
   --status` do the same through the installed controller. After an interrupted restore that
   controller may belong to the restored, older release; the `recover` script does not.
 - Restore refuses up front, with nothing changed, when the application or data folder is not a
@@ -260,6 +72,44 @@ pre-release.
   rollback stops and names two ways out. Move the real folder back and run the rollback again. Or
   stop the stack by hand, move the journal aside and restore again from a backup with
   `vesselstackctl restore /path/to/vesselstack-<time>.tar.gz --yes`.
+- `vesselstackctl restore ARCHIVE --yes` hands the swap to a background unit
+  (`run-vesselstack-restore`) when systemd is running. Your terminal only follows it and prints the
+  same lines and exit status as a restore in the terminal. A dropped SSH session or a closed
+  terminal no longer interrupts the restore, and you do not need `screen` or `tmux`.
+- Ctrl-C or closing the terminal only stops following. `sudo vesselstackctl restore --status
+  --follow` re-attaches to a running restore, or shows the last result. `--foreground` runs the
+  restore in your terminal, and without systemd it always does. There is no abort: wait for it to
+  end, or undo it afterwards with `recover rollback`.
+- `status`, `doctor`, `restore --status` and `recover status` report a restore that is running.
+  They call it running only while its worker is alive in this boot, so after a power loss they
+  show an unfinished restore and the rollback steps.
+- A shutdown request before the restore has moved the first folder stops it and rolls it back at
+  once. A request before anything was stopped ends it without stopping the stack. Once folders
+  are moving, the shutdown waits up to 10 minutes for the restore to finish. After that, or after
+  a power loss, the recovery at boot rolls it back.
+- The Control Panel, a browser-started update and the boat profile command report that
+  VesselStack is busy while a restore is unfinished, as `vesselstackctl` commands already did.
+  `recover rollback` and `recover abandon` are not affected.
+- Recovery at boot: `boot-vesselstack-restore.service` runs once per boot, only while a restore
+  journal exists. When the journal was written in an earlier boot, it runs the journal's own
+  `recover rollback`: the previous folders come back and the stack is started. A journal of the
+  running boot is left alone, because that restore may still be going. A restore that finished or
+  was rolled back is only cleaned up. Cleaning up an abandoned restore starts the units and
+  containers it had stopped, so it runs only in `rollback` mode.
+- When the service is not sure, it holds: it changes nothing and writes down why. It holds when
+  the journal cannot be read, when a rollback failed in a way a retry cannot fix, and when
+  another VesselStack operation keeps the lock for about 5 minutes (ten tries, 30 s apart).
+- The service runs `recover rollback` at most 3 times per journal (2 after a failed rollback).
+  Every run counts, also one that hung or was cut off by a power loss. After that it holds at
+  every boot and the system stays as it is, possibly with the folders half swapped and the
+  services stopped, until you run `recover status` and decide.
+- `VESSELSTACK_RESTORE_AT_BOOT` is `rollback` (the default) or `hold`, which only records what it
+  found. The installer writes it to `/etc/vesselstack-recovery.conf`. A bad value, a second
+  `MODE=` line or a file that is not regular means `hold`. A restore from a backup made without
+  the setting writes `rollback` again: check the file after a restore.
+- The outcome is in `/var/lib/vesselstack/restore/boot-recovery` and `boot-recovery.log` (root
+  only), and in `sudo vesselstackctl status` and `doctor`. The journal now also records which boot
+  wrote it (`boot_id`) and whether trying a failed rollback again can help (`last_error_kind`).
 - Leftover `*.pre-restore-*`, `*.failed-restore-*` and stage directories are never pruned. They
   hold a copy of your data, including secrets. `doctor` warns about them. Delete them yourself
   when you no longer need them. Finished, rolled-back and abandoned restores leave a small record
@@ -271,9 +121,42 @@ pre-release.
   explicit `"alarm_takeover": false` for the display in `displays.json` keeps it off.
 - An alarm no longer clears because its data stopped. An item in alarm whose data goes stale,
   invalid or missing, or whose source disconnects, is reported as lost and stays lost until a
-  fresh reading that is not an alarm, an explicit clear, or removal from `displays.json`. The
-  lost list and the alarm counter (`seq`) are saved in `<data>/displays-bridge/state.json`, so a
-  bridge restart or power cut does not forget them.
+  fresh reading that is not an alarm, an explicit clear, or removal from `displays.json`.
+- The banner comes back for every new alarm, also when one alarm clears and another raises in
+  the same update. The display follows the `seq` counter that the bridge publishes. A Wi-Fi or
+  MQTT blip does not bring a dismissed banner back.
+- When the data of every alarm has stopped, the banner says `NO DATA` (or `2 NO DATA`) instead of
+  `ALARM`. With one live alarm it says `ALARM` or `ALARMS`.
+- An alarm a display has seen does not disappear when the data or the bridge is lost. The banner
+  stays up as `NO DATA` with the name of the last known alarm, and a tap dismisses it. Losing the
+  link does not switch the page or undo a tap.
+- A display that starts while the bridge is down gets the alarm summary the broker holds. If it
+  is an alarm, the display switches to the alarm page and shows `NO DATA` with the first alarm's
+  name until you tap it, again after every reboot while the broker holds that summary. It shows
+  nothing only when the broker holds no summary. Start the bridge to replace a stale summary.
+- A display treats the bridge as lost when it has not heard `online` for
+  `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5), not
+  only when the bridge says `offline`. Tiles then show `--` and the bridge dot turns red. The
+  15 s margin covers a bridge that is blocked for about 13 s in a connection attempt. The alarm
+  summary, the clock, the notification and Home Assistant tiles and `vesselstackctl display
+  status` use the same limit.
+- A display compares the unit tag (`cu`) in each reading with the one it was built for. If you
+  change a unit, conversion or precision on the Pi, that tile shows `--` and the display logs one
+  warning, until you reflash.
+- A display takes the night flag from the bridge clock only while the bridge is live, so a
+  display that reboots in daytime with the bridge down does not dim. Clock and night mode appear
+  with the first clock message after the first `online`: up to about two heartbeats after start.
+- The bridge saves the alarms that are live, as well as the lost ones, in
+  `<data>/displays-bridge/state.json` (new optional key `live`, with `latched` and `seq`
+  unchanged). If the bridge is killed or the Pi loses power during an alarm, it restarts with that
+  alarm as lost, so displays show `NO DATA`. When the data returns in alarm, `seq` does not
+  change, a dismissed banner stays dismissed and the page does not switch. Without an alarm it
+  clears.
+- The bridge writes `state.json` at once for a new alarm or a `seq` change. A change that only
+  removes alarm ids is written at most once every 5 s, and a clean stop writes what is pending.
+  A bridge killed within 5 s of an alarm clearing restarts with that alarm as lost, and it
+  clears with its first non-alarm reading. Set `hysteresis` on thresholds of noisy values:
+  without it, a value that hovers at the threshold re-arms the banner on every rising crossing.
 - A missing, null or invalid value shows `--` at once. Losing the Signal K connection marks
   numeric instruments stale at once. A value that repeats the last source timestamp is no longer
   treated as fresh, so a dead sensor goes stale on schedule.
@@ -285,7 +168,11 @@ pre-release.
   and every `heartbeat_s`, and `offline` on a clean stop or through its last will. A retained
   `vesselstack/v1/bridge/service` is for tools; judge it by its `ts`. `vesselstackctl display
   status` reads it. After connecting, displays show `--` for up to one `heartbeat_s` (5 s by
-  default). Numeric payloads also carry a `cu` unit tag that current firmware ignores.
+  default). Numeric payloads also carry a `cu` unit tag.
+- Rebuild and reflash each display for the firmware part of this: `sudo vesselstackctl display
+  build ID`, then `display flash ID`. Displays you do not reflash keep the old behaviour and
+  keep working with the new bridge. The checks are in the hardware bring-up checklist in
+  `docs/DISPLAYS.md`.
 
 ### Boat Chat
 
@@ -327,6 +214,8 @@ pre-release.
 - The Dashboard 2.0 live channel requires the `crew` sign-in. Browsers keep working if they resend
   the cached sign-in.
 - Tailscale: no auth key is stored or logged. The Control Panel's Origin check stays strict.
+- Recovery at boot runs as root: a systemd unit that runs the restore journal's own `recover`
+  command. `/etc/vesselstack-recovery.conf` is read as text and never run.
 - The Signal K writer token (`vesselstack-signalk-writer`) can read the raw bucket, including
   position data. It is stored in the plugin configuration with mode 0600.
 
@@ -339,7 +228,15 @@ pre-release.
   `200M`.
 - `vesselstackctl status` exits non-zero while an installation or restore is unfinished. A script
   of your own that checks it will see a failure in that state. While a restore is unfinished,
-  commands that change the system and the installer refuse to run.
+  commands that change the system and the installer refuse to run, and the Control Panel, a
+  browser-started update and the boat profile command report that VesselStack is busy.
+- The installer adds the script `/usr/local/lib/vesselstack-recovery/restore-boot`, the unit
+  `boot-vesselstack-restore.service` (enabled, not started) and `/etc/vesselstack-recovery.conf`
+  for the recovery at boot. Nothing changes while no restore is pending. To opt out, set
+  `VESSELSTACK_RESTORE_AT_BOOT="hold"` and rerun the installer. Restoring an older backup leaves
+  these files in place, and uninstall removes them.
+- Restores run in the background unit `run-vesselstack-restore` when systemd is running. Use
+  `--foreground` for the old behaviour.
 - New alert messages and `/fail` heartbeats appear if `ALERT_BILGE_ENTITY` or
   `ALERT_SHORE_POWER_ENTITY` is set without a valid `HOME_ASSISTANT_TOKEN`. Set the token in
   Control Panel settings.
@@ -349,9 +246,12 @@ pre-release.
   `VESSELSTACK_BACKUP_KEEP` plus one archives.
 - Anything outside VesselStack that reads the retained `bridge/status` (for example a Node-RED
   flow) must read `bridge/service` or listen for the heartbeat.
-- Displays need a rebuild and reflash to get the alarm banner: `vesselstackctl display build ID`,
-  then `display flash ID`, or **Apply to screen** in the Control Panel. The other display changes
-  take effect when the bridge restarts.
+- Displays need a rebuild and reflash to get the alarm banner and the other firmware changes:
+  `vesselstackctl display build ID`, then `display flash ID`, or **Apply to screen** in the Control
+  Panel. The new firmware needs this release's bridge: an older bridge sends no heartbeat, so the
+  display shows `--` after the link limit. The bridge changes take effect when the update restarts
+  the bridge. The first restart reads the existing `state.json`; there is no change to
+  `displays.json`.
 - Boat Chat answers use new wording and units. Cached summaries keep the old text until they
   refresh.
 - The first update into 0.9.0 is run by the old Control Panel, so the unfinished-update notice and
@@ -380,18 +280,33 @@ To turn off a feature without restoring, change its setting and rerun the instal
   plugin configuration and the `vesselstack-signalk-writer` token.
 - `sudo vesselstackctl remote disable --purge` for Tailscale.
 - `"ui": {"alarm_takeover": false}` for a display in `displays.json`, then rebuild and reflash it.
+- `VESSELSTACK_RESTORE_AT_BOOT="hold"` for the recovery at boot, or `sudo systemctl disable
+  boot-vesselstack-restore.service`. Recovery by hand with `recover rollback` is unchanged.
+- `sudo vesselstackctl restore ARCHIVE --yes --foreground` runs a restore in your terminal.
+- `sudo vesselstackctl display flash ID --previous` puts the previous display firmware back.
+  Do this on every display when you roll the Pi back to an older release, because the new
+  firmware needs this release's bridge. An older bridge ignores the `live` key in `state.json`.
 
 ### Known limits
 
-- Restore still runs in the terminal session. There is no detached worker and nothing recovers
-  automatically at boot. Keep it on a stable connection or inside `screen` or `tmux`, and after
-  an interruption run `recover status`, then `recover rollback`.
+- Services still start at boot before the recovery stops them. Holding them back is not in this
+  release. Containers that Docker restarts itself are stopped by the rollback, not prevented from
+  starting.
+- A restore that was interrupted without a reboot is not recovered by the boot unit when it ran
+  with `--foreground` or without systemd. A background restore that was killed (for example with
+  `kill -9`) needs `sudo /var/lib/vesselstack/restore/current/recover rollback`.
+- A restore that had finished all but its last step when power was lost is rolled back at boot.
+  The restored folders are kept as `*.failed-restore-<stamp>`. A failed automatic rollback
+  leaves the services stopped.
+- After the attempt limit the system is held as it is until you run `recover status`.
+- The background restore, the recovery at boot and the new display firmware have not been run on
+  a real boat computer or display. Tests use stand-ins. CI starts the background unit on a real
+  systemd, but with a stand-in payload, not a restore.
 - The by-hand recovery commands printed when the journal cannot be used are checked by tests as
   text. They have not yet been run on a boat computer with running services.
-- Only a lost alarm is saved. A live alarm at the moment of a crash or power cut counts as new
-  afterwards. The first value after a bridge restart is accepted once.
-- Current display firmware keeps its banner up for a lost item without separate "no data" wording.
-  It ignores the `cu` tag. Both need a later firmware change.
+- The first value after a bridge restart is accepted once. An alarm whose source never reports
+  again after a crash or power cut stays `NO DATA` with no time limit until you forget it (see
+  [Alarm summary and takeover](docs/DISPLAYS.md#alarm-summary-and-takeover)).
 - Tailscale: every tailnet device can reach services bound to `0.0.0.0` (use Tailscale ACLs), and
   tailnet sign-in failures share the panel's lockout bucket. `--auth-key-stdin` works only when
   the installed Tailscale reads keys from a file. HTTPS publishes the host name in Certificate
@@ -408,8 +323,19 @@ are pending. It is not marked Latest until the documented lab checks pass.
 - Tests and CI: the optional Compose profiles check passes `--no-env-resolution`, the scripted
   wizard answers cover the alerts prompt, the fake npm container runs under `umask 022`, and
   `tests/test-nodered-dashboard-auth.sh` runs in the `service-integration` job (needs internet).
+- New tests: `tests/test-restore-detach-systemd.sh` (opt-in, runs the background unit's launcher on
+  a real systemd in CI), `tests/test_restore_boot.py`, `tests/test_restore_journal.py` and
+  `tests/test_restore_transaction.py` for the journal, the background worker and the recovery at
+  boot. The display alarm logic is a header (`displays/esphome/app/vesselstack_logic.h`) that
+  `tests/test_displays_logic.py` builds and runs on the host. The lifecycle lock helper
+  `common/lifecycle_lock.py` refuses a new lock while a restore is unfinished and gained
+  `run --wait SECONDS`.
+- Documentation: reference text moved out of the README into the guides that cover it, leaving
+  short summaries with links (Control Panel sign-in, Grafana and Homepage first run, Boat Chat
+  notes, boat profile, configuration contract). No behaviour changed.
 - ShellCheck findings in `scripts/vesselstackctl` are fixed for ShellCheck 0.9.0 and 0.11.0. No
   behaviour change.
+
 
 ## 0.8.0 - 2026-11-12
 

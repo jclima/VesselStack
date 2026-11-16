@@ -16,7 +16,8 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
     "$ROOT/scripts/update-requirements-lock.sh" "$ROOT/scripts/get-vesselstack.sh" "$ROOT/tests/test-get-vesselstack.sh" \
     "$ROOT/scripts/verify-release-tag.sh" "$ROOT/tests/test-verify-release-tag.sh" \
-    "$ROOT/scripts/lib/remediate.sh" "$ROOT/scripts/lib/record-backup-result" "$ROOT/scripts/lib/restore-boot"
+    "$ROOT/scripts/lib/remediate.sh" "$ROOT/scripts/lib/record-backup-result" "$ROOT/scripts/lib/restore-boot" \
+    "$ROOT/tests/test-restore-detach-systemd.sh"
 python3 -m py_compile "$ROOT/scripts/pin-displays-requirements.py"
 python3 -m py_compile "$ROOT/control-panel/app.py"
 python3 -m py_compile "$ROOT/common/vesselstack_auth.py" "$ROOT/common/vesselstack_authctl.py" "$ROOT/common/qrcodegen.py"
@@ -43,7 +44,8 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/tests/test-build-package.sh" "$ROOT/tests/test-socketcan.sh" "$ROOT/tests/test-offline-install.sh" "$ROOT/tests/test-update-launcher.sh" \
     "$ROOT/scripts/update-requirements-lock.sh" "$ROOT/scripts/get-vesselstack.sh" "$ROOT/tests/test-get-vesselstack.sh" \
     "$ROOT/scripts/verify-release-tag.sh" "$ROOT/tests/test-verify-release-tag.sh" \
-    "$ROOT/scripts/lib/remediate.sh" "$ROOT/scripts/lib/record-backup-result" "$ROOT/scripts/lib/restore-boot"
+    "$ROOT/scripts/lib/remediate.sh" "$ROOT/scripts/lib/record-backup-result" "$ROOT/scripts/lib/restore-boot" \
+    "$ROOT/tests/test-restore-detach-systemd.sh"
 if grep -nE 'mosquitto_passwd -b' "$ROOT/install.sh" "$ROOT/scripts/vesselstackctl" "$ROOT"/scripts/*.sh "$ROOT"/displays/*.py; then
     echo "MQTT passwords must not be passed on a command line" >&2
     exit 1

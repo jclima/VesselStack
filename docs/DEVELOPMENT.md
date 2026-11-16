@@ -71,8 +71,8 @@ Do not build and upload files by hand.
    pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes
    (see the CHANGELOG).
    `v0.7.0`, `v0.7.1` and `v0.8.0` were published as regular releases (`v0.8.0` marked Latest) while
-   physical Raspberry Pi acceptance was still pending. `v0.9.0` is prepared as a pre-release; physical
-   Raspberry Pi acceptance is pending.
+   physical Raspberry Pi acceptance was still pending. `v0.9.0` is prepared as a pre-release, including the background restore, the recovery at boot and
+   the display alarm changes; physical Raspberry Pi acceptance is pending.
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate

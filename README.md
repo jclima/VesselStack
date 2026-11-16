@@ -22,7 +22,8 @@ the boat's local network when the internet is unavailable.
 > ```
 >
 > For a lab Pi, use the [quick start](#quick-start-one-command-on-the-raspberry-pi) below to try
-> 0.9.0. Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
+> 0.9.0. The background restore, the recovery at boot after a power loss and the new display
+> firmware have not been run on a real boat computer or display. Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
 
 ## Contents
 
@@ -121,7 +122,9 @@ Power sources and instrument-reading coverage for Boat Chat are in
   [hardware guide](docs/BOM.md).
 - History and dashboards through InfluxDB, Grafana, MQTT, and Home Assistant.
 - Boat Chat, a local diagnostic assistant with an optional provider you choose.
-- A guided installer, backups, health checks, and an offline release path.
+- A guided installer, backups, health checks, and an offline release path. A restore runs in the
+  background and is rolled back automatically at the next boot if the power fails
+  ([If a restore is interrupted](#if-a-restore-is-interrupted)).
 - Optional, all off by default: [Telegram alerts](#alerts) (`ALERTS_ENABLE=true`),
   [Tailscale remote access](#remote-access-with-tailscale) (`sudo vesselstackctl remote enable`),
   [Node-RED](#node-red-optional) (`NODERED_ENABLE=true`), the
@@ -523,9 +526,18 @@ documented lab checks pass. The stable release is 0.8.0.
   alerts, you were not receiving any: turn on "Boat alerts to Telegram" (`ALERTS_ENABLE`). If
   `ALERT_BILGE_ENTITY` or `ALERT_SHORE_POWER_ENTITY` is set without a valid `HOME_ASSISTANT_TOKEN`,
   new alert messages and `/fail` heartbeats appear: set the token in Control Panel settings.
-- **Displays** need a rebuild and reflash to get the alarm banner: `vesselstackctl display build ID`,
-  then `display flash ID`, or **Apply to screen** in the Control Panel. The other display changes
-  take effect when the bridge restarts. Anything outside VesselStack that reads the retained
+- **A restore runs in the background and is recovered at boot.** `vesselstackctl restore` hands the
+  swap to the unit `run-vesselstack-restore`, so a closed terminal does not interrupt it; re-attach
+  with `sudo vesselstackctl restore --status --follow`, or use `--foreground` for the old behaviour.
+  The installer adds `boot-vesselstack-restore.service` (enabled), the script
+  `/usr/local/lib/vesselstack-recovery/restore-boot` and `/etc/vesselstack-recovery.conf`. After a
+  power loss during a restore, the next boot rolls it back; set `VESSELSTACK_RESTORE_AT_BOOT="hold"`
+  to only record what it found. Services still start before the recovery stops them. See
+  [Recovery at boot](#recovery-at-boot).
+- **Displays** need a rebuild and reflash to get the alarm banner and the other firmware changes:
+  `vesselstackctl display build ID`, then `display flash ID`, or **Apply to screen** in the Control
+  Panel. The new firmware needs this release's bridge; the bridge changes apply when the update
+  restarts the bridge. See [Instrument displays (preview)](#instrument-displays-preview). Anything outside VesselStack that reads the retained
   `bridge/status` (for example a Node-RED flow) must read `bridge/service` or listen for the heartbeat.
 - **Boat Chat** answers use new wording and units. Cached summaries keep the old text until they
   refresh.
@@ -558,7 +570,12 @@ sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
 
-Open Boat Chat and the Control Panel, and confirm the dashboards show live values.
+Open Boat Chat and the Control Panel, and confirm the dashboards show live values. Then check
+`systemctl is-enabled boot-vesselstack-restore.service` (`enabled`) and
+`cat /etc/vesselstack-recovery.conf` (`MODE=rollback`). If you use displays, reflash each one and
+check that the banner says `NO DATA` when you stop the bridge during an alarm (the
+[hardware bring-up checklist](docs/DISPLAYS.md#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)
+has the steps).
 
 **Rollback.** Downgrades are refused (`Downgrade from 0.9.0 to ... is not supported`). Restore the
 verified pre-update backup instead:
@@ -580,6 +597,11 @@ installer:
   remove the plugin configuration and the `vesselstack-signalk-writer` token.
 - `sudo vesselstackctl remote disable --purge` for Tailscale.
 - `"ui": {"alarm_takeover": false}` for a display in `displays.json`, then rebuild and reflash it.
+- `VESSELSTACK_RESTORE_AT_BOOT="hold"` (or `sudo systemctl disable boot-vesselstack-restore.service`)
+  for the recovery at boot, and `--foreground` to run a restore in your terminal.
+- `sudo vesselstackctl display flash ID --previous` for the previous display firmware. Do this on
+  every display if you roll the Pi back below 0.9.0, because the new firmware needs this
+  release's bridge.
 
 ## What VesselStack installs
 
@@ -2010,7 +2032,8 @@ self-contained: a state file written atomically before each step (phases `prepar
 copies of the running controller, the lifecycle-lock helper and the journal helper, a
 `recover` script, and the snapshot of the system files. The whole journal and the
 extracted backup are flushed to disk before the first change, and each tree rename is
-followed by a directory flush. There is no automatic recovery after a reboot yet.
+followed by a directory flush. After a power loss, the boat computer recovers a restore that was
+interrupted by itself at the next boot (see [Recovery at boot](#recovery-at-boot)).
 
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall
@@ -2341,14 +2364,18 @@ What to know:
 - The firewall is not stopped by a rollback, but if its restart fails it may not be running
   afterwards. The log then holds "The firewall (vesselstack-firewall.service) is NOT running ...";
   start it with `sudo systemctl start vesselstack-firewall.service`.
-- Services still start at boot BEFORE the recovery stops them. A later release holds them back.
+- Services still start at boot BEFORE the recovery stops them. Holding them back is not part of this
+  release.
 - Containers that Docker restarts by itself are stopped by the rollback; they are not prevented
   from starting.
 - A journal written by 0.9.0 has no boot id. It is held, not rolled back: use the commands above.
 - A restore that is interrupted WITHOUT a reboot is not recovered by this service, because its
-  journal belongs to the running boot. This is a dropped SSH session, a closed terminal or a killed
-  process. The restore does not catch a hangup or a termination signal: it simply stops where it is
-  (nothing is cleaned up), and the journal keeps the phase it had reached. Run
+  journal belongs to the running boot. A background restore survives a dropped SSH session or a
+  closed terminal. This applies to a restore run with `--foreground` or without systemd, which a
+  dropped session or a closed terminal stops, and to a background restore that was killed (for
+  example with `kill -9`). A restore run with `--foreground` does not catch a hangup or a
+  termination signal: it simply stops where it is (nothing is cleaned up), and the journal keeps
+  the phase it had reached. Run
   `sudo /var/lib/vesselstack/restore/current/recover rollback`, or restart the boat computer and
   let the service do it.
 - A full `/var` blocks the automatic recovery. The service writes down its attempt before it runs
