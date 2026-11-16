@@ -3285,11 +3285,13 @@ if mode == "start-then-fail":
                 self.signal_ours(pid, pgid)
 
     def env(self, **extra):
+        # The launch wait is the production default: a worker that is slow to start (a busy CI runner) must not be
+        # taken for one that never appears. The tests of that case set a short wait themselves.
         env = {k: v for k, v in os.environ.items() if not k.startswith("VESSELSTACK_")}
         env.update(PATH=f"{self.base / 'fakebin'}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(self.base),
                    VESSELSTACK_ROOT=str(self.root), VESSELSTACK_TEST_SYSTEMD_RUN=str(self.launcher),
                    VESSELSTACK_BOOT_ID_FILE=_BOOT_FILE, VESSELSTACK_RESTORE_FOLLOW_INTERVAL="0.1",
-                   VESSELSTACK_RESTORE_LAUNCH_WAIT="3", VESSELSTACK_RESTORE_DEAD_GRACE="1", VESSELSTACK_RESTORE_LOCK_WAIT="10")
+                   VESSELSTACK_RESTORE_LAUNCH_WAIT="30", VESSELSTACK_RESTORE_DEAD_GRACE="1", VESSELSTACK_RESTORE_LOCK_WAIT="10")
         env.update(extra)
         return env
 
@@ -3307,13 +3309,51 @@ if mode == "start-then-fail":
         result = subprocess.run(["bash", str(self.ctl), *args], capture_output=True, text=True, env=self.env(**extra_env), timeout=timeout)
         return result.returncode, result.stdout, result.stderr
 
-    def wait_for(self, path, timeout=30):
+    def wait_for(self, path, timeout=60):
         deadline = time.time() + timeout
         while time.time() < deadline:
             if Path(path).exists():
                 return
             time.sleep(0.05)
-        self.fail(f"{path} did not appear")
+        self.fail(f"{path} did not appear\n{self.diagnostics()}")
+
+    def diagnostics(self):
+        """What a failed wait needs to explain itself: the foregrounds' status and output so far, the launcher's log, the
+        worker files, the journal phase and the processes that mention this test's directory."""
+        lines = []
+        for number, proc in enumerate(self.procs):
+            lines.append(f"foreground {number}: pid {proc.pid} returncode {proc.poll()}")
+            for name in ("stdout", "stderr"):
+                stream = getattr(proc, name)
+                text = ""
+                if stream is not None:
+                    try:
+                        os.set_blocking(stream.fileno(), False)
+                        text = os.read(stream.fileno(), 65536).decode(errors="replace")
+                    except (OSError, ValueError):
+                        pass
+                lines.append(f"  {name} so far: {self.normalise(text)!r}")
+        for name in ("launcher.log", "started-workers.log"):
+            try:
+                lines.append(f"{name}: {self.normalise((self.base / name).read_text())!r}")
+            except OSError:
+                lines.append(f"{name}: (none)")
+        try:
+            lines.append("journal phase: %r runner: %r" % (state_value(self.journal, "phase"), state_value(self.journal, "runner")))
+        except (OSError, ValueError) as exc:
+            lines.append(f"journal: unreadable ({exc})")
+        try:
+            for path in sorted(self.restore_dir.iterdir()):
+                text = ""
+                if path.is_file() and path.name.startswith("worker-"):
+                    text = path.read_text(errors="replace")[-1500:]
+                lines.append(f"  {path.name}: {self.normalise(text)!r}")
+        except OSError:
+            lines.append("restore dir: (none)")
+        lines.append("files here: " + " ".join(sorted(path.name for path in self.base.iterdir())))
+        ps = subprocess.run(["ps", "-eo", "pid,pgid,stat,command"], capture_output=True, text=True).stdout
+        lines.append("processes:\n" + "\n".join(self.normalise(line) for line in ps.splitlines() if str(self.base) in line))
+        return "\n".join(lines)
 
     def mode(self, name, value):
         (self.base / name).write_text(value)
@@ -3431,6 +3471,7 @@ if mode == "start-then-fail":
             with self.subTest(sig=sig.name):
                 if (self.base / "release").exists():
                     (self.base / "release").unlink(); (self.base / "hanging").unlink()
+                    self.wait_for_lock_free()  # the previous worker (and the lock helper around it) has really ended
                     self.tearDown_fixture_and_rebuild()
                     for old in self.base.glob("worker-env.*"): old.unlink()
                 self.mode("ctl-mode", "hang")
@@ -3446,6 +3487,21 @@ if mode == "start-then-fail":
                 self.wait_for(self.restore_dir / f"worker-{HEX_ID}.rc")
                 self.assertEqual((self.restore_dir / f"worker-{HEX_ID}.rc").read_text(), "0\n")
                 self.assertEqual(phase_of(self.archived()), "committed")
+
+    def wait_for_lock_free(self, timeout=60):
+        """The lifecycle lock can be taken: the worker of an earlier run in this test has ended. Bounded."""
+        from common.lifecycle_lock import LifecycleLock, LifecycleLockBusy
+        deadline = time.time() + timeout
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VESSELSTACK_LIFECYCLE_LOCK_FD", None)
+            while True:
+                try:
+                    LifecycleLock(self.root, self.base).acquire().release()
+                    return
+                except LifecycleLockBusy:
+                    if time.time() > deadline:
+                        self.fail("the lifecycle lock is still held by an earlier run\n" + self.diagnostics())
+                    time.sleep(0.05)
 
     def wait_for_runner(self, timeout=30):
         """The journal exists and has been handed to a worker (runner=worker)."""

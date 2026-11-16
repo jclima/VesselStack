@@ -2759,7 +2759,7 @@ bytecode in the source or bundled runtime tree.
 
 CI runs the Python regressions with a 20 minute limit (`timeout-minutes: 20`), so a hanging test fails the job with a log instead of blocking it.
 
-Test clean-up only ever signals processes its own test started (never a pid read from a file under test, and never pid or process group 0 or 1, the runner or its parent).
+Test clean-up only ever signals processes its own test started (never a pid read from a file under test, and never pid or process group 0 or 1, the runner or its parent)), and the restore hand-off tests wait the production 30 s for a worker to start, so a busy runner is not mistaken for a worker that never appeared; a failed wait prints the foreground output, the launcher log, the worker files and the processes.
 
 The test-mechanics notes (directory-listing and `tar -t` assertions, `tests/test-remote.sh`, the CI profile check, scripted wizard answers and reproducing CI on a Mac) are in [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 

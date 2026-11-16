@@ -332,6 +332,8 @@ are pending. It is not marked Latest until the documented lab checks pass.
   only the launcher writes, never pid or group 0 or 1, the test runner, its parent or their groups; a
   regression test proves it. The shell tests guard their `kill` of a parent or process group the same
   way. The "Run all Python regressions" step now has a 20 minute time limit.
+  The restore hand-off tests wait the production 30 s launch wait (not 3 s) for a worker, wait for the
+  previous worker to release the lock between repeated runs, and print diagnostics when a wait fails.
 - Tests and CI: the optional Compose profiles check passes `--no-env-resolution`, the scripted
   wizard answers cover the alerts prompt, the fake npm container runs under `umask 022`, and
   `tests/test-nodered-dashboard-auth.sh` runs in the `service-integration` job (needs internet).
