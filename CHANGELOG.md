@@ -7,12 +7,32 @@ Semantic Versioning.
 
 ### Restore
 
+- `vesselstackctl restore ARCHIVE --yes` now hands the swap to a background unit
+  (`run-vesselstack-restore`) when systemd is running, so a dropped SSH session or a closed terminal no
+  longer interrupts it half-way. Your terminal follows the restore and prints the same lines and exit
+  status as before; Ctrl-C or closing the terminal only stops following. New: `sudo vesselstackctl
+  restore --status --follow` re-attaches to a running restore (or shows the last result),
+  `--foreground` runs the restore in your terminal as before, and `status`, `doctor`,
+  `restore --status` and `recover status` report a restore that is running. There is no abort. The
+  journal records `runner` (`inline` or `worker`) and `launched`; phases and rollback are unchanged.
+  Without systemd the restore runs in the terminal.
+
+**Operational impact:** a restore started from an SSH session no longer needs `screen` or `tmux`. A
+shutdown during a restore waits up to 10 minutes for it; after that, or after a power loss, the
+recovery at boot rolls it back. While it runs, other commands are refused as for any unfinished
+restore. The journal still validates for older releases' tools (the two new keys are optional).
+
+**Verify:** over SSH start a restore, kill the SSH client, reconnect and run `sudo vesselstackctl
+restore --status --follow`: it prints the rest of the output and exits 0. `systemctl status
+run-vesselstack-restore` shows the unit while it runs.
+
+**Rollback:** run restores with `--foreground` (the old behaviour), or reinstall the previous release.
+
 - While a restore is unfinished, the Control Panel, a browser-started update and the boat profile
   command now report that VesselStack is busy, as `vesselstackctl` commands already did. The
   lifecycle lock helper (`common/lifecycle_lock.py`) refuses a new lock until the restore is
   committed or rolled back; `recover rollback`, `recover abandon` and the recovery at boot are not
-  affected. The helper also gained `run --wait SECONDS`. A restore still runs in your terminal
-  exactly as before.
+  affected. The helper also gained `run --wait SECONDS`.
 
 **Operational impact:** a Control Panel action, a browser update or a boat profile change started
 while a restore is unfinished is refused with "a restore is unfinished" instead of running. Nothing

@@ -198,6 +198,43 @@ class DecisionTable(BootCase):
         self.assertEqual(self.record()["note"], "")
 
 
+class BackgroundWorkerJournals(BootCase):
+    """A restore run by the background worker leaves the same journal behind as an inline one, plus the worker's files."""
+    WORKER = "0123456789abcdef0123456789abcdef"
+    EXTRA = "runner=worker\nlaunched=2026-01-02T03:04:05Z\n"
+
+    def worker_files(self):
+        for ext in ("pid", "out", "err"):
+            (self.dir / f"worker-{self.WORKER}.{ext}").write_text("4242\n" if ext == "pid" else "old output\n")
+
+    def test_a_journal_written_by_a_worker_in_an_earlier_boot_is_recovered_like_any_other(self):
+        for phase in DecisionTable.ROLLBACK_PHASES:
+            with self.subTest(phase=phase):
+                self.calls.write_text(""); (self.dir / "boot-recovery").unlink(missing_ok=True)
+                self.make_journal(phase, jid=self.WORKER, extra=self.EXTRA)
+                self.worker_files()
+                self.run_boot()
+                self.assertEqual(self.calls_made(), ["rollback"])
+                rec = self.record()
+                self.assertEqual((rec["action"], rec["result"], rec["phase_before"], rec["rc"]), ("rollback", "rolled-back", phase, "0"))
+
+    def test_a_journal_written_by_a_worker_in_this_boot_is_left_alone_so_a_running_worker_is_not_touched(self):
+        self.make_journal("data-swap", boot=BOOT_NOW, jid=self.WORKER, extra=self.EXTRA)
+        self.worker_files()
+        (self.dir / f"worker-{self.WORKER}.pid").write_text(f"{os.getpid()}\n")  # alive, as a running worker is
+        self.run_boot()
+        self.assertEqual(self.calls_made(), [])
+        self.assertTrue((self.journal / "state").exists())
+
+    def test_a_worker_journal_is_held_in_hold_mode(self):
+        self.conf("MODE=hold\n")
+        self.make_journal("starting", jid=self.WORKER, extra=self.EXTRA)
+        self.worker_files()
+        self.run_boot()
+        self.assertNotIn("rollback", self.calls_made())
+        self.assertEqual(self.record()["result"], "held")
+
+
 class SameBootAndUnreadable(BootCase):
     def test_a_journal_written_in_this_boot_is_left_alone(self):
         self.make_journal("root-swap", boot=BOOT_NOW)

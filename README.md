@@ -2103,6 +2103,15 @@ member (a legitimate backup never contains one) before anything is extracted:
 sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 ```
 
+From step (4) on, the restore runs in the background when systemd is running, so it goes on if your
+SSH session drops or your terminal closes. Your terminal follows it and prints the same lines. Ctrl-C
+(or closing the terminal) only stops following: the restore continues, and there is no abort. To
+follow it again, run `sudo vesselstackctl restore --status --follow`; it prints what the restore
+printed so far and waits until it ends, with the same exit status. When no restore is running it
+shows the result of the last one. Add `--foreground` to run the restore in your terminal instead
+(it then stops if the terminal closes, and you undo it with `recover rollback`). Without systemd
+(a rescue system or a chroot) the restore always runs in your terminal.
+
 Restore never extracts over the live tree. It (1) verifies the archive,
 (2) checks free space (staging holds a second full copy next to the live trees;
 the previous trees are kept too, so you need room for old + new), (3) extracts
@@ -2166,9 +2175,15 @@ the `.pre-restore-STAMP` trees back.
 
 #### If a restore is interrupted
 
-If the restore stops half-way (the SSH session dropped, the power failed, the process was
-killed, or it printed `RECOVERY ERROR`), the journal stays in place. Check how far it got,
-then undo it:
+A restore that runs in the background keeps going when your SSH session drops. Follow it again
+with `sudo vesselstackctl restore --status --follow`; `restore --status`, `recover status` and
+`vesselstackctl status` say "running in the background" while it runs, and `doctor` shows a WARN.
+If the background restore itself stops (it was killed, or the Pi lost power), your terminal says
+"The restore worker stopped in phase ..." and the journal stays in place, as below.
+
+If the restore stops half-way (it ran with `--foreground` and the SSH session dropped, the power
+failed, the process was killed, or it printed `RECOVERY ERROR`), the journal stays in place. Check
+how far it got, then undo it:
 
 ```bash
 sudo /var/lib/vesselstack/restore/current/recover status
@@ -2501,8 +2516,15 @@ What to know:
   (`sudo systemctl start boot-vesselstack-restore.service` is refused). To remove it, set the
   setting to `hold`, or run `sudo systemctl disable boot-vesselstack-restore.service`.
 
-The restore itself still runs in your terminal session, so keep it on a stable connection or run
-it inside `screen` or `tmux`.
+A restore runs in the background (the unit `run-vesselstack-restore`, see `systemctl status
+run-vesselstack-restore` while it runs), so a dropped SSH session does not interrupt it. Ctrl-C
+only stops following it. There is no abort: wait for it to end, or, once it has ended or stopped,
+undo it with `recover rollback`. If you shut the Pi down while a restore runs, the shutdown waits up
+to 10 minutes for it; after that, or after a power loss, the recovery at boot (above) rolls it back.
+`sudo vesselstackctl restore --status --follow` re-attaches to a running restore, and
+`restore ARCHIVE --yes --foreground` runs the restore in your terminal as older releases did; on
+that path, keep the connection stable or run it inside `screen` or `tmux`. Without systemd the
+restore also runs in your terminal.
 
 If stopping the
 running stack fails, no rollback is attempted under live services. Unrelated

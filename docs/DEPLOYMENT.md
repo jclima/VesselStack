@@ -442,6 +442,15 @@ values, and record the `doctor` result and data-directory size each day.
    restored bundled installer, which needs network for `pip` unless you use
    `--skip-installer` and run the installer yourself (offline: see 3.5.3).
 
+   The restore swap runs in the background, so check that it survives a dropped connection. Over SSH
+   start a restore, then kill the SSH client during it. Reconnect and run
+   `sudo vesselstackctl restore --status --follow`; it must complete with the same result lines
+   ("Restore completed" and the `.pre-restore-STAMP` line) as a restore in the terminal
+   (`--foreground`). While it runs, `systemctl status run-vesselstack-restore` shows the unit.
+   Then reboot during a second background restore and confirm that the recovery at boot rolls it
+   back (`sudo vesselstackctl restore --status` says "No restore is pending."; `doctor` shows the
+   INFO line about the automatic rollback).
+
 3. **Offline install with the internet blocked.** Build the bundle on a
    connected machine (docker + python3 + pip; defaults target aarch64, Python 3.11,
    `linux/arm64` images; add `--python-version 3.13` if the Pi's Python differs):
@@ -730,7 +739,7 @@ changed by this command.
 - [ ] Lab: Homepage and sign-in rehearsed (section 3.5.6): front door at `http://<hostname>.local` shows the tiles, removing and re-adding a component updates its tile, the allowed hosts refresh after a reboot, and, only when the lab Pi came from 0.6.2 or earlier, the update removed the Heimdall container and left `$VESSELSTACK_DATA/heimdall`.
 - [ ] Lab: passphrase sign-in with Remember and revoke from another device, a `panel-link --for chat` QR scanned by a phone, the Boat Chat crew passphrase, and a token rotation that signs devices out.
 - [ ] Lab, 0.9.0: **interrupted restore and rollback** (README [If a restore is interrupted](../README.md#if-a-restore-is-interrupted)). Scratch lab Pi only, with a verified backup from section 3.5.2. **[MUTATES HOST]**
-  1. In `screen` or `tmux` run `sudo vesselstackctl restore /path/to/vesselstack-STAMP.tar.gz --yes`. From a second SSH session, `kill -9` the restore process part-way (after it has stopped the stack).
+  1. Run `sudo vesselstackctl restore /path/to/vesselstack-STAMP.tar.gz --yes`; no `screen` or `tmux` is needed because the restore runs in the background unit `run-vesselstack-restore`. From a second SSH session, `sudo systemctl kill --signal=KILL run-vesselstack-restore.service` part-way (after it has stopped the stack). (With `--foreground`, `kill -9` the restore process instead.) The first terminal prints "The restore worker stopped in phase ...".
   2. `sudo /var/lib/vesselstack/restore/current/recover status` shows how far it got, then `sudo /var/lib/vesselstack/restore/current/recover rollback`. Expect the previous application and data folders back in place, the stack started, and no `*.pre-restore-*` folder left in the way.
   3. `sudo vesselstackctl doctor` is healthy, and `sudo vesselstackctl status` no longer prints `FAIL restore did not finish` and exits 0. While the journal was pending, `status` reported it and commands that change the system refused ("A restore did not finish"): note that too.
   4. Delete the leftover `*.pre-restore-*`, `*.failed-restore-*` and stage folders yourself when done; they hold a copy of the data including secrets.
