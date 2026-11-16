@@ -2179,7 +2179,9 @@ A restore that runs in the background keeps going when your SSH session drops. F
 with `sudo vesselstackctl restore --status --follow`; `restore --status`, `recover status` and
 `vesselstackctl status` say "running in the background" while it runs, and `doctor` shows a WARN.
 If the background restore itself stops (it was killed, or the Pi lost power), your terminal says
-"The restore worker stopped in phase ..." and the journal stays in place, as below.
+"The restore worker stopped in phase ..." and the journal stays in place, as below. After a reboot
+the status commands no longer call it running, because the old process is gone; use `recover status`
+and `recover rollback`.
 
 If the restore stops half-way (it ran with `--foreground` and the SSH session dropped, the power
 failed, the process was killed, or it printed `RECOVERY ERROR`), the journal stays in place. Check
@@ -2519,8 +2521,14 @@ What to know:
 A restore runs in the background (the unit `run-vesselstack-restore`, see `systemctl status
 run-vesselstack-restore` while it runs), so a dropped SSH session does not interrupt it. Ctrl-C
 only stops following it. There is no abort: wait for it to end, or, once it has ended or stopped,
-undo it with `recover rollback`. If you shut the Pi down while a restore runs, the shutdown waits up
-to 10 minutes for it; after that, or after a power loss, the recovery at boot (above) rolls it back.
+undo it with `recover rollback`. If you shut the Pi down while a restore runs and it has not moved
+the first folder yet, it stops and rolls back at once, and the journal records `stop_requested`. Once
+it has begun to move folders, the shutdown waits up to 10 minutes for it to finish; after that, or
+after a power loss, the recovery at boot (above) rolls it back. A restore counts as running only
+while its worker process is alive in this boot: after a reboot, `status`, `doctor` and `recover
+status` report an unfinished restore, not a running one. If you run `recover rollback` or `recover
+abandon --yes` from another terminal while your terminal still follows a restore that has not
+started, the terminal says "The restore is no longer pending" and exits with status 1.
 `sudo vesselstackctl restore --status --follow` re-attaches to a running restore, and
 `restore ARCHIVE --yes --foreground` runs the restore in your terminal as older releases did; on
 that path, keep the connection stable or run it inside `screen` or `tmux`. Without systemd the

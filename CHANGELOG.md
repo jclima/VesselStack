@@ -18,9 +18,14 @@ Semantic Versioning.
   Without systemd the restore runs in the terminal.
 
 **Operational impact:** a restore started from an SSH session no longer needs `screen` or `tmux`. A
-shutdown during a restore waits up to 10 minutes for it; after that, or after a power loss, the
-recovery at boot rolls it back. While it runs, other commands are refused as for any unfinished
-restore. The journal still validates for older releases' tools (the two new keys are optional).
+shutdown before the restore has moved the first folder stops it and rolls it back at once (the
+journal records `stop_requested`). After that, the shutdown waits up to 10 minutes for it to
+finish; after that, or after a power loss, the recovery at boot rolls it back. `status`, `doctor`
+and `recover status` call a restore running only while its worker process is alive in this boot,
+so a stale record after a power loss shows the unfinished restore and the rollback steps. If you
+roll back or abandon a restore from another terminal before it starts, the first terminal says so
+and exits 1. While it runs, other commands are refused as for any unfinished
+restore. The journal still validates for older releases' tools (the new keys are optional).
 
 **Verify:** over SSH start a restore, kill the SSH client, reconnect and run `sudo vesselstackctl
 restore --status --follow`: it prints the rest of the output and exits 0. `systemctl status

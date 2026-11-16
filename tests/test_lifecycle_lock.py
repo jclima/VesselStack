@@ -245,6 +245,32 @@ class PendingRestoreTests(unittest.TestCase):
                 self.assertIsInstance(caught.exception, LifecycleLockBusy)
                 self.assertIn(f"a restore is unfinished; see: sudo {self.journal}/recover status", str(caught.exception))
 
+    def test_an_empty_or_relative_system_root_looks_for_the_journal_under_slash_never_in_the_working_directory(self):
+        from common import lifecycle_lock
+        # A decoy journal at the relative path an empty root used to resolve to, in a different working directory.
+        elsewhere = self.base / "elsewhere"
+        decoy = elsewhere / "var/lib/vesselstack/restore/current"
+        decoy.mkdir(parents=True)
+        (decoy / "state").write_text("format=1\nid=" + RESTORE_ID + "\nphase=prepared\n")
+        looked_at = []
+
+        def lexists(path):
+            looked_at.append(path)
+            return False
+
+        old_cwd = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            for root in ("", "var", "relative/root"):
+                with self.subTest(root=root), mock.patch("os.path.lexists", side_effect=lexists):
+                    looked_at.clear()
+                    self.assertIsNone(lifecycle_lock._unfinished_restore(root))
+                    self.assertEqual(looked_at, ["/var/lib/vesselstack/restore/current"])
+            # The lock class normalises its root first, so production always passes "/" here.
+            self.assertEqual(LifecycleLock(self.install, "").system_root, "/")
+        finally:
+            os.chdir(old_cwd)
+
     def test_a_refusal_does_not_keep_the_lock(self):
         self.journal_with("prepared")
         with self.assertRaises(LifecycleLockBusy):

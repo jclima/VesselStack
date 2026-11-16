@@ -126,7 +126,10 @@ def _unfinished_restore(system_root: str) -> str | None:
     helper, and anything it cannot read with certainty counts as unfinished.  A restore's own processes carry
     its id in VESSELSTACK_RESTORE_ID and pass.
     """
-    journal = os.path.join(system_root, "var", "lib", "vesselstack", "restore", "current")
+    # An empty or relative root must never resolve against the working directory: it means "/".
+    root = os.fspath(system_root)
+    root = os.path.normpath(root) if os.path.isabs(root) else os.sep
+    journal = os.path.join(root, "var", "lib", "vesselstack", "restore", "current")
     if not os.path.lexists(journal):
         return None
     values: dict[str, str] = {}

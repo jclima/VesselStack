@@ -67,18 +67,47 @@ restore_pid_alive() {
     kill -0 "$1" 2>/dev/null || return 1
     [ "$(ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != Z ]
 }
-# True when a background worker of the pending restore is running: the journal's id has a worker pid file,
-# no result file, and the process in it is alive. Sets restore_worker_id.
+# The boot id of this boot, or "-" when it cannot be read.
+restore_current_boot_id() {
+    local boot
+    boot=$(tr -d '[:space:]' < "${VESSELSTACK_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null || true)
+    printf '%s' "${boot:--}"
+}
+# True when the command line of process PID holds "worker ID": the process is that restore's worker.
+restore_pid_is_worker() {
+    local cmd
+    if [ -r "/proc/$1/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true)
+    else
+        cmd=$(ps -o command= -p "$1" 2>/dev/null || true)
+    fi
+    case "$cmd" in *"worker $2"*) return 0 ;; esac
+    return 1
+}
+# True when the worker process of restore ID is running now. Its pid file holds "PID BOOT_ID" (an older file
+# holds only the PID). It counts only when there is no result file, the file was written in this boot (when
+# both boot ids are known), the process is alive, and its command line says it is this restore's worker.
+restore_worker_process_running() {
+    local id=$1 base=$RESTORE_DIR/worker-$1 pid='' boot='' extra='' current
+    [ -f "$base.pid" ] && [ ! -e "$base.rc" ] || return 1
+    read -r pid boot extra < "$base.pid" 2>/dev/null || true
+    [[ $pid =~ ^[0-9]+$ ]] && [ -z "$extra" ] || return 1
+    if [ -n "$boot" ] && [ "$boot" != - ]; then
+        current=$(restore_current_boot_id)
+        if [ "$current" != - ] && [ "$current" != "$boot" ]; then return 1; fi
+    fi
+    restore_pid_alive "$pid" || return 1
+    restore_pid_is_worker "$pid" "$id"
+}
+# True when a background worker of the pending restore is running (see restore_worker_process_running).
+# Sets restore_worker_id.
 restore_worker_running() {
-    local dir=$RESTORE_CURRENT base pid
+    local dir=$RESTORE_CURRENT
     restore_worker_id=''
     [ -f "$dir/state" ] || return 1
     restore_worker_id=$(restore_state_peek "$dir" id)
     [[ $restore_worker_id =~ ^[0-9a-f]{32}$ ]] || return 1
-    base=$RESTORE_DIR/worker-$restore_worker_id
-    [ -f "$base.pid" ] && [ ! -e "$base.rc" ] || return 1
-    pid=$(cat -- "$base.pid" 2>/dev/null || true)
-    restore_pid_alive "$pid"
+    restore_worker_process_running "$restore_worker_id"
 }
 # The way out of a journal that cannot be used (state unreadable, a repeated key, or rejected by the
 # validator). The same text everywhere. Root and data are printed only when the state can still be read.
@@ -3614,14 +3643,14 @@ restore_state_load() {
     local journal=$1 dump line key
     st_format='' st_id='' st_stamp='' st_root='' st_data='' st_system_root='' st_stage='' st_archive='' st_started=''
     st_root_live='' st_data_live='' st_root_new='' st_data_new='' st_phase='' st_rollback_from=''
-    st_last_error='' st_last_error_kind='' st_runner='' st_launched='' st_boot_id='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_skip_installer='' st_keys=$'\n'
+    st_last_error='' st_last_error_kind='' st_runner='' st_launched='' st_stop_requested='' st_boot_id='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_skip_installer='' st_keys=$'\n'
     dump=$(python3 -I "$journal/restore_journal.py" dump "$journal") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         key=${line%%=*}
         st_keys="$st_keys$key"$'\n'
         case "$key" in
-            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|last_error_kind|boot_id|firewall_enabled|firewall_active|abandoned_from|skip_installer|runner|launched)
+            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|last_error_kind|boot_id|firewall_enabled|firewall_active|abandoned_from|skip_installer|runner|launched|stop_requested)
                 printf -v "st_$key" '%s' "${line#*=}" ;;
         esac
     done <<< "$dump"
@@ -3725,6 +3754,10 @@ restore_validate_state() {
     esac
     if [ -n "${st_launched:-}" ] && [[ ! $st_launched =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
         restore_validate_error="its record of when the background restore was launched is \"${st_launched//[![:print:]]/?}\", not a UTC time"
+        return 1
+    fi
+    if [ -n "${st_stop_requested:-}" ] && [[ ! $st_stop_requested =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+        restore_validate_error="its record of when a stop was requested is \"${st_stop_requested//[![:print:]]/?}\", not a UTC time"
         return 1
     fi
     for value in "$st_root_live" "$st_data_live" "$st_root_new" "$st_data_new"; do
@@ -4821,20 +4854,23 @@ restore_worker_admit() {
         return 1
     fi
 }
-# Remove the worker files of all but the newest three restores; KEEP (the running one) is never removed.
+# Remove the worker files of all but the newest three restores (a set is every worker-ID.* file); KEEP (the
+# running one) is never removed.
 restore_worker_prune() {
-    local keep=$1 path name id count=0
+    local keep=$1 path name id count=0 seen=' '
     while IFS= read -r path; do
         name=${path##*/}
         id=${name#worker-}
-        id=${id%.pid}
+        id=${id%%.*}
         [[ $id =~ ^[0-9a-f]{32}$ ]] || continue
+        case "$seen" in *" $id "*) continue ;; esac
+        seen="$seen$id "
         count=$((count + 1))
         if [ "$count" -gt 3 ] && [ "$id" != "$keep" ]; then
             rm -f -- "$RESTORE_DIR/worker-$id.pid" "$RESTORE_DIR/worker-$id.out" "$RESTORE_DIR/worker-$id.err" \
                 "$RESTORE_DIR/worker-$id.rc"
         fi
-    done < <(ls -1t -- "$RESTORE_DIR"/worker-*.pid 2>/dev/null || true)
+    done < <(ls -1t -- "$RESTORE_DIR"/worker-* 2>/dev/null || true)
 }
 # Records the exit status of the worker (EXIT trap): a temporary file, flushed, renamed, and the directory flushed.
 restore_worker_finish() {
@@ -4864,22 +4900,25 @@ restore_recover_worker() {
     restore_worker_admit "$id" "$journal" || return 0
     base="$RESTORE_DIR/worker-$id"
     restore_worker_base=$base
-    (umask 077; : >> "$base.out"; : >> "$base.err"; printf '%s\n' "$$" > "$base.pid") || return 1
+    # The result file comes first: whatever fails from here on still leaves one.
+    trap 'restore_worker_finish "$?"' EXIT
+    (umask 077; : >> "$base.out"; : >> "$base.err"; printf '%s %s\n' "$$" "$(restore_current_boot_id)" > "$base.pid") || return 1
     chmod 0600 "$base.out" "$base.err" "$base.pid" || return 1
     restore_worker_prune "$id"
     exec >> "$base.out" 2>> "$base.err"
-    trap 'restore_worker_finish "$?"' EXIT
-    # A shutdown asks the unit to stop and waits for it (the unit allows ten minutes): the restore goes on, and
-    # the boot recovery handles whatever is left after that.
+    # A shutdown asks the unit to stop and waits for it (the unit allows ten minutes). Before the first folder
+    # is moved the restore is rolled back at once; after that it goes on to its end, and the boot recovery
+    # handles whatever is left.
     trap 'restore_worker_stop_requested "$journal"' TERM
     restore_forward "$journal"
     exit 0
 }
-# Notes once in the journal that a stop was requested; the restore itself is not interrupted.
+# Sets the stop flag and notes once in the journal (key stop_requested, not last_error) that a stop was
+# requested. The restore looks at the flag only before it moves the first folder.
 restore_worker_stop_requested() {
-    [ -z "${restore_worker_stop_noted:-}" ] || return 0
-    restore_worker_stop_noted=1
-    restore_state_set "$1" "last_error=stop requested" 2>/dev/null || true
+    [ -z "${restore_stop_flag:-}" ] || return 0
+    restore_stop_flag=1
+    restore_state_set "$1" "stop_requested=$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null || true
 }
 # Runs under the lock for a foreground that handed the restore to a worker that never appeared: if the
 # journal is still prepared and no worker has started, nothing was changed, so the restore is cancelled
@@ -4973,6 +5012,11 @@ restore_commit_transaction() {
         return 1
     fi
     restore_enter "$journal" stopped || return 1
+    # A shutdown asked the worker to stop and no folder has been moved yet: roll back (this restarts what was stopped).
+    if [ -n "${restore_stop_flag:-}" ]; then
+        restore_abort "$journal" "stop requested before anything was moved"
+        return 1
+    fi
     restore_enter "$journal" data-swap || return 1
     if ! restore_mv_tree "$journal" "$data" "$data.pre-restore-$stamp"; then restore_abort "$journal" "data old-tree rename"; return 1; fi
     if ! restore_mv_tree "$journal" "$stage/vesselstack-backup/${data#/}" "$data"; then restore_abort "$journal" "data publication"; return 1; fi
@@ -5382,20 +5426,39 @@ restore_follow_copy() {
         printf -v "$var" '%s' "$size"
     fi
 }
+# A cheap fingerprint of the journal's state file (inode, modification time, size), empty when it is missing.
+restore_state_stamp() {
+    local file=$RESTORE_CURRENT/state out
+    [ -f "$file" ] || return 0
+    out=$(stat -c '%i %Y %s' -- "$file" 2>/dev/null) || out=$(stat -f '%i %m %z' -- "$file" 2>/dev/null) || out=''
+    printf '%s' "$out"
+}
+# A signal only stops following: say what is true about the restore.
 restore_follow_signal() {
-    echo "The restore continues in the background. Follow it: sudo vesselstackctl restore --status --follow" >&2 2>/dev/null || true
+    local base=$RESTORE_DIR/worker-${restore_follow_id:-none}
+    if [ -e "$base.rc" ]; then
+        echo "The restore has finished. See: sudo vesselstackctl restore --status --follow" >&2 2>/dev/null || true
+    elif restore_worker_process_running "${restore_follow_id:-none}"; then
+        echo "The restore continues in the background. Follow it: sudo vesselstackctl restore --status --follow" >&2 2>/dev/null || true
+    else
+        echo "Stopped following. No restore worker is running now. See: sudo vesselstackctl restore --status" >&2 2>/dev/null || true
+    fi
     exit "$1"
 }
 # Follows the worker of restore ID until it has finished, printing its output (stdout and stderr, each only
 # once) and a line when the phase changes, and returns the exit status the inline restore would have had.
 # MODE is "launch" (this process started the worker: it is given time to appear, and a worker that never
-# appears is cancelled) or "attach" (it is already running). A signal only stops following.
+# appears is cancelled) or "attach" (it is already running). A signal only stops following. It never waits
+# for ever: a worker that is gone ends the follow with its message, and a journal that another command rolled
+# back or cancelled ends it too.
 restore_follow() {
     local id=$1 mode=$2 base=$RESTORE_DIR/worker-$1 journal=$RESTORE_CURRENT
     local interval=${VESSELSTACK_RESTORE_FOLLOW_INTERVAL:-1} launch_wait=${VESSELSTACK_RESTORE_LAUNCH_WAIT:-30}
-    local dead_grace=${VESSELSTACK_RESTORE_DEAD_GRACE:-5} phase last_phase='' pid rc deadline dead_since='' unlaunched_rc
+    local dead_grace=${VESSELSTACK_RESTORE_DEAD_GRACE:-5} phase='' jid='' last_phase='' rc deadline dead_since='' unlaunched_rc
+    local stamp last_stamp='@' had_pid=0 tries=0
     # shellcheck disable=SC2034  # read and written through restore_follow_copy
     local follow_out_off=0 follow_err_off=0
+    restore_follow_id=$id
     [ "$mode" = launch ] && last_phase=prepared
     trap 'restore_follow_signal 130' INT
     trap 'restore_follow_signal 129' HUP
@@ -5412,39 +5475,53 @@ restore_follow() {
             [[ $rc =~ ^[0-9]+$ ]] || rc=1
             return "$rc"
         fi
-        phase=$(restore_state_peek "$journal" phase)
-        if [ -n "$phase" ] && [ "$phase" != "$last_phase" ]; then
-            echo "Restore: $(restore_phase_words "$phase")" >&2
-            last_phase=$phase
+        # The journal is read again only when its state file changed.
+        stamp=$(restore_state_stamp)
+        if [ "$stamp" != "$last_stamp" ]; then
+            last_stamp=$stamp
+            phase=$(restore_state_peek "$journal" phase)
+            jid=$(restore_state_peek "$journal" id)
+            if [ -n "$phase" ] && [ "$phase" != "$last_phase" ]; then
+                echo "Restore: $(restore_phase_words "$phase")" >&2
+                last_phase=$phase
+            fi
         fi
-        if [ ! -f "$base.pid" ]; then
-            if [ "$mode" = launch ] && [ "$SECONDS" -ge "$deadline" ] && [ "$phase" = prepared ]; then
+        [ ! -f "$base.pid" ] || had_pid=1
+        if restore_worker_process_running "$id"; then
+            dead_since=''
+        elif [ "$mode" = launch ] && [ "$had_pid" -eq 0 ]; then
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                if [ "$jid" != "$id" ] || [ "$phase" != prepared ]; then
+                    echo "The restore is no longer pending: it was rolled back or cancelled by another command. See: sudo vesselstackctl restore --status" >&2
+                    return 1
+                fi
                 unlaunched_rc=0
-                ( bash "$0" restore-recover unlaunched "$id" ) >/dev/null 2>&1 || unlaunched_rc=$?
+                ( bash "$journal/controller" restore-recover unlaunched "$id" ) >/dev/null 2>&1 || unlaunched_rc=$?
                 case "$unlaunched_rc" in
                     0)
                         echo "The restore did not start in the background. Nothing was changed and the staged copy was removed. Run it again with --foreground to run it in this terminal." >&2
                         return 1 ;;
-                    4|75) deadline=$((SECONDS + launch_wait)) ;;
+                    4|75)
+                        tries=$((tries + 1))
+                        if [ "$tries" -ge 3 ]; then
+                            echo "The restore did not start in the background and could not be cancelled; run: sudo $journal/recover status" >&2
+                            return 1
+                        fi
+                        deadline=$((SECONDS + launch_wait)) ;;
                     *)
                         echo "The restore did not start in the background and could not be cancelled. See: sudo $journal/recover status" >&2
                         return 1 ;;
                 esac
             fi
         else
-            pid=$(cat -- "$base.pid" 2>/dev/null || true)
-            if [[ $pid =~ ^[0-9]+$ ]] && ! restore_pid_alive "$pid"; then
-                [ -n "$dead_since" ] || dead_since=$SECONDS
-                if [ $((SECONDS - dead_since)) -ge "$dead_grace" ]; then
-                    if [ -z "$phase" ]; then
-                        echo "The restore worker stopped without reporting a result, and no restore is pending. Check the system: sudo vesselstackctl doctor" >&2
-                    else
-                        echo "The restore worker stopped in phase $(restore_phase_words "$phase"). Run: sudo $journal/recover status" >&2
-                    fi
-                    return 1
+            [ -n "$dead_since" ] || dead_since=$SECONDS
+            if [ $((SECONDS - dead_since)) -ge "$dead_grace" ]; then
+                if [ -z "$phase" ]; then
+                    echo "The restore worker stopped without reporting a result, and no restore is pending. Check the system: sudo vesselstackctl doctor" >&2
+                else
+                    echo "The restore worker stopped in phase $(restore_phase_words "$phase"). Run: sudo $journal/recover status" >&2
                 fi
-            else
-                dead_since=''
+                return 1
             fi
         fi
         sleep "$interval" &
@@ -5455,25 +5532,33 @@ restore_follow() {
 # restore --status --follow: attach to a restore that runs in the background; otherwise say what restore
 # --status says and, when nothing is pending, how the last background restore ended.
 restore_status_follow() {
-    local rc=0 last mtime status
+    local rc=0 last mtime status path name
     if restore_worker_running; then
         restore_follow "$restore_worker_id" attach
         return $?
     fi
     restore_recover_command status || rc=$?
     if [ ! -f "$RESTORE_CURRENT/state" ] && [ ! -e "$RESTORE_CURRENT" ]; then
-        # shellcheck disable=SC2012  # file names here are ours
-        last=$(ls -1t -- "$RESTORE_DIR"/worker-*.rc 2>/dev/null | head -n 1 || true)
-        if [ -n "$last" ] && [ -f "$last" ]; then
-            status=$(head -n 1 "$last" 2>/dev/null || true)
+        # The newest set of worker files (every worker-ID.* file counts); its result is reported only when it has one.
+        last=''
+        while IFS= read -r path; do
+            name=${path##*/}; name=${name#worker-}; name=${name%%.*}
+            [[ $name =~ ^[0-9a-f]{32}$ ]] || continue
+            last=$name
+            break
+        done < <(ls -1t -- "$RESTORE_DIR"/worker-* 2>/dev/null || true)
+        if [ -n "$last" ] && [ -f "$RESTORE_DIR/worker-$last.rc" ]; then
+            status=$(head -n 1 "$RESTORE_DIR/worker-$last.rc" 2>/dev/null || true)
             [[ $status =~ ^[0-9]+$ ]] || status=unknown
             mtime=$(python3 -I -c 'import os, sys, time
-print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.stat(sys.argv[1]).st_mtime)))' "$last" 2>/dev/null || true)
+print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.stat(sys.argv[1]).st_mtime)))' "$RESTORE_DIR/worker-$last.rc" 2>/dev/null || true)
             if [ "$status" = 0 ]; then
                 echo "The last restore that ran in the background completed${mtime:+ at $mtime}."
             else
                 echo "The last restore that ran in the background failed (exit status $status)${mtime:+ at $mtime}."
             fi
+        elif [ -n "$last" ]; then
+            echo "The last background restore did not run to the end or was cancelled; no result was recorded for it."
         fi
     fi
     return "$rc"
