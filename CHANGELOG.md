@@ -372,6 +372,10 @@ are pending. It is not marked Latest until the documented lab checks pass.
 
 ### For contributors
 
+- The service tests (Mosquitto ACL, upgrade and bridge tests, Node-RED dashboard auth test) take each
+  component's image from `common/component_versions.py` instead of reading `templates/compose.yml`
+  as text, which now holds `${X_VERSION:-default}` references; `tests/test-distribution.sh` fails
+  if one goes back to a `sed` on the compose `image:` line.
 - Restore: `restore_writer_units` used to print its list from a loop reading a process substitution,
   and its callers read it through another one. Under bash 3.2 (macOS `/bin/bash`, which the Python
   tests use) the child's exit sometimes interrupted the write, the loop saw an early end of file and

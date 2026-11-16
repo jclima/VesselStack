@@ -91,6 +91,13 @@ grep -qF "offline install: the Signal K data path" "$ROOT/install.sh"
 grep -qF 'configure-signalk-datapath.py' "$ROOT/install.sh"
 grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION:-v2.27.0}' "$ROOT/templates/compose.yml"
 grep -q '${AIS_IMAGE:-ghcr.io/jvde-github/ais-catcher:v0.70}' "$ROOT/templates/compose.yml"
+# Every image in compose.yml is repository:${X_VERSION:-default}; a sed on its "image:" line hands
+# docker the literal ${...}. The service tests take the image from common/component_versions.py.
+if grep -rnE "sed .*image:.*\\\\\(" "$ROOT/tests" "$ROOT/scripts" "$ROOT/displays" "$ROOT/control-panel" \
+    --include='*.sh' --include='*.py' --exclude=test-distribution.sh; then
+    echo "do not extract an image from compose.yml with sed; use common/component_versions.py --effective" >&2
+    exit 1
+fi
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"

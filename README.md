@@ -2840,6 +2840,8 @@ and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
 dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
 bytecode in the source or bundled runtime tree.
 
+The service tests (`tests/test-displays-mosquitto.sh`, `test-displays-bridge.sh`, `test-mosquitto-upgrade.sh`, `test-nodered-dashboard-auth.sh`) take each component's image from `common/component_versions.py` (the release default, `--effective <id> ""`), not from the text of `templates/compose.yml`, whose image lines are `repository:${X_VERSION:-default}`; `tests/test-distribution.sh` fails if a test or script goes back to extracting an image from that file with `sed`. This changes tests only, with nothing to roll back at runtime.
+
 CI runs the Python regressions with a 20 minute limit (`timeout-minutes: 20`), so a hanging test fails the job with a log instead of blocking it.
 
 Test clean-up only ever signals processes its own test started (never a pid read from a file under test, and never pid or process group 0 or 1, the runner or its parent)), and the restore hand-off tests wait the production 30 s for a worker to start, so a busy runner is not mistaken for a worker that never appeared; a failed wait prints the foreground output, the launcher log, the worker files and the processes.
