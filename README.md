@@ -2529,6 +2529,9 @@ while its worker process is alive in this boot: after a reboot, `status`, `docto
 status` report an unfinished restore, not a running one. If you run `recover rollback` or `recover
 abandon --yes` from another terminal while your terminal still follows a restore that has not
 started, the terminal says "The restore is no longer pending" and exits with status 1.
+If you press Ctrl-C in the first moments, before the background restore has started, the terminal
+says it has not started yet and may still start; `restore --status --follow` then waits for it to
+appear (up to 30 seconds) and otherwise shows the status with the rollback command.
 `sudo vesselstackctl restore --status --follow` re-attaches to a running restore, and
 `restore ARCHIVE --yes --foreground` runs the restore in your terminal as older releases did; on
 that path, keep the connection stable or run it inside `screen` or `tmux`. Without systemd the

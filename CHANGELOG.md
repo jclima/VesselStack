@@ -19,7 +19,8 @@ Semantic Versioning.
 
 **Operational impact:** a restore started from an SSH session no longer needs `screen` or `tmux`. A
 shutdown before the restore has moved the first folder stops it and rolls it back at once (the
-journal records `stop_requested`). After that, the shutdown waits up to 10 minutes for it to
+journal records `stop_requested`; this includes a request that arrives before anything was
+stopped, which ends the restore without stopping the stack). After that, the shutdown waits up to 10 minutes for it to
 finish; after that, or after a power loss, the recovery at boot rolls it back. `status`, `doctor`
 and `recover status` call a restore running only while its worker process is alive in this boot,
 so a stale record after a power loss shows the unfinished restore and the rollback steps. If you

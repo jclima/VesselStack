@@ -3040,6 +3040,25 @@ mv() { echo "MV $*" >> "@LOG@"; __mv "$@"; }
                 self.assertEqual((restore / f"worker-{HEX_ID}.rc").read_text(), "1\n")
                 self.assertIn("stop requested before anything was moved", (restore / f"worker-{HEX_ID}.err").read_text())
 
+    def test_a_stop_request_while_still_prepared_ends_the_restore_without_stopping_anything(self):
+        lay = self.prepare()
+        # TERM arrives after the worker took over and before the commit transaction does its first step.
+        hook = ('eval "$(declare -f restore_commit_transaction | sed 1s/restore_commit_transaction/restore_commit_original/)"\n'
+                'restore_commit_transaction() { kill -TERM $$; restore_commit_original "$@"; }\n')
+        result = self.run_harness(self.body(lay, "\n" + hook + f'restore_recover_command worker "{HEX_ID}"\nexit 0\n'), lay["base"])
+        restore = lay["base"] / "restore"
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([l for l in self.calls(lay) if l.startswith("systemctl stop") or l.startswith("systemctl start")], [])
+        self.assertNotIn("PHASE phase=stopping", "\n".join(self.calls(lay)))
+        self.assertEqual([l for l in self.calls(lay) if l.startswith("MV ") and "rolled-back-" not in l], [], "only the journal was archived")
+        self.assertTrue((lay["root"] / "old").exists()); self.assertTrue((lay["data"] / "old").exists())
+        self.assertFalse(lay["stage"].exists())
+        self.assertFalse((restore / "current").exists())
+        self.assertEqual(phase_of(restore / f"rolled-back-{STAMP}"), "rolled-back")
+        self.assertRegex(state_value(restore / f"rolled-back-{STAMP}", "stop_requested"), r"^\d{4}-")
+        self.assertNotEqual((restore / f"worker-{HEX_ID}.rc").read_text(), "0\n")
+        self.assertIn("stop requested before anything was stopped", (restore / f"worker-{HEX_ID}.err").read_text())
+
     def test_a_stop_request_once_the_first_folder_moves_does_not_interrupt_the_restore(self):
         for phase in ("data-swap", "root-swap", "starting"):
             with self.subTest(phase):
@@ -3386,6 +3405,69 @@ if mode == "start-then-fail":
                 self.assertEqual((self.restore_dir / f"worker-{HEX_ID}.rc").read_text(), "0\n")
                 self.assertEqual(phase_of(self.archived()), "committed")
 
+    def wait_for_runner(self, timeout=30):
+        """The journal exists and has been handed to a worker (runner=worker)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if state_value(self.journal, "runner") == "worker":
+                    return
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.fail("the journal was not handed to a worker")
+
+    def test_a_signal_in_the_launch_window_says_the_restore_may_still_start(self):
+        self.mode("launcher-mode", "never")
+        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="30")
+        self.wait_for_runner()
+        time.sleep(1)  # the follower has installed its traps
+        os.kill(proc.pid, signal.SIGINT)
+        rc, out, err = self.finish(proc)
+        self.assertEqual(rc, 130, err)
+        self.assertIn("The background restore has not started yet and may still start. Follow it: sudo vesselstackctl restore --status --follow", err)
+        self.assertNotIn("No restore worker is running now", err)
+        self.assertEqual(phase_of(self.journal), "prepared")  # nothing was cancelled
+
+    def test_status_follow_waits_for_a_worker_in_the_launch_window(self):
+        self.mode("launcher-mode", "never")
+        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="30")
+        self.wait_for_runner()
+        proc.kill(); proc.wait()
+        # no worker appears: the normal status and the way to roll back, after the launch wait
+        start = time.time()
+        rc, out, err = self.run_ctl("restore", "--status", "--follow", VESSELSTACK_RESTORE_LAUNCH_WAIT="2")
+        self.assertGreaterEqual(time.time() - start, 1.0)  # whole seconds: it can fire up to one second early
+        self.assertEqual(rc, 0, err)
+        self.assertIn("A restore did not finish.", out)
+        self.assertIn(f"sudo {self.journal}/recover rollback", out)
+        # a worker that appears during the wait is followed to its end
+        self.mode("ctl-mode", "hang")
+        def late_worker():
+            time.sleep(1)
+            env = {"PATH": self.env()["PATH"], "VESSELSTACK_BOOT_ID_FILE": _BOOT_FILE}
+            self.procs.append(subprocess.Popen(["/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()], "bash", str(self.journal / "recover"), "worker", HEX_ID],
+                                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+            self.wait_for(self.base / "hanging")
+            self.mode("release", "")
+        thread = threading.Thread(target=late_worker); thread.start()
+        try:
+            rc, out, err = self.run_ctl("restore", "--status", "--follow", VESSELSTACK_RESTORE_LAUNCH_WAIT="20")
+        finally:
+            thread.join()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Restore completed", out)
+
+    def test_a_missing_boot_id_file_prints_nothing_to_stderr(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging"); self.worker_pid()
+        proc.kill(); proc.wait()
+        rc, out, err = self.run_ctl("status", VESSELSTACK_BOOT_ID_FILE=str(self.base / "no-such-boot-id"))
+        self.assertIn("Restore              RUNNING (phase stopping)", out)
+        self.assertNotIn("No such file", err)
+        self.assertEqual(err, "")
+
     def test_status_follow_attaches_to_a_running_worker_and_then_reports_the_last_result(self):
         self.mode("ctl-mode", "hang")
         proc = self.start()
@@ -3683,14 +3765,20 @@ if mode == "start-then-fail":
         self.assertEqual(self.finish(first, timeout=30)[0], 1)
 
     def test_a_signal_while_no_worker_runs_does_not_claim_one_continues(self):
-        self.mode("launcher-mode", "never")
-        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="30")
-        self.wait_for(self.base / "launcher.log")
+        # a worker that started (pid file written) and was killed without writing its result, signalled
+        # while the follower is still inside its dead-worker grace period
+        self.mode("ctl-mode", "hang")
+        proc = self.start(VESSELSTACK_RESTORE_DEAD_GRACE="60")
+        self.wait_for(self.base / "hanging")
+        os.kill(self.worker_pid(), signal.SIGKILL)
         time.sleep(1.5)
+        self.assertIsNone(proc.poll())
+        self.assertFalse((self.restore_dir / f"worker-{HEX_ID}.rc").exists())
         os.kill(proc.pid, signal.SIGTERM)
         rc, out, err = self.finish(proc, timeout=30)
         self.assertEqual(rc, 143, err)
         self.assertNotIn("continues in the background", err)
+        self.assertNotIn("may still start", err)
         self.assertIn("Stopped following. No restore worker is running now. See: sudo vesselstackctl restore --status", err)
 
     def test_the_follower_reads_the_journal_again_only_when_its_state_file_changed(self):

@@ -70,7 +70,7 @@ restore_pid_alive() {
 # The boot id of this boot, or "-" when it cannot be read.
 restore_current_boot_id() {
     local boot
-    boot=$(tr -d '[:space:]' < "${VESSELSTACK_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null || true)
+    boot=$({ tr -d '[:space:]' < "${VESSELSTACK_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"; } 2>/dev/null || true)
     printf '%s' "${boot:--}"
 }
 # True when the command line of process PID holds "worker ID": the process is that restore's worker.
@@ -90,7 +90,7 @@ restore_pid_is_worker() {
 restore_worker_process_running() {
     local id=$1 base=$RESTORE_DIR/worker-$1 pid='' boot='' extra='' current
     [ -f "$base.pid" ] && [ ! -e "$base.rc" ] || return 1
-    read -r pid boot extra < "$base.pid" 2>/dev/null || true
+    { read -r pid boot extra < "$base.pid"; } 2>/dev/null || true
     [[ $pid =~ ^[0-9]+$ ]] && [ -z "$extra" ] || return 1
     if [ -n "$boot" ] && [ "$boot" != - ]; then
         current=$(restore_current_boot_id)
@@ -4993,6 +4993,12 @@ restore_commit_transaction() {
     rid=$(restore_state_get "$journal" id)
     # Every phase is written before the step it names; restore_reconcile undoes whatever the
     # journal and the two trees show, whether this process fails or is killed.
+    # A shutdown asked the worker to stop before anything was stopped: end here (the journal is still
+    # "prepared", so the rollback archives it, removes the staged copy and starts nothing).
+    if [ -n "${restore_stop_flag:-}" ]; then
+        restore_abort "$journal" "stop requested before anything was stopped"
+        return 1
+    fi
     restore_enter "$journal" stopping || return 1
     if ! restore_run_controller "$journal" "$old_controller" stop; then
         restore_abort "$journal" "the running stack could not be stopped"
@@ -5433,6 +5439,17 @@ restore_state_stamp() {
     out=$(stat -c '%i %Y %s' -- "$file" 2>/dev/null) || out=$(stat -f '%i %m %z' -- "$file" 2>/dev/null) || out=''
     printf '%s' "$out"
 }
+# True when restore ID is the pending restore, handed to a worker (runner=worker), still in phase "prepared",
+# and the worker has neither written its pid file nor its result: the background run may still start.
+restore_follow_in_launch_window() {
+    local id=$1 base=$RESTORE_DIR/worker-$1 journal=$RESTORE_CURRENT
+    [[ $id =~ ^[0-9a-f]{32}$ ]] || return 1
+    [ ! -e "$base.rc" ] && [ ! -e "$base.pid" ] || return 1
+    [ -f "$journal/state" ] || return 1
+    [ "$(restore_state_peek "$journal" id)" = "$id" ] || return 1
+    [ "$(restore_state_peek "$journal" phase)" = prepared ] || return 1
+    [ "$(restore_state_peek "$journal" runner)" = worker ]
+}
 # A signal only stops following: say what is true about the restore.
 restore_follow_signal() {
     local base=$RESTORE_DIR/worker-${restore_follow_id:-none}
@@ -5440,6 +5457,8 @@ restore_follow_signal() {
         echo "The restore has finished. See: sudo vesselstackctl restore --status --follow" >&2 2>/dev/null || true
     elif restore_worker_process_running "${restore_follow_id:-none}"; then
         echo "The restore continues in the background. Follow it: sudo vesselstackctl restore --status --follow" >&2 2>/dev/null || true
+    elif restore_follow_in_launch_window "${restore_follow_id:-none}"; then
+        echo "The background restore has not started yet and may still start. Follow it: sudo vesselstackctl restore --status --follow" >&2 2>/dev/null || true
     else
         echo "Stopped following. No restore worker is running now. See: sudo vesselstackctl restore --status" >&2 2>/dev/null || true
     fi
@@ -5496,7 +5515,7 @@ restore_follow() {
                     return 1
                 fi
                 unlaunched_rc=0
-                ( bash "$journal/controller" restore-recover unlaunched "$id" ) >/dev/null 2>&1 || unlaunched_rc=$?
+                ( bash "$journal/recover" unlaunched "$id" ) >/dev/null 2>&1 || unlaunched_rc=$?
                 case "$unlaunched_rc" in
                     0)
                         echo "The restore did not start in the background. Nothing was changed and the staged copy was removed. Run it again with --foreground to run it in this terminal." >&2
@@ -5532,7 +5551,16 @@ restore_follow() {
 # restore --status --follow: attach to a restore that runs in the background; otherwise say what restore
 # --status says and, when nothing is pending, how the last background restore ended.
 restore_status_follow() {
-    local rc=0 last mtime status path name
+    local rc=0 last mtime status path name wait_id wait_deadline
+    # A restore handed to a worker that has not written its pid file yet: give the worker the launch wait to
+    # appear instead of printing a static status. If it does not, the normal status below says what to run.
+    if [ -f "$RESTORE_CURRENT/state" ]; then
+        wait_id=$(restore_state_peek "$RESTORE_CURRENT" id)
+        wait_deadline=$((SECONDS + ${VESSELSTACK_RESTORE_LAUNCH_WAIT:-30}))
+        while ! restore_worker_running && restore_follow_in_launch_window "$wait_id" && [ "$SECONDS" -lt "$wait_deadline" ]; do
+            sleep "${VESSELSTACK_RESTORE_FOLLOW_INTERVAL:-1}"
+        done
+    fi
     if restore_worker_running; then
         restore_follow "$restore_worker_id" attach
         return $?
