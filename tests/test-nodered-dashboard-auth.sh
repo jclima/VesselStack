@@ -8,8 +8,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SETTINGS=${NODERED_SETTINGS_UNDER_TEST:-$ROOT/templates/node-red/settings.js}
 DASHBOARD_VERSION=1.36.1
-IMAGE=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(nodered\/node-red:[^[:space:]]*\)[[:space:]]*$/\1/p' "$ROOT/templates/compose.yml" | head -n 1)
-[ -n "$IMAGE" ] || { echo "cannot read the Node-RED image from templates/compose.yml" >&2; exit 1; }
+IMAGE=$(python3 -I "$ROOT/common/component_versions.py" --effective nodered "")
+[ -n "$IMAGE" ] || { echo "cannot read the Node-RED image from common/component_versions.py" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 CTR="vs-nodered-auth-$$"

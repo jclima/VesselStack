@@ -112,6 +112,21 @@ def load_env(path):
             values[key]=tokens[0] if tokens else ""
     return values
 
+# Older installers wrote the release default of their day into these two settings, so they never moved forward.
+OLD_PINNED_DEFAULTS={"SIGNALK_VERSION":"v2.27.0","AIS_IMAGE":"ghcr.io/jvde-github/ais-catcher:v0.70"}
+
+def blank_old_defaults(base):
+    """A base file without HOMEPAGE_VERSION predates the component version settings: an old pinned default
+    is not a choice, so it is cleared once (the same rule as install.sh). Otherwise the wizard would write
+    HOMEPAGE_VERSION next to the old value and the installer could no longer tell."""
+    if "HOMEPAGE_VERSION" in base: return base
+    base=dict(base)
+    for key,old in OLD_PINNED_DEFAULTS.items():
+        if base.get(key)==old:
+            print(f"Note: {key} now follows the release default (it was pinned at {old} by an older installer).",file=sys.stderr)
+            base[key]=""
+    return base
+
 def expand_lan_access(values):
     """Web API: replace the LAN_ACCESS pseudo-setting (see LAN_PRESETS, shared with the terminal
     wizard) by the real bind settings. The preset wins over explicit bind values; the control
@@ -202,6 +217,13 @@ class Aborted(Exception):
 def _re(regex,message):
     compiled=re.compile(regex)
     return lambda value: None if compiled.fullmatch(value) else message
+
+def _version(key):
+    def check(value):
+        try: registry_validate_value(key,value)
+        except ValueError as exc: return str(exc)
+        return None
+    return check
 
 def _number(low,high,what):
     def check(value):
@@ -336,7 +358,7 @@ SECTIONS=[
   F("SIGNALK_DATAPATH_AUTOCONFIG","Configure the Signal K data path","Managed Docker/native modes install the pinned signalk-to-influxdb2 plugin, add the CAN provider when SocketCAN is on, and give the plugin its own InfluxDB token (read and write on the raw bucket only). Existing mode is never modified.","bool",advanced=True,when=lambda s:s.values["SIGNALK_MODE"]!="existing"),
   F("SIGNALK_MARINE_BUNDLE","Marine essentials bundle","Managed Docker/native modes only: NMEA 0183 on TCP port 10110 for chartplotter apps, an anchor alarm, an automatic logbook, and the KIP and Freeboard-SK web apps. Off by default; needs internet during install. Existing mode is never modified.","bool",advanced=True,when=lambda s:s.values["SIGNALK_MODE"]!="existing"),
   F("SIGNALK_URL","Address of your Signal K server","For example http://127.0.0.1:3000 (or another computer on the boat network).",required=True,check=URL,when=lambda s:s.values["SIGNALK_MODE"]=="existing"),
-  F("SIGNALK_VERSION","Signal K version","Release tag of the Signal K container image.",advanced=True,required=True,check=_re(r"v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?","A version such as v2.27.0."))]},
+  F("SIGNALK_VERSION","Signal K version (optional)","Leave empty to follow the release default. A value keeps that Signal K version across updates; it is not tested with this release, and Signal K data may upgrade one way. Back up first. Type - to clear.",advanced=True,optional=True,check=_version("SIGNALK_VERSION"))]},
  {"title":"NMEA 2000 (CAN bus)","intro":"Reads your boat's NMEA 2000 network through a CAN interface (isolated is preferred, safest; a non-isolated one such as the PiCAN-M works with caveats, see docs/BOM.md). Skip this until the hardware is installed and bench-tested; you can enable it later by running the installer again.","fields":[
   F("SOCKETCAN_ENABLE","Enable SocketCAN / NMEA 2000?","An isolated CAN interface is preferred (safest); a non-isolated one such as the PiCAN-M works with caveats (see docs/BOM.md). Needs a powered and terminated backbone and the can0 device present. Leave it off for a first dry run or a desk install.","bool",hint=_can_hint),
   F("VESSELSTACK_CAN_CREATE_VCAN","Home-lab mode: create a virtual CAN interface (vcan0, no real bus)?","For replaying recorded data at a desk. It creates a virtual vcan interface at boot. Answer no on a boat.","bool",when=lambda s:s.values["SOCKETCAN_ENABLE"]=="true",after=_vcan_after),
@@ -345,7 +367,7 @@ SECTIONS=[
  {"title":"AIS receiver","intro":"Optional: a USB AIS receiver shows nearby ships.","fields":[
   F("AIS_ENABLE","Do you have a USB AIS receiver to enable?","Needs a connected receiver under /dev/bus/usb. Say no if unsure.","bool"),
   F("AIS_DEVICE","AIS device","USB bus or receiver device path passed to AIS-catcher. The default works for most single receivers.",required=True,check=_re(r"/dev/[A-Za-z0-9_./-]+","A device path such as /dev/bus/usb."),when=lambda s:s.values["AIS_ENABLE"]=="true"),
-  F("AIS_IMAGE","AIS-catcher container image","Container image for the AIS decoder.",advanced=True,required=True,check=_re(r"[A-Za-z0-9_./:-]+","A container image reference.")),
+  F("AIS_IMAGE","AIS-catcher container image (optional)","Leave empty to follow the release default. A value is a full image reference such as ghcr.io/jvde-github/ais-catcher:v0.70 and keeps that version across updates; it is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("AIS_IMAGE")),
   F("AIS_CATCHER_ARGS","AIS-catcher arguments","Command-line options for the decoder; must match the two ports below.",advanced=True,required=True),
   F("AIS_WEB_PORT","AIS web port","Port of the decoder's status page.",advanced=True,required=True,check=PORT),
   F("AIS_TCP_PORT","AIS TCP port","Port Signal K reads decoded AIS from.",advanced=True,required=True,check=PORT)]},
@@ -390,6 +412,15 @@ SECTIONS=[
   F("VESSELSTACK_FIREWALL_STRICT","Strict mode (drop everything except the allow list)?","Strict mode only lets the ports below through on the untrusted interface. Say no unless you know you need it.","bool",when=lambda s:s.values["VESSELSTACK_FIREWALL_ENABLE"]=="true"),
   F("VESSELSTACK_FIREWALL_ALLOW_TCP","TCP ports to keep open","Comma-separated ports or ranges, for example 22 or 22,5000:5100. Keep 22 so you can still log in over SSH. Type - for none.",optional=True,when=lambda s:s.values["VESSELSTACK_FIREWALL_ENABLE"]=="true"),
   F("VESSELSTACK_FIREWALL_ALLOW_UDP","UDP ports to keep open","Comma-separated ports or ranges. Usually none. Type - for none.",optional=True,when=lambda s:s.values["VESSELSTACK_FIREWALL_ENABLE"]=="true")]},
+ {"title":"Component versions","intro":"Advanced and optional. Each container follows the version this release was tested with unless you set a different one here. A version you set is kept across updates and is not tested with this release; components that hold data (Home Assistant, InfluxDB, Grafana, Node-RED, Mosquitto, Signal K) may upgrade it one way, so make a backup first. Leave these empty if unsure.","fields":[
+  F("NODERED_VERSION","Node-RED version (optional)","Leave empty to follow the release default. A value such as 5.0.10-debian keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("NODERED_VERSION")),
+  F("HOMEASSISTANT_VERSION","Home Assistant version (optional)","Leave empty to follow the release default. A value such as 2026.7.0 keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("HOMEASSISTANT_VERSION")),
+  F("INFLUXDB_VERSION","InfluxDB version (optional)","Leave empty to follow the release default. A value such as 2.9.2 keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("INFLUXDB_VERSION")),
+  F("GRAFANA_VERSION","Grafana version (optional)","Leave empty to follow the release default. A value such as 13.0.2 keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("GRAFANA_VERSION")),
+  F("PROMETHEUS_VERSION","Prometheus version (optional)","Leave empty to follow the release default. A value such as v2.55.1 keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("PROMETHEUS_VERSION")),
+  F("NODE_EXPORTER_VERSION","Node exporter version (optional)","Leave empty to follow the release default. A value such as v1.10.3 keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("NODE_EXPORTER_VERSION")),
+  F("MOSQUITTO_VERSION","Mosquitto version (optional)","Leave empty to follow the release default. A value such as 2.1.3-alpine keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("MOSQUITTO_VERSION")),
+  F("HOMEPAGE_VERSION","Homepage version (optional)","Leave empty to follow the release default. A value such as v2.7.1 keeps that version across updates and is not tested with this release. Type - to clear.",advanced=True,optional=True,check=_version("HOMEPAGE_VERSION"))]},
  {"title":"Data retention","intro":"How long InfluxDB keeps the full-detail (raw) readings. One-minute averages are kept much longer.","fields":[
   F("INFLUXDB_RAW_RETENTION","Keep raw data for","Enter a duration such as 30d, 8w or 720h, 0 to keep it forever, or press Enter for the installer default: 30d on a new install and no change to an existing database. Raw data is large: 30 days suits a small SSD.",optional=True)]},
  {"title":"Unattended operation","intro":"How the boat computer looks after itself while you are away. All optional; the defaults are safe.","fields":[
@@ -718,7 +749,7 @@ def run_cli(console,values,facts):
 def cli_main(args):
     facts=detect_facts(); values=initial_values(facts)
     try:
-        if args.base: values=validate({**values,**load_env(args.base)})
+        if args.base: values=validate({**values,**blank_old_defaults(load_env(args.base))})
         apply_settings(values,args.set or [])
     except (OSError,ValueError) as exc: raise SystemExit(f"error: {exc}")
     output=Path(args.output).resolve() if args.output else OUTPUT

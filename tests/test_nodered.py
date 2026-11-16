@@ -46,7 +46,7 @@ class ComposeTests(unittest.TestCase):
     def test_service_definition(self):
         block = service_block("nodered")
         self.assertIn('profiles: ["nodered"]', block)
-        self.assertRegex(block, r"image: nodered/node-red:5\.0\.9-debian\n")
+        self.assertRegex(block, r"image: nodered/node-red:\$\{NODERED_VERSION:-5\.0\.9-debian\}\n")
         self.assertIn("container_name: vesselstack-nodered", block)
         self.assertIn('user: "1000:1000"', block)
         self.assertIn("mem_limit: 384m", block)

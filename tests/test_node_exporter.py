@@ -22,7 +22,7 @@ class NodeExporterTemplateTests(unittest.TestCase):
         compose = (ROOT / "templates/compose.yml").read_text()
         service = compose[compose.index("  node-exporter:"):compose.index("  mosquitto:")]
         self.assertIn('profiles: ["metrics"]', service)
-        self.assertIn("quay.io/prometheus/node-exporter:v1.10.2", service)
+        self.assertIn("quay.io/prometheus/node-exporter:${NODE_EXPORTER_VERSION:-v1.10.2}", service)
         self.assertNotIn("ports:", service)
         self.assertIn("pid: host", service)
         self.assertIn("read_only: true", service)

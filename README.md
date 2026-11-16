@@ -130,6 +130,8 @@ Power sources and instrument-reading coverage for Boat Chat are in
   [Node-RED](#node-red-optional) (`NODERED_ENABLE=true`), the
   [marine essentials bundle](#marine-essentials-optional) (`SIGNALK_MARINE_BUNDLE=true`) and
   [scheduled backups](#scheduled-backups) (`VESSELSTACK_BACKUP_SCHEDULE`).
+- A version setting for each component, with `sudo vesselstackctl component versions` to show what
+  runs against the release ([Component versions](#component-versions)).
 - A [hardware watchdog](#unattended-operation-and-power), armed by default on a Raspberry Pi that has
   `/dev/watchdog`. Set `VESSELSTACK_WATCHDOG="false"` to opt out.
 
@@ -162,6 +164,74 @@ changes in the component view at `http://127.0.0.1:8780` through an SSH tunnel,
 or use the corresponding `vesselstackctl` commands. Hardware and systemd
 services remain configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
 for acceptance steps.
+
+### Component versions
+
+Each release runs every container at a tested default version. If you need another version of
+one component, set its version in the settings file and run the installer again (this is an
+expert setting; a command and a Control Panel dialog for it come later):
+
+```bash
+sudoedit /opt/vesselstack/config/vesselstack.env      # for example GRAFANA_VERSION="13.0.2"
+sudo /opt/vesselstack/installer/install.sh --config /opt/vesselstack/config/vesselstack.env --start
+```
+
+The settings are `SIGNALK_VERSION`, `AIS_IMAGE` (a full image reference), `NODERED_VERSION`,
+`HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`,
+`NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION` and `HOMEPAGE_VERSION`. Leave a setting empty (the
+default) and that component follows the release: it moves forward when you install a newer
+release. A version that is not the default is an override:
+
+- It is kept across updates, so it will not move forward with the release.
+- It is not tested with this release. For the eight newer settings the installer only accepts a
+  fixed, numbered version of the same line the release uses (for example Grafana 13.x); `latest`
+  and similar names, other registries and other image names are refused, with a message that
+  names the setting. `SIGNALK_VERSION` and `AIS_IMAGE` keep the forms that earlier releases
+  accepted: a Signal K 2.x tag with or without the leading `v` (such as `2.27.0` or
+  `v2.28.0-beta.1`, used exactly as you wrote it), and any plain image reference for AIS-catcher,
+  including a name with no tag or a moving tag such as `edge` or `latest`. `doctor` warns when
+  AIS-catcher uses a moving tag (it can change without notice whenever the image is downloaded) or
+  an image that is not the one this release uses. Values with spaces, quotes, `$`, uppercase image
+  names, names that start with `-`, a Signal K version that is not 2.x, and references longer
+  than 255 characters are refused.
+- A value that cannot be used is never started. `sudo vesselstackctl start`, `restart` and
+  `component add` check all ten settings first and, if one is wrong, print its message and
+  `Nothing was started. Fix or empty <SETTING> in <settings file>, then run the command again.`
+  without stopping or starting anything. `status`, `doctor`, `component versions` and `stop` keep
+  working.
+- The settings file is the only source. The Control Panel and `vesselstackctl` ignore a
+  version setting that is exported in the environment they were started from, because Docker
+  Compose would otherwise prefer it over the file.
+- With Signal K installed natively (`SIGNALK_MODE=native`), an empty `SIGNALK_VERSION` also follows
+  the release: the installer installs that version of the npm package when it runs.
+- Components that hold data (Signal K, Home Assistant, InfluxDB, Grafana, Node-RED, Mosquitto)
+  may upgrade their data one way. Make a backup first (`sudo vesselstackctl backup`).
+- To go back, empty the setting and run the installer again. Going back to an older version of a
+  component that holds data may need a restore of a backup made before the change.
+
+To see what each component is set to and what is running, use the read-only command:
+
+```bash
+sudo vesselstackctl component versions          # a table
+sudo vesselstackctl component versions --json   # for tools
+```
+
+For each component it shows the release default, your chosen version (or "release default"), the
+image that is running, and a state: `release default`, `override (newer)`, `override (older)`,
+`override`, `invalid: nothing will start until fixed` (the value shown is what the file says, not
+the default) or `running a different image than configured`. It works while Docker is down (the
+running side then shows `unknown`) and while a restore is pending, and it changes nothing.
+`sudo vesselstackctl doctor` adds one warning per override and a failure when a running container
+does not match its setting. The drift advice is to rerun the installer, not `restart` (which
+stops everything before it looks for the image); the installer checks the setting first and,
+offline, that the image is already on the computer. When Docker answers, `doctor` also says if an
+overridden version is not on this computer yet (it must be downloaded before it can start). An
+override older than the release default for a component that holds data gets a stronger warning:
+its data may already have been upgraded, and the older version may not start or may damage it;
+restore a backup made with that version to go back. `sudo vesselstackctl status` adds one line when any component is not at
+the release default. Older installers wrote the Signal K and AIS-catcher defaults into the settings
+file; on the first update to a release with this feature those two values are cleared (and
+only those that equal an old default), so those components follow the release from then on.
 
 ## Optional integrations
 
@@ -534,6 +604,11 @@ documented lab checks pass. The stable release is 0.8.0.
   power loss during a restore, the next boot rolls it back; set `VESSELSTACK_RESTORE_AT_BOOT="hold"`
   to only record what it found. Services still start before the recovery stops them. See
   [Recovery at boot](#recovery-at-boot).
+- **Signal K and AIS-catcher may move to this release's versions at the first update.** An older
+  installer wrote their versions into your settings file. The first update to 0.9.0 clears a
+  `SIGNALK_VERSION` or `AIS_IMAGE` that it wrote, with one line telling you, so both follow the
+  release from now on. A value you chose yourself is kept. To keep a specific version, set it in
+  the settings file and rerun the installer (see [Component versions](#component-versions)).
 - **Displays** need a rebuild and reflash to get the alarm banner and the other firmware changes:
   `vesselstackctl display build ID`, then `display flash ID`, or **Apply to screen** in the Control
   Panel. The new firmware needs this release's bridge; the bridge changes apply when the update
@@ -631,8 +706,9 @@ authenticated Control Panel that can inspect and operate every managed
 container and host service, edit redacted configuration, check the setup, save and apply
 settings, create backups, and check for and install release updates.
 
-All container tags are release-pinned and checked for Linux ARM64 availability;
-VesselStack does not rely on floating `latest` tags.
+The release defaults for all container tags are pinned and checked for Linux ARM64
+availability; VesselStack does not rely on floating `latest` tags. You can set a different
+version for each component (an expert setting, see "Component versions" below).
 
 The installer supports an existing Signal K server, an opt-in
 pinned Signal K container, or an opt-in pinned native Signal K installation. It
@@ -765,7 +841,9 @@ nano vesselstack.env
 | `VESSELSTACK_DATA` | Persistent container-data path |
 | `VESSELSTACK_BACKUP` | Backup destination; must be outside the application and data trees |
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
-| `SIGNALK_VERSION` | Pinned Signal K release used by managed modes. It and `AIS_IMAGE` are written to your settings file at first install and kept, so an update does not move Signal K or AIS-catcher by itself; to move them, change the setting and rerun the installer |
+| `SIGNALK_VERSION` | Signal K version used by managed modes. Leave empty to follow the release default (`v2.27.0`); a 2.x value such as `v2.28.0` or `2.28.0` (used as written) keeps that version across updates. See "Component versions" |
+| `AIS_IMAGE` | Full AIS-catcher image reference, such as `ghcr.io/jvde-github/ais-catcher:v0.71`. Leave empty to follow the release default; a value keeps that image across updates. A moving tag (`edge`, `latest`) or no tag is accepted but `doctor` warns |
+| `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION`, `HOMEPAGE_VERSION` | The version (image tag) of that container. Empty follows the release default; a value keeps that version across updates. See "Component versions" |
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `SIGNALK_DATAPATH_AUTOCONFIG` | Managed Docker/native modes install `signalk-to-influxdb2` 2.3.0, add the NMEA 2000 provider and write the plugin's InfluxDB configuration (default `true`, see [Signal K and InfluxDB](#signal-k-and-influxdb)); existing mode ignores it, and `false` skips without removing anything |
@@ -2761,6 +2839,8 @@ For the lifecycle/install boundary, also run `bash tests/test-clean-install.sh`
 and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
 dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
 bytecode in the source or bundled runtime tree.
+
+The service tests (`tests/test-displays-mosquitto.sh`, `test-displays-bridge.sh`, `test-mosquitto-upgrade.sh`, `test-nodered-dashboard-auth.sh`) take each component's image from `common/component_versions.py` (the release default, `--effective <id> ""`), not from the text of `templates/compose.yml`, whose image lines are `repository:${X_VERSION:-default}`; `tests/test-distribution.sh` fails if a test or script goes back to extracting an image from that file with `sed`. This changes tests only, with nothing to roll back at runtime.
 
 CI runs the Python regressions with a 20 minute limit (`timeout-minutes: 20`), so a hanging test fails the job with a log instead of blocking it.
 

@@ -424,6 +424,48 @@ class CommandAllowlistTests(unittest.TestCase):
                     panel.action_command("update", {"source_directory": release})
 
 
+class ComponentVersionEnvironmentTests(unittest.TestCase):
+    """Docker Compose lets the process environment win over --env-file, and the panel holds the values it
+    started with: no child of the panel may carry a component version setting."""
+
+    def test_children_never_inherit_the_version_settings(self) -> None:
+        names = ("GRAFANA_VERSION", "SIGNALK_VERSION", "AIS_IMAGE", "HOMEPAGE_VERSION")
+        seen: list = []
+
+        def fake_run(command, **kwargs):
+            seen.append(kwargs.get("env"))
+            return mock.Mock(returncode=0, stdout="")
+
+        class FakeProcess:
+            stdout = iter(["done\n"])
+
+            def wait(self) -> int:
+                return 0
+
+        def fake_popen(command, **kwargs):
+            seen.append(kwargs["env"])
+            return FakeProcess()
+
+        with mock.patch.dict(os.environ, {"GRAFANA_VERSION": "13.9.9", "SIGNALK_VERSION": "v2.99.0", "AIS_IMAGE": "x:1", "HOMEPAGE_VERSION": "v9.9.9", "KEEP_ME": "1"}):
+            with mock.patch.object(panel.subprocess, "run", side_effect=fake_run), mock.patch.object(panel.subprocess, "Popen", side_effect=fake_popen), \
+                    mock.patch.object(panel, "release_lifecycle_slot"):
+                panel.command_output(panel.compose_base() + ["ps"])
+                panel.command_stdout(panel.compose_base() + ["ps", "--format", "json"])
+                panel.OperationStore()._run({"label": "x", "state": "running", "output": panel.deque(maxlen=10), "exit_code": None, "finished_at": None},
+                                            panel.compose_base() + ["up", "-d", "grafana"], None)
+        self.assertEqual(len(seen), 3)
+        for env in seen:
+            self.assertIsNotNone(env)
+            for name in names:
+                self.assertNotIn(name, env)
+            self.assertEqual(env.get("KEEP_ME"), "1")
+
+    def test_the_settings_file_is_the_only_source_in_the_compose_command(self) -> None:
+        command = panel.compose_base()
+        self.assertIn("--env-file", command)
+        self.assertEqual(command[command.index("--env-file") + 1], str(panel.VESSEL_ENV))
+
+
 class LifecycleStateTests(unittest.TestCase):
     def test_status_reports_unknown_for_malformed_docker_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

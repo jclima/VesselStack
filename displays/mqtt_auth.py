@@ -85,7 +85,62 @@ def default_runner(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, check=False, capture_output=True, text=True)
 
 
-def find_image(root: Path, compose: Path | None = None) -> str:
+
+def _component_versions():
+    """common/component_versions.py (installed and source tree: ../common), loaded by path."""
+    import importlib.util
+    module = sys.modules.get("vesselstack_component_versions")
+    if module is None:
+        path = Path(__file__).resolve().parent.parent / "common" / "component_versions.py"
+        spec = importlib.util.spec_from_file_location("vesselstack_component_versions", path)
+        try:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["vesselstack_component_versions"] = module
+            spec.loader.exec_module(module)
+        except (OSError, ImportError, AttributeError):
+            sys.modules.pop("vesselstack_component_versions", None)
+            raise MqttAuthError("cannot read common/component_versions.py, which checks the Mosquitto version")
+    return module
+
+
+def _resolve_image(image: str, setting: str, override: str) -> str:
+    """Turn the compose image line into the image that really runs.
+
+    Compose pins it as repository:${SETTING:-release default}. The setting (from the stack's
+    settings) wins when it is set and valid; an invalid value is refused, so no image name from an
+    unvalidated value is ever run. A compose file with a plain pin is used as it is."""
+    match = re.fullmatch(r"([^:$]+):\$\{" + setting + r":-([^}]*)\}", image)
+    if not match:
+        return image
+    cv = _component_versions()
+    component = cv.BY_SETTING[setting].id
+    repository, default = match.groups()
+    value = (override or "").strip()
+    if value:
+        problem = cv.validate(component, value)
+        if problem:
+            raise MqttAuthError(problem + " Nothing was changed.")
+        return f"{repository}:{value}"
+    if cv.validate(component, default):
+        raise MqttAuthError(f"the {setting} default in compose.yml is not a valid version")
+    return f"{repository}:{default}"
+
+
+def _stack_setting(root: Path, key: str, env: dict | None) -> str:
+    """The setting from the caller's environment, else the process environment, else the stack's settings file."""
+    if env is not None and key in env:
+        return str(env.get(key) or "")
+    if key in os.environ:
+        return os.environ[key]
+    cv = _component_versions()
+    for path in (root / "config" / "vesselstack.env", root / "vesselstack.env"):
+        value = cv.read_env_setting(str(path), key)
+        if value is not None:
+            return value
+    return ""
+
+
+def find_image(root: Path, compose: Path | None = None, env: dict | None = None) -> str:
     """The Mosquitto image is pinned once, in compose.yml; read it from there.
 
     ``compose`` names the definition about to be installed (the installer passes
@@ -106,7 +161,7 @@ def find_image(root: Path, compose: Path | None = None) -> str:
         except OSError:
             continue
         if match:
-            return match.group(1)
+            return _resolve_image(match.group(1), "MOSQUITTO_VERSION", _stack_setting(root, "MOSQUITTO_VERSION", env))
     raise MqttAuthError("cannot find the pinned eclipse-mosquitto image in compose.yml")
 
 
@@ -561,7 +616,7 @@ def sync(root: Path, data_dir: Path | None, env: dict, displays_config: Path | N
     admin_user = _check_username("MQTT_USERNAME", env.get("MQTT_USERNAME", ""))
     _check_password("MQTT_PASSWORD", env.get("MQTT_PASSWORD", ""))
     display_ids = load_display_ids(displays_config, enabled)
-    image = image or find_image(root, compose)
+    image = image or find_image(root, compose, env)
     ensure_image(image, runner)
     secret_path = root / "config" / SECRETS_NAME
     nodered_text = env.get("NODERED_ENABLE")
@@ -725,7 +780,7 @@ def preflight(root: Path, env: dict, compose: Path | None = None,
                    "displays": {i: {"mqtt_password": "x"} for i in display_ids}}
     build_accounts(admin_user, "x", enabled, bridge_user, display_ids, placeholder, nodered_text == "true")
     if image_mode != "none":
-        image = image or find_image(root, compose)
+        image = image or find_image(root, compose, env)
         if image_mode == "pull":
             ensure_image(image, runner)
         elif runner(["docker", "image", "inspect", image]).returncode != 0:

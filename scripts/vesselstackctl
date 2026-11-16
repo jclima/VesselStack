@@ -42,6 +42,7 @@ command_needs_lifecycle_lock() {
             [ "${2:-}" = --status ] && [ "$#" -eq 2 ] && return 1
             [ "${2:-}" = --status ] && [ "${3:-}" = --follow ] && [ "$#" -eq 3 ] && return 1 ;;
         profile) case "${2:-}" in show|validate) return 1 ;; esac ;;
+        component) [ "${2:-}" = versions ] && return 1 ;;
         ha-http) [ "${2:-}" = status ] && return 1 ;;
         backup-drive) [ "${2:-}" = list ] && return 1 ;;
         display)
@@ -343,6 +344,8 @@ Commands:
                                (sign in with the printed link) and, with REMOTE_PANEL_SERVE=true,
                                publishes the Control Panel to the tailnet only. disable undoes it;
                                --purge also removes a Tailscale package VesselStack installed
+  component versions [--json] Show each component's release default, the version you chose, and
+                               what is running (read-only; works while a restore is pending)
   doctor                       Validate config, dependencies, disk, and health (also
                                hardware watchdog, journal cap, scheduled backups and
                                power/under-voltage warnings)
@@ -463,8 +466,23 @@ profile_command() {
 load_config() {
     [ -r "$ENV_FILE" ] || { echo "Missing installed config: $ENV_FILE" >&2; exit 1; }
     VESSELSTACK_DISABLED_COMPONENTS=""
+    # The component version settings come from the settings file and nowhere else: Docker Compose lets an
+    # exported variable win over --env-file, so a value inherited from the caller (the Control Panel keeps the
+    # values it started with) must not reach it. Unset them first; a plain assignment in the file is not exported.
+    # The names are built in on purpose: this must work (and clear inherited values) even when the helper is
+    # missing or damaged, for example during recover. tests/test_component_versions.py checks the list against
+    # `common/component_versions.py --settings`.
+    local version_setting
+    local version_settings=(SIGNALK_VERSION AIS_IMAGE NODERED_VERSION HOMEASSISTANT_VERSION INFLUXDB_VERSION
+                            GRAFANA_VERSION PROMETHEUS_VERSION NODE_EXPORTER_VERSION MOSQUITTO_VERSION HOMEPAGE_VERSION)
+    for version_setting in ${version_settings[@]+"${version_settings[@]}"}; do unset "$version_setting"; done
     # shellcheck disable=SC1090
     source "$ENV_FILE"
+    for version_setting in ${version_settings[@]+"${version_settings[@]}"}; do
+        # Set (possibly empty) from the file and never exported, whatever the file's own text did.
+        printf -v "$version_setting" '%s' "${!version_setting:-}"
+        export -n "${version_setting?}"
+    done
     : "${VESSELSTACK_ROOT:?Missing VESSELSTACK_ROOT}"
     : "${VESSELSTACK_DATA:?Missing VESSELSTACK_DATA}"
     validate_disabled_components
@@ -618,6 +636,7 @@ remove_heimdall() {
 homepage_refresh() {
     homepage_sync || return 1
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homepage,*) return 0 ;; esac
+    require_valid_component_versions || return 1
     "${COMPOSE[@]}" up -d homepage
 }
 
@@ -635,6 +654,7 @@ component_change() {
     for item in "${CORE_COMPONENTS[@]}"; do [ "$item" = "$component" ] && found=1; done
     [ "$found" -eq 1 ] || { echo "Unknown core component: $component" >&2; exit 2; }
     local disabled=${VESSELSTACK_DISABLED_COMPONENTS:-}
+    [ "$action" = remove ] || require_valid_component_versions || exit 1
     while [ -n "$disabled" ]; do
         case "$disabled" in *,*) item=${disabled%%,*}; disabled=${disabled#*,} ;; *) item=$disabled; disabled="" ;; esac
         [ -n "$item" ] && [ "$item" != "$component" ] && value="${value:+$value,}$item"
@@ -710,6 +730,7 @@ ensure_memory_index() {
 
 start_stack() {
     local installer_scripts="$VESSELSTACK_ROOT/installer/scripts"
+    require_valid_component_versions || return 1
     if [ -x "$installer_scripts/reconcile-lifecycle.sh" ]; then
         "$installer_scripts/reconcile-lifecycle.sh" "$ENV_FILE" apply || return 1
     else
@@ -961,6 +982,38 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
     fi
 }
 
+# Component versions (README "Component versions"): configured against what is running. The rules and
+# the report live in common/component_versions.py; nothing here changes a container.
+component_versions_helper() { printf '%s' "$ROOT/common/component_versions.py"; }
+component_versions_command() {
+    local format=table helper
+    case "${1:-}" in
+        "") ;;
+        --json) format=json; [ "$#" -eq 1 ] || { usage; exit 2; } ;;
+        *) usage; exit 2 ;;
+    esac
+    helper=$(component_versions_helper)
+    [ -r "$helper" ] || { echo "Missing $helper; run the installer again." >&2; return 1; }
+    python3 -I "$helper" --report --format "$format" --env-file "$ENV_FILE"
+}
+# require_valid_component_versions: refuse (return 1) when a version setting in the settings file cannot be used.
+# Called before anything that could create or start a container; read-only commands never call it.
+require_valid_component_versions() {
+    local helper message
+    helper=$(component_versions_helper)
+    [ -r "$helper" ] || return 0
+    message=$(python3 -I "$helper" --check-env "$ENV_FILE") && return 0
+    printf '%s\n' "$message" >&2
+    return 1
+}
+# component_versions_lines doctor|status: the doctor or status lines (nothing when every component follows the release).
+component_versions_lines() {
+    local helper
+    helper=$(component_versions_helper)
+    [ -r "$helper" ] || return 0
+    python3 -I "$helper" --report --format "$1" --env-file "$ENV_FILE"
+}
+
 status_stack() {
     local failed=0 service running_services
     # doctor reports the unfinished restore and installation itself (check_restore_state, check_install_state),
@@ -1024,6 +1077,7 @@ status_stack() {
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homeassistant,*) ;; *) check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1 ;; esac
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,influxdb,*) ;; *) check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1 ;; esac
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,grafana,*) ;; *) check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1 ;; esac
+    if [ "${1:-}" != quiet ]; then component_versions_lines status || true; fi
     printf '\nRun vesselstackctl doctor for configuration and dependency checks.\n'
     return "$failed"
 }
@@ -1805,6 +1859,7 @@ EOF
     homepage_sync || echo "WARN: could not update the home page tiles; run: sudo vesselstackctl homepage sync" >&2
     # Re-apply: compose recreates only the containers whose published ports changed.
     if "${COMPOSE[@]}" ps --status running --quiet 2>/dev/null | grep -q .; then
+        require_valid_component_versions || return 1
         local -a lan_services=()
         local services_text
         services_text=$(selected_services) || return 1
@@ -2761,6 +2816,7 @@ doctor_stack() {
     check_nodered
     check_remote
     check_power
+    component_versions_lines doctor || failed=1
     status_stack quiet || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
@@ -6199,8 +6255,9 @@ case "$command" in
     reindex) [ $# -eq 0 ] || { usage; exit 2; }; memory_index_helper rebuild ;;
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
-    restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
-    component) [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
+    restart) [ $# -eq 0 ] || { usage; exit 2; }; require_valid_component_versions || exit 1; stop_stack; start_stack ;;
+    component) [ "${1:-}" = versions ] && { shift; component_versions_command "$@"; exit $?; }
+        [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
     backup) backup_stack "$@" ;;
     backup-drive) backup_drive_command "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;

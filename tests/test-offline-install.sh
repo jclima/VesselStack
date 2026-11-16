@@ -104,7 +104,7 @@ case "${1:-}" in
             while IFS= read -r line; do
                 case "$line" in
                     *signalk-server*) [[ " $* " == *" signalk "* ]] || continue ;;
-                    *'${AIS_IMAGE}'*) [[ " $* " == *" ais "* ]] || continue ;;
+                    *'${AIS_IMAGE'*) [[ " $* " == *" ais "* ]] || continue ;;
                     *node-exporter*) [[ " $* " == *" metrics "* ]] || continue ;;
                     *node-red*) [[ " $* " == *" nodered "* ]] || continue ;;
                 esac

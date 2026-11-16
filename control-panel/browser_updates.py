@@ -35,6 +35,12 @@ try:
 except ImportError:  # Detached runner is copied outside the source tree.
     LifecycleLock = None  # type: ignore[assignment,misc]
 
+try:
+    from common.component_versions import scrub_environment
+except ImportError:  # Detached runner copy: the unit's environment comes from systemd, not from the panel.
+    def scrub_environment(env=None):  # type: ignore[no-redef]
+        return dict(os.environ if env is None else env)
+
 REPOSITORY = "jclima/VesselStack"
 API_RELEASES = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=30"
 API_RELEASE_BASE = f"https://api.github.com/repos/{REPOSITORY}/releases"
@@ -810,7 +816,7 @@ def run_update(request: dict[str, Any], operation: dict[str, Any], root: Path, s
         if not installer.is_file():
             raise ValueError("release installer missing")
 
-        base_env = dict(os.environ, VESSELSTACK_ROOT=str(root), VESSELSTACK_ENV=config, VESSELSTACK_NONINTERACTIVE="true")
+        base_env = dict(scrub_environment(), VESSELSTACK_ROOT=str(root), VESSELSTACK_ENV=config, VESSELSTACK_NONINTERACTIVE="true")
         child_env = shared_lock.child_env(base_env) if shared_lock is not None else base_env
         child_pass_fds = shared_lock.pass_fds() if shared_lock is not None else ()
         _validate_fixed_ctl()

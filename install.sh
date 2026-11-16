@@ -62,7 +62,9 @@ for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
     if key == "BOAT_UNITS": continue
     if key in {"VESSELSTACK_UID", "VESSELSTACK_GID"} and value == "0": continue
     try: validate_value(key, value)
-    except ValueError as exc: raise SystemExit(f"Invalid {key}: {exc}")
+    except ValueError as exc:
+        if key.endswith("_VERSION") or key == "AIS_IMAGE": raise SystemExit(f"{exc} Nothing was changed.")
+        raise SystemExit(f"Invalid {key}: {exc}")
 PY
 # Prompt helpers for the fixes offered below (see scripts/lib/remediate.sh).
 # shellcheck source=scripts/lib/remediate.sh
@@ -79,6 +81,13 @@ config_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }
 # Set below when an interactive run may offer to fix the value instead of stopping.
 FIX_BOAT_UNITS=0
 FIX_TOKEN_KEY=
+# The ten component version settings come from the settings file (and explicit installer options) only. An
+# exported variable would win over --env-file in Docker Compose and would also hide that a file predates the
+# feature, so a value inherited from the caller (for example the Control Panel) is dropped before sourcing.
+COMPONENT_VERSION_KEYS=(SIGNALK_VERSION AIS_IMAGE NODERED_VERSION HOMEASSISTANT_VERSION INFLUXDB_VERSION GRAFANA_VERSION
+                        PROMETHEUS_VERSION NODE_EXPORTER_VERSION MOSQUITTO_VERSION HOMEPAGE_VERSION)
+for component_key in "${COMPONENT_VERSION_KEYS[@]}"; do unset "$component_key"; done
+unset component_key
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
@@ -191,6 +200,25 @@ EOF
     fi
 fi
 
+# Component versions (README "Component versions"): an empty setting follows the release default
+# through the ${VAR:-default} form in templates/compose.yml; a value is an owner override. Older
+# installers wrote the release default of their day into SIGNALK_VERSION and AIS_IMAGE, so those
+# settings never moved forward. An environment that does not carry the new settings yet predates
+# this behaviour: a value equal to a default that was ever shipped (v2.27.0, and
+# ghcr.io/jvde-github/ais-catcher:v0.70) is an old default, not a choice, and is cleared once.
+# The test is on the FILE (does it define HOMEPAGE_VERSION?), never on a variable that may be inherited.
+if ! config_key_assigned HOMEPAGE_VERSION; then
+    if [ "${SIGNALK_VERSION:-}" = v2.27.0 ]; then
+        echo "Signal K now follows the release default (was pinned at v2.27.0 by an older installer)." >&2
+        SIGNALK_VERSION=""
+    fi
+    if [ "${AIS_IMAGE:-}" = ghcr.io/jvde-github/ais-catcher:v0.70 ]; then
+        echo "AIS-catcher now follows the release default (was pinned at ghcr.io/jvde-github/ais-catcher:v0.70 by an older installer)." >&2
+        AIS_IMAGE=""
+    fi
+fi
+for component_key in "${COMPONENT_VERSION_KEYS[@]}"; do printf -v "$component_key" '%s' "${!component_key:-}"; export "${component_key?}"; done
+unset component_key
 # Existing 0.x installations did not define configurable bucket names.
 : "${INFLUXDB_RAW_BUCKET:=vesselstack_raw}"
 : "${INFLUXDB_HISTORY_BUCKET:=vesselstack_1m}"
@@ -216,7 +244,6 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${INFLUXDB_HOME_ASSISTANT_BUCKET:=homeassistant}"
 : "${INFLUXDB_AIS_BUCKET:=ais}"
 : "${SIGNALK_MODE:=existing}"
-: "${SIGNALK_VERSION:=v2.27.0}"
 : "${SIGNALK_VESSELTWIN_PRELOAD:=true}"
 : "${SIGNALK_DATAPATH_AUTOCONFIG:=true}"
 : "${SIGNALK_MARINE_BUNDLE:=false}"
@@ -225,7 +252,6 @@ unset HEIMDALL_PORT HEIMDALL_HTTPS_PORT
 : "${SOCKETCAN_BITRATE:=250000}"
 : "${VESSELSTACK_CAN_CREATE_VCAN:=false}"
 : "${AIS_ENABLE:=false}"
-: "${AIS_IMAGE:=ghcr.io/jvde-github/ais-catcher:v0.70}"
 : "${AIS_DEVICE:=/dev/bus/usb}"
 : "${AIS_CATCHER_ARGS:=-q -N 8100 -S 5011}"
 : "${VESSELSTACK_FIREWALL_ENABLE:=false}"
@@ -623,7 +649,10 @@ if ! "$SCRIPT_DIR/scripts/migrate.sh" --check "$CONFIG_FILE" "$(<"$SCRIPT_DIR/VE
     exit 1
 fi
 compose_template() {
-    SIGNALK_VERSION=$SIGNALK_VERSION AIS_IMAGE=$AIS_IMAGE \
+    local -a version_env=()
+    local version_key
+    for version_key in "${COMPONENT_VERSION_KEYS[@]}"; do version_env+=("$version_key=${!version_key}"); done
+    env "${version_env[@]}" \
         docker compose "${COMPOSE_PROFILES[@]}" --env-file "$CONFIG_FILE" \
         -f "$SCRIPT_DIR/templates/compose.yml" "$@"
 }
@@ -703,6 +732,14 @@ VESSELSTACK_DATA
 VESSELSTACK_BACKUP
 SIGNALK_MODE
 SIGNALK_VERSION
+NODERED_VERSION
+HOMEASSISTANT_VERSION
+INFLUXDB_VERSION
+GRAFANA_VERSION
+PROMETHEUS_VERSION
+NODE_EXPORTER_VERSION
+MOSQUITTO_VERSION
+HOMEPAGE_VERSION
 SIGNALK_URL
 SIGNALK_VESSELTWIN_PRELOAD
 SIGNALK_DATAPATH_AUTOCONFIG
@@ -1611,7 +1648,7 @@ tar -C "$SOURCE_ROOT/control-panel" --exclude='__pycache__' --exclude='*.pyc' -c
 # not writable by anyone else: the panel and vesselstackctl load them as root.
 install -d -m 0755 "$VESSELSTACK_ROOT/common"
 install -m 0644 "$SOURCE_ROOT/common/vesselstack_auth.py" "$SOURCE_ROOT/common/vesselstack_authctl.py" "$SOURCE_ROOT/common/qrcodegen.py" \
-    "$SOURCE_ROOT/common/config_registry.py" "$SOURCE_ROOT/common/boat_profile.py" "$SOURCE_ROOT/common/boat_profile_cli.py" \
+    "$SOURCE_ROOT/common/config_registry.py" "$SOURCE_ROOT/common/component_versions.py" "$SOURCE_ROOT/common/boat_profile.py" "$SOURCE_ROOT/common/boat_profile_cli.py" \
     "$SOURCE_ROOT/common/lifecycle_lock.py" "$VESSELSTACK_ROOT/common/"
 tar -C "$SOURCE_ROOT/displays" --exclude=.venv --exclude='__pycache__' --exclude='*.pyc' -cf - . \
     | tar --no-same-owner -C "$VESSELSTACK_ROOT/displays" -xf -

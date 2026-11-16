@@ -29,6 +29,8 @@ pre-release.
   Boat Overview**, shows batteries, tanks, engine, navigation (no position) and environment.
 - Instrument displays (preview): the alarm banner comes back for every new alarm and says `NO DATA`
   instead of disappearing when an alarm's data or the bridge is lost (see Displays and alarms).
+- You can set the version of each component in your settings file. `sudo vesselstackctl component
+  versions` shows what is running against the release (see Component versions).
 - An install or update that stopped part-way is now reported and can be finished: by
   `vesselstackctl`, the Control Panel and a rerun of `get-vesselstack.sh`.
 
@@ -117,6 +119,40 @@ pre-release.
 - A restore or rollback now checks that the list of services it must stop is complete before it
   moves any folder. If the list cannot be built in full, it stops with "the list of units to stop
   could not be built; nothing was moved". Run it again.
+
+### Component versions
+
+- Each container's version is a setting: `SIGNALK_VERSION`, `AIS_IMAGE` (a full image reference),
+  `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`,
+  `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION` and `HOMEPAGE_VERSION`. Empty
+  follows the release default. A value is kept across updates. `SIGNALK_VERSION` and `AIS_IMAGE`
+  are empty by default in `vesselstack.example.env`.
+- The installer, the setup wizard and the settings file checks accept only a numbered version of
+  the same major line the release uses for the eight newer settings. They refuse floating tags such
+  as `latest`, and a setting cannot name another registry. `SIGNALK_VERSION` and `AIS_IMAGE` keep
+  the forms earlier releases accepted: a 2.x Signal K tag with or without `v` (used as written) and
+  any plain image reference, a moving tag or no tag included; `doctor` warns about a moving tag
+  and about an image that is not the release's. The check runs before anything is changed.
+- `sudo vesselstackctl start`, `restart` and `component add` refuse a version setting that cannot
+  be used (`Nothing was started. Fix or empty <SETTING> in <settings file>, then run the command
+  again.`), before anything is stopped. `status`, `doctor`, `component versions` and `stop` still
+  work and show the value as written.
+- The settings file is the only source of the ten settings. The Control Panel and
+  `vesselstackctl` drop an exported value, because Docker Compose would prefer it over the file;
+  without this, a Control Panel started before a change could put a container back on the old
+  image.
+- `doctor` advises rerunning the installer (not `restart`) for a container on another image than
+  configured, says when an overridden version is not on this computer yet, and warns more strongly
+  about an older override of a component that holds data.
+- A version other than the release default is not tested with this release.
+- Components that hold data can upgrade it one way, so make a backup first. Going back to an older
+  version of such a component may need a restore of a backup made before the change.
+- `sudo vesselstackctl component versions [--json]` (read-only) shows the release default, your
+  chosen version, the running image and the state of every component. `doctor` warns about each
+  override and fails on a running container that does not match its setting. `status` adds one line
+  when any component is not at the release default.
+- No command or Control Panel dialog changes a version yet. Set it in the settings file and rerun the
+  installer.
 
 ### Displays and alarms
 
@@ -245,6 +281,14 @@ pre-release.
   Control Panel settings.
 - If you turned on the old "Send alerts to Telegram" switch expecting boat alerts, you were not
   receiving any. Turn on "Boat alerts to Telegram".
+- On the first update to 0.9.0, a Signal K or AIS-catcher version that an older installer had
+  written into your settings file (`v2.27.0`, `ghcr.io/jvde-github/ais-catcher:v0.70`) is cleared
+  once, with one line telling you, so those components follow the release. They may move to this
+  release's version at that update. A value you chose yourself is kept. The decision is made from
+  the settings file, not from the environment. Earlier forms still work (`SIGNALK_VERSION` without
+  `v`, any plain `AIS_IMAGE`); only a value that cannot work is refused before anything changes:
+  a Signal K version that is not 2.x, spaces, quotes, `$` or uppercase in an image name, or a
+  name that starts with `-`.
 - A scheduled backup stops the whole stack while it runs. The backup drive needs room for
   `VESSELSTACK_BACKUP_KEEP` plus one archives.
 - Anything outside VesselStack that reads the retained `bridge/status` (for example a Node-RED
@@ -286,6 +330,8 @@ To turn off a feature without restoring, change its setting and rerun the instal
 - `VESSELSTACK_RESTORE_AT_BOOT="hold"` for the recovery at boot, or `sudo systemctl disable
   boot-vesselstack-restore.service`. Recovery by hand with `recover rollback` is unchanged.
 - `sudo vesselstackctl restore ARCHIVE --yes --foreground` runs a restore in your terminal.
+- Component versions: empty the setting and rerun the installer to follow the release again. Going
+  back to an older version of a component that holds data may need a restore.
 - `sudo vesselstackctl display flash ID --previous` puts the previous display firmware back.
   Do this on every display when you roll the Pi back to an older release, because the new
   firmware needs this release's bridge. An older bridge ignores the `live` key in `state.json`.
@@ -315,10 +361,9 @@ To turn off a feature without restoring, change its setting and rerun the instal
   the installed Tailscale reads keys from a file. HTTPS publishes the host name in Certificate
   Transparency logs.
 - Node-RED can run code: keep it on a trusted LAN or Tailscale.
-- Signal K and AIS-catcher do not move to newer versions when you update VesselStack. Their
-  versions (`SIGNALK_VERSION` and `AIS_IMAGE`) are saved in your settings file at first install
-  and kept. To move them, change the setting and rerun the installer. All other components
-  follow the release.
+- Changing a component version is for experts for now. There is no command or dialog for it, no
+  automatic backup before the change and no automatic return to the previous version. A version you
+  choose is outside what this release was tested with.
 
 ### Release status
 
@@ -327,6 +372,10 @@ are pending. It is not marked Latest until the documented lab checks pass.
 
 ### For contributors
 
+- The service tests (Mosquitto ACL, upgrade and bridge tests, Node-RED dashboard auth test) take each
+  component's image from `common/component_versions.py` instead of reading `templates/compose.yml`
+  as text, which now holds `${X_VERSION:-default}` references; `tests/test-distribution.sh` fails
+  if one goes back to a `sed` on the compose `image:` line.
 - Restore: `restore_writer_units` used to print its list from a loop reading a process substitution,
   and its callers read it through another one. Under bash 3.2 (macOS `/bin/bash`, which the Python
   tests use) the child's exit sometimes interrupted the write, the loop saw an early end of file and
@@ -359,6 +408,10 @@ are pending. It is not marked Latest until the documented lab checks pass.
 - Documentation: reference text moved out of the README into the guides that cover it, leaving
   short summaries with links (Control Panel sign-in, Grafana and Homepage first run, Boat Chat
   notes, boat profile, configuration contract). No behaviour changed.
+- Component versions: the rules live in `common/component_versions.py`. A parity test checks that
+  its release defaults equal the `${SETTING:-default}` values in `templates/compose.yml`. The
+  Mosquitto password hashing and the Node-RED helper use the validated effective image, so an
+  override applies to them too.
 - ShellCheck findings in `scripts/vesselstackctl` are fixed for ShellCheck 0.9.0 and 0.11.0. No
   behaviour change.
 

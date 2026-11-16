@@ -3,7 +3,7 @@ name: vesselstack
 services:
   signalk:
     profiles: ["signalk"]
-    image: cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}
+    image: cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION:-v2.27.0}
     container_name: vesselstack-signalk
     init: true
     restart: unless-stopped
@@ -15,7 +15,7 @@ services:
 
   ais-catcher:
     profiles: ["ais"]
-    image: ${AIS_IMAGE}
+    image: ${AIS_IMAGE:-ghcr.io/jvde-github/ais-catcher:v0.70}
     container_name: vesselstack-ais-catcher
     restart: unless-stopped
     command: ${AIS_CATCHER_ARGS}
@@ -28,7 +28,7 @@ services:
   # Optional (NODERED_ENABLE=true; README "Node-RED (optional)"). Nothing else depends on it.
   nodered:
     profiles: ["nodered"]
-    image: nodered/node-red:5.0.9-debian
+    image: nodered/node-red:${NODERED_VERSION:-5.0.9-debian}
     container_name: vesselstack-nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -60,7 +60,7 @@ services:
           create_host_path: false
 
   homeassistant:
-    image: homeassistant/home-assistant:2026.6.4
+    image: homeassistant/home-assistant:${HOMEASSISTANT_VERSION:-2026.6.4}
     container_name: vesselstack-homeassistant
     restart: unless-stopped
     network_mode: host
@@ -71,7 +71,7 @@ services:
       - ${VESSELSTACK_DATA}/homeassistant:/config
 
   influxdb:
-    image: influxdb:2.9.1
+    image: influxdb:${INFLUXDB_VERSION:-2.9.1}
     container_name: ${INFLUXDB_CONTAINER_NAME:-vesselstack-influxdb}
     restart: unless-stopped
     ports:
@@ -91,7 +91,7 @@ services:
       - ${VESSELSTACK_DATA}/influxdb:/var/lib/influxdb2
 
   grafana:
-    image: grafana/grafana:13.0.1
+    image: grafana/grafana:${GRAFANA_VERSION:-13.0.1}
     container_name: vesselstack-grafana
     restart: unless-stopped
     ports:
@@ -109,7 +109,7 @@ services:
       - ${VESSELSTACK_ROOT}/config/grafana/dashboards:/var/lib/grafana/dashboards:ro
 
   prometheus:
-    image: prom/prometheus:v2.55.0
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v2.55.0}
     container_name: vesselstack-prometheus
     restart: unless-stopped
     ports:
@@ -129,7 +129,7 @@ services:
 
   node-exporter:
     profiles: ["metrics"]
-    image: quay.io/prometheus/node-exporter:v1.10.2
+    image: quay.io/prometheus/node-exporter:${NODE_EXPORTER_VERSION:-v1.10.2}
     container_name: vesselstack-node-exporter
     restart: unless-stopped
     pid: host
@@ -152,7 +152,7 @@ services:
       - /sys:/host/sys:ro
 
   mosquitto:
-    image: eclipse-mosquitto:2.1.2-alpine
+    image: eclipse-mosquitto:${MOSQUITTO_VERSION:-2.1.2-alpine}
     container_name: vesselstack-mosquitto
     restart: unless-stopped
     ports:
@@ -163,7 +163,7 @@ services:
       - ${VESSELSTACK_ROOT}/config/mosquitto-auth:/mosquitto/auth:ro
 
   homepage:
-    image: ghcr.io/gethomepage/homepage:v2.7.0@sha256:19c5c09184458a41b7b5915e71463a39f36cd33540f41bdbed008791b8182d5f
+    image: ghcr.io/gethomepage/homepage:${HOMEPAGE_VERSION:-v2.7.0@sha256:19c5c09184458a41b7b5915e71463a39f36cd33540f41bdbed008791b8182d5f}
     container_name: vesselstack-homepage
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]

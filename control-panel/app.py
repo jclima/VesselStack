@@ -35,6 +35,7 @@ from common.config_registry import (
     validate_value as registry_validate_value,
 )
 from common.lifecycle_lock import LifecycleLock, LifecycleLockError
+from common.component_versions import scrub_environment
 
 try:
     from browser_updates import installed_version, install_in_progress, release_catalog, read_operation, public_operation, release_snapshot, running_identity, acquire_slot, release_slot, start_detached
@@ -271,7 +272,7 @@ FIELDS = [
     field("TELEGRAM_ALLOWED_CHAT_IDS", "Allowed Telegram chats", SEC_CHAT, source="chat", kind="secret", description="The Telegram chat IDs that may use the bot. Kept private."),
     # Signal K & NMEA 2000
     field("SIGNALK_MODE", "Signal K mode", SEC_SIGNALK, kind="select", choices=["existing", "docker", "native"], description="Docker: VesselStack runs Signal K for you in a container (recommended). Existing: you already run a Signal K server and VesselStack only connects to it. Native: Signal K is installed directly on this Pi. Changing it takes effect when you apply your settings."),
-    field("SIGNALK_VERSION", "Signal K version", SEC_SIGNALK, description="Release tag of the Signal K container image, for example v2.27.0."),
+    field("SIGNALK_VERSION", "Signal K version", SEC_SIGNALK, description="Leave empty to follow the release: updates move Signal K forward with it. A value (for example v2.28.0) keeps that Signal K version across updates; it is not tested with this release and Signal K data may upgrade one way. Back up first. Takes effect when you rerun the installer."),
     field("SIGNALK_URL", "Signal K address", SEC_SIGNALK, kind="url", description="Where VesselStack reaches Signal K. Needed when the mode is Existing."),
     field("SIGNALK_VESSELTWIN_PRELOAD", "Preload the VesselTwin plugin", SEC_SIGNALK, kind="boolean", description="Installs the pinned signalk-vesseltwin plugin before Signal K starts (Docker and Native modes). Existing mode is never modified; turning this off skips installation and never uninstalls."),
     field("SIGNALK_DATAPATH_AUTOCONFIG", "Configure the Signal K data path", SEC_SIGNALK, kind="boolean", description="Docker and Native modes: installs the pinned signalk-to-influxdb2 plugin, adds the NMEA 2000 provider and gives the plugin its own InfluxDB token on the next install or update. Existing mode is never modified; turning this off skips the step and never uninstalls anything."),
@@ -318,7 +319,7 @@ FIELDS = [
     field("NODERED_BIND_ADDRESS", "Node-RED visible to", SEC_SERVICES, description="127.0.0.1 = only this computer (recommended; use an SSH tunnel or Tailscale); 0.0.0.0 = whole boat network, plain HTTP, password only."),
     # Advanced: AIS receiver
     field("AIS_ENABLE", "Enable AIS-catcher", SEC_AIS, kind="boolean", description="Shows nearby ships from a USB AIS receiver. Turn on only when a receiver is plugged in."),
-    field("AIS_IMAGE", "AIS-catcher image", SEC_AIS, description="The Docker image to run. Change only if you were told to."),
+    field("AIS_IMAGE", "AIS-catcher image", SEC_AIS, description="Leave empty to follow the release. A value must be a full image reference, such as ghcr.io/jvde-github/ais-catcher:v0.71, and keeps that version across updates; it is not tested with this release. Takes effect when you rerun the installer."),
     field("AIS_DEVICE", "AIS receiver device", SEC_AIS, kind="path", description="Where the USB AIS receiver appears on this Pi. The default, /dev/bus/usb, works for most single receivers."),
     field("AIS_CATCHER_ARGS", "AIS-catcher options", SEC_AIS, description="Extra command-line options for AIS-catcher. Leave empty unless you know you need them."),
     field("AIS_WEB_PORT", "AIS web page port", SEC_AIS, kind="port", description="The port of the AIS-catcher web page."),
@@ -909,7 +910,7 @@ def action_command(action: str, parameters: dict[str, Any], backup_choice: dict[
 
 def command_output(command: list[str], timeout: int = 8) -> tuple[int, str]:
     try:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False, env=scrub_environment())
         return result.returncode, result.stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, str(exc)
@@ -954,7 +955,7 @@ def run_display_tool(args: list[str], timeout: float = DISPLAY_TOOL_TIMEOUT_S,
     # A request body goes to the tool's standard input, never to its argument list.
     stdin = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
     # Mutating CLI commands reuse the reservation already held by the panel.
-    lock_args = {"env": slot.child_env(), "pass_fds": slot.pass_fds()} if isinstance(slot, LifecycleSlot) else {}
+    lock_args = {"env": scrub_environment(slot.child_env()), "pass_fds": slot.pass_fds()} if isinstance(slot, LifecycleSlot) else {"env": scrub_environment()}
     try:
         result = subprocess.run(display_argv(*args), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=timeout, check=False, **stdin, **lock_args)
@@ -1154,7 +1155,7 @@ def start_display_upload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
 def command_stdout(command: list[str], timeout: int = 20) -> tuple[int, str]:
     """Like command_output, but stderr is dropped so a warning cannot corrupt JSON."""
     try:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False, env=scrub_environment())
         return result.returncode, result.stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
@@ -1544,7 +1545,7 @@ class OperationStore:
             raise
 
     def _run(self, operation: dict[str, Any], command: list[str], slot_fd, steps: list[list[str]] | None = None) -> None:
-        environment = (slot_fd.child_env() if isinstance(slot_fd, LifecycleSlot) else os.environ.copy())
+        environment = scrub_environment(slot_fd.child_env() if isinstance(slot_fd, LifecycleSlot) else os.environ.copy())
         environment["VESSELSTACK_SKIP_PANEL_RESTART"] = "true"
         environment["VESSELSTACK_NONINTERACTIVE"] = "true"  # the panel cannot answer prompts; scripts print "To fix:" guidance instead
         exit_code = 1

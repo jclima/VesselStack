@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-IMAGE=$(sed -n 's/^ *image: \(eclipse-mosquitto:[^ ]*\) *$/\1/p' "$REPO_ROOT/templates/compose.yml" | head -n 1)
+IMAGE=$(python3 -I "$REPO_ROOT/common/component_versions.py" --effective mosquitto "")
 [ -n "$IMAGE" ] || { echo "Cannot find pinned Mosquitto image" >&2; exit 1; }
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 IS_ROOT=0
