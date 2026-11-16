@@ -660,7 +660,7 @@ def status(ctx: Context) -> int:
 
     heartbeat = config.get("heartbeat_s", schema.DEFAULT_HEARTBEAT_S)
     ctx.out(f"{'Bridge':<20}" + bridge_report(messages.get(topics.BRIDGE_SERVICE_TOPIC), ctx.now(),
-                                              3 * heartbeat))
+                                              max(3 * heartbeat, heartbeat + 15)))
     ctx.out(f"{'SignalK link':<20}{state_of(topics.BRIDGE_SIGNALK_TOPIC, 'unknown (no retained status)')}")
     if not config["displays"]:
         ctx.out("No displays configured.")

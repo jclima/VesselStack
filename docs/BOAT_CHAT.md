@@ -93,6 +93,26 @@ restarting Boat Chat clears the pause. A correct sign-in does not erase an addre
 | `POST /api/auth/passphrase` | Current passphrase, or the admin code / an admin device; the very first passphrase needs the admin code or an admin device (403 for access alone). Needs `Origin` |
 | Chat, status, insights, maintenance, `GET /api/settings` | Access code **or** `X-Boat-Chat-Device` |
 
+**Install, storage and rollback details:** Boat Chat accepts a separate crew passphrase (at least 8 characters) with
+remembered devices: `sudo vesselstackctl passphrase set chat` (or Boat Chat, Settings, Sign-in), `passphrase
+status|clear chat`, `devices list|revoke ID|revoke-all chat`. It stores `auth.json` (service user, 0600) in
+Boat Chat's state directory and loads the root-owned `common/vesselstack_auth.py` by path (readable by the
+service user; if it is missing, passphrase sign-in is simply off). The device token travels in
+`X-Boat-Chat-Device`; the passphrase grants access only, so settings still need the admin code, and the
+Access code and admin code are unchanged. Passphrase sign-in and device requests require a `Host` naming
+this machine (extra names via `BOAT_CHAT_ALLOWED_HOSTS`) and, for login, passphrase changes and device
+POSTs, a matching `Origin`. Panel and chat passphrases may not be equal (checked by the CLI and the panel).
+When root edits the chat store (CLI or Control Panel), the work runs in a child process that has dropped to the
+directory owner's uid/gid, so root never opens or chowns files in the service user's directory; store files
+must be regular, single-link files (symlinks and hard links are refused). Rollback: reinstalling the previous
+release restores the old behaviour; the store format is unchanged.
+Same brute-force limits as the panel, including the global pause anyone on the network can trigger (the
+access code still works). **Rollback:** reinstall the previous release; older versions ignore `auth.json`.
+**Verify:** `sudo vesselstackctl passphrase status chat` and a sign-in from a phone.
+
+Pairing links, rotation, throttle and the other sign-in details that apply to both services are in the
+[Control Panel guide: Sign-in reference](CONTROL_PANEL.md#sign-in-reference).
+
 ## A tour of the interface
 
 ![Boat Chat Overview: boat condition, observations, needs attention and suggested actions](images/boat-chat-overview.png)
@@ -422,3 +442,11 @@ not the application's resolved query window. Source instants, authoritative
 unit labels, and canonical cache values are preserved. Save and **Apply** the setting
 and restart the service after changing the timezone. Updated local knowledge is
 picked up by the existing telemetry index refresh path.
+
+### Signal K units and data age
+
+`boat-chat/signalk_units.py` is the single table Boat Chat uses to convert Signal K SI values to its stored units and to label them, so a value and its unit always come from the same lookup (tests in `tests/test_signalk_units.py`). Live telemetry snapshots carry a unit for every numeric value (empty means unknown and is never guessed), and values whose reported unit disagrees with the expected one are left unconverted and listed under `unit_conflicts`. Boat Chat tells the model how old each live reading is and what time the question was asked: readings older than 10 minutes are presented as last known, with their age and local time, never as current, and a boat-clock check (against GPS time when available) warns when ages may be inaccurate. The freshness rule lives in `boat-chat/data_age.py`. Answers Boat Chat builds directly from telemetry (briefing, battery-voltage history, fuel usage, generic history) state the age or sample time of the values they print, say "no recent data" with the last known value and its age rather than "unavailable" for stale readings, distinguish "no data recorded" from "engines not running" for fuel use, and show 12 V voltage guidance only for banks whose readings fall between 9 and 16 V.
+
+### Fuel totals and power integration
+
+Boat Chat fuel totals require finite, non-negative values and complete channel coverage within the returned running observation minutes; missing RPM or rates are never treated as zero. Gaps or unreturned minutes in the requested window are not known zero. Incomplete windows report labeled observed partial consumption instead of an authoritative total. Power/solar integration retains source-timestamp provenance, excludes legacy or unverified observations, rejects stale/future/repeated/out-of-order samples, and does not bridge rejected gaps. Status cards and briefings use a 600-second source-age limit with 60 seconds of future tolerance. Legacy power history remains visible but cannot be retroactively verified without source timestamps.

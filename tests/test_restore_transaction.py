@@ -1,10 +1,12 @@
 """Real temp-root subprocess coverage for restore external transactions."""
 from pathlib import Path
-import os, re, shutil, subprocess, sys, tempfile, unittest
+import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = ROOT / "scripts/vesselstackctl"
 JOURNAL_HELPER = ROOT / "scripts/lib/restore_journal.py"
+BOOT_SCRIPT = ROOT / "scripts/lib/restore-boot"
 
 def replace_with_foreign_dir(path):
     """Swap `path` for a different directory that can never share its inode.
@@ -46,6 +48,22 @@ def create_journal_source():
     a = text.index("restore_create_journal() {")
     return text[a:text.index("restore_stack() {", a)]
 
+BOOT_ID = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+_BOOT_FILE = None
+
+def setUpModule():
+    # A fixed boot id for every journal write, so the tests give the same result on macOS and Linux.
+    global _BOOT_FILE
+    handle = tempfile.NamedTemporaryFile("w", suffix=".boot_id", delete=False)
+    handle.write(BOOT_ID + "\n"); handle.close()
+    _BOOT_FILE = handle.name
+    os.environ["VESSELSTACK_BOOT_ID_FILE"] = _BOOT_FILE
+
+def tearDownModule():
+    os.environ.pop("VESSELSTACK_BOOT_ID_FILE", None)
+    if _BOOT_FILE:
+        os.unlink(_BOOT_FILE)
+
 STAMP = "20260102T030405Z-1-1"
 STAGE_NAME = ".vesselstack-restore.AbC123"
 
@@ -75,6 +93,10 @@ def make_journal(base, root, data, stage, phase="prepared", stamp=STAMP):
 def phase_of(directory):
     for line in (Path(directory) / "state").read_text().splitlines():
         if line.startswith("phase="): return line[6:]
+
+def state_value(directory, key):
+    for line in (Path(directory) / "state").read_text().splitlines():
+        if line.startswith(key + "="): return line[len(key) + 1:]
 
 def controller_function_source(name, end_marker):
     text = CONTROLLER.read_text()
@@ -107,6 +129,16 @@ def manual_procedure_block(path, function, marker, end):
 
 class RestoreTransactionTests(unittest.TestCase):
     def run_harness(self, body, root, real_rename=False):
+        script = self.build_harness(body, real_rename)
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write(script); name = f.name
+        os.chmod(name, 0o700)
+        try:
+            return subprocess.run(["bash", name, str(root)], capture_output=True, text=True)
+        finally:
+            os.unlink(name)
+
+    def build_harness(self, body, real_rename=False):
         script = '''#!/bin/bash
 set -eu
 SYSTEM_ROOT=$1
@@ -133,13 +165,7 @@ __mv() {
             # helper (restore_rename_tree, tested on its own). Route the harness through the hooked mv.
             script = script.replace("restore_rename_tree() {", "restore_rename_tree_real() {")
             script = script.replace('# GNU "mv -T" is what', 'restore_rename_tree() { mv -T -- "$2" "$3"; }\n# GNU "mv -T" is what', 1)
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
-            f.write(script); name = f.name
-        os.chmod(name, 0o700)
-        try:
-            return subprocess.run(["bash", name, str(root)], capture_output=True, text=True)
-        finally:
-            os.unlink(name)
+        return script
 
     def run_transaction(self, mode, quiesce=False, mv_hook="", post="", pre=""):
         td = tempfile.TemporaryDirectory(); base = Path(td.name)
@@ -719,7 +745,7 @@ VESSELSTACK_ROOT="{root}" VESSELSTACK_DATA="{data}" restore_config_identity "{cu
                 "original": original, "new": new, "published": published, "log": base / "calls.log",
                 "active": base / "active", "root_step": root_step, "data_step": data_step, "phase": phase}
 
-    def reconcile(self, lay, extra=""):
+    def reconcile(self, lay, extra="", via_recover=False):
         body = pending_source() + transaction_source() + """
 SYSTEMD_DIR="@SYSTEMD@"
 mv() { if [ "${LOG_RM:-0}" = 1 ]; then echo "MV $*" >> "@LOG@"; fi; __mv "$@"; }
@@ -789,6 +815,18 @@ exit "$rc"
         for key, value in {"@SYSTEMD@": lay["systemd"], "@LOG@": lay["log"], "@J@": lay["journal"], "@STAGE@": lay["stage"],
                            "@ACTIVE@": lay["active"], "@CONT@": lay["base"] / "containers", "@PUBLISHED@": "1" if lay["published"] else "0", "@EXTRA@": extra}.items():
             body = body.replace(key, str(value))
+        if via_recover:
+            # Not run here: the journal's own `recover` (extracted from the controller) runs this body as its controller,
+            # which is how the boot script reaches the same code in these tests.
+            tail = 'restore_reconcile "%s" && rc=0 || rc=$?\necho "outcome=${restore_outcome:-}"\nexit "$rc"\n' % lay["journal"]
+            assert tail in body
+            body = body.replace(tail, f'SYSTEM_ROOT="{lay["base"]}"\nRESTORE_CURRENT="{lay["journal"]}"\nROOT="/nonexistent/vesselstack"\n'
+                                       f'usage() {{ echo usage; }}\nrestore_take_lock() {{ :; }}\nrestore_recover_command rollback\n')
+            harness = lay["base"] / "controller-harness.sh"
+            harness.write_text(self.build_harness(body, lay.get("real_rename", False))); harness.chmod(0o700)
+            controller = lay["journal"] / "controller"
+            controller.write_text(f'#!/bin/bash\nexec bash "{harness}" "{lay["base"]}"\n'); controller.chmod(0o700)
+            return None
         result = self.run_harness(body, lay["base"], real_rename=lay.get("real_rename", False))
         lay["result"] = result
         lay["calls"] = lay["log"].read_text().splitlines() if lay["log"].exists() else []
@@ -1036,6 +1074,84 @@ exit "$rc"
         seen = (self.base / "restore/current.phases").read_text().split()
         self.assertEqual(seen, ["data-swap", "data-swap", "root-swap", "root-swap"])
 
+    def test_every_phase_is_written_with_the_boot_id(self):
+        hook = 'echo "$(sed -n s/^boot_id=//p "@JOURNAL@/state")" >> "@JOURNAL@.boots"'
+        hook = hook.replace('@JOURNAL@', '$(dirname @ACTIVE@)/restore/current')
+        td, result, root, data = self.run_transaction("success", mv_hook=hook); self.addCleanup(td.cleanup)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = (self.base / "restore/current.boots").read_text().split()
+        self.assertEqual(seen, [BOOT_ID] * 4)
+        self.assertEqual(phase_of(self.journal), "committed")
+        self.assertEqual(state_value(self.journal, "boot_id"), BOOT_ID)
+
+    def test_a_rolled_back_journal_keeps_the_boot_id_and_no_failure_kind(self):
+        td, result, root, data = self.run_transaction("new_start_fail", quiesce=True); self.addCleanup(td.cleanup)
+        text = (self.archived("rolled-back") / "state").read_text()
+        self.assertIn(f"boot_id={BOOT_ID}\n", text)
+        self.assertNotRegex(text, r"last_error_kind=(retry|manual|previous)")
+
+    def test_a_failed_rollback_stores_its_kind_and_the_boot_id(self):
+        # retry: the trees are back but systemd cannot reload
+        lay = self.layout("externals", "swapped", "swapped", True)
+        self.reconcile(lay, extra="export FAIL_RELOAD=1")
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+        self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+        self.assertTrue(state_value(lay["journal"], "last_error"))
+        # manual: the journal itself cannot be used
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        self.set_state(lay["journal"], "stamp=S")
+        self.reconcile(lay)
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "manual")
+        self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+        # previous: the previous folder is a symbolic link
+        lay = self.layout("root-swap", "swapped", "swapped", False)
+        pre = Path(f"{lay['root']}.pre-restore-{STAMP}"); moved = Path(f"{pre}.real")
+        os.rename(pre, moved); pre.symlink_to(moved, target_is_directory=True)
+        self.reconcile(lay)
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "previous")
+        self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+
+    def test_a_retried_rollback_that_succeeds_leaves_no_failure_kind(self):
+        lay = self.layout("externals", "swapped", "swapped", True)
+        self.reconcile(lay, extra="export FAIL_RELOAD=1")
+        self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+        self.reconcile(lay)
+        self.assertEqual(lay["result"].returncode, 0, lay["result"].stderr)
+        text = (self.archive(lay, "rolled-back") / "state").read_text()
+        self.assertIn(f"boot_id={BOOT_ID}\n", text)
+        self.assertNotRegex(text, r"last_error_kind=(retry|manual|previous)")
+
+    def test_the_validator_accepts_a_journal_without_boot_id_and_rejects_bad_ones(self):
+        def write(lay, **changes):
+            path = lay["journal"] / "state"
+            lines = [l for l in path.read_text().splitlines() if not l.startswith(("boot_id=", "last_error_kind="))]
+            lines += [f"{k}={v}" for k, v in changes.items()]
+            path.write_text("\n".join(lines) + "\n")
+        for name, changes, outcome in (
+            ("no boot id (0.9.0 journal)", {}, "rolled-back"),
+            ("valid boot id", {"boot_id": BOOT_ID}, "rolled-back"),
+            ("empty failure kind", {"last_error_kind": ""}, "rolled-back"),
+            ("malformed boot id", {"boot_id": "not-a-boot-id"}, "rollback-failed"),
+            ("upper-case boot id", {"boot_id": BOOT_ID.upper()}, "rollback-failed"),
+            ("bad failure kind", {"last_error_kind": "sometimes"}, "rollback-failed"),
+        ):
+            with self.subTest(name):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                write(lay, **changes)
+                self.reconcile(lay)
+                self.assertIn(f"outcome={outcome}", lay["result"].stdout, lay["result"].stderr)
+
+    def test_recover_status_says_what_the_failure_kind_means(self):
+        lay = self.layout("root-swap", "swapped", "away", False)
+        self.set_state(lay["journal"], "last_error=boom")
+        self.assertIn("Last error: boom\n", self.status_harness(lay).stdout)
+        for kind, words in (("retry", "(this can be retried once the cause is fixed)"),
+                            ("manual", "(a retry will not help; do the steps by hand that were printed with the error)"),
+                            ("previous", "(a retry will not help; use one of the two ways out that were printed with the error)")):
+            with self.subTest(kind):
+                self.set_state(lay["journal"], f"last_error_kind={kind}")
+                self.assertIn(f"Last error: boom {words}\n", self.status_harness(lay).stdout)
+
     # ---- recover status, with the application folder gone ----
     def status_harness(self, lay, action="status"):
         body = pending_source() + transaction_source() + f"""
@@ -1224,6 +1340,89 @@ check_restore_leftovers
         self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM "))], lay["calls"])
         self.assertTrue(lay["stage"].exists())
 
+    # ---- the list of units to stop: complete, or nothing is moved ----
+
+    BROKEN_UNIT_LISTS = {
+        "nothing": "restore_writer_units() { return 0; }",
+        "a short list": "restore_writer_units() { printf '%s\\n' vesselstack-chat.service vesselstack-alerts.service; }",
+        "a failure after part of the list": "restore_writer_units() { printf '%s\\n' vesselstack-chat.service vesselstack-alerts.service; return 1; }",
+        "no known units": "restore_known_units() { return 0; }",
+        "a duplicated unit": "restore_writer_units() { { restore_known_units | while IFS= read -r u; do restore_not_a_writer \"$u\" || printf '%s\\n' \"$u\"; done; } | sed '$d'; printf '%s\\n' vesselstack-chat.service; }",
+        "a failing known list": "restore_known_units() { printf '%s\\n' vesselstack-firewall.service vesselstack-chat.service; return 1; }",
+    }
+
+    def test_the_known_units_the_writers_are_built_from_are_the_expected_ones(self):
+        known = re.findall(r"vesselstack-[a-z-]+\.(?:service|timer)", helper_source().split("restore_known_units() {", 1)[1].split("}", 1)[0])
+        self.assertEqual(len(known), 16, known)
+        self.assertEqual(len(set(known)), 16)
+
+    def test_the_writer_units_come_out_complete_and_in_order_300_times_under_load(self):
+        # Regression: under bash 3.2 (macOS /bin/bash) a process substitution whose producer has a child of its own
+        # sometimes lost the end of its output when the child's exit interrupted the write. The list is now built before
+        # it is printed. Both the way the callers used to read it and a command substitution are checked.
+        body = helper_source().split("restore_known_units() {", 1)[1].split("\n}\n", 1)[0]
+        known = re.findall(r"vesselstack-[a-z-]+\.(?:service|timer)", body)
+        expected = "\n".join(u for u in known if u not in ("vesselstack-firewall.service", "vesselstack-socketcan.service"))
+        script = """
+for _ in 1 2 3 4; do ( while :; do :; done ) & done
+load=$(jobs -p)
+trap 'kill $load 2>/dev/null' EXIT
+want=@EXPECTED@
+bad=0
+for i in $(seq 1 300); do
+    got=$(restore_writer_units) || { bad=$((bad + 1)); continue; }
+    [ "$got" = "$want" ] || bad=$((bad + 1))
+    got=''
+    while IFS= read -r unit; do got="$got$unit"$'\\n'; done < <(restore_writer_units)
+    [ "${got%$'\\n'}" = "$want" ] || bad=$((bad + 1))
+done
+echo "bad=$bad"
+[ "$bad" -eq 0 ]
+""".replace("@EXPECTED@", "'" + expected + "'")
+        result = self.run_harness(transaction_source() + script, Path(tempfile.gettempdir()))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_unit_list_check_accepts_the_real_list_and_refuses_every_broken_one(self):
+        script = """
+restore_load_writer_units && echo "real:${#restore_writer_list[@]}"
+@BREAK@
+if restore_load_writer_units; then echo accepted; else echo "refused:${#restore_writer_list[@]}"; fi
+"""
+        real = self.run_harness(transaction_source() + script.replace("@BREAK@", ""), Path(tempfile.gettempdir()))
+        self.assertEqual(real.stdout.splitlines()[0], "real:14", real.stdout + real.stderr)
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            result = self.run_harness(transaction_source() + script.replace("@BREAK@", override), Path(tempfile.gettempdir()))
+            self.assertEqual(result.stdout.splitlines()[-1], "refused:0", f"{name}: {result.stdout}{result.stderr}")
+
+    def test_the_forward_restore_aborts_before_any_move_when_the_unit_list_cannot_be_built(self):
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            with self.subTest(name):
+                td, result, root, data = self.run_transaction("success", pre=override); self.addCleanup(td.cleanup)
+                self.assertNotEqual(result.returncode, 0)
+                calls = self.log.read_text().splitlines()
+                self.assertFalse([c for c in calls if c.startswith("MV ") and "restore/current" not in c], calls)
+                self.assertFalse([c for c in calls if c.startswith("systemctl stop")], calls)
+                self.assertIn("the list of units to stop could not be built; nothing was moved", result.stderr)
+                self.assertTrue((root / "old").exists()); self.assertTrue((data / "old").exists())
+                self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+
+    def test_the_rollback_refuses_when_the_unit_list_cannot_be_built(self):
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            with self.subTest(name):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                lay["active"].write_text("vesselstack-chat.service\n")
+                self.reconcile(lay, extra="export LOG_RM=1\n" + override)
+                result = lay["result"]
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
+                self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+                self.assertIn("the list of units to stop could not be built; nothing was moved", result.stderr)
+                self.assertIn("could not be built; nothing was moved. Run the recovery again: sudo ", result.stderr)
+                self.assertIn("/recover rollback", result.stderr)
+                self.assertNotIn("Fix the cause above", result.stderr)
+                self.assertEqual((lay["root"] / "marker").read_text(), "new-root"); self.assertEqual((lay["data"] / "marker").read_text(), "new-data")
+                self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM ", "systemctl stop"))], lay["calls"])
+
     # ---- fixes 2, 3 and 5: what must not be running before a tree moves ----
 
     def containers(self, lay, *lines):
@@ -1334,12 +1533,12 @@ check_restore_leftovers
         self.reconcile(lay, extra="export STUCK_UNITS=vesselstack-chat.service")
         self.assertNotEqual(lay["result"].returncode, 0)
         self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
-        self.assertEqual(self.state_value(lay["journal"], "rollback_from"), "data-swap")
+        self.assertEqual(state_value(lay["journal"], "rollback_from"), "data-swap")
         # a failure before the phase is rewritten (here: validation) also records it, and never overwrites it
         lay2 = self.layout("data-swap", "swapped", "none", False)
         self.set_state(lay2["journal"], "root=relative/path")
         self.reconcile(lay2)
-        self.assertEqual(self.state_value(lay2["journal"], "rollback_from"), "data-swap")
+        self.assertEqual(state_value(lay2["journal"], "rollback_from"), "data-swap")
         # the cause is fixed: the retry rolls back without restoring the system files from the snapshot
         lay["calls"].clear()
         lay["log"].write_text("")
@@ -1436,6 +1635,16 @@ if restore_validate_state; then echo "VALID"; else echo "INVALID $restore_valida
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip().splitlines()[-1], "VALID", result.stdout + result.stderr)
 
+    def test_a_new_journal_removes_the_record_of_an_earlier_automatic_recovery(self):
+        extra = ('mkdir -p "$RESTORE_DIR"; printf "journal_id=old\\nresult=rolled-back\\n" > "$RESTORE_DIR/boot-recovery"; '
+                 'echo OLD-LOG > "$RESTORE_DIR/boot-recovery.log"')
+        result = self.journal_for_layout("@B@/opt/vesselstack", "@B@/opt/vesselstack-data", extra=extra)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "VALID", result.stdout + result.stderr)
+        restore_dir = self.last_base / "var/lib/vesselstack/restore"
+        self.assertEqual(phase_of(restore_dir / "current"), "prepared")
+        self.assertFalse((restore_dir / "boot-recovery").exists(), "the record of the earlier restore is gone")
+        self.assertEqual((restore_dir / "boot-recovery.log").read_text(), "OLD-LOG\n", "the log is kept")
+
     def test_unusual_root_data_layouts_are_refused_up_front(self):
         for name, root, data in (
             ("data inside root", "@B@/opt/vs", "@B@/opt/vs/data"),
@@ -1526,7 +1735,7 @@ restore_validate_state && echo VALID || echo "INVALID $restore_validate_error"
         lay = self.layout("root-swap", "swapped", "swapped", False)
         changes = []
         for key in ("root_live", "data_live", "root_new", "data_new"):
-            changes.append(f"{key}=4242:{self.state_value(lay['journal'], key).split(':')[1]}")
+            changes.append(f"{key}=4242:{state_value(lay['journal'], key).split(':')[1]}")
         self.set_state(lay["journal"], *changes)
         self.reconcile(lay)
         self.assert_rolled_back(lay)
@@ -1740,6 +1949,75 @@ restore_status_line && echo status-ok || echo status-blocked
                 self.assertIn("restore cleanup pending", result.stderr)
                 self.assertIn("cleanup pending", result.stdout)
 
+    # ---- recovery at boot (scripts/lib/restore-boot) ----
+    OTHER_BOOT_ID = "f0e1d2c3-b4a5-4968-8776-655443322110"
+
+    def real_recover_wrapper(self):
+        # The journal's own `recover`, exactly as the controller writes it.
+        text = CONTROLLER.read_text()
+        start = "cat > \"$building/recover\" <<'RECOVER'\n"
+        a = text.index(start) + len(start)
+        return text[a:text.index("\nRECOVER\n", a) + 1]
+
+    def boot_ready(self, **layout_args):
+        """A journal from the harness whose `recover` is the real wrapper and whose controller is the harness."""
+        lay = self.layout(*layout_args.pop("args"), **layout_args)
+        self.reconcile(lay, via_recover=True)
+        recover = lay["journal"] / "recover"
+        recover.write_text(self.real_recover_wrapper()); recover.chmod(0o700)
+        return lay
+
+    def run_restore_boot(self, lay, boot_id):
+        seam = lay["base"] / "boot_id.now"; seam.write_text(boot_id + "\n")
+        # The harness keeps its journals in <base>/restore; the boot script looks under var/lib/vesselstack/restore.
+        link = lay["base"] / "var/lib/vesselstack/restore"
+        if not link.exists():
+            link.parent.mkdir(parents=True, exist_ok=True); link.symlink_to(lay["base"] / "restore")
+        env = dict(os.environ, SYSTEM_ROOT=str(lay["base"]), VESSELSTACK_BOOT_ID_FILE=str(seam), RESTORE_BOOT_BUSY_WAIT="0", RESTORE_BOOT_TIMEOUT="120")
+        return subprocess.run(["/bin/bash", str(BOOT_SCRIPT)], env=env, capture_output=True, text=True, timeout=300)
+
+    def test_the_boot_script_drives_the_real_recover_and_the_folders_come_back(self):
+        for name, phase, data_step, root_step, published in self.CRASH_POINTS:
+            with self.subTest(name):
+                lay = self.boot_ready(args=(phase, data_step, root_step, published))
+                self.assertEqual(state_value(lay["journal"], "boot_id"), BOOT_ID)
+                result = self.run_restore_boot(lay, self.OTHER_BOOT_ID)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                record = (lay["base"] / "restore" / "current").exists()
+                self.assertFalse(record, "the journal is archived")
+                self.assertEqual(phase_of(self.archive(lay, "rolled-back")), "rolled-back")
+                self.assertEqual(inode(lay["root"]), lay["original"]["root"]); self.assertEqual(inode(lay["data"]), lay["original"]["data"])
+                self.assertEqual((lay["root"] / "marker").read_text(), "old-root"); self.assertEqual((lay["data"] / "marker").read_text(), "old-data")
+                values = dict(line.partition("=")[::2] for line in (lay["base"] / "restore" / "boot-recovery").read_text().splitlines())
+                self.assertEqual((values["result"], values["phase_after"], values["phase_before"], values["attempts"], values["rc"]),
+                                 ("rolled-back", "archived", phase, "1", "0"))
+                self.assertIn("Rollback completed", (lay["base"] / "restore" / "boot-recovery.log").read_text())
+
+    def test_the_boot_script_moves_nothing_when_the_journal_is_from_this_boot(self):
+        lay = self.boot_ready(args=("root-swap", "swapped", "swapped", False))
+        result = self.run_restore_boot(lay, BOOT_ID)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(lay["journal"].exists()); self.assertEqual(phase_of(lay["journal"]), "root-swap")
+        self.assertEqual(inode(lay["root"]), lay["new"]["root"]); self.assertEqual(inode(lay["data"]), lay["new"]["data"])
+        self.assertFalse((lay["base"] / "restore" / "boot-recovery").exists())
+
+    def test_a_rollback_leaves_the_boot_recovery_unit_script_and_setting_alone(self):
+        lay = self.layout("externals", "swapped", "swapped", True)
+        planted = {lay["systemd"] / "boot-vesselstack-restore.service": "unit",
+                   lay["base"] / "usr/local/lib/vesselstack-recovery/restore-boot": "script",
+                   lay["base"] / "etc/vesselstack-recovery.conf": "MODE=hold\n",
+                   lay["systemd"] / "multi-user.target.wants/boot-vesselstack-restore.service": None}
+        for path, text in planted.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if text is None: path.symlink_to("../boot-vesselstack-restore.service")
+            else: path.write_text(text)
+        self.reconcile(lay)
+        self.assert_rolled_back(lay)
+        for path, text in planted.items():
+            if text is None: self.assertTrue(path.is_symlink(), path)
+            else: self.assertEqual(path.read_text(), text, path)
+        self.assertFalse((lay["systemd"] / "vesselstack-extra.service").exists(), "the rollback did remove what the restore published")
+
     # ---- recover abandon ----
     def recover_harness(self, lay, arguments, env=""):
         body = (f"export {env}\n" if env else "") + pending_source() + transaction_source() + f"""
@@ -1907,7 +2185,8 @@ restore_recover_command {arguments}
         stack = text[text.index("\nrestore_stack() {"):text.index("# ---------------------------------------------------------------- backup drive")]
         flush = stack.index('restore_journal.py" fsync-tree "$stage"')
         self.assertLess(flush, stack.index('restore_create_journal "$stage"'))
-        self.assertLess(flush, stack.index("restore_commit_transaction"), "the staged copy is flushed before anything is stopped")
+        self.assertLess(flush, stack.index('restore_forward "$journal"'), "the staged copy is flushed before anything is stopped")
+        self.assertIn("restore_commit_transaction", body("restore_forward", "restore_stack"), "restore_forward is what runs the transaction")
         self.assertIn("this can take several minutes", stack[:flush + 400] + stack[flush - 400:flush])
 
     # ---- the recover wrapper refuses a damaged journal ----
@@ -2128,7 +2407,7 @@ restore_recover_command {arguments}
             self.assertFalse([c for c in lay["calls"] if c.startswith(("controller ", "systemctl", "docker"))], lay["calls"])
             self.assertEqual((lay["root"] / "marker").read_text(), "old-root")
             self.assertEqual((lay["data"] / "marker").read_text(), "old-data")
-            self.assertIsNone(self.state_value(lay["journal"], "rollback_from"))
+            self.assertIsNone(state_value(lay["journal"], "rollback_from"))
 
     def test_without_a_running_systemd_every_unit_is_idle_and_with_one_a_failed_answer_is_not(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2473,6 +2752,1294 @@ cat "{lay['journal']}/quiesced-containers"
         self.assertIn("restore-recover status|rollback|abandon [--yes]", text)
         self.assertIn('install -d -m 0700 "$RESTORE_DIR"', text)
         self.assertNotIn('install -d -m 0700 "$SYSTEM_ROOT/var/lib/vesselstack"', text)
+
+# ---------------------------------------------------------------- lock hand-over and the hidden worker action
+HEX_ID = "0123456789abcdef0123456789abcdef"
+LOCK_HELPER = ROOT / "common/lifecycle_lock.py"
+
+
+class RestoreLockTests(unittest.TestCase):
+    """restore_take_lock with the journal's own copy of the lock helper, while the restore is pending."""
+
+    def pending_system(self, phase="starting", helper_source=None):
+        td = tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup); base = Path(td.name)
+        (base / "opt/vesselstack").mkdir(parents=True)
+        journal = base / "var/lib/vesselstack/restore/current"; journal.mkdir(parents=True, mode=0o700)
+        shutil.copy(JOURNAL_HELPER, journal / "restore_journal.py")
+        (journal / "lifecycle_lock.py").write_text(helper_source if helper_source is not None else LOCK_HELPER.read_text())
+        subprocess.run([sys.executable, "-I", str(journal / "restore_journal.py"), "set", str(journal),
+                        "format=1", f"id={HEX_ID}", f"phase={phase}"], check=True)
+        return base, journal
+
+    def run_take_lock(self, base, journal, *take_lock_args, preset_id=False, env=None):
+        text = CONTROLLER.read_text()
+        functions = text[text.index("restore_state_get() {"):text.index("restore_state_set() {")] + \
+            text[text.index("restore_take_lock() {"):text.index("restore_recover_rollback() {")]
+        preset = "st_id=" + HEX_ID if preset_id else ""
+        script = base / "take-lock.sh"
+        script.write_text(f"""#!/bin/bash
+set -euo pipefail
+if [ "${{1:-}}" = restore-recover ]; then
+    echo "reentered $*"
+    echo "RID=${{VESSELSTACK_RESTORE_ID:-}}"
+    echo "FD=${{VESSELSTACK_LIFECYCLE_LOCK_FD:+set}}"
+    exit 0
+fi
+ROOT="{base}/opt/vesselstack"; SYSTEM_ROOT="{base}"
+{functions}
+{preset}
+restore_take_lock "{journal}" {" ".join(take_lock_args)}
+echo "returned"
+""")
+        run_env = {k: v for k, v in os.environ.items() if k not in ("VESSELSTACK_LIFECYCLE_LOCK_FD", "VESSELSTACK_RESTORE_ID")}
+        run_env.update(env or {})
+        return subprocess.run(["bash", str(script), "first"], capture_output=True, text=True, env=run_env, timeout=60)
+
+    def test_the_recovery_takes_a_fresh_lock_while_its_restore_is_pending(self):
+        for phase in ("prepared", "starting", "rollback-failed", "abandoned"):
+            for preset in (False, True):
+                with self.subTest(phase=phase, preset_id=preset):
+                    base, journal = self.pending_system(phase)
+                    result = self.run_take_lock(base, journal, "rollback", preset_id=preset)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("reentered restore-recover rollback", result.stdout)
+                    self.assertIn(f"RID={HEX_ID}", result.stdout)
+                    self.assertIn("FD=set", result.stdout)
+
+    def test_a_journal_from_0_9_0_with_a_helper_that_has_no_check_still_works(self):
+        old = LOCK_HELPER.read_text().replace("journal = _unfinished_restore(self.system_root)", "journal = None")
+        self.assertNotEqual(old, LOCK_HELPER.read_text())
+        base, journal = self.pending_system("starting", helper_source=old)
+        result = self.run_take_lock(base, journal, "rollback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"RID={HEX_ID}", result.stdout)
+
+    def test_without_the_restore_id_the_same_helper_refuses(self):
+        base, journal = self.pending_system("starting")
+        result = subprocess.run([sys.executable, "-I", str(journal / "lifecycle_lock.py"), "run", "--root", str(base / "opt/vesselstack"),
+                                 "--system-root", str(base), "--", "true"],
+                                capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "VESSELSTACK_RESTORE_ID"})
+        self.assertEqual(result.returncode, 75)
+        self.assertIn(f"a restore is unfinished; see: sudo {journal}/recover status", result.stderr)
+
+    def test_an_id_exported_by_the_caller_is_replaced_by_the_journals(self):
+        base, journal = self.pending_system("starting")
+        result = self.run_take_lock(base, journal, "rollback", env={"VESSELSTACK_RESTORE_ID": "f" * 32})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"RID={HEX_ID}", result.stdout)
+
+    def hold(self, base):
+        """Hold the lifecycle lock of the test system (as the restore itself does) and return the handle."""
+        from common.lifecycle_lock import LifecycleLock
+        with mock.patch.dict(os.environ, {"VESSELSTACK_RESTORE_ID": HEX_ID}):
+            os.environ.pop("VESSELSTACK_LIFECYCLE_LOCK_FD", None)
+            return LifecycleLock(base / "opt/vesselstack", base).acquire()
+
+    def test_a_wait_is_passed_to_the_helper_and_waits_for_the_lock(self):
+        import threading
+        base, journal = self.pending_system("prepared")
+        holder = self.hold(base)
+        timer = threading.Timer(1.0, holder.release); timer.start()
+        try:
+            result = self.run_take_lock(base, journal, "--wait", "10", "worker", HEX_ID)
+        finally:
+            timer.join()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"reentered restore-recover worker {HEX_ID}", result.stdout)
+
+    def test_a_wait_that_runs_out_gives_up_with_75(self):
+        base, journal = self.pending_system("prepared")
+        holder = self.hold(base)
+        try:
+            busy = self.run_take_lock(base, journal, "--wait", "1", "worker", HEX_ID)
+        finally:
+            holder.release()
+        self.assertEqual(busy.returncode, 75)
+        self.assertNotIn("reentered", busy.stdout)
+
+    def test_recover_rollback_through_the_real_controller_is_not_locked_out(self):
+        # The journal's own wrapper and controller copy, the real lock helper and a pending journal: the rollback
+        # starts (it is not refused by the lock), while another command is refused.
+        helper = RestoreTransactionTests(); self.addCleanup(helper.doCleanups)
+        lay = helper.layout("prepared")
+        base = lay["base"]
+        (base / "var/lib/vesselstack").mkdir(parents=True)
+        os.rename(base / "restore", base / "var/lib/vesselstack/restore")
+        journal = base / "var/lib/vesselstack/restore/current"
+        helper.set_state(journal, f"system_root={base}")
+        shutil.copy(CONTROLLER, journal / "controller"); (journal / "controller").chmod(0o700)
+        shutil.copy(LOCK_HELPER, journal / "lifecycle_lock.py")
+        recover = journal / "recover"; recover.write_text(helper.real_recover_wrapper()); recover.chmod(0o700)
+        (base / "opt/vesselstack/common").mkdir(parents=True); shutil.copy(LOCK_HELPER, base / "opt/vesselstack/common/lifecycle_lock.py")
+        fakebin = base / "fakebin"; fakebin.mkdir()
+        (fakebin / "id").write_text("#!/bin/sh\necho 0\n")
+        (fakebin / "systemctl").write_text("#!/bin/sh\ncase \"$1\" in is-active|is-enabled) exit 1 ;; esac\nexit 0\n")
+        for name in ("id", "systemctl"): (fakebin / name).chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k not in ("VESSELSTACK_LIFECYCLE_LOCK_FD", "VESSELSTACK_RESTORE_ID", "VESSELSTACK_ENV")}
+        env.update(PATH=f"{fakebin}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(base))
+        refused = subprocess.run(["bash", str(CONTROLLER), "start"], capture_output=True, text=True, env=env)
+        self.assertEqual(refused.returncode, 1); self.assertIn("A restore did not finish", refused.stderr)
+        result = subprocess.run([str(recover), "rollback"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertNotIn("lifecycle lock", result.stderr, result.stdout + result.stderr)
+        self.assertNotIn("a restore is unfinished", result.stderr)
+        self.assertIn("Recovering an unfinished restore (phase: prepared)", result.stdout, result.stdout + result.stderr)
+
+    def test_an_unreadable_core_component_list_only_warns_and_the_recovery_status_still_works(self):
+        # The journal's controller can run from a restored or damaged tree: a registry that exists but cannot run
+        # (exits non-zero, or prints nothing) falls back to the built-in list with one warning, never stops the command.
+        for name, source in (("fails", "import sys\nsys.exit(3)\n"), ("prints nothing", "pass\n")):
+            with self.subTest(name):
+                helper = RestoreTransactionTests(); self.addCleanup(helper.doCleanups)
+                lay = helper.layout("prepared")
+                base = lay["base"]
+                (base / "var/lib/vesselstack").mkdir(parents=True)
+                os.rename(base / "restore", base / "var/lib/vesselstack/restore")
+                journal = base / "var/lib/vesselstack/restore/current"
+                helper.set_state(journal, f"system_root={base}")
+                shutil.copy(CONTROLLER, journal / "controller"); (journal / "controller").chmod(0o700)
+                shutil.copy(LOCK_HELPER, journal / "lifecycle_lock.py")
+                recover = journal / "recover"; recover.write_text(helper.real_recover_wrapper()); recover.chmod(0o700)
+                (base / "opt/vesselstack/common").mkdir(parents=True, exist_ok=True)
+                registry = base / "opt/vesselstack/common/config_registry.py"
+                registry.write_text(source)
+                env = {k: v for k, v in os.environ.items() if k not in ("VESSELSTACK_LIFECYCLE_LOCK_FD", "VESSELSTACK_RESTORE_ID", "VESSELSTACK_ENV")}
+                fakebin = base / "fakebin"; fakebin.mkdir()
+                (fakebin / "id").write_text("#!/bin/sh\necho 0\n"); (fakebin / "id").chmod(0o755)
+                env.update(PATH=f"{fakebin}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(base))
+                status = subprocess.run([str(recover), "status"], capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertEqual(status.stderr.count("using the built-in list"), 1, status.stderr)
+                self.assertIn("could not read the list of core components from", status.stderr)
+                self.assertIn("prepared", status.stdout)
+                (base / "opt/vesselstack/config").mkdir(); (base / "opt/vesselstack/config/vesselstack.env").write_text(f"VESSELSTACK_DATA={base}/data\n")
+                version = subprocess.run(["bash", str(CONTROLLER), "version"], capture_output=True, text=True,
+                                         env=dict(env, VESSELSTACK_ROOT=str(base / "opt/vesselstack")), timeout=60)
+                self.assertEqual(version.returncode, 0, version.stdout + version.stderr)
+                self.assertEqual(version.stderr.count("using the built-in list"), 1, version.stderr)
+
+
+class RestoreWorkerTests(unittest.TestCase):
+    """`recover worker ID`: the forward part of a restore, run from the journal alone."""
+    run_harness = RestoreTransactionTests.run_harness
+    build_harness = RestoreTransactionTests.build_harness
+
+    STUBS = r"""
+SYSTEMD_DIR="@SYSTEMD@"
+RESTORE_DIR="@BASE@/restore"
+RESTORE_CURRENT="$RESTORE_DIR/current"
+usage() { echo usage; }
+restore_take_lock() { echo "TAKE_LOCK $*" >> "@LOG@"; }
+restore_state_set() { local j=$1; shift; case "$*" in *phase=*) echo "PHASE $*" >> "@LOG@" ;; esac; python3 -I "$j/restore_journal.py" set "$j" "$@"; }
+restore_run_controller() { action=$3; if [ "$action" = stop ]; then if [ "$2" = "@NEW@" ]; then [ "@MODE@" != new_stop_fail ]; else [ "@MODE@" != old_stop_fail ]; fi; elif [ "$action" = start ]; then if [ "$2" = "@NEW@" ]; then [ "@MODE@" != new_start_fail ] && [ "@MODE@" != new_stop_fail ]; else true; fi; fi; }
+docker() { return 1; }
+restore_docker_processes() { return 1; }
+restore_publish_externals() { return 0; }
+restore_sync_system_files() { return 0; }
+restore_restore_externals() { return 0; }
+restore_check_externals() { return 0; }
+systemctl() {
+    echo "systemctl $*" >> "@LOG@"
+    local u
+    case "$1" in
+        is-active) u=${@: -1}; grep -qx "$u" "@ACTIVE@" ;;
+        show) if [ "${3:-}" = ActiveState ]; then u=${@: -1}; if grep -qx "$u" "@ACTIVE@"; then echo active; else echo inactive; fi; fi ;;
+        stop) for u in "${@:2}"; do { grep -vx "$u" "@ACTIVE@" || true; } > "@ACTIVE@.n"; command mv "@ACTIVE@.n" "@ACTIVE@"; done ;;
+        start) for u in "${@:2}"; do echo "$u" >> "@ACTIVE@"; done ;;
+        daemon-reload) if [ "@SIGNAL@" = 1 ] && [ ! -e "@BASE@/signalled" ]; then : > "@BASE@/signalled"; kill -HUP $$; kill -INT $$; fi ;;
+        *) return 0 ;;
+    esac
+}
+mv() { echo "MV $*" >> "@LOG@"; __mv "$@"; }
+"""
+
+    def prepare(self, mode="success", signal=False):
+        td = tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup); base = Path(td.name)
+        root = base / "root"; data = base / "data"; (root / "old").mkdir(parents=True); (data / "old").mkdir(parents=True)
+        stage = base / STAGE_NAME; backup = stage / "vesselstack-backup"
+        for tree in (root, data):
+            (backup / str(tree).lstrip("/")).mkdir(parents=True); (backup / str(tree).lstrip("/") / "new").write_text("new")
+        journal = make_journal(base, root, data, stage)
+        subprocess.run([sys.executable, "-I", str(journal / "restore_journal.py"), "set", str(journal), f"id={HEX_ID}", "skip_installer=1"], check=True)
+        systemd = base / "etc/systemd/system"; systemd.mkdir(parents=True)
+        (base / "calls.log").write_text(""); (base / "active").write_text("")
+        return {"base": base, "root": root, "data": data, "stage": stage, "journal": journal, "systemd": systemd,
+                "log": base / "calls.log", "mode": mode, "signal": signal}
+
+    def body(self, lay, tail):
+        text = pending_source() + transaction_source() + controller_function_source("restore_forward() {", "restore_stack() {") + self.STUBS + tail
+        for key, value in {"@SYSTEMD@": lay["systemd"], "@BASE@": lay["base"], "@LOG@": lay["log"], "@ACTIVE@": lay["base"] / "active",
+                           "@NEW@": lay["journal"] / "new-controller", "@MODE@": lay["mode"], "@SIGNAL@": "1" if lay["signal"] else "0"}.items():
+            text = text.replace(key, str(value))
+        return text
+
+    def run_inline(self, lay):
+        return self.run_harness(self.body(lay, f'\nrestore_forward "{lay["journal"]}"\nexit 0\n'), lay["base"])
+
+    def run_worker(self, lay, worker_id=HEX_ID):
+        return self.run_harness(self.body(lay, f'\nrestore_recover_command worker "{worker_id}"\nexit 0\n'), lay["base"])
+
+    def calls(self, lay):
+        return lay["log"].read_text().replace(str(lay["base"]), "BASE").splitlines()
+
+    def files(self, lay):
+        return sorted(p.name for p in (lay["base"] / "restore").glob("worker-*"))
+
+    def assert_nothing_happened(self, lay, result, before):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr); self.assertTrue(lines[0].startswith("worker: "), lines[0])
+        self.assertEqual(self.files(lay), [])
+        self.assertEqual(self.calls(lay), [])
+        self.assertEqual((lay["journal"] / "state").read_text() if (lay["journal"] / "state").exists() else None, before)
+        self.assertTrue((lay["root"] / "old").exists()); self.assertTrue((lay["data"] / "old").exists())
+
+    def test_a_worker_that_is_not_admitted_does_nothing_and_exits_0(self):
+        cases = {"another id": HEX_ID[::-1], "uppercase": HEX_ID.upper(), "too short": "abc123", "too long": HEX_ID + "0",
+                 "path": "../../etc/passwd", "empty": ""}
+        for name, worker_id in cases.items():
+            with self.subTest(name):
+                lay = self.prepare(); before = (lay["journal"] / "state").read_text()
+                self.assert_nothing_happened(lay, self.run_worker(lay, worker_id), before)
+
+    def test_a_phase_other_than_prepared_is_not_admitted(self):
+        for phase in ("stopping", "stopped", "data-swap", "root-swap", "externals", "reloaded", "starting", "committed",
+                      "rolling-back", "rolled-back", "rollback-failed", "abandoned"):
+            with self.subTest(phase):
+                lay = self.prepare()
+                subprocess.run([sys.executable, "-I", str(lay["journal"] / "restore_journal.py"), "set", str(lay["journal"]), f"phase={phase}"], check=True)
+                before = (lay["journal"] / "state").read_text()
+                result = self.run_worker(lay)
+                self.assert_nothing_happened(lay, result, before)
+                self.assertIn(f"phase {phase}", result.stderr)
+
+    def test_a_missing_journal_is_not_admitted(self):
+        lay = self.prepare(); shutil.rmtree(lay["journal"])
+        self.assert_nothing_happened(lay, self.run_worker(lay), None)
+
+    def test_a_journal_without_state_is_not_admitted(self):
+        lay = self.prepare(); (lay["journal"] / "state").unlink()
+        result = self.run_worker(lay)
+        self.assertEqual(result.returncode, 0, result.stderr); self.assertEqual(self.files(lay), []); self.assertEqual(self.calls(lay), [])
+
+    def test_a_second_start_after_the_phase_moved_on_changes_nothing(self):
+        lay = self.prepare()
+        first = self.run_worker(lay); self.assertEqual(first.returncode, 0, first.stderr)
+        files = self.files(lay); rc_text = (lay["base"] / f"restore/worker-{HEX_ID}.rc").read_text()
+        calls = self.calls(lay)
+        second = self.run_worker(lay)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(second.stderr.strip().splitlines()), 1)
+        self.assertEqual(self.files(lay), files); self.assertEqual(self.calls(lay), calls)
+        self.assertEqual((lay["base"] / f"restore/worker-{HEX_ID}.rc").read_text(), rc_text)
+
+    def test_the_worker_runs_the_same_phases_and_calls_as_the_inline_restore(self):
+        inline = self.prepare(); worker = self.prepare()
+        result_inline = self.run_inline(inline)
+        result_worker = self.run_worker(worker)
+        self.assertEqual(result_inline.returncode, 0, result_inline.stderr)
+        self.assertEqual(result_worker.returncode, 0, result_worker.stderr)
+        calls = [line for line in self.calls(worker) if not line.startswith("TAKE_LOCK")]
+        # The message carries both complete logs: a difference is then diagnosed from the evidence, not by a rerun.
+        self.assertEqual(calls, self.calls(inline),
+                         "worker calls (%d lines):\n%s\n\ninline calls (%d lines):\n%s" % (
+                             len(calls), "\n".join(calls), len(self.calls(inline)), "\n".join(self.calls(inline))))
+        phases = [line.split()[1] for line in calls if line.startswith("PHASE ")]
+        self.assertEqual(phases, ["phase=stopping", "phase=stopped", "phase=data-swap", "phase=root-swap", "phase=externals",
+                                  "phase=reloaded", "phase=starting", "phase=committed"])
+        self.assertTrue(any(line.startswith("TAKE_LOCK ") and line.endswith(f" --wait 120 worker {HEX_ID}") for line in self.calls(worker)))
+        for lay in (inline, worker):
+            self.assertEqual((lay["root"] / "new").read_text(), "new"); self.assertEqual((lay["data"] / "new").read_text(), "new")
+            self.assertEqual(phase_of(lay["base"] / "restore" / f"done-{STAMP}"), "committed")
+            self.assertFalse((lay["base"] / "restore/current").exists())
+        out = (worker["base"] / f"restore/worker-{HEX_ID}.out").read_text()
+        err = (worker["base"] / f"restore/worker-{HEX_ID}.err").read_text()
+        self.assertEqual(out.replace(str(worker["base"]), "BASE"), result_inline.stdout.replace(str(inline["base"]), "BASE"))
+        self.assertEqual(err.replace(str(worker["base"]), "BASE"), result_inline.stderr.replace(str(inline["base"]), "BASE"))
+        self.assertIn("Restore completed", out)
+        self.assertEqual(result_worker.stdout, ""); self.assertEqual(result_worker.stderr, "")
+
+    def test_the_worker_writes_its_files_with_mode_0600_and_the_status_last(self):
+        lay = self.prepare()
+        result = self.run_worker(lay); self.assertEqual(result.returncode, 0, result.stderr)
+        restore = lay["base"] / "restore"
+        self.assertEqual(self.files(lay), [f"worker-{HEX_ID}.{ext}" for ext in ("err", "out", "pid", "rc")])
+        for ext in ("err", "out", "pid", "rc"):
+            self.assertEqual((restore / f"worker-{HEX_ID}.{ext}").stat().st_mode & 0o777, 0o600, ext)
+        self.assertEqual((restore / f"worker-{HEX_ID}.rc").read_text(), "0\n")
+        self.assertRegex((restore / f"worker-{HEX_ID}.pid").read_text(), r"^[0-9]+ (-|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\n$")
+
+    def test_a_forward_part_that_fails_leaves_the_failing_status_and_a_rolled_back_journal(self):
+        inline = self.prepare("new_start_fail"); worker = self.prepare("new_start_fail")
+        result_inline = self.run_inline(inline); result_worker = self.run_worker(worker)
+        self.assertNotEqual(result_inline.returncode, 0)
+        self.assertEqual(result_worker.returncode, result_inline.returncode)
+        restore = worker["base"] / "restore"
+        self.assertEqual((restore / f"worker-{HEX_ID}.rc").read_text(), f"{result_inline.returncode}\n")
+        self.assertEqual(phase_of(restore / f"rolled-back-{STAMP}"), "rolled-back")
+        self.assertTrue((worker["root"] / "old").exists()); self.assertTrue((worker["data"] / "old").exists())
+        self.assertEqual((restore / f"worker-{HEX_ID}.err").read_text().replace(str(worker["base"]), "BASE"),
+                         result_inline.stderr.replace(str(inline["base"]), "BASE"))
+        self.assertEqual([l for l in self.calls(worker) if not l.startswith("TAKE_LOCK")], self.calls(inline))
+
+    def test_the_worker_ignores_sigint_and_sighup(self):
+        lay = self.prepare(signal=True)
+        result = self.run_worker(lay)
+        self.assertTrue((lay["base"] / "signalled").exists(), "the test did send the signals")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((lay["base"] / f"restore/worker-{HEX_ID}.rc").read_text(), "0\n")
+        self.assertEqual(phase_of(lay["base"] / "restore" / f"done-{STAMP}"), "committed")
+
+    def test_only_the_newest_three_sets_of_worker_files_are_kept(self):
+        lay = self.prepare(); restore = lay["base"] / "restore"
+        old_ids = [f"{n:032x}" for n in range(1, 6)]
+        for index, old_id in enumerate(old_ids):
+            for ext in ("pid", "out", "err", "rc"):
+                path = restore / f"worker-{old_id}.{ext}"; path.write_text("x")
+                os.utime(path, (1_000_000 + index * 100, 1_000_000 + index * 100))
+        (restore / "worker-notes.txt").write_text("keep")
+        result = self.run_worker(lay); self.assertEqual(result.returncode, 0, result.stderr)
+        kept = sorted({name.split(".")[0][len("worker-"):] for name in self.files(lay) if name.endswith(".pid")})
+        self.assertEqual(kept, sorted([HEX_ID, old_ids[4], old_ids[3]]))
+        self.assertEqual(list(restore.glob(f"worker-{old_ids[0]}.*")), [])
+        self.assertEqual(len(list(restore.glob(f"worker-{old_ids[4]}.*"))), 4)
+        self.assertEqual((restore / "worker-notes.txt").read_text(), "keep")
+        self.assertTrue((restore / f"worker-{HEX_ID}.rc").exists())
+
+    def test_the_worker_action_is_not_advertised(self):
+        text = CONTROLLER.read_text()
+        usage = text[text.index("usage() {"):text.index("EOF", text.index("usage() {"))]
+        self.assertNotIn("worker", usage)
+        wrapper = text[text.index("cat > \"$building/recover\""):text.index("\nRECOVER\n")]
+        self.assertNotIn("worker", wrapper)
+
+    def test_the_pid_file_records_the_pid_and_the_boot_id(self):
+        lay = self.prepare()
+        self.assertEqual(self.run_worker(lay).returncode, 0)
+        self.assertRegex((lay["base"] / "restore" / f"worker-{HEX_ID}.pid").read_text(), rf"^[0-9]+ {BOOT_ID}\n$")
+        lay = self.prepare()
+        text = self.body(lay, f'\nexport VESSELSTACK_BOOT_ID_FILE="@BASE@/no-boot-id"\nrestore_recover_command worker "{HEX_ID}"\nexit 0\n'.replace("@BASE@", str(lay["base"])))
+        self.assertEqual(self.run_harness(text, lay["base"]).returncode, 0)
+        self.assertRegex((lay["base"] / "restore" / f"worker-{HEX_ID}.pid").read_text(), r"^[0-9]+ -\n$")
+
+    def test_a_failure_before_the_pid_file_is_written_still_leaves_a_result_file(self):
+        lay = self.prepare()
+        (lay["base"] / "restore" / f"worker-{HEX_ID}.pid").mkdir()  # the pid file cannot be written
+        result = self.run_harness(self.body(lay, f'\nrestore_recover_command worker "{HEX_ID}"\nexit $?\n'), lay["base"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((lay["base"] / "restore" / f"worker-{HEX_ID}.rc").read_text(), f"{result.returncode}\n")
+        self.assertTrue((lay["root"] / "old").exists()); self.assertTrue((lay["data"] / "old").exists())
+        self.assertEqual(phase_of(lay["journal"]), "prepared")
+
+    def run_worker_with_term(self, lay, phase):
+        """The worker gets SIGTERM right after the journal records PHASE."""
+        hook = (r'restore_state_set() { local j=$1; shift; case "$*" in *phase=*) echo "PHASE $*" >> "@LOG@" ;; esac; '
+                r'python3 -I "$j/restore_journal.py" set "$j" "$@" || return; '
+                'case "$*" in *"phase=' + phase + '"*) kill -TERM $$ ;; esac; }\n')
+        hook = hook.replace("@LOG@", str(lay["log"]))
+        return self.run_harness(self.body(lay, "\n" + hook + f'restore_recover_command worker "{HEX_ID}"\nexit 0\n'), lay["base"])
+
+    def test_a_stop_request_before_any_folder_moved_rolls_the_restore_back(self):
+        for phase in ("stopping", "stopped"):
+            with self.subTest(phase):
+                lay = self.prepare()
+                result = self.run_worker_with_term(lay, phase)
+                restore = lay["base"] / "restore"
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertTrue((lay["root"] / "old").exists()); self.assertTrue((lay["data"] / "old").exists())
+                self.assertFalse((lay["root"] / "new").exists()); self.assertFalse((lay["data"] / "new").exists())
+                self.assertEqual([l for l in self.calls(lay) if l.startswith("MV ") and "rolled-back-" not in l], [], "only the journal was archived")
+                self.assertFalse((restore / "current").exists())
+                self.assertEqual(phase_of(restore / f"rolled-back-{STAMP}"), "rolled-back")
+                self.assertRegex(state_value(restore / f"rolled-back-{STAMP}", "stop_requested"), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                self.assertNotIn("stop requested", state_value(restore / f"rolled-back-{STAMP}", "last_error").replace("stop requested before anything was moved", ""))
+                self.assertEqual((restore / f"worker-{HEX_ID}.rc").read_text(), "1\n")
+                self.assertIn("stop requested before anything was moved", (restore / f"worker-{HEX_ID}.err").read_text())
+
+    def test_a_stop_request_while_still_prepared_ends_the_restore_without_stopping_anything(self):
+        lay = self.prepare()
+        # TERM arrives after the worker took over and before the commit transaction does its first step.
+        hook = ('eval "$(declare -f restore_commit_transaction | sed 1s/restore_commit_transaction/restore_commit_original/)"\n'
+                'restore_commit_transaction() { kill -TERM $$; restore_commit_original "$@"; }\n')
+        result = self.run_harness(self.body(lay, "\n" + hook + f'restore_recover_command worker "{HEX_ID}"\nexit 0\n'), lay["base"])
+        restore = lay["base"] / "restore"
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual([l for l in self.calls(lay) if l.startswith("systemctl stop") or l.startswith("systemctl start")], [])
+        self.assertNotIn("PHASE phase=stopping", "\n".join(self.calls(lay)))
+        self.assertEqual([l for l in self.calls(lay) if l.startswith("MV ") and "rolled-back-" not in l], [], "only the journal was archived")
+        self.assertTrue((lay["root"] / "old").exists()); self.assertTrue((lay["data"] / "old").exists())
+        self.assertFalse(lay["stage"].exists())
+        self.assertFalse((restore / "current").exists())
+        self.assertEqual(phase_of(restore / f"rolled-back-{STAMP}"), "rolled-back")
+        self.assertRegex(state_value(restore / f"rolled-back-{STAMP}", "stop_requested"), r"^\d{4}-")
+        self.assertNotEqual((restore / f"worker-{HEX_ID}.rc").read_text(), "0\n")
+        self.assertIn("stop requested before anything was stopped", (restore / f"worker-{HEX_ID}.err").read_text())
+
+    def test_a_stop_request_once_the_first_folder_moves_does_not_interrupt_the_restore(self):
+        for phase in ("data-swap", "root-swap", "starting"):
+            with self.subTest(phase):
+                lay = self.prepare()
+                result = self.run_worker_with_term(lay, phase)
+                restore = lay["base"] / "restore"
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((lay["root"] / "new").read_text(), "new"); self.assertEqual((lay["data"] / "new").read_text(), "new")
+                self.assertEqual(phase_of(restore / f"done-{STAMP}"), "committed")
+                self.assertEqual((restore / f"worker-{HEX_ID}.rc").read_text(), "0\n")
+                self.assertRegex(state_value(restore / f"done-{STAMP}", "stop_requested"), r"^\d{4}-")
+
+    def test_without_a_stop_request_no_stop_is_recorded(self):
+        lay = self.prepare()
+        self.assertEqual(self.run_worker(lay).returncode, 0)
+        self.assertIsNone(state_value(lay["base"] / "restore" / f"done-{STAMP}", "stop_requested"))
+
+
+class RestoreDetachTests(unittest.TestCase):
+    """The real controller: a restore that hands its forward part to a background worker and follows it.
+
+    The pieces around the forward part are replaced in a copy of the controller (the journal is copied into place
+    instead of being built from an archive, and restore_forward only walks the phases), so the hand-off, the
+    lock release, the worker and the follower are the production code. The launcher is a stub that starts the
+    worker like a transient unit does: a new session and an empty environment but PATH."""
+
+    HOOK = r'''
+restore_stack() {
+    local arg
+    restore_foreground=0
+    for arg in "$@"; do [ "$arg" != --foreground ] || restore_foreground=1; done
+    restore_early_stage=$SYSTEM_ROOT/opt/@STAGE@
+    trap 'restore_early_signal 130' INT
+    trap 'restore_early_signal 129' HUP
+    trap 'restore_early_signal 143' TERM
+    while [ -e "$SYSTEM_ROOT/early-hold" ]; do sleep 0.1; done
+    install -d -m 0700 "$RESTORE_DIR"
+    cp -a "$SYSTEM_ROOT/prebuilt" "$RESTORE_CURRENT"
+    restore_run_journal "$RESTORE_CURRENT" "$restore_early_stage"
+}
+restore_forward() {
+    local journal=$1 mode step
+    restore_exit_status=1
+    restore_state_load "$journal" && restore_validate_state || { echo "journal rejected: $restore_validate_error" >&2; return 1; }
+    mode=$(cat "$SYSTEM_ROOT/ctl-mode" 2>/dev/null || echo ok)
+    env > "$SYSTEM_ROOT/worker-env.$$"
+    for step in stopping data-swap root-swap starting; do
+        restore_state_set "$journal" "phase=$step"
+        if [ "$step" = stopping ] && [ "$mode" = hang ]; then
+            : > "$SYSTEM_ROOT/hanging"
+            while [ ! -e "$SYSTEM_ROOT/release" ]; do sleep 0.1; done
+        fi
+        if [ "$step" = stopping ] && [ "${mode#fail}" != "$mode" ]; then
+            echo "Restore failed: simulated failure" >&2
+            restore_state_set "$journal" phase=rolled-back
+            restore_reconcile "$journal" || true
+            restore_exit_status=${mode#fail}
+            return "$restore_exit_status"
+        fi
+        sleep "$(cat "$SYSTEM_ROOT/ctl-step" 2>/dev/null || echo 0)"
+    done
+    restore_state_set "$journal" phase=committed
+    restore_reconcile "$journal" || true
+    echo "Restore completed"
+    echo "Previous trees kept as $st_root.pre-restore-$st_stamp and $st_data.pre-restore-$st_stamp."
+    return 0
+}
+restore_run_controller() { return 0; }
+docker() { return 1; }
+mv() {
+    if [ "$(uname)" = Darwin ] && [ "${1:-}" = -T ]; then
+        shift; [ "${1:-}" = -- ] && shift
+        if [ -d "$2" ] && [ ! -L "$2" ]; then rmdir "$2" || return 1; fi
+        command mv -- "$1" "$2"
+    else
+        command mv "$@"
+    fi
+}
+'''
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup)
+        self.base = base = Path(td.name).resolve()
+        self.procs = []
+        self.addCleanup(self.stop_everything)
+        self.root = base / "opt/vesselstack"; self.data = base / "opt/vesselstack-data"
+        for tree, label in ((self.root, "root"), (self.data, "data")):
+            tree.mkdir(parents=True); (tree / "marker").write_text(f"old-{label}")
+        (self.root / "common").mkdir()
+        shutil.copy(LOCK_HELPER, self.root / "common/lifecycle_lock.py")
+        self.stage = base / "opt" / STAGE_NAME
+        for tree in (self.root, self.data):
+            staged = self.stage / "vesselstack-backup" / str(tree).lstrip("/"); staged.mkdir(parents=True); (staged / "marker").write_text("new")
+        (base / "run/systemd/system").mkdir(parents=True)
+        fakebin = base / "fakebin"; fakebin.mkdir()
+        (fakebin / "id").write_text("#!/bin/sh\necho 0\n")
+        (fakebin / "systemctl").write_text("#!/bin/sh\ncase \"$1\" in is-active|is-enabled) exit 1 ;; esac\nexit 0\n")
+        for name in ("id", "systemctl"): (fakebin / name).chmod(0o755)
+        text = CONTROLLER.read_text()
+        marker = "\n[ $# -gt 0 ] || { usage; exit 2; }\n"
+        self.assertEqual(text.count(marker), 1)
+        text = text.replace(marker, self.HOOK.replace("@STAGE@", STAGE_NAME) + marker)
+        call = '\nensure_lifecycle_lock "$command" "$@"\n'
+        self.assertEqual(text.count(call), 1)
+        text = text.replace(call, call + 'if [ "$command" = restore ]; then restore_stack "$@"; exit $?; fi\n')
+        self.ctl = base / "test-controller"; self.ctl.write_text(text); self.ctl.chmod(0o700)
+        helper = RestoreTransactionTests()
+        journal = make_journal(base, self.root, self.data, self.stage)
+        subprocess.run([sys.executable, "-I", str(journal / "restore_journal.py"), "set", str(journal), f"id={HEX_ID}"], check=True)
+        shutil.copy(self.ctl, journal / "controller"); (journal / "controller").chmod(0o700)
+        shutil.copy(LOCK_HELPER, journal / "lifecycle_lock.py")
+        (journal / "recover").write_text(helper.real_recover_wrapper()); (journal / "recover").chmod(0o700)
+        os.rename(journal, base / "prebuilt"); shutil.rmtree(base / "restore")
+        (base / "var/lib/vesselstack").mkdir(parents=True)
+        self.restore_dir = base / "var/lib/vesselstack/restore"; self.journal = self.restore_dir / "current"
+        self.launcher = base / "launcher.py"
+        self.launcher.write_text(self.STUB.replace("@PY@", sys.executable).replace("@BASE@", str(base)))
+        self.launcher.chmod(0o755)
+
+    STUB = r'''#!@PY@
+import json, os, shutil, signal, subprocess, sys
+base = "@BASE@"
+args = sys.argv[1:]
+with open(os.path.join(base, "launcher.log"), "a") as log:
+    log.write(json.dumps(args) + "\n")
+with open(os.path.join(base, "launcher-fds"), "a") as out:
+    idents = []
+    for n in sorted(int(n) for n in os.listdir("/dev/fd")):
+        try:
+            st = os.fstat(n)
+            idents.append([st.st_dev, st.st_ino])
+        except OSError:
+            pass
+    out.write(json.dumps(idents) + "\n")
+missing = [need for need in ("--unit=run-vesselstack-restore", "--collect", "--quiet", "Type=exec", "KillMode=mixed", "TimeoutStopSec=10min",
+                             "After=docker.service", "IgnoreOnIsolate=yes") if need not in args]
+if missing or "--wait" in args or "--pipe" in args:
+    open(os.path.join(base, "launcher-bad-args"), "w").write(repr(missing))
+    sys.exit(98)
+try:
+    mode = open(os.path.join(base, "launcher-mode")).read().strip()
+except OSError:
+    mode = "start"
+if mode == "fail":
+    print("Failed to start transient service: Unit run-vesselstack-restore.service already exists.", file=sys.stderr)
+    sys.exit(1)
+if mode == "never":
+    sys.exit(0)
+cmd = args[args.index("/bin/bash"):]
+cmd[0] = shutil.which("bash")
+def reset():
+    for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
+worker = subprocess.Popen(["/usr/bin/env", "-i", "PATH=" + os.environ["PATH"]] + ["VESSELSTACK_BOOT_ID_FILE=" + os.environ[name] for name in ("VESSELSTACK_BOOT_ID_FILE",) if name in os.environ] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, preexec_fn=reset)
+# The only record of the workers this launcher really started, written by nobody else: the test's clean-up signals
+# these and never a pid it reads from a worker-*.pid file (a file under test, which tests fill with unrelated pids).
+with open(os.path.join(base, "started-workers.log"), "a") as started:
+    started.write("%d %d\n" % (worker.pid, os.getpgid(worker.pid)))
+if mode == "start-then-fail":
+    print("Failed to start transient service: simulated", file=sys.stderr)
+    sys.exit(1)
+'''
+
+    def started_workers(self):
+        """(pid, pgid) of every worker the stub launcher started, from the file only the launcher writes."""
+        found = []
+        try:
+            lines = (self.base / "started-workers.log").read_text().splitlines()
+        except OSError:
+            return found
+        for line in lines:
+            try:
+                pid, pgid = (int(field) for field in line.split())
+            except ValueError:
+                continue
+            found.append((pid, pgid))
+        return found
+
+    def own_process(self, pid):
+        """True when `pid` is a live process that mentions this test's temp directory on its command line."""
+        try:
+            if sys.platform.startswith("linux"):
+                command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            else:
+                command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return str(self.base) in command
+
+    @staticmethod
+    def signal_ours(pid, group, sig=signal.SIGKILL):
+        """Last line of defence for every kill of this class. Never pid or group 0 or 1 (on Linux killpg(1, ...) is
+        kill(-1, ...), which kills every process of the user, the runner agent of a CI job included), never the test
+        runner, its parent or its own group. The callers pass only processes this test started itself."""
+        refused = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        if pid in refused or pid < 0:
+            return
+        try:
+            if group not in refused and group > 1:
+                os.killpg(group, sig)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+    def stop_everything(self):
+        """Nothing started by a test outlives it: every foreground and every worker, with its process group.
+
+        Only processes this test started are signalled: the Popen objects it holds (all started in a session of their
+        own, so the group is theirs) and the workers its stub launcher recorded. A worker-*.pid file is never read for
+        this: tests write unrelated pids into those on purpose."""
+        try:
+            (self.base / "release").write_text("")
+        except OSError:
+            pass
+        for proc in self.procs:
+            self.signal_ours(proc.pid, proc.pid)  # its group is its own: it was started with start_new_session=True
+            proc.wait()
+        for pid, pgid in self.started_workers():
+            if self.own_process(pid):
+                self.signal_ours(pid, pgid)
+
+    def env(self, **extra):
+        # The launch wait is the production default: a worker that is slow to start (a busy CI runner) must not be
+        # taken for one that never appears. The tests of that case set a short wait themselves.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("VESSELSTACK_")}
+        env.update(PATH=f"{self.base / 'fakebin'}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(self.base),
+                   VESSELSTACK_ROOT=str(self.root), VESSELSTACK_TEST_SYSTEMD_RUN=str(self.launcher),
+                   VESSELSTACK_BOOT_ID_FILE=_BOOT_FILE, VESSELSTACK_RESTORE_FOLLOW_INTERVAL="0.1",
+                   VESSELSTACK_RESTORE_LAUNCH_WAIT="30", VESSELSTACK_RESTORE_DEAD_GRACE="1", VESSELSTACK_RESTORE_LOCK_WAIT="10")
+        env.update(extra)
+        return env
+
+    def start(self, *args, command=("restore", "x.tar.gz", "--yes"), **extra_env):
+        proc = subprocess.Popen(["bash", str(self.ctl), *command, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=self.env(**extra_env), start_new_session=True)
+        self.procs.append(proc)
+        return proc
+
+    def finish(self, proc, timeout=60):
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err
+
+    def run_ctl(self, *args, timeout=60, **extra_env):
+        result = subprocess.run(["bash", str(self.ctl), *args], capture_output=True, text=True, env=self.env(**extra_env), timeout=timeout)
+        return result.returncode, result.stdout, result.stderr
+
+    def wait_for(self, path, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if Path(path).exists():
+                return
+            time.sleep(0.05)
+        self.fail(f"{path} did not appear\n{self.diagnostics()}")
+
+    def diagnostics(self):
+        """What a failed wait needs to explain itself: the foregrounds' status and output so far, the launcher's log, the
+        worker files, the journal phase and the processes that mention this test's directory."""
+        lines = []
+        for number, proc in enumerate(self.procs):
+            lines.append(f"foreground {number}: pid {proc.pid} returncode {proc.poll()}")
+            for name in ("stdout", "stderr"):
+                stream = getattr(proc, name)
+                text = ""
+                if stream is not None:
+                    try:
+                        os.set_blocking(stream.fileno(), False)
+                        text = os.read(stream.fileno(), 65536).decode(errors="replace")
+                    except (OSError, ValueError):
+                        pass
+                lines.append(f"  {name} so far: {self.normalise(text)!r}")
+        for name in ("launcher.log", "started-workers.log"):
+            try:
+                lines.append(f"{name}: {self.normalise((self.base / name).read_text())!r}")
+            except OSError:
+                lines.append(f"{name}: (none)")
+        try:
+            lines.append("journal phase: %r runner: %r" % (state_value(self.journal, "phase"), state_value(self.journal, "runner")))
+        except (OSError, ValueError) as exc:
+            lines.append(f"journal: unreadable ({exc})")
+        try:
+            for path in sorted(self.restore_dir.iterdir()):
+                text = ""
+                if path.is_file() and path.name.startswith("worker-"):
+                    text = path.read_text(errors="replace")[-1500:]
+                lines.append(f"  {path.name}: {self.normalise(text)!r}")
+        except OSError:
+            lines.append("restore dir: (none)")
+        lines.append("files here: " + " ".join(sorted(path.name for path in self.base.iterdir())))
+        ps = subprocess.run(["ps", "-eo", "pid,pgid,stat,command"], capture_output=True, text=True).stdout
+        lines.append("processes:\n" + "\n".join(self.normalise(line) for line in ps.splitlines() if str(self.base) in line))
+        return "\n".join(lines)
+
+    def mode(self, name, value):
+        (self.base / name).write_text(value)
+
+    def worker_pid(self):
+        self.wait_for(self.restore_dir / f"worker-{HEX_ID}.pid")
+        return int((self.restore_dir / f"worker-{HEX_ID}.pid").read_text().split()[0])
+
+    def archived(self, kind="done"):
+        return self.restore_dir / f"{kind}-{STAMP}"
+
+    def normalise(self, text):
+        return text.replace(str(self.base), "BASE")
+
+    def launcher_calls(self):
+        log = self.base / "launcher.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def assert_untouched(self):
+        self.assertEqual((self.root / "marker").read_text(), "old-root"); self.assertEqual((self.data / "marker").read_text(), "old-data")
+        self.assertFalse(self.stage.exists(), "the staged copy was removed")
+        self.assertFalse(self.journal.exists())
+
+    # ---- the normal course ----
+    def test_a_detached_restore_commits_and_prints_the_same_lines_as_an_inline_one(self):
+        self.mode("ctl-step", "0.1")
+        rc, out, err = self.finish(self.start("--foreground"))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.launcher_calls(), [])
+        self.assertEqual(state_value(self.archived(), "runner"), "inline")
+        self.assertIsNone(state_value(self.archived(), "launched"))
+        inline_out, inline_err = self.normalise(out), self.normalise(err)
+        self.assertIn("Restore completed", inline_out)
+        self.tearDown_fixture_and_rebuild()
+        rc, out, err = self.finish(self.start())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.normalise(out), inline_out)
+        self.assertEqual(phase_of(self.archived()), "committed")
+        self.assertEqual(state_value(self.archived(), "runner"), "worker")
+        self.assertRegex(state_value(self.archived(), "launched"), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertIn("runs in the background", err)
+        self.assertRegex(err, r"(?m)^Restore: ")
+        self.assertEqual((self.root / "marker").read_text(), "old-root")  # the forward part was only simulated
+        calls = self.launcher_calls(); self.assertEqual(len(calls), 1)
+        args = calls[0]
+        self.assertEqual(args[-4:], ["/bin/bash", f"{self.journal}/recover", "worker", HEX_ID])
+        self.assertIn(f"--description=VesselStack restore {STAMP}", args)
+        for needed in ("--unit=run-vesselstack-restore", "--collect", "--quiet"):
+            self.assertIn(needed, args)
+        for prop in ("Type=exec", "KillMode=mixed", "TimeoutStopSec=10min", "After=docker.service", "IgnoreOnIsolate=yes"):
+            self.assertEqual(args[args.index(prop) - 1], "-p", prop)
+        self.assertNotIn("--wait", args); self.assertNotIn("--pipe", args)
+        self.assertFalse((self.base / "launcher-bad-args").exists())
+        from common.lifecycle_lock import lock_path
+        lock = os.stat(lock_path(self.root, self.base))
+        for idents in (json.loads(line) for line in (self.base / "launcher-fds").read_text().splitlines()):
+            self.assertNotIn([lock.st_dev, lock.st_ino], idents, "the lifecycle lock descriptor was passed to the launcher")
+
+    def tearDown_fixture_and_rebuild(self):
+        """Put the fixture back as it was before the restore (the archived record of the first run is dropped)."""
+        shutil.rmtree(self.restore_dir, ignore_errors=True)
+        for tree in (self.root, self.data):
+            staged = self.stage / "vesselstack-backup" / str(tree).lstrip("/")
+            staged.mkdir(parents=True, exist_ok=True); (staged / "marker").write_text("new")
+
+    def test_the_worker_has_only_what_a_transient_unit_gets_and_the_foreground_gave_up_the_lock(self):
+        from common.lifecycle_lock import LifecycleLock, LifecycleLockBusy
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging")
+        self.assertIsNone(proc.poll(), "the foreground is still following while the worker holds the lock")
+        worker = self.worker_pid(); self.assertNotEqual(worker, proc.pid)
+        envs = list(self.base.glob("worker-env.*")); self.assertEqual(len(envs), 1)
+        names = {line.split("=", 1)[0] for line in envs[0].read_text().splitlines()}
+        self.assertNotIn("VESSELSTACK_TEST_SYSTEMD_RUN", names); self.assertNotIn("VESSELSTACK_ENV", names)
+        self.assertNotIn("VESSELSTACK_RESTORE_FOLLOW_INTERVAL", names)
+        self.assertIn("VESSELSTACK_SYSTEM_ROOT", names)  # from the journal, through the recover wrapper
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VESSELSTACK_LIFECYCLE_LOCK_FD", None)
+            with self.assertRaises(LifecycleLockBusy):
+                LifecycleLock(self.root, self.base).acquire()
+        self.mode("release", "")
+        rc, out, err = self.finish(proc)
+        self.assertEqual(rc, 0, err)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VESSELSTACK_LIFECYCLE_LOCK_FD", None)
+            # The result file is written just before the worker (and the lock helper around it) exits.
+            deadline = time.time() + 10
+            while True:
+                try:
+                    LifecycleLock(self.root, self.base).acquire().release()
+                    break
+                except LifecycleLockBusy:
+                    if time.time() > deadline:
+                        raise
+                    time.sleep(0.05)
+
+    def test_a_failing_restore_passes_its_status_and_messages_through(self):
+        results = {}
+        for mode, status in (("fail1", 1), ("fail3", 3)):
+            for foreground in (True, False):
+                if results:
+                    self.tearDown_fixture_and_rebuild()
+                self.mode("ctl-mode", mode)
+                rc, out, err = self.finish(self.start(*(["--foreground"] if foreground else [])))
+                self.assertEqual(rc, status, err)
+                self.assertIn("Restore failed: simulated failure", err)
+                self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+                results[(mode, foreground)] = (rc, self.normalise(out))
+            self.assertEqual(results[(mode, True)], results[(mode, False)])
+
+    # ---- signals and re-attaching ----
+    def test_a_signal_in_the_following_foreground_only_stops_following(self):
+        for sig, code in ((signal.SIGINT, 130), (signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(sig=sig.name):
+                if (self.base / "release").exists():
+                    (self.base / "release").unlink(); (self.base / "hanging").unlink()
+                    self.wait_for_lock_free()  # the previous worker (and the lock helper around it) has really ended
+                    self.tearDown_fixture_and_rebuild()
+                    for old in self.base.glob("worker-env.*"): old.unlink()
+                self.mode("ctl-mode", "hang")
+                proc = self.start()
+                self.wait_for(self.base / "hanging")
+                worker = self.worker_pid()
+                os.kill(proc.pid, sig)
+                rc, out, err = self.finish(proc)
+                self.assertEqual(rc, code, err)
+                self.assertIn("The restore continues in the background. Follow it: sudo vesselstackctl restore --status --follow", err)
+                os.kill(worker, 0)  # the worker was not signalled
+                self.mode("release", "")
+                self.wait_for(self.restore_dir / f"worker-{HEX_ID}.rc")
+                self.assertEqual((self.restore_dir / f"worker-{HEX_ID}.rc").read_text(), "0\n")
+                self.assertEqual(phase_of(self.archived()), "committed")
+
+    def wait_for_lock_free(self, timeout=60):
+        """The lifecycle lock can be taken: the worker of an earlier run in this test has ended. Bounded."""
+        from common.lifecycle_lock import LifecycleLock, LifecycleLockBusy
+        deadline = time.time() + timeout
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VESSELSTACK_LIFECYCLE_LOCK_FD", None)
+            while True:
+                try:
+                    LifecycleLock(self.root, self.base).acquire().release()
+                    return
+                except LifecycleLockBusy:
+                    if time.time() > deadline:
+                        self.fail("the lifecycle lock is still held by an earlier run\n" + self.diagnostics())
+                    time.sleep(0.05)
+
+    def wait_for_runner(self, timeout=30):
+        """The journal exists and has been handed to a worker (runner=worker)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if state_value(self.journal, "runner") == "worker":
+                    return
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.fail("the journal was not handed to a worker")
+
+    def test_a_signal_in_the_launch_window_says_the_restore_may_still_start(self):
+        self.mode("launcher-mode", "never")
+        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="30")
+        self.wait_for_runner()
+        time.sleep(1)  # the follower has installed its traps
+        os.kill(proc.pid, signal.SIGINT)
+        rc, out, err = self.finish(proc)
+        self.assertEqual(rc, 130, err)
+        self.assertIn("The background restore has not started yet and may still start. Follow it: sudo vesselstackctl restore --status --follow", err)
+        self.assertNotIn("No restore worker is running now", err)
+        self.assertEqual(phase_of(self.journal), "prepared")  # nothing was cancelled
+
+    def test_status_follow_waits_for_a_worker_in_the_launch_window(self):
+        self.mode("launcher-mode", "never")
+        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="30")
+        self.wait_for_runner()
+        proc.kill(); proc.wait()
+        # no worker appears: the normal status and the way to roll back, after the launch wait
+        start = time.time()
+        rc, out, err = self.run_ctl("restore", "--status", "--follow", VESSELSTACK_RESTORE_LAUNCH_WAIT="2")
+        self.assertGreaterEqual(time.time() - start, 1.0)  # whole seconds: it can fire up to one second early
+        self.assertEqual(rc, 0, err)
+        self.assertIn("A restore did not finish.", out)
+        self.assertIn(f"sudo {self.journal}/recover rollback", out)
+        # a worker that appears during the wait is followed to its end
+        self.mode("ctl-mode", "hang")
+        def late_worker():
+            time.sleep(1)
+            env = {"PATH": self.env()["PATH"], "VESSELSTACK_BOOT_ID_FILE": _BOOT_FILE}
+            self.procs.append(subprocess.Popen(["/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()], "bash", str(self.journal / "recover"), "worker", HEX_ID],
+                                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+            self.wait_for(self.base / "hanging")
+            self.mode("release", "")
+        thread = threading.Thread(target=late_worker); thread.start()
+        try:
+            rc, out, err = self.run_ctl("restore", "--status", "--follow", VESSELSTACK_RESTORE_LAUNCH_WAIT="20")
+        finally:
+            thread.join()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Restore completed", out)
+
+    def test_a_missing_boot_id_file_prints_nothing_to_stderr(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging"); self.worker_pid()
+        proc.kill(); proc.wait()
+        rc, out, err = self.run_ctl("status", VESSELSTACK_BOOT_ID_FILE=str(self.base / "no-such-boot-id"))
+        self.assertIn("Restore              RUNNING (phase stopping)", out)
+        self.assertNotIn("No such file", err)
+        self.assertEqual(err, "")
+
+    def test_status_follow_attaches_to_a_running_worker_and_then_reports_the_last_result(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging"); self.worker_pid()
+        proc.kill(); proc.wait()  # the connection dropped
+        rc, out, err = self.run_ctl("restore", "--status")
+        first = out.splitlines()[0]
+        self.assertEqual(first, "A restore is running in the background (phase: stopping). Follow it: sudo vesselstackctl restore --status --follow")
+        rc, out, err = self.run_ctl("status")
+        self.assertEqual(rc, 1)
+        self.assertIn("Restore              RUNNING (phase stopping); follow: sudo vesselstackctl restore --status --follow", out)
+        rc, out, err = self.run_ctl("doctor")
+        self.assertIn("WARN restore RUNNING (phase stopping); follow: sudo vesselstackctl restore --status --follow", err)
+        self.assertNotIn("FAIL restore", err)
+        rc, out, err = self.run_ctl("restore-recover", "status")
+        self.assertEqual(out.splitlines()[0], "A restore is running in the background (phase: stopping). Follow it: sudo vesselstackctl restore --status --follow")
+        timer = threading.Timer(1.0, lambda: (self.base / "release").write_text("")); timer.start()
+        try:
+            rc, out, err = self.run_ctl("restore", "--status", "--follow")
+        finally:
+            timer.join()
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Restore completed", out)
+        rc, out, err = self.run_ctl("restore", "--status", "--follow")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[0], "No restore is pending.")
+        self.assertRegex(out.splitlines()[1], r"^The last restore that ran in the background completed at \d{4}-")
+        self.assertEqual(self.run_ctl("restore", "--status")[1], "No restore is pending.\n")
+        # a failed one is reported with its status, and a follow of it ends with that status
+        self.tearDown_fixture_and_rebuild()
+        for path in self.restore_dir.glob("worker-*"): path.unlink()
+        self.mode("ctl-mode", "fail3")
+        self.assertEqual(self.finish(self.start())[0], 3)
+        rc, out, err = self.run_ctl("restore", "--status", "--follow")
+        self.assertRegex(out.splitlines()[1], r"^The last restore that ran in the background failed \(exit status 3\) at ")
+
+    def test_status_follow_is_not_refused_by_the_lock_and_needs_no_pending_restore(self):
+        text = CONTROLLER.read_text()
+        a = text.index("command_needs_lifecycle_lock() {")
+        body = text[a:text.index("\n}\n", a)]
+        self.assertIn('[ "${2:-}" = --status ] && [ "${3:-}" = --follow ] && [ "$#" -eq 3 ] && return 1', body)
+        self.assertEqual(self.run_ctl("restore", "--status", "--follow")[1], "No restore is pending.\n")
+        self.assertEqual(self.run_ctl("restore", "--status", "--bogus")[0], 2)
+
+    # ---- the hand-off goes wrong ----
+    def test_a_launcher_that_fails_cancels_the_restore_and_changes_nothing(self):
+        self.mode("launcher-mode", "fail")
+        rc, out, err = self.finish(self.start())
+        self.assertEqual(rc, 1, err)
+        self.assertIn("The restore could not be started in the background: Failed to start transient service", err)
+        self.assertIn("--foreground", err)
+        self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+        self.assert_untouched()
+        self.assertEqual(list(self.restore_dir.glob("worker-*")), [])
+
+    def test_a_launcher_that_fails_after_the_worker_started_leaves_a_late_worker_harmless(self):
+        self.mode("launcher-mode", "start-then-fail")
+        rc, out, err = self.finish(self.start())
+        self.assertEqual(rc, 1, err)
+        self.assert_untouched()
+        time.sleep(3)  # the worker has been waiting for the lock; it now gets it, finds no restore and ends
+        self.assertEqual(list(self.restore_dir.glob("worker-*")), [])
+        self.assertFalse(self.journal.exists())
+        self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+
+    def test_a_worker_that_never_appears_is_cancelled_after_the_wait(self):
+        self.mode("launcher-mode", "never")
+        start = time.time()
+        rc, out, err = self.finish(self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="2"))
+        self.assertEqual(rc, 1, err)
+        # the follower counts whole seconds with $SECONDS, so it can fire up to one second early
+        self.assertGreaterEqual(time.time() - start, 2 - 1)
+        self.assertIn("The restore did not start in the background. Nothing was changed", err)
+        self.assert_untouched()
+        self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+
+    def test_the_cancel_never_touches_a_restore_that_is_no_longer_prepared(self):
+        install = lambda: (self.restore_dir.mkdir(mode=0o700, exist_ok=True), shutil.copytree(self.base / "prebuilt", self.journal, symlinks=True))
+        install()
+        subprocess.run([sys.executable, "-I", str(self.journal / "restore_journal.py"), "set", str(self.journal), "phase=data-swap"], check=True)
+        rc, out, err = self.run_ctl("restore-recover", "unlaunched", HEX_ID)
+        self.assertEqual(rc, 4, err)
+        self.assertEqual(phase_of(self.journal), "data-swap"); self.assertTrue(self.stage.exists())
+        for other in ("0" * 32, "bad"):
+            self.assertEqual(self.run_ctl("restore-recover", "unlaunched", other)[0], 4)
+        self.assertEqual(phase_of(self.journal), "data-swap")
+        # prepared, but a worker already wrote its pid: also left alone
+        subprocess.run([sys.executable, "-I", str(self.journal / "restore_journal.py"), "set", str(self.journal), "phase=prepared"], check=True)
+        (self.restore_dir / f"worker-{HEX_ID}.pid").write_text("1\n")
+        self.assertEqual(self.run_ctl("restore-recover", "unlaunched", HEX_ID)[0], 4)
+        self.assertEqual(phase_of(self.journal), "prepared")
+        (self.restore_dir / f"worker-{HEX_ID}.pid").unlink()
+        rc, out, err = self.run_ctl("restore-recover", "unlaunched", HEX_ID)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.journal.exists()); self.assertFalse(self.stage.exists())
+
+    def test_a_worker_that_is_killed_is_reported_and_the_restore_can_be_rolled_back(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging")
+        os.kill(self.worker_pid(), signal.SIGKILL)
+        rc, out, err = self.finish(proc)
+        self.assertEqual(rc, 1, err)
+        self.assertIn(f"The restore worker stopped in phase stopping the running stack; no folder had been moved. Run: sudo {self.journal}/recover status", err)
+        self.assertEqual(phase_of(self.journal), "stopping")
+        result = subprocess.run([str(self.journal / "recover"), "rollback"], capture_output=True, text=True, timeout=60,
+                                env=self.env(VESSELSTACK_ROOT="/wrong"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Rollback completed", result.stdout)
+        self.assertFalse(self.journal.exists())
+        self.assertEqual((self.root / "marker").read_text(), "old-root")
+
+    def test_a_second_restore_while_one_runs_is_refused_before_anything_happens(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging"); self.worker_pid()
+        rc, out, err = self.run_ctl("restore", "y.tar.gz", "--yes")
+        self.assertEqual(rc, 1)
+        self.assertIn("A restore did not finish (phase: stopping). Nothing else can change this system until it is resolved.", err)
+        self.assertEqual(len(self.launcher_calls()), 1)
+        self.assertEqual(phase_of(self.journal), "stopping")
+        self.mode("release", "")
+        self.assertEqual(self.finish(proc)[0], 0)
+
+    # ---- when it still runs in the terminal ----
+    def test_without_systemd_or_a_launcher_the_restore_runs_inline(self):
+        shutil.rmtree(self.base / "run/systemd/system")
+        rc, out, err = self.finish(self.start())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.launcher_calls(), [])
+        self.assertEqual(state_value(self.archived(), "runner"), "inline")
+        self.tearDown_fixture_and_rebuild()
+        (self.base / "run/systemd/system").mkdir(parents=True)
+        rc, out, err = self.finish(self.start(VESSELSTACK_TEST_SYSTEMD_RUN=str(self.base / "no-such-launcher")))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.launcher_calls(), [])
+        self.assertEqual(state_value(self.archived(), "runner"), "inline")
+        self.tearDown_fixture_and_rebuild()
+        env = self.env(); env.pop("VESSELSTACK_TEST_SYSTEMD_RUN")
+        proc = subprocess.run(["bash", str(self.ctl), "restore", "x.tar.gz", "--yes"], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.launcher_calls(), [])
+
+    def test_the_decision_to_detach_is_one_function(self):
+        text = CONTROLLER.read_text()
+        a = text.index("restore_can_detach() {"); body = text[a:text.index("\n}\n", a)]
+        for needle in ('restore_foreground', "restore_systemd_running", "command -v systemd-run", "VESSELSTACK_TEST_SYSTEMD_RUN"):
+            self.assertIn(needle, body)
+
+    def test_a_signal_before_the_journal_exists_removes_the_stage_and_leaves_no_journal(self):
+        for sig, code in ((signal.SIGINT, 130), (signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(sig=sig.name):
+                self.mode("early-hold", "")
+                proc = self.start()
+                time.sleep(1.0)
+                self.assertIsNone(proc.poll())
+                os.kill(proc.pid, sig)
+                rc, out, err = self.finish(proc)
+                self.assertEqual(rc, code, err)
+                self.assertIn("interrupted before anything was changed", err)
+                self.assertFalse(self.stage.exists()); self.assertFalse(self.journal.exists())
+                self.assertEqual((self.root / "marker").read_text(), "old-root")
+                (self.base / "early-hold").unlink()
+                self.tearDown_fixture_and_rebuild()
+
+    # ---- a restore is "running" only while its worker process is ----
+    def install_pending(self, phase="stopping"):
+        self.restore_dir.mkdir(mode=0o700, exist_ok=True)
+        shutil.copytree(self.base / "prebuilt", self.journal, symlinks=True)
+        subprocess.run([sys.executable, "-I", str(self.journal / "restore_journal.py"), "set", str(self.journal), f"phase={phase}"], check=True)
+
+    def unrelated_process(self):
+        proc = subprocess.Popen(["sleep", "120"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.procs.append(proc)  # its own session: the clean-up may signal its group
+        return proc
+
+    def assert_not_running(self, label):
+        rc, out, err = self.run_ctl("doctor")
+        self.assertIn("FAIL restore did not finish (phase stopping)", err, label)
+        self.assertNotIn("RUNNING", err, label)
+        rc, out, err = self.run_ctl("status")
+        self.assertIn("Restore              INCOMPLETE (phase stopping)", out, label)
+        rc, out, err = self.run_ctl("restore-recover", "status")
+        self.assertEqual(out.splitlines()[0], "A restore did not finish.", label)
+        self.assertIn(f"sudo {self.journal}/recover rollback", out, label)
+        rc, out, err = self.run_ctl("restore", "--status", "--follow", timeout=30)
+        self.assertEqual(out.splitlines()[0], "A restore did not finish.", label)
+        self.assertNotIn("Follow it", out, label)
+
+    def test_a_pid_file_that_does_not_belong_to_a_live_worker_is_not_a_running_restore(self):
+        self.install_pending(); other = self.unrelated_process()
+        dead = subprocess.Popen(["true"]); dead.wait()
+        pidfile = self.restore_dir / f"worker-{HEX_ID}.pid"
+        cases = {"another boot, a live unrelated pid": f"{other.pid} 11111111-2222-4333-8444-555555555555\n",
+                 "this boot, a live unrelated pid": f"{other.pid} {BOOT_ID}\n",
+                 "an old file with only a pid, unrelated": f"{other.pid}\n",
+                 "this boot, a dead pid": f"{dead.pid} {BOOT_ID}\n",
+                 "not a pid": f"abc {BOOT_ID}\n",
+                 "too many fields": f"{other.pid} {BOOT_ID} x\n"}
+        for label, text in cases.items():
+            with self.subTest(label):
+                pidfile.write_text(text)
+                self.assert_not_running(label)
+
+    def test_the_genuine_worker_is_running_with_either_form_of_pid_file(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start()
+        self.wait_for(self.base / "hanging")
+        pid = self.worker_pid()
+        pidfile = self.restore_dir / f"worker-{HEX_ID}.pid"
+        self.assertEqual(pidfile.read_text(), f"{pid} {BOOT_ID}\n")
+        for text in (f"{pid} {BOOT_ID}\n", f"{pid}\n", f"{pid} -\n"):
+            with self.subTest(text=text):
+                pidfile.write_text(text)
+                rc, out, err = self.run_ctl("restore-recover", "status")
+                self.assertEqual(out.splitlines()[0], "A restore is running in the background (phase: stopping). Follow it: sudo vesselstackctl restore --status --follow")
+        pidfile.write_text(f"{pid} 11111111-2222-4333-8444-555555555555\n")
+        self.assertEqual(self.run_ctl("restore-recover", "status")[1].splitlines()[0], "A restore did not finish.")
+        pidfile.write_text(f"{pid} {BOOT_ID}\n")
+        self.mode("release", "")
+        self.assertEqual(self.finish(proc)[0], 0)
+
+    def test_the_pid_file_holds_a_dash_when_the_boot_id_cannot_be_read(self):
+        self.mode("ctl-mode", "hang")
+        proc = self.start(VESSELSTACK_BOOT_ID_FILE=str(self.base / "no-boot-id"))
+        self.wait_for(self.base / "hanging")
+        pid = self.worker_pid()
+        self.assertEqual((self.restore_dir / f"worker-{HEX_ID}.pid").read_text(), f"{pid} -\n")
+        self.assertIn("A restore is running in the background", self.run_ctl("restore-recover", "status")[1])
+        self.mode("release", "")
+        self.assertEqual(self.finish(proc)[0], 0)
+
+    # ---- the follower never waits for ever ----
+    def test_a_follower_ends_when_the_restore_was_rolled_back_from_another_terminal(self):
+        self.mode("launcher-mode", "never")
+        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="4")
+        self.wait_for(self.base / "launcher.log")
+        for _ in range(50):
+            rc, out, err = self.run_ctl("restore-recover", "rollback")
+            if rc == 0:
+                break
+            time.sleep(0.1)
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.finish(proc, timeout=30)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("The restore is no longer pending: it was rolled back or cancelled by another command. See: sudo vesselstackctl restore --status", err)
+        self.assertNotIn("did not start in the background", err)
+
+    def test_a_follower_ends_when_the_restore_was_abandoned_from_another_terminal(self):
+        self.mode("launcher-mode", "never")
+        proc = self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="4")
+        self.wait_for(self.base / "launcher.log")
+        for _ in range(50):
+            rc, out, err = self.run_ctl("restore-recover", "abandon", "--yes")
+            if rc == 0:
+                break
+            time.sleep(0.1)
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.finish(proc, timeout=30)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("The restore is no longer pending", err)
+
+    def test_the_cancel_is_tried_three_times_through_the_journals_own_controller(self):
+        self.mode("launcher-mode", "never")
+        calls = self.base / "controller-calls"
+        stub = self.base / "prebuilt" / "controller"
+        stub.write_text(f'#!/bin/bash\necho "$@" >> "{calls}"\nexit 75\n')
+        rc, out, err = self.finish(self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="1"), timeout=60)
+        self.assertEqual(rc, 1, err)
+        self.assertIn(f"The restore did not start in the background and could not be cancelled; run: sudo {self.journal}/recover status", err)
+        self.assertEqual(calls.read_text().splitlines(), [f"restore-recover unlaunched {HEX_ID}"] * 3)
+        self.assertEqual(phase_of(self.journal), "prepared")
+
+    def test_the_cancel_runs_the_journals_controller_not_the_one_that_follows(self):
+        self.mode("launcher-mode", "never")
+        calls = self.base / "controller-calls"
+        (self.base / "prebuilt" / "controller").write_text(f'#!/bin/bash\necho "$@" >> "{calls}"\nexit 0\n')
+        rc, out, err = self.finish(self.start(VESSELSTACK_RESTORE_LAUNCH_WAIT="1"), timeout=60)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("The restore did not start in the background. Nothing was changed", err)
+        self.assertEqual(calls.read_text().splitlines(), [f"restore-recover unlaunched {HEX_ID}"])
+
+    def test_an_attached_follower_ends_when_the_worker_is_killed(self):
+        self.mode("ctl-mode", "hang")
+        first = self.start()
+        self.wait_for(self.base / "hanging")
+        worker = self.worker_pid()
+        attached = self.start(command=("restore", "--status", "--follow"))
+        time.sleep(1.0)
+        self.assertIsNone(attached.poll())
+        os.kill(worker, signal.SIGKILL)
+        rc, out, err = self.finish(attached, timeout=30)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("The restore worker stopped in phase", err)
+        self.assertEqual(self.finish(first, timeout=30)[0], 1)
+
+    def test_a_signal_while_no_worker_runs_does_not_claim_one_continues(self):
+        # a worker that started (pid file written) and was killed without writing its result, signalled
+        # while the follower is still inside its dead-worker grace period
+        self.mode("ctl-mode", "hang")
+        proc = self.start(VESSELSTACK_RESTORE_DEAD_GRACE="60")
+        self.wait_for(self.base / "hanging")
+        os.kill(self.worker_pid(), signal.SIGKILL)
+        time.sleep(1.5)
+        self.assertIsNone(proc.poll())
+        self.assertFalse((self.restore_dir / f"worker-{HEX_ID}.rc").exists())
+        os.kill(proc.pid, signal.SIGTERM)
+        rc, out, err = self.finish(proc, timeout=30)
+        self.assertEqual(rc, 143, err)
+        self.assertNotIn("continues in the background", err)
+        self.assertNotIn("may still start", err)
+        self.assertIn("Stopped following. No restore worker is running now. See: sudo vesselstackctl restore --status", err)
+
+    def test_the_follower_reads_the_journal_again_only_when_its_state_file_changed(self):
+        text = CONTROLLER.read_text()
+        a = text.index("restore_follow() {"); body = text[a:text.index("\n}\n", a)]
+        self.assertIn("restore_state_stamp", body)
+        self.assertEqual(body.count("restore_state_peek"), 2)
+        self.assertIn('stat -c', text[text.index("restore_state_stamp() {"):text.index("restore_follow_signal() {")])
+        self.assertIn('stat -f', text[text.index("restore_state_stamp() {"):text.index("restore_follow_signal() {")])
+
+    # ---- the result of the last background restore ----
+    def test_status_follow_reports_a_result_only_for_the_newest_set_of_worker_files(self):
+        self.restore_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        old_id, new_id = "a" * 32, "b" * 32
+        for ext in ("pid", "out", "err", "rc"):
+            path = self.restore_dir / f"worker-{old_id}.{ext}"; path.write_text("0\n" if ext == "rc" else "x")
+            os.utime(path, (1_000_000, 1_000_000))
+        pid = self.restore_dir / f"worker-{new_id}.pid"; pid.write_text("1 -\n"); os.utime(pid, (2_000_000, 2_000_000))
+        rc, out, err = self.run_ctl("restore", "--status", "--follow", timeout=30)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.splitlines()[0], "No restore is pending.")
+        self.assertEqual(out.splitlines()[1], "The last background restore did not run to the end or was cancelled; no result was recorded for it.")
+        self.assertNotIn("completed", out)
+        result = self.restore_dir / f"worker-{new_id}.rc"; result.write_text("3\n"); os.utime(result, (2_000_100, 2_000_100))
+        rc, out, err = self.run_ctl("restore", "--status", "--follow", timeout=30)
+        self.assertRegex(out.splitlines()[1], r"^The last restore that ran in the background failed \(exit status 3\) at ")
+
+    def test_cleanup_never_signals_a_pid_read_from_a_worker_pid_file(self):
+        """The clean-up once read worker-*.pid and killpg(1, SIGKILL) took down the whole CI runner. It must not signal
+        any pid a test planted there, nor 0/1, the test runner, its parent or any group of theirs, whatever else is written."""
+        self.restore_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        planted = {"1 -": "a" * 32, f"{os.getpid()} -": "b" * 32, f"{os.getppid()} {BOOT_ID}": "c" * 32, f"{os.getpgrp()}": "d" * 32}
+        for text, ident in planted.items():
+            (self.restore_dir / f"worker-{ident}.pid").write_text(text + "\n")
+        forbidden = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        calls = []
+        def record(kind):
+            return lambda target, sig: calls.append((kind, target, sig))
+        with mock.patch.object(os, "kill", record("kill")), mock.patch.object(os, "killpg", record("killpg")):
+            self.stop_everything()
+            self.assertEqual(calls, [], "the pid files were used to signal something")
+            # even a launcher record that names such pids (it never does) cannot make the clean-up signal them
+            (self.base / "started-workers.log").write_text("".join(f"{pid} {pgid}\n" for pid in forbidden for pgid in forbidden) + "junk\n")
+            with mock.patch.object(type(self), "own_process", lambda self, pid: True):
+                self.stop_everything()
+        self.assertEqual([call for call in calls if call[1] in forbidden or call[1] < 0], [], calls)
+        (self.base / "started-workers.log").unlink()
 
 if __name__ == "__main__":
     unittest.main()

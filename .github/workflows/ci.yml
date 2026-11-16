@@ -40,6 +40,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Real systemd browser update acceptance
         run: sudo env VESSELSTACK_SYSTEMD_UPDATE_TEST=true tests/test-browser-update-systemd.sh
+      - name: Real systemd background restore launch
+        run: sudo env VESSELSTACK_SYSTEMD_RESTORE_TEST=true tests/test-restore-detach-systemd.sh
       - name: Public-source privacy check
         run: python3 scripts/check-public-tree.py
       - name: Static distribution checks
@@ -74,6 +76,7 @@ jobs:
       - name: Validate Linux ARM64 image manifests
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
+        timeout-minutes: 20
         run: |
           trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX")
           trap 'rm -rf -- "$trusted_test_tmp"' EXIT

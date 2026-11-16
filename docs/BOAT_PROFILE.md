@@ -6,6 +6,8 @@ telemetry. If the file is absent, consumers use the legacy diagnostic default:
 port/starboard combustion engines, a house bank, and fuel tanks `0` and `1`.
 Malformed or unsafe files are errors and never silently fall back.
 
+## Commands
+
 Use the standalone CLI (from the repository root):
 
 ```bash
@@ -30,6 +32,8 @@ and are written mode `0640`; when run as root, ownership is `root:vesselstack`
 when that group exists. A successful change is picked up on the next consumer
 refresh; this module does not restart or mutate services.
 
+## Schema
+
 Schema version 1 requires exact fields and safe Signal K paths. IDs and paths
 must be unique. Empty arrays mean that capability is absent. Engine kinds are
 `combustion` or `electric`; battery roles are `house`, `starter`, or `other`.
@@ -38,8 +42,24 @@ electric engines when omitted.
 When `primary_battery_bank` is set, it must identify a battery bank whose role
 is `house`; solar and battery summaries use that bank consistently.
 
+## How Boat Chat uses the profile
+
 Boat Chat and the telemetry indexer read this profile at request/refresh
 boundaries. It does not automatically generate Home Assistant, Grafana, or
 display mappings; those integrations retain their own configuration. Profile
 extensions should preserve the schema and capability semantics above, with
 consumers explicitly updated and tested before relying on new fields.
+
+Boat Chat reads the optional `config/boat-profile.json` on each request and
+telemetry-indexer run. The validated shared profile controls engine, battery
+bank, and fuel-tank paths and labels; a missing file uses the historical
+two-engine profile. A malformed file remains actionable in chat/settings while
+profile-dependent analytics are reported unavailable. Derived cache keys and
+power observations include the profile fingerprint, so changing equipment
+takes effect without a restart and never joins energy intervals across profiles.
+Paired port/starboard comparisons are only available for the exact legacy
+paths and capabilities; display labels and declaration order do not affect
+compatibility. Arbitrary profiles receive an explicit unsupported diagnostic.
+
+Fuel totals and power integration, which also depend on the equipment described here, are in
+[Boat Chat setup: Fuel totals and power integration](BOAT_CHAT.md#fuel-totals-and-power-integration).

@@ -865,8 +865,10 @@ class CliTests(unittest.TestCase):
         cfg = self.cfg()
         cfg["heartbeat_s"] = 2
         self.config.write_text(json.dumps(cfg))
-        line = self.bridge_line(self.service("online", "2026-03-01T12:00:00Z") + "\n")   # 12 s old, limit 6
-        self.assertIn("last reported online 12 s ago", line)
+        line = self.bridge_line(self.service("online", "2026-03-01T11:59:50Z") + "\n")   # 22 s old, limit 17
+        self.assertIn("last reported online 22 s ago", line)
+        line = self.bridge_line(self.service("online", "2026-03-01T12:00:00Z") + "\n")   # 12 s old: 3 x 2 s is no limit
+        self.assertIn("online (reported 12 s ago)", line)
         line = self.bridge_line(self.service("online", "2026-03-01T12:00:08Z") + "\n")   # 4 s old
         self.assertIn("online (reported 4 s ago)", line)
 

@@ -21,7 +21,19 @@ release marked Latest. A boat should stay on 0.8.0 until 0.9.0 is promoted.
   the installer refuse to run. Run `sudo /var/lib/vesselstack/restore/current/recover status`, then
   `recover rollback` if you need to go back. See
   [If a restore is interrupted](../README.md#if-a-restore-is-interrupted).
-- `vesselstackctl status` exits non-zero while an installation or restore is unfinished.
+- `vesselstackctl status` exits non-zero while an installation or restore is unfinished. The Control
+  Panel, a browser-started update and the boat profile command also report that VesselStack is busy
+  then.
+- A restore now runs in the background unit `run-vesselstack-restore`: a closed terminal does not
+  interrupt it, and `sudo vesselstackctl restore --status --follow` re-attaches. After a power loss
+  during a restore, the next boot rolls it back (`boot-vesselstack-restore.service`, installed and
+  enabled by the installer). Set `VESSELSTACK_RESTORE_AT_BOOT="hold"` to opt out, or use
+  `--foreground`. Services still start before that recovery stops them. See
+  [Recovery at boot](../README.md#recovery-at-boot).
+- Displays need a rebuild and reflash (`sudo vesselstackctl display build ID`, then `display flash
+  ID`) to get the new alarm banner. The new firmware needs this release's bridge. To go back, reflash
+  with `sudo vesselstackctl display flash ID --previous`. See
+  [Instrument displays (preview)](../README.md#instrument-displays-preview).
 
 All upgrade notes, the list of settings to turn each new feature off, and rollback are in
 [Upgrading to 0.9.0](../README.md#upgrading-to-090) and in the `0.9.0` section of

@@ -69,8 +69,9 @@ STATUS_FONTS = {"lg": "font_status_lg", "sm": "font_status_sm"}
 TAP_TIME = "0ms"
 BANNER_COLOR = 0xC62828
 BANNER_HEIGHT = 96
-BANNER_GLYPHS = "0123456789+ ALRMS"   # "<n> ALARM(S)" and "99+": the only text the banner composes
+BANNER_GLYPHS = "0123456789+ ALRMSDNOT"   # "<n> ALARM(S)", "<n> NO DATA" and "99+": the only text the banner composes
 BANNER_COUNT_MAX = 99
+LOGIC_HEADER = "app/vesselstack_logic.h"   # the banner decisions, host-tested; included by the device YAML
 BANNER_FLASH_INTERVAL = "500ms"
 HEADER_CLOCK_X = -24      # clock label centre, relative to the screen's middle
 HEADER_DOT_X = (13, 27, 41)   # SignalK, bridge, MQTT status dots (centres, same reference)
@@ -400,9 +401,13 @@ def item_topic(config: dict, iid: str) -> str:
 
 
 def item_limit_ms(config: dict, iid: str, heartbeat_s: int) -> int:
-    """How long without a message before an item's tile is blanked (milliseconds)."""
+    """How long without a message before an item's tile is blanked (milliseconds).
+
+    A word item (notification, Home Assistant) is republished by the bridge on its tick, like the summary,
+    so it gets the bridge link limit; an instrument is judged by its own staleness rule.
+    """
     if is_word(config, iid):
-        return 3 * heartbeat_s * 1000
+        return summary_stale_ms(heartbeat_s)
     return stale_threshold_s(config["instruments"][iid], heartbeat_s) * 1000
 
 
@@ -976,7 +981,7 @@ def _gauge_lines(config: dict, display: dict, iid: str, heartbeat: int, night: b
     kinds = {gauge_kind(page) for _, page in pages}
     lines = [
         "      - lambda: |-",
-        "          bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
+        f"          bool fresh = {_link_expr(heartbeat)}"
         f" && id(ins_{iid}_ok) && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL;",
         f"          float n = id(ins_{iid}_num);",
     ]
@@ -1189,7 +1194,7 @@ def _electrical_page(config: dict, board: dict, display: dict, pi: int, page: di
 
 
 def _fresh_expr(config: dict, iid: str, heartbeat: int) -> str:
-    return (f"id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_{iid}_ok)"
+    return (f"{_link_expr(heartbeat)} && id(ins_{iid}_ok)"
             f" && (millis() - id(ins_{iid}_seen)) < {item_limit_ms(config, iid, heartbeat)}UL")
 
 
@@ -1473,8 +1478,22 @@ def _fonts_lines(display: dict, config: dict) -> list:
     return lines
 
 
+def expected_unit_tag(config: dict, iid: str) -> str:
+    """The ``cu`` the bridge puts in this item's payload, computed with the bridge's own expression.
+
+    An instrument: ``Engine._cu`` (convert, unit, precision from the instrument). A numeric Home
+    Assistant item: ``HaEngine._emit`` (``"ha"``, its unit, its precision), read from the ``ha``
+    entry itself because the generator's merged view leaves out what the bridge reads.
+    """
+    item = (config.get("ha") or {}).get(iid)
+    if item is not None:
+        return topics.unit_tag("ha", item.get("unit", ""), item.get("precision"))
+    inst = config["instruments"][iid]
+    return topics.unit_tag(inst["convert"], inst["unit"], inst["precision"])
+
+
 def _json_handler(iid: str, decimals: int, with_sev: bool = False, numeric: bool = False,
-                  topic: str | None = None) -> list:
+                  topic: str | None = None, tag: str = "") -> list:
     sev_lines = []
     if with_sev:
         sev_lines = [
@@ -1488,8 +1507,18 @@ def _json_handler(iid: str, decimals: int, with_sev: bool = False, numeric: bool
         "        - lambda: |-",
         '            const char *st = x["st"] | "missing";',
         f"            id(ins_{iid}_seen) = millis();",
-        '            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>();',
+        '            const char *cu = x["cu"] | "";',
+        f'            bool unit_ok = vs_unit_ok(cu, "{tag}");',
+        '            bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>() && unit_ok;',
         f"            id(ins_{iid}_ok) = ok;",
+        "            if (!unit_ok) {",
+        f"              if (!id(ins_{iid}_cuw)) {{",
+        f'                ESP_LOGW("vesselstack", "{iid}: the unit changed on the Pi; rebuild and reflash this display");',
+        f"                id(ins_{iid}_cuw) = true;",
+        "              }",
+        f"            }} else {{",
+        f"              id(ins_{iid}_cuw) = false;",
+        "            }",
         "            if (ok) {",
         "              char buf[VALUE_ACCURACY_MAX_LEN];",
         f'              value_accuracy_to_buf(buf, x["v"].as<float>(), {decimals});',
@@ -1566,7 +1595,7 @@ def _word_lines(config: dict, display: dict, iid: str, heartbeat: int) -> list:
     if is_ha_state(config, iid):
         return _ha_word_lines(config, display, iid, heartbeat)
     limit_ms = item_limit_ms(config, iid, heartbeat)
-    fresh = (f"id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_{iid}_ok)"
+    fresh = (f"{_link_expr(heartbeat)} && id(ins_{iid}_ok)"
              f" && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL")
     lines = []
     for pi, page in enumerate(display["pages"]):
@@ -1596,7 +1625,7 @@ def _sev_lines(config: dict, display: dict, iid: str, heartbeat: int, night: boo
             sets.append((tile, value))
     lines = [
         "      - lambda: |-",
-        "          bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
+        f"          bool fresh = {_link_expr(heartbeat)}"
         f" && id(ins_{iid}_ok) && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL;",
         f"          uint8_t sev = fresh ? id(ins_{iid}_sev) : 0;",
         f"          if (sev != id(ins_{iid}_drawn_sev)) {{",
@@ -1633,15 +1662,35 @@ def alarm_page_index(display: dict) -> int:
 
 
 def summary_stale_ms(heartbeat: int) -> int:
-    """The alarm summary is republished every heartbeat; three missed ones make it stale."""
-    return 3 * heartbeat * 1000
+    """How long the bridge's liveness and alarm summary stay trusted, in ms: max(3 x heartbeat, heartbeat + 15 s).
+
+    Both are only (re)published from the bridge's tick, and its loop can block for about 13 s in a
+    connection attempt (open_timeout 10 s, close_timeout 3 s), so a short heartbeat needs the 15 s
+    margin: three missed beats are not enough when the heartbeat is 1 s.
+    """
+    return max(3 * heartbeat, heartbeat + 15) * 1000
+
+
+def _link_expr(heartbeat: int) -> str:
+    """C++ condition "the bridge is live": it said online, recently, and MQTT is connected.
+
+    The bridge publishes ``online`` every heartbeat and ``offline`` as its last will, but a hung
+    bridge with a working MQTT connection sends neither, so the flag alone is never trusted. The
+    limit is the summary's, and the unsigned subtraction is safe across the millis() wrap.
+    Every liveness test in the generated firmware uses this one expression.
+    """
+    return (f"(id(bridge_online) && (millis() - id(bridge_seen)) < {summary_stale_ms(heartbeat)}UL"
+            " && mqtt::global_mqtt_client->is_connected())")
 
 
 ALARM_GLOBALS = [
     '  - {id: summary_max, type: uint8_t, initial_value: "0"}',      # 0 unknown, 1 ok, 2 warn, 3 alarm
     '  - {id: summary_na, type: int, initial_value: "0"}',
+    '  - {id: summary_nl, type: int, initial_value: "0"}',             # how many counted alarms are lost
+    '  - {id: summary_seq, type: uint32_t, initial_value: "0"}',        # the bridge's counter of new live alarms
+    '  - {id: summary_has_seq, type: bool, initial_value: "false"}',   # false for a bridge older than 0.9.0
     '  - {id: summary_seen, type: uint32_t, initial_value: "0"}',
-    '  - {id: summary_valid, type: bool, initial_value: "false"}',
+    '  - {id: summary_valid, type: bool, initial_value: "false"}',     # a summary has arrived since boot
     '  - {id: summary_first, type: int, initial_value: "-1"}',       # index of ids[0] among this display\'s items
     '  - {id: alarm_rising, type: bool, initial_value: "false"}',
     '  - {id: alarm_dismissed, type: bool, initial_value: "false"}',
@@ -1661,15 +1710,22 @@ def _alarm_handler(used: list, display: dict) -> list:
         '            uint8_t m = strcmp(mx, "ok") == 0 ? 1 : strcmp(mx, "warn") == 0 ? 2 : '
         'strcmp(mx, "alarm") == 0 ? 3 : 0;',
         '            int na = x["na"] | 0;',
+        '            int nl = x["nl"] | 0;',
+        '            bool has_seq = x["seq"].is<uint32_t>();',
+        '            uint32_t seq = has_seq ? x["seq"].as<uint32_t>() : 0;',
         '            const char *id0 = x["ids"][0] | "";',
         "            int first = -1;",
     ]
     for index, iid in enumerate(used):
         lines.append(f'            {"" if index == 0 else "else "}if (strcmp(id0, "{iid}") == 0) first = {index};')
     lines += [
-        "            bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));",
+        "            bool rising = vs_alarm_rising(!id(summary_valid), m, na, has_seq, seq, id(summary_has_seq),"
+        " id(summary_seq), id(summary_max), id(summary_na));",
         "            id(summary_max) = m;",
         "            id(summary_na) = na;",
+        "            id(summary_nl) = nl;",
+        "            id(summary_seq) = seq;",
+        "            id(summary_has_seq) = has_seq;",
         "            id(summary_first) = first;",
         "            id(summary_seen) = millis();",
         "            id(summary_valid) = true;",
@@ -1711,20 +1767,16 @@ def _alarm_script(config: dict, used: list, heartbeat: int) -> list:
         "    mode: restart",
         "    then:",
         "      - lambda: |-",
-        "          bool seen = id(summary_valid) && (millis() - id(summary_seen)) < "
+        "          bool fresh = (millis() - id(summary_seen)) < "
         f"{summary_stale_ms(heartbeat)}UL;",
-        "          if (!seen) {",
-        "            id(summary_max) = 0;",
-        "            id(summary_na) = 0;",
-        "          }",
-        "          bool show = seen && id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
-        " && id(summary_max) == 3 && id(summary_na) > 0 && !id(alarm_dismissed);",
+        f"          bool link = {_link_expr(heartbeat)};",
+        "          int mode = vs_banner_mode(id(summary_valid), fresh, link,"
+        " id(summary_max), id(summary_na), id(summary_nl), id(alarm_dismissed));",
+        "          bool show = mode != VS_BANNER_HIDDEN;",
         "          id(alarm_idx) = show ? id(summary_first) : -1;",
         "          if (show) {",
         "            char buf[16];",
-        f"            snprintf(buf, sizeof(buf), \"%d%s %s\", id(summary_na) > {BANNER_COUNT_MAX} ? "
-        f"{BANNER_COUNT_MAX} : id(summary_na), id(summary_na) > {BANNER_COUNT_MAX} ? \"+\" : \"\", "
-        "id(summary_na) == 1 ? \"ALARM\" : \"ALARMS\");",
+        "            vs_banner_count(buf, sizeof(buf), mode, id(summary_na));",
         "            if (strcmp(lv_label_get_text(id(alarm_banner_count)), buf) != 0)"
         " lv_label_set_text(id(alarm_banner_count), buf);",
         "            lv_obj_clear_flag(id(alarm_banner), LV_OBJ_FLAG_HIDDEN);",
@@ -1835,10 +1887,16 @@ def _ha_message() -> list:
     ]
 
 
-def _clock_handler(display: dict) -> list:
-    """The bridge clock: two integers parsed from ``hm`` (the text itself is never shown) and the flag."""
+def _clock_handler(display: dict, heartbeat: int) -> list:
+    """The bridge clock: two integers parsed from ``hm`` (the text itself is never shown) and the flag.
+
+    The clock is retained, so the broker replays it on connect even when the bridge is dead. It is
+    used only while the bridge link is live; the bridge republishes it every heartbeat, so one
+    that arrives before the first ``online`` is picked up by the next one.
+    """
     lines = [
         f"    - topic: {topics.BRIDGE_CLOCK_TOPIC}", "      then:", "        - lambda: |-",
+        f"            if (!{_link_expr(heartbeat)}) return;",
         '            const char *hm = x["hm"] | "";',
         "            int h = -1, m = -1;",
         "            if (strlen(hm) == 5 && hm[2] == ':' && isdigit((unsigned char) hm[0])"
@@ -1874,7 +1932,7 @@ def _header_script(board: dict, display: dict, heartbeat: int, ha: bool = False,
     lines = [
         "  - id: render_header", "    mode: restart", "    then:", "      - lambda: |-",
         "          bool mq = mqtt::global_mqtt_client->is_connected();",
-        "          bool online = id(bridge_online) && mq;",
+        f"          bool online = {_link_expr(heartbeat)};",
         f"          bool fresh = online && id(clock_h) >= 0 && (millis() - id(clock_seen)) < {limit}UL;",
         "          int hm = fresh ? id(clock_h) * 60 + id(clock_m) : -1;",
         "          if (hm != id(clock_drawn)) {",
@@ -2045,6 +2103,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         "esphome:",
         "  name: ${device_name}",
         f"  min_version: {esphome_version()}",
+        "  includes:",
+        f"    - {LOGIC_HEADER}",
         "",
         "packages:",
         f"  board: !include {board_package}",
@@ -2053,7 +2113,8 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     if display.get("home_assistant_api", False):
         lines.append("  api: !include app/api.yaml")
     lines += ["", "# ---- generated user interface ----", "globals:",
-              '  - {id: bridge_online, type: bool, initial_value: "false"}']
+              '  - {id: bridge_online, type: bool, initial_value: "false"}',
+              '  - {id: bridge_seen, type: uint32_t, initial_value: "0"}']
     for iid in used:
         lines += [f'  - {{id: ins_{iid}_ok, type: bool, initial_value: "false"}}',
                   f'  - {{id: ins_{iid}_seen, type: uint32_t, initial_value: "0"}}']
@@ -2063,6 +2124,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
             if is_ha_state(config, iid):
                 lines.append(f'  - {{id: ins_{iid}_k, type: int, initial_value: "-1"}}')
             continue
+        lines.append(f'  - {{id: ins_{iid}_cuw, type: bool, initial_value: "false"}}')   # unit mismatch already logged
         lines.append(f"  - {{id: ins_{iid}_val, type: std::string, initial_value: '\"{BLANK_VALUE}\"'}}")
         if has_thresholds(config["instruments"][iid]):
             lines.append(f'  - {{id: ins_{iid}_sev, type: uint8_t, initial_value: "0"}}')
@@ -2080,8 +2142,12 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
     lines += _ui_globals(display, has_ha(config))
     lines += ["", *_fonts_lines(display, config), "", "mqtt:", "  on_message:",
               f"    - topic: {topics.BRIDGE_STATUS_TOPIC}", "      then:",
-              '        - lambda: \'id(bridge_online) = (x == "online");\'',
+              "        - lambda: |-",
+              '            id(bridge_online) = (x == "online");',
+              "            if (id(bridge_online)) id(bridge_seen) = millis();",
               "        - script.execute: render_tiles"]
+    if takeover:
+        lines.append("        - script.execute: render_alarm")     # the banner follows the link at once
     if header_enabled(display):
         lines += ["        - script.execute: render_header", *_signalk_message(display)]
         if has_ha(config):
@@ -2095,11 +2161,11 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         else:
             lines += _json_handler(iid, config["instruments"][iid]["precision"],
                                    has_thresholds(config["instruments"][iid]), keeps_number(config, display, iid),
-                                   item_topic(config, iid))
+                                   item_topic(config, iid), expected_unit_tag(config, iid))
     if takeover:
         lines += _alarm_handler(used, display)
     if clock_enabled(display):
-        lines += _clock_handler(display)
+        lines += _clock_handler(display, heartbeat)
     lines += ["  on_disconnect:", "    - lambda: 'id(bridge_online) = false;'",
               "    - script.execute: render_tiles", "", "script:", "  - id: render_tiles",
               "    mode: restart", "    then:"]
@@ -2114,7 +2180,7 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
                 "      - lvgl.label.update:",
                 f"          id: p{pi}_{iid}_value",
                 "          text: !lambda |-",
-                "            bool fresh = id(bridge_online) && mqtt::global_mqtt_client->is_connected()"
+                f"            bool fresh = {_link_expr(heartbeat)}"
                 f" && id(ins_{iid}_ok) && (millis() - id(ins_{iid}_seen)) < {limit_ms}UL;",
                 f"            return fresh ? id(ins_{iid}_val) : std::string(\"{BLANK_VALUE}\");",
             ]
@@ -2136,7 +2202,13 @@ def render_device_yaml(config: dict, registry: dict, display_id: str, *, board_p
         lines += _night_script(config, display, used, pal=pal)
     if power_enabled(display):
         lines += _power_script(display, config)
-    lines += ["", "interval:", "  - interval: 1s", "    then:", "      - script.execute: render_tiles"]
+    # A hung bridge with MQTT still up never sends offline: drop the flag once the window has passed, so
+    # the unsigned age cannot wrap (after 49.7 days) and make the link look live again.
+    lines += ["", "interval:", "  - interval: 1s", "    then:",
+              "      - lambda: |-",
+              f"          if (id(bridge_online) && (millis() - id(bridge_seen)) >= {summary_stale_ms(heartbeat)}UL)"
+              " id(bridge_online) = false;",
+              "      - script.execute: render_tiles"]
     if takeover:
         lines.append("      - script.execute: render_alarm")
     lines += _after_ui_change(display, "      ")
@@ -2230,6 +2302,7 @@ def source_files(config: dict, registry: dict, display_id: str) -> dict:
     files: dict = {}
     files[f"{prefix}/{package}"] = _read_package(package)
     files[f"{prefix}/app/vesselstack.yaml"] = _read_package("app/vesselstack.yaml")
+    files[f"{prefix}/{LOGIC_HEADER}"] = _read_package(LOGIC_HEADER)
     if display.get("home_assistant_api", False):
         files[f"{prefix}/app/api.yaml"] = _read_package("app/api.yaml")
     fonts = sorted(FONT_FILES.values()) + [FONT_LICENSE]

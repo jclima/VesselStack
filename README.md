@@ -22,7 +22,8 @@ the boat's local network when the internet is unavailable.
 > ```
 >
 > For a lab Pi, use the [quick start](#quick-start-one-command-on-the-raspberry-pi) below to try
-> 0.9.0. Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
+> 0.9.0. The background restore, the recovery at boot after a power loss and the new display
+> firmware have not been run on a real boat computer or display. Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
 
 ## Contents
 
@@ -91,8 +92,10 @@ network without it.
 | Build a new Pi | [Hardware bill of materials](docs/BOM.md), then [Installation](docs/INSTALLATION.md) |
 | Add VesselStack to an existing Pi | [Quick start](#quick-start-one-command-on-the-raspberry-pi), then [Getting started](docs/GETTING_STARTED.md) |
 | Do first boot, SSH and token steps | [Getting started](docs/GETTING_STARTED.md) |
-| Use or secure the Control Panel | [Control Panel](docs/CONTROL_PANEL.md) |
-| Set up Boat Chat, units and timezone | [Boat Chat setup](docs/BOAT_CHAT.md), providers in [Boat Chat providers](boat-chat/README.md) |
+| Use or secure the Control Panel, set a passphrase, pair a phone | [Control Panel](docs/CONTROL_PANEL.md), [sign-in reference](docs/CONTROL_PANEL.md#sign-in-reference) |
+| Find the Grafana dashboards or change the Homepage tiles | [Installation: Grafana](docs/INSTALLATION.md#grafana), [Homepage](docs/INSTALLATION.md#homepage-the-front-door) |
+| Describe the boat's engines, batteries and tanks | [Boat profile](docs/BOAT_PROFILE.md) |
+| Set up Boat Chat, units and timezone | [Boat Chat setup](docs/BOAT_CHAT.md) (also [Signal K units and data age](docs/BOAT_CHAT.md#signal-k-units-and-data-age)), providers in [Boat Chat providers](boat-chat/README.md) |
 | Reach dashboards from other devices | [Network access and security](docs/NETWORK.md) |
 | Manage MQTT accounts and access lists | [MQTT access control](docs/MQTT.md) |
 | Update, roll back, or install offline | [Updating](#updating), [Updating and offline install](docs/UPDATING.md) |
@@ -119,7 +122,9 @@ Power sources and instrument-reading coverage for Boat Chat are in
   [hardware guide](docs/BOM.md).
 - History and dashboards through InfluxDB, Grafana, MQTT, and Home Assistant.
 - Boat Chat, a local diagnostic assistant with an optional provider you choose.
-- A guided installer, backups, health checks, and an offline release path.
+- A guided installer, backups, health checks, and an offline release path. A restore runs in the
+  background and is rolled back automatically at the next boot if the power fails
+  ([If a restore is interrupted](#if-a-restore-is-interrupted)).
 - Optional, all off by default: [Telegram alerts](#alerts) (`ALERTS_ENABLE=true`),
   [Tailscale remote access](#remote-access-with-tailscale) (`sudo vesselstackctl remote enable`),
   [Node-RED](#node-red-optional) (`NODERED_ENABLE=true`), the
@@ -184,6 +189,8 @@ sudo vesselstackctl display status
 ```
 
 Lifecycle commands are `vesselstackctl display list|add|remove|rotate|wifi|status|render|export|build|flash|deploy|themes|set-theme|catalog|show|set-pages|history|restore-config|serial-ports`.
+The alarm banner on a display comes back for every new alarm, even when another alarm clears at the same moment. A Wi-Fi blip no longer brings a dismissed banner back. An alarm a display has seen is never cleared by losing data or the bridge: the banner says `NO DATA` instead. The broker keeps the last alarm summary, so a display that boots while the bridge is down shows `NO DATA` with the first alarm's name if that summary was an alarm, and shows nothing only when the broker holds no summary. A summary left by a bridge that is no longer running stays `NO DATA` until you tap the banner or start the bridge, which publishes a fresh summary within one heartbeat of starting. If the bridge still remembers the alarm (see below), the banner then keeps saying `NO DATA`, now with a live link, until the data returns. A display treats the bridge as lost when it has not heard it for `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5), even if the bridge hangs with its connection up, and then shows `--`. If the bridge is killed while an alarm is live, it remembers that alarm in `state.json` and restarts with it as `NO DATA` until its data returns: the page does not switch and a dismissed banner stays dismissed. It also compares the unit tag in each reading with the one it was built for, and shows `--` after you change a unit on the Pi until you reflash. Night mode only follows a live bridge. Rebuild and reflash each display to get this; it needs bridge 0.9.0 or later. The bridge part (saving live alarms) is applied by the normal update, which restarts the bridge; to roll it back, install the previous VesselStack version. An alarm that was live at a crash and whose source never sends again (a Signal K notification Signal K no longer sends, a Home Assistant entity that no longer exists) stays `NO DATA` with no time limit; to forget it, run `sudo systemctl stop vesselstack-displays-bridge`, then `sudo rm /opt/vesselstack-data/displays-bridge/state.json`, then `sudo systemctl start vesselstack-displays-bridge` (see docs/DISPLAYS.md, "Lost alarms"). Notification and Home Assistant tiles now use the same link limit as the bridge, and the bridge writes `state.json` at most once every 5 s when only alarms clear.
+
 See [Instrument displays (preview)](docs/DISPLAYS.md) for setup, firmware, layouts, the pinned ESPHome version and limitations, and [displays/README.md](displays/README.md) for the code layout.
 
 Displays show a full-screen alarm banner by default when anything
@@ -503,7 +510,8 @@ documented lab checks pass. The stable release is 0.8.0.
   [Unattended operation and power](#unattended-operation-and-power).
 - **`vesselstackctl status` exits non-zero while an installation or restore is unfinished.** A script of
   your own that checks it sees a failure in that state. While a restore is unfinished, commands that
-  change the system and the installer refuse to run (see [If a restore is interrupted](#if-a-restore-is-interrupted)).
+  change the system and the installer refuse to run, and the Control Panel, a browser-started update and
+  the boat profile command report that VesselStack is busy (see [If a restore is interrupted](#if-a-restore-is-interrupted)).
 - **The first update into 0.9.0 runs on the old Control Panel.** The unfinished-update notice and the
   **Finish this update** button apply from the next update on.
 - **Restoring a backup made before 0.9.0** turns off the features that version does not have, for
@@ -518,9 +526,18 @@ documented lab checks pass. The stable release is 0.8.0.
   alerts, you were not receiving any: turn on "Boat alerts to Telegram" (`ALERTS_ENABLE`). If
   `ALERT_BILGE_ENTITY` or `ALERT_SHORE_POWER_ENTITY` is set without a valid `HOME_ASSISTANT_TOKEN`,
   new alert messages and `/fail` heartbeats appear: set the token in Control Panel settings.
-- **Displays** need a rebuild and reflash to get the alarm banner: `vesselstackctl display build ID`,
-  then `display flash ID`, or **Apply to screen** in the Control Panel. The other display changes
-  take effect when the bridge restarts. Anything outside VesselStack that reads the retained
+- **A restore runs in the background and is recovered at boot.** `vesselstackctl restore` hands the
+  swap to the unit `run-vesselstack-restore`, so a closed terminal does not interrupt it; re-attach
+  with `sudo vesselstackctl restore --status --follow`, or use `--foreground` for the old behaviour.
+  The installer adds `boot-vesselstack-restore.service` (enabled), the script
+  `/usr/local/lib/vesselstack-recovery/restore-boot` and `/etc/vesselstack-recovery.conf`. After a
+  power loss during a restore, the next boot rolls it back; set `VESSELSTACK_RESTORE_AT_BOOT="hold"`
+  to only record what it found. Services still start before the recovery stops them. See
+  [Recovery at boot](#recovery-at-boot).
+- **Displays** need a rebuild and reflash to get the alarm banner and the other firmware changes:
+  `vesselstackctl display build ID`, then `display flash ID`, or **Apply to screen** in the Control
+  Panel. The new firmware needs this release's bridge; the bridge changes apply when the update
+  restarts the bridge. See [Instrument displays (preview)](#instrument-displays-preview). Anything outside VesselStack that reads the retained
   `bridge/status` (for example a Node-RED flow) must read `bridge/service` or listen for the heartbeat.
 - **Boat Chat** answers use new wording and units. Cached summaries keep the old text until they
   refresh.
@@ -553,7 +570,12 @@ sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
 
-Open Boat Chat and the Control Panel, and confirm the dashboards show live values.
+Open Boat Chat and the Control Panel, and confirm the dashboards show live values. Then check
+`systemctl is-enabled boot-vesselstack-restore.service` (`enabled`) and
+`cat /etc/vesselstack-recovery.conf` (`MODE=rollback`). If you use displays, reflash each one and
+check that the banner says `NO DATA` when you stop the bridge during an alarm (the
+[hardware bring-up checklist](docs/DISPLAYS.md#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)
+has the steps).
 
 **Rollback.** Downgrades are refused (`Downgrade from 0.9.0 to ... is not supported`). Restore the
 verified pre-update backup instead:
@@ -575,6 +597,11 @@ installer:
   remove the plugin configuration and the `vesselstack-signalk-writer` token.
 - `sudo vesselstackctl remote disable --purge` for Tailscale.
 - `"ui": {"alarm_takeover": false}` for a display in `displays.json`, then rebuild and reflash it.
+- `VESSELSTACK_RESTORE_AT_BOOT="hold"` (or `sudo systemctl disable boot-vesselstack-restore.service`)
+  for the recovery at boot, and `--foreground` to run a restore in your terminal.
+- `sudo vesselstackctl display flash ID --previous` for the previous display firmware. Do this on
+  every display if you roll the Pi back below 0.9.0, because the new firmware needs this
+  release's bridge.
 
 ## What VesselStack installs
 
@@ -738,7 +765,7 @@ nano vesselstack.env
 | `VESSELSTACK_DATA` | Persistent container-data path |
 | `VESSELSTACK_BACKUP` | Backup destination; must be outside the application and data trees |
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
-| `SIGNALK_VERSION` | Pinned Signal K release used by managed modes |
+| `SIGNALK_VERSION` | Pinned Signal K release used by managed modes. It and `AIS_IMAGE` are written to your settings file at first install and kept, so an update does not move Signal K or AIS-catcher by itself; to move them, change the setting and rerun the installer |
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `SIGNALK_DATAPATH_AUTOCONFIG` | Managed Docker/native modes install `signalk-to-influxdb2` 2.3.0, add the NMEA 2000 provider and write the plugin's InfluxDB configuration (default `true`, see [Signal K and InfluxDB](#signal-k-and-influxdb)); existing mode ignores it, and `false` skips without removing anything |
@@ -1219,20 +1246,10 @@ sudo grep '^GRAFANA_ADMIN_PASSWORD=' \
   /opt/vesselstack/config/vesselstack.env
 ```
 
-The installer provisions `VesselStack InfluxDB`, `VesselStack Prometheus`, the
-**VesselStack / VesselStack System Health** starter dashboard and the
-**VesselStack / VesselStack Boat Overview** dashboard. The Boat Overview reads
-the raw bucket (`INFLUXDB_RAW_BUCKET`, validated as 1 to 64 letters, digits,
-dots, hyphens or underscores because the name is written into its Flux queries)
-and shows batteries (voltage, current, state of charge), tank levels, engine
-(speed, temperature, oil pressure), navigation (speed and course over ground,
-depth) and environment (apparent wind, outside temperature, pressure), converted
-from Signal K's SI units to knots, degrees, degrees Celsius, bar and hectopascal.
-Panels read "No data yet" until the matching instrument reports. It
-deliberately has no position or map panel. Use these as the operational
-baseline, then add vessel dashboards for the Signal K paths available on the
-boat. Provisioned dashboards are editable in Grafana; keep
-reusable versions in the repository so reinstallations remain reproducible.
+The installer provisions the `VesselStack InfluxDB` and `VesselStack Prometheus` data sources, the
+**VesselStack System Health** starter dashboard and the **VesselStack Boat Overview** dashboard. What the
+Boat Overview shows, the `INFLUXDB_RAW_BUCKET` rule and how to extend the dashboards are in
+[Installation: Grafana](docs/INSTALLATION.md#grafana).
 
 ### Boat Chat
 
@@ -1249,185 +1266,37 @@ nothing to an external model.
 Settings, the admin code, API access rules, telemetry refresh, optional host metrics, timezone
 and units are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in
 [Boat Chat providers](boat-chat/README.md).
-`boat-chat/signalk_units.py` is the single table Boat Chat uses to convert Signal K SI values to its stored units and to label them, so a value and its unit always come from the same lookup (tests in `tests/test_signalk_units.py`). Live telemetry snapshots carry a unit for every numeric value (empty means unknown and is never guessed), and values whose reported unit disagrees with the expected one are left unconverted and listed under `unit_conflicts`. Boat Chat tells the model how old each live reading is and what time the question was asked: readings older than 10 minutes are presented as last known, with their age and local time, never as current, and a boat-clock check (against GPS time when available) warns when ages may be inaccurate. The freshness rule lives in `boat-chat/data_age.py`. Answers Boat Chat builds directly from telemetry (briefing, battery-voltage history, fuel usage, generic history) state the age or sample time of the values they print, say "no recent data" with the last known value and its age rather than "unavailable" for stale readings, distinguish "no data recorded" from "engines not running" for fuel use, and show 12 V voltage guidance only for banks whose readings fall between 9 and 16 V.
+
+How Boat Chat converts Signal K units, how it treats stale readings and what the answers state about data age are in
+[Boat Chat setup: Signal K units and data age](docs/BOAT_CHAT.md#signal-k-units-and-data-age).
 
 ### Control Panel
 
-The Control Panel is the browser page for looking after VesselStack. It listens on loopback by
-default (`http://127.0.0.1:8780` through an SSH tunnel); `sudo vesselstackctl panel-access
-lan|local` changes only that bind. Sign in with the token from
-`sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
-`CONTROL_PANEL_TOKEN=...` line works too.
+The Control Panel is the browser page for looking after VesselStack: status, backups, settings,
+updates and repairs. It listens on loopback by default (`http://127.0.0.1:8780` through an SSH
+tunnel); `sudo vesselstackctl panel-access lan|local` changes only that bind. Sign in with the token
+from `sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
+`CONTROL_PANEL_TOKEN=...` line works too. **Limitation:** on plain HTTP (`panel-access lan`) the
+passphrase and device token cross the network unencrypted, so keep the SSH tunnel.
 
-**Boat Chat sign-in (unreleased):** Boat Chat accepts a separate crew passphrase (at least 8 characters) with
-remembered devices: `sudo vesselstackctl passphrase set chat` (or Boat Chat, Settings, Sign-in), `passphrase
-status|clear chat`, `devices list|revoke ID|revoke-all chat`. It stores `auth.json` (service user, 0600) in
-Boat Chat's state directory and loads the root-owned `common/vesselstack_auth.py` by path (readable by the
-service user; if it is missing, passphrase sign-in is simply off). The device token travels in
-`X-Boat-Chat-Device`; the passphrase grants access only, so settings still need the admin code, and the
-Access code and admin code are unchanged. Passphrase sign-in and device requests require a `Host` naming
-this machine (extra names via `BOAT_CHAT_ALLOWED_HOSTS`) and, for login, passphrase changes and device
-POSTs, a matching `Origin`. Panel and chat passphrases may not be equal (checked by the CLI and the panel).
-When root edits the chat store (CLI or Control Panel), the work runs in a child process that has dropped to the
-directory owner's uid/gid, so root never opens or chowns files in the service user's directory; store files
-must be regular, single-link files (symlinks and hard links are refused). Rollback: reinstalling the previous
-release restores the old behaviour; the store format is unchanged.
-Same brute-force limits as the panel, including the global pause anyone on the network can trigger (the
-access code still works). **Rollback:** reinstall the previous release; older versions ignore `auth.json`.
-**Verify:** `sudo vesselstackctl passphrase status chat` and a sign-in from a phone. See the
-[Boat Chat guide](docs/BOAT_CHAT.md).
-
-**Easier sign-in (unreleased):** choose a passphrase once with `sudo vesselstackctl passphrase set panel`
-(hidden prompt, at least 12 characters; `--stdin` reads one line for scripts and never takes it as an
-argument), or set it in the panel under Settings, Sign-in after unlocking with the token. The unlock
-screen then takes the passphrase, with **Remember this device (30 days)** (otherwise 12 hours). Settings
-lists signed-in devices with Revoke and Revoke all; `sudo vesselstackctl devices list|revoke ID|revoke-all`
-does the same on the boat, `passphrase status` shows the state and `passphrase clear panel` turns it
-off. Details: the browser holds a random 256-bit device token (local storage when remembered, session
-storage otherwise; no cookies) sent as `X-VesselStack-Device`; the boat keeps only its SHA-256 and a
-scrypt hash of the passphrase in `config/control-panel-auth.json` (root, 0600, written atomically; never
-commit it). The `X-VesselStack-Token` header keeps working unchanged for scripts and existing
-sessions, including while passphrase sign-in is paused by the brute-force limits (5 failures per
-address start a growing wait up to 15 minutes; over 20 failures in 15 minutes pause passphrase sign-in
-for 15 minutes). **Operational impact:** a new root-owned module `common/vesselstack_auth.py` is
-installed with the panel, nothing is migrated and passphrase sign-in stays off until you set one.
-Attempts are counted atomically when they arrive, and the panel now refuses any request whose `Host`
-header is not this machine (`127.0.0.1`, `localhost`, `[::1]`; with `panel-access lan` also the
-hostname, `hostname.local` and the current interface addresses, refreshed every 60 s), each with the
-panel port, answering `421`; add other names with `CONTROL_PANEL_ALLOWED_HOSTS` (comma separated,
-`name` or `name:port`) in `config/control-panel.env`. `/api/auth/login` and `/api/auth/passphrase`
-require an `Origin` matching `Host` whatever the credential. **Known trade-off:** the global pause means
-anyone on the network can trigger a 15-minute passphrase lockout; the token keeps working during it.
-**Limitation:** on plain HTTP (`panel-access lan`) the passphrase and device token cross the network
-unencrypted, so keep the SSH tunnel. **Lost passphrase or locked out:** unlock with the token or run
-`passphrase set panel` / `passphrase clear panel` on the boat. **Rollback:** reinstall the previous
-release; older versions ignore `control-panel-auth.json` and only the token works. **Verify:**
-`sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
-[Control Panel guide](docs/CONTROL_PANEL.md).
-
-**Sign-in hardening (unreleased):** setting or changing a passphrase (panel or Boat Chat) also clears waiting pairing links. A Boat Chat admin device (`panel-link --for chat --admin`, or the panel pairing option) records a keyed marker of the admin code (`BOAT_CHAT_SETTINGS_TOKEN`; HMAC-SHA256 under a random key kept in the Boat Chat store, see the review follow-ups below) at pairing time and counts as admin only while that marker matches the current code; rotating or removing the code ends its admin rights (stale admin devices are pruned when the code is changed in Boat Chat settings), and without an admin code a device never overrides the loopback-only settings rule. Admin pairing is refused with a clear error while no admin code is set. Rollback: `sudo vesselstackctl devices revoke-all` and pair again.
-
-**Sign-in review follow-ups (unreleased):**
-- **Rotating a token signs out every device.** Changing `CONTROL_PANEL_TOKEN` (installer re-run with a new
-  value) revokes all Control Panel devices and pairing links; changing `BOAT_CHAT_ACCESS_TOKEN` (installer,
-  Boat Chat Settings, or the panel's Boat Chat settings) revokes all Boat Chat devices and pairing links;
-  changing `BOAT_CHAT_SETTINGS_TOKEN` (installer or Boat Chat Settings) ends every admin device (the
-  installer signs out all Boat Chat devices in that case). The installer prints what it did; the root
-  paths use the privilege-dropping helper for Boat Chat's store. If a revocation fails the rotation still
-  stands and a warning gives the manual command: `sudo vesselstackctl devices revoke-all [panel|chat]`.
-  Operational impact: after a rotation everyone signs in again (passphrase or pairing link).
-- **Unreadable sign-in stores fail closed.** Wrong types anywhere in `auth.json` / `control-panel-auth.json`
-  (for example `"devices": 5`) count as corruption: no passphrase, no devices, access code and token still
-  work, nothing is rewritten, and the panel/Boat Chat answer normally instead of a 500. Repair or delete the
-  file (`passphrase clear` cannot rewrite what it cannot read), then set the passphrase again.
-- **Boat Chat revoke rules.** Crew (access code or passphrase sign-in) can sign out only their own device;
-  signing out another device or everyone, and setting the very first passphrase, need the admin code or an
-  admin device (`vesselstackctl passphrase set chat` on the boat always works). The Sign-in page hides what
-  does not apply.
-- **Admin binding** is now HMAC-SHA256 of the admin code under a random 32-byte `binding_key` created on
-  first need in the Boat Chat store; the panel and `panel-link --admin` resolve the admin code exactly as
-  Boat Chat does (Settings-page override file first, then `config/boat-chat.env`). Admin devices paired
-  before this change carry the old format and read as non-admin: pair them again. Rollback: reinstall the
-  previous release (older versions ignore `binding_key`; old-format admin devices must be paired again).
-- **Throttle.** A successful sign-in no longer clears the address's backoff; it withdraws only its own
-  attempt, and an hour of quiet forgives old failures. Boat Chat listens on the LAN, so the global lockout
-  is a known trade-off: 21 bad attempts in 15 minutes from anywhere lock passphrase and pairing sign-in for
-  everyone for 15 minutes; the access code and admin code keep working, and restarting Boat Chat clears it.
-- Hardening: `vesselstackctl` runs the sign-in helper with `python3 -B -I`; Boat Chat pages send
-  `frame-ancestors 'none'` and `X-Frame-Options: DENY` (the panel already did; it now sends the header too).
-  Verify: `python3 -B -m unittest discover -s tests`, then rotate a token on a test boat and check
-  `sudo vesselstackctl devices list [chat]` is empty.
-
-**Passphrases at install time (unreleased):** `get-vesselstack.sh` asks, after a successful install or update
-and only on a real terminal without `--yes`/`--defaults`, "Set a Control Panel passphrase now? (recommended)",
-the same for a Boat Chat crew passphrase (hidden, typed twice, up to 3 tries, policy errors shown, Enter skips) and
-"Pair this phone/laptop with Boat Chat now?" (default no; prints `vesselstackctl panel-link --for chat`). Passphrases
-reach `vesselstackctl passphrase set SCOPE --stdin` on standard input only. With `--yes` or `--defaults` nothing is
-asked and the commands for later are printed; the final summary says how to sign in (passphrase if set, else
-`sudo vesselstackctl passphrase set panel` / `panel-link`) and keeps the token commands as a secondary fallback.
-The terminal wizard and browser wizard have optional passphrase fields; they hash with `common/vesselstack_auth.py`
-(scrypt) and write only `CONTROL_PANEL_PASSPHRASE_HASH` / `BOAT_CHAT_PASSPHRASE_HASH`. `install.sh` strictly validates
-the hash format before changing anything (refusing otherwise), imports each into its sign-in store (panel store as
-root; Boat Chat store through the privilege-dropping helper), then deletes the key from the env file; the hashes are
-never kept in `vesselstack.env` and are never printed. `vesselstackctl passphrase set-hash panel|chat` (hash on
-standard input) is the underlying command. The installer uses `set-hash ... --if-unset` and removes each key as soon as
-its own import is settled: it never overwrites a passphrase that is already stored (exit status 3, an "already set"
-notice, the key is scrubbed), and a failed import keeps only its own key for the next run. Rollback: `sudo vesselstackctl passphrase clear panel|chat`.
-
-**Pairing links and QR codes (unreleased):** `sudo vesselstackctl panel-link [--for panel|chat] [--admin]
-[--label TEXT]` prints a single-use link (`http://HOST:PORT/#pair=CODE`, `$(hostname).local` plus each IPv4
-address; the SSH-tunnel form when the service is loopback-only), the code as `XXXXX-XXXXX`, its expiry and a
-terminal QR code. The Control Panel offers the same under Settings, Sign-in, **Pair a phone**
-(`POST /api/auth/pairing`, authenticated, `Origin` required, returns the link, code, expiry and QR module
-matrix; the root panel changes the Boat Chat store only by running `common/vesselstack_authctl.py` as a fresh process with the Boat Chat service user's uid/gid and no supplementary groups, never by forking itself or writing in that directory; `/api/auth/passphrase` on both services is a compare-and-set and answers 409 "passphrase changed, try again" if the passphrase changed between the check and the write). Redemption is
-`POST /api/auth/pair` on both services (same `Origin`/`Host` rules and throttle as login). Codes are 10
-Crockford base32 characters, only their SHA-256 is stored, they are single use, last 10 minutes, at most 3 may
-wait per store, and a redeemed link always remembers the device for 30 days. `--admin` (Boat Chat only) makes
-an admin device that passes the admin-code checks. **Security notes:** the QR code is a credential for 10
-minutes, so show it only to the person pairing; the code travels in the URL fragment (never sent to the
-server or logged) and the page removes it from the address bar before doing anything else; the link is plain
-HTTP on the boat network. Requires the vendored `common/qrcodegen.py` (Nayuki, MIT; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). **Rollback:** reinstall the previous release; older
-versions ignore the `pairings` list and the extra file. **Verify:** `sudo vesselstackctl panel-link`, then scan
-it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
-
-![Control Panel Home tab](docs/images/control-panel-home.png)
-
-- **Home** is status only: services running or stopped, the last backup and backup drive (read-only;
-  "unknown" when they cannot be read) and whether an update is known, with one **Back up now**
-  button (it asks for confirmation first, because a backup stops every service until it finishes) and the components below. Component cards offer Start, Stop, Restart and, in a **⋯**
-  menu, Disable.
-- **Settings** has a jump list, help for every field, Advanced sections that start collapsed,
-  inline field errors, and one save bar: **Save** writes the settings, **Apply** renders and installs
-  them (it does not recreate containers and restarts only the displays bridge; restart a component to use the new values).
-- **Updates** checks only when you press **Check for updates**, which contacts github.com. If an update does not finish, the Control Panel keeps showing "The update to X did not finish" (with the pre-update backup and its restore command when one was made) until an installation completes, and the Updates tab offers **Finish this update** to try again.
-- **Maintenance** holds Back up now, Start all, Restart all, Stop all, **Check setup**,
-  **Reinstall & start**, **Provision history** and **Restart Control Panel**.
-
-Stopping or interrupting actions ask first in an in-page dialog. If the connection drops the
-header shows Disconnected with **Retry now**; the page keeps retrying by itself while you are signed in
-(2, 4, 6 and 8 seconds, then every 15 seconds) and retries at once when the page becomes visible again or the
-browser comes back online. Rollback: restore the previous release from a
-backup as described under [Updating](#updating); stored settings keys are unchanged.
+Choose a passphrase once (`sudo vesselstackctl passphrase set panel`) or pair a phone with a link or
+QR code (`sudo vesselstackctl panel-link`); the token keeps working. Boat Chat has its own crew
+passphrase and pairing. Each step, its limits, rollback and verification are in the
+[Control Panel guide](docs/CONTROL_PANEL.md): [open the panel](docs/CONTROL_PANEL.md#open-the-panel),
+[sign in](docs/CONTROL_PANEL.md#sign-in) and [sign-in details, rollback and verification](docs/CONTROL_PANEL.md#sign-in-reference),
+[the five tabs](docs/CONTROL_PANEL.md#the-five-tabs), [updates](docs/CONTROL_PANEL.md#updates) and
+[when the panel cannot connect](docs/CONTROL_PANEL.md#when-the-panel-cannot-connect). Boat Chat sign-in is in
+[Boat Chat setup](docs/BOAT_CHAT.md#sign-in-with-a-crew-passphrase).
 
 ### Homepage (the front door)
 
 Open `http://HOST` (port 80) or `http://BOATNAME.local`. [Homepage](https://gethomepage.dev) shows one
-tile per enabled service: Boat Chat, Grafana, Home Assistant, Signal K, AIS, and, when the databases
-are published beyond loopback, InfluxDB and Prometheus. The Control Panel tile links only when
-`panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. A Displays tile
-appears when `DISPLAYS_ENABLE=true`. With `SIGNALK_MODE=existing` and a `SIGNALK_URL` on another
-computer, the Signal K tile links to that server (scheme, host and port only; no status dot). Links use
-`$(hostname).local` and follow the address you opened the page with. The Boat Chat and Control Panel tiles
-are plain links: each opens its own sign-in screen (passphrase or pairing link, see the sign-in sections
-below); the home page itself holds no sign-in and no secrets.
-
-The default Homepage uses VesselStack’s navy and teal palette, the bundled logo, your boat name,
-three tiles per row on wide screens, and a 24-hour clock. In **Control Panel → Settings → Homepage**,
-choose the light or dark palette, the boat name or VesselStack heading, the number of tiles per row,
-and a 24-hour, 12-hour, or hidden clock. **Save**, then **Apply**, and reload Homepage to see the result.
-The **Displays** tile opens that tab when the Control Panel is reachable on the boat network.
-
-For a manual configuration, the equivalent keys in `config/vesselstack.env` are `HOMEPAGE_THEME`
-(`dark` or `light`), `HOMEPAGE_COLUMNS` (`compact`, `standard`, or `wide`),
-`HOMEPAGE_HEADING` (`boat` or `brand`), and `HOMEPAGE_CLOCK` (`24h`, `12h`, or `hidden`).
-Run `sudo vesselstackctl homepage sync` after changing them manually. Restore the defaults by choosing
-dark, three tiles, the boat name, and the 24-hour clock in Settings.
-
-Tiles update automatically: `vesselstackctl homepage sync` runs at every start, on component
-add/remove, `lan` and `panel-access` changes, display enable and install/update. The rendered files in
-`config/homepage/` are overwritten each time and contain no passwords or tokens. Add your own tiles
-and bookmarks in `config/homepage-custom/services.yaml` and `bookmarks.yaml` (created once, never
-overwritten; an invalid file is skipped with a warning). The page accepts only the host names and
-addresses in `HOMEPAGE_ALLOWED_HOSTS` (managed; add more with `HOMEPAGE_ALLOWED_HOSTS_EXTRA`). The
-list is also refreshed at every boot by `vesselstack-homepage-refresh.service`
-(`sudo vesselstackctl homepage refresh`, which recreates the container only if the list changed), so
-IP access keeps working after a new DHCP lease; `BOATNAME.local` always works. IPv4 addresses only:
-IPv6 is not added.
-
-The `config/homepage*` folders are made world-readable (`0755`, files `0644`) so the container's
-service user can read them; they hold no secrets. The container runs with all capabilities dropped
-except `CHOWN`, `SETUID` and `SETGID`.
+tile per enabled service and follows the address you opened it with. The Control Panel tile links only
+when `panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. Choose its
+palette, heading, tile layout and clock in **Control Panel → Settings → Homepage**; the manual keys are
+`HOMEPAGE_THEME`, `HOMEPAGE_COLUMNS`, `HOMEPAGE_HEADING` and `HOMEPAGE_CLOCK`, followed by
+`sudo vesselstackctl homepage sync`. Tiles, your own tiles and bookmarks, the allowed host names and the
+file permissions are in [Installation: Homepage](docs/INSTALLATION.md#homepage-the-front-door).
 
 **Heimdall was removed.** Updating removes the old Heimdall container and image and leaves `/opt/vesselstack-data/heimdall` for you to delete; see [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older).
 
@@ -1734,6 +1603,7 @@ installer; run `sudo vesselstackctl doctor` afterwards to see each one.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `VESSELSTACK_WATCHDOG` | `auto` | `auto` enables the hardware watchdog only on a Raspberry Pi (`/proc/device-tree/model` contains "Raspberry Pi") that has `/dev/watchdog`; `true` enables it on any computer that has `/dev/watchdog` and warns when the device is missing; `false` removes the VesselStack drop-in. |
+| `VESSELSTACK_RESTORE_AT_BOOT` | `rollback` | What happens at boot when a restore was interrupted (a power loss). `rollback` rolls it back automatically; `hold` only records what it found and leaves the decision to you. Written to `/etc/vesselstack-recovery.conf`. See [Recovery at boot](#recovery-at-boot). |
 | `VESSELSTACK_JOURNAL_MAX_USE` | `200M` | Cap for the persistent system journal (`SystemMaxUse`), a size such as `200M` or `1G`; `off` writes no VesselStack journald drop-in and removes an existing one. |
 | `VESSELSTACK_BACKUP_SCHEDULE` | `off` | `off`, `daily` or `weekly` (about 03:30). Stays `off` on upgrade. See [Scheduled backups](#scheduled-backups). |
 | `VESSELSTACK_BACKUP_KEEP` | `8` | Scheduled archives to keep (a whole number from 1 to 365, no leading zero). The backup drive needs room for `KEEP`+1 archives. |
@@ -2101,6 +1971,15 @@ member (a legitimate backup never contains one) before anything is extracted:
 sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 ```
 
+From step (4) on, the restore runs in the background when systemd is running, so it goes on if your
+SSH session drops or your terminal closes. Your terminal follows it and prints the same lines. Ctrl-C
+(or closing the terminal) only stops following: the restore continues, and there is no abort. To
+follow it again, run `sudo vesselstackctl restore --status --follow`; it prints what the restore
+printed so far and waits until it ends, with the same exit status. When no restore is running it
+shows the result of the last one. Add `--foreground` to run the restore in your terminal instead
+(it then stops if the terminal closes, and you undo it with `recover rollback`). Without systemd
+(a rescue system or a chroot) the restore always runs in your terminal.
+
 Restore never extracts over the live tree. It (1) verifies the archive,
 (2) checks free space (staging holds a second full copy next to the live trees;
 the previous trees are kept too, so you need room for old + new), (3) extracts
@@ -2153,7 +2032,13 @@ self-contained: a state file written atomically before each step (phases `prepar
 copies of the running controller, the lifecycle-lock helper and the journal helper, a
 `recover` script, and the snapshot of the system files. The whole journal and the
 extracted backup are flushed to disk before the first change, and each tree rename is
-followed by a directory flush. There is no automatic recovery after a reboot yet.
+followed by a directory flush. After a power loss, the boat computer recovers a restore that was
+interrupted by itself at the next boot (see [Recovery at boot](#recovery-at-boot)).
+
+Before it moves anything, a restore or rollback builds the list of services to stop and checks
+that it is complete. If the list cannot be built in full, it stops and says "the list of units to
+stop could not be built; nothing was moved". Nothing is changed, so run the restore or
+`recover rollback` again.
 
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall
@@ -2164,14 +2049,26 @@ the `.pre-restore-STAMP` trees back.
 
 #### If a restore is interrupted
 
-If the restore stops half-way (the SSH session dropped, the power failed, the process was
-killed, or it printed `RECOVERY ERROR`), the journal stays in place. Check how far it got,
-then undo it:
+A restore that runs in the background keeps going when your SSH session drops. Follow it again
+with `sudo vesselstackctl restore --status --follow`; `restore --status`, `recover status` and
+`vesselstackctl status` say "running in the background" while it runs, and `doctor` shows a WARN.
+If the background restore itself stops (it was killed, or the Pi lost power), your terminal says
+"The restore worker stopped in phase ..." and the journal stays in place, as below. After a reboot
+the status commands no longer call it running, because the old process is gone; use `recover status`
+and `recover rollback`.
+
+If the restore stops half-way (it ran with `--foreground` and the SSH session dropped, the power
+failed, the process was killed, or it printed `RECOVERY ERROR`), the journal stays in place. Check
+how far it got, then undo it:
 
 ```bash
 sudo /var/lib/vesselstack/restore/current/recover status
 sudo /var/lib/vesselstack/restore/current/recover rollback
 ```
+
+While the journal is unfinished, the Control Panel, a browser-started update and the boat
+profile command report that VesselStack is busy, as `vesselstackctl` commands already do. The
+recovery itself is not affected.
 
 The same two commands are available as `sudo vesselstackctl restore-recover status` and
 `sudo vesselstackctl restore-recover rollback`, and `sudo vesselstackctl restore --status`
@@ -2197,6 +2094,12 @@ reads from the journal before acting on it. The journal that a restore has just 
 validated the same way before anything is stopped, so a restore that the recovery would reject
 refuses to start. A restore that had already completed is never rolled back;
 `rollback` then only finishes the cleanup.
+
+The journal records which boot last wrote it (`boot_id`, left out where the system does not
+provide one) and, after a failed rollback, whether trying again can help. `recover status`
+puts that on the `Last error` line: "can be retried" once you fix the cause, or "a retry will
+not help" when the by-hand steps or the two ways out that were printed with the error are
+the way forward. Journals written by 0.9.0 have neither and work as before. At the next boot, the journal's boot id is what tells the automatic recovery whether a restore may still be running (see [Recovery at boot](#recovery-at-boot)).
 
 If the previous system is back in place but cannot be started, the journal is closed anyway
 and the message says "The previous system is back in place, but it could not be started"
@@ -2371,9 +2274,146 @@ The journal is moved aside with `sudo mv -T`, so a second resolution on the same
 
 The commands in this by-hand procedure have been checked by tests as text and have not yet been exercised on a boat computer with running services. Folder paths read from the journal are printed with control characters replaced by `?`.
 
-The restore still
-runs in your terminal session and nothing recovers automatically at boot yet, so keep
-it on a stable connection or run it inside `screen` or `tmux`.
+##### Recovery at boot
+
+If the power fails in the middle of a restore, the boat computer does not wait for you. When it
+starts again, a small service called `boot-vesselstack-restore.service` looks for a restore
+journal. If it finds one that an earlier boot left behind, it runs the journal's own
+`recover rollback` for you. The previous application and data folders come back and the
+stack is started. You then see what happened in `sudo vesselstackctl status` and
+`sudo vesselstackctl doctor`.
+
+It only acts on a journal written in an EARLIER boot. A journal written in the boot that is
+running now belongs to a restore that may still be going, so the service leaves it alone.
+It decides from the journal alone. The service itself only runs the journal's `recover rollback`
+command; what that command does depends on the phase (see the table). When the service is not
+sure, it HOLDS: it runs nothing, changes nothing, writes down why, and leaves the decision to you
+(`sudo /var/lib/vesselstack/restore/current/recover status` shows the state).
+
+| What the journal says | Setting `rollback` (default) | Setting `hold` |
+| --- | --- | --- |
+| The restore finished or was rolled back (phase `committed`, `rolled-back`) | Cleanup only: `recover rollback` removes the staged copy of the backup and archives the journal | Same cleanup |
+| The restore was abandoned (phase `abandoned`) | Cleanup: `recover rollback` archives the journal AND starts the services and containers that restore had stopped | Held: nothing is started |
+| The restore was interrupted (phase `prepared` to `starting`) | Rolled back automatically: the folders and system files are put back, then the stack is started | Held |
+| A rollback was interrupted (phase `rolling-back`) | Rolled back automatically if the journal says where it started, otherwise held | Held |
+| A rollback failed and trying again can help (`rollback-failed`, `retry`) | Tried again, up to two automatic attempts in all; then held | Held |
+| A rollback failed and trying again cannot help (`manual`, `previous`) | Held | Held |
+| The journal cannot be read, has no boot id (written by 0.9.0) or this boot's id cannot be read | Held | Held |
+| The service already ran 3 times for this journal (a rollback or cleanup that hung, was killed or failed) | Held | Held |
+| Another VesselStack operation holds the lock (up to ten tries, 30 seconds apart) | Held | Held |
+
+**The limit.** The service runs `recover rollback` at most 3 times for the same journal, whatever
+the phase (after a failed rollback, 2 times). Every run counts, also one that hung, was killed by
+the 28-minute limit or by a power loss, or ended with the journal in the same phase. A lock that
+stays busy is not a run: status 75 counts as a busy lock only when the journal's `state` file is
+unchanged by the call (compared by checksum); if the call changed it, the run counts and its result is
+`failed`, with no second try in that boot. If `boot-recovery` exists and is not a regular file (a
+directory, a link), the limit counts as reached and the service holds. The cleanup of a finished or abandoned restore has the same limit of 3.
+After the limit the service HOLDS at every boot and never runs it again for that journal. That means
+the system stays AS IT IS: possibly with the application and data folders half swapped and the
+services stopped. Nothing then starts it by itself. Run
+`sudo /var/lib/vesselstack/restore/current/recover status` and decide: fix the cause and run
+`sudo /var/lib/vesselstack/restore/current/recover rollback` yourself, or follow the by-hand
+procedure above. A new restore has a new journal and starts again from zero.
+
+To turn the automatic rollback off, set `VESSELSTACK_RESTORE_AT_BOOT="hold"` in `vesselstack.env`
+and rerun the installer. The installer writes the choice to `/etc/vesselstack-recovery.conf`
+(`MODE=rollback` or `MODE=hold`), which the service reads at boot (it is read as text and never run).
+The file must contain exactly one `MODE=rollback` or `MODE=hold` line (uppercase `MODE`, no spaces
+around `=`; one pair of quotes around the value, a trailing ` # comment`, blank lines and lines
+starting with `#` are fine if you edit it by hand). A missing file means `rollback`. An unrecognised
+or empty file means `hold`: no `MODE=` line, another key, `mode=` in lower case, `export`, spaces
+around `=`, more than one `MODE=` line, another value, a file that cannot be read or is not a regular
+file. The log says why. The installer writes the file with a comment at the top and flushes it to disk
+before it replaces the old one.
+
+A restore runs the installer of the backup, with the settings of the backup. If those settings do
+not contain `VESSELSTACK_RESTORE_AT_BOOT`, a release that knows the setting writes `MODE=rollback`
+again, so a `hold` you chose is lost after such a restore. Check
+`cat /etc/vesselstack-recovery.conf` after a restore, and set `VESSELSTACK_RESTORE_AT_BOOT="hold"`
+again and rerun the installer if you want it. A release that does not know the setting leaves the
+file as it was, and so does a restore with `--skip-installer`.
+
+The service leaves two files in `/var/lib/vesselstack/restore/`, both readable by root only:
+`boot-recovery` (what it decided and the result: `rolled-back`, `rolled-back-not-started`,
+`cleaned-up`, `held`, `failed` or `timed-out`, with the journal id, the number of attempts,
+the times and the reason) and `boot-recovery.log` (everything the rollback printed). A run that
+acts starts the log afresh; a run that finds a journal written in the running boot only adds one
+line to it. The starting of a new restore deletes the `boot-recovery` record of an earlier one (not
+the log). The attempt is written down BEFORE the rollback starts, so a hang or a reboot loop still
+counts, and it is flushed to disk (`sync`) before the rollback starts. A result `timed-out` means
+the rollback ran past the time limit or was killed (by the limit or by the system). See the outcome with:
+
+```bash
+sudo vesselstackctl status
+sudo vesselstackctl doctor
+sudo journalctl -b -u boot-vesselstack-restore
+sudo cat /var/lib/vesselstack/restore/boot-recovery
+sudo cat /var/lib/vesselstack/restore/boot-recovery.log
+```
+
+`status` and `doctor` show the last automatic recovery in plain words, for example
+"rolled back automatically at boot", "rolled back at boot but the stack was not started; run:
+sudo vesselstackctl start", "HELD at boot: ...; see: sudo .../recover status" or "automatic
+rollback failed at boot (see .../boot-recovery.log)". A rollback or cleanup is shown while its
+journal is still pending, or, when none is pending, if it was finished in the current boot or less
+than two days ago. A hold or a failure is shown only while its journal is still pending: resolving the
+journal ends it. A restore that is still pending stays a FAIL in `doctor`, as before.
+
+What to know:
+
+- A restore that had finished all but its last step (phase `starting`) is rolled back too. The
+  restored folders are kept as `*.failed-restore-<stamp>`, so nothing is lost.
+- A failed automatic rollback leaves the services stopped. `status` shows the pending restore
+  and `recover status` says what to do.
+- The firewall is not stopped by a rollback, but if its restart fails it may not be running
+  afterwards. The log then holds "The firewall (vesselstack-firewall.service) is NOT running ...";
+  start it with `sudo systemctl start vesselstack-firewall.service`.
+- Services still start at boot BEFORE the recovery stops them. Holding them back is not part of this
+  release.
+- Containers that Docker restarts by itself are stopped by the rollback; they are not prevented
+  from starting.
+- A journal written by 0.9.0 has no boot id. It is held, not rolled back: use the commands above.
+- A restore that is interrupted WITHOUT a reboot is not recovered by this service, because its
+  journal belongs to the running boot. A background restore survives a dropped SSH session or a
+  closed terminal. This applies to a restore run with `--foreground` or without systemd, which a
+  dropped session or a closed terminal stops, and to a background restore that was killed (for
+  example with `kill -9`). A restore run with `--foreground` does not catch a hangup or a
+  termination signal: it simply stops where it is (nothing is cleaned up), and the journal keeps
+  the phase it had reached. Run
+  `sudo /var/lib/vesselstack/restore/current/recover rollback`, or restart the boat computer and
+  let the service do it.
+- A full `/var` blocks the automatic recovery. The service writes down its attempt before it runs
+  anything; if it cannot (a full disk or an unwritable `/var/lib/vesselstack/restore`), it runs
+  nothing, prints one line to the journal (`sudo journalctl -b -u boot-vesselstack-restore`) and the
+  unit ends without a failure. The restore stays pending. Free some space and run `recover rollback`
+  yourself.
+- The service waits up to ten times 30 seconds for the lock of another VesselStack operation, then
+  holds. Its unit allows 40 minutes in all.
+- `sudo vesselstackctl uninstall` is refused while a restore is pending, like every other command
+  that changes the system; resolve the journal first.
+- You can still run `recover rollback` yourself at any time. The service never starts by hand
+  (`sudo systemctl start boot-vesselstack-restore.service` is refused). To remove it, set the
+  setting to `hold`, or run `sudo systemctl disable boot-vesselstack-restore.service`.
+
+A restore runs in the background (the unit `run-vesselstack-restore`, see `systemctl status
+run-vesselstack-restore` while it runs), so a dropped SSH session does not interrupt it. Ctrl-C
+only stops following it. There is no abort: wait for it to end, or, once it has ended or stopped,
+undo it with `recover rollback`. If you shut the Pi down while a restore runs and it has not moved
+the first folder yet, it stops and rolls back at once, and the journal records `stop_requested`. Once
+it has begun to move folders, the shutdown waits up to 10 minutes for it to finish; after that, or
+after a power loss, the recovery at boot (above) rolls it back. A restore counts as running only
+while its worker process is alive in this boot: after a reboot, `status`, `doctor` and `recover
+status` report an unfinished restore, not a running one. If you run `recover rollback` or `recover
+abandon --yes` from another terminal while your terminal still follows a restore that has not
+started, the terminal says "The restore is no longer pending" and exits with status 1.
+If you press Ctrl-C in the first moments, before the background restore has started, the terminal
+says it has not started yet and may still start; `restore --status --follow` then waits for it to
+appear (up to 30 seconds) and otherwise shows the status with the rollback command.
+`sudo vesselstackctl restore --status --follow` re-attaches to a running restore, and
+`restore ARCHIVE --yes --foreground` runs the restore in your terminal as older releases did; on
+that path, keep the connection stable or run it inside `screen` or `tmux`. Without systemd the
+restore also runs in your terminal.
 
 If stopping the
 running stack fails, no rollback is attempted under live services. Unrelated
@@ -2722,6 +2762,10 @@ and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
 dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
 bytecode in the source or bundled runtime tree.
 
+CI runs the Python regressions with a 20 minute limit (`timeout-minutes: 20`), so a hanging test fails the job with a log instead of blocking it.
+
+Test clean-up only ever signals processes its own test started (never a pid read from a file under test, and never pid or process group 0 or 1, the runner or its parent)), and the restore hand-off tests wait the production 30 s for a worker to start, so a busy runner is not mistaken for a worker that never appeared; a failed wait prints the foreground output, the launcher log, the worker files and the processes.
+
 The test-mechanics notes (directory-listing and `tar -t` assertions, `tests/test-remote.sh`, the CI profile check, scripted wizard answers and reproducing CI on a Mac) are in [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 
 ## Documentation policy
@@ -2756,10 +2800,12 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="alarm-summary-and-takeover"></a>[Alarm summary and takeover](docs/DISPLAYS.md#alarm-summary-and-takeover)
 - <a id="automatic-telemetry-refresh"></a>[Automatic telemetry refresh](docs/BOAT_CHAT.md#automatic-telemetry-refresh)
 - <a id="board-registry-schema-2"></a>[Board registry schema 2](docs/DISPLAYS.md#board-registry-schema-2)
+- <a id="boat-equipment-profiles"></a>[Boat equipment profiles](docs/BOAT_PROFILE.md#how-boat-chat-uses-the-profile)
 - <a id="building-and-flashing-on-the-pi"></a>[Building and flashing on the Pi](docs/DISPLAYS.md#building-and-flashing-on-the-pi)
 - <a id="choose-your-path"></a>[Choose your path](#where-to-go-next)
 - <a id="configuration-and-validation"></a>[Configuration and validation](docs/DISPLAYS.md#configuration-and-validation)
 - <a id="current-development-improvements"></a>[Current development improvements](docs/DEVELOPMENT.md#current-development-improvements)
+- <a id="development-and-release-history"></a>[Development and release history](docs/DEVELOPMENT.md#historical-notes)
 - <a id="displays-bridge-service"></a>[Displays bridge service](docs/DISPLAYS.md#displays-bridge-service)
 - <a id="find-your-next-answer"></a>[Find your next answer](#where-to-go-next)
 - <a id="firmware-generate-build-and-flash"></a>[Firmware: generate, build and flash](docs/DISPLAYS.md#firmware-generate-build-and-flash)
@@ -2775,6 +2821,7 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="quick-start-for-an-internet-connected-pi"></a>[Quick start for an internet-connected Pi](#quick-start-one-command-on-the-raspberry-pi)
 - <a id="selective-core-component-lifecycle"></a>[Selective core component lifecycle](docs/DEVELOPMENT.md#selective-core-component-lifecycle)
 - <a id="settings-and-configuration-precedence"></a>[Settings and configuration precedence](docs/BOAT_CHAT.md#settings-and-configuration-precedence)
+- <a id="shared-configuration-contract"></a>[Shared configuration contract](docs/DEVELOPMENT.md#shared-configuration-contract)
 - <a id="shared-lifecycle-lock"></a>[Shared lifecycle lock](docs/DEVELOPMENT.md#shared-lifecycle-lock)
 - <a id="signalk-and-influxdb"></a>[SignalK and InfluxDB](#signal-k-and-influxdb)
 - <a id="signalk-not-running--eacces-on-packagejson"></a>[SignalK not running / EACCES on package.json](#signal-k-not-running--eacces-on-packagejson)
@@ -2787,38 +2834,3 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="update-from-the-control-panel-057-lab-release"></a>[Update from the Control Panel (0.5.7 lab release)](#updating)
 - <a id="upgrading-to-060"></a>[Upgrading to 0.6.0](docs/UPDATING.md#upgrading-from-06x-or-older)
 - <a id="version-10-release-scope"></a>[Version 1.0 release scope](docs/DEVELOPMENT.md#version-10-release-scope-historical)
-
-## Development and release history
-
-Historical release scope and review-fix notes are kept in
-[Development: Historical notes](docs/DEVELOPMENT.md#historical-notes). Release notes are in `CHANGELOG.md`.
-
-Contributors: CI runs ShellCheck 0.9.0 from the Ubuntu package at info severity; a clean run of a newer
-local ShellCheck is not enough (see [Development](docs/DEVELOPMENT.md)).
-The shell scripts checked by `tests/test-distribution.sh` pass ShellCheck 0.9.0 and newer (verified on 0.11.0) with default options and no `-x`; the `A && B || C` patterns in `scripts/vesselstackctl` are written as `if ! { A && B; }; then C; fi`, and the few remaining suppressions carry a reason.
-
-### Boat equipment profiles
-
-Boat Chat reads the optional `config/boat-profile.json` on each request and
-telemetry-indexer run. The validated shared profile controls engine, battery
-bank, and fuel-tank paths and labels; a missing file uses the historical
-two-engine profile. A malformed file remains actionable in chat/settings while
-profile-dependent analytics are reported unavailable. Derived cache keys and
-power observations include the profile fingerprint, so changing equipment
-takes effect without a restart and never joins energy intervals across profiles.
-Paired port/starboard comparisons are only available for the exact legacy
-paths and capabilities; display labels and declaration order do not affect
-compatibility. Arbitrary profiles receive an explicit unsupported diagnostic.
-
-### Shared configuration contract
-
-The installation wizard and Control Panel use the data-only registry in
-`common/config_registry.py` for shared defaults, types, ranges, choices,
-ownership, and component mappings. The registry validates configuration without
-contacting services or reading secrets. Boat Chat endpoint resolution uses the
-saved state and an explicit `BOAT_CHAT_ENV` file when supplied; an empty port
-means the app default (8765), while an invalid explicit port is an error.
-Managed listener addresses are IPv4 values, and `BOAT_NAME` is limited to safe
-display characters.
-
-Boat Chat fuel totals require finite, non-negative values and complete channel coverage within the returned running observation minutes; missing RPM or rates are never treated as zero. Gaps or unreturned minutes in the requested window are not known zero. Incomplete windows report labeled observed partial consumption instead of an authoritative total. Power/solar integration retains source-timestamp provenance, excludes legacy or unverified observations, rejects stale/future/repeated/out-of-order samples, and does not bridge rejected gaps. Status cards and briefings use a 600-second source-age limit with 60 seconds of future tolerance. Legacy power history remains visible but cannot be retroactively verified without source timestamps.

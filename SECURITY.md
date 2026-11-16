@@ -45,4 +45,7 @@ and alerts is a credential stored on the Pi. The `*.pre-restore-*` and
 not removed automatically: delete them yourself once the restored system is verified. The restore
 journal under `/var/lib/vesselstack/restore/current` is readable by root only and holds a snapshot
 of system files while a restore is unfinished: do not delete it by hand, finish it with its
-`recover` command (see [If a restore is interrupted](README.md#if-a-restore-is-interrupted)).
+`recover` command (see [If a restore is interrupted](README.md#if-a-restore-is-interrupted)). At
+boot, the root unit `boot-vesselstack-restore.service` runs that journal's own `recover` command
+after an interrupted restore; a restore runs as the root unit `run-vesselstack-restore`.
+`/etc/vesselstack-recovery.conf` is read as text and never run.

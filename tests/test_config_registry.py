@@ -159,6 +159,23 @@ class ConfigRegistryTests(unittest.TestCase):
                 spec = panel.FIELD_BY_KEY[key]
                 with self.assertRaises(ValueError): panel.validate_value(spec, bad)
 
+    def test_restore_at_boot_setting(self):
+        key = "VESSELSTACK_RESTORE_AT_BOOT"
+        self.assertEqual(registry.DEFAULTS[key], "rollback")
+        self.assertEqual(wizard.DEFAULTS[key], "rollback")
+        self.assertIn(key, wizard.FIELD_INDEX)
+        for good in ("rollback", "hold"):
+            self.assertEqual(registry.validate_value(key, good), good)
+            self.assertEqual(wizard.validate({key: good})[key], good)
+        for bad in ("yes", "off", "Hold"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError): registry.validate_value(key, bad)
+                with self.assertRaises(ValueError): wizard.validate({key: bad})
+        installer = (ROOT / "install.sh").read_text()
+        self.assertIn(f': "${{{key}:=rollback}}"', installer)
+        self.assertRegex(installer, rf"(?m)^{key}$")
+        self.assertIn(f'{key}="rollback"', (ROOT / "vesselstack.example.env").read_text())
+
     def test_installer_and_example_env_carry_the_unattended_keys(self):
         installer = (ROOT / "install.sh").read_text()
         example = (ROOT / "vesselstack.example.env").read_text()

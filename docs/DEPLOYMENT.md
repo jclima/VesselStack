@@ -442,6 +442,13 @@ values, and record the `doctor` result and data-directory size each day.
    restored bundled installer, which needs network for `pip` unless you use
    `--skip-installer` and run the installer yourself (offline: see 3.5.3).
 
+   The restore swap runs in the background, so check that it survives a dropped connection. Over SSH
+   start a restore, then kill the SSH client during it. Reconnect and run
+   `sudo vesselstackctl restore --status --follow`; it must complete with the same result lines
+   ("Restore completed" and the `.pre-restore-STAMP` line) as a restore in the terminal
+   (`--foreground`). While it runs, `systemctl status run-vesselstack-restore` shows the unit.
+   The power cut during a restore is a separate lab item in section 7 (recovery at boot).
+
 3. **Offline install with the internet blocked.** Build the bundle on a
    connected machine (docker + python3 + pip; defaults target aarch64, Python 3.11,
    `linux/arm64` images; add `--python-version 3.13` if the Pi's Python differs):
@@ -511,6 +518,10 @@ values, and record the `doctor` result and data-directory size each day.
       `display history`) and then `sudo vesselstackctl display flash ID --previous --ota DISPLAY_IP`
       (or **Put previous firmware back**). The previous image is only offered when it
       matches the restored settings and credentials. Confirm the screen shows the earlier pages.
+
+   8. Alarm banner and bridge link (displays built with 0.9.0): follow the alarm, bridge-loss,
+      unit-change and night steps in the [hardware bring-up checklist](DISPLAYS.md#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c).
+      They need a real display.
 
    Before downgrading below 0.6.2 run `sudo vesselstackctl display set-theme ID classic` for
    every themed display, otherwise the displays bridge exits with status 2.
@@ -706,13 +717,15 @@ secrets. `vesselstack-update --rollback BACKUP_DIRECTORY` is only for code-only
 Since 0.9.0 a restore keeps a journal in `/var/lib/vesselstack/restore/current`. If a restore is
 interrupted, use `sudo /var/lib/vesselstack/restore/current/recover status` and `recover rollback`
 (README [If a restore is interrupted](../README.md#if-a-restore-is-interrupted)); while the journal
-is pending, commands that change the system and the installer refuse to run.
+is pending, commands that change the system and the installer refuse to run. After a power loss
+the next boot rolls an interrupted restore back by itself (README
+[Recovery at boot](../README.md#recovery-at-boot)); check `sudo vesselstackctl status`.
 
 ## 7. Acceptance checklist
 
 - [ ] Release `v0.9.0`: tag signature verified (`scripts/verify-release-tag.sh v0.9.0 .github/allowed_signers "$RECORDED_COMMIT"`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
 - [ ] Lab: 48 h+ soak with daily `doctor` healthy; replay data visible in Grafana.
-- [ ] Lab: update from 0.8.0, backup/verify/restore, and offline install rehearsed.
+- [ ] Lab: update from 0.8.0, backup/verify/restore (including a background restore whose SSH client is killed, then `restore --status --follow`; section 3.5.2), and offline install rehearsed.
 - [ ] Boat: sha256 of the carried tarball equals the recorded value.
 - [ ] Boat: verified backup exists on separate media and a copy is off the Pi.
 - [ ] Boat: `installed-version` is `0.9.0`; `doctor` healthy before and after reboot.
@@ -726,11 +739,11 @@ all interfaces and uses unencrypted HTTP; strict firewall policy may still
 block it. Restore loopback-only access with
 `sudo vesselstackctl panel-access local`. No firewall rule or other listener is
 changed by this command.
-- [ ] Optional, only if displays are used: lab Wi-Fi (OTA) display update rehearsed (section 3.5.5: USB first, OTA by IP and `.local`, offline device, rotated credentials, power cut, `flash --previous` rollback) with timings recorded; otherwise displays stay USB-flashed on the boat.
+- [ ] Optional, only if displays are used: lab Wi-Fi (OTA) display update rehearsed (section 3.5.5: USB first, OTA by IP and `.local`, offline device, rotated credentials, power cut, `flash --previous` rollback, and the alarm banner and bridge-loss checks of step 8) with timings recorded; otherwise displays stay USB-flashed on the boat.
 - [ ] Lab: Homepage and sign-in rehearsed (section 3.5.6): front door at `http://<hostname>.local` shows the tiles, removing and re-adding a component updates its tile, the allowed hosts refresh after a reboot, and, only when the lab Pi came from 0.6.2 or earlier, the update removed the Heimdall container and left `$VESSELSTACK_DATA/heimdall`.
 - [ ] Lab: passphrase sign-in with Remember and revoke from another device, a `panel-link --for chat` QR scanned by a phone, the Boat Chat crew passphrase, and a token rotation that signs devices out.
 - [ ] Lab, 0.9.0: **interrupted restore and rollback** (README [If a restore is interrupted](../README.md#if-a-restore-is-interrupted)). Scratch lab Pi only, with a verified backup from section 3.5.2. **[MUTATES HOST]**
-  1. In `screen` or `tmux` run `sudo vesselstackctl restore /path/to/vesselstack-STAMP.tar.gz --yes`. From a second SSH session, `kill -9` the restore process part-way (after it has stopped the stack).
+  1. Run `sudo vesselstackctl restore /path/to/vesselstack-STAMP.tar.gz --yes`; no `screen` or `tmux` is needed because the restore runs in the background unit `run-vesselstack-restore`. From a second SSH session, `sudo systemctl kill --signal=KILL run-vesselstack-restore.service` part-way (after it has stopped the stack). (With `--foreground`, `kill -9` the restore process instead.) The first terminal prints "The restore worker stopped in phase ...".
   2. `sudo /var/lib/vesselstack/restore/current/recover status` shows how far it got, then `sudo /var/lib/vesselstack/restore/current/recover rollback`. Expect the previous application and data folders back in place, the stack started, and no `*.pre-restore-*` folder left in the way.
   3. `sudo vesselstackctl doctor` is healthy, and `sudo vesselstackctl status` no longer prints `FAIL restore did not finish` and exits 0. While the journal was pending, `status` reported it and commands that change the system refused ("A restore did not finish"): note that too.
   4. Delete the leftover `*.pre-restore-*`, `*.failed-restore-*` and stage folders yourself when done; they hold a copy of the data including secrets.
@@ -740,6 +753,15 @@ changed by this command.
   3. Follow the printed steps exactly, in order, in a second session, and record in your private lab notes whether each printed command worked as written. Pay particular attention to the `systemctl list-units 'vesselstack-*' --all --plain --no-legend` stop and check lines (does the list reach only `inactive` or `failed`?), the `sudo docker ps --no-trunc --format '{{.Names}} {{.Mounts}}'` line, the `sudo mv -T` folder and journal moves, and the final `install.sh --start`.
   4. Finish with `sudo vesselstackctl doctor` and `sudo vesselstackctl status`.
   5. File each discrepancy as an issue describing the command and the difference only. Do not attach logs, `doctor` output or paths that contain vessel data.
+- [ ] Lab, 0.9.0: **recovery at boot after a power loss** (README [Recovery at boot](../README.md#recovery-at-boot)). Scratch lab Pi only, with a verified backup from section 3.5.2. **[MUTATES HOST]**
+  1. Start `sudo vesselstackctl restore ARCHIVE --yes` in one session. In a second session run `sudo /var/lib/vesselstack/restore/current/recover status` until it shows phase `starting`, then cut the power.
+  2. Power the Pi on again. After boot, run `sudo journalctl -b -u boot-vesselstack-restore` and `sudo cat /var/lib/vesselstack/restore/boot-recovery`: the result must be `rolled-back` and `phase_after` must be `archived`.
+  3. Check that the application and data folders are the previous ones (the restored ones are kept as `*.failed-restore-<stamp>`), then run `sudo vesselstackctl status` and `sudo vesselstackctl doctor`. `status` must say "rolled back automatically at boot" and the stack must be running.
+  4. Confirm SSH was reachable while the recovery ran: you could log in before the recovery finished, and `systemd-analyze critical-chain` does not show `boot-vesselstack-restore.service` in front of `ssh.service`.
+  5. Repeat the power cut with `VESSELSTACK_RESTORE_AT_BOOT="hold"` set (rerun the installer first). After boot the result must be `held`, both folders must still be as the interrupted restore left them, and `sudo vesselstackctl doctor` must FAIL with the pending restore. Then run `sudo /var/lib/vesselstack/restore/current/recover rollback` by hand and set the setting back to `rollback`. In `hold` mode an abandoned journal is held too (nothing is started).
+  6. Interrupt a restore WITHOUT a reboot: start it with `--foreground` and close the SSH session while it runs (a background restore survives that), or kill a background one as in the interrupted-restore item. The journal stays, the service does not act, and `sudo /var/lib/vesselstack/restore/current/recover rollback` puts the previous folders back. After a restore of a backup, check `cat /etc/vesselstack-recovery.conf` (a `hold` you chose may be `rollback` again).
+  7. Confirm a restore that is running normally is not touched: during a restore, run `sudo systemctl daemon-reload` and `sudo systemctl start multi-user.target` in a second session. The restore must finish, and `/var/lib/vesselstack/restore/boot-recovery` must not appear.
+  8. Record in your private lab notes how long the boot took with a pending journal compared with a normal boot. Do not attach logs or paths that contain vessel data.
 - [ ] Lab, 0.9.0: **leftover units after going back.** After restoring an older-release backup (the 0.8.0 backup from section 3.5.1) or rolling back from a newer one, run `systemctl list-units 'vesselstack-*' --all --plain --no-legend` and `sudo vesselstackctl doctor`. Expect the restore to have listed the managed features the older release does not have under "Turned off because the restored version does not have them" (for example scheduled backups and Telegram alerts for a 0.8.0 archive). Record whether any `vesselstack-*` unit that the installed release does not ship is still installed or enabled (`systemctl list-unit-files 'vesselstack-*'`), and file an issue if so. **[read-only]** after the restore itself.
 - [ ] Lab, 0.9.0: **new optional features, each off by default.** Enable, check and disable each one on the lab Pi only, and leave it off afterwards. Settings go in `vesselstack.env` or the Control Panel Settings page; rerun the installer (or **Apply**) after a change. **[MUTATES HOST]**
   - Telegram alerts ([Alerts](../README.md#alerts)): set `ALERTS_ENABLE=true` and `ALERT_TELEGRAM_CHAT_IDS`, check with `sudo vesselstackctl alerts test` and `alerts status`, disable with `ALERTS_ENABLE=false` (or `sudo systemctl disable --now vesselstack-alerts.timer`). The separate "Ask Boat Chat from Telegram" switch is `TELEGRAM_ENABLE`.

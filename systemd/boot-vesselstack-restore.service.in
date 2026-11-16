@@ -1,0 +1,15 @@
+[Unit]
+Description=VesselStack: recover an interrupted restore
+RefuseManualStart=yes
+ConditionPathExists=/var/lib/vesselstack/restore/current
+After=local-fs.target docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/vesselstack-recovery/restore-boot
+TimeoutStartSec=40min
+
+[Install]
+WantedBy=multi-user.target

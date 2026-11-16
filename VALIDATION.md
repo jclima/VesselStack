@@ -25,6 +25,9 @@ commissioning on the boat.
   EnvironmentFile under real systemd.
 - The Node-RED dashboard live channel requires the crew sign-in (`tests/test-nodered-dashboard-auth.sh`).
 - The generated display projects are validated with the pinned ESPHome image.
+- The launcher that hands a restore to the background unit `run-vesselstack-restore` runs on a real
+  systemd with a stand-in payload (`tests/test-restore-detach-systemd.sh`, opt-in). It does not run
+  a restore.
 
 Not covered by CI: SocketCAN and NMEA 2000 wiring, SDR/AIS reception, real Raspberry Pi
 hardware and upgrades, and vessel-specific alarm thresholds. Release status for each version is recorded in the CHANGELOG.

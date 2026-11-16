@@ -301,6 +301,7 @@ fi
 : "${VESSELSTACK_DISABLED_COMPONENTS:=}"
 # Unattended operation (README "Unattended operation and power"). Upgrades keep scheduled backups off.
 : "${VESSELSTACK_WATCHDOG:=auto}"
+: "${VESSELSTACK_RESTORE_AT_BOOT:=rollback}"
 : "${VESSELSTACK_JOURNAL_MAX_USE:=200M}"
 : "${VESSELSTACK_BACKUP_SCHEDULE:=off}"
 : "${VESSELSTACK_BACKUP_KEEP:=8}"
@@ -308,7 +309,10 @@ fi
 
 if [ -r "$SOURCE_ROOT/common/config_registry.py" ]; then
     CORE_COMPONENTS=()
-    while IFS= read -r component; do CORE_COMPONENTS+=("$component"); done < <(python3 -I "$SOURCE_ROOT/common/config_registry.py" --core-components)
+    # Captured first: a failing helper must not leave a silently short list.
+    core_components_text=$(python3 -I "$SOURCE_ROOT/common/config_registry.py" --core-components) || { echo "Could not read the list of core components" >&2; exit 1; }
+    while IFS= read -r component; do [ -z "$component" ] || CORE_COMPONENTS+=("$component"); done <<< "$core_components_text"
+    [ "${#CORE_COMPONENTS[@]}" -gt 0 ] || { echo "The list of core components is empty" >&2; exit 1; }
 else
     CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
 fi
@@ -386,6 +390,7 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     exit 1
 fi
 case "$VESSELSTACK_WATCHDOG" in auto|true|false) ;; *) echo "VESSELSTACK_WATCHDOG must be auto, true or false" >&2; exit 1 ;; esac
+case "$VESSELSTACK_RESTORE_AT_BOOT" in rollback|hold) ;; *) echo "VESSELSTACK_RESTORE_AT_BOOT must be rollback or hold" >&2; exit 1 ;; esac
 if ! [[ "$ALERT_REPEAT_MINUTES" =~ ^[0-9]{1,5}$ ]] || [ "$ALERT_REPEAT_MINUTES" -lt 5 ] || [ "$ALERT_REPEAT_MINUTES" -gt 10080 ]; then
     echo "ALERT_REPEAT_MINUTES must be a whole number from 5 to 10080" >&2
     exit 1
@@ -777,6 +782,7 @@ VESSELSTACK_DATA_BIND_ADDRESS
 VESSELSTACK_WEB_BIND_ADDRESS
 HOMEASSISTANT_BIND_ADDRESS
 VESSELSTACK_WATCHDOG
+VESSELSTACK_RESTORE_AT_BOOT
 VESSELSTACK_JOURNAL_MAX_USE
 VESSELSTACK_BACKUP_SCHEDULE
 VESSELSTACK_BACKUP_KEEP
@@ -844,16 +850,17 @@ config_key_is_secret() {
 # config_env_snapshot FILE KEY: in a clean subshell, sources FILE and prints the declared
 # state of every known setting except KEY (so a fix is checked against all the others).
 config_env_snapshot() {
-    local file=$1 skip=$2 key
+    local file=$1 skip=$2 key keys
+    keys=$(vesselstack_env_keys; extra_env_keys) || return 1
     (
         set +eu
-        while IFS= read -r key; do unset "$key"; done < <(vesselstack_env_keys; extra_env_keys)
+        while IFS= read -r key; do unset "$key"; done <<< "$keys"
         # shellcheck disable=SC1090
         source "$file" >/dev/null 2>&1 || exit 3
         while IFS= read -r key; do
             [ "$key" = "$skip" ] && continue
             declare -p "$key" 2>/dev/null || echo "unset $key"
-        done < <(vesselstack_env_keys; extra_env_keys)
+        done <<< "$keys"
     )
 }
 
@@ -1022,7 +1029,8 @@ cleanup_env_temps() {
 # and control-panel.env, run before anything is changed and before the dry run
 # exits. Reports KEY names and reasons only, never values.
 env_values_preflight() {
-    local key bad=0 hard=0 fixable='' fix_reason='' reason secrets=0 report=''
+    local key keys bad=0 hard=0 fixable='' fix_reason='' reason secrets=0 report=''
+    keys=$(vesselstack_env_keys; extra_env_keys) || { echo "Could not build the list of settings to check" >&2; exit 1; }
     while IFS= read -r key; do
         if reason=$(env_value_problem "${!key:-}"); then
             report+="  $key: $reason"$'\n'
@@ -1035,7 +1043,7 @@ env_values_preflight() {
                 hard=1
             fi
         fi
-    done < <(vesselstack_env_keys; extra_env_keys)
+    done <<< "$keys"
     if reason=$(env_value_problem "$(<"$SCRIPT_DIR/VERSION")"); then
         report+="  VERSION: $reason"$'\n'
         bad=1; hard=1
@@ -1787,9 +1795,11 @@ install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-socketcan.service.in" \
     "$VESSELSTACK_ROOT/systemd/vesselstack-socketcan.service.in"
 
 new_env_temp vesselstack.env; vs_env_tmp=$NEW_ENV_TEMP
+# The key list is read in full first: a short list would write a vesselstack.env with settings missing.
+env_keys_text=$(vesselstack_env_keys) || { echo "Could not build the list of settings to write" >&2; exit 1; }
 while IFS= read -r key; do
     env_line "$key" "${!key:-}" >> "$vs_env_tmp"
-done < <(vesselstack_env_keys)
+done <<< "$env_keys_text"
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
 # Optional Node-RED: data directory, settings.js (only when absent) and the root-only nodered.env
 # (MQTT and sign-in values; the InfluxDB token is added once InfluxDB is up). Removes nodered.env when disabled.
@@ -2035,6 +2045,31 @@ if [ "$ALERTS_ENABLE" = true ]; then
 else
     systemctl disable vesselstack-alerts.timer 2>/dev/null || true
 fi
+
+# --- Recovery at boot after an interrupted restore (README "If a restore is interrupted") ---------
+# The script lives outside the application folder and outside the helper folder a restore republishes,
+# so a half-finished restore cannot take it away. The unit is enabled, never started: it runs at boot
+# and only while a restore journal exists. Its name does not start with "vesselstack-" on purpose.
+RECOVERY_DIR="$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
+RECOVERY_CONF="$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+install -d -m 0755 -o root -g root "$SYSTEM_ROOT/usr/local/lib" "$RECOVERY_DIR"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/restore-boot" "$RECOVERY_DIR/restore-boot"
+install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/boot-vesselstack-restore.service.in" "$SYSTEMD_DIR/boot-vesselstack-restore.service"
+recovery_conf_tmp=$(mktemp "$RECOVERY_CONF.XXXXXX")
+{
+    printf '# VesselStack recovery at boot. MODE=rollback rolls an interrupted restore back automatically;\n'
+    printf '# MODE=hold only records what was found. Anything else in this file (an empty file, another key,\n'
+    printf '# spaces around "=", two MODE lines, an unknown value) is treated as MODE=hold.\n'
+    printf 'MODE=%s\n' "$VESSELSTACK_RESTORE_AT_BOOT"
+} > "$recovery_conf_tmp"
+chmod 0644 "$recovery_conf_tmp"
+# install.sh has no fsync helper, so: flush the file to disk before the rename (GNU sync takes file
+# arguments; plain sync otherwise), and the directory entry after it.
+sync -- "$recovery_conf_tmp" 2>/dev/null || sync
+mv -f -- "$recovery_conf_tmp" "$RECOVERY_CONF"
+sync -- "$(dirname -- "$RECOVERY_CONF")" 2>/dev/null || sync
+systemctl daemon-reload
+systemctl enable boot-vesselstack-restore.service
 
 # --- Unattended operation: hardware watchdog and journal cap ----------------------------------
 # install_dropin DESTINATION: reads the new content on standard input and replaces DESTINATION
