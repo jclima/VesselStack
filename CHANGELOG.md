@@ -3,43 +3,6 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
-
-### Added
-
-- Per-component versions. Each container's version is now a setting (`SIGNALK_VERSION`,
-  `AIS_IMAGE`, `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`,
-  `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION`, `HOMEPAGE_VERSION`). Empty
-  follows the release default; a value is kept across updates. The installer, the setup wizard and
-  the settings file checks refuse floating tags (`latest`), other registries and versions outside
-  the line the release uses, before anything is changed. The rules live in the new
-  `common/component_versions.py`, and `templates/compose.yml` takes each default through
-  `${SETTING:-default}`.
-- `sudo vesselstackctl component versions [--json]` (read-only) shows the release default, the chosen
-  version, the running image and the state of every component; `doctor` warns about each override and
-  fails on a running container that does not match its setting; `status` adds one line when any
-  component is not at the release default. No command that changes a version, no image pull and no
-  Control Panel dialog yet.
-- Mosquitto password hashing and the Node-RED helper now use the effective image, so a version
-  override applies to them too.
-
-### Changed
-
-- `SIGNALK_VERSION` and `AIS_IMAGE` are empty by default in `vesselstack.example.env`.
-
-**Operational impact**: on the first update to this version, a Signal K or AIS-catcher version that
-an older installer had written down (`v2.27.0`, `ghcr.io/jvde-github/ais-catcher:v0.70`) is cleared,
-with one line telling you, so those components follow the release from now on. They may move to a
-newer version at that update. Any other value you set is kept as an override. Nothing else changes
-with the defaults: the same ten images run.
-
-**Verify**: `sudo vesselstackctl component versions` lists every component as `release default` (or
-your overrides), and `sudo vesselstackctl doctor` ends with `RESULT healthy`.
-
-**Rollback**: restore the backup taken before the update (`sudo vesselstackctl restore
-/path/to/vesselstack-TIMESTAMP.tar.gz --yes`). To undo a version you set, empty its setting and run
-the installer again; going back to an older version of a component that holds data may need that restore.
-
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,
@@ -66,6 +29,8 @@ pre-release.
   Boat Overview**, shows batteries, tanks, engine, navigation (no position) and environment.
 - Instrument displays (preview): the alarm banner comes back for every new alarm and says `NO DATA`
   instead of disappearing when an alarm's data or the bridge is lost (see Displays and alarms).
+- You can set the version of each component in your settings file. `sudo vesselstackctl component
+  versions` shows what is running against the release (see Component versions).
 - An install or update that stopped part-way is now reported and can be finished: by
   `vesselstackctl`, the Control Panel and a rerun of `get-vesselstack.sh`.
 
@@ -151,6 +116,29 @@ pre-release.
   hold a copy of your data, including secrets. `doctor` warns about them. Delete them yourself
   when you no longer need them. Finished, rolled-back and abandoned restores leave a small record
   under `/var/lib/vesselstack/restore` (the newest three of each are kept).
+- A restore or rollback now checks that the list of services it must stop is complete before it
+  moves any folder. If the list cannot be built in full, it stops with "the list of units to stop
+  could not be built; nothing was moved". Run it again.
+
+### Component versions
+
+- Each container's version is a setting: `SIGNALK_VERSION`, `AIS_IMAGE` (a full image reference),
+  `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`,
+  `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION` and `HOMEPAGE_VERSION`. Empty
+  follows the release default. A value is kept across updates. `SIGNALK_VERSION` and `AIS_IMAGE`
+  are empty by default in `vesselstack.example.env`.
+- The installer, the setup wizard and the settings file checks accept only a numbered version of
+  the same major line the release uses. They refuse floating tags such as `latest`, and a setting
+  cannot name another registry. The check runs before anything is changed.
+- A version other than the release default is not tested with this release.
+- Components that hold data can upgrade it one way, so make a backup first. Going back to an older
+  version of such a component may need a restore of a backup made before the change.
+- `sudo vesselstackctl component versions [--json]` (read-only) shows the release default, your
+  chosen version, the running image and the state of every component. `doctor` warns about each
+  override and fails on a running container that does not match its setting. `status` adds one line
+  when any component is not at the release default.
+- No command or Control Panel dialog changes a version yet. Set it in the settings file and rerun the
+  installer.
 
 ### Displays and alarms
 
@@ -279,6 +267,10 @@ pre-release.
   Control Panel settings.
 - If you turned on the old "Send alerts to Telegram" switch expecting boat alerts, you were not
   receiving any. Turn on "Boat alerts to Telegram".
+- On the first update to 0.9.0, a Signal K or AIS-catcher version that an older installer had
+  written into your settings file (`v2.27.0`, `ghcr.io/jvde-github/ais-catcher:v0.70`) is cleared
+  once, with one line telling you, so those components follow the release. They may move to this
+  release's version at that update. A value you chose yourself is kept.
 - A scheduled backup stops the whole stack while it runs. The backup drive needs room for
   `VESSELSTACK_BACKUP_KEEP` plus one archives.
 - Anything outside VesselStack that reads the retained `bridge/status` (for example a Node-RED
@@ -320,6 +312,8 @@ To turn off a feature without restoring, change its setting and rerun the instal
 - `VESSELSTACK_RESTORE_AT_BOOT="hold"` for the recovery at boot, or `sudo systemctl disable
   boot-vesselstack-restore.service`. Recovery by hand with `recover rollback` is unchanged.
 - `sudo vesselstackctl restore ARCHIVE --yes --foreground` runs a restore in your terminal.
+- Component versions: empty the setting and rerun the installer to follow the release again. Going
+  back to an older version of a component that holds data may need a restore.
 - `sudo vesselstackctl display flash ID --previous` puts the previous display firmware back.
   Do this on every display when you roll the Pi back to an older release, because the new
   firmware needs this release's bridge. An older bridge ignores the `live` key in `state.json`.
@@ -349,6 +343,9 @@ To turn off a feature without restoring, change its setting and rerun the instal
   the installed Tailscale reads keys from a file. HTTPS publishes the host name in Certificate
   Transparency logs.
 - Node-RED can run code: keep it on a trusted LAN or Tailscale.
+- Changing a component version is for experts for now. There is no command or dialog for it, no
+  automatic backup before the change and no automatic return to the previous version. A version you
+  choose is outside what this release was tested with.
 
 ### Release status
 
@@ -357,6 +354,25 @@ are pending. It is not marked Latest until the documented lab checks pass.
 
 ### For contributors
 
+- Restore: `restore_writer_units` used to print its list from a loop reading a process substitution,
+  and its callers read it through another one. Under bash 3.2 (macOS `/bin/bash`, which the Python
+  tests use) the child's exit sometimes interrupted the write, the loop saw an early end of file and
+  some units were neither stopped nor checked, silently. The list is now captured first and printed
+  afterwards. `restore_load_writer_units` accepts it only when it is non-empty and equals the known
+  units minus the firewall and SocketCAN, so `restore_stop_writers` and `restore_verify_stopped` fail
+  before anything is moved. The same capture-and-check is used for the other lists the restore, the
+  backup path check and `install.sh` rely on. Tests: 300 calls under load, and refusal for an empty,
+  short and half-printed list in the forward restore and the rollback.
+- Tests and CI: the background-restore test clean-up signalled the pids it read from `worker-*.pid`
+  files, which tests fill with unrelated pids on purpose (`1`, the test runner); on Linux
+  `killpg(1, ...)` is `kill(-1, ...)`, which killed every process of the user, the CI runner agent
+  included, so the Python step hung. The clean-up now signals only processes the test started: its own
+  `Popen` objects (each in a session of its own) and the workers its stub launcher recorded in a file
+  only the launcher writes, never pid or group 0 or 1, the test runner, its parent or their groups; a
+  regression test proves it. The shell tests guard their `kill` of a parent or process group the same
+  way. The "Run all Python regressions" step now has a 20 minute time limit.
+  The restore hand-off tests wait the production 30 s launch wait (not 3 s) for a worker, wait for the
+  previous worker to release the lock between repeated runs, and print diagnostics when a wait fails.
 - Tests and CI: the optional Compose profiles check passes `--no-env-resolution`, the scripted
   wizard answers cover the alerts prompt, the fake npm container runs under `umask 022`, and
   `tests/test-nodered-dashboard-auth.sh` runs in the `service-integration` job (needs internet).
@@ -370,6 +386,10 @@ are pending. It is not marked Latest until the documented lab checks pass.
 - Documentation: reference text moved out of the README into the guides that cover it, leaving
   short summaries with links (Control Panel sign-in, Grafana and Homepage first run, Boat Chat
   notes, boat profile, configuration contract). No behaviour changed.
+- Component versions: the rules live in `common/component_versions.py`. A parity test checks that
+  its release defaults equal the `${SETTING:-default}` values in `templates/compose.yml`. The
+  Mosquitto password hashing and the Node-RED helper use the validated effective image, so an
+  override applies to them too.
 - ShellCheck findings in `scripts/vesselstackctl` are fixed for ShellCheck 0.9.0 and 0.11.0. No
   behaviour change.
 

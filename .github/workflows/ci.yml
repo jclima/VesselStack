@@ -76,6 +76,7 @@ jobs:
       - name: Validate Linux ARM64 image manifests
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions
+        timeout-minutes: 20
         run: |
           trusted_test_tmp=$(mktemp -d "$HOME/vesselstack-python-tests.XXXXXX")
           trap 'rm -rf -- "$trusted_test_tmp"' EXIT

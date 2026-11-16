@@ -7,11 +7,17 @@ umask 077
 ROOT=${VESSELSTACK_ROOT:-/opt/vesselstack}
 ENV_FILE=${VESSELSTACK_ENV:-$ROOT/config/vesselstack.env}
 REGISTRY_CLI="$ROOT/common/config_registry.py"
+# The built-in list, used when the registry cannot be read. A recovery runs this controller from a journal's
+# ROOT, which can be a restored or damaged tree, so an unreadable registry must not stop the command.
+CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
 if [ -r "$REGISTRY_CLI" ]; then
-    CORE_COMPONENTS=()
-    while IFS= read -r component; do CORE_COMPONENTS+=("$component"); done < <(python3 -I "$REGISTRY_CLI" --core-components)
-else
-    CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
+    # Captured first: a failing helper must not leave a silently short list.
+    if core_components_text=$(python3 -I "$REGISTRY_CLI" --core-components 2>/dev/null) && [ -n "${core_components_text//[[:space:]]/}" ]; then
+        CORE_COMPONENTS=()
+        while IFS= read -r component; do [ -z "$component" ] || CORE_COMPONENTS+=("$component"); done <<< "$core_components_text"
+    else
+        echo "WARN: could not read the list of core components from $REGISTRY_CLI; using the built-in list" >&2
+    fi
 fi
 SYSTEM_ROOT=${VESSELSTACK_SYSTEM_ROOT:-}
 SYSTEMD_DIR="$SYSTEM_ROOT/etc/systemd/system"
@@ -731,12 +737,14 @@ start_stack() {
            fi ;;
     esac
     local -a services=()
+    local services_text
     # Heimdall held port 80 before Homepage; remove it first, then re-render the
     # home page (the machine's addresses may have changed since the last start).
     remove_heimdall || return 1
     homepage_sync || echo "WARN: could not render the home page; run: sudo vesselstackctl homepage sync" >&2
     sync_prometheus_config || return 1
-    while IFS= read -r service; do services+=("$service"); done < <(selected_services)
+    services_text=$(selected_services) || return 1
+    while IFS= read -r service; do [ -z "$service" ] || services+=("$service"); done <<< "$services_text"
     if [ "${#services[@]}" -gt 0 ]; then
         "${COMPOSE[@]}" up -d "${services[@]}"
     fi
@@ -1824,7 +1832,9 @@ EOF
     # Re-apply: compose recreates only the containers whose published ports changed.
     if "${COMPOSE[@]}" ps --status running --quiet 2>/dev/null | grep -q .; then
         local -a lan_services=()
-        while IFS= read -r service; do lan_services+=("$service"); done < <(selected_services)
+        local services_text
+        services_text=$(selected_services) || return 1
+        while IFS= read -r service; do [ -z "$service" ] || lan_services+=("$service"); done <<< "$services_text"
         [ "${#lan_services[@]}" -eq 0 ] || "${COMPOSE[@]}" up -d "${lan_services[@]}"
     else
         echo "The containers are not running; the new addresses apply at the next start."
@@ -3255,6 +3265,10 @@ PY
     sbin_path=${SBIN_DIR#/}
     update_path=${SYSTEM_ROOT#/}
     update_path=${update_path:+$update_path/}etc/vesselstack/update.env
+    # Read the whole listing first: a listing that stops early must not pass as a short, valid one.
+    archive_listing=$(tar -tzf "$archive") || { echo "Could not list the backup contents" >&2; exit 1; }
+    # A valid backup always lists at least its top folder.
+    [ -n "$archive_listing" ] || { echo "The backup lists no contents" >&2; exit 1; }
     while IFS= read -r entry; do
         case "$entry" in
             "vesselstack-backup/$root_path"|"vesselstack-backup/$root_path/"*|\
@@ -3265,7 +3279,7 @@ PY
             "vesselstack-backup/$update_path") ;;
             *) invalid=1 ;;
         esac
-    done < <(tar -tzf "$archive")
+    done <<< "$archive_listing" || { echo "Could not check the paths in the backup" >&2; exit 1; }
     if [ "$invalid" -ne 0 ]; then
         echo "Backup contains paths outside this VesselStack installation" >&2
         exit 1
@@ -3299,14 +3313,16 @@ restore_helper_map() {
 }
 
 restore_external_candidates() {
-    local p unit
+    local p unit known
+    # The list is read first and a failure stops the snapshot: a short list would leave a file out of it.
+    known=$(restore_known_units) || return 1
     # This is the installer output allowlist.  Absent paths are inventoried too so
     # rollback can restore the previous state, including removing files that a failed
     # restore introduced.  Every unit file and enable link that exists now is inventoried
     # as well, because restoring an older release may remove it.
     while IFS= read -r unit; do
         printf '%s\n' "$SYSTEMD_DIR/$unit"
-    done < <(restore_known_units)
+    done <<< "$known"
     printf '%s\n' "$SYSTEMD_DIR/timers.target.wants/vesselstack-backup.timer" "$SYSTEMD_DIR/timers.target.wants/vesselstack-alerts.timer"
     for unit in vesselstack-firewall.service vesselstack-homepage-refresh.service vesselstack-chat.service vesselstack-chat-telegram.service vesselstack-telemetry-indexer.timer \
         vesselstack-telemetry-sample.timer vesselstack-signalk.service vesselstack-socketcan.service \
@@ -3501,7 +3517,10 @@ restore_unit_label() {
 restore_sync_system_files() {
     local journal=$1 stage=$2 root=$3 unit link wants_link scripts source target mode tmp
     local -a doomed=() links=() owner=()
-    local archive_units=0
+    local archive_units=0 known helpers
+    # Both lists are read in full first; a failure here stops the restore before the system files change.
+    known=$(restore_known_units) || return 1
+    helpers=$(restore_helper_map) || return 1
     : > "$journal/removed-units" || return 1
     # An archive with no managed unit at all is malformed or hand-built (real archives have
     # carried unit files since 0.6.4); removing every known unit because of it would be wrong.
@@ -3510,7 +3529,7 @@ restore_sync_system_files() {
         if [ -e "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/$unit" ] || [ -L "$stage/vesselstack-backup/${SYSTEMD_DIR#/}/$unit" ]; then
             archive_units=$((archive_units + 1))
         fi
-    done < <(restore_known_units)
+    done <<< "$known"
     if [ "$archive_units" -eq 0 ]; then
         echo "WARN the backup contains no VesselStack unit files; leaving the installed units in place" >&2
     fi
@@ -3525,7 +3544,7 @@ restore_sync_system_files() {
         if [ -e "$SYSTEMD_DIR/$unit" ] || [ -L "$SYSTEMD_DIR/$unit" ] || [ "${#links[@]}" -gt 0 ]; then
             doomed+=("$unit")
         fi
-    done < <(restore_known_units)
+    done <<< "$known"
     for unit in ${doomed[@]+"${doomed[@]}"}; do
         # Best effort: the writers are already quiesced and the stack stopped.
         systemctl stop "$unit" 2>/dev/null || true
@@ -3563,7 +3582,7 @@ restore_sync_system_files() {
         else
             rm -f -- "$target" || return 1
         fi
-    done < <(restore_helper_map)
+    done <<< "$helpers"
 }
 # Units that read or write ROOT or DATA and are not stopped by stop_stack. They are
 # stopped for the swap only, and the ones actually stopped are recorded in
@@ -3584,10 +3603,15 @@ restore_quiesce_unit() {
     systemctl stop "$unit" || return 1
 }
 restore_quiesce_writers() {
-    local journal=$1 timer service
+    local journal=$1 timer service timers
     restore_quiesced=''
     : > "$journal/quiesced-units" || return 1
     : > "$journal/quiesced-containers" || return 1
+    # The timer list is read in full before any is stopped, and a failing sort stops the restore.
+    # (A systemctl that cannot list units only means there are no extra timers: the fixed four still apply.)
+    timers=$({ printf '%s\n' vesselstack-alerts.timer vesselstack-backup.timer \
+                   vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.timer
+               systemctl list-units --plain --no-legend --no-pager --type=timer 'vesselstack-*.timer' 2>/dev/null | awk '{print $1}' || true; } | sort -u) || return 1
     while IFS= read -r timer; do
         [ -n "$timer" ] || continue
         systemctl is-active --quiet "$timer" 2>/dev/null || continue
@@ -3595,9 +3619,7 @@ restore_quiesce_writers() {
         service=$(systemctl show -p Unit --value "$timer" 2>/dev/null || true)
         case "$service" in *.service) ;; *) service=${timer%.timer}.service ;; esac
         restore_quiesce_unit "$journal" "$service" || return 1
-    done < <({ printf '%s\n' vesselstack-alerts.timer vesselstack-backup.timer \
-                   vesselstack-telemetry-indexer.timer vesselstack-telemetry-sample.timer
-               systemctl list-units --plain --no-legend --no-pager --type=timer 'vesselstack-*.timer' 2>/dev/null | awk '{print $1}'; } | sort -u)
+    done <<< "$timers"
     restore_quiesce_unit "$journal" vesselstack-control-panel.service || return 1
     restore_quiesce_unit "$journal" vesselstack-homepage-refresh.service || return 1
     restore_sync_file "$journal" "$journal/quiesced-units" || return 1
@@ -3916,7 +3938,7 @@ restore_reconcile_fail() {
         restore_manual_procedure "$journal"
     elif [ "$kind" = previous ]; then
         restore_previous_ways_out "$journal" "$4" "${5:-}"
-    else
+    elif [ "${4:-}" != own ]; then
         echo "Fix the cause above, then run the recovery again: sudo $journal/recover rollback" >&2
     fi
     return 1
@@ -4054,14 +4076,67 @@ restore_probe_renames() {
 # would drop the firewall; vesselstack-socketcan.service only brings a CAN link up or down.
 # (homepage-refresh also has RemainAfterExit but has no ExecStop and runs vesselstackctl from ROOT, so it
 # is a writer and stays in the list.)
+restore_not_a_writer() {
+    case "$1" in
+        vesselstack-firewall.service|vesselstack-socketcan.service) return 0 ;;
+    esac
+    return 1
+}
+# The list is built in full before any of it is printed (no child process is alive while it is written,
+# which bash 3.2 does not survive reliably), and a failure to build it is a failure of the function.
 restore_writer_units() {
-    local unit
+    local unit known
+    known=$(restore_known_units) || return 1
     while IFS= read -r unit; do
-        case "$unit" in
-            vesselstack-firewall.service|vesselstack-socketcan.service) ;;
-            *) printf '%s\n' "$unit" ;;
-        esac
-    done < <(restore_known_units)
+        restore_not_a_writer "$unit" || printf '%s\n' "$unit"
+    done <<< "$known"
+}
+# Fills restore_writer_list with the writer units, or fails. The stop and the check that follows rely on
+# this list for safety, so it is accepted only when it is complete: it must be non-empty, the known units
+# must include the markers below (the first of the excluded ones, one in the middle, the last), and it must
+# hold exactly the known units minus the ones that are not writers, each once. The expected set comes from
+# restore_known_units itself, so the check cannot drift from the list. An incomplete list is never used.
+restore_load_writer_units() {
+    restore_load_writer_units_checked || { restore_writer_list=(); return 1; }
+}
+restore_load_writer_units_checked() {
+    local known writers unit marker expected=0 got=0 seen=$'\n'
+    restore_writer_list=()
+    known=$(restore_known_units) || return 1
+    writers=$(restore_writer_units) || return 1
+    [ -n "$known" ] && [ -n "$writers" ] || return 1
+    for marker in vesselstack-firewall.service vesselstack-socketcan.service vesselstack-alerts.timer; do
+        case $'\n'"$known"$'\n' in *$'\n'"$marker"$'\n'*) ;; *) return 1 ;; esac
+    done
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        restore_not_a_writer "$unit" || expected=$((expected + 1))
+    done <<< "$known"
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || return 1
+        if restore_not_a_writer "$unit"; then return 1; fi
+        case $'\n'"$known"$'\n' in *$'\n'"$unit"$'\n'*) ;; *) return 1 ;; esac
+        case "$seen" in *$'\n'"$unit"$'\n'*) return 1 ;; esac
+        seen="$seen$unit"$'\n'
+        got=$((got + 1))
+        restore_writer_list+=("$unit")
+    done <<< "$writers"
+    [ "$expected" -gt 0 ] && [ "$got" -eq "$expected" ] || return 1
+}
+restore_writer_list_error() {
+    restore_verify_error="the list of units to stop could not be built"
+    restore_verify_suffix="; nothing was moved"
+    restore_verify_list_failed=1
+}
+# The rollback's refusal for a failed stop or check. When the unit list could not be built there is no cause the owner
+# can fix, so the message carries the instruction itself instead of "Fix the cause above".
+restore_verify_refusal() {
+    local journal=$1
+    if [ "${restore_verify_list_failed:-0}" = 1 ]; then
+        restore_reconcile_fail "$journal" "$restore_verify_error$restore_verify_suffix. Run the recovery again: sudo $journal/recover rollback" retry own
+    else
+        restore_reconcile_fail "$journal" "$restore_verify_error$restore_verify_suffix"
+    fi
 }
 # True when systemd is the running init system (a rescue system, a chroot or a container has none).
 restore_systemd_running() {
@@ -4208,9 +4283,10 @@ restore_start_containers() {
 # Both fail with restore_verify_error (the cause) and restore_verify_suffix (what the rollback adds to it) set.
 restore_stop_writers() {
     local journal=$1 record=$2 pass unit
-    restore_verify_error='' restore_verify_suffix=''
+    restore_verify_error='' restore_verify_suffix='' restore_verify_list_failed=0
+    restore_load_writer_units || { restore_writer_list_error; return 1; }
     for pass in timer service; do
-        while IFS= read -r unit; do
+        for unit in ${restore_writer_list[@]+"${restore_writer_list[@]}"}; do
             case "$unit" in *".$pass") ;; *) continue ;; esac
             if ! restore_unit_idle "$unit"; then
                 restore_stopped_units="$restore_stopped_units $unit"
@@ -4220,7 +4296,7 @@ restore_stop_writers() {
                 fi
             fi
             systemctl stop "$unit" >/dev/null 2>&1 || true
-        done < <(restore_writer_units)
+        done
     done
 }
 # A fourth argument "rollback" makes a failure to record the containers a warning instead of a refusal: a rollback
@@ -4228,10 +4304,11 @@ restore_stop_writers() {
 restore_verify_stopped() {
     local root=$1 data=$2 journal=$3 mode=${4:-forward} unit active='' rc helper="$3/restore_journal.py" name
     local -a tried=()
-    restore_verify_error='' restore_verify_suffix=''
-    while IFS= read -r unit; do
+    restore_verify_error='' restore_verify_suffix='' restore_verify_list_failed=0
+    restore_load_writer_units || { restore_writer_list_error; return 1; }
+    for unit in ${restore_writer_list[@]+"${restore_writer_list[@]}"}; do
         restore_unit_idle "$unit" || active="$active $unit"
-    done < <(restore_writer_units)
+    done
     if [ -n "$active" ]; then
         restore_verify_error="these units are still running and may be using the folders:$active"
         restore_verify_suffix="; nothing was moved. Stop them (sudo systemctl stop ...) and run the recovery again"
@@ -4285,7 +4362,7 @@ restore_verify_stopped() {
 # auto-restart of a crash-looping unit), and must then be inactive or failed.
 restore_stop_before_moving() {
     local journal=$1 root=$2 root_live=$3 root_new=$4 data=$5 current
-    restore_stop_writers "$journal" 0 || { restore_reconcile_fail "$journal" "$restore_verify_error"; return 1; }
+    restore_stop_writers "$journal" 0 || { restore_verify_refusal "$journal"; return 1; }
     current=$(restore_inode "$journal" "$root")
     if restore_same_ino "$current" "$root_new"; then
         restore_run_controller "$journal" "$journal/new-controller" stop || \
@@ -4295,7 +4372,7 @@ restore_stop_before_moving() {
             echo "WARN the stack could not be stopped (controller stop); checking the units instead" >&2
     fi
     if ! restore_verify_stopped "$root" "$data" "$journal" rollback; then
-        restore_reconcile_fail "$journal" "$restore_verify_error$restore_verify_suffix"
+        restore_verify_refusal "$journal"
         return 1
     fi
 }

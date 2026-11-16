@@ -1340,6 +1340,89 @@ check_restore_leftovers
         self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM "))], lay["calls"])
         self.assertTrue(lay["stage"].exists())
 
+    # ---- the list of units to stop: complete, or nothing is moved ----
+
+    BROKEN_UNIT_LISTS = {
+        "nothing": "restore_writer_units() { return 0; }",
+        "a short list": "restore_writer_units() { printf '%s\\n' vesselstack-chat.service vesselstack-alerts.service; }",
+        "a failure after part of the list": "restore_writer_units() { printf '%s\\n' vesselstack-chat.service vesselstack-alerts.service; return 1; }",
+        "no known units": "restore_known_units() { return 0; }",
+        "a duplicated unit": "restore_writer_units() { { restore_known_units | while IFS= read -r u; do restore_not_a_writer \"$u\" || printf '%s\\n' \"$u\"; done; } | sed '$d'; printf '%s\\n' vesselstack-chat.service; }",
+        "a failing known list": "restore_known_units() { printf '%s\\n' vesselstack-firewall.service vesselstack-chat.service; return 1; }",
+    }
+
+    def test_the_known_units_the_writers_are_built_from_are_the_expected_ones(self):
+        known = re.findall(r"vesselstack-[a-z-]+\.(?:service|timer)", helper_source().split("restore_known_units() {", 1)[1].split("}", 1)[0])
+        self.assertEqual(len(known), 16, known)
+        self.assertEqual(len(set(known)), 16)
+
+    def test_the_writer_units_come_out_complete_and_in_order_300_times_under_load(self):
+        # Regression: under bash 3.2 (macOS /bin/bash) a process substitution whose producer has a child of its own
+        # sometimes lost the end of its output when the child's exit interrupted the write. The list is now built before
+        # it is printed. Both the way the callers used to read it and a command substitution are checked.
+        body = helper_source().split("restore_known_units() {", 1)[1].split("\n}\n", 1)[0]
+        known = re.findall(r"vesselstack-[a-z-]+\.(?:service|timer)", body)
+        expected = "\n".join(u for u in known if u not in ("vesselstack-firewall.service", "vesselstack-socketcan.service"))
+        script = """
+for _ in 1 2 3 4; do ( while :; do :; done ) & done
+load=$(jobs -p)
+trap 'kill $load 2>/dev/null' EXIT
+want=@EXPECTED@
+bad=0
+for i in $(seq 1 300); do
+    got=$(restore_writer_units) || { bad=$((bad + 1)); continue; }
+    [ "$got" = "$want" ] || bad=$((bad + 1))
+    got=''
+    while IFS= read -r unit; do got="$got$unit"$'\\n'; done < <(restore_writer_units)
+    [ "${got%$'\\n'}" = "$want" ] || bad=$((bad + 1))
+done
+echo "bad=$bad"
+[ "$bad" -eq 0 ]
+""".replace("@EXPECTED@", "'" + expected + "'")
+        result = self.run_harness(transaction_source() + script, Path(tempfile.gettempdir()))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_unit_list_check_accepts_the_real_list_and_refuses_every_broken_one(self):
+        script = """
+restore_load_writer_units && echo "real:${#restore_writer_list[@]}"
+@BREAK@
+if restore_load_writer_units; then echo accepted; else echo "refused:${#restore_writer_list[@]}"; fi
+"""
+        real = self.run_harness(transaction_source() + script.replace("@BREAK@", ""), Path(tempfile.gettempdir()))
+        self.assertEqual(real.stdout.splitlines()[0], "real:14", real.stdout + real.stderr)
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            result = self.run_harness(transaction_source() + script.replace("@BREAK@", override), Path(tempfile.gettempdir()))
+            self.assertEqual(result.stdout.splitlines()[-1], "refused:0", f"{name}: {result.stdout}{result.stderr}")
+
+    def test_the_forward_restore_aborts_before_any_move_when_the_unit_list_cannot_be_built(self):
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            with self.subTest(name):
+                td, result, root, data = self.run_transaction("success", pre=override); self.addCleanup(td.cleanup)
+                self.assertNotEqual(result.returncode, 0)
+                calls = self.log.read_text().splitlines()
+                self.assertFalse([c for c in calls if c.startswith("MV ") and "restore/current" not in c], calls)
+                self.assertFalse([c for c in calls if c.startswith("systemctl stop")], calls)
+                self.assertIn("the list of units to stop could not be built; nothing was moved", result.stderr)
+                self.assertTrue((root / "old").exists()); self.assertTrue((data / "old").exists())
+                self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+
+    def test_the_rollback_refuses_when_the_unit_list_cannot_be_built(self):
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            with self.subTest(name):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                lay["active"].write_text("vesselstack-chat.service\n")
+                self.reconcile(lay, extra="export LOG_RM=1\n" + override)
+                result = lay["result"]
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
+                self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+                self.assertIn("the list of units to stop could not be built; nothing was moved", result.stderr)
+                self.assertIn("could not be built; nothing was moved. Run the recovery again: sudo ", result.stderr)
+                self.assertIn("/recover rollback", result.stderr)
+                self.assertNotIn("Fix the cause above", result.stderr)
+                self.assertEqual((lay["root"] / "marker").read_text(), "new-root"); self.assertEqual((lay["data"] / "marker").read_text(), "new-data")
+                self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM ", "systemctl stop"))], lay["calls"])
+
     # ---- fixes 2, 3 and 5: what must not be running before a tree moves ----
 
     def containers(self, lay, *lines):
@@ -2801,6 +2884,39 @@ echo "returned"
         self.assertNotIn("a restore is unfinished", result.stderr)
         self.assertIn("Recovering an unfinished restore (phase: prepared)", result.stdout, result.stdout + result.stderr)
 
+    def test_an_unreadable_core_component_list_only_warns_and_the_recovery_status_still_works(self):
+        # The journal's controller can run from a restored or damaged tree: a registry that exists but cannot run
+        # (exits non-zero, or prints nothing) falls back to the built-in list with one warning, never stops the command.
+        for name, source in (("fails", "import sys\nsys.exit(3)\n"), ("prints nothing", "pass\n")):
+            with self.subTest(name):
+                helper = RestoreTransactionTests(); self.addCleanup(helper.doCleanups)
+                lay = helper.layout("prepared")
+                base = lay["base"]
+                (base / "var/lib/vesselstack").mkdir(parents=True)
+                os.rename(base / "restore", base / "var/lib/vesselstack/restore")
+                journal = base / "var/lib/vesselstack/restore/current"
+                helper.set_state(journal, f"system_root={base}")
+                shutil.copy(CONTROLLER, journal / "controller"); (journal / "controller").chmod(0o700)
+                shutil.copy(LOCK_HELPER, journal / "lifecycle_lock.py")
+                recover = journal / "recover"; recover.write_text(helper.real_recover_wrapper()); recover.chmod(0o700)
+                (base / "opt/vesselstack/common").mkdir(parents=True, exist_ok=True)
+                registry = base / "opt/vesselstack/common/config_registry.py"
+                registry.write_text(source)
+                env = {k: v for k, v in os.environ.items() if k not in ("VESSELSTACK_LIFECYCLE_LOCK_FD", "VESSELSTACK_RESTORE_ID", "VESSELSTACK_ENV")}
+                fakebin = base / "fakebin"; fakebin.mkdir()
+                (fakebin / "id").write_text("#!/bin/sh\necho 0\n"); (fakebin / "id").chmod(0o755)
+                env.update(PATH=f"{fakebin}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(base))
+                status = subprocess.run([str(recover), "status"], capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertEqual(status.stderr.count("using the built-in list"), 1, status.stderr)
+                self.assertIn("could not read the list of core components from", status.stderr)
+                self.assertIn("prepared", status.stdout)
+                (base / "opt/vesselstack/config").mkdir(); (base / "opt/vesselstack/config/vesselstack.env").write_text(f"VESSELSTACK_DATA={base}/data\n")
+                version = subprocess.run(["bash", str(CONTROLLER), "version"], capture_output=True, text=True,
+                                         env=dict(env, VESSELSTACK_ROOT=str(base / "opt/vesselstack")), timeout=60)
+                self.assertEqual(version.returncode, 0, version.stdout + version.stderr)
+                self.assertEqual(version.stderr.count("using the built-in list"), 1, version.stderr)
+
 
 class RestoreWorkerTests(unittest.TestCase):
     """`recover worker ID`: the forward part of a restore, run from the journal alone."""
@@ -3212,42 +3328,86 @@ cmd[0] = shutil.which("bash")
 def reset():
     for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, signal.SIG_DFL)
-subprocess.Popen(["/usr/bin/env", "-i", "PATH=" + os.environ["PATH"]] + ["VESSELSTACK_BOOT_ID_FILE=" + os.environ[name] for name in ("VESSELSTACK_BOOT_ID_FILE",) if name in os.environ] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+worker = subprocess.Popen(["/usr/bin/env", "-i", "PATH=" + os.environ["PATH"]] + ["VESSELSTACK_BOOT_ID_FILE=" + os.environ[name] for name in ("VESSELSTACK_BOOT_ID_FILE",) if name in os.environ] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                  stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, preexec_fn=reset)
+# The only record of the workers this launcher really started, written by nobody else: the test's clean-up signals
+# these and never a pid it reads from a worker-*.pid file (a file under test, which tests fill with unrelated pids).
+with open(os.path.join(base, "started-workers.log"), "a") as started:
+    started.write("%d %d\n" % (worker.pid, os.getpgid(worker.pid)))
 if mode == "start-then-fail":
     print("Failed to start transient service: simulated", file=sys.stderr)
     sys.exit(1)
 '''
 
+    def started_workers(self):
+        """(pid, pgid) of every worker the stub launcher started, from the file only the launcher writes."""
+        found = []
+        try:
+            lines = (self.base / "started-workers.log").read_text().splitlines()
+        except OSError:
+            return found
+        for line in lines:
+            try:
+                pid, pgid = (int(field) for field in line.split())
+            except ValueError:
+                continue
+            found.append((pid, pgid))
+        return found
+
+    def own_process(self, pid):
+        """True when `pid` is a live process that mentions this test's temp directory on its command line."""
+        try:
+            if sys.platform.startswith("linux"):
+                command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            else:
+                command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return str(self.base) in command
+
+    @staticmethod
+    def signal_ours(pid, group, sig=signal.SIGKILL):
+        """Last line of defence for every kill of this class. Never pid or group 0 or 1 (on Linux killpg(1, ...) is
+        kill(-1, ...), which kills every process of the user, the runner agent of a CI job included), never the test
+        runner, its parent or its own group. The callers pass only processes this test started itself."""
+        refused = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        if pid in refused or pid < 0:
+            return
+        try:
+            if group not in refused and group > 1:
+                os.killpg(group, sig)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
     def stop_everything(self):
-        """Nothing started by a test outlives it: every foreground and every worker, with its process group."""
+        """Nothing started by a test outlives it: every foreground and every worker, with its process group.
+
+        Only processes this test started are signalled: the Popen objects it holds (all started in a session of their
+        own, so the group is theirs) and the workers its stub launcher recorded. A worker-*.pid file is never read for
+        this: tests write unrelated pids into those on purpose."""
         try:
             (self.base / "release").write_text("")
         except OSError:
             pass
-        groups = []
         for proc in self.procs:
-            groups.append(proc.pid)
-            if proc.poll() is None:
-                proc.kill(); proc.wait()
-        for pidfile in self.restore_dir.glob("worker-*.pid") if self.restore_dir.exists() else []:
-            try:
-                groups.append(int(pidfile.read_text().split()[0]))
-            except (OSError, ValueError, IndexError):
-                pass
-        for group in groups:
-            for kill in (lambda: os.killpg(group, signal.SIGKILL), lambda: os.kill(group, signal.SIGKILL)):
-                try:
-                    kill()
-                except (OSError, ProcessLookupError):
-                    pass
+            self.signal_ours(proc.pid, proc.pid)  # its group is its own: it was started with start_new_session=True
+            proc.wait()
+        for pid, pgid in self.started_workers():
+            if self.own_process(pid):
+                self.signal_ours(pid, pgid)
 
     def env(self, **extra):
+        # The launch wait is the production default: a worker that is slow to start (a busy CI runner) must not be
+        # taken for one that never appears. The tests of that case set a short wait themselves.
         env = {k: v for k, v in os.environ.items() if not k.startswith("VESSELSTACK_")}
         env.update(PATH=f"{self.base / 'fakebin'}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(self.base),
                    VESSELSTACK_ROOT=str(self.root), VESSELSTACK_TEST_SYSTEMD_RUN=str(self.launcher),
                    VESSELSTACK_BOOT_ID_FILE=_BOOT_FILE, VESSELSTACK_RESTORE_FOLLOW_INTERVAL="0.1",
-                   VESSELSTACK_RESTORE_LAUNCH_WAIT="3", VESSELSTACK_RESTORE_DEAD_GRACE="1", VESSELSTACK_RESTORE_LOCK_WAIT="10")
+                   VESSELSTACK_RESTORE_LAUNCH_WAIT="30", VESSELSTACK_RESTORE_DEAD_GRACE="1", VESSELSTACK_RESTORE_LOCK_WAIT="10")
         env.update(extra)
         return env
 
@@ -3265,13 +3425,51 @@ if mode == "start-then-fail":
         result = subprocess.run(["bash", str(self.ctl), *args], capture_output=True, text=True, env=self.env(**extra_env), timeout=timeout)
         return result.returncode, result.stdout, result.stderr
 
-    def wait_for(self, path, timeout=30):
+    def wait_for(self, path, timeout=60):
         deadline = time.time() + timeout
         while time.time() < deadline:
             if Path(path).exists():
                 return
             time.sleep(0.05)
-        self.fail(f"{path} did not appear")
+        self.fail(f"{path} did not appear\n{self.diagnostics()}")
+
+    def diagnostics(self):
+        """What a failed wait needs to explain itself: the foregrounds' status and output so far, the launcher's log, the
+        worker files, the journal phase and the processes that mention this test's directory."""
+        lines = []
+        for number, proc in enumerate(self.procs):
+            lines.append(f"foreground {number}: pid {proc.pid} returncode {proc.poll()}")
+            for name in ("stdout", "stderr"):
+                stream = getattr(proc, name)
+                text = ""
+                if stream is not None:
+                    try:
+                        os.set_blocking(stream.fileno(), False)
+                        text = os.read(stream.fileno(), 65536).decode(errors="replace")
+                    except (OSError, ValueError):
+                        pass
+                lines.append(f"  {name} so far: {self.normalise(text)!r}")
+        for name in ("launcher.log", "started-workers.log"):
+            try:
+                lines.append(f"{name}: {self.normalise((self.base / name).read_text())!r}")
+            except OSError:
+                lines.append(f"{name}: (none)")
+        try:
+            lines.append("journal phase: %r runner: %r" % (state_value(self.journal, "phase"), state_value(self.journal, "runner")))
+        except (OSError, ValueError) as exc:
+            lines.append(f"journal: unreadable ({exc})")
+        try:
+            for path in sorted(self.restore_dir.iterdir()):
+                text = ""
+                if path.is_file() and path.name.startswith("worker-"):
+                    text = path.read_text(errors="replace")[-1500:]
+                lines.append(f"  {path.name}: {self.normalise(text)!r}")
+        except OSError:
+            lines.append("restore dir: (none)")
+        lines.append("files here: " + " ".join(sorted(path.name for path in self.base.iterdir())))
+        ps = subprocess.run(["ps", "-eo", "pid,pgid,stat,command"], capture_output=True, text=True).stdout
+        lines.append("processes:\n" + "\n".join(self.normalise(line) for line in ps.splitlines() if str(self.base) in line))
+        return "\n".join(lines)
 
     def mode(self, name, value):
         (self.base / name).write_text(value)
@@ -3389,6 +3587,7 @@ if mode == "start-then-fail":
             with self.subTest(sig=sig.name):
                 if (self.base / "release").exists():
                     (self.base / "release").unlink(); (self.base / "hanging").unlink()
+                    self.wait_for_lock_free()  # the previous worker (and the lock helper around it) has really ended
                     self.tearDown_fixture_and_rebuild()
                     for old in self.base.glob("worker-env.*"): old.unlink()
                 self.mode("ctl-mode", "hang")
@@ -3404,6 +3603,21 @@ if mode == "start-then-fail":
                 self.wait_for(self.restore_dir / f"worker-{HEX_ID}.rc")
                 self.assertEqual((self.restore_dir / f"worker-{HEX_ID}.rc").read_text(), "0\n")
                 self.assertEqual(phase_of(self.archived()), "committed")
+
+    def wait_for_lock_free(self, timeout=60):
+        """The lifecycle lock can be taken: the worker of an earlier run in this test has ended. Bounded."""
+        from common.lifecycle_lock import LifecycleLock, LifecycleLockBusy
+        deadline = time.time() + timeout
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VESSELSTACK_LIFECYCLE_LOCK_FD", None)
+            while True:
+                try:
+                    LifecycleLock(self.root, self.base).acquire().release()
+                    return
+                except LifecycleLockBusy:
+                    if time.time() > deadline:
+                        self.fail("the lifecycle lock is still held by an earlier run\n" + self.diagnostics())
+                    time.sleep(0.05)
 
     def wait_for_runner(self, timeout=30):
         """The journal exists and has been handed to a worker (runner=worker)."""
@@ -3640,8 +3854,8 @@ if mode == "start-then-fail":
         subprocess.run([sys.executable, "-I", str(self.journal / "restore_journal.py"), "set", str(self.journal), f"phase={phase}"], check=True)
 
     def unrelated_process(self):
-        proc = subprocess.Popen(["sleep", "120"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.procs.append(proc)
+        proc = subprocess.Popen(["sleep", "120"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.procs.append(proc)  # its own session: the clean-up may signal its group
         return proc
 
     def assert_not_running(self, label):
@@ -3805,6 +4019,27 @@ if mode == "start-then-fail":
         result = self.restore_dir / f"worker-{new_id}.rc"; result.write_text("3\n"); os.utime(result, (2_000_100, 2_000_100))
         rc, out, err = self.run_ctl("restore", "--status", "--follow", timeout=30)
         self.assertRegex(out.splitlines()[1], r"^The last restore that ran in the background failed \(exit status 3\) at ")
+
+    def test_cleanup_never_signals_a_pid_read_from_a_worker_pid_file(self):
+        """The clean-up once read worker-*.pid and killpg(1, SIGKILL) took down the whole CI runner. It must not signal
+        any pid a test planted there, nor 0/1, the test runner, its parent or any group of theirs, whatever else is written."""
+        self.restore_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        planted = {"1 -": "a" * 32, f"{os.getpid()} -": "b" * 32, f"{os.getppid()} {BOOT_ID}": "c" * 32, f"{os.getpgrp()}": "d" * 32}
+        for text, ident in planted.items():
+            (self.restore_dir / f"worker-{ident}.pid").write_text(text + "\n")
+        forbidden = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        calls = []
+        def record(kind):
+            return lambda target, sig: calls.append((kind, target, sig))
+        with mock.patch.object(os, "kill", record("kill")), mock.patch.object(os, "killpg", record("killpg")):
+            self.stop_everything()
+            self.assertEqual(calls, [], "the pid files were used to signal something")
+            # even a launcher record that names such pids (it never does) cannot make the clean-up signal them
+            (self.base / "started-workers.log").write_text("".join(f"{pid} {pgid}\n" for pid in forbidden for pgid in forbidden) + "junk\n")
+            with mock.patch.object(type(self), "own_process", lambda self, pid: True):
+                self.stop_everything()
+        self.assertEqual([call for call in calls if call[1] in forbidden or call[1] < 0], [], calls)
+        (self.base / "started-workers.log").unlink()
 
 if __name__ == "__main__":
     unittest.main()

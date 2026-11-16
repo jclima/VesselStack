@@ -130,6 +130,8 @@ Power sources and instrument-reading coverage for Boat Chat are in
   [Node-RED](#node-red-optional) (`NODERED_ENABLE=true`), the
   [marine essentials bundle](#marine-essentials-optional) (`SIGNALK_MARINE_BUNDLE=true`) and
   [scheduled backups](#scheduled-backups) (`VESSELSTACK_BACKUP_SCHEDULE`).
+- A version setting for each component, with `sudo vesselstackctl component versions` to show what
+  runs against the release ([Component versions](#component-versions)).
 - A [hardware watchdog](#unattended-operation-and-power), armed by default on a Raspberry Pi that has
   `/dev/watchdog`. Set `VESSELSTACK_WATCHDOG="false"` to opt out.
 
@@ -577,6 +579,11 @@ documented lab checks pass. The stable release is 0.8.0.
   power loss during a restore, the next boot rolls it back; set `VESSELSTACK_RESTORE_AT_BOOT="hold"`
   to only record what it found. Services still start before the recovery stops them. See
   [Recovery at boot](#recovery-at-boot).
+- **Signal K and AIS-catcher may move to this release's versions at the first update.** An older
+  installer wrote their versions into your settings file. The first update to 0.9.0 clears a
+  `SIGNALK_VERSION` or `AIS_IMAGE` that it wrote, with one line telling you, so both follow the
+  release from now on. A value you chose yourself is kept. To keep a specific version, set it in
+  the settings file and rerun the installer (see [Component versions](#component-versions)).
 - **Displays** need a rebuild and reflash to get the alarm banner and the other firmware changes:
   `vesselstackctl display build ID`, then `display flash ID`, or **Apply to screen** in the Control
   Panel. The new firmware needs this release's bridge; the bridge changes apply when the update
@@ -2081,6 +2088,11 @@ extracted backup are flushed to disk before the first change, and each tree rena
 followed by a directory flush. After a power loss, the boat computer recovers a restore that was
 interrupted by itself at the next boot (see [Recovery at boot](#recovery-at-boot)).
 
+Before it moves anything, a restore or rollback builds the list of services to stop and checks
+that it is complete. If the list cannot be built in full, it stops and says "the list of units to
+stop could not be built; nothing was moved". Nothing is changed, so run the restore or
+`recover rollback` again.
+
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall
 --purge-data`). Verify the system first, then
@@ -2802,6 +2814,10 @@ For the lifecycle/install boundary, also run `bash tests/test-clean-install.sh`
 and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
 dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
 bytecode in the source or bundled runtime tree.
+
+CI runs the Python regressions with a 20 minute limit (`timeout-minutes: 20`), so a hanging test fails the job with a log instead of blocking it.
+
+Test clean-up only ever signals processes its own test started (never a pid read from a file under test, and never pid or process group 0 or 1, the runner or its parent)), and the restore hand-off tests wait the production 30 s for a worker to start, so a busy runner is not mistaken for a worker that never appeared; a failed wait prints the foreground output, the launcher log, the worker files and the processes.
 
 The test-mechanics notes (directory-listing and `tar -t` assertions, `tests/test-remote.sh`, the CI profile check, scripted wizard answers and reproducing CI on a Mac) are in [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 

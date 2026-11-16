@@ -329,7 +329,10 @@ fi
 
 if [ -r "$SOURCE_ROOT/common/config_registry.py" ]; then
     CORE_COMPONENTS=()
-    while IFS= read -r component; do CORE_COMPONENTS+=("$component"); done < <(python3 -I "$SOURCE_ROOT/common/config_registry.py" --core-components)
+    # Captured first: a failing helper must not leave a silently short list.
+    core_components_text=$(python3 -I "$SOURCE_ROOT/common/config_registry.py" --core-components) || { echo "Could not read the list of core components" >&2; exit 1; }
+    while IFS= read -r component; do [ -z "$component" ] || CORE_COMPONENTS+=("$component"); done <<< "$core_components_text"
+    [ "${#CORE_COMPONENTS[@]}" -gt 0 ] || { echo "The list of core components is empty" >&2; exit 1; }
 else
     CORE_COMPONENTS=(homeassistant influxdb grafana prometheus mosquitto homepage)
 fi
@@ -878,16 +881,17 @@ config_key_is_secret() {
 # config_env_snapshot FILE KEY: in a clean subshell, sources FILE and prints the declared
 # state of every known setting except KEY (so a fix is checked against all the others).
 config_env_snapshot() {
-    local file=$1 skip=$2 key
+    local file=$1 skip=$2 key keys
+    keys=$(vesselstack_env_keys; extra_env_keys) || return 1
     (
         set +eu
-        while IFS= read -r key; do unset "$key"; done < <(vesselstack_env_keys; extra_env_keys)
+        while IFS= read -r key; do unset "$key"; done <<< "$keys"
         # shellcheck disable=SC1090
         source "$file" >/dev/null 2>&1 || exit 3
         while IFS= read -r key; do
             [ "$key" = "$skip" ] && continue
             declare -p "$key" 2>/dev/null || echo "unset $key"
-        done < <(vesselstack_env_keys; extra_env_keys)
+        done <<< "$keys"
     )
 }
 
@@ -1056,7 +1060,8 @@ cleanup_env_temps() {
 # and control-panel.env, run before anything is changed and before the dry run
 # exits. Reports KEY names and reasons only, never values.
 env_values_preflight() {
-    local key bad=0 hard=0 fixable='' fix_reason='' reason secrets=0 report=''
+    local key keys bad=0 hard=0 fixable='' fix_reason='' reason secrets=0 report=''
+    keys=$(vesselstack_env_keys; extra_env_keys) || { echo "Could not build the list of settings to check" >&2; exit 1; }
     while IFS= read -r key; do
         if reason=$(env_value_problem "${!key:-}"); then
             report+="  $key: $reason"$'\n'
@@ -1069,7 +1074,7 @@ env_values_preflight() {
                 hard=1
             fi
         fi
-    done < <(vesselstack_env_keys; extra_env_keys)
+    done <<< "$keys"
     if reason=$(env_value_problem "$(<"$SCRIPT_DIR/VERSION")"); then
         report+="  VERSION: $reason"$'\n'
         bad=1; hard=1
@@ -1821,9 +1826,11 @@ install -m 0644 "$SCRIPT_DIR/systemd/vesselstack-socketcan.service.in" \
     "$VESSELSTACK_ROOT/systemd/vesselstack-socketcan.service.in"
 
 new_env_temp vesselstack.env; vs_env_tmp=$NEW_ENV_TEMP
+# The key list is read in full first: a short list would write a vesselstack.env with settings missing.
+env_keys_text=$(vesselstack_env_keys) || { echo "Could not build the list of settings to write" >&2; exit 1; }
 while IFS= read -r key; do
     env_line "$key" "${!key:-}" >> "$vs_env_tmp"
-done < <(vesselstack_env_keys)
+done <<< "$env_keys_text"
 mv -f -- "$vs_env_tmp" "$VESSELSTACK_ROOT/config/vesselstack.env"
 # Optional Node-RED: data directory, settings.js (only when absent) and the root-only nodered.env
 # (MQTT and sign-in values; the InfluxDB token is added once InfluxDB is up). Removes nodered.env when disabled.

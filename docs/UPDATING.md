@@ -30,6 +30,11 @@ release marked Latest. A boat should stay on 0.8.0 until 0.9.0 is promoted.
   enabled by the installer). Set `VESSELSTACK_RESTORE_AT_BOOT="hold"` to opt out, or use
   `--foreground`. Services still start before that recovery stops them. See
   [Recovery at boot](../README.md#recovery-at-boot).
+- Signal K and AIS-catcher may move to this release's versions at the first update. An older
+  installer wrote their versions into your settings file. The first update to 0.9.0 clears a
+  `SIGNALK_VERSION` or `AIS_IMAGE` that it wrote, so both follow the release from now on. A value
+  you chose is kept. To keep a specific version, set it in the settings file and rerun the
+  installer. See [Component versions](../README.md#component-versions).
 - Displays need a rebuild and reflash (`sudo vesselstackctl display build ID`, then `display flash
   ID`) to get the new alarm banner. The new firmware needs this release's bridge. To go back, reflash
   with `sudo vesselstackctl display flash ID --previous`. See
