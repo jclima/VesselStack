@@ -62,7 +62,7 @@ cp "$REPO_ROOT/boat-chat/memory_index.py" "$APP_ROOT/boat-chat/"
 cp "$REPO_ROOT"/boat-chat/knowledge/*.md "$APP_ROOT/boat-chat/knowledge/"
 cp "$REPO_ROOT/scripts/memory-index.sh" "$APP_ROOT/installer/scripts/memory-index.sh"
 cp "$REPO_ROOT/scripts/reconcile-lifecycle.sh" "$APP_ROOT/installer/scripts/reconcile-lifecycle.sh"
-cp "$REPO_ROOT/common/lifecycle_lock.py" "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/boat_profile.py" "$REPO_ROOT/common/boat_profile_cli.py" "$APP_ROOT/common/"
+cp "$REPO_ROOT/common/lifecycle_lock.py" "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/component_versions.py" "$REPO_ROOT/common/boat_profile.py" "$REPO_ROOT/common/boat_profile_cli.py" "$APP_ROOT/common/"
 chmod +x "$APP_ROOT/installer/scripts/reconcile-lifecycle.sh"
 cp "$REPO_ROOT/scripts/render-homepage.py" "$APP_ROOT/installer/scripts/render-homepage.py"
 install -d "$APP_ROOT/installer/brand"
@@ -124,6 +124,14 @@ if [ "$(basename "$0")" = curl ]; then
     else
         printf '%s\n' '{"ok":true,"ready":true}'
     fi
+fi
+# `docker inspect NAME` answers from FAKE_COMPONENT_INSPECT (lines NAME|image|image id|running) when a test sets it.
+if [ "$(basename "$0")" = docker ] && [ "${1:-}" = inspect ] && [ -n "${FAKE_COMPONENT_INSPECT:-}" ]; then
+    while IFS='|' read -r cname cimage cid crunning; do
+        [ "$cname" = "${!#}" ] && { echo "$cimage|$cid|$crunning"; exit 0; }
+    done < "$FAKE_COMPONENT_INSPECT"
+    echo "Error: No such object: ${!#}" >&2
+    exit 1
 fi
 if [ "${1:-}" = compose ] && [[ " $* " == *" --status running --services "* ]]; then
     printf '%s\n' homeassistant influxdb grafana prometheus mosquitto homepage
@@ -1133,6 +1141,25 @@ status_output=$(run_ctl status)
 doctor_output=$(run_ctl doctor)
 grep -Eq 'OK   Boat Chat memory index: [1-9][0-9]* chunks' <<<"$doctor_output"
 
+# Component versions: everything at the release default prints no doctor or status line; an override and a drift do.
+if grep -q 'Component versions' <<<"$status_output"; then exit 1; fi
+if grep -q 'not tested with this release' <<<"$doctor_output"; then exit 1; fi
+cv_table=$(run_ctl component versions)
+grep -q 'release default' <<<"$cv_table"
+cv_json=$(run_ctl component versions --json)
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert [c["state"] for c in d["components"] if c["id"]=="grafana"]==["release default"]' "$cv_json"
+printf 'GRAFANA_VERSION="13.1.0"\n' >> "$APP_ROOT/config/vesselstack.env"
+printf '%s\n' 'vesselstack-grafana|grafana/grafana:13.1.0|sha256:aaa|true' > "$TEST_ROOT/component-inspect"
+export FAKE_COMPONENT_INSPECT="$TEST_ROOT/component-inspect"
+cv_table=$(run_ctl component versions)
+grep -q 'override (newer)' <<<"$cv_table"
+cv_status=$(run_ctl status)
+grep -q 'Component versions *1 not at the release default; see: sudo vesselstackctl component versions' <<<"$cv_status"
+cv_doctor=$(run_ctl doctor 2>&1 || true)
+grep -qF 'WARN Grafana 13.1.0 is set; the release default is 13.0.1. This version is not tested with this release.' <<<"$cv_doctor"
+unset FAKE_COMPONENT_INSPECT
+sed -i '/^GRAFANA_VERSION=/d' "$APP_ROOT/config/vesselstack.env"
+
 # An unfinished installation (config/install-in-progress) is reported by doctor, status and version.
 MARKER_SRC="$TEST_ROOT/marker-source"
 install -d "$MARKER_SRC"
@@ -1598,7 +1625,7 @@ rm -f -- "$SYSTEM_ROOT/dev/watchdog" "$SYSTEM_ROOT/proc/device-tree/model"
 LAN_ROOT="$TEST_ROOT/lan"
 install -d "$LAN_ROOT/config" "$LAN_ROOT/data/boat-chat"
 install -d "$LAN_ROOT/common"
-cp "$REPO_ROOT/common/lifecycle_lock.py" "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/boat_profile.py" "$REPO_ROOT/common/boat_profile_cli.py" "$LAN_ROOT/common/"
+cp "$REPO_ROOT/common/lifecycle_lock.py" "$REPO_ROOT/common/config_registry.py" "$REPO_ROOT/common/component_versions.py" "$REPO_ROOT/common/boat_profile.py" "$REPO_ROOT/common/boat_profile_cli.py" "$LAN_ROOT/common/"
 sed -e "s|^VESSELSTACK_ROOT=.*|VESSELSTACK_ROOT=$LAN_ROOT|" -e "s|^VESSELSTACK_DATA=.*|VESSELSTACK_DATA=$LAN_ROOT/data|" \
     "$APP_ROOT/config/vesselstack.env" > "$LAN_ROOT/config/vesselstack.env"
 printf 'BOAT_CHAT_HOST=0.0.0.0\nBOAT_CHAT_PORT=9876\nOPENAI_API_KEY=keep-this-secret\n' > "$LAN_ROOT/config/boat-chat.env"

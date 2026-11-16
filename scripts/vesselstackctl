@@ -36,6 +36,7 @@ command_needs_lifecycle_lock() {
             [ "${2:-}" = --status ] && [ "$#" -eq 2 ] && return 1
             [ "${2:-}" = --status ] && [ "${3:-}" = --follow ] && [ "$#" -eq 3 ] && return 1 ;;
         profile) case "${2:-}" in show|validate) return 1 ;; esac ;;
+        component) [ "${2:-}" = versions ] && return 1 ;;
         ha-http) [ "${2:-}" = status ] && return 1 ;;
         backup-drive) [ "${2:-}" = list ] && return 1 ;;
         display)
@@ -337,6 +338,8 @@ Commands:
                                (sign in with the printed link) and, with REMOTE_PANEL_SERVE=true,
                                publishes the Control Panel to the tailnet only. disable undoes it;
                                --purge also removes a Tailscale package VesselStack installed
+  component versions [--json] Show each component's release default, the version you chose, and
+                               what is running (read-only; works while a restore is pending)
   doctor                       Validate config, dependencies, disk, and health (also
                                hardware watchdog, journal cap, scheduled backups and
                                power/under-voltage warnings)
@@ -953,6 +956,28 @@ raise SystemExit(0 if data.get("ok") is True and data.get("ready") is True else 
     fi
 }
 
+# Component versions (README "Component versions"): configured against what is running. The rules and
+# the report live in common/component_versions.py; nothing here changes a container.
+component_versions_helper() { printf '%s' "$ROOT/common/component_versions.py"; }
+component_versions_command() {
+    local format=table helper
+    case "${1:-}" in
+        "") ;;
+        --json) format=json; [ "$#" -eq 1 ] || { usage; exit 2; } ;;
+        *) usage; exit 2 ;;
+    esac
+    helper=$(component_versions_helper)
+    [ -r "$helper" ] || { echo "Missing $helper; run the installer again." >&2; return 1; }
+    python3 -I "$helper" --report --format "$format" --env-file "$ENV_FILE"
+}
+# component_versions_lines doctor|status: the doctor or status lines (nothing when every component follows the release).
+component_versions_lines() {
+    local helper
+    helper=$(component_versions_helper)
+    [ -r "$helper" ] || return 0
+    python3 -I "$helper" --report --format "$1" --env-file "$ENV_FILE"
+}
+
 status_stack() {
     local failed=0 service running_services
     # doctor reports the unfinished restore and installation itself (check_restore_state, check_install_state),
@@ -1016,6 +1041,7 @@ status_stack() {
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,homeassistant,*) ;; *) check_endpoint 'Home Assistant' "${HOME_ASSISTANT_URL%/}/manifest.json" || failed=1 ;; esac
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,influxdb,*) ;; *) check_endpoint InfluxDB "${INFLUXDB_URL%/}/health" || failed=1 ;; esac
     case ",${VESSELSTACK_DISABLED_COMPONENTS:-}," in *,grafana,*) ;; *) check_endpoint Grafana "http://127.0.0.1:${GRAFANA_PORT:-43000}/api/health" || failed=1 ;; esac
+    if [ "${1:-}" != quiet ]; then component_versions_lines status || true; fi
     printf '\nRun vesselstackctl doctor for configuration and dependency checks.\n'
     return "$failed"
 }
@@ -2751,6 +2777,7 @@ doctor_stack() {
     check_nodered
     check_remote
     check_power
+    component_versions_lines doctor || failed=1
     status_stack quiet || failed=1
     if [ "$failed" -eq 0 ]; then
         echo 'RESULT healthy'
@@ -6123,7 +6150,8 @@ case "$command" in
     start) [ $# -eq 0 ] || { usage; exit 2; }; start_stack ;;
     stop) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack ;;
     restart) [ $# -eq 0 ] || { usage; exit 2; }; stop_stack; start_stack ;;
-    component) [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
+    component) [ "${1:-}" = versions ] && { shift; component_versions_command "$@"; exit $?; }
+        [ "$#" -eq 2 ] || { usage; exit 2; }; case "$1" in add|remove) component_change "$1" "$2" ;; *) echo "Unknown component action: $1" >&2; exit 2 ;; esac ;;
     backup) backup_stack "$@" ;;
     backup-drive) backup_drive_command "$@" ;;
     verify-backup) [ $# -eq 1 ] || { usage; exit 2; }; verify_backup "$1" ;;

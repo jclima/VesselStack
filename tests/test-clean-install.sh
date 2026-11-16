@@ -1902,4 +1902,66 @@ test "$(marker_value from)" = "$M_VERSION"
 minstall --start >/dev/null
 test ! -e "$M_MARKER"
 
+# Component versions (README "Component versions"). The installer only needs docker to render the template.
+CV_ENV="$APP_ROOT/config/vesselstack.env"
+cv_value() { bash -c 'source "$1"; printf %s "${!2-UNSET}"' _ "$1" "$2"; }
+cv_install() {  # CONFIG [--dry-run]
+    env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/install.sh" --config "$@"
+}
+# The first install ran with a config written by an older installer (SIGNALK_VERSION and AIS_IMAGE at the shipped defaults):
+# the old defaults were cleared, and every new setting is written back, empty.
+for key in SIGNALK_VERSION AIS_IMAGE NODERED_VERSION HOMEASSISTANT_VERSION INFLUXDB_VERSION GRAFANA_VERSION PROMETHEUS_VERSION NODE_EXPORTER_VERSION MOSQUITTO_VERSION HOMEPAGE_VERSION; do
+    test "$(cv_value "$CV_ENV" "$key")" = ""
+done
+# An old default is cleared with one line; a custom value is kept.
+CV_CONFIG="$TEST_ROOT/component-versions.env"
+cp "$CONFIG" "$CV_CONFIG"
+sed -i '/^SIGNALK_VERSION=/d' "$CV_CONFIG"
+printf 'SIGNALK_VERSION="v2.27.0"\n' >> "$CV_CONFIG"
+cv_install "$CV_CONFIG" --dry-run > "$TEST_ROOT/cv-old.out" 2>&1
+grep -qF 'Signal K now follows the release default (was pinned at v2.27.0 by an older installer)' "$TEST_ROOT/cv-old.out"
+grep -qF 'AIS-catcher now follows the release default' "$TEST_ROOT/cv-old.out"
+sed -i '/^SIGNALK_VERSION=/d;/^AIS_IMAGE=/d' "$CV_CONFIG"
+printf 'SIGNALK_VERSION="v2.30.1"\nGRAFANA_VERSION="13.1.0"\n' >> "$CV_CONFIG"
+cv_install "$CV_CONFIG" > "$TEST_ROOT/cv-custom.out" 2>&1
+if grep -q 'now follows the release default' "$TEST_ROOT/cv-custom.out"; then exit 1; fi
+test "$(cv_value "$CV_ENV" SIGNALK_VERSION)" = v2.30.1
+test "$(cv_value "$CV_ENV" GRAFANA_VERSION)" = 13.1.0
+test "$(cv_value "$CV_ENV" MOSQUITTO_VERSION)" = ""
+# Once the settings exist, a value equal to the release default is a choice and stays (it is no longer treated as an old default).
+sed -i '/^SIGNALK_VERSION=/d;/^GRAFANA_VERSION=/d' "$CV_CONFIG"
+printf 'SIGNALK_VERSION="v2.27.0"\nHOMEPAGE_VERSION=""\n' >> "$CV_CONFIG"
+cv_install "$CV_CONFIG" > "$TEST_ROOT/cv-kept.out" 2>&1
+test "$(cv_value "$CV_ENV" SIGNALK_VERSION)" = v2.27.0
+test "$(cv_value "$CV_ENV" GRAFANA_VERSION)" = ""
+# An invalid value is refused before anything changes, also in a dry run, with the module's message.
+before=$(cksum < "$CV_ENV")
+for bad in 'GRAFANA_VERSION=latest' 'NODERED_VERSION=5.0.9' 'MOSQUITTO_VERSION=2.0.1-alpine' 'HOMEPAGE_VERSION=evil/x:v2.7.0' 'AIS_IMAGE=ghcr.io/x/y:latest'; do
+    cp "$CV_CONFIG" "$CV_CONFIG.bad"
+    printf '%s\n' "${bad%%=*}=\"${bad#*=}\"" >> "$CV_CONFIG.bad"
+    for flag in --dry-run ""; do
+        rc=0
+        # shellcheck disable=SC2086
+        cv_install "$CV_CONFIG.bad" $flag > "$TEST_ROOT/cv-bad.out" 2>&1 || rc=$?
+        test "$rc" -ne 0
+        grep -q "${bad%%=*}" "$TEST_ROOT/cv-bad.out"
+        grep -q 'Nothing was changed' "$TEST_ROOT/cv-bad.out"
+    done
+    test "$(cksum < "$CV_ENV")" = "$before"
+done
+# The native Signal K installer and the data-path script get the release default when SIGNALK_VERSION is empty.
+CV_NATIVE_BIN="$TEST_ROOT/cv-native-bin"
+install -d "$CV_NATIVE_BIN"
+printf '#!/bin/bash\necho "$*" >> "%s/cv-npm.log"\n' "$TEST_ROOT" > "$CV_NATIVE_BIN/npm"
+printf '#!/bin/bash\necho 22\n' > "$CV_NATIVE_BIN/node"
+chmod +x "$CV_NATIVE_BIN/npm" "$CV_NATIVE_BIN/node"
+cv_native_env="$TEST_ROOT/cv-native.env"
+{ printf 'VESSELSTACK_ROOT=%q\nVESSELSTACK_DATA=%q\nVESSELSTACK_USER=%q\nSIGNALK_MODE=native\nSIGNALK_VERSION=""\n' "$TEST_ROOT/native-root" "$TEST_ROOT/native-data" "$(id -un)"; } > "$cv_native_env"
+if [ "$(id -u)" -eq 0 ]; then
+    install -d "$TEST_ROOT/native-root/systemd" "$SYSTEM_ROOT/etc/systemd/system"
+    : > "$TEST_ROOT/native-root/systemd/vesselstack-signalk.service.in"
+    env PATH="$CV_NATIVE_BIN:$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM_ROOT" "$REPO_ROOT/scripts/install-signalk-native.sh" "$cv_native_env" >/dev/null
+    grep -q 'signalk-server@2.27.0' "$TEST_ROOT/cv-npm.log"
+fi
+
 echo "clean installation checks passed"

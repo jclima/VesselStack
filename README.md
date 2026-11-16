@@ -163,6 +163,49 @@ or use the corresponding `vesselstackctl` commands. Hardware and systemd
 services remain configuration-driven. See [Control Panel lab testing](docs/CONTROL_PANEL_TESTING.md)
 for acceptance steps.
 
+### Component versions
+
+Each release runs every container at a tested default version. If you need another version of
+one component, set its version in the settings file and run the installer again (this is an
+expert setting; a command and a Control Panel dialog for it come later):
+
+```bash
+sudoedit /opt/vesselstack/config/vesselstack.env      # for example GRAFANA_VERSION="13.0.2"
+sudo /opt/vesselstack/installer/install.sh --config /opt/vesselstack/config/vesselstack.env --start
+```
+
+The settings are `SIGNALK_VERSION`, `AIS_IMAGE` (a full image reference), `NODERED_VERSION`,
+`HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`,
+`NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION` and `HOMEPAGE_VERSION`. Leave a setting empty (the
+default) and that component follows the release: it moves forward when you install a newer
+release. A version that is not the default is an override:
+
+- It is kept across updates, so it will not move forward with the release.
+- It is not tested with this release. The installer only accepts a fixed, numbered version of
+  the same line the release uses (for example Grafana 13.x); `latest` and similar names, other
+  registries and other image names are refused, with a message that names the setting.
+- Components that hold data (Signal K, Home Assistant, InfluxDB, Grafana, Node-RED, Mosquitto)
+  may upgrade their data one way. Make a backup first (`sudo vesselstackctl backup`).
+- To go back, empty the setting and run the installer again. Going back to an older version of a
+  component that holds data may need a restore of a backup made before the change.
+
+To see what each component is set to and what is running, use the read-only command:
+
+```bash
+sudo vesselstackctl component versions          # a table
+sudo vesselstackctl component versions --json   # for tools
+```
+
+For each component it shows the release default, your chosen version (or "release default"), the
+image that is running, and a state: `release default`, `override (newer)`, `override (older)`,
+`override`, or `running a different image than configured`. It works while Docker is down (the
+running side then shows `unknown`) and while a restore is pending, and it changes nothing.
+`sudo vesselstackctl doctor` adds one warning per override and a failure when a running container
+does not match its setting; `sudo vesselstackctl status` adds one line when any component is not at
+the release default. Older installers wrote the Signal K and AIS-catcher defaults into the settings
+file; on the first update to a release with this feature those two values are cleared (and
+only those that equal an old default), so those components follow the release from then on.
+
 ## Optional integrations
 
 These features are off or inert until you deliberately enable them. Neither is needed for the core stack.
@@ -631,8 +674,9 @@ authenticated Control Panel that can inspect and operate every managed
 container and host service, edit redacted configuration, check the setup, save and apply
 settings, create backups, and check for and install release updates.
 
-All container tags are release-pinned and checked for Linux ARM64 availability;
-VesselStack does not rely on floating `latest` tags.
+The release defaults for all container tags are pinned and checked for Linux ARM64
+availability; VesselStack does not rely on floating `latest` tags. You can set a different
+version for each component (an expert setting, see "Component versions" below).
 
 The installer supports an existing Signal K server, an opt-in
 pinned Signal K container, or an opt-in pinned native Signal K installation. It
@@ -765,7 +809,9 @@ nano vesselstack.env
 | `VESSELSTACK_DATA` | Persistent container-data path |
 | `VESSELSTACK_BACKUP` | Backup destination; must be outside the application and data trees |
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
-| `SIGNALK_VERSION` | Pinned Signal K release used by managed modes |
+| `SIGNALK_VERSION` | Signal K version used by managed modes. Leave empty to follow the release default (`v2.27.0`); a value such as `v2.28.0` keeps that version across updates. See "Component versions" |
+| `AIS_IMAGE` | Full AIS-catcher image reference, such as `ghcr.io/jvde-github/ais-catcher:v0.70`. Leave empty to follow the release default; a value keeps that image across updates |
+| `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION`, `HOMEPAGE_VERSION` | The version (image tag) of that container. Empty follows the release default; a value keeps that version across updates. See "Component versions" |
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `SIGNALK_DATAPATH_AUTOCONFIG` | Managed Docker/native modes install `signalk-to-influxdb2` 2.3.0, add the NMEA 2000 provider and write the plugin's InfluxDB configuration (default `true`, see [Signal K and InfluxDB](#signal-k-and-influxdb)); existing mode ignores it, and `false` skips without removing anything |

@@ -74,16 +74,20 @@ the notices shipped in the image you run.
 | `node-red-contrib-home-assistant-websocket` | 0.83.0 | `scripts/configure-nodered.py` | MIT | npm, preinstalled into the Node-RED data folder |
 | Prometheus (`prom/prometheus` image) | `v2.55.0` | `templates/compose.yml` | Apache-2.0 | Docker image |
 | node-exporter (`quay.io/prometheus/node-exporter` image) | `v1.10.2` | `templates/compose.yml` | Apache-2.0 | Docker image |
-| AIS-catcher (`ghcr.io/jvde-github/ais-catcher` image) | `v0.70` | `vesselstack.example.env` and `install.sh` (`AIS_IMAGE`) | GPL-3.0 | Docker image, when `AIS_ENABLE=true` |
+| AIS-catcher (`ghcr.io/jvde-github/ais-catcher` image) | `v0.70` | `templates/compose.yml` (`AIS_IMAGE`) | GPL-3.0 | Docker image, when `AIS_ENABLE=true` |
 | `signalk-to-influxdb2` | 2.3.0 | `scripts/configure-signalk-datapath.py` | Apache-2.0 | npm, into the Signal K data folder |
 | `signalk-anchoralarm-plugin` | 2.0.1 | `scripts/configure-signalk-datapath.py` | ISC | npm, marine essentials bundle |
 | `@meri-imperiumi/signalk-logbook` | 0.15.1 | `scripts/configure-signalk-datapath.py` | MIT | npm, marine essentials bundle |
 | `@meri-imperiumi/signalk-autostate` | 0.6.4 | `scripts/configure-signalk-datapath.py` | MIT | npm, marine essentials bundle |
 
+The versions listed in this file are the release defaults. An owner can set a different version of
+a container in the settings file (see "Component versions" in the README); VesselStack does not test
+or ship those versions, and their licenses are their authors' own.
+
 KIP, Freeboard-SK and the NMEA 0183 converter (`sk-to-nmea0183`) are not installed by
 VesselStack. They ship inside the Signal K server image, which VesselStack configures
 (`scripts/configure-signalk-datapath.py`) but does not modify. The Signal K server
-itself (image tag `SIGNALK_VERSION`, `v2.27.0` in `vesselstack.example.env`) is pulled
+itself (image tag `SIGNALK_VERSION`, default `v2.27.0` in `templates/compose.yml`) is pulled
 as a Docker image and is distributed under Apache-2.0 by its authors.
 
 ## Tailscale

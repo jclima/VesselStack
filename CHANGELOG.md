@@ -3,6 +3,43 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- Per-component versions. Each container's version is now a setting (`SIGNALK_VERSION`,
+  `AIS_IMAGE`, `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`,
+  `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION`, `HOMEPAGE_VERSION`). Empty
+  follows the release default; a value is kept across updates. The installer, the setup wizard and
+  the settings file checks refuse floating tags (`latest`), other registries and versions outside
+  the line the release uses, before anything is changed. The rules live in the new
+  `common/component_versions.py`, and `templates/compose.yml` takes each default through
+  `${SETTING:-default}`.
+- `sudo vesselstackctl component versions [--json]` (read-only) shows the release default, the chosen
+  version, the running image and the state of every component; `doctor` warns about each override and
+  fails on a running container that does not match its setting; `status` adds one line when any
+  component is not at the release default. No command that changes a version, no image pull and no
+  Control Panel dialog yet.
+- Mosquitto password hashing and the Node-RED helper now use the effective image, so a version
+  override applies to them too.
+
+### Changed
+
+- `SIGNALK_VERSION` and `AIS_IMAGE` are empty by default in `vesselstack.example.env`.
+
+**Operational impact**: on the first update to this version, a Signal K or AIS-catcher version that
+an older installer had written down (`v2.27.0`, `ghcr.io/jvde-github/ais-catcher:v0.70`) is cleared,
+with one line telling you, so those components follow the release from now on. They may move to a
+newer version at that update. Any other value you set is kept as an override. Nothing else changes
+with the defaults: the same ten images run.
+
+**Verify**: `sudo vesselstackctl component versions` lists every component as `release default` (or
+your overrides), and `sudo vesselstackctl doctor` ends with `RESULT healthy`.
+
+**Rollback**: restore the backup taken before the update (`sudo vesselstackctl restore
+/path/to/vesselstack-TIMESTAMP.tar.gz --yes`). To undo a version you set, empty its setting and run
+the installer again; going back to an older version of a component that holds data may need that restore.
+
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,

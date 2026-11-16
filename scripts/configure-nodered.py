@@ -62,6 +62,47 @@ def _datapath():
     return module
 
 
+
+def _component_versions():
+    """common/component_versions.py (installed and source tree: ../common), loaded by path."""
+    import importlib.util
+    module = sys.modules.get("vesselstack_component_versions")
+    if module is None:
+        path = HERE.parent / "common" / "component_versions.py"
+        spec = importlib.util.spec_from_file_location("vesselstack_component_versions", path)
+        try:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["vesselstack_component_versions"] = module
+            spec.loader.exec_module(module)
+        except (OSError, ImportError, AttributeError):
+            sys.modules.pop("vesselstack_component_versions", None)
+            raise Failure("cannot read common/component_versions.py, which checks the Node-RED version")
+    return module
+
+
+def _resolve_image(image: str, setting: str, override: str) -> str:
+    """Turn the compose image line into the image that really runs.
+
+    Compose pins it as repository:${SETTING:-release default}. The setting (from the stack's
+    settings) wins when it is set and valid; an invalid value is refused, so no image name from an
+    unvalidated value is ever run. A compose file with a plain pin is used as it is."""
+    match = re.fullmatch(r"([^:$]+):\$\{" + setting + r":-([^}]*)\}", image)
+    if not match:
+        return image
+    cv = _component_versions()
+    component = cv.BY_SETTING[setting].id
+    repository, default = match.groups()
+    value = (override or "").strip()
+    if value:
+        problem = cv.validate(component, value)
+        if problem:
+            raise Failure(problem + " Nothing was changed.")
+        return f"{repository}:{value}"
+    if cv.validate(component, default):
+        raise Failure(f"the {setting} default in compose.yml is not a valid version")
+    return f"{repository}:{default}"
+
+
 def find_image(compose: Path | None) -> str:
     candidates = [compose] if compose else [HERE.parent / "templates" / "compose.yml", Path("/opt/vesselstack/compose.yml")]
     for path in candidates:
@@ -70,7 +111,7 @@ def find_image(compose: Path | None) -> str:
         except OSError:
             continue
         if match:
-            return match.group(1)
+            return _resolve_image(match.group(1), "NODERED_VERSION", os.environ.get("NODERED_VERSION", ""))
     raise Failure("cannot find the pinned Node-RED image in compose.yml")
 
 

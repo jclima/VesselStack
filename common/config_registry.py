@@ -50,9 +50,9 @@ SETTINGS: dict[str, Setting] = {
     "BOAT_TIMEZONE": _s("UTC", required=True), "BOAT_UNITS": _s("us_customary", enum=("us_customary", "metric")),
     "VESSELSTACK_USER": _s("boat", required=True), "VESSELSTACK_UID": _s("1000", kind="number", minimum=1, maximum=65534, required=True), "VESSELSTACK_GID": _s("1000", kind="number", minimum=1, maximum=65534, required=True),
     "VESSELSTACK_ROOT": _s("/opt/vesselstack", required=True), "VESSELSTACK_DATA": _s("/opt/vesselstack-data", required=True), "VESSELSTACK_BACKUP": _s("/media/vesselstack-backup/backups", required=True),
-    "SIGNALK_MODE": _s("docker", enum=("existing", "docker", "native"), component="signalk"), "SIGNALK_VERSION": _s("v2.27.0", required=True), "SIGNALK_URL": _s("http://127.0.0.1:3000", kind="url", required=True),
+    "SIGNALK_MODE": _s("docker", enum=("existing", "docker", "native"), component="signalk"), "SIGNALK_VERSION": _s("", component="signalk"), "SIGNALK_URL": _s("http://127.0.0.1:3000", kind="url", required=True),
     "SOCKETCAN_ENABLE": _s("false", kind="boolean", component="socketcan"), "VESSELSTACK_CAN_CREATE_VCAN": _s("false", kind="boolean", component="socketcan"), "SOCKETCAN_INTERFACE": _s("can0", required=True, component="socketcan"), "SOCKETCAN_BITRATE": _s("250000", kind="number", minimum=10000, maximum=1000000, required=True, component="socketcan"),
-    "AIS_ENABLE": _s("false", kind="boolean", component="ais-catcher"), "AIS_IMAGE": _s("ghcr.io/jvde-github/ais-catcher:v0.70", required=True, component="ais-catcher"), "AIS_DEVICE": _s("/dev/bus/usb", required=True, component="ais-catcher"), "AIS_CATCHER_ARGS": _s("-q -N 8100 -S 5011", required=True, component="ais-catcher"), "AIS_WEB_PORT": _s("8100", kind="port", minimum=1, maximum=65535, required=True, component="ais-catcher"), "AIS_TCP_PORT": _s("5011", kind="port", minimum=1, maximum=65535, required=True, component="ais-catcher"),
+    "AIS_ENABLE": _s("false", kind="boolean", component="ais-catcher"), "AIS_IMAGE": _s("", component="ais-catcher"), "AIS_DEVICE": _s("/dev/bus/usb", required=True, component="ais-catcher"), "AIS_CATCHER_ARGS": _s("-q -N 8100 -S 5011", required=True, component="ais-catcher"), "AIS_WEB_PORT": _s("8100", kind="port", minimum=1, maximum=65535, required=True, component="ais-catcher"), "AIS_TCP_PORT": _s("5011", kind="port", minimum=1, maximum=65535, required=True, component="ais-catcher"),
     "HOME_ASSISTANT_URL": _s("http://127.0.0.1:8123", kind="url"), "HOME_ASSISTANT_TOKEN": _s("", owner="vessel"), "INFLUXDB_URL": _s("http://127.0.0.1:8086", kind="url", required=True), "INFLUXDB_PORT": _s("8086", kind="port", minimum=1, maximum=65535, required=True, component="influxdb"), "INFLUXDB_CONTAINER_NAME": _s("vesselstack-influxdb", required=True, component="influxdb"), "INFLUXDB_ORG": _s("vesselstack", required=True, component="influxdb"), "INFLUXDB_USERNAME": _s("boatadmin", required=True, component="influxdb"),
     "INFLUXDB_RAW_BUCKET": _s("signalk", required=True, component="influxdb"), "INFLUXDB_HISTORY_BUCKET": _s("signalk_1m", required=True, component="influxdb"), "INFLUXDB_HOME_ASSISTANT_BUCKET": _s("homeassistant", required=True, component="influxdb"), "INFLUXDB_AIS_BUCKET": _s("ais", required=True, component="influxdb"), "INFLUXDB_RAW_RETENTION": _s(), "INFLUXDB_PASSWORD": _s("GENERATE", owner="vessel"), "INFLUXDB_TOKEN": _s("GENERATE", owner="vessel"), "GRAFANA_ADMIN_PASSWORD": _s("GENERATE", owner="vessel"),
     "MQTT_USERNAME": _s("homeassistant", required=True, component="mosquitto"), "MQTT_PASSWORD": _s("GENERATE", component="mosquitto"), "MQTT_PORT": _s("1883", kind="port", minimum=1, maximum=65535, required=True, component="mosquitto"), "BOAT_CHAT_PROVIDER": _s("local", owner="chat", enum=("local", "codex_cli", "claude_cli", "openai", "vercel", "bedrock", "google", "ollama", "openai_compatible"), component="boat-chat"), "BOAT_CHAT_HOST": _s("0.0.0.0", owner="chat", required=True, component="boat-chat"), "BOAT_CHAT_PORT": _s("8765", kind="port", owner="chat", minimum=1, maximum=65535, required=True, component="boat-chat"), "BOAT_CHAT_SETTINGS_TOKEN": _s("GENERATE", owner="chat", component="boat-chat"), "BOAT_CHAT_ACCESS_TOKEN": _s("GENERATE", owner="chat", component="boat-chat"),
@@ -69,7 +69,24 @@ SETTINGS: dict[str, Setting] = {
     # Optional Tailscale remote access (README "Remote access with Tailscale"). Off by default; enabled only by `vesselstackctl remote enable`.
     "REMOTE_ACCESS": _s("off", enum=("off", "tailscale"), component="remote"), "REMOTE_PANEL_SERVE": _s("true", kind="boolean", component="remote"),
     "ALERT_HEARTBEAT_URL": _s(component="alerts"), "ALERT_REPEAT_MINUTES": _s("60", kind="number", minimum=5, maximum=10080, required=True, component="alerts"), "ALERT_STALE_DATA_MINUTES": _s("15", kind="number", minimum=2, maximum=10080, required=True, component="alerts"),
+    # Component versions (README "Component versions"). Empty follows the release default; a value keeps that version across updates.
+    # Rules live in common/component_versions.py. SIGNALK_VERSION and AIS_IMAGE above follow the same rule.
+    "NODERED_VERSION": _s(component="nodered"), "HOMEASSISTANT_VERSION": _s(component="homeassistant"), "INFLUXDB_VERSION": _s(component="influxdb"),
+    "GRAFANA_VERSION": _s(component="grafana"), "PROMETHEUS_VERSION": _s(component="prometheus"), "NODE_EXPORTER_VERSION": _s(component="node-exporter"),
+    "MOSQUITTO_VERSION": _s(component="mosquitto"), "HOMEPAGE_VERSION": _s(component="homepage"),
 }
+
+COMPONENT_VERSION_SETTINGS = frozenset({"SIGNALK_VERSION", "AIS_IMAGE", "NODERED_VERSION", "HOMEASSISTANT_VERSION", "INFLUXDB_VERSION", "GRAFANA_VERSION", "PROMETHEUS_VERSION", "NODE_EXPORTER_VERSION", "MOSQUITTO_VERSION", "HOMEPAGE_VERSION"})
+
+
+def _component_versions():
+    """common/component_versions.py, loaded by path so it works as a package module and under python3 -I."""
+    import importlib.util, sys
+    module = sys.modules.get("vesselstack_component_versions")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("vesselstack_component_versions", os.path.join(os.path.dirname(os.path.abspath(__file__)), "component_versions.py"))
+        module = importlib.util.module_from_spec(spec); sys.modules["vesselstack_component_versions"] = module; spec.loader.exec_module(module)
+    return module
 
 DEFAULTS = {key: spec.default for key, spec in SETTINGS.items()}
 LEGACY_DEFAULTS = {"SIGNALK_MODE": "existing", "INFLUXDB_RAW_BUCKET": "vesselstack_raw", "INFLUXDB_HISTORY_BUCKET": "vesselstack_1m", "VESSELSTACK_BACKUP": "/var/backups/vesselstack"}
@@ -86,6 +103,10 @@ def validate_value(key: str, value: Any, *, allow_blank: bool = True) -> str:
     if not text:
         if spec.required: raise ValueError(f"{key} is required")
         if allow_blank: return text
+    if text and key in COMPONENT_VERSION_SETTINGS:
+        cv = _component_versions()
+        problem = cv.validate(cv.BY_SETTING[key].id, text)
+        if problem: raise ValueError(problem)
     if spec.enum and text not in spec.enum: raise ValueError(f"Invalid value for {key}")
     if spec.kind == "boolean" and text not in {"true", "false"}: raise ValueError(f"Invalid boolean for {key}")
     if spec.kind in {"number", "port"} and text:

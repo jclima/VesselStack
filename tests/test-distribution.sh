@@ -89,8 +89,8 @@ python3 -m json.tool "$ROOT/templates/grafana/dashboards/boat-overview.json" >/d
 # must never fail the installation.
 grep -qF "offline install: the Signal K data path" "$ROOT/install.sh"
 grep -qF 'configure-signalk-datapath.py' "$ROOT/install.sh"
-grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION}' "$ROOT/templates/compose.yml"
-grep -q 'ghcr.io/jvde-github/ais-catcher:v0.70' "$ROOT/vesselstack.example.env"
+grep -q 'cr.signalk.io/signalk/signalk-server:${SIGNALK_VERSION:-v2.27.0}' "$ROOT/templates/compose.yml"
+grep -q '${AIS_IMAGE:-ghcr.io/jvde-github/ais-catcher:v0.70}' "$ROOT/templates/compose.yml"
 test "$(find "$ROOT/templates/homeassistant/blueprints" -name '*.yaml' | wc -l)" -eq 3
 grep -q 'sensor.vesselstack_battery_voltage' \
     "$ROOT/templates/homeassistant/lovelace-vesselstack.example.yaml"

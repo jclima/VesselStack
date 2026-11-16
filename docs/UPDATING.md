@@ -379,6 +379,17 @@ command to continue and, when a backup was recorded, the command to go back; `su
 status` shows an `Installation INCOMPLETE` line (and exits non-zero) and `vesselstackctl version`
 adds a note.
 
+## Component versions and updates
+
+A stack update moves every component that follows the release default to the new release's
+version. A component whose version you set yourself (`GRAFANA_VERSION`, `SIGNALK_VERSION` and the
+other component settings in `config/vesselstack.env`) stays at that version, which is not tested
+with the new release. Check with `sudo vesselstackctl component versions`. To follow the release
+again, empty the setting and run the installer (a backup first, because a component that holds data
+may have upgraded it one way). The first update to a release that has these settings clears a
+Signal K or AIS-catcher version that an older installer wrote down, so they follow the release from
+then on; a value you chose yourself is kept. See "Component versions" in the README.
+
 ## Rollback
 
 Downgrades are refused. Rolling back a completed or half-finished upgrade is a restore of

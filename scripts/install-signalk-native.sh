@@ -19,7 +19,19 @@ signalk_root="$VESSELSTACK_ROOT/signalk-server"
 signalk_data="$VESSELSTACK_DATA/signalk"
 install -d -m 0755 "$signalk_root"
 install -d -m 0750 -o "$VESSELSTACK_USER" -g "$VESSELSTACK_USER" "$signalk_data"
-npm install --prefix "$signalk_root" --omit=dev "signalk-server@${SIGNALK_VERSION#v}"
+# An empty SIGNALK_VERSION follows the release default (common/component_versions.py).
+component_versions=""
+for candidate in "$(dirname -- "${BASH_SOURCE[0]}")/../common/component_versions.py" "$VESSELSTACK_ROOT/common/component_versions.py"; do
+    [ -r "$candidate" ] && { component_versions=$candidate; break; }
+done
+[ -n "$component_versions" ] || { echo "Missing common/component_versions.py; cannot work out the Signal K version." >&2; exit 1; }
+signalk_version=${SIGNALK_VERSION:-}
+if [ -n "$signalk_version" ]; then
+    python3 -I "$component_versions" --validate signalk "$signalk_version" >&2 || exit 1
+else
+    signalk_version=$(python3 -I "$component_versions" --default signalk)
+fi
+npm install --prefix "$signalk_root" --omit=dev "signalk-server@${signalk_version#v}"
 chown -R root:root "$signalk_root"
 
 sed -e "s|@VESSELSTACK_USER@|$VESSELSTACK_USER|g" \

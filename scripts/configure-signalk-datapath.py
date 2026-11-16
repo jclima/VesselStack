@@ -302,12 +302,29 @@ def plugin_needed(dir_fd: int, name: str = PLUGIN, pinned: str = PLUGIN_VERSION,
     return installed < version_tuple(pinned)
 
 
+def signalk_tag(value: str) -> str:
+    """The Signal K image tag: the setting, or the release default when it is empty (common/component_versions.py)."""
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "common" / "component_versions.py"
+    spec = importlib.util.spec_from_file_location("vesselstack_component_versions", path)
+    try:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["vesselstack_component_versions"] = module  # dataclasses needs the module registered
+        spec.loader.exec_module(module)
+    except (OSError, ImportError, AttributeError):
+        sys.modules.pop("vesselstack_component_versions", None)
+        fail("reading the Signal K release default (common/component_versions.py is missing)")
+    if value and module.validate("signalk", value):
+        fail("reading SIGNALK_VERSION")
+    return value or module.default("signalk")
+
+
 def npm_command(args, env: dict[str, str], signalk: Path, extra: list[str], cache: str | None, name: str | None = None,
                 specs: list[str] | None = None):
     """Return (argv, subprocess kwargs) for npm in the Signal K data directory."""
     specs = specs or [f"{PLUGIN}@{PLUGIN_VERSION}"]
     if args.mode == "docker":
-        tag = env.get("SIGNALK_VERSION", "")
+        tag = signalk_tag(env.get("SIGNALK_VERSION", ""))
         if not TAG_RE.fullmatch(tag):
             fail("reading SIGNALK_VERSION")
         if ":" in str(signalk) or "," in str(signalk):
