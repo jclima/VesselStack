@@ -1,13 +1,17 @@
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
 from common.lifecycle_lock import (ENV_FD, LifecycleLock, LifecycleLockBusy,
-                                   LifecycleLockError, lock_path)
+                                   LifecycleLockError, LifecycleLockPending, lock_path)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -134,6 +138,229 @@ class LifecycleLockTests(unittest.TestCase):
             self.assertIn("busy", result.stderr)
         finally:
             held.wait(timeout=5)
+
+
+RESTORE_ID = "0123456789abcdef0123456789abcdef"
+CLI = ROOT / "common" / "lifecycle_lock.py"
+
+
+class LifecycleLockWaitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.install = self.base / "opt" / "vesselstack"
+        self.install.mkdir(parents=True)
+        self.system = self.base / "system"
+        self.system.mkdir()
+
+    def run_cli(self, *extra, command=None):
+        command = command or [sys.executable, "-c", "print('ran')"]
+        return subprocess.run([sys.executable, str(CLI), "run", "--root", str(self.install),
+                               "--system-root", str(self.system), *extra, "--", *command],
+                              cwd=ROOT, text=True, capture_output=True, timeout=60)
+
+    def test_wait_succeeds_when_the_lock_is_released_in_time(self):
+        holder = LifecycleLock(self.install, self.system).acquire()
+        timer = threading.Timer(1.0, holder.release)
+        timer.start()
+        try:
+            started = time.monotonic()
+            result = self.run_cli("--wait", "10")
+            elapsed = time.monotonic() - started
+        finally:
+            timer.join()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ran")
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 8)
+
+    def test_wait_gives_up_with_75_after_the_wait(self):
+        with LifecycleLock(self.install, self.system):
+            started = time.monotonic()
+            result = self.run_cli("--wait", "1")
+            elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("busy", result.stderr)
+        self.assertGreaterEqual(elapsed, 0.9)
+
+    def test_default_is_not_to_wait(self):
+        with LifecycleLock(self.install, self.system):
+            started = time.monotonic()
+            result = self.run_cli()
+            self.assertLess(time.monotonic() - started, 0.4)
+        self.assertEqual(result.returncode, 75)
+
+    def test_a_status_75_from_the_command_itself_is_never_retried(self):
+        counter = self.base / "runs"
+        code = "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text()+'x' if p.exists() else 'x'); raise SystemExit(75)"
+        result = self.run_cli("--wait", "5", command=[sys.executable, "-c", code, str(counter)])
+        self.assertEqual(result.returncode, 75)
+        self.assertEqual(counter.read_text(), "x")
+
+    def test_wait_argument_is_validated(self):
+        for value in ("-1", "3601", "abc", "nan", "inf", ""):
+            with self.subTest(value):
+                result = self.run_cli("--wait", value)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("ran", result.stdout)
+        for value in ("0", "0.5", "3600"):
+            with self.subTest(value):
+                self.assertEqual(self.run_cli("--wait", value).returncode, 0)
+
+
+class PendingRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.install = self.base / "opt" / "vesselstack"
+        self.install.mkdir(parents=True)
+        self.system = self.base / "system"
+        self.journal = self.system / "var/lib/vesselstack/restore/current"
+        env = {k: v for k, v in os.environ.items() if k not in (ENV_FD, "VESSELSTACK_RESTORE_ID")}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_state(self, text):
+        self.journal.mkdir(parents=True, exist_ok=True)
+        (self.journal / "state").write_text(text)
+
+    def journal_with(self, phase, restore_id=RESTORE_ID):
+        self.write_state(f"format=1\nid={restore_id}\nphase={phase}\nroot=/x\n")
+
+    def acquire(self):
+        lock = LifecycleLock(self.install, self.system)
+        lock.acquire()
+        lock.release()
+
+    def test_every_unfinished_phase_refuses(self):
+        for phase in ("prepared", "stopping", "stopped", "data-swap", "root-swap", "externals", "reloaded",
+                      "starting", "rolling-back", "rollback-failed", "abandoned", "something-new"):
+            with self.subTest(phase):
+                self.journal_with(phase)
+                with self.assertRaises(LifecycleLockPending) as caught:
+                    self.acquire()
+                self.assertIsInstance(caught.exception, LifecycleLockBusy)
+                self.assertIn(f"a restore is unfinished; see: sudo {self.journal}/recover status", str(caught.exception))
+
+    def test_an_empty_or_relative_system_root_looks_for_the_journal_under_slash_never_in_the_working_directory(self):
+        from common import lifecycle_lock
+        # A decoy journal at the relative path an empty root used to resolve to, in a different working directory.
+        elsewhere = self.base / "elsewhere"
+        decoy = elsewhere / "var/lib/vesselstack/restore/current"
+        decoy.mkdir(parents=True)
+        (decoy / "state").write_text("format=1\nid=" + RESTORE_ID + "\nphase=prepared\n")
+        looked_at = []
+
+        def lexists(path):
+            looked_at.append(path)
+            return False
+
+        old_cwd = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            for root in ("", "var", "relative/root"):
+                with self.subTest(root=root), mock.patch("os.path.lexists", side_effect=lexists):
+                    looked_at.clear()
+                    self.assertIsNone(lifecycle_lock._unfinished_restore(root))
+                    self.assertEqual(looked_at, ["/var/lib/vesselstack/restore/current"])
+            # The lock class normalises its root first, so production always passes "/" here.
+            self.assertEqual(LifecycleLock(self.install, "").system_root, "/")
+        finally:
+            os.chdir(old_cwd)
+
+    def test_a_refusal_does_not_keep_the_lock(self):
+        self.journal_with("prepared")
+        with self.assertRaises(LifecycleLockBusy):
+            self.acquire()
+        shutil.rmtree(self.journal)
+        self.acquire()
+
+    def test_committed_and_rolled_back_do_not_block(self):
+        for phase in ("committed", "rolled-back"):
+            with self.subTest(phase):
+                self.journal_with(phase)
+                self.acquire()
+
+    def test_no_journal_does_not_block(self):
+        self.acquire()
+
+    def test_the_restores_own_id_is_let_through_and_another_is_not(self):
+        self.journal_with("starting")
+        with mock.patch.dict(os.environ, {"VESSELSTACK_RESTORE_ID": RESTORE_ID}):
+            self.acquire()
+        for wrong in ("f" * 32, "", RESTORE_ID + "0", "abc"):
+            with self.subTest(wrong):
+                with mock.patch.dict(os.environ, {"VESSELSTACK_RESTORE_ID": wrong}):
+                    with self.assertRaises(LifecycleLockPending):
+                        self.acquire()
+
+    def test_unreadable_repeated_key_and_missing_phase_count_as_pending(self):
+        cases = {
+            "repeated phase": f"id={RESTORE_ID}\nphase=committed\nphase=committed\n",
+            "repeated other key": f"id={RESTORE_ID}\nroot=/a\nroot=/a\nphase=committed\n",
+            "no phase": f"id={RESTORE_ID}\nroot=/x\n",
+            "empty phase": f"id={RESTORE_ID}\nphase=\n",
+            "damaged line": f"id={RESTORE_ID}\nphase=committed\ngarbage\n",
+            "empty file": "",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.write_state(text)
+                with mock.patch.dict(os.environ, {"VESSELSTACK_RESTORE_ID": RESTORE_ID}):
+                    with self.assertRaises(LifecycleLockPending):
+                        self.acquire()
+        self.write_state(f"id={RESTORE_ID}\nphase=committed\n")
+        (self.journal / "state").chmod(0)
+        try:
+            if os.geteuid() != 0:
+                with self.assertRaises(LifecycleLockPending):
+                    self.acquire()
+        finally:
+            (self.journal / "state").chmod(0o600)
+
+    def test_a_journal_directory_without_state_is_pending(self):
+        self.journal.mkdir(parents=True)
+        with self.assertRaises(LifecycleLockPending):
+            self.acquire()
+        with mock.patch.dict(os.environ, {"VESSELSTACK_RESTORE_ID": RESTORE_ID}):
+            with self.assertRaises(LifecycleLockPending):
+                self.acquire()
+
+    def test_a_state_that_is_a_directory_is_pending(self):
+        (self.journal / "state").mkdir(parents=True)
+        with self.assertRaises(LifecycleLockPending):
+            self.acquire()
+
+    def test_an_inherited_descriptor_is_not_checked(self):
+        with LifecycleLock(self.install, self.system) as parent:
+            self.journal_with("starting")
+            code = ("from common.lifecycle_lock import LifecycleLock; import sys; "
+                    "LifecycleLock(sys.argv[1], sys.argv[2]).acquire(); print('ok')")
+            child = subprocess.run([sys.executable, "-c", code, str(self.install), str(self.system)], cwd=ROOT,
+                                   env=parent.child_env(), pass_fds=parent.pass_fds(), text=True, capture_output=True)
+            self.assertEqual(child.stdout.strip(), "ok", child.stderr)
+
+    def test_run_refuses_with_75_at_once_even_when_asked_to_wait(self):
+        self.journal_with("prepared")
+        started = time.monotonic()
+        result = subprocess.run([sys.executable, str(CLI), "run", "--root", str(self.install), "--system-root",
+                                 str(self.system), "--wait", "30", "--", sys.executable, "-c", "print('ran')"],
+                                cwd=ROOT, text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 75)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn("a restore is unfinished", result.stderr)
+        self.assertNotIn("ran", result.stdout)
+
+    def test_run_passes_the_restores_own_id_to_the_command(self):
+        self.journal_with("starting")
+        env = dict(os.environ, VESSELSTACK_RESTORE_ID=RESTORE_ID)
+        result = subprocess.run([sys.executable, str(CLI), "run", "--root", str(self.install), "--system-root",
+                                 str(self.system), "--", sys.executable, "-c", "print('ran')"],
+                                cwd=ROOT, text=True, capture_output=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

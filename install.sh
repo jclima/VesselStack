@@ -301,6 +301,7 @@ fi
 : "${VESSELSTACK_DISABLED_COMPONENTS:=}"
 # Unattended operation (README "Unattended operation and power"). Upgrades keep scheduled backups off.
 : "${VESSELSTACK_WATCHDOG:=auto}"
+: "${VESSELSTACK_RESTORE_AT_BOOT:=rollback}"
 : "${VESSELSTACK_JOURNAL_MAX_USE:=200M}"
 : "${VESSELSTACK_BACKUP_SCHEDULE:=off}"
 : "${VESSELSTACK_BACKUP_KEEP:=8}"
@@ -386,6 +387,7 @@ if ! [[ "$PROMETHEUS_RETENTION" =~ ^[1-9][0-9]{0,4}[hdw]$ ]]; then
     exit 1
 fi
 case "$VESSELSTACK_WATCHDOG" in auto|true|false) ;; *) echo "VESSELSTACK_WATCHDOG must be auto, true or false" >&2; exit 1 ;; esac
+case "$VESSELSTACK_RESTORE_AT_BOOT" in rollback|hold) ;; *) echo "VESSELSTACK_RESTORE_AT_BOOT must be rollback or hold" >&2; exit 1 ;; esac
 if ! [[ "$ALERT_REPEAT_MINUTES" =~ ^[0-9]{1,5}$ ]] || [ "$ALERT_REPEAT_MINUTES" -lt 5 ] || [ "$ALERT_REPEAT_MINUTES" -gt 10080 ]; then
     echo "ALERT_REPEAT_MINUTES must be a whole number from 5 to 10080" >&2
     exit 1
@@ -777,6 +779,7 @@ VESSELSTACK_DATA_BIND_ADDRESS
 VESSELSTACK_WEB_BIND_ADDRESS
 HOMEASSISTANT_BIND_ADDRESS
 VESSELSTACK_WATCHDOG
+VESSELSTACK_RESTORE_AT_BOOT
 VESSELSTACK_JOURNAL_MAX_USE
 VESSELSTACK_BACKUP_SCHEDULE
 VESSELSTACK_BACKUP_KEEP
@@ -2035,6 +2038,31 @@ if [ "$ALERTS_ENABLE" = true ]; then
 else
     systemctl disable vesselstack-alerts.timer 2>/dev/null || true
 fi
+
+# --- Recovery at boot after an interrupted restore (README "If a restore is interrupted") ---------
+# The script lives outside the application folder and outside the helper folder a restore republishes,
+# so a half-finished restore cannot take it away. The unit is enabled, never started: it runs at boot
+# and only while a restore journal exists. Its name does not start with "vesselstack-" on purpose.
+RECOVERY_DIR="$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
+RECOVERY_CONF="$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+install -d -m 0755 -o root -g root "$SYSTEM_ROOT/usr/local/lib" "$RECOVERY_DIR"
+install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/restore-boot" "$RECOVERY_DIR/restore-boot"
+install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/boot-vesselstack-restore.service.in" "$SYSTEMD_DIR/boot-vesselstack-restore.service"
+recovery_conf_tmp=$(mktemp "$RECOVERY_CONF.XXXXXX")
+{
+    printf '# VesselStack recovery at boot. MODE=rollback rolls an interrupted restore back automatically;\n'
+    printf '# MODE=hold only records what was found. Anything else in this file (an empty file, another key,\n'
+    printf '# spaces around "=", two MODE lines, an unknown value) is treated as MODE=hold.\n'
+    printf 'MODE=%s\n' "$VESSELSTACK_RESTORE_AT_BOOT"
+} > "$recovery_conf_tmp"
+chmod 0644 "$recovery_conf_tmp"
+# install.sh has no fsync helper, so: flush the file to disk before the rename (GNU sync takes file
+# arguments; plain sync otherwise), and the directory entry after it.
+sync -- "$recovery_conf_tmp" 2>/dev/null || sync
+mv -f -- "$recovery_conf_tmp" "$RECOVERY_CONF"
+sync -- "$(dirname -- "$RECOVERY_CONF")" 2>/dev/null || sync
+systemctl daemon-reload
+systemctl enable boot-vesselstack-restore.service
 
 # --- Unattended operation: hardware watchdog and journal cap ----------------------------------
 # install_dropin DESTINATION: reads the new content on standard input and replaces DESTINATION

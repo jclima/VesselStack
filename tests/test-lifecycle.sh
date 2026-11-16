@@ -301,6 +301,44 @@ run_ctl() {
         "$REPO_ROOT/scripts/vesselstackctl" "$@"
 }
 
+# A stand-in for systemd-run, used only through VESSELSTACK_TEST_SYSTEMD_RUN (the controller never runs a real
+# systemd-run under a test root). It checks the arguments the restore passes and starts the command the way a
+# transient unit starts one: a new session, default signal handling, and no environment but PATH (plus the
+# FAKE_* and KILL_* settings of this script's own test doubles, which are not VesselStack settings).
+RESTORE_LAUNCHER="$TEST_ROOT/systemd-run-stub"
+cat > "$RESTORE_LAUNCHER" <<'EOF'
+#!/usr/bin/env python3
+import os, signal, sys
+args = sys.argv[1:]
+with open(os.environ["LAUNCHER_LOG"], "a") as log:
+    log.write(" ".join(args) + "\n")
+for need in ("--unit=run-vesselstack-restore", "--collect", "--quiet", "Type=exec", "KillMode=mixed", "TimeoutStopSec=10min",
+             "After=docker.service", "IgnoreOnIsolate=yes"):
+    if need not in args:
+        print("launcher stub: missing " + need, file=sys.stderr)
+        sys.exit(98)
+if "--wait" in args or "--pipe" in args:
+    print("launcher stub: --wait and --pipe are not allowed", file=sys.stderr)
+    sys.exit(98)
+cmd = args[args.index("/bin/bash"):]
+env = {"PATH": os.environ["PATH"]}
+env.update({k: v for k, v in os.environ.items() if k.startswith(("FAKE_", "KILL_"))})
+if os.fork() == 0:
+    os.setsid()
+    for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.execve("/bin/bash", cmd, env)
+EOF
+chmod +x "$RESTORE_LAUNCHER"
+# The same as run_ctl, but a restore is handed to a background worker started by the stub above.
+run_ctl_detached() {
+    LAUNCHER_LOG="$TEST_ROOT/launcher.log" VESSELSTACK_TEST_SYSTEMD_RUN="$RESTORE_LAUNCHER" \
+        VESSELSTACK_RESTORE_FOLLOW_INTERVAL=0.2 VESSELSTACK_RESTORE_DEAD_GRACE=2 run_ctl "$@"
+}
+
 # Telemetry is opt-out at start time as well as install time: disabling it must
 # clean up both schedules and any legacy one-shot services, while preserving the
 # existing start path when enabled.  This uses the production start_stack path
@@ -2065,6 +2103,34 @@ grep -qxF "sudo $APP_ROOT/installer/install.sh --config $APP_ROOT/config/vessels
 }
 rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
 
+# The same restore run in the terminal (--foreground) and by the background worker prints the same lines on
+# stdout; the worker's run is followed by the foreground, which returns the worker's exit status.
+normalise_restore_output() { sed -E 's/pre-restore-[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+/pre-restore-STAMP/g'; }
+inline_output=$(run_ctl restore "$archive" --yes --foreground 2>"$TEST_ROOT/inline.err")
+grep -qx 'Restore completed' <<<"$inline_output"
+rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-*
+: > "$TEST_ROOT/launcher.log"
+detached_rc=0
+detached_output=$(run_ctl_detached restore "$archive" --yes 2>"$TEST_ROOT/detached.err") || detached_rc=$?
+[ "$detached_rc" -eq 0 ] || { echo "the detached restore exited $detached_rc" >&2; cat "$TEST_ROOT/detached.err" >&2; exit 1; }
+if [ "$(normalise_restore_output <<<"$inline_output")" != "$(normalise_restore_output <<<"$detached_output")" ]; then
+    echo 'a detached restore printed other lines than an inline one' >&2
+    diff <(normalise_restore_output <<<"$inline_output") <(normalise_restore_output <<<"$detached_output") >&2 || true
+    exit 1
+fi
+grep -q 'runs in the background' "$TEST_ROOT/detached.err"
+[ "$(wc -l < "$TEST_ROOT/launcher.log")" -eq 1 ]
+grep -q -- '--unit=run-vesselstack-restore' "$TEST_ROOT/launcher.log"
+worker_records=("$SYSTEM_ROOT"/var/lib/vesselstack/restore/done-*)
+grep -qx 'runner=worker' "${worker_records[${#worker_records[@]}-1]}/state" || { echo 'the journal does not say a worker ran the restore' >&2; exit 1; }
+for rc_file in "$SYSTEM_ROOT"/var/lib/vesselstack/restore/worker-*.rc; do
+    grep -qx 0 "$rc_file" || { echo 'the worker did not record status 0' >&2; exit 1; }
+done
+detached_status=$(run_ctl restore --status --follow)
+grep -qx 'No restore is pending.' <<<"$detached_status"
+grep -q '^The last restore that ran in the background completed at ' <<<"$detached_status"
+rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-* "$SYSTEM_ROOT"/var/lib/vesselstack/restore/worker-* "$SYSTEM_ROOT"/var/lib/vesselstack/restore/done-*
+
 # A restore that is killed part-way (no hooks in the product: test doubles for python3 and mv kill the restore
 # process at the chosen tree rename) can be inspected and undone with the journal's own recover command,
 # without help from the application folder, and a later restore then works.
@@ -2228,7 +2294,7 @@ assert_back_after_installer_kill() {
 cleanup_after_installer_kill() {
     rm -rf -- "$APP_ROOT".pre-restore-* "$DATA_ROOT".pre-restore-* "$APP_ROOT".failed-restore-* "$DATA_ROOT".failed-restore-* \
         "$RESTORE_RECORDS"/rolled-back-* "$RESTORE_RECORDS"/done-*
-    rm -f -- "$APP_ROOT/live-marker"
+    rm -f -- "$APP_ROOT/live-marker" "$RESTORE_RECORDS/boot-recovery" "$RESTORE_RECORDS/boot-recovery.log"
 }
 kill_at_installer
 recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 2>&1) || {
@@ -2238,6 +2304,28 @@ recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 
 }
 grep -q 'Rollback completed' <<<"$recover_output"
 assert_back_after_installer_kill
+cleanup_after_installer_kill
+
+# The same kill, undone by the boot recovery script instead of by hand: a different boot id plays "the next boot".
+kill_at_installer
+printf 'f0e1d2c3-b4a5-4968-8776-655443322110\n' > "$TEST_ROOT/next-boot-id"
+boot_output=$(env PATH="$FAKE_BIN:$PATH" SYSTEM_ROOT="$SYSTEM_ROOT" VESSELSTACK_BOOT_ID_FILE="$TEST_ROOT/next-boot-id" \
+    "$REPO_ROOT/scripts/lib/restore-boot" 2>&1) || {
+    echo 'restore-boot failed after a kill at the restored installer' >&2
+    echo "$boot_output" >&2
+    exit 1
+}
+grep -q 'was rolled back' <<<"$boot_output"
+assert_back_after_installer_kill
+grep -qx 'result=rolled-back' "$RESTORE_RECORDS/boot-recovery"
+grep -qx 'phase_before=starting' "$RESTORE_RECORDS/boot-recovery"
+grep -qx 'phase_after=archived' "$RESTORE_RECORDS/boot-recovery"
+grep -q 'Rollback completed' "$RESTORE_RECORDS/boot-recovery.log"
+test "$(stat -c %a "$RESTORE_RECORDS/boot-recovery")" = 600
+test "$(stat -c %a "$RESTORE_RECORDS/boot-recovery.log")" = 600
+boot_status=$(run_ctl status 2>&1 || true)
+grep -q '^Restore  *rolled back automatically at boot' <<<"$boot_status" || { echo 'status does not report the automatic recovery' >&2; echo "$boot_status" >&2; exit 1; }
+grep -q 'INFO an interrupted restore was rolled back automatically at boot' <<<"$(run_ctl doctor 2>&1 || true)"
 cleanup_after_installer_kill
 
 kill_at_installer
@@ -2253,11 +2341,40 @@ assert_back_after_installer_kill
 rolled_back_records=("$RESTORE_RECORDS"/rolled-back-*)
 grep -qx 'phase=rolled-back' "${rolled_back_records[0]}/state"
 grep -q '^last_error=.*could not be started' "${rolled_back_records[0]}/state"
+# The journal records the boot that wrote it (this host has a kernel boot id).
+if [ -r /proc/sys/kernel/random/boot_id ]; then
+    grep -Eq '^boot_id=[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' "${rolled_back_records[0]}/state"
+fi
 # Nothing is locked: the very next start is accepted and the status no longer reports a restore.
 run_ctl start > "$TEST_ROOT/start-after.out" 2>&1 || { echo 'start was refused after a rolled-back restore' >&2; cat "$TEST_ROOT/start-after.out" >&2; exit 1; }
 status_after=$(run_ctl status 2>&1 || true)
 if grep -q '^Restore  ' <<<"$status_after"; then echo 'status still reports a restore after the rollback' >&2; exit 1; fi
 cleanup_after_installer_kill
+
+# The same kill at the restored installer when a background worker runs the restore: the worker dies, the
+# foreground that follows it says so and exits 1, and the journal's recover rolls the restore back.
+rm -rf -- "$UNIT_STATE"; install -d "$UNIT_STATE"
+printf 'unit two\n' > "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+printf 'UPDATE_KEY=two\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
+printf 'live app installer kill\n' > "$APP_ROOT/live-marker"
+live_app_inode=$(stat -c %i "$APP_ROOT")
+live_data_inode=$(stat -c %i "$DATA_ROOT")
+: > "$FAKE_BIN/calls.log"
+killed_rc=0
+KILL_ON_INSTALLER=1 run_ctl_detached restore "$archive" --yes > "$TEST_ROOT/killed.out" 2> "$TEST_ROOT/killed.err" || killed_rc=$?
+[ "$killed_rc" -eq 1 ] || { echo "the detached restore killed at the installer exited $killed_rc, not 1" >&2; cat "$TEST_ROOT/killed.out" "$TEST_ROOT/killed.err" >&2; exit 1; }
+grep -q "The restore worker stopped in phase starting the restored system. Run: sudo $RESTORE_CURRENT/recover status" "$TEST_ROOT/killed.err" || {
+    echo 'the foreground did not report that the worker stopped' >&2; cat "$TEST_ROOT/killed.err" >&2; exit 1; }
+grep -qx 'phase=starting' "$RESTORE_CURRENT/state"
+grep -qx 'unit one' "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service"
+status_running=$(run_ctl status 2>&1 || true)
+grep -q '^Restore  *INCOMPLETE (phase starting)' <<<"$status_running" || { echo 'status does not call a dead worker an incomplete restore' >&2; echo "$status_running" >&2; exit 1; }
+recover_output=$(env PATH="$FAKE_BIN:$PATH" "$RESTORE_CURRENT/recover" rollback 2>&1) || {
+    echo 'recover rollback failed after the worker was killed at the installer' >&2; echo "$recover_output" >&2; exit 1; }
+grep -q 'Rollback completed' <<<"$recover_output"
+assert_back_after_installer_kill
+cleanup_after_installer_kill
+rm -rf -- "$SYSTEM_ROOT"/var/lib/vesselstack/restore/worker-*
 unset FAKE_SYSTEMCTL_STATE_DIR
 
 touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \
@@ -2265,6 +2382,10 @@ touch "$SYSTEM_ROOT/etc/systemd/system/vesselstack-chat.service" \
 install -d "$SYSTEM_ROOT/usr/local/libexec/vesselstack"
 touch "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update" \
     "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
+# Recovery at boot is not a vesselstack-* unit, so uninstall removes it by name: unit, script directory and setting.
+install -d "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
+touch "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery/restore-boot" "$SYSTEM_ROOT/etc/systemd/system/boot-vesselstack-restore.service" \
+    "$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
 if run_ctl uninstall --purge-data >/dev/null 2>&1; then
     echo 'Purge uninstall accepted missing --yes confirmation' >&2
     exit 1
@@ -2281,6 +2402,10 @@ test ! -e "$SYSTEM_ROOT/etc/systemd/system/vesselstack-displays-bridge.service"
 # Uninstall also removes the root-owned update launcher and its helper.
 test ! -e "$SYSTEM_ROOT/usr/local/sbin/vesselstack-update"
 test ! -e "$SYSTEM_ROOT/usr/local/libexec/vesselstack/deploy-chat.py"
+test ! -e "$SYSTEM_ROOT/etc/systemd/system/boot-vesselstack-restore.service"
+test ! -e "$SYSTEM_ROOT/usr/local/lib/vesselstack-recovery"
+test ! -e "$SYSTEM_ROOT/etc/vesselstack-recovery.conf"
+grep -qx 'systemctl disable boot-vesselstack-restore.service' "$FAKE_BIN/calls.log"
 test -e "$DATA_ROOT/state.txt"
 
 if run_ctl status unexpected >/dev/null 2>&1; then

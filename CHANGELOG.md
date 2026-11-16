@@ -85,6 +85,112 @@ Semantic Versioning.
   To roll the bridge back, install the previous VesselStack version. An older bridge ignores the
   `live` key in `state.json`; a live alarm at the moment of a crash is then forgotten again.
 
+### Restore
+
+- `vesselstackctl restore ARCHIVE --yes` now hands the swap to a background unit
+  (`run-vesselstack-restore`) when systemd is running, so a dropped SSH session or a closed terminal no
+  longer interrupts it half-way. Your terminal follows the restore and prints the same lines and exit
+  status as before; Ctrl-C or closing the terminal only stops following. New: `sudo vesselstackctl
+  restore --status --follow` re-attaches to a running restore (or shows the last result),
+  `--foreground` runs the restore in your terminal as before, and `status`, `doctor`,
+  `restore --status` and `recover status` report a restore that is running. There is no abort. The
+  journal records `runner` (`inline` or `worker`) and `launched`; phases and rollback are unchanged.
+  Without systemd the restore runs in the terminal.
+
+**Operational impact:** a restore started from an SSH session no longer needs `screen` or `tmux`. A
+shutdown before the restore has moved the first folder stops it and rolls it back at once (the
+journal records `stop_requested`; this includes a request that arrives before anything was
+stopped, which ends the restore without stopping the stack). After that, the shutdown waits up to 10 minutes for it to
+finish; after that, or after a power loss, the recovery at boot rolls it back. `status`, `doctor`
+and `recover status` call a restore running only while its worker process is alive in this boot,
+so a stale record after a power loss shows the unfinished restore and the rollback steps. If you
+roll back or abandon a restore from another terminal before it starts, the first terminal says so
+and exits 1. While it runs, other commands are refused as for any unfinished
+restore. The journal still validates for older releases' tools (the new keys are optional).
+
+**Verify:** over SSH start a restore, kill the SSH client, reconnect and run `sudo vesselstackctl
+restore --status --follow`: it prints the rest of the output and exits 0. `systemctl status
+run-vesselstack-restore` shows the unit while it runs.
+
+**Rollback:** run restores with `--foreground` (the old behaviour), or reinstall the previous release.
+
+- While a restore is unfinished, the Control Panel, a browser-started update and the boat profile
+  command now report that VesselStack is busy, as `vesselstackctl` commands already did. The
+  lifecycle lock helper (`common/lifecycle_lock.py`) refuses a new lock until the restore is
+  committed or rolled back; `recover rollback`, `recover abandon` and the recovery at boot are not
+  affected. The helper also gained `run --wait SECONDS`.
+
+**Operational impact:** a Control Panel action, a browser update or a boat profile change started
+while a restore is unfinished is refused with "a restore is unfinished" instead of running. Nothing
+changes while no restore is pending. A journal written by 0.9.0 carries the old helper, which does
+not refuse, and keeps working.
+
+**Verify:** with an unfinished restore, `sudo python3 /opt/vesselstack/common/boat_profile_cli.py
+init --root /opt/vesselstack` prints "a restore is unfinished" and exits with status 2; after
+`sudo /var/lib/vesselstack/restore/current/recover rollback` it no longer does.
+
+**Rollback:** reinstall the previous release. The journal format is unchanged, so a journal
+written by this release stays valid for 0.9.0.
+
+- The restore journal now records which boot last wrote it (`boot_id`, read from
+  `/proc/sys/kernel/random/boot_id`, left out when that is unavailable) and, after a failed
+  rollback, whether trying again can help (`last_error_kind`: retry, manual or previous).
+  `vesselstackctl restore --status` and `recover status` say so on the `Last error` line. The
+  recovery at boot (below) uses both.
+
+**Operational impact:** none for a running system. Journals written by 0.9.0 have neither key and
+stay valid; rollback decisions, phases and the by-hand steps are unchanged.
+
+**Verify:** start a restore that fails, then run `sudo vesselstackctl restore --status`; the
+journal's `state` file contains a `boot_id=` line (the same value as
+`cat /proc/sys/kernel/random/boot_id`), and a failed rollback adds `last_error_kind=`.
+
+**Rollback:** reinstall the previous release. A journal that already has the new keys stays
+readable by 0.9.0, which ignores them.
+
+### Recovery at boot
+
+- After a power loss in the middle of a restore, the boat computer now recovers by itself at the
+  next boot. The new `boot-vesselstack-restore.service` runs once per boot, only while a restore
+  journal exists, and runs the journal's own `recover rollback` when the journal was written in an
+  earlier boot. When it is not sure it holds: it changes nothing and writes down why.
+  Cleanup of a finished or rolled-back restore runs in both modes; the cleanup of an abandoned
+  restore also starts the services and containers it had stopped, so it runs only in `rollback` mode.
+- The service runs `recover rollback` at most 3 times per journal, whatever the phase (2 after a
+  failed rollback); the cleanup has the same limit. After that it holds at every boot and the
+  system stays as it is, possibly with the folders half swapped and the services stopped, until you
+  run `recover status`. It waits up to ten times 30 seconds for a busy lock.
+- `/etc/vesselstack-recovery.conf` fails closed: a bad value, a second `MODE=` line or a file that
+  is not regular means `hold`; a missing file or no `MODE=` line means `rollback`. A starting
+  restore removes the `boot-recovery` record of an earlier one.
+- A restore interrupted without a reboot (a dropped SSH session, a killed process) is not recovered
+  by the service; run `recover rollback`. A full `/var` blocks the automatic recovery; the unit then
+  ends without a failure and the restore stays pending. The unit allows 40 minutes (was 30).
+- New setting `VESSELSTACK_RESTORE_AT_BOOT` (`rollback`, the default, or `hold`), written to
+  `/etc/vesselstack-recovery.conf`.
+- The outcome is in `/var/lib/vesselstack/restore/boot-recovery` and `boot-recovery.log`, and in
+  `sudo vesselstackctl status` and `doctor`.
+- Known limits: a restore that had finished all but its last step is rolled back too (the restored
+  folders are kept as `*.failed-restore-<stamp>`); a failed automatic rollback leaves the services
+  stopped; services still start at boot before the recovery stops them; containers that Docker
+  restarts itself are stopped by the rollback, not prevented from starting.
+
+**Operational impact:** the installer adds `/usr/local/lib/vesselstack-recovery/restore-boot`, the
+unit `/etc/systemd/system/boot-vesselstack-restore.service` (enabled, not started) and
+`/etc/vesselstack-recovery.conf`. Nothing changes while no restore is pending. At the next boot with
+a pending journal from an earlier boot, the previous folders come back and the stack is started.
+A journal written by 0.9.0 has no boot id: it is held, not rolled back. Restoring an older backup
+leaves the new files in place. Uninstall removes all three.
+
+**Verify:** `systemctl is-enabled boot-vesselstack-restore.service` prints `enabled` and
+`cat /etc/vesselstack-recovery.conf` prints `MODE=rollback`. After an interrupted restore and a
+reboot: `sudo journalctl -b -u boot-vesselstack-restore`,
+`sudo cat /var/lib/vesselstack/restore/boot-recovery` and `sudo vesselstackctl status`.
+
+**Rollback:** set `VESSELSTACK_RESTORE_AT_BOOT="hold"` in `vesselstack.env` and rerun the
+installer, or run `sudo systemctl disable boot-vesselstack-restore.service`. Recovery by hand with
+`recover rollback` is unchanged.
+
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,

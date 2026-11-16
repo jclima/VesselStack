@@ -27,6 +27,12 @@ that are read and written here and are never sourced or evaluated by a shell.
                                      an empty directory, otherwise it fails. Never copies: a rename
                                      across filesystems fails with an error
 
+Every `set` also records boot_id=<the running boot> (the kernel's random boot id, read from
+/proc/sys/kernel/random/boot_id, or from the file named by VESSELSTACK_BOOT_ID_FILE when that is
+set, which is how the tests choose it). When that file is missing, unreadable or not a UUID, no boot_id is
+written and an existing one is removed, so an id from an earlier boot never looks current. A caller
+cannot pass boot_id=: the helper sets it.
+
 A state file with a repeated key is corrupt: get, dump and set refuse it.
 
 Exit status: 0 success, 1 key absent / operational error, 2 usage or invalid input.
@@ -40,6 +46,10 @@ import stat
 import sys
 
 KEY_RE = re.compile(r"^[a-z_]+$")
+BOOT_ID_KEY = "boot_id"
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+BOOT_ID_ENV = "VESSELSTACK_BOOT_ID_FILE"
+BOOT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 STATE_NAME = "state"
 TMP_NAME = "state.tmp"
 
@@ -110,15 +120,34 @@ def write_state(directory: str, values: dict[str, str]) -> None:
     fsync_dir(directory)
 
 
+def current_boot_id() -> str | None:
+    """The id of the running boot, or None when it cannot be read or is not a UUID."""
+    path = os.environ.get(BOOT_ID_ENV) or BOOT_ID_FILE
+    try:
+        with open(path, encoding="ascii", errors="replace") as handle:
+            text = handle.read(256).strip()
+    except OSError:
+        return None
+    return text if BOOT_ID_RE.match(text) else None
+
+
 def set_values(directory: str, assignments: list[str]) -> None:
     updates: dict[str, str] = {}
     for item in assignments:
         key, sep, value = item.partition("=")
         if not sep:
             raise StateError(f"expected KEY=VALUE, got {item!r}")
+        if key == BOOT_ID_KEY:
+            raise StateError("boot_id is recorded by this helper and cannot be set")
         updates[validate_key(key)] = validate_value(value)
     values = read_state(directory)
     values.update(updates)
+    # Every state write goes through here, so the journal always says which boot wrote it last.
+    boot_id = current_boot_id()
+    if boot_id is None:
+        values.pop(BOOT_ID_KEY, None)
+    else:
+        values[BOOT_ID_KEY] = boot_id
     write_state(directory, values)
 
 
