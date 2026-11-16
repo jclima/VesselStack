@@ -340,7 +340,7 @@ disconnect the new drop and correct it before proceeding.
 
 ## 8. Configure integrations and acceptance tests
 
-Follow the root README for Home Assistant, Signal K, AIS, Grafana, and Boat Chat.
+Follow the root README for Home Assistant, Signal K, AIS and Boat Chat; Grafana and Homepage are below.
 Before relying on the system:
 
 - Reboot and confirm `sudo vesselstackctl doctor` passes.
@@ -357,6 +357,69 @@ sudo vesselstackctl verify-backup /path/to/archive.tar.gz
 - To run backups on a schedule (off by default), see [Scheduled backups](../README.md#scheduled-backups).
 - Record the Pi hostname/IP, fuse location, power isolation point, CAN adapter,
   connector, installed version, backup location, and recovery owner.
+
+### Grafana
+
+Open `http://HOST:43000`. Retrieve the generated initial password locally:
+
+```bash
+sudo grep '^GRAFANA_ADMIN_PASSWORD=' \
+  /opt/vesselstack/config/vesselstack.env
+```
+
+The installer provisions `VesselStack InfluxDB`, `VesselStack Prometheus`, the
+**VesselStack / VesselStack System Health** starter dashboard and the
+**VesselStack / VesselStack Boat Overview** dashboard. The Boat Overview reads
+the raw bucket (`INFLUXDB_RAW_BUCKET`, validated as 1 to 64 letters, digits,
+dots, hyphens or underscores because the name is written into its Flux queries)
+and shows batteries (voltage, current, state of charge), tank levels, engine
+(speed, temperature, oil pressure), navigation (speed and course over ground,
+depth) and environment (apparent wind, outside temperature, pressure), converted
+from Signal K's SI units to knots, degrees, degrees Celsius, bar and hectopascal.
+Panels read "No data yet" until the matching instrument reports. It
+deliberately has no position or map panel. Use these as the operational
+baseline, then add vessel dashboards for the Signal K paths available on the
+boat. Provisioned dashboards are editable in Grafana; keep
+reusable versions in the repository so reinstallations remain reproducible.
+
+### Homepage (the front door)
+
+Open `http://HOST` (port 80) or `http://BOATNAME.local`. [Homepage](https://gethomepage.dev) shows one
+tile per enabled service: Boat Chat, Grafana, Home Assistant, Signal K, AIS, and, when the databases
+are published beyond loopback, InfluxDB and Prometheus. The Control Panel tile links only when
+`panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. A Displays tile
+appears when `DISPLAYS_ENABLE=true`. With `SIGNALK_MODE=existing` and a `SIGNALK_URL` on another
+computer, the Signal K tile links to that server (scheme, host and port only; no status dot). Links use
+`$(hostname).local` and follow the address you opened the page with. The Boat Chat and Control Panel tiles
+are plain links: each opens its own sign-in screen (passphrase or pairing link; see the [Control Panel guide](CONTROL_PANEL.md#sign-in) and
+[Boat Chat setup](BOAT_CHAT.md#sign-in-with-a-crew-passphrase)); the home page itself holds no sign-in and no secrets.
+
+The default Homepage uses VesselStack’s navy and teal palette, the bundled logo, your boat name,
+three tiles per row on wide screens, and a 24-hour clock. In **Control Panel → Settings → Homepage**,
+choose the light or dark palette, the boat name or VesselStack heading, the number of tiles per row,
+and a 24-hour, 12-hour, or hidden clock. **Save**, then **Apply**, and reload Homepage to see the result.
+The **Displays** tile opens that tab when the Control Panel is reachable on the boat network.
+
+For a manual configuration, the equivalent keys in `config/vesselstack.env` are `HOMEPAGE_THEME`
+(`dark` or `light`), `HOMEPAGE_COLUMNS` (`compact`, `standard`, or `wide`),
+`HOMEPAGE_HEADING` (`boat` or `brand`), and `HOMEPAGE_CLOCK` (`24h`, `12h`, or `hidden`).
+Run `sudo vesselstackctl homepage sync` after changing them manually. Restore the defaults by choosing
+dark, three tiles, the boat name, and the 24-hour clock in Settings.
+
+Tiles update automatically: `vesselstackctl homepage sync` runs at every start, on component
+add/remove, `lan` and `panel-access` changes, display enable and install/update. The rendered files in
+`config/homepage/` are overwritten each time and contain no passwords or tokens. Add your own tiles
+and bookmarks in `config/homepage-custom/services.yaml` and `bookmarks.yaml` (created once, never
+overwritten; an invalid file is skipped with a warning). The page accepts only the host names and
+addresses in `HOMEPAGE_ALLOWED_HOSTS` (managed; add more with `HOMEPAGE_ALLOWED_HOSTS_EXTRA`). The
+list is also refreshed at every boot by `vesselstack-homepage-refresh.service`
+(`sudo vesselstackctl homepage refresh`, which recreates the container only if the list changed), so
+IP access keeps working after a new DHCP lease; `BOATNAME.local` always works. IPv4 addresses only:
+IPv6 is not added.
+
+The `config/homepage*` folders are made world-readable (`0755`, files `0644`) so the container's
+service user can read them; they hold no secrets. The container runs with all capabilities dropped
+except `CHOWN`, `SETUID` and `SETGID`.
 
 ## Reaching VesselStack from other devices
 

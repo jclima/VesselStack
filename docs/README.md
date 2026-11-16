@@ -23,8 +23,12 @@ Boat Chat provider that sends data elsewhere.
 | Carry an update to an offline boat | [Deployment: offline path](DEPLOYMENT.md#simple-path-one-command) |
 | Understand every setting and command | [README settings reference](../README.md#4-configure-the-vessel) |
 | Use or secure the Control Panel (tab-by-tab tour, backups, updates, recovery) | [Control Panel](CONTROL_PANEL.md) |
+| Sign in with a passphrase or pair a phone; token rotation, limits and rollback | [Control Panel: Sign in](CONTROL_PANEL.md#sign-in), [Sign-in reference](CONTROL_PANEL.md#sign-in-reference) |
 | Test the Control Panel on a lab Pi | [Control Panel lab testing](CONTROL_PANEL_TESTING.md) |
 | Use Boat Chat, its access and admin codes, units and timezone | [Boat Chat setup](BOAT_CHAT.md), providers in [Boat Chat providers](../boat-chat/README.md) |
+| Find the Grafana dashboards or change the Homepage tiles | [Installation: Grafana](INSTALLATION.md#grafana), [Homepage](INSTALLATION.md#homepage-the-front-door) |
+| Describe engines, batteries and tanks (boat profile) | [Boat profile](BOAT_PROFILE.md) |
+| Understand Boat Chat unit conversion, data age and fuel totals | [Signal K units and data age](BOAT_CHAT.md#signal-k-units-and-data-age), [Fuel totals and power integration](BOAT_CHAT.md#fuel-totals-and-power-integration) |
 | Manage MQTT accounts and access lists | [MQTT access control](MQTT.md) |
 | Reach dashboards from other devices | [Network access and security](NETWORK.md) |
 | Update, roll back, or install offline | [Updating and offline install](UPDATING.md) |
@@ -35,6 +39,7 @@ Boat Chat provider that sends data elsewhere.
 | Review power sources and instrument-reading coverage | [Power monitoring](../boat-chat/POWER_MONITORING.md) |
 | Connect selected readings to VesselTwin | [Optional VesselTwin connection](VESSELTWIN.md) |
 | Develop, test, or cut a release | [Development](DEVELOPMENT.md) |
+| Know how the installer and Control Panel share settings | [Development: Shared configuration contract](DEVELOPMENT.md#shared-configuration-contract) |
 | Upgrade to 0.9.0 (pre-release) | [README: Upgrading to 0.9.0](../README.md#upgrading-to-090), [Updating](UPDATING.md#upgrading-to-090) |
 | Upgrade from 0.6.x or older | [Updating: upgrading from 0.6.x or older](UPDATING.md#upgrading-from-06x-or-older) |
 | Get alerts on Telegram (off by default) | [README: Alerts](../README.md#alerts) |

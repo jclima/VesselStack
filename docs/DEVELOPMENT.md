@@ -311,6 +311,8 @@ Check with ShellCheck 0.9.0 (the Ubuntu and Debian bookworm package, which CI
 installs): ShellCheck 0.11.0 does not report SC2015 for `A && B || continue`, so
 a clean local 0.11 run can still fail CI.
 
+The shell scripts checked by `tests/test-distribution.sh` pass ShellCheck 0.9.0 and newer (verified on 0.11.0) with default options and no `-x`; the `A && B || C` patterns in `scripts/vesselstackctl` are written as `if ! { A && B; }; then C; fi`, and the few remaining suppressions carry a reason.
+
 Root-controlled test fixtures (`tests/test-offline-install.sh`,
 `tests/test-update-launcher.sh`) are created under `/usr/local/share/vs-test`,
 not `/opt`: the product refuses root-used paths whose chain is not root-owned
@@ -436,6 +438,17 @@ alongside the panel so its service-start check exercises the same import set as
 an installed release. The panel releases the shared lifecycle lock before handing
 off its browser-update lock, so a detached updater cannot wake between those two
 steps and report a spurious busy state.
+
+## Shared configuration contract
+
+The installation wizard and Control Panel use the data-only registry in
+`common/config_registry.py` for shared defaults, types, ranges, choices,
+ownership, and component mappings. The registry validates configuration without
+contacting services or reading secrets. Boat Chat endpoint resolution uses the
+saved state and an explicit `BOAT_CHAT_ENV` file when supplied; an empty port
+means the app default (8765), while an invalid explicit port is an error.
+Managed listener addresses are IPv4 values, and `BOAT_NAME` is limited to safe
+display characters.
 
 ## Historical notes
 

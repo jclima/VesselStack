@@ -149,6 +149,103 @@ If no passphrase is set yet, the unlock screen says so and shows the command
 above. If you press **Lock** with unsaved Settings edits, the panel asks first,
 because locking discards them.
 
+### Sign-in reference
+
+Operator and reviewer details for sign-in on the Control Panel and Boat Chat: storage, limits, operational impact, rollback and verification. The steps to sign in are above.
+
+**Passphrase sign-in details:** choose a passphrase once with `sudo vesselstackctl passphrase set panel`
+(hidden prompt, at least 12 characters; `--stdin` reads one line for scripts and never takes it as an
+argument), or set it in the panel under Settings, Sign-in after unlocking with the token. The unlock
+screen then takes the passphrase, with **Remember this device (30 days)** (otherwise 12 hours). Settings
+lists signed-in devices with Revoke and Revoke all; `sudo vesselstackctl devices list|revoke ID|revoke-all`
+does the same on the boat, `passphrase status` shows the state and `passphrase clear panel` turns it
+off. Details: the browser holds a random 256-bit device token (local storage when remembered, session
+storage otherwise; no cookies) sent as `X-VesselStack-Device`; the boat keeps only its SHA-256 and a
+scrypt hash of the passphrase in `config/control-panel-auth.json` (root, 0600, written atomically; never
+commit it). The `X-VesselStack-Token` header keeps working unchanged for scripts and existing
+sessions, including while passphrase sign-in is paused by the brute-force limits (5 failures per
+address start a growing wait up to 15 minutes; over 20 failures in 15 minutes pause passphrase sign-in
+for 15 minutes). **Operational impact:** a new root-owned module `common/vesselstack_auth.py` is
+installed with the panel, nothing is migrated and passphrase sign-in stays off until you set one.
+Attempts are counted atomically when they arrive, and the panel now refuses any request whose `Host`
+header is not this machine (`127.0.0.1`, `localhost`, `[::1]`; with `panel-access lan` also the
+hostname, `hostname.local` and the current interface addresses, refreshed every 60 s), each with the
+panel port, answering `421`; add other names with `CONTROL_PANEL_ALLOWED_HOSTS` (comma separated,
+`name` or `name:port`) in `config/control-panel.env`. `/api/auth/login` and `/api/auth/passphrase`
+require an `Origin` matching `Host` whatever the credential. **Known trade-off:** the global pause means
+anyone on the network can trigger a 15-minute passphrase lockout; the token keeps working during it.
+**Limitation:** on plain HTTP (`panel-access lan`) the passphrase and device token cross the network
+unencrypted, so keep the SSH tunnel. **Lost passphrase or locked out:** unlock with the token or run
+`passphrase set panel` / `passphrase clear panel` on the boat. **Rollback:** reinstall the previous
+release; older versions ignore `control-panel-auth.json` and only the token works. **Verify:**
+`sudo vesselstackctl passphrase status` and a sign-in from a fresh browser.
+
+**Sign-in hardening:** setting or changing a passphrase (panel or Boat Chat) also clears waiting pairing links. A Boat Chat admin device (`panel-link --for chat --admin`, or the panel pairing option) records a keyed marker of the admin code (`BOAT_CHAT_SETTINGS_TOKEN`; HMAC-SHA256 under a random key kept in the Boat Chat store, see the review follow-ups below) at pairing time and counts as admin only while that marker matches the current code; rotating or removing the code ends its admin rights (stale admin devices are pruned when the code is changed in Boat Chat settings), and without an admin code a device never overrides the loopback-only settings rule. Admin pairing is refused with a clear error while no admin code is set. Rollback: `sudo vesselstackctl devices revoke-all` and pair again.
+
+**Sign-in review follow-ups:**
+- **Rotating a token signs out every device.** Changing `CONTROL_PANEL_TOKEN` (installer re-run with a new
+  value) revokes all Control Panel devices and pairing links; changing `BOAT_CHAT_ACCESS_TOKEN` (installer,
+  Boat Chat Settings, or the panel's Boat Chat settings) revokes all Boat Chat devices and pairing links;
+  changing `BOAT_CHAT_SETTINGS_TOKEN` (installer or Boat Chat Settings) ends every admin device (the
+  installer signs out all Boat Chat devices in that case). The installer prints what it did; the root
+  paths use the privilege-dropping helper for Boat Chat's store. If a revocation fails the rotation still
+  stands and a warning gives the manual command: `sudo vesselstackctl devices revoke-all [panel|chat]`.
+  Operational impact: after a rotation everyone signs in again (passphrase or pairing link).
+- **Unreadable sign-in stores fail closed.** Wrong types anywhere in `auth.json` / `control-panel-auth.json`
+  (for example `"devices": 5`) count as corruption: no passphrase, no devices, access code and token still
+  work, nothing is rewritten, and the panel/Boat Chat answer normally instead of a 500. Repair or delete the
+  file (`passphrase clear` cannot rewrite what it cannot read), then set the passphrase again.
+- **Boat Chat revoke rules.** Crew (access code or passphrase sign-in) can sign out only their own device;
+  signing out another device or everyone, and setting the very first passphrase, need the admin code or an
+  admin device (`vesselstackctl passphrase set chat` on the boat always works). The Sign-in page hides what
+  does not apply.
+- **Admin binding** is now HMAC-SHA256 of the admin code under a random 32-byte `binding_key` created on
+  first need in the Boat Chat store; the panel and `panel-link --admin` resolve the admin code exactly as
+  Boat Chat does (Settings-page override file first, then `config/boat-chat.env`). Admin devices paired
+  before this change carry the old format and read as non-admin: pair them again. Rollback: reinstall the
+  previous release (older versions ignore `binding_key`; old-format admin devices must be paired again).
+- **Throttle.** A successful sign-in no longer clears the address's backoff; it withdraws only its own
+  attempt, and an hour of quiet forgives old failures. Boat Chat listens on the LAN, so the global lockout
+  is a known trade-off: 21 bad attempts in 15 minutes from anywhere lock passphrase and pairing sign-in for
+  everyone for 15 minutes; the access code and admin code keep working, and restarting Boat Chat clears it.
+- Hardening: `vesselstackctl` runs the sign-in helper with `python3 -B -I`; Boat Chat pages send
+  `frame-ancestors 'none'` and `X-Frame-Options: DENY` (the panel already did; it now sends the header too).
+  Verify: `python3 -B -m unittest discover -s tests`, then rotate a token on a test boat and check
+  `sudo vesselstackctl devices list [chat]` is empty.
+
+**Passphrases at install time:** `get-vesselstack.sh` asks, after a successful install or update
+and only on a real terminal without `--yes`/`--defaults`, "Set a Control Panel passphrase now? (recommended)",
+the same for a Boat Chat crew passphrase (hidden, typed twice, up to 3 tries, policy errors shown, Enter skips) and
+"Pair this phone/laptop with Boat Chat now?" (default no; prints `vesselstackctl panel-link --for chat`). Passphrases
+reach `vesselstackctl passphrase set SCOPE --stdin` on standard input only. With `--yes` or `--defaults` nothing is
+asked and the commands for later are printed; the final summary says how to sign in (passphrase if set, else
+`sudo vesselstackctl passphrase set panel` / `panel-link`) and keeps the token commands as a secondary fallback.
+The terminal wizard and browser wizard have optional passphrase fields; they hash with `common/vesselstack_auth.py`
+(scrypt) and write only `CONTROL_PANEL_PASSPHRASE_HASH` / `BOAT_CHAT_PASSPHRASE_HASH`. `install.sh` strictly validates
+the hash format before changing anything (refusing otherwise), imports each into its sign-in store (panel store as
+root; Boat Chat store through the privilege-dropping helper), then deletes the key from the env file; the hashes are
+never kept in `vesselstack.env` and are never printed. `vesselstackctl passphrase set-hash panel|chat` (hash on
+standard input) is the underlying command. The installer uses `set-hash ... --if-unset` and removes each key as soon as
+its own import is settled: it never overwrites a passphrase that is already stored (exit status 3, an "already set"
+notice, the key is scrubbed), and a failed import keeps only its own key for the next run. Rollback: `sudo vesselstackctl passphrase clear panel|chat`.
+
+**Pairing links and QR codes:** `sudo vesselstackctl panel-link [--for panel|chat] [--admin]
+[--label TEXT]` prints a single-use link (`http://HOST:PORT/#pair=CODE`, `$(hostname).local` plus each IPv4
+address; the SSH-tunnel form when the service is loopback-only), the code as `XXXXX-XXXXX`, its expiry and a
+terminal QR code. The Control Panel offers the same under Settings, Sign-in, **Pair a phone**
+(`POST /api/auth/pairing`, authenticated, `Origin` required, returns the link, code, expiry and QR module
+matrix; the root panel changes the Boat Chat store only by running `common/vesselstack_authctl.py` as a fresh process with the Boat Chat service user's uid/gid and no supplementary groups, never by forking itself or writing in that directory; `/api/auth/passphrase` on both services is a compare-and-set and answers 409 "passphrase changed, try again" if the passphrase changed between the check and the write). Redemption is
+`POST /api/auth/pair` on both services (same `Origin`/`Host` rules and throttle as login). Codes are 10
+Crockford base32 characters, only their SHA-256 is stored, they are single use, last 10 minutes, at most 3 may
+wait per store, and a redeemed link always remembers the device for 30 days. `--admin` (Boat Chat only) makes
+an admin device that passes the admin-code checks. **Security notes:** the QR code is a credential for 10
+minutes, so show it only to the person pairing; the code travels in the URL fragment (never sent to the
+server or logged) and the page removes it from the address bar before doing anything else; the link is plain
+HTTP on the boat network. Requires the vendored `common/qrcodegen.py` (Nayuki, MIT; see
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)). **Rollback:** reinstall the previous release; older
+versions ignore the `pairings` list and the extra file. **Verify:** `sudo vesselstackctl panel-link`, then scan
+it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
+
 ## The five tabs
 
 The header shows the installed version and a connection state (Connected,
@@ -169,7 +266,7 @@ Home is for looking, not for changing.
 - **Services** says "All systems running", or how many components are stopped
   and which ones.
 - **Backup** shows when the last backup was made and whether the backup drive is
-  mounted. It warns when there is no backup yet, when the drive is not mounted,
+  mounted (read-only; "unknown" when they cannot be read). It warns when there is no backup yet, when the drive is not mounted,
   when the folder is not writable, or when backups sit on the computer's own
   disk instead of an external drive. When scheduled backups are on
   (`VESSELSTACK_BACKUP_SCHEDULE`) it also shows the schedule, whether the last scheduled run
@@ -490,8 +587,8 @@ check still gate installer actions.
 ## When the panel cannot connect
 
 - **Disconnected.** The header says Disconnected and the page shows "Can't reach
-  the boat computer". Controls are paused. The panel keeps retrying by itself (every few
-  seconds at first, then every 15 seconds) and retries at once when the page
+  the boat computer". Controls are paused. The panel keeps retrying by itself (after 2, 4, 6 and 8
+  seconds, then every 15 seconds) and retries at once when the page
   wakes or the network returns. **Retry now** tries immediately. Check that the SSH tunnel window is still open and
   that the Pi is powered, then press **Retry now**. If the Pi was updating or
   restarting, it reconnects by itself and reloads when the panel has restarted.
@@ -527,6 +624,8 @@ check still gate installer actions.
 
 The panel does not restart itself while an operation is running. After applying
 a release that changes Control Panel code, restart it the same way.
+
+Rollback: restore the previous release from a backup as described under [Updating](../README.md#updating); stored settings keys are unchanged.
 
 ## Telegram, indexer and host service
 
