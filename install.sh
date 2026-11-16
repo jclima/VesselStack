@@ -2049,9 +2049,18 @@ install -d -m 0755 -o root -g root "$SYSTEM_ROOT/usr/local/lib" "$RECOVERY_DIR"
 install -m 0755 -o root -g root "$SCRIPT_DIR/scripts/lib/restore-boot" "$RECOVERY_DIR/restore-boot"
 install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/boot-vesselstack-restore.service.in" "$SYSTEMD_DIR/boot-vesselstack-restore.service"
 recovery_conf_tmp=$(mktemp "$RECOVERY_CONF.XXXXXX")
-printf 'MODE=%s\n' "$VESSELSTACK_RESTORE_AT_BOOT" > "$recovery_conf_tmp"
+{
+    printf '# VesselStack recovery at boot. MODE=rollback rolls an interrupted restore back automatically;\n'
+    printf '# MODE=hold only records what was found. Anything else in this file (an empty file, another key,\n'
+    printf '# spaces around "=", two MODE lines, an unknown value) is treated as MODE=hold.\n'
+    printf 'MODE=%s\n' "$VESSELSTACK_RESTORE_AT_BOOT"
+} > "$recovery_conf_tmp"
 chmod 0644 "$recovery_conf_tmp"
+# install.sh has no fsync helper, so: flush the file to disk before the rename (GNU sync takes file
+# arguments; plain sync otherwise), and the directory entry after it.
+sync -- "$recovery_conf_tmp" 2>/dev/null || sync
 mv -f -- "$recovery_conf_tmp" "$RECOVERY_CONF"
+sync -- "$(dirname -- "$RECOVERY_CONF")" 2>/dev/null || sync
 systemctl daemon-reload
 systemctl enable boot-vesselstack-restore.service
 

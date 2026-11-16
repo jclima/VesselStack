@@ -20,7 +20,7 @@
 # Environment (tests): SYSTEM_ROOT prefix for every path, VESSELSTACK_BOOT_ID_FILE, RESTORE_BOOT_TIMEOUT
 # (default 28m), RESTORE_BOOT_BUSY_WAIT and RESTORE_BOOT_BUSY_TRIES.
 #
-# Files: $dir/boot-recovery (the record, key=value, written atomically, mode 0600) and
+# Files: $dir/boot-recovery (the record, key=value, written atomically, mode 0600; if it is not a regular file the limit counts as reached) and
 # $dir/boot-recovery.log (what was run and its output, mode 0600; a run that acts starts it afresh, a run
 # that finds a journal of the running boot only adds one line).
 # Exit status: 0 for every decided outcome (also a hold or a failed rollback); non-zero only when
@@ -92,7 +92,11 @@ save_record() {
         printf 'note=%s\n' "$(clean "$r_note")"
     } > "$tmp" || { rm -f -- "$tmp"; return 1; }
     chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-    mv -f -- "$tmp" "$record" || { rm -f -- "$tmp"; return 1; }
+    # -T: never descend into a directory at $record. (A system whose mv has no -T gets a plain mv, but only
+    # when $record is not a directory.)
+    if ! mv -fT -- "$tmp" "$record" 2>/dev/null; then
+        if [ -d "$record" ] || ! mv -f -- "$tmp" "$record"; then rm -f -- "$tmp"; return 1; fi
+    fi
 }
 
 # Last resort: an internal error of this script is written into the record when it still can be.
@@ -132,36 +136,57 @@ record_get() {
 }
 
 # ---- mode -------------------------------------------------------------------------------------
-# Parsed, never sourced. A missing file, or one without a MODE= line, means rollback (the default). A file
-# with exactly one MODE= line whose value (one pair of surrounding quotes and surrounding whitespace removed)
-# is `rollback` or `hold` means that. Anything else (another value, several MODE= lines, a file that cannot
-# be read, a symbolic link) fails closed: hold.
+# Parsed, never sourced. A missing file means rollback (the default). A file that exists fails closed:
+# it must hold exactly one line that, after removing a leading BOM, a trailing CR, surrounding whitespace,
+# a trailing " # comment" and one pair of quotes around the value, is `MODE=rollback` or `MODE=hold`
+# (uppercase key, no space around "="). Blank lines and lines starting with "#" are ignored. Anything else
+# (no MODE line, an empty file, another key, `mode=`, `export`, spaces around "=", two MODE lines, another
+# value, a file that cannot be read, a file that is not a regular file) means hold.
 mode=rollback
+conf_problem=''
+conf_value=''
+conf_modes=0
+# Sets conf_problem, conf_value and conf_modes; returns 1 only when the file cannot be opened.
+conf_parse() {
+    local line first=1 bom=$'\xef\xbb\xbf'
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$first" -eq 1 ]; then first=0; line=${line#"$bom"}; fi
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        case "$line" in ''|'#'*) continue ;; esac
+        line=${line%% \# *}   # a comment is a blank, "#", a blank ("MODE=hold #x" is not one: it holds)
+        line=${line% \#}
+        line=${line%"${line##*[![:space:]]}"}
+        if [[ $line == MODE=* ]]; then
+            conf_modes=$((conf_modes + 1))
+            if [ "$conf_modes" -gt 1 ]; then conf_problem="has more than one MODE= line"; return 0; fi
+            conf_value=${line#MODE=}
+            case "$conf_value" in
+                \"*\"|\'*\') [ "${#conf_value}" -lt 2 ] || conf_value=${conf_value:1:${#conf_value}-2} ;;
+            esac
+            case "$conf_value" in
+                rollback|hold) ;;
+                *) conf_problem="has $(clean "${line:0:60}"), which is neither MODE=rollback nor MODE=hold"; return 0 ;;
+            esac
+        else
+            conf_problem="has a line that is not MODE=rollback or MODE=hold: $(clean "${line:0:60}")"
+            return 0
+        fi
+    done 2>/dev/null < "$conf"
+}
 if [ -e "$conf" ] || [ -L "$conf" ]; then
+    mode=hold
     if [ ! -f "$conf" ] || [ -L "$conf" ]; then
-        mode=hold
         mode_log="the mode file $conf is not a regular file; treated as MODE=hold"
-    elif conf_count_rc=0; conf_count=$(grep -c '^MODE=' "$conf" 2>/dev/null) || conf_count_rc=$?; [ "$conf_count_rc" -gt 1 ]; then
-        mode=hold
+    elif ! conf_parse; then
         mode_log="the mode file $conf cannot be read; treated as MODE=hold"
-    elif [ "$conf_count" -gt 1 ]; then
-        mode=hold
-        mode_log="the mode file $conf has more than one MODE= line; treated as MODE=hold"
-    elif [ "$conf_count" -eq 1 ]; then
-        conf_mode=$(sed -n 's/^MODE=//p' "$conf" 2>/dev/null) || conf_mode=''
-        conf_raw=$conf_mode
-        conf_mode=${conf_mode#"${conf_mode%%[![:space:]]*}"}
-        conf_mode=${conf_mode%"${conf_mode##*[![:space:]]}"}
-        case "$conf_mode" in
-            \"*\"|\'*\') [ "${#conf_mode}" -lt 2 ] || conf_mode=${conf_mode:1:${#conf_mode}-2} ;;
-        esac
-        case "$conf_mode" in
-            rollback) mode=rollback ;;
-            hold) mode=hold ;;
-            *)
-                mode=hold
-                mode_log="the mode file $conf has MODE=$(clean "${conf_raw:0:60}"), which is neither rollback nor hold; treated as MODE=hold" ;;
-        esac
+    elif [ -n "$conf_problem" ]; then
+        mode_log="the mode file $conf $conf_problem; treated as MODE=hold"
+    elif [ "$conf_modes" -eq 0 ]; then
+        mode_log="the mode file $conf has no MODE= line (is it empty?); treated as MODE=hold"
+    else
+        mode=$conf_value
     fi
 fi
 
@@ -235,6 +260,14 @@ if [ -n "$jid" ] && [ "$(record_get journal_id)" = "$jid" ]; then
     fi
     prev_attempts=$((10#$prev_attempts))
 fi
+record_bad=''
+if [ -e "$record" ] || [ -L "$record" ]; then
+    if [ ! -f "$record" ] || [ -L "$record" ]; then
+        # A directory, a symbolic link or a device: the count cannot be trusted or kept. The limit is reached.
+        record_bad=1
+        prev_attempts=$RESTORE_BOOT_MAX_ATTEMPTS
+    fi
+fi
 r_attempts=$prev_attempts
 
 # ---- decide (first match wins) ----------------------------------------------------------------
@@ -277,12 +310,15 @@ if [ -z "$action" ]; then
         rollback-failed)
             [ "$kind" = retry ] || hold "a retry will not help (the earlier rollback stopped for a reason a retry cannot change)"
             [ -n "$rollback_from" ] || hold "the journal does not say where the rollback started"
-            [ "$prev_attempts" -lt 2 ] || hold "the rollback was already tried $prev_attempts times at boot after it failed; the limit after a failed rollback is 2"
+            [ "$prev_attempts" -lt 2 ] || hold "the rollback was already tried $prev_attempts times at boot; the limit after a failed rollback is 2"
             action=rollback ;;
     esac
 fi
 # One limit for every automatic run, whatever the phase: a rollback that hangs or is killed leaves the
 # journal in `rolling-back` (or in its old phase), and would otherwise be started again at every boot.
+if [ -n "$record_bad" ]; then
+    hold "the record $record is not a regular file, so the attempts cannot be counted; treated as the limit reached ($RESTORE_BOOT_MAX_ATTEMPTS)"
+fi
 if [ "$prev_attempts" -ge "$RESTORE_BOOT_MAX_ATTEMPTS" ]; then
     if [ "$action" = cleanup ]; then
         hold "the cleanup was already tried $prev_attempts times at boot; the limit is $RESTORE_BOOT_MAX_ATTEMPTS"
@@ -313,22 +349,38 @@ if ! save_record; then
     finished_cleanly=1
     exit 0
 fi
+# Flushed to disk: a power loss right after must not lose the count. GNU sync takes file arguments; where
+# it does not (older or BSD sync) the plain sync flushes everything.
+sync -- "$record" "$dir" >/dev/null 2>&1 || sync >/dev/null 2>&1 || true
 echo "VesselStack recovery at boot: restore journal in phase $phase from an earlier boot; running: recover rollback ($action)"
 log_line "running: recover rollback (phase $phase, action $action, attempt $r_attempts)"
 
+# Signature of the journal's state file: the POSIX checksum (which includes the length) of its content, or
+# "none" when it cannot be read. cksum is the same on Linux and macOS and does not depend on timestamp
+# resolution. A rollback that really ran changes `state` (at least its phase).
+state_sig() { cksum < "$journal/state" 2>/dev/null || echo none; }
+
 rc=0
 tries=0
+state_changed=0
 while :; do
     tries=$((tries + 1))
     rc=0
+    sig_before=$(state_sig)
     timeout -k 60 "$run_timeout" /bin/bash "$journal/recover" rollback >> "$log" 2>&1 || rc=$?
     [ "$rc" -eq 75 ] || break
+    if [ "$(state_sig)" != "$sig_before" ]; then
+        # Status 75 from a rollback that changed the journal: a command inside it exited 75. It ran.
+        state_changed=1
+        log_line "recover rollback exited with status 75 but changed the journal state: counted as a run, not as a busy lock"
+        break
+    fi
     if [ "$tries" -ge "$((10#$busy_tries))" ]; then break; fi
     log_line "the lifecycle lock is busy; waiting ${busy_wait}s (try $tries of $((10#$busy_tries)))"
     sleep "$busy_wait"
 done
 
-if [ "$rc" -eq 75 ]; then
+if [ "$rc" -eq 75 ] && [ "$state_changed" -eq 0 ]; then
     # Not an attempt and not a failure: another operation holds the lock.
     r_attempts=$prev_attempts
     hold "another VesselStack operation holds the lock"
@@ -351,8 +403,12 @@ case "$rc" in
     *) r_result=failed ;;
 esac
 case "$r_result" in
-    timed-out) r_reason="recover rollback did not finish within $run_timeout" ;;
-    failed) r_reason="recover rollback exited with status $rc" ;;
+    timed-out)
+        if [ "$rc" -eq 124 ]; then r_reason="recover rollback did not finish within $run_timeout"
+        else r_reason="recover rollback was killed (the time limit of $run_timeout or the system)"; fi ;;
+    failed)
+        r_reason="recover rollback exited with status $rc"
+        if [ "$state_changed" -eq 1 ]; then r_reason="$r_reason after it had changed the journal state (not a busy lock)"; fi ;;
 esac
 if ! save_record; then
     # The run is over; a record that cannot be written must not turn it into an internal error.

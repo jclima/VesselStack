@@ -299,7 +299,8 @@ if grep -Eq '^(start|restart|enable --now) .*boot-vesselstack-restore' "$FAKE_BI
     exit 1
 fi
 grep -qx 'MODE=rollback' "$RECOVERY_CONF"
-test "$(wc -l < "$RECOVERY_CONF" | tr -d ' ')" = 1
+test "$(grep -vc '^#' "$RECOVERY_CONF")" = 1
+grep -q '^# .*hold' "$RECOVERY_CONF"
 # Weekly schedule + a watchdog device on a Raspberry Pi: both drop-ins, the timer, and daemon-reexec.
 UNATTENDED_CONFIG="$TEST_ROOT/unattended.env"
 cp "$CONFIG" "$UNATTENDED_CONFIG"
@@ -320,7 +321,7 @@ run_unattended >/dev/null
 grep -qx 'MODE=hold' "$RECOVERY_CONF"
 run_unattended >/dev/null
 grep -qx 'MODE=hold' "$RECOVERY_CONF"
-test "$(wc -l < "$RECOVERY_CONF" | tr -d ' ')" = 1
+test "$(grep -vc '^#' "$RECOVERY_CONF")" = 1
 test "$(stat -c '%u:%a' "$RECOVERY_CONF")" = "0:644"
 bad_config="$TEST_ROOT/bad-restore-at-boot.env"
 cp "$UNATTENDED_CONFIG" "$bad_config"

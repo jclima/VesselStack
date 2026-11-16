@@ -496,12 +496,32 @@ class ModeFile(BootCase):
         return "rollback" in self.calls_made()
 
     def test_mode_parsing(self):
-        for text, expect_run in (("MODE=rollback\n", True), ("MODE=hold\n", False), ("MODE=hold", False), ("", True), ("hold\n", True),
-                                 ("# comment\nMODE=hold\n", False), ("MODE = hold\n", True), ("# only a comment\n", True),
+        bom = "\ufeff"
+        for text, expect_run in (("MODE=rollback\n", True), ("MODE=hold\n", False), ("MODE=hold", False), ("", False), ("hold\n", False),
+                                 ("# comment\nMODE=hold\n", False), ("# comment\nMODE=rollback\n\n", True), ("MODE = hold\n", False), ("MODE = rollback\n", False),
+                                 ("# only a comment\n", False), ("\n\n", False), ("mode=hold\n", False), ("mode=rollback\n", False),
+                                 (" MODE=hold\n", False), (" MODE=rollback\n", True), ("export MODE=hold\n", False), ("export MODE=rollback\n", False),
+                                 (bom + "MODE=hold\n", False), (bom + "MODE=rollback\n", True), ("MODE=rollback\r\n", True), ("MODE=hold\r\n", False),
+                                 ("MODE=hold # c\n", False), ("MODE=rollback # c\n", True), ("MODE=rollback #c\n", False), ("OTHER=1\nMODE=rollback\n", False),
+                                 ("MODE=x\n", False), ("MODE=rollback\nMODE=rollback\n", False),
                                  ('MODE="hold"\n', False), ("MODE='hold'\n", False), ('MODE="rollback"\n', True), ("MODE='rollback'\n", True),
-                                 ("MODE=hold \n", False), ("MODE=hold\r\n", False), ("MODE=  hold\n", False), ('MODE= "hold" \n', False)):
+                                 ("MODE=hold \n", False), ("MODE=  hold\n", False), ('MODE= "hold" \n', False), ('MODE= "rollback" \n', False)):
             with self.subTest(text=text):
                 self.assertEqual(self.mode_runs(text), expect_run)
+
+    def test_every_file_that_is_not_one_valid_line_says_why_in_the_log(self):
+        for text, why in (("", "no MODE= line"), ("# c\n", "no MODE= line"), ("MODE = hold\n", "not MODE=rollback or MODE=hold"), ("mode=hold\n", "not MODE=rollback or MODE=hold"),
+                          ("export MODE=hold\n", "export MODE=hold"), ("MODE=x\n", "neither MODE=rollback nor MODE=hold")):
+            with self.subTest(text=text):
+                self.assertFalse(self.mode_runs(text))
+                self.assertIn(why, self.log()); self.assertIn("treated as MODE=hold", self.log())
+                self.assertEqual(self.record()["mode"], "hold")
+
+    def test_a_mode_file_that_cannot_be_read_holds(self):
+        if os.geteuid() == 0: self.skipTest("root reads everything")
+        self.conf("MODE=rollback\n"); os.chmod(self.base / "etc/vesselstack-recovery.conf", 0)
+        self.make_journal("starting"); self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"]); self.assertIn("cannot be read", self.log())
 
     def test_a_missing_file_means_rollback(self):
         self.make_journal("starting"); self.run_boot()
@@ -523,6 +543,11 @@ class ModeFile(BootCase):
         self.assertFalse(self.mode_runs("MODE=ab\x01cd\x1b[31m\n"))
         self.assertNotIn("\x01", self.log()); self.assertNotIn("\x1b", self.log()); self.assertIn("MODE=ab?cd?[31m", self.log())
 
+    def test_a_mode_file_that_is_a_directory_holds(self):
+        self.make_journal("starting"); (self.base / "etc/vesselstack-recovery.conf").mkdir()
+        self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"]); self.assertIn("not a regular file", self.log())
+
     def test_a_mode_file_that_is_not_a_regular_file_holds(self):
         self.make_journal("starting")
         target = self.base / "elsewhere"; target.write_text("MODE=rollback\n")
@@ -535,6 +560,61 @@ class ModeFile(BootCase):
         self.conf(f"MODE=hold\ntouch {planted}\n$(touch {planted})\nMODE=`touch {planted}`\n")
         self.make_journal("starting"); self.run_boot()
         self.assertFalse(planted.exists()); self.assertEqual(self.record()["action"], "hold")
+
+
+class HardeningFollowUps(BootCase):
+    def stub_dir(self, name, body):
+        stubs = self.base / "stubs"; stubs.mkdir(exist_ok=True)
+        (stubs / name).write_text("#!/bin/bash\n" + body); (stubs / name).chmod(0o755)
+        return stubs
+
+    def test_a_record_that_is_a_directory_holds_and_is_not_written_into(self):
+        (self.dir / "boot-recovery").mkdir(); self.make_journal("starting")
+        out = self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"]); self.assertIn("HELD", out.stdout)
+        self.assertTrue((self.dir / "boot-recovery").is_dir()); self.assertEqual(list((self.dir / "boot-recovery").iterdir()), [])
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.startswith(".boot-recovery.")], [])
+        self.assertIn("not a regular file", self.log())
+
+    def test_a_record_that_is_a_symlink_holds_and_the_target_is_untouched(self):
+        target = self.base / "elsewhere"; target.write_text("journal_id=abc123\nattempts=0\n")
+        (self.dir / "boot-recovery").symlink_to(target); self.make_journal("starting")
+        out = self.run_boot()
+        self.assertEqual(self.calls_made(), ["status"]); self.assertIn("HELD", out.stdout)
+        self.assertEqual(target.read_text(), "journal_id=abc123\nattempts=0\n")
+        self.assertIn("not a regular file", self.log())
+
+    def test_status_75_with_an_unchanged_state_is_still_a_busy_lock(self):
+        self.make_journal("starting"); (self.journal / "rcs").write_text("75\n75\n75\n")
+        self.run_boot()
+        rec = self.record(); self.assertEqual((rec["result"], rec["attempts"]), ("held", "0"))
+
+    def test_status_75_from_a_rollback_that_changed_the_state_is_an_attempt_that_failed(self):
+        self.make_journal("starting"); (self.journal / "rcs").write_text("75\n0\n")
+        (self.journal / "touch").write_text(str(self.journal / "state-marker"))
+        # the fake recover rewrites the state file as a running rollback would
+        (self.journal / "recover").write_text(FAKE_RECOVER.replace('exit "$rc"', 'echo "x=1" >> "$dir/state"\nexit "$rc"'))
+        out = self.run_boot()
+        self.assertEqual(self.calls_made(), ["rollback"], "no retry in this boot")
+        rec = self.record()
+        self.assertEqual((rec["result"], rec["rc"], rec["attempts"]), ("failed", "75", "1"))
+        self.assertIn("changed the journal state", rec["reason"]); self.assertNotIn("HELD", out.stdout)
+
+    def test_the_attempt_is_flushed_to_disk_before_the_run(self):
+        self.make_journal("starting")
+        synclog = self.base / "sync.log"
+        stubs = self.stub_dir("sync", f'echo "$*" >> "{synclog}"\necho "attempts=$(sed -n s/^attempts=//p "{self.dir}/boot-recovery")" >> "{synclog}"\nexit 0\n')
+        env = self.env(); env["PATH"] = f"{stubs}:{env['PATH']}"
+        result = subprocess.run(["/bin/bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = synclog.read_text().splitlines()
+        self.assertEqual(lines[0], f"-- {self.dir}/boot-recovery {self.dir}"); self.assertEqual(lines[1], "attempts=1", "the record was written before the sync")
+
+    def test_the_timed_out_reasons(self):
+        self.make_journal("starting"); (self.journal / "rc").write_text("137"); self.run_boot()
+        self.assertIn("was killed", self.record()["reason"])
+        shutil.rmtree(self.journal); (self.dir / "boot-recovery").unlink(); self.make_journal("starting"); (self.journal / "rc").write_text("124"); self.run_boot()
+        self.assertIn("did not finish within", self.record()["reason"])
 
 
 class UnitAndInventory(unittest.TestCase):

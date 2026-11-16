@@ -2409,7 +2409,10 @@ sure, it HOLDS: it runs nothing, changes nothing, writes down why, and leaves th
 **The limit.** The service runs `recover rollback` at most 3 times for the same journal, whatever
 the phase (after a failed rollback, 2 times). Every run counts, also one that hung, was killed by
 the 28-minute limit or by a power loss, or ended with the journal in the same phase. A lock that
-stays busy is not a run. The cleanup of a finished or abandoned restore has the same limit of 3.
+stays busy is not a run: status 75 counts as a busy lock only when the journal's `state` file is
+unchanged by the call (compared by checksum); if the call changed it, the run counts and its result is
+`failed`, with no second try in that boot. If `boot-recovery` exists and is not a regular file (a
+directory, a link), the limit counts as reached and the service holds. The cleanup of a finished or abandoned restore has the same limit of 3.
 After the limit the service HOLDS at every boot and never runs it again for that journal. That means
 the system stays AS IT IS: possibly with the application and data folders half swapped and the
 services stopped. Nothing then starts it by itself. Run
@@ -2420,10 +2423,13 @@ procedure above. A new restore has a new journal and starts again from zero.
 To turn the automatic rollback off, set `VESSELSTACK_RESTORE_AT_BOOT="hold"` in `vesselstack.env`
 and rerun the installer. The installer writes the choice to `/etc/vesselstack-recovery.conf`
 (`MODE=rollback` or `MODE=hold`), which the service reads at boot (it is read as text and never run).
-The file must have exactly one `MODE=` line with the value `rollback` or `hold` (one pair of quotes
-around it is fine if you edit it by hand). A missing file, or one without a `MODE=` line, means
-`rollback`. Any other value, more than one `MODE=` line, or a file that is not a regular file means
-`hold`, and the log says why.
+The file must contain exactly one `MODE=rollback` or `MODE=hold` line (uppercase `MODE`, no spaces
+around `=`; one pair of quotes around the value, a trailing ` # comment`, blank lines and lines
+starting with `#` are fine if you edit it by hand). A missing file means `rollback`. An unrecognised
+or empty file means `hold`: no `MODE=` line, another key, `mode=` in lower case, `export`, spaces
+around `=`, more than one `MODE=` line, another value, a file that cannot be read or is not a regular
+file. The log says why. The installer writes the file with a comment at the top and flushes it to disk
+before it replaces the old one.
 
 A restore runs the installer of the backup, with the settings of the backup. If those settings do
 not contain `VESSELSTACK_RESTORE_AT_BOOT`, a release that knows the setting writes `MODE=rollback`
@@ -2439,7 +2445,8 @@ the times and the reason) and `boot-recovery.log` (everything the rollback print
 acts starts the log afresh; a run that finds a journal written in the running boot only adds one
 line to it. The starting of a new restore deletes the `boot-recovery` record of an earlier one (not
 the log). The attempt is written down BEFORE the rollback starts, so a hang or a reboot loop still
-counts. See the outcome with:
+counts, and it is flushed to disk (`sync`) before the rollback starts. A result `timed-out` means
+the rollback ran past the time limit or was killed (by the limit or by the system). See the outcome with:
 
 ```bash
 sudo vesselstackctl status
