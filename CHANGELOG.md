@@ -3,6 +3,88 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Displays
+
+- The alarm banner on a display now comes back for every new alarm. Before, a banner you had
+  tapped away stayed away when one alarm cleared and another raised in the same update. The
+  display now follows the `seq` counter that the bridge has published since 0.9.0.
+- A Wi-Fi or MQTT blip no longer brings a dismissed banner back. While the link is down the
+  banner stays hidden; when it returns with the same alarms, nothing is raised again.
+- When the data of every alarm has stopped, the banner says `NO DATA` (or `2 NO DATA`) instead of
+  `ALARM`. With at least one live alarm it still says `ALARM` or `ALARMS`.
+- An alarm a display has seen no longer disappears when the data or the bridge is lost. The banner
+  now says `NO DATA`, with the name of the last known alarm, when the summary is stale or the bridge
+  is lost. This reverses the earlier rule that the banner is hidden when the link is lost. Tap it
+  to dismiss it like any other banner. Losing the link does not switch the page or undo a tap.
+  A display that boots while the bridge is down still gets the stored alarm summary from the
+  broker. If it is an alarm, the display switches to the alarm page and shows plain `NO DATA` with
+  the first alarm's name until you tap it, and again after every reboot while the broker holds that
+  summary. It shows nothing only when the broker holds no summary. Start the bridge to replace a
+  summary left by a bridge that is no longer running.
+- A display now treats the bridge as lost when it has not heard `online` for
+  `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5), not
+  only when the bridge says `offline`. Before, a bridge that hung with its connection up left the
+  header dot green and the tiles trusted. Tiles show `--` and the bridge dot turns red. The 15 s
+  margin covers a bridge that is blocked for about 13 s in a connection attempt. The alarm summary
+  and the clock use the same limit. The banner is redrawn as soon as `online` arrives, and a bridge
+  that hangs for 49.7 days can no longer look live again when the millisecond counter wraps.
+- The bridge now also saves the alarms that are live, not only the lost ones, in `state.json` (the
+  existing key `latched` is unchanged, and a new optional key `live` is added). If the bridge is
+  killed (or the Pi loses power) while an alarm is live, it restarts with that alarm as lost, so
+  displays show `NO DATA` instead of hiding the banner. When the data returns in alarm the alarm is
+  live again and `seq` does not change, so a dismissed banner stays dismissed and the page does not
+  switch; when it returns without an alarm it clears. The file is written only when the live set,
+  the lost set or `seq` change, not on every heartbeat. This replaces the known limit in 0.9.0 that
+  a live alarm at the moment of a crash counts as new afterwards.
+- The bridge now writes `state.json` at most once every 5 s when the only change is that alarm ids
+  are removed (an alarm clears, or a live alarm becomes lost). A new alarm and every `seq` change
+  are still written at once, and a clean stop writes whatever is pending. If the bridge is killed
+  within 5 s of an alarm clearing, the file still lists that alarm; it comes back as lost and
+  clears with its first non-alarm reading. Set `hysteresis` on alarm thresholds of noisy values:
+  without it, a value that hovers at the threshold re-arms the banner and writes the file on every
+  rising crossing.
+- Notification and Home Assistant tiles now go to `--` after the same link limit as the bridge,
+  `max(3 × heartbeat_s, heartbeat_s + 15)` seconds (20 s with the example `heartbeat_s` of 5),
+  not after 3 × `heartbeat_s`. With a 1 s heartbeat they blanked after 3 s while the bridge can be
+  blocked for about 13 s. Instrument tiles are unchanged. `vesselstackctl display status` uses the
+  same limit before it says the bridge may not be running.
+- A display now compares the unit tag (`cu`) in each reading with the one it was built for. If you
+  change a unit, conversion or precision on the Pi, that tile shows `--` and the display logs one
+  warning, instead of a number under the old label. Reflash to get the number back.
+- A display now takes the night flag from the bridge clock only while the bridge is live, so a
+  display that reboots in daytime with the bridge down no longer dims. The clock and night mode
+  appear with the first clock message after the first `online`: up to about two heartbeats after a
+  display starts or reconnects, so a display that restarts at night can be at day brightness for
+  that time.
+- **Operational impact:** this release changes the bridge as well as the display firmware. The
+  normal update or installer applies the bridge change and restarts the bridge; the first restart
+  reads the existing `state.json` as before. Rebuild and reflash every display for the firmware
+  part. This firmware needs bridge 0.9.0 or later: an older bridge sends no heartbeat, so the
+  display would show `--` after the link limit. If you roll the Pi back below 0.9.0, reflash the
+  displays with the previous firmware. After you change a unit on the Pi, tiles show `--` until
+  you reflash. There is no change to `displays.json`. Displays you do not reflash keep the old
+  behaviour, and keep working with the new bridge. After a power cut or a bridge crash, an alarm
+  that was live comes back as lost. If its source never sends again (Signal K restarted with an
+  empty notification tree, or a Home Assistant entity that no longer exists), it stays `NO DATA`
+  with no time limit, and a tap dismisses it on that display only. To forget it, run
+  `sudo systemctl stop vesselstack-displays-bridge`, then
+  `sudo rm /opt/vesselstack-data/displays-bridge/state.json`, then
+  `sudo systemctl start vesselstack-displays-bridge`, in this order: a plain restart writes the
+  alarm back while stopping. This also forgets every other lost alarm, and `seq` restarts at a
+  random value, so every display re-arms its banner once.
+- **Verify:** `sudo vesselstackctl display build ID`, then `sudo vesselstackctl display flash ID`.
+  Raise an alarm, tap the banner away, then clear that alarm and raise another one: the banner
+  returns. During an alarm stop the bridge: within 20 s (with the example `heartbeat_s` of 5) the
+  banner says `NO DATA` and the tiles show `--`. Start the bridge: the alarm shows as `NO DATA`
+  until its data returns, then as `ALARM`, with no page switch. Check the bridge with
+  `sudo systemctl status vesselstack-displays-bridge`. The full list is in the Hardware bring-up
+  checklist in `docs/DISPLAYS.md`.
+- **Rollback:** `sudo vesselstackctl display flash ID --previous`, or reflash the previous build.
+  To roll the bridge back, install the previous VesselStack version. An older bridge ignores the
+  `live` key in `state.json`; a live alarm at the moment of a crash is then forgotten again.
+
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,

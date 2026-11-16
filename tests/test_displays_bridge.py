@@ -417,6 +417,7 @@ class StatePersistenceTests(unittest.TestCase):
         self.assertEqual(self.last(b.publisher)["na"], 3)
         b._set_signalk(bridge.SIGNALK_DISCONNECTED)
         b.has.source_state(False, b.clock())
+        b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S      # live -> lost adds no id: the write waits the interval
         b._publish_summary(b.clock())
         self.assertEqual(self.last(b.publisher)["nl"], 3)
 
@@ -425,7 +426,8 @@ class StatePersistenceTests(unittest.TestCase):
         self.alarm_everything(first)
         seq = first._alarm_seq
         self.assertEqual(self.state(), {"format": 1, "seq": seq, "latched": {
-            "instruments": ["sog"], "notifications": ["anchor"], "ha": ["high"]}})
+            "instruments": ["sog"], "notifications": ["anchor"], "ha": ["high"]},
+            "live": {"instruments": [], "notifications": [], "ha": []}})
         second, pub = self.make()
         self.assertEqual(second._alarm_seq, seq)
         second._publish_summary(second.clock())
@@ -465,8 +467,139 @@ class StatePersistenceTests(unittest.TestCase):
         second.handle_message(self.sog(10 * KN))
         self.assertNotIn("sog", self.last(pub)["lost"])
         self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": ["anchor"], "ha": ["high"]})
+        second.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S    # a second removal waits for the interval
         second.handle_message(note_delta(None))
         self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": [], "ha": ["high"]})
+
+    # -- a crash while an alarm is live: it comes back as lost, not as nothing and not as a new alarm ----
+    def live_alarm(self):
+        """A bridge with the instrument in live alarm (SignalK up), as it was just before a crash."""
+        first, pub = self.make()
+        first._set_signalk(bridge.SIGNALK_CONNECTED)
+        first.clock.now += 10
+        first.handle_message(self.sog(1 * KN))
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["na"], body["nl"], body["ids"]), ("alarm", 1, 0, ["sog"]))
+        return first, body["seq"]
+
+    def restart_after_crash(self):
+        first, seq = self.live_alarm()                    # no shutdown(): kill -9
+        second, pub = self.make()
+        second._publish_summary(second.clock())
+        return second, pub, seq
+
+    def test_a_live_alarm_is_written_with_the_counter_while_it_is_live(self):
+        first, seq = self.live_alarm()
+        self.assertEqual(self.state(), {"format": 1, "seq": seq,
+                                        "latched": {"instruments": [], "notifications": [], "ha": []},
+                                        "live": {"instruments": ["sog"], "notifications": [], "ha": []}})
+
+    def test_a_crash_with_a_live_alarm_restarts_it_as_lost_with_the_same_seq(self):          # case a
+        second, pub, seq = self.restart_after_crash()
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["na"], body["nl"], body["lost"], body["seq"]),
+                         ("alarm", 1, 1, ["sog"], seq))
+        self.assertEqual(second._alarm_seq, seq)
+
+    def test_the_restored_alarm_is_live_again_without_a_new_seq_when_its_data_returns_in_alarm(self):   # case b
+        second, pub, seq = self.restart_after_crash()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(1 * KN))
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["na"], body["nl"], body["ids"], body["seq"]), ("alarm", 1, 0, ["sog"], seq))
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        self.assertEqual(self.state()["latched"]["instruments"], [])
+
+    def test_the_restored_alarm_clears_when_its_data_returns_without_an_alarm(self):          # case c
+        second, pub, seq = self.restart_after_crash()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(10 * KN))
+        body = self.last(pub)
+        self.assertEqual((body["na"], body["nl"], body["seq"]), (0, 0, seq))
+        self.assertNotEqual(body["max"], "alarm")
+        self.assertEqual(self.state()["live"], {"instruments": [], "notifications": [], "ha": []})
+        self.assertEqual(self.state()["latched"], {"instruments": [], "notifications": [], "ha": []})
+
+    def test_a_new_alarm_after_the_restart_moves_the_seq_by_one(self):                          # case d
+        second, pub, seq = self.restart_after_crash()
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(note_delta({"state": "alarm"}))                    # B: not the restored A
+        self.assertEqual(self.last(pub)["seq"], (seq + 1) % 2 ** 32)
+        second.handle_message(self.sog(1 * KN))                                  # A returns: still not new
+        body = self.last(pub)
+        self.assertEqual((body["seq"], body["na"], body["nl"]), ((seq + 1) % 2 ** 32, 2, 0))
+
+    def test_a_second_crash_before_the_data_returns_still_remembers_the_alarm(self):
+        second, pub, seq = self.restart_after_crash()
+        self.assertEqual(self.state()["latched"]["instruments"], ["sog"])
+        third, pub3 = self.make()
+        third._publish_summary(third.clock())
+        self.assertEqual((self.last(pub3)["lost"], self.last(pub3)["seq"]), (["sog"], seq))
+
+    def test_a_clean_stop_with_a_live_alarm_keeps_it_lost_and_the_seq(self):                   # case e
+        first, seq = self.live_alarm()
+        first.shutdown()
+        self.assertEqual(self.state()["latched"]["instruments"], ["sog"])
+        self.assertEqual(self.state()["live"]["instruments"], [])
+        second, pub = self.make()
+        second._publish_summary(second.clock())
+        body = self.last(pub)
+        self.assertEqual((body["na"], body["nl"], body["seq"]), (1, 1, seq))
+
+    def test_the_state_is_written_when_the_live_set_changes_and_not_on_every_tick(self):
+        b, _ = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b.handle_message(self.sog(10 * KN))
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            for _ in range(5):
+                b._tick()
+                b.clock.now += 1
+            self.assertEqual(write.call_count, 0)
+            b.handle_message(self.sog(1 * KN))                  # live set changes (seq moves too): one write
+            self.assertEqual(write.call_count, 1)
+            for _ in range(5):
+                b._tick()
+                b.handle_message(self.sog(1 * KN))
+            self.assertEqual(write.call_count, 1)
+            b.handle_message(self.sog(10 * KN))                 # live set changes back: a removal, held back
+            self.assertEqual(write.call_count, 1)
+            b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S
+            b._tick()                                           # ... and written once the interval has passed
+            self.assertEqual(write.call_count, 2)
+
+    def test_a_file_without_the_live_key_loads_as_before(self):                                 # case f
+        old = {"format": 1, "seq": 77, "latched": {"instruments": ["sog"], "notifications": [], "ha": []}}
+        with open(self.file, "w", encoding="utf-8") as handle:
+            json.dump(old, handle)
+        b, pub = self.make()
+        b._publish_summary(b.clock())
+        body = self.last(pub)
+        self.assertEqual((body["seq"], body["lost"], body["nl"]), (77, ["sog"], 1))
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b.handle_message(self.sog(1 * KN))                       # the next change writes the new layout
+        self.assertEqual(self.state()["live"], {"instruments": ["sog"], "notifications": [], "ha": []})
+
+    def test_unknown_keys_are_ignored_and_a_malformed_live_key_is_treated_as_corrupt(self):
+        newer = {"format": 1, "seq": 9, "latched": {}, "live": {"instruments": ["sog"]}, "future": {"x": 1}}
+        with open(self.file, "w", encoding="utf-8") as handle:
+            json.dump(newer, handle)
+        b, pub = self.make()
+        b._publish_summary(b.clock())
+        self.assertEqual((self.last(pub)["seq"], self.last(pub)["lost"]), (9, ["sog"]))
+        for live in ([], {"ha": [1]}, {"ha": "x"}, "x"):
+            self.assert_ignored_and_overwritten(json.dumps({"format": 1, "seq": 1, "latched": {}, "live": live}))
+
+    def test_an_older_bridge_reads_the_new_file(self):
+        """The previous parser looked only at format, seq and latched: extra keys cannot break it."""
+        first, seq = self.live_alarm()
+        data = self.state()
+        self.assertEqual((data["format"], data["seq"], sorted(data["latched"])),
+                         (1, seq, ["ha", "instruments", "notifications"]))
 
     def test_ids_no_longer_configured_or_no_longer_counted_are_dropped_on_load(self):
         first, _ = self.make()
@@ -484,7 +617,8 @@ class StatePersistenceTests(unittest.TestCase):
         b._publish_summary(b.clock())
         self.assertEqual(self.last(pub)["nl"], 0)
         self.assertEqual(self.state(), {"format": 1, "seq": b._alarm_seq,
-                                        "latched": {"instruments": [], "notifications": [], "ha": []}})
+                                        "latched": {"instruments": [], "notifications": [], "ha": []},
+                                        "live": {"instruments": [], "notifications": [], "ha": []}})
 
     def assert_ignored_and_overwritten(self, content):
         with open(self.file, "w", encoding="utf-8") as handle:
@@ -556,6 +690,92 @@ class StatePersistenceTests(unittest.TestCase):
             self.assertEqual(write.call_count, 1)
             b.handle_message(note_delta({"state": "alarm"}))
             self.assertEqual(write.call_count, 1)
+
+    # -- write-rate bound: only removals are coalesced -----------------------------
+    def coalescing_bridge(self):
+        """A bridge whose file already holds the live instrument alarm; returns it with the write spy's patcher."""
+        b, _ = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b.handle_message(self.sog(1 * KN))
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        return b
+
+    def test_a_removal_is_not_written_before_the_interval_and_is_written_after_it(self):
+        b = self.coalescing_bridge()
+        seq = b._alarm_seq
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            b.handle_message(self.sog(10 * KN))                 # the alarm clears: removal only
+            self.assertEqual(write.call_count, 0)
+            self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+            b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S - 1
+            b._tick()
+            self.assertEqual(write.call_count, 0)
+            b.clock.now += 2
+            b._tick()
+            self.assertEqual(write.call_count, 1)
+            b._tick()
+            b.clock.now += 1
+            b._tick()
+            self.assertEqual(write.call_count, 1)
+        self.assertEqual(self.state()["live"]["instruments"], [])
+        self.assertEqual(self.state()["seq"], seq)
+
+    def test_a_new_id_during_a_pending_removal_writes_at_once_and_the_file_equals_the_state(self):
+        b = self.coalescing_bridge()
+        b.has.source_state(True, b.clock())
+        b.handle_message(self.sog(10 * KN))                     # pending removal of sog
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        b.has.set_state("binary_sensor.high_water", "HIGH", "t", b.clock())     # a new id
+        b._publish_summary(b.clock())
+        data = self.state()
+        self.assertEqual(data["live"], {"instruments": [], "notifications": [], "ha": ["high"]})
+        self.assertEqual(data["seq"], b._alarm_seq)
+
+    def test_a_seq_increase_writes_at_once(self):
+        b = self.coalescing_bridge()
+        b.handle_message(self.sog(10 * KN))                     # pending removal
+        before = self.state()["seq"]
+        b.handle_message(self.sog(1 * KN))                      # the same id re-appears: seq moves
+        self.assertNotEqual(b._alarm_seq, before)
+        self.assertEqual(self.state()["seq"], b._alarm_seq)
+
+    def test_shutdown_flushes_a_pending_removal(self):
+        b = self.coalescing_bridge()
+        b.handle_message(self.sog(10 * KN))
+        self.assertEqual(self.state()["live"]["instruments"], ["sog"])
+        b.shutdown()
+        self.assertEqual(self.state()["live"]["instruments"], [])
+
+    def test_ten_oscillations_in_one_interval_write_the_ten_rising_crossings_and_one_removal(self):
+        b, _ = self.make()
+        b._set_signalk(bridge.SIGNALK_CONNECTED)
+        b.clock.now += 10
+        b.handle_message(self.sog(10 * KN))                     # the initial file
+        with mock.patch.object(bridge.StateStore, "_write", wraps=b._store._write) as write:
+            for _ in range(10):
+                b.handle_message(self.sog(1 * KN))              # rising: seq moves, written at once
+                b.handle_message(self.sog(10 * KN))             # falling: coalesced
+            self.assertEqual(write.call_count, 10)
+            b.clock.now += bridge.STATE_MIN_WRITE_INTERVAL_S + 1
+            b._tick()
+            self.assertEqual(write.call_count, 11)
+        self.assertEqual(self.state()["live"]["instruments"], [])
+
+    def test_a_crash_with_a_pending_removal_restores_the_cleared_alarm_as_lost_and_the_next_reading_clears_it(self):
+        b = self.coalescing_bridge()
+        seq = b._alarm_seq
+        b.handle_message(self.sog(10 * KN))                     # cleared in memory, still in the file; then kill -9
+        second, pub = self.make()
+        second._publish_summary(second.clock())
+        body = self.last(pub)
+        self.assertEqual((body["max"], body["nl"], body["lost"], body["seq"]), ("alarm", 1, ["sog"], seq))
+        second._set_signalk(bridge.SIGNALK_CONNECTED)
+        second.clock.now += 10
+        second.handle_message(self.sog(10 * KN))                # the first non-alarm reading
+        self.assertEqual(self.last(pub).get("seq"), seq)
+        self.assertEqual(self.last(pub).get("nl", 0), 0)
+        self.assertEqual(second._alarm_seq, seq)
 
     def test_the_file_is_private_and_no_temporary_file_is_left(self):
         b, _ = self.make()

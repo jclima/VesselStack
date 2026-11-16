@@ -10,6 +10,7 @@ import math
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -25,6 +26,7 @@ import lifecycle  # noqa: E402
 import mqtt_auth  # noqa: E402
 import render  # noqa: E402
 import schema  # noqa: E402
+import topics  # noqa: E402
 
 GOLDEN = ROOT / "tests" / "fixtures" / "displays" / "golden"
 EXAMPLE = json.loads((ROOT / "displays" / "displays.example.json").read_text())
@@ -248,6 +250,51 @@ class Base(unittest.TestCase):
         return json.loads(self.secrets_path.read_text())
 
 
+def font_advances(data: bytes) -> dict:
+    """unitsPerEm and the advance width of every character the cmap (format 4) maps, from hmtx."""
+    count = struct.unpack_from(">H", data, 4)[0]
+    tables = {}
+    for i in range(count):
+        tag, _csum, offset, length = struct.unpack_from(">4sIII", data, 12 + 16 * i)
+        tables[tag] = (offset, length)
+    units = struct.unpack_from(">H", data, tables[b"head"][0] + 18)[0]
+    n_metrics = struct.unpack_from(">H", data, tables[b"hhea"][0] + 34)[0]
+    hmtx = tables[b"hmtx"][0]
+
+    def advance(gid):
+        return struct.unpack_from(">H", data, hmtx + 4 * min(gid, n_metrics - 1))[0]
+
+    cmap = tables[b"cmap"][0]
+    base = None
+    for i in range(struct.unpack_from(">H", data, cmap + 2)[0]):
+        platform, encoding, off = struct.unpack_from(">HHI", data, cmap + 4 + 8 * i)
+        if (platform, encoding) == (3, 1):
+            base = cmap + off
+    segx2 = struct.unpack_from(">H", data, base + 6)[0]
+    segs = segx2 // 2
+    ends = struct.unpack_from(f">{segs}H", data, base + 14)
+    starts = struct.unpack_from(f">{segs}H", data, base + 16 + segx2)
+    deltas = struct.unpack_from(f">{segs}h", data, base + 16 + 2 * segx2)
+    range_pos = base + 16 + 3 * segx2
+    ranges = struct.unpack_from(f">{segs}H", data, range_pos)
+
+    def gid_of(code):
+        for s in range(segs):
+            if starts[s] <= code <= ends[s]:
+                if ranges[s] == 0:
+                    return (code + deltas[s]) & 0xFFFF
+                gid = struct.unpack_from(">H", data, range_pos + 2 * s + ranges[s] + 2 * (code - starts[s]))[0]
+                return (gid + deltas[s]) & 0xFFFF if gid else 0
+        return 0
+
+    by_char = {}
+    for ch in render.BANNER_GLYPHS:
+        gid = gid_of(ord(ch))
+        assert gid, ch
+        by_char[ch] = advance(gid)
+    return {"units_per_em": units, "by_char": by_char}
+
+
 class GoldenAndDeterminism(Base):
     def check_golden(self, name, text):
         path = GOLDEN / name
@@ -452,17 +499,20 @@ class StatusGrid(Base):
         # the gated severity is used, so stale/unknown/disconnected can only ever read "--"
         branch = text.split("id(ins_anchor_sev) : 0) == 1;")[0].splitlines()[-1]
         for gate in ("id(bridge_online)", "mqtt::global_mqtt_client->is_connected()", "id(ins_anchor_ok)",
-                     "(millis() - id(ins_anchor_seen)) < 15000UL"):
+                     "(millis() - id(ins_anchor_seen)) < 20000UL"):
             self.assertIn(gate, branch)
 
-    def test_notification_gate_is_three_heartbeats(self):
+    def test_notification_gate_is_the_bridge_link_limit(self):
         def mutate(cfg):
             cfg["heartbeat_s"] = 7
             for inst in cfg["instruments"].values():
                 inst["stale_after_s"] = 14
         text = self.status_device(mutate=mutate)
-        self.assertIn("(millis() - id(ins_anchor_seen)) < 21000UL", text)
-        self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", 5), 15000)
+        self.assertIn("(millis() - id(ins_anchor_seen)) < 22000UL", text)   # max(3 x 7, 7 + 15) s
+        for beats in (1, 5, 7):
+            self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", beats),
+                             render.summary_stale_ms(beats))
+        self.assertEqual(render.item_limit_ms({"notifications": {"n": {}}, "instruments": {}}, "n", 5), 20000)
         self.assertIn("id(ins_sog_seen)) < 28000UL", text)  # instruments keep stale_after_s + 2 heartbeats
 
     def test_notification_message_handler_and_globals(self):
@@ -656,12 +706,20 @@ class AlarmTakeover(Base):
 
     def test_edge_detection_staleness_and_dismissal(self):
         text = self.alarm_device()
-        self.assertIn("bool rising = m == 3 && (id(summary_max) != 3 || na > id(summary_na));", text)
-        self.assertIn("(millis() - id(summary_seen)) < 15000UL", text)   # 3 x heartbeat_s (5 s)
+        self.assertIn("bool rising = vs_alarm_rising(!id(summary_valid), m, na, has_seq, seq, "
+                      "id(summary_has_seq), id(summary_seq), id(summary_max), id(summary_na));", text)
+        self.assertIn('bool has_seq = x["seq"].is<uint32_t>();', text)
+        self.assertNotIn("id(summary_max) = 0;", text)   # a stale summary keeps the last known state
+        self.assertNotIn("id(summary_na) = 0;", text)
+        self.assertIn("(millis() - id(summary_seen)) < 20000UL", text)   # max(3 x heartbeat_s, heartbeat_s + 15 s) = 20 s
         show = re.search(r"bool show = (.*);", text).group(1)
-        for guard in ("seen", "id(bridge_online)", "mqtt::global_mqtt_client->is_connected()",
-                      "id(summary_max) == 3", "!id(alarm_dismissed)"):
-            self.assertIn(guard, show)
+        self.assertTrue(show.startswith("mode != VS_BANNER_HIDDEN"), show)
+        mode = re.search(r"int mode = (.*);", text).group(1)
+        self.assertTrue(mode.startswith("vs_banner_mode(id(summary_valid), fresh, link, "), mode)
+        for guard in ("id(summary_max)", "id(summary_na)", "id(summary_nl)", "id(alarm_dismissed)"):
+            self.assertIn(guard, mode)
+        self.assertIn(f"bool link = {render._link_expr(5)};", text)
+        self.assertIn("bool fresh = (millis() - id(summary_seen)) < 20000UL;", text)
         self.assertIn("on_click:\n            - lambda: 'id(alarm_dismissed) = true;'", text)
         self.assertNotIn("mqtt.publish", text)
 
@@ -670,7 +728,7 @@ class AlarmTakeover(Base):
             cfg["heartbeat_s"] = 7
             for inst in cfg["instruments"].values():
                 inst["stale_after_s"] = 14
-        self.assertIn("< 21000UL;", self.alarm_device(mutate).split("id: render_alarm")[1][:400])
+        self.assertIn("< 22000UL;", self.alarm_device(mutate).split("id: render_alarm")[1][:400])
 
     def test_hostile_labels_stay_literal_and_out_of_lambdas(self):
         hostile = {"anchor": '$x ${y} "q" \\ #:', "depth": "<% 1+1 %>"}
@@ -686,8 +744,13 @@ class AlarmTakeover(Base):
         for label in hostile.values():
             self.assertNotIn(label, inside)
         # the only composed text is the count and the two fixed words
-        composed = next(l for l in text.splitlines() if "snprintf" in l)
-        self.assertEqual(re.findall(r'"(ALARMS?)"', composed), ["ALARM", "ALARMS"])
+        self.assertIn("vs_banner_count(buf, sizeof(buf), mode, id(summary_na));", text)
+        self.assertIn('int nl = x["nl"] | 0;', text)
+        self.assertIn("id(summary_nl)", text)
+        header = "\n".join(l for l in (ROOT / "displays" / "esphome" / "app" / "vesselstack_logic.h").read_text().splitlines()
+                           if not l.lstrip().startswith("//"))
+        self.assertEqual(re.findall(r'"([^"]*(?:ALARMS?|NO DATA))"', header),
+                         ["NO DATA", "NO DATA", "%d%s NO DATA", "ALARM", "ALARMS"])
 
     def test_banner_glyphs_cover_the_fixed_text_and_labels(self):
         text = self.alarm_device()
@@ -696,9 +759,29 @@ class AlarmTakeover(Base):
         banner = json.loads(re.search(r"id: font_banner\n    size: 48\n    bpp: 4\n    glyphs: !literal (\".*\")",
                                       text).group(1))
         self.assertTrue(set("0123456789+ ALARMS") <= set(banner))
+        self.assertTrue(set("NO DATA") <= set(banner))
+        self.assertEqual(set(render.BANNER_GLYPHS), set("0123456789+ ") | set("ALARMS") | set("NO DATA"))
         name = json.loads(re.search(r"id: font_banner_name\n    size: 28\n    bpp: 4\n    glyphs: !literal (\".*\")",
                                     text).group(1))
         self.assertTrue(set("SOGDepthAWAHouseAnchorLow batteryBilge") <= set(name))
+
+    def test_banner_count_lines_fit_the_banner_width(self):
+        """The widest count lines, measured from the bold font's advance widths at the banner size."""
+        data = (render.FONTS_DIR / render.FONT_FILES["bold"]).read_bytes()
+        advances = font_advances(data)
+        scale = render.FONT_SIZES["banner"] / advances["units_per_em"]
+
+        def width(text):
+            return sum(advances["by_char"][ch] for ch in text) * scale
+
+        text = self.alarm_device()
+        # the banner is board.content_width wide with pad_all 4 on both sides; labels fill the inside
+        self.assertIn(f"width: {REGISTRY['boards'][BOARD]['content_width']}\n          height: {render.BANNER_HEIGHT}", text)
+        self.assertIn("pad_all: 4", text.split("          id: alarm_banner\n")[1][:400])
+        for name, board in REGISTRY["boards"].items():
+            usable = board["content_width"] - 2 * 4
+            for line in ("99+ NO DATA", "99+ ALARMS"):
+                self.assertLessEqual(width(line), usable, f"{line} on {name}: {width(line):.1f} > {usable}")
 
     def test_unsupported_label_glyph_is_still_reported(self):
         def mutate(cfg):
@@ -922,8 +1005,8 @@ class DashboardUi(Base):
         self.assertIn("if (h > 23 || m > 59) { h = -1; m = -1; }", handler)
         script = text.split("id: render_header")[1].split("\n  - id:")[0].split("\ninterval:")[0]
         self.assertIn('snprintf(buf, sizeof(buf), "%02d:%02d", hm / 60, hm % 60);', script)
-        self.assertIn("(millis() - id(clock_seen)) < 15000UL", script)
-        self.assertIn("bool online = id(bridge_online) && mq;", script)
+        self.assertIn("(millis() - id(clock_seen)) < 20000UL", script)
+        self.assertIn(f"bool online = {render._link_expr(5)};", script)
         self.assertEqual(script.count("lv_label_set_text("), 3)
         self.assertNotIn("hm)", script.replace("hm / 60", "").replace("hm % 60", "").replace(
             "(hm != id", "").replace("hm < 0", "").replace("hm =", ""))
@@ -937,7 +1020,7 @@ class DashboardUi(Base):
             for inst in cfg["instruments"].values():
                 inst["stale_after_s"] = 30
         self.set_config(mutate)
-        self.assertIn("< 21000UL", self.device(allow_missing_wifi=True).split("id: render_header")[1][:600])
+        self.assertIn("< 22000UL", self.device(allow_missing_wifi=True).split("id: render_header")[1][:600])
 
     def test_dots_are_good_only_when_everything_behind_them_is(self):
         script = self.ui_device().split("id: render_header")[1].split("\n  - id:")[0]
@@ -2046,7 +2129,7 @@ class Content(Base):
 
     def test_tile_blanks_unless_bridge_online_connected_and_ok(self):
         text = self.device()
-        self.assertIn("id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_sog_ok)", text)
+        self.assertIn(f"{render._link_expr(5)} && id(ins_sog_ok)", text)
         self.assertIn("on_disconnect:\n    - lambda: 'id(bridge_online) = false;'", text)
         self.assertIn('strcmp(st, "ok") == 0', text)
         self.assertNotIn('x["age"]', text)
@@ -2128,7 +2211,7 @@ class BuildDirectory(Base):
         names = {p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file()}
         self.assertEqual(names, {
             "helm.yaml", "secrets.yaml", "README.txt", f"boards/{BOARD}.yaml",
-            "app/vesselstack.yaml", "fonts/OFL.txt", "fonts/RobotoCondensed-Bold.ttf",
+            "app/vesselstack.yaml", "app/vesselstack_logic.h", "fonts/OFL.txt", "fonts/RobotoCondensed-Bold.ttf",
             "fonts/RobotoCondensed-Regular.ttf"})
 
     def test_rerender_keeps_previous_build(self):
@@ -2222,6 +2305,195 @@ class BuildDirectory(Base):
     def test_unknown_display(self):
         with self.assertRaises(lifecycle.LifecycleError):
             render.render(self.ctx(), "ghost", allow_missing_wifi=True)
+
+
+class BridgeLink(Base):
+    """The bridge is live only while it keeps saying so (S5), and what depends on it (S3, S6)."""
+
+    BARE = re.compile(r"id\(bridge_online\)")
+
+    def configs(self):
+        out = {}
+        for name, mutate in (("example", None), ("alarm", alarm_takeover), ("ui", dashboard_ui),
+                             ("gauges", lambda c: gauge_pages(c, header=True, night=True)),
+                             ("electrical", lambda c: electrical_pages(c, header=True, night=True)),
+                             ("ha", ha_dashboard)):
+            self.set_config(mutate)
+            out[name] = self.device(allow_missing_wifi=True)
+        return out
+
+    def test_the_link_expression_is_one_helper_and_its_limit_is_the_summary_staleness(self):
+        for beats in (1, 5, 7, 30):
+            expr = render._link_expr(beats)
+            self.assertIn(f"(millis() - id(bridge_seen)) < {render.summary_stale_ms(beats)}UL", expr)
+            self.assertEqual(render.summary_stale_ms(beats), max(3 * beats, beats + 15) * 1000)
+        # the bridge's loop can block ~13 s in a connection attempt: a short heartbeat keeps a 15 s margin
+        self.assertEqual([render.summary_stale_ms(b) for b in (1, 5, 7, 30)], [16000, 20000, 22000, 90000])
+        for beats in (1, 5, 7, 30):
+            expr = render._link_expr(beats)
+            self.assertIn("mqtt::global_mqtt_client->is_connected()", expr)
+            self.assertTrue(expr.startswith("(id(bridge_online) && ") and expr.endswith(")"))
+
+    def test_no_bare_use_of_bridge_online_outside_the_helper_and_its_handlers(self):
+        for name, text in self.configs().items():
+            expr = render._link_expr(5)
+            rest = text.replace(expr, "LINK")
+            for line in rest.splitlines():
+                if self.BARE.search(line):
+                    self.assertTrue(
+                        "{id: bridge_online," in line
+                        or 'id(bridge_online) = (x == "online");' in line
+                        or "if (id(bridge_online)) id(bridge_seen) = millis();" in line
+                        or "id(bridge_online) = false;" in line, (name, line))
+        source = (ROOT / "displays" / "render.py").read_text()
+        for line in source.splitlines():
+            if "id(bridge_online)" in line:
+                self.assertTrue(line.lstrip().startswith(('return (f"(id(bridge_online)', "'            id(bridge_online)",
+                                                          "\"            if (id(bridge_online))",
+                                                          "'  - {id: bridge_online", "\"        - lambda: |-")) or
+                                "id(bridge_online) = false" in line
+                                or line.lstrip().startswith('f"          if (id(bridge_online) && (millis()'), line)
+
+    def test_a_hung_bridge_cannot_look_live_again_after_the_millis_wrap(self):
+        for name, text in self.configs().items():
+            interval = text.split("\ninterval:\n")[1]
+            first = interval.split("- script.execute: render_tiles")[0]
+            self.assertIn("if (id(bridge_online) && (millis() - id(bridge_seen)) >= 20000UL) "
+                          "id(bridge_online) = false;", first, name)
+            self.assertIn('  - {id: bridge_online, type: bool, initial_value: "false"}', text)
+
+    def test_the_status_handler_refreshes_the_banner_only_where_there_is_one(self):
+        for name, text in self.configs().items():
+            handler = text.split("topic: vesselstack/v1/bridge/status")[1].split("  on_json_message:")[0]
+            has_banner = "  - id: render_alarm" in text
+            self.assertEqual("- script.execute: render_alarm" in handler, has_banner, name)
+            if has_banner:
+                self.assertLess(handler.index("render_tiles"), handler.index("render_alarm"))
+        self.assertTrue(any("  - id: render_alarm" in t for t in self.configs().values()))
+
+    def test_the_handler_stamps_seen_only_for_online(self):
+        text = self.device()
+        handler = text.split("topic: vesselstack/v1/bridge/status")[1].split("  on_json_message:")[0]
+        self.assertIn('id(bridge_online) = (x == "online");', handler)
+        self.assertIn("if (id(bridge_online)) id(bridge_seen) = millis();", handler)
+        self.assertIn("bridge_seen, type: uint32_t", text)
+        self.assertIn("on_disconnect:\n    - lambda: 'id(bridge_online) = false;'", text)
+
+    def test_every_gate_uses_the_helper_with_the_heartbeat_limit(self):
+        def mutate(cfg):
+            ha_dashboard(cfg)
+            cfg["heartbeat_s"] = 7
+            for inst in cfg["instruments"].values():
+                inst["stale_after_s"] = 14
+        self.set_config(mutate)
+        text = self.device(allow_missing_wifi=True)
+        expr = render._link_expr(7)
+        self.assertIn("< 22000UL", expr)
+        self.assertNotIn("id(bridge_seen)) < 15000UL", text)
+        for marker in ("bool fresh = " + expr, "bool online = " + expr, "bool link = " + expr,
+                       "if (!" + expr + ") return;"):
+            self.assertIn(marker, text)
+        self.assertGreater(text.count(expr), 8)
+
+    def test_the_clock_is_ignored_unless_the_link_is_live(self):
+        for name in ("ui", "ha"):
+            text = self.configs()[name]
+            clock = text.split("topic: vesselstack/v1/bridge/clock")[1].split("  on_disconnect:")[0]
+            first = clock.split("lambda: |-\n")[1].splitlines()[0].strip()
+            self.assertEqual(first, f"if (!{render._link_expr(5)}) return;")
+            self.assertLess(clock.index("return;"), clock.index('x["hm"]'))
+            self.assertLess(clock.index("return;"), clock.index("id(night_sched) = n"))
+
+    def test_the_banner_is_reevaluated_every_second(self):
+        text = self.configs()["alarm"]
+        interval = text.split("\ninterval:")[1]
+        self.assertIn("- interval: 1s", interval)
+        self.assertIn("- script.execute: render_alarm", interval.split("- interval:")[1])
+
+
+class UnitTagParity(Base):
+    """The unit tag built into the firmware equals the cu the bridge code publishes for the same item (S4)."""
+
+    FILES = ("displays.example.json", "displays.dashboard.example.json")
+
+    def published_tags(self, cfg):
+        """{topic: cu} from the bridge's own engines, driven directly (no MQTT)."""
+        tags = {}
+        engine = topics.Engine(cfg)
+        for topic, payload, _retain in engine.tick(0.0):
+            body = json.loads(payload)
+            self.assertIn("cu", body, topic)
+            tags[topic] = body["cu"]
+        if cfg.get("ha"):
+            for topic, payload, _retain in topics.HaEngine(cfg).tick(0.0):
+                body = json.loads(payload)
+                if "cu" in body:
+                    tags[topic] = body["cu"]
+        return tags
+
+    def embedded_tags(self, text):
+        """{topic: tag} from the generated handlers."""
+        tags = {}
+        for block in re.split(r"\n    - topic: ", text)[1:]:
+            topic = block.split("\n", 1)[0].strip()
+            found = re.findall(r'vs_unit_ok\(cu, "([^"]*)"\)', block)
+            if found:
+                self.assertEqual(len(found), 1, topic)
+                tags[topic] = found[0]
+        return tags
+
+    def check(self, cfg, label):
+        self.set_config(lambda c: (c.clear(), c.update(copy.deepcopy(cfg))))
+        text = self.device(allow_missing_wifi=True)
+        published = self.published_tags(cfg)
+        embedded = self.embedded_tags(text)
+        eff = render.effective_config(cfg)
+        used = render.used_instruments(eff["displays"]["helm"])
+        wanted = {render.item_topic(eff, iid) for iid in used if not render.is_word(eff, iid)}
+        self.assertTrue(wanted, label)
+        self.assertEqual(set(embedded), wanted, label)      # every number the display shows is checked
+        self.assertEqual({t: published[t] for t in embedded}, embedded, label)
+        for tag in embedded.values():
+            self.assertRegex(tag, r"^[0-9a-f]{8}$")
+        return embedded
+
+    def test_example_configs_and_a_home_assistant_numeric_item(self):
+        for name in self.FILES:
+            cfg = json.loads((ROOT / "displays" / name).read_text())
+            self.check(cfg, name)
+        ha = copy.deepcopy(EXAMPLE)
+        ha_dashboard(ha)
+        embedded = self.check(ha, "ha fixture")
+        self.assertEqual(embedded[topics.ha_topic("cabin_t")], topics.unit_tag("ha", "C", 1))
+        self.assertNotIn(topics.ha_topic("bilge_pump"), embedded)   # only numbers carry a unit
+        self.assertNotIn(topics.ha_topic("engine"), embedded)
+
+    def test_a_change_of_unit_conversion_or_precision_changes_the_tag(self):
+        base = copy.deepcopy(EXAMPLE)
+        before = self.check(base, "base")
+        for key, value in (("unit", "mph"), ("convert", "none"), ("precision", 3)):
+            cfg = copy.deepcopy(EXAMPLE)
+            cfg["instruments"]["sog"][key] = value
+            after = self.check(cfg, key)
+            self.assertNotEqual(after[topics.instrument_topic("sog")], before[topics.instrument_topic("sog")], key)
+            self.assertEqual({t: v for t, v in after.items() if t != topics.instrument_topic("sog")},
+                             {t: v for t, v in before.items() if t != topics.instrument_topic("sog")})
+
+    def test_handler_shape(self):
+        text = self.device()
+        handler = text.split("topic: " + topics.instrument_topic("sog"))[1].split("\n    - topic:")[0]
+        self.assertIn('const char *cu = x["cu"] | "";', handler)
+        self.assertIn('bool ok = strcmp(st, "ok") == 0 && x["v"].is<float>() && unit_ok;', handler)
+        self.assertEqual(handler.count("ESP_LOGW"), 1)
+        self.assertIn("if (!id(ins_sog_cuw))", handler)
+        self.assertIn("id(ins_sog_cuw) = false;", handler)
+
+    def test_the_alarm_summary_ignores_cu(self):
+        self.set_config(alarm_takeover)
+        text = self.device(allow_missing_wifi=True)
+        summary = text.split("topic: " + topics.ALARM_SUMMARY_TOPIC)[1].split("\n    - topic:")[0]
+        self.assertNotIn("unit_ok", summary)
+        self.assertNotIn('"cu"', summary)
 
 
 class AclConsistency(Base):
@@ -2744,8 +3016,8 @@ class HomeAssistantItems(Base):
         selector = [line for line in text.splitlines() if "ins_engine_k) >= -1" in line]
         self.assertTrue(selector)
         for line in selector:
-            self.assertIn("id(bridge_online) && mqtt::global_mqtt_client->is_connected() && id(ins_engine_ok)", line)
-            self.assertIn("< 15000UL", line)   # 3 x the example 5 s heartbeat
+            self.assertIn(f"{render._link_expr(5)} && id(ins_engine_ok)", line)
+            self.assertIn("< 20000UL", line)   # max(3 x 5, 5 + 15) s, the example heartbeat
 
     def test_severity_colours_use_the_guarded_mechanism_in_both_palettes(self):
         text = self.ha_device()

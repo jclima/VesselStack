@@ -96,7 +96,7 @@ published on connect, refreshed every `heartbeat_s` and set to `offline` on a cl
 MQTT allows one last will per connection and it is used for `bridge/status`, so after a
 crash or power loss this topic can still say `online` with an old `ts`: treat it as
 "last known" and judge freshness by `ts` (`vesselstackctl display status` reports it
-as stale after 3 x `heartbeat_s`). An owner's own flow that read the retained
+as stale after `max(3 x heartbeat_s, heartbeat_s + 15)` seconds). An owner's own flow that read the retained
 `bridge/status` must switch to `bridge/service` or listen for the heartbeat. Other
 `bridge/*` topics (`signalk`, `homeassistant`, `clock`) are unchanged and still retained.
 

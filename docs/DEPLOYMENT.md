@@ -512,6 +512,10 @@ values, and record the `doctor` result and data-directory size each day.
       (or **Put previous firmware back**). The previous image is only offered when it
       matches the restored settings and credentials. Confirm the screen shows the earlier pages.
 
+   8. Alarm banner and bridge link (displays built after 0.9.0): follow the alarm, bridge-loss,
+      unit-change and night steps in the [hardware bring-up checklist](DISPLAYS.md#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c).
+      They need a real display.
+
    Before downgrading below 0.6.2 run `sudo vesselstackctl display set-theme ID classic` for
    every themed display, otherwise the displays bridge exits with status 2.
 
