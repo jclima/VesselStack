@@ -2035,6 +2035,11 @@ extracted backup are flushed to disk before the first change, and each tree rena
 followed by a directory flush. After a power loss, the boat computer recovers a restore that was
 interrupted by itself at the next boot (see [Recovery at boot](#recovery-at-boot)).
 
+Before it moves anything, a restore or rollback builds the list of services to stop and checks
+that it is complete. If the list cannot be built in full, it stops and says "the list of units to
+stop could not be built; nothing was moved". Nothing is changed, so run the restore or
+`recover rollback` again.
+
 The `*.pre-restore-STAMP` trees are kept until you delete them (they hold the
 pre-restore config, secrets and databases, and are not covered by `uninstall
 --purge-data`). Verify the system first, then

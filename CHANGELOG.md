@@ -114,6 +114,9 @@ pre-release.
   hold a copy of your data, including secrets. `doctor` warns about them. Delete them yourself
   when you no longer need them. Finished, rolled-back and abandoned restores leave a small record
   under `/var/lib/vesselstack/restore` (the newest three of each are kept).
+- A restore or rollback now checks that the list of services it must stop is complete before it
+  moves any folder. If the list cannot be built in full, it stops with "the list of units to stop
+  could not be built; nothing was moved". Run it again.
 
 ### Displays and alarms
 
@@ -324,6 +327,15 @@ are pending. It is not marked Latest until the documented lab checks pass.
 
 ### For contributors
 
+- Restore: `restore_writer_units` used to print its list from a loop reading a process substitution,
+  and its callers read it through another one. Under bash 3.2 (macOS `/bin/bash`, which the Python
+  tests use) the child's exit sometimes interrupted the write, the loop saw an early end of file and
+  some units were neither stopped nor checked, silently. The list is now captured first and printed
+  afterwards. `restore_load_writer_units` accepts it only when it is non-empty and equals the known
+  units minus the firewall and SocketCAN, so `restore_stop_writers` and `restore_verify_stopped` fail
+  before anything is moved. The same capture-and-check is used for the other lists the restore, the
+  backup path check and `install.sh` rely on. Tests: 300 calls under load, and refusal for an empty,
+  short and half-printed list in the forward restore and the rollback.
 - Tests and CI: the background-restore test clean-up signalled the pids it read from `worker-*.pid`
   files, which tests fill with unrelated pids on purpose (`1`, the test runner); on Linux
   `killpg(1, ...)` is `kill(-1, ...)`, which killed every process of the user, the CI runner agent

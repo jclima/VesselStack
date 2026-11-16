@@ -1340,6 +1340,89 @@ check_restore_leftovers
         self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM "))], lay["calls"])
         self.assertTrue(lay["stage"].exists())
 
+    # ---- the list of units to stop: complete, or nothing is moved ----
+
+    BROKEN_UNIT_LISTS = {
+        "nothing": "restore_writer_units() { return 0; }",
+        "a short list": "restore_writer_units() { printf '%s\\n' vesselstack-chat.service vesselstack-alerts.service; }",
+        "a failure after part of the list": "restore_writer_units() { printf '%s\\n' vesselstack-chat.service vesselstack-alerts.service; return 1; }",
+        "no known units": "restore_known_units() { return 0; }",
+        "a duplicated unit": "restore_writer_units() { { restore_known_units | while IFS= read -r u; do restore_not_a_writer \"$u\" || printf '%s\\n' \"$u\"; done; } | sed '$d'; printf '%s\\n' vesselstack-chat.service; }",
+        "a failing known list": "restore_known_units() { printf '%s\\n' vesselstack-firewall.service vesselstack-chat.service; return 1; }",
+    }
+
+    def test_the_known_units_the_writers_are_built_from_are_the_expected_ones(self):
+        known = re.findall(r"vesselstack-[a-z-]+\.(?:service|timer)", helper_source().split("restore_known_units() {", 1)[1].split("}", 1)[0])
+        self.assertEqual(len(known), 16, known)
+        self.assertEqual(len(set(known)), 16)
+
+    def test_the_writer_units_come_out_complete_and_in_order_300_times_under_load(self):
+        # Regression: under bash 3.2 (macOS /bin/bash) a process substitution whose producer has a child of its own
+        # sometimes lost the end of its output when the child's exit interrupted the write. The list is now built before
+        # it is printed. Both the way the callers used to read it and a command substitution are checked.
+        body = helper_source().split("restore_known_units() {", 1)[1].split("\n}\n", 1)[0]
+        known = re.findall(r"vesselstack-[a-z-]+\.(?:service|timer)", body)
+        expected = "\n".join(u for u in known if u not in ("vesselstack-firewall.service", "vesselstack-socketcan.service"))
+        script = """
+for _ in 1 2 3 4; do ( while :; do :; done ) & done
+load=$(jobs -p)
+trap 'kill $load 2>/dev/null' EXIT
+want=@EXPECTED@
+bad=0
+for i in $(seq 1 300); do
+    got=$(restore_writer_units) || { bad=$((bad + 1)); continue; }
+    [ "$got" = "$want" ] || bad=$((bad + 1))
+    got=''
+    while IFS= read -r unit; do got="$got$unit"$'\\n'; done < <(restore_writer_units)
+    [ "${got%$'\\n'}" = "$want" ] || bad=$((bad + 1))
+done
+echo "bad=$bad"
+[ "$bad" -eq 0 ]
+""".replace("@EXPECTED@", "'" + expected + "'")
+        result = self.run_harness(transaction_source() + script, Path(tempfile.gettempdir()))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_unit_list_check_accepts_the_real_list_and_refuses_every_broken_one(self):
+        script = """
+restore_load_writer_units && echo "real:${#restore_writer_list[@]}"
+@BREAK@
+if restore_load_writer_units; then echo accepted; else echo "refused:${#restore_writer_list[@]}"; fi
+"""
+        real = self.run_harness(transaction_source() + script.replace("@BREAK@", ""), Path(tempfile.gettempdir()))
+        self.assertEqual(real.stdout.splitlines()[0], "real:14", real.stdout + real.stderr)
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            result = self.run_harness(transaction_source() + script.replace("@BREAK@", override), Path(tempfile.gettempdir()))
+            self.assertEqual(result.stdout.splitlines()[-1], "refused:0", f"{name}: {result.stdout}{result.stderr}")
+
+    def test_the_forward_restore_aborts_before_any_move_when_the_unit_list_cannot_be_built(self):
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            with self.subTest(name):
+                td, result, root, data = self.run_transaction("success", pre=override); self.addCleanup(td.cleanup)
+                self.assertNotEqual(result.returncode, 0)
+                calls = self.log.read_text().splitlines()
+                self.assertFalse([c for c in calls if c.startswith("MV ") and "restore/current" not in c], calls)
+                self.assertFalse([c for c in calls if c.startswith("systemctl stop")], calls)
+                self.assertIn("the list of units to stop could not be built; nothing was moved", result.stderr)
+                self.assertTrue((root / "old").exists()); self.assertTrue((data / "old").exists())
+                self.assertEqual(phase_of(self.archived("rolled-back")), "rolled-back")
+
+    def test_the_rollback_refuses_when_the_unit_list_cannot_be_built(self):
+        for name, override in self.BROKEN_UNIT_LISTS.items():
+            with self.subTest(name):
+                lay = self.layout("root-swap", "swapped", "swapped", False)
+                lay["active"].write_text("vesselstack-chat.service\n")
+                self.reconcile(lay, extra="export LOG_RM=1\n" + override)
+                result = lay["result"]
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(phase_of(lay["journal"]), "rollback-failed")
+                self.assertEqual(state_value(lay["journal"], "last_error_kind"), "retry")
+                self.assertIn("the list of units to stop could not be built; nothing was moved", result.stderr)
+                self.assertIn("could not be built; nothing was moved. Run the recovery again: sudo ", result.stderr)
+                self.assertIn("/recover rollback", result.stderr)
+                self.assertNotIn("Fix the cause above", result.stderr)
+                self.assertEqual((lay["root"] / "marker").read_text(), "new-root"); self.assertEqual((lay["data"] / "marker").read_text(), "new-data")
+                self.assertFalse([c for c in lay["calls"] if c.startswith(("MV ", "RM ", "systemctl stop"))], lay["calls"])
+
     # ---- fixes 2, 3 and 5: what must not be running before a tree moves ----
 
     def containers(self, lay, *lines):
@@ -2800,6 +2883,39 @@ echo "returned"
         self.assertNotIn("lifecycle lock", result.stderr, result.stdout + result.stderr)
         self.assertNotIn("a restore is unfinished", result.stderr)
         self.assertIn("Recovering an unfinished restore (phase: prepared)", result.stdout, result.stdout + result.stderr)
+
+    def test_an_unreadable_core_component_list_only_warns_and_the_recovery_status_still_works(self):
+        # The journal's controller can run from a restored or damaged tree: a registry that exists but cannot run
+        # (exits non-zero, or prints nothing) falls back to the built-in list with one warning, never stops the command.
+        for name, source in (("fails", "import sys\nsys.exit(3)\n"), ("prints nothing", "pass\n")):
+            with self.subTest(name):
+                helper = RestoreTransactionTests(); self.addCleanup(helper.doCleanups)
+                lay = helper.layout("prepared")
+                base = lay["base"]
+                (base / "var/lib/vesselstack").mkdir(parents=True)
+                os.rename(base / "restore", base / "var/lib/vesselstack/restore")
+                journal = base / "var/lib/vesselstack/restore/current"
+                helper.set_state(journal, f"system_root={base}")
+                shutil.copy(CONTROLLER, journal / "controller"); (journal / "controller").chmod(0o700)
+                shutil.copy(LOCK_HELPER, journal / "lifecycle_lock.py")
+                recover = journal / "recover"; recover.write_text(helper.real_recover_wrapper()); recover.chmod(0o700)
+                (base / "opt/vesselstack/common").mkdir(parents=True, exist_ok=True)
+                registry = base / "opt/vesselstack/common/config_registry.py"
+                registry.write_text(source)
+                env = {k: v for k, v in os.environ.items() if k not in ("VESSELSTACK_LIFECYCLE_LOCK_FD", "VESSELSTACK_RESTORE_ID", "VESSELSTACK_ENV")}
+                fakebin = base / "fakebin"; fakebin.mkdir()
+                (fakebin / "id").write_text("#!/bin/sh\necho 0\n"); (fakebin / "id").chmod(0o755)
+                env.update(PATH=f"{fakebin}:{os.environ['PATH']}", VESSELSTACK_SYSTEM_ROOT=str(base))
+                status = subprocess.run([str(recover), "status"], capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertEqual(status.stderr.count("using the built-in list"), 1, status.stderr)
+                self.assertIn("could not read the list of core components from", status.stderr)
+                self.assertIn("prepared", status.stdout)
+                (base / "opt/vesselstack/config").mkdir(); (base / "opt/vesselstack/config/vesselstack.env").write_text(f"VESSELSTACK_DATA={base}/data\n")
+                version = subprocess.run(["bash", str(CONTROLLER), "version"], capture_output=True, text=True,
+                                         env=dict(env, VESSELSTACK_ROOT=str(base / "opt/vesselstack")), timeout=60)
+                self.assertEqual(version.returncode, 0, version.stdout + version.stderr)
+                self.assertEqual(version.stderr.count("using the built-in list"), 1, version.stderr)
 
 
 class RestoreWorkerTests(unittest.TestCase):
