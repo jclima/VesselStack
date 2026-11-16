@@ -3,6 +3,12 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Documentation
+
+- Reference text moved out of the README into the guides that cover it, leaving short summaries with links: the Control Panel sign-in details to `docs/CONTROL_PANEL.md` (Sign-in reference) and `docs/BOAT_CHAT.md`, the Grafana and Homepage first-run text to `docs/INSTALLATION.md`, Boat Chat unit, data-age and fuel-total notes to `docs/BOAT_CHAT.md`, the boat-profile notes to `docs/BOAT_PROFILE.md`, and the shared configuration contract and ShellCheck notes to `docs/DEVELOPMENT.md`. No behaviour changed.
+
 ## 0.9.0 - 2026-11-15
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,

@@ -91,8 +91,10 @@ network without it.
 | Build a new Pi | [Hardware bill of materials](docs/BOM.md), then [Installation](docs/INSTALLATION.md) |
 | Add VesselStack to an existing Pi | [Quick start](#quick-start-one-command-on-the-raspberry-pi), then [Getting started](docs/GETTING_STARTED.md) |
 | Do first boot, SSH and token steps | [Getting started](docs/GETTING_STARTED.md) |
-| Use or secure the Control Panel | [Control Panel](docs/CONTROL_PANEL.md) |
-| Set up Boat Chat, units and timezone | [Boat Chat setup](docs/BOAT_CHAT.md), providers in [Boat Chat providers](boat-chat/README.md) |
+| Use or secure the Control Panel, set a passphrase, pair a phone | [Control Panel](docs/CONTROL_PANEL.md), [sign-in reference](docs/CONTROL_PANEL.md#sign-in-reference) |
+| Find the Grafana dashboards or change the Homepage tiles | [Installation: Grafana](docs/INSTALLATION.md#grafana), [Homepage](docs/INSTALLATION.md#homepage-the-front-door) |
+| Describe the boat's engines, batteries and tanks | [Boat profile](docs/BOAT_PROFILE.md) |
+| Set up Boat Chat, units and timezone | [Boat Chat setup](docs/BOAT_CHAT.md) (also [Signal K units and data age](docs/BOAT_CHAT.md#signal-k-units-and-data-age)), providers in [Boat Chat providers](boat-chat/README.md) |
 | Reach dashboards from other devices | [Network access and security](docs/NETWORK.md) |
 | Manage MQTT accounts and access lists | [MQTT access control](docs/MQTT.md) |
 | Update, roll back, or install offline | [Updating](#updating), [Updating and offline install](docs/UPDATING.md) |
@@ -1219,20 +1221,10 @@ sudo grep '^GRAFANA_ADMIN_PASSWORD=' \
   /opt/vesselstack/config/vesselstack.env
 ```
 
-The installer provisions `VesselStack InfluxDB`, `VesselStack Prometheus`, the
-**VesselStack / VesselStack System Health** starter dashboard and the
-**VesselStack / VesselStack Boat Overview** dashboard. The Boat Overview reads
-the raw bucket (`INFLUXDB_RAW_BUCKET`, validated as 1 to 64 letters, digits,
-dots, hyphens or underscores because the name is written into its Flux queries)
-and shows batteries (voltage, current, state of charge), tank levels, engine
-(speed, temperature, oil pressure), navigation (speed and course over ground,
-depth) and environment (apparent wind, outside temperature, pressure), converted
-from Signal K's SI units to knots, degrees, degrees Celsius, bar and hectopascal.
-Panels read "No data yet" until the matching instrument reports. It
-deliberately has no position or map panel. Use these as the operational
-baseline, then add vessel dashboards for the Signal K paths available on the
-boat. Provisioned dashboards are editable in Grafana; keep
-reusable versions in the repository so reinstallations remain reproducible.
+The installer provisions the `VesselStack InfluxDB` and `VesselStack Prometheus` data sources, the
+**VesselStack System Health** starter dashboard and the **VesselStack Boat Overview** dashboard. What the
+Boat Overview shows, the `INFLUXDB_RAW_BUCKET` rule and how to extend the dashboards are in
+[Installation: Grafana](docs/INSTALLATION.md#grafana).
 
 ### Boat Chat
 
@@ -1249,185 +1241,37 @@ nothing to an external model.
 Settings, the admin code, API access rules, telemetry refresh, optional host metrics, timezone
 and units are in [Boat Chat setup](docs/BOAT_CHAT.md); providers are in
 [Boat Chat providers](boat-chat/README.md).
-`boat-chat/signalk_units.py` is the single table Boat Chat uses to convert Signal K SI values to its stored units and to label them, so a value and its unit always come from the same lookup (tests in `tests/test_signalk_units.py`). Live telemetry snapshots carry a unit for every numeric value (empty means unknown and is never guessed), and values whose reported unit disagrees with the expected one are left unconverted and listed under `unit_conflicts`. Boat Chat tells the model how old each live reading is and what time the question was asked: readings older than 10 minutes are presented as last known, with their age and local time, never as current, and a boat-clock check (against GPS time when available) warns when ages may be inaccurate. The freshness rule lives in `boat-chat/data_age.py`. Answers Boat Chat builds directly from telemetry (briefing, battery-voltage history, fuel usage, generic history) state the age or sample time of the values they print, say "no recent data" with the last known value and its age rather than "unavailable" for stale readings, distinguish "no data recorded" from "engines not running" for fuel use, and show 12 V voltage guidance only for banks whose readings fall between 9 and 16 V.
+
+How Boat Chat converts Signal K units, how it treats stale readings and what the answers state about data age are in
+[Boat Chat setup: Signal K units and data age](docs/BOAT_CHAT.md#signal-k-units-and-data-age).
 
 ### Control Panel
 
-The Control Panel is the browser page for looking after VesselStack. It listens on loopback by
-default (`http://127.0.0.1:8780` through an SSH tunnel); `sudo vesselstackctl panel-access
-lan|local` changes only that bind. Sign in with the token from
-`sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
-`CONTROL_PANEL_TOKEN=...` line works too.
+The Control Panel is the browser page for looking after VesselStack: status, backups, settings,
+updates and repairs. It listens on loopback by default (`http://127.0.0.1:8780` through an SSH
+tunnel); `sudo vesselstackctl panel-access lan|local` changes only that bind. Sign in with the token
+from `sudo grep '^CONTROL_PANEL_TOKEN=' /opt/vesselstack/config/control-panel.env`; pasting the whole
+`CONTROL_PANEL_TOKEN=...` line works too. **Limitation:** on plain HTTP (`panel-access lan`) the
+passphrase and device token cross the network unencrypted, so keep the SSH tunnel.
 
-**Boat Chat sign-in (unreleased):** Boat Chat accepts a separate crew passphrase (at least 8 characters) with
-remembered devices: `sudo vesselstackctl passphrase set chat` (or Boat Chat, Settings, Sign-in), `passphrase
-status|clear chat`, `devices list|revoke ID|revoke-all chat`. It stores `auth.json` (service user, 0600) in
-Boat Chat's state directory and loads the root-owned `common/vesselstack_auth.py` by path (readable by the
-service user; if it is missing, passphrase sign-in is simply off). The device token travels in
-`X-Boat-Chat-Device`; the passphrase grants access only, so settings still need the admin code, and the
-Access code and admin code are unchanged. Passphrase sign-in and device requests require a `Host` naming
-this machine (extra names via `BOAT_CHAT_ALLOWED_HOSTS`) and, for login, passphrase changes and device
-POSTs, a matching `Origin`. Panel and chat passphrases may not be equal (checked by the CLI and the panel).
-When root edits the chat store (CLI or Control Panel), the work runs in a child process that has dropped to the
-directory owner's uid/gid, so root never opens or chowns files in the service user's directory; store files
-must be regular, single-link files (symlinks and hard links are refused). Rollback: reinstalling the previous
-release restores the old behaviour; the store format is unchanged.
-Same brute-force limits as the panel, including the global pause anyone on the network can trigger (the
-access code still works). **Rollback:** reinstall the previous release; older versions ignore `auth.json`.
-**Verify:** `sudo vesselstackctl passphrase status chat` and a sign-in from a phone. See the
-[Boat Chat guide](docs/BOAT_CHAT.md).
-
-**Easier sign-in (unreleased):** choose a passphrase once with `sudo vesselstackctl passphrase set panel`
-(hidden prompt, at least 12 characters; `--stdin` reads one line for scripts and never takes it as an
-argument), or set it in the panel under Settings, Sign-in after unlocking with the token. The unlock
-screen then takes the passphrase, with **Remember this device (30 days)** (otherwise 12 hours). Settings
-lists signed-in devices with Revoke and Revoke all; `sudo vesselstackctl devices list|revoke ID|revoke-all`
-does the same on the boat, `passphrase status` shows the state and `passphrase clear panel` turns it
-off. Details: the browser holds a random 256-bit device token (local storage when remembered, session
-storage otherwise; no cookies) sent as `X-VesselStack-Device`; the boat keeps only its SHA-256 and a
-scrypt hash of the passphrase in `config/control-panel-auth.json` (root, 0600, written atomically; never
-commit it). The `X-VesselStack-Token` header keeps working unchanged for scripts and existing
-sessions, including while passphrase sign-in is paused by the brute-force limits (5 failures per
-address start a growing wait up to 15 minutes; over 20 failures in 15 minutes pause passphrase sign-in
-for 15 minutes). **Operational impact:** a new root-owned module `common/vesselstack_auth.py` is
-installed with the panel, nothing is migrated and passphrase sign-in stays off until you set one.
-Attempts are counted atomically when they arrive, and the panel now refuses any request whose `Host`
-header is not this machine (`127.0.0.1`, `localhost`, `[::1]`; with `panel-access lan` also the
-hostname, `hostname.local` and the current interface addresses, refreshed every 60 s), each with the
-panel port, answering `421`; add other names with `CONTROL_PANEL_ALLOWED_HOSTS` (comma separated,
-`name` or `name:port`) in `config/control-panel.env`. `/api/auth/login` and `/api/auth/passphrase`
-require an `Origin` matching `Host` whatever the credential. **Known trade-off:** the global pause means
-anyone on the network can trigger a 15-minute passphrase lockout; the token keeps working during it.
-**Limitation:** on plain HTTP (`panel-access lan`) the passphrase and device token cross the network
-unencrypted, so keep the SSH tunnel. **Lost passphrase or locked out:** unlock with the token or run
-`passphrase set panel` / `passphrase clear panel` on the boat. **Rollback:** reinstall the previous
-release; older versions ignore `control-panel-auth.json` and only the token works. **Verify:**
-`sudo vesselstackctl passphrase status` and a sign-in from a fresh browser. The full tour is in the
-[Control Panel guide](docs/CONTROL_PANEL.md).
-
-**Sign-in hardening (unreleased):** setting or changing a passphrase (panel or Boat Chat) also clears waiting pairing links. A Boat Chat admin device (`panel-link --for chat --admin`, or the panel pairing option) records a keyed marker of the admin code (`BOAT_CHAT_SETTINGS_TOKEN`; HMAC-SHA256 under a random key kept in the Boat Chat store, see the review follow-ups below) at pairing time and counts as admin only while that marker matches the current code; rotating or removing the code ends its admin rights (stale admin devices are pruned when the code is changed in Boat Chat settings), and without an admin code a device never overrides the loopback-only settings rule. Admin pairing is refused with a clear error while no admin code is set. Rollback: `sudo vesselstackctl devices revoke-all` and pair again.
-
-**Sign-in review follow-ups (unreleased):**
-- **Rotating a token signs out every device.** Changing `CONTROL_PANEL_TOKEN` (installer re-run with a new
-  value) revokes all Control Panel devices and pairing links; changing `BOAT_CHAT_ACCESS_TOKEN` (installer,
-  Boat Chat Settings, or the panel's Boat Chat settings) revokes all Boat Chat devices and pairing links;
-  changing `BOAT_CHAT_SETTINGS_TOKEN` (installer or Boat Chat Settings) ends every admin device (the
-  installer signs out all Boat Chat devices in that case). The installer prints what it did; the root
-  paths use the privilege-dropping helper for Boat Chat's store. If a revocation fails the rotation still
-  stands and a warning gives the manual command: `sudo vesselstackctl devices revoke-all [panel|chat]`.
-  Operational impact: after a rotation everyone signs in again (passphrase or pairing link).
-- **Unreadable sign-in stores fail closed.** Wrong types anywhere in `auth.json` / `control-panel-auth.json`
-  (for example `"devices": 5`) count as corruption: no passphrase, no devices, access code and token still
-  work, nothing is rewritten, and the panel/Boat Chat answer normally instead of a 500. Repair or delete the
-  file (`passphrase clear` cannot rewrite what it cannot read), then set the passphrase again.
-- **Boat Chat revoke rules.** Crew (access code or passphrase sign-in) can sign out only their own device;
-  signing out another device or everyone, and setting the very first passphrase, need the admin code or an
-  admin device (`vesselstackctl passphrase set chat` on the boat always works). The Sign-in page hides what
-  does not apply.
-- **Admin binding** is now HMAC-SHA256 of the admin code under a random 32-byte `binding_key` created on
-  first need in the Boat Chat store; the panel and `panel-link --admin` resolve the admin code exactly as
-  Boat Chat does (Settings-page override file first, then `config/boat-chat.env`). Admin devices paired
-  before this change carry the old format and read as non-admin: pair them again. Rollback: reinstall the
-  previous release (older versions ignore `binding_key`; old-format admin devices must be paired again).
-- **Throttle.** A successful sign-in no longer clears the address's backoff; it withdraws only its own
-  attempt, and an hour of quiet forgives old failures. Boat Chat listens on the LAN, so the global lockout
-  is a known trade-off: 21 bad attempts in 15 minutes from anywhere lock passphrase and pairing sign-in for
-  everyone for 15 minutes; the access code and admin code keep working, and restarting Boat Chat clears it.
-- Hardening: `vesselstackctl` runs the sign-in helper with `python3 -B -I`; Boat Chat pages send
-  `frame-ancestors 'none'` and `X-Frame-Options: DENY` (the panel already did; it now sends the header too).
-  Verify: `python3 -B -m unittest discover -s tests`, then rotate a token on a test boat and check
-  `sudo vesselstackctl devices list [chat]` is empty.
-
-**Passphrases at install time (unreleased):** `get-vesselstack.sh` asks, after a successful install or update
-and only on a real terminal without `--yes`/`--defaults`, "Set a Control Panel passphrase now? (recommended)",
-the same for a Boat Chat crew passphrase (hidden, typed twice, up to 3 tries, policy errors shown, Enter skips) and
-"Pair this phone/laptop with Boat Chat now?" (default no; prints `vesselstackctl panel-link --for chat`). Passphrases
-reach `vesselstackctl passphrase set SCOPE --stdin` on standard input only. With `--yes` or `--defaults` nothing is
-asked and the commands for later are printed; the final summary says how to sign in (passphrase if set, else
-`sudo vesselstackctl passphrase set panel` / `panel-link`) and keeps the token commands as a secondary fallback.
-The terminal wizard and browser wizard have optional passphrase fields; they hash with `common/vesselstack_auth.py`
-(scrypt) and write only `CONTROL_PANEL_PASSPHRASE_HASH` / `BOAT_CHAT_PASSPHRASE_HASH`. `install.sh` strictly validates
-the hash format before changing anything (refusing otherwise), imports each into its sign-in store (panel store as
-root; Boat Chat store through the privilege-dropping helper), then deletes the key from the env file; the hashes are
-never kept in `vesselstack.env` and are never printed. `vesselstackctl passphrase set-hash panel|chat` (hash on
-standard input) is the underlying command. The installer uses `set-hash ... --if-unset` and removes each key as soon as
-its own import is settled: it never overwrites a passphrase that is already stored (exit status 3, an "already set"
-notice, the key is scrubbed), and a failed import keeps only its own key for the next run. Rollback: `sudo vesselstackctl passphrase clear panel|chat`.
-
-**Pairing links and QR codes (unreleased):** `sudo vesselstackctl panel-link [--for panel|chat] [--admin]
-[--label TEXT]` prints a single-use link (`http://HOST:PORT/#pair=CODE`, `$(hostname).local` plus each IPv4
-address; the SSH-tunnel form when the service is loopback-only), the code as `XXXXX-XXXXX`, its expiry and a
-terminal QR code. The Control Panel offers the same under Settings, Sign-in, **Pair a phone**
-(`POST /api/auth/pairing`, authenticated, `Origin` required, returns the link, code, expiry and QR module
-matrix; the root panel changes the Boat Chat store only by running `common/vesselstack_authctl.py` as a fresh process with the Boat Chat service user's uid/gid and no supplementary groups, never by forking itself or writing in that directory; `/api/auth/passphrase` on both services is a compare-and-set and answers 409 "passphrase changed, try again" if the passphrase changed between the check and the write). Redemption is
-`POST /api/auth/pair` on both services (same `Origin`/`Host` rules and throttle as login). Codes are 10
-Crockford base32 characters, only their SHA-256 is stored, they are single use, last 10 minutes, at most 3 may
-wait per store, and a redeemed link always remembers the device for 30 days. `--admin` (Boat Chat only) makes
-an admin device that passes the admin-code checks. **Security notes:** the QR code is a credential for 10
-minutes, so show it only to the person pairing; the code travels in the URL fragment (never sent to the
-server or logged) and the page removes it from the address bar before doing anything else; the link is plain
-HTTP on the boat network. Requires the vendored `common/qrcodegen.py` (Nayuki, MIT; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). **Rollback:** reinstall the previous release; older
-versions ignore the `pairings` list and the extra file. **Verify:** `sudo vesselstackctl panel-link`, then scan
-it from a phone; `sudo vesselstackctl devices list [chat]` shows the new device.
-
-![Control Panel Home tab](docs/images/control-panel-home.png)
-
-- **Home** is status only: services running or stopped, the last backup and backup drive (read-only;
-  "unknown" when they cannot be read) and whether an update is known, with one **Back up now**
-  button (it asks for confirmation first, because a backup stops every service until it finishes) and the components below. Component cards offer Start, Stop, Restart and, in a **⋯**
-  menu, Disable.
-- **Settings** has a jump list, help for every field, Advanced sections that start collapsed,
-  inline field errors, and one save bar: **Save** writes the settings, **Apply** renders and installs
-  them (it does not recreate containers and restarts only the displays bridge; restart a component to use the new values).
-- **Updates** checks only when you press **Check for updates**, which contacts github.com. If an update does not finish, the Control Panel keeps showing "The update to X did not finish" (with the pre-update backup and its restore command when one was made) until an installation completes, and the Updates tab offers **Finish this update** to try again.
-- **Maintenance** holds Back up now, Start all, Restart all, Stop all, **Check setup**,
-  **Reinstall & start**, **Provision history** and **Restart Control Panel**.
-
-Stopping or interrupting actions ask first in an in-page dialog. If the connection drops the
-header shows Disconnected with **Retry now**; the page keeps retrying by itself while you are signed in
-(2, 4, 6 and 8 seconds, then every 15 seconds) and retries at once when the page becomes visible again or the
-browser comes back online. Rollback: restore the previous release from a
-backup as described under [Updating](#updating); stored settings keys are unchanged.
+Choose a passphrase once (`sudo vesselstackctl passphrase set panel`) or pair a phone with a link or
+QR code (`sudo vesselstackctl panel-link`); the token keeps working. Boat Chat has its own crew
+passphrase and pairing. Each step, its limits, rollback and verification are in the
+[Control Panel guide](docs/CONTROL_PANEL.md): [open the panel](docs/CONTROL_PANEL.md#open-the-panel),
+[sign in](docs/CONTROL_PANEL.md#sign-in) and [sign-in details, rollback and verification](docs/CONTROL_PANEL.md#sign-in-reference),
+[the five tabs](docs/CONTROL_PANEL.md#the-five-tabs), [updates](docs/CONTROL_PANEL.md#updates) and
+[when the panel cannot connect](docs/CONTROL_PANEL.md#when-the-panel-cannot-connect). Boat Chat sign-in is in
+[Boat Chat setup](docs/BOAT_CHAT.md#sign-in-with-a-crew-passphrase).
 
 ### Homepage (the front door)
 
 Open `http://HOST` (port 80) or `http://BOATNAME.local`. [Homepage](https://gethomepage.dev) shows one
-tile per enabled service: Boat Chat, Grafana, Home Assistant, Signal K, AIS, and, when the databases
-are published beyond loopback, InfluxDB and Prometheus. The Control Panel tile links only when
-`panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. A Displays tile
-appears when `DISPLAYS_ENABLE=true`. With `SIGNALK_MODE=existing` and a `SIGNALK_URL` on another
-computer, the Signal K tile links to that server (scheme, host and port only; no status dot). Links use
-`$(hostname).local` and follow the address you opened the page with. The Boat Chat and Control Panel tiles
-are plain links: each opens its own sign-in screen (passphrase or pairing link, see the sign-in sections
-below); the home page itself holds no sign-in and no secrets.
-
-The default Homepage uses VesselStack’s navy and teal palette, the bundled logo, your boat name,
-three tiles per row on wide screens, and a 24-hour clock. In **Control Panel → Settings → Homepage**,
-choose the light or dark palette, the boat name or VesselStack heading, the number of tiles per row,
-and a 24-hour, 12-hour, or hidden clock. **Save**, then **Apply**, and reload Homepage to see the result.
-The **Displays** tile opens that tab when the Control Panel is reachable on the boat network.
-
-For a manual configuration, the equivalent keys in `config/vesselstack.env` are `HOMEPAGE_THEME`
-(`dark` or `light`), `HOMEPAGE_COLUMNS` (`compact`, `standard`, or `wide`),
-`HOMEPAGE_HEADING` (`boat` or `brand`), and `HOMEPAGE_CLOCK` (`24h`, `12h`, or `hidden`).
-Run `sudo vesselstackctl homepage sync` after changing them manually. Restore the defaults by choosing
-dark, three tiles, the boat name, and the 24-hour clock in Settings.
-
-Tiles update automatically: `vesselstackctl homepage sync` runs at every start, on component
-add/remove, `lan` and `panel-access` changes, display enable and install/update. The rendered files in
-`config/homepage/` are overwritten each time and contain no passwords or tokens. Add your own tiles
-and bookmarks in `config/homepage-custom/services.yaml` and `bookmarks.yaml` (created once, never
-overwritten; an invalid file is skipped with a warning). The page accepts only the host names and
-addresses in `HOMEPAGE_ALLOWED_HOSTS` (managed; add more with `HOMEPAGE_ALLOWED_HOSTS_EXTRA`). The
-list is also refreshed at every boot by `vesselstack-homepage-refresh.service`
-(`sudo vesselstackctl homepage refresh`, which recreates the container only if the list changed), so
-IP access keeps working after a new DHCP lease; `BOATNAME.local` always works. IPv4 addresses only:
-IPv6 is not added.
-
-The `config/homepage*` folders are made world-readable (`0755`, files `0644`) so the container's
-service user can read them; they hold no secrets. The container runs with all capabilities dropped
-except `CHOWN`, `SETUID` and `SETGID`.
+tile per enabled service and follows the address you opened it with. The Control Panel tile links only
+when `panel-access` is `lan`; otherwise a note explains how to reach it through an SSH tunnel. Choose its
+palette, heading, tile layout and clock in **Control Panel → Settings → Homepage**; the manual keys are
+`HOMEPAGE_THEME`, `HOMEPAGE_COLUMNS`, `HOMEPAGE_HEADING` and `HOMEPAGE_CLOCK`, followed by
+`sudo vesselstackctl homepage sync`. Tiles, your own tiles and bookmarks, the allowed host names and the
+file permissions are in [Installation: Homepage](docs/INSTALLATION.md#homepage-the-front-door).
 
 **Heimdall was removed.** Updating removes the old Heimdall container and image and leaves `/opt/vesselstack-data/heimdall` for you to delete; see [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older).
 
@@ -2756,10 +2600,12 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="alarm-summary-and-takeover"></a>[Alarm summary and takeover](docs/DISPLAYS.md#alarm-summary-and-takeover)
 - <a id="automatic-telemetry-refresh"></a>[Automatic telemetry refresh](docs/BOAT_CHAT.md#automatic-telemetry-refresh)
 - <a id="board-registry-schema-2"></a>[Board registry schema 2](docs/DISPLAYS.md#board-registry-schema-2)
+- <a id="boat-equipment-profiles"></a>[Boat equipment profiles](docs/BOAT_PROFILE.md#how-boat-chat-uses-the-profile)
 - <a id="building-and-flashing-on-the-pi"></a>[Building and flashing on the Pi](docs/DISPLAYS.md#building-and-flashing-on-the-pi)
 - <a id="choose-your-path"></a>[Choose your path](#where-to-go-next)
 - <a id="configuration-and-validation"></a>[Configuration and validation](docs/DISPLAYS.md#configuration-and-validation)
 - <a id="current-development-improvements"></a>[Current development improvements](docs/DEVELOPMENT.md#current-development-improvements)
+- <a id="development-and-release-history"></a>[Development and release history](docs/DEVELOPMENT.md#historical-notes)
 - <a id="displays-bridge-service"></a>[Displays bridge service](docs/DISPLAYS.md#displays-bridge-service)
 - <a id="find-your-next-answer"></a>[Find your next answer](#where-to-go-next)
 - <a id="firmware-generate-build-and-flash"></a>[Firmware: generate, build and flash](docs/DISPLAYS.md#firmware-generate-build-and-flash)
@@ -2775,6 +2621,7 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="quick-start-for-an-internet-connected-pi"></a>[Quick start for an internet-connected Pi](#quick-start-one-command-on-the-raspberry-pi)
 - <a id="selective-core-component-lifecycle"></a>[Selective core component lifecycle](docs/DEVELOPMENT.md#selective-core-component-lifecycle)
 - <a id="settings-and-configuration-precedence"></a>[Settings and configuration precedence](docs/BOAT_CHAT.md#settings-and-configuration-precedence)
+- <a id="shared-configuration-contract"></a>[Shared configuration contract](docs/DEVELOPMENT.md#shared-configuration-contract)
 - <a id="shared-lifecycle-lock"></a>[Shared lifecycle lock](docs/DEVELOPMENT.md#shared-lifecycle-lock)
 - <a id="signalk-and-influxdb"></a>[SignalK and InfluxDB](#signal-k-and-influxdb)
 - <a id="signalk-not-running--eacces-on-packagejson"></a>[SignalK not running / EACCES on package.json](#signal-k-not-running--eacces-on-packagejson)
@@ -2787,38 +2634,3 @@ Earlier versions of this README held these sections. Old links to them land here
 - <a id="update-from-the-control-panel-057-lab-release"></a>[Update from the Control Panel (0.5.7 lab release)](#updating)
 - <a id="upgrading-to-060"></a>[Upgrading to 0.6.0](docs/UPDATING.md#upgrading-from-06x-or-older)
 - <a id="version-10-release-scope"></a>[Version 1.0 release scope](docs/DEVELOPMENT.md#version-10-release-scope-historical)
-
-## Development and release history
-
-Historical release scope and review-fix notes are kept in
-[Development: Historical notes](docs/DEVELOPMENT.md#historical-notes). Release notes are in `CHANGELOG.md`.
-
-Contributors: CI runs ShellCheck 0.9.0 from the Ubuntu package at info severity; a clean run of a newer
-local ShellCheck is not enough (see [Development](docs/DEVELOPMENT.md)).
-The shell scripts checked by `tests/test-distribution.sh` pass ShellCheck 0.9.0 and newer (verified on 0.11.0) with default options and no `-x`; the `A && B || C` patterns in `scripts/vesselstackctl` are written as `if ! { A && B; }; then C; fi`, and the few remaining suppressions carry a reason.
-
-### Boat equipment profiles
-
-Boat Chat reads the optional `config/boat-profile.json` on each request and
-telemetry-indexer run. The validated shared profile controls engine, battery
-bank, and fuel-tank paths and labels; a missing file uses the historical
-two-engine profile. A malformed file remains actionable in chat/settings while
-profile-dependent analytics are reported unavailable. Derived cache keys and
-power observations include the profile fingerprint, so changing equipment
-takes effect without a restart and never joins energy intervals across profiles.
-Paired port/starboard comparisons are only available for the exact legacy
-paths and capabilities; display labels and declaration order do not affect
-compatibility. Arbitrary profiles receive an explicit unsupported diagnostic.
-
-### Shared configuration contract
-
-The installation wizard and Control Panel use the data-only registry in
-`common/config_registry.py` for shared defaults, types, ranges, choices,
-ownership, and component mappings. The registry validates configuration without
-contacting services or reading secrets. Boat Chat endpoint resolution uses the
-saved state and an explicit `BOAT_CHAT_ENV` file when supplied; an empty port
-means the app default (8765), while an invalid explicit port is an error.
-Managed listener addresses are IPv4 values, and `BOAT_NAME` is limited to safe
-display characters.
-
-Boat Chat fuel totals require finite, non-negative values and complete channel coverage within the returned running observation minutes; missing RPM or rates are never treated as zero. Gaps or unreturned minutes in the requested window are not known zero. Incomplete windows report labeled observed partial consumption instead of an authoritative total. Power/solar integration retains source-timestamp provenance, excludes legacy or unverified observations, rejects stale/future/repeated/out-of-order samples, and does not bridge rejected gaps. Status cards and briefings use a 600-second source-age limit with 60 seconds of future tolerance. Legacy power history remains visible but cannot be retroactively verified without source timestamps.
