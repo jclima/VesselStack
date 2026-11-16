@@ -312,6 +312,10 @@ To turn off a feature without restoring, change its setting and rerun the instal
   the installed Tailscale reads keys from a file. HTTPS publishes the host name in Certificate
   Transparency logs.
 - Node-RED can run code: keep it on a trusted LAN or Tailscale.
+- Signal K and AIS-catcher do not move to newer versions when you update VesselStack. Their
+  versions (`SIGNALK_VERSION` and `AIS_IMAGE`) are saved in your settings file at first install
+  and kept. To move them, change the setting and rerun the installer. All other components
+  follow the release.
 
 ### Release status
 
@@ -320,6 +324,14 @@ are pending. It is not marked Latest until the documented lab checks pass.
 
 ### For contributors
 
+- Tests and CI: the background-restore test clean-up signalled the pids it read from `worker-*.pid`
+  files, which tests fill with unrelated pids on purpose (`1`, the test runner); on Linux
+  `killpg(1, ...)` is `kill(-1, ...)`, which killed every process of the user, the CI runner agent
+  included, so the Python step hung. The clean-up now signals only processes the test started: its own
+  `Popen` objects (each in a session of its own) and the workers its stub launcher recorded in a file
+  only the launcher writes, never pid or group 0 or 1, the test runner, its parent or their groups; a
+  regression test proves it. The shell tests guard their `kill` of a parent or process group the same
+  way. The "Run all Python regressions" step now has a 20 minute time limit.
 - Tests and CI: the optional Compose profiles check passes `--no-env-resolution`, the scripted
   wizard answers cover the alerts prompt, the fake npm container runs under `umask 022`, and
   `tests/test-nodered-dashboard-auth.sh` runs in the `service-integration` job (needs internet).

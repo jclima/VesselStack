@@ -177,6 +177,10 @@ setsid "$FIXTURE/launch-session.sh" "$FIXTURE" "${ARGS[@]}" </dev/null >/dev/nul
 disown $! 2>/dev/null || true
 wait_for 20 test -s "$FIXTURE/launch.rc" || fail "the launcher did not return within 20 s"
 LAUNCHER_PGID=$(cat "$FIXTURE/launcher.pid")
+# Only a group this test created: the launching session was started by setsid, so its pid is its own group id.
+# Never 0 or 1 (kill -- -1 signals every process of the user) and never the group of this script.
+[[ "$LAUNCHER_PGID" =~ ^[0-9]+$ && "$LAUNCHER_PGID" -gt 1 && "$LAUNCHER_PGID" != "$(ps -o pgid= -p $$ | tr -d ' ')" \
+    && "$(ps -o pgid= -p "$LAUNCHER_PGID" | tr -d ' ')" == "$LAUNCHER_PGID" ]] || { LAUNCHER_PGID=""; fail "the launching session is not a process group of its own"; }
 [[ "$(cat "$FIXTURE/launch.rc")" == 0 ]] || fail "launch failed: rc=$(cat "$FIXTURE/launch.rc") stderr=$(head -c 400 "$FIXTURE/launch.err")"
 wait_for 10 pid_file_ready || fail "the payload did not start"
 wait_for 5 main_pid_set || fail "the unit has no MainPID"

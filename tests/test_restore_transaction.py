@@ -3212,35 +3212,77 @@ cmd[0] = shutil.which("bash")
 def reset():
     for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, signal.SIG_DFL)
-subprocess.Popen(["/usr/bin/env", "-i", "PATH=" + os.environ["PATH"]] + ["VESSELSTACK_BOOT_ID_FILE=" + os.environ[name] for name in ("VESSELSTACK_BOOT_ID_FILE",) if name in os.environ] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+worker = subprocess.Popen(["/usr/bin/env", "-i", "PATH=" + os.environ["PATH"]] + ["VESSELSTACK_BOOT_ID_FILE=" + os.environ[name] for name in ("VESSELSTACK_BOOT_ID_FILE",) if name in os.environ] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                  stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, preexec_fn=reset)
+# The only record of the workers this launcher really started, written by nobody else: the test's clean-up signals
+# these and never a pid it reads from a worker-*.pid file (a file under test, which tests fill with unrelated pids).
+with open(os.path.join(base, "started-workers.log"), "a") as started:
+    started.write("%d %d\n" % (worker.pid, os.getpgid(worker.pid)))
 if mode == "start-then-fail":
     print("Failed to start transient service: simulated", file=sys.stderr)
     sys.exit(1)
 '''
 
+    def started_workers(self):
+        """(pid, pgid) of every worker the stub launcher started, from the file only the launcher writes."""
+        found = []
+        try:
+            lines = (self.base / "started-workers.log").read_text().splitlines()
+        except OSError:
+            return found
+        for line in lines:
+            try:
+                pid, pgid = (int(field) for field in line.split())
+            except ValueError:
+                continue
+            found.append((pid, pgid))
+        return found
+
+    def own_process(self, pid):
+        """True when `pid` is a live process that mentions this test's temp directory on its command line."""
+        try:
+            if sys.platform.startswith("linux"):
+                command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            else:
+                command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return str(self.base) in command
+
+    @staticmethod
+    def signal_ours(pid, group, sig=signal.SIGKILL):
+        """Last line of defence for every kill of this class. Never pid or group 0 or 1 (on Linux killpg(1, ...) is
+        kill(-1, ...), which kills every process of the user, the runner agent of a CI job included), never the test
+        runner, its parent or its own group. The callers pass only processes this test started itself."""
+        refused = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        if pid in refused or pid < 0:
+            return
+        try:
+            if group not in refused and group > 1:
+                os.killpg(group, sig)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
     def stop_everything(self):
-        """Nothing started by a test outlives it: every foreground and every worker, with its process group."""
+        """Nothing started by a test outlives it: every foreground and every worker, with its process group.
+
+        Only processes this test started are signalled: the Popen objects it holds (all started in a session of their
+        own, so the group is theirs) and the workers its stub launcher recorded. A worker-*.pid file is never read for
+        this: tests write unrelated pids into those on purpose."""
         try:
             (self.base / "release").write_text("")
         except OSError:
             pass
-        groups = []
         for proc in self.procs:
-            groups.append(proc.pid)
-            if proc.poll() is None:
-                proc.kill(); proc.wait()
-        for pidfile in self.restore_dir.glob("worker-*.pid") if self.restore_dir.exists() else []:
-            try:
-                groups.append(int(pidfile.read_text().split()[0]))
-            except (OSError, ValueError, IndexError):
-                pass
-        for group in groups:
-            for kill in (lambda: os.killpg(group, signal.SIGKILL), lambda: os.kill(group, signal.SIGKILL)):
-                try:
-                    kill()
-                except (OSError, ProcessLookupError):
-                    pass
+            self.signal_ours(proc.pid, proc.pid)  # its group is its own: it was started with start_new_session=True
+            proc.wait()
+        for pid, pgid in self.started_workers():
+            if self.own_process(pid):
+                self.signal_ours(pid, pgid)
 
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith("VESSELSTACK_")}
@@ -3640,8 +3682,8 @@ if mode == "start-then-fail":
         subprocess.run([sys.executable, "-I", str(self.journal / "restore_journal.py"), "set", str(self.journal), f"phase={phase}"], check=True)
 
     def unrelated_process(self):
-        proc = subprocess.Popen(["sleep", "120"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.procs.append(proc)
+        proc = subprocess.Popen(["sleep", "120"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.procs.append(proc)  # its own session: the clean-up may signal its group
         return proc
 
     def assert_not_running(self, label):
@@ -3805,6 +3847,27 @@ if mode == "start-then-fail":
         result = self.restore_dir / f"worker-{new_id}.rc"; result.write_text("3\n"); os.utime(result, (2_000_100, 2_000_100))
         rc, out, err = self.run_ctl("restore", "--status", "--follow", timeout=30)
         self.assertRegex(out.splitlines()[1], r"^The last restore that ran in the background failed \(exit status 3\) at ")
+
+    def test_cleanup_never_signals_a_pid_read_from_a_worker_pid_file(self):
+        """The clean-up once read worker-*.pid and killpg(1, SIGKILL) took down the whole CI runner. It must not signal
+        any pid a test planted there, nor 0/1, the test runner, its parent or any group of theirs, whatever else is written."""
+        self.restore_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        planted = {"1 -": "a" * 32, f"{os.getpid()} -": "b" * 32, f"{os.getppid()} {BOOT_ID}": "c" * 32, f"{os.getpgrp()}": "d" * 32}
+        for text, ident in planted.items():
+            (self.restore_dir / f"worker-{ident}.pid").write_text(text + "\n")
+        forbidden = {0, 1, os.getpid(), os.getppid(), os.getpgrp()}
+        calls = []
+        def record(kind):
+            return lambda target, sig: calls.append((kind, target, sig))
+        with mock.patch.object(os, "kill", record("kill")), mock.patch.object(os, "killpg", record("killpg")):
+            self.stop_everything()
+            self.assertEqual(calls, [], "the pid files were used to signal something")
+            # even a launcher record that names such pids (it never does) cannot make the clean-up signal them
+            (self.base / "started-workers.log").write_text("".join(f"{pid} {pgid}\n" for pid in forbidden for pgid in forbidden) + "junk\n")
+            with mock.patch.object(type(self), "own_process", lambda self, pid: True):
+                self.stop_everything()
+        self.assertEqual([call for call in calls if call[1] in forbidden or call[1] < 0], [], calls)
+        (self.base / "started-workers.log").unlink()
 
 if __name__ == "__main__":
     unittest.main()

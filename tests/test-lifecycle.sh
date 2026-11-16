@@ -289,7 +289,7 @@ install -d "$SYSTEM_ROOT/etc/vesselstack"
 printf 'UPDATE_KEY=one\n' > "$SYSTEM_ROOT/etc/vesselstack/update.env"
 # KILL_ON_INSTALLER lets a test kill the restore (the caller) at the moment the restored installer runs.
 # shellcheck disable=SC2016
-printf '#!/bin/bash\nif [ -n "${KILL_ON_INSTALLER:-}" ]; then kill -KILL "$PPID"; exit 137; fi\necho "$@" > "%s/installer-ran"\n' "$TEST_ROOT" > "$APP_ROOT/installer/install.sh"
+printf '#!/bin/bash\nif [ -n "${KILL_ON_INSTALLER:-}" ]; then [ "$PPID" -gt 1 ] && kill -KILL "$PPID"; exit 137; fi\necho "$@" > "%s/installer-ran"\n' "$TEST_ROOT" > "$APP_ROOT/installer/install.sh"
 chmod +x "$APP_ROOT/installer/install.sh"
 chown 1234:1234 "$DATA_ROOT/state.txt"
 
@@ -2147,9 +2147,9 @@ if [ -n "${KILL_AT:-}" ] && [ "${1:-}" = -T ]; then
         "$KILL_APP_ROOT"|"$KILL_DATA_ROOT"|*.pre-restore-*)
             n=$(( $(cat "$KILL_COUNT" 2>/dev/null || echo 0) + 1 ))
             echo "$n" > "$KILL_COUNT"
-            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = before ]; then kill -KILL "$PPID"; exit 137; fi
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = before ]; then [ "$PPID" -gt 1 ] && kill -KILL "$PPID"; exit 137; fi
             "$real_mv" "$@" || exit $?
-            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = after ]; then kill -KILL "$PPID"; exit 137; fi
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = after ]; then [ "$PPID" -gt 1 ] && kill -KILL "$PPID"; exit 137; fi
             exit 0 ;;
     esac
 fi
@@ -2172,9 +2172,9 @@ if [ -n "${KILL_AT:-}" ] && [ "${1:-}" = -I ] && [ "${3:-}" = rename ] && [ "$#"
             n=$(( $(cat "$KILL_COUNT" 2>/dev/null || echo 0) + 1 ))
             echo "$n" > "$KILL_COUNT"
             echo "rename $n: $4 -> $5" >> "$KILL_COUNT.log"
-            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = before ]; then kill -KILL "$PPID"; exit 137; fi
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = before ]; then [ "$PPID" -gt 1 ] && kill -KILL "$PPID"; exit 137; fi
             "$real_python3" "$@" || exit $?
-            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = after ]; then kill -KILL "$PPID"; exit 137; fi
+            if [ "$n" = "$KILL_AT" ] && [ "$KILL_WHEN" = after ]; then [ "$PPID" -gt 1 ] && kill -KILL "$PPID"; exit 137; fi
             exit 0 ;;
     esac
 fi

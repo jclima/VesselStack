@@ -765,7 +765,7 @@ nano vesselstack.env
 | `VESSELSTACK_DATA` | Persistent container-data path |
 | `VESSELSTACK_BACKUP` | Backup destination; must be outside the application and data trees |
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
-| `SIGNALK_VERSION` | Pinned Signal K release used by managed modes |
+| `SIGNALK_VERSION` | Pinned Signal K release used by managed modes. It and `AIS_IMAGE` are written to your settings file at first install and kept, so an update does not move Signal K or AIS-catcher by itself; to move them, change the setting and rerun the installer |
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |
 | `SIGNALK_DATAPATH_AUTOCONFIG` | Managed Docker/native modes install `signalk-to-influxdb2` 2.3.0, add the NMEA 2000 provider and write the plugin's InfluxDB configuration (default `true`, see [Signal K and InfluxDB](#signal-k-and-influxdb)); existing mode ignores it, and `false` skips without removing anything |
@@ -2756,6 +2756,10 @@ For the lifecycle/install boundary, also run `bash tests/test-clean-install.sh`
 and `bash tests/test-lifecycle.sh` in an isolated Linux container. Installer
 dry runs set `PYTHONDONTWRITEBYTECODE=1`, so validation does not create Python
 bytecode in the source or bundled runtime tree.
+
+CI runs the Python regressions with a 20 minute limit (`timeout-minutes: 20`), so a hanging test fails the job with a log instead of blocking it.
+
+Test clean-up only ever signals processes its own test started (never a pid read from a file under test, and never pid or process group 0 or 1, the runner or its parent).
 
 The test-mechanics notes (directory-listing and `tar -t` assertions, `tests/test-remote.sh`, the CI profile check, scripted wizard answers and reproducing CI on a Mac) are in [Development: Developer validation](docs/DEVELOPMENT.md#developer-validation).
 
