@@ -112,6 +112,21 @@ def load_env(path):
             values[key]=tokens[0] if tokens else ""
     return values
 
+# Older installers wrote the release default of their day into these two settings, so they never moved forward.
+OLD_PINNED_DEFAULTS={"SIGNALK_VERSION":"v2.27.0","AIS_IMAGE":"ghcr.io/jvde-github/ais-catcher:v0.70"}
+
+def blank_old_defaults(base):
+    """A base file without HOMEPAGE_VERSION predates the component version settings: an old pinned default
+    is not a choice, so it is cleared once (the same rule as install.sh). Otherwise the wizard would write
+    HOMEPAGE_VERSION next to the old value and the installer could no longer tell."""
+    if "HOMEPAGE_VERSION" in base: return base
+    base=dict(base)
+    for key,old in OLD_PINNED_DEFAULTS.items():
+        if base.get(key)==old:
+            print(f"Note: {key} now follows the release default (it was pinned at {old} by an older installer).",file=sys.stderr)
+            base[key]=""
+    return base
+
 def expand_lan_access(values):
     """Web API: replace the LAN_ACCESS pseudo-setting (see LAN_PRESETS, shared with the terminal
     wizard) by the real bind settings. The preset wins over explicit bind values; the control
@@ -734,7 +749,7 @@ def run_cli(console,values,facts):
 def cli_main(args):
     facts=detect_facts(); values=initial_values(facts)
     try:
-        if args.base: values=validate({**values,**load_env(args.base)})
+        if args.base: values=validate({**values,**blank_old_defaults(load_env(args.base))})
         apply_settings(values,args.set or [])
     except (OSError,ValueError) as exc: raise SystemExit(f"error: {exc}")
     output=Path(args.output).resolve() if args.output else OUTPUT

@@ -128,8 +128,22 @@ pre-release.
   follows the release default. A value is kept across updates. `SIGNALK_VERSION` and `AIS_IMAGE`
   are empty by default in `vesselstack.example.env`.
 - The installer, the setup wizard and the settings file checks accept only a numbered version of
-  the same major line the release uses. They refuse floating tags such as `latest`, and a setting
-  cannot name another registry. The check runs before anything is changed.
+  the same major line the release uses for the eight newer settings. They refuse floating tags such
+  as `latest`, and a setting cannot name another registry. `SIGNALK_VERSION` and `AIS_IMAGE` keep
+  the forms earlier releases accepted: a 2.x Signal K tag with or without `v` (used as written) and
+  any plain image reference, a moving tag or no tag included; `doctor` warns about a moving tag
+  and about an image that is not the release's. The check runs before anything is changed.
+- `sudo vesselstackctl start`, `restart` and `component add` refuse a version setting that cannot
+  be used (`Nothing was started. Fix or empty <SETTING> in <settings file>, then run the command
+  again.`), before anything is stopped. `status`, `doctor`, `component versions` and `stop` still
+  work and show the value as written.
+- The settings file is the only source of the ten settings. The Control Panel and
+  `vesselstackctl` drop an exported value, because Docker Compose would prefer it over the file;
+  without this, a Control Panel started before a change could put a container back on the old
+  image.
+- `doctor` advises rerunning the installer (not `restart`) for a container on another image than
+  configured, says when an overridden version is not on this computer yet, and warns more strongly
+  about an older override of a component that holds data.
 - A version other than the release default is not tested with this release.
 - Components that hold data can upgrade it one way, so make a backup first. Going back to an older
   version of such a component may need a restore of a backup made before the change.
@@ -270,7 +284,11 @@ pre-release.
 - On the first update to 0.9.0, a Signal K or AIS-catcher version that an older installer had
   written into your settings file (`v2.27.0`, `ghcr.io/jvde-github/ais-catcher:v0.70`) is cleared
   once, with one line telling you, so those components follow the release. They may move to this
-  release's version at that update. A value you chose yourself is kept.
+  release's version at that update. A value you chose yourself is kept. The decision is made from
+  the settings file, not from the environment. Earlier forms still work (`SIGNALK_VERSION` without
+  `v`, any plain `AIS_IMAGE`); only a value that cannot work is refused before anything changes:
+  a Signal K version that is not 2.x, spaces, quotes, `$` or uppercase in an image name, or a
+  name that starts with `-`.
 - A scheduled backup stops the whole stack while it runs. The backup drive needs room for
   `VESSELSTACK_BACKUP_KEEP` plus one archives.
 - Anything outside VesselStack that reads the retained `bridge/status` (for example a Node-RED

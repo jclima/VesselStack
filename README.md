@@ -183,9 +183,27 @@ default) and that component follows the release: it moves forward when you insta
 release. A version that is not the default is an override:
 
 - It is kept across updates, so it will not move forward with the release.
-- It is not tested with this release. The installer only accepts a fixed, numbered version of
-  the same line the release uses (for example Grafana 13.x); `latest` and similar names, other
-  registries and other image names are refused, with a message that names the setting.
+- It is not tested with this release. For the eight newer settings the installer only accepts a
+  fixed, numbered version of the same line the release uses (for example Grafana 13.x); `latest`
+  and similar names, other registries and other image names are refused, with a message that
+  names the setting. `SIGNALK_VERSION` and `AIS_IMAGE` keep the forms that earlier releases
+  accepted: a Signal K 2.x tag with or without the leading `v` (such as `2.27.0` or
+  `v2.28.0-beta.1`, used exactly as you wrote it), and any plain image reference for AIS-catcher,
+  including a name with no tag or a moving tag such as `edge` or `latest`. `doctor` warns when
+  AIS-catcher uses a moving tag (it can change without notice whenever the image is downloaded) or
+  an image that is not the one this release uses. Values with spaces, quotes, `$`, uppercase image
+  names, names that start with `-`, a Signal K version that is not 2.x, and references longer
+  than 255 characters are refused.
+- A value that cannot be used is never started. `sudo vesselstackctl start`, `restart` and
+  `component add` check all ten settings first and, if one is wrong, print its message and
+  `Nothing was started. Fix or empty <SETTING> in <settings file>, then run the command again.`
+  without stopping or starting anything. `status`, `doctor`, `component versions` and `stop` keep
+  working.
+- The settings file is the only source. The Control Panel and `vesselstackctl` ignore a
+  version setting that is exported in the environment they were started from, because Docker
+  Compose would otherwise prefer it over the file.
+- With Signal K installed natively (`SIGNALK_MODE=native`), an empty `SIGNALK_VERSION` also follows
+  the release: the installer installs that version of the npm package when it runs.
 - Components that hold data (Signal K, Home Assistant, InfluxDB, Grafana, Node-RED, Mosquitto)
   may upgrade their data one way. Make a backup first (`sudo vesselstackctl backup`).
 - To go back, empty the setting and run the installer again. Going back to an older version of a
@@ -200,10 +218,17 @@ sudo vesselstackctl component versions --json   # for tools
 
 For each component it shows the release default, your chosen version (or "release default"), the
 image that is running, and a state: `release default`, `override (newer)`, `override (older)`,
-`override`, or `running a different image than configured`. It works while Docker is down (the
+`override`, `invalid: nothing will start until fixed` (the value shown is what the file says, not
+the default) or `running a different image than configured`. It works while Docker is down (the
 running side then shows `unknown`) and while a restore is pending, and it changes nothing.
 `sudo vesselstackctl doctor` adds one warning per override and a failure when a running container
-does not match its setting; `sudo vesselstackctl status` adds one line when any component is not at
+does not match its setting. The drift advice is to rerun the installer, not `restart` (which
+stops everything before it looks for the image); the installer checks the setting first and,
+offline, that the image is already on the computer. When Docker answers, `doctor` also says if an
+overridden version is not on this computer yet (it must be downloaded before it can start). An
+override older than the release default for a component that holds data gets a stronger warning:
+its data may already have been upgraded, and the older version may not start or may damage it;
+restore a backup made with that version to go back. `sudo vesselstackctl status` adds one line when any component is not at
 the release default. Older installers wrote the Signal K and AIS-catcher defaults into the settings
 file; on the first update to a release with this feature those two values are cleared (and
 only those that equal an old default), so those components follow the release from then on.
@@ -816,8 +841,8 @@ nano vesselstack.env
 | `VESSELSTACK_DATA` | Persistent container-data path |
 | `VESSELSTACK_BACKUP` | Backup destination; must be outside the application and data trees |
 | `SIGNALK_MODE` | `existing`, `docker`, or `native` |
-| `SIGNALK_VERSION` | Signal K version used by managed modes. Leave empty to follow the release default (`v2.27.0`); a value such as `v2.28.0` keeps that version across updates. See "Component versions" |
-| `AIS_IMAGE` | Full AIS-catcher image reference, such as `ghcr.io/jvde-github/ais-catcher:v0.70`. Leave empty to follow the release default; a value keeps that image across updates |
+| `SIGNALK_VERSION` | Signal K version used by managed modes. Leave empty to follow the release default (`v2.27.0`); a 2.x value such as `v2.28.0` or `2.28.0` (used as written) keeps that version across updates. See "Component versions" |
+| `AIS_IMAGE` | Full AIS-catcher image reference, such as `ghcr.io/jvde-github/ais-catcher:v0.71`. Leave empty to follow the release default; a value keeps that image across updates. A moving tag (`edge`, `latest`) or no tag is accepted but `doctor` warns |
 | `NODERED_VERSION`, `HOMEASSISTANT_VERSION`, `INFLUXDB_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `NODE_EXPORTER_VERSION`, `MOSQUITTO_VERSION`, `HOMEPAGE_VERSION` | The version (image tag) of that container. Empty follows the release default; a value keeps that version across updates. See "Component versions" |
 | `SIGNALK_URL` | Existing Signal K endpoint |
 | `SIGNALK_VESSELTWIN_PRELOAD` | Managed Docker/native modes preload immutable `signalk-vesseltwin` 0.2.3 (default `true`); existing mode ignores it, and `false` skips without uninstalling |

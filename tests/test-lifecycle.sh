@@ -80,6 +80,10 @@ cat > "$FAKE_BIN/$command" <<'EOF'
 #!/bin/bash
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$(dirname "$0")/calls.log"
 [ -z "${FAKE_CALL_LOG:-}" ] || printf '%s %s\n' "$(basename "$0")" "$*" >> "$FAKE_CALL_LOG"
+# What a compose command would see in its process environment (Compose lets it win over --env-file).
+if [ "$(basename "$0")" = docker ] && [ "${1:-}" = compose ]; then
+    printf '%s\n' "${GRAFANA_VERSION-<unset>}" >> "$(dirname "$0")/compose-grafana-env.log"
+fi
 # The recovery asks for ActiveState: a unit is inactive unless a test keeps state and has not stopped it.
 if [ "$(basename "$0")" = systemctl ] && [ "${1:-}" = show ] && [ "${3:-}" = ActiveState ]; then
     if [ -n "${FAKE_SYSTEMCTL_STATE_DIR:-}" ] && [ ! -e "$FAKE_SYSTEMCTL_STATE_DIR/${!#}.stopped" ]; then echo active; else echo inactive; fi
@@ -1159,6 +1163,44 @@ cv_doctor=$(run_ctl doctor 2>&1 || true)
 grep -qF 'WARN Grafana 13.1.0 is set; the release default is 13.0.1. This version is not tested with this release.' <<<"$cv_doctor"
 unset FAKE_COMPONENT_INSPECT
 sed -i '/^GRAFANA_VERSION=/d' "$APP_ROOT/config/vesselstack.env"
+
+# Component version settings come from the settings file only. The Control Panel's environment holds the
+# values it started with and Compose lets the environment win over --env-file, so a value inherited from the
+# caller must never reach a compose command that can create a container (vesselstackctl start).
+for file_value in "" 13.1.0; do
+    sed -i '/^GRAFANA_VERSION=/d' "$APP_ROOT/config/vesselstack.env"
+    printf "GRAFANA_VERSION='%s'\n" "$file_value" >> "$APP_ROOT/config/vesselstack.env"
+    : > "$FAKE_BIN/compose-grafana-env.log"
+    GRAFANA_VERSION=13.9.9 FAKE_SYSTEMCTL_NOT_FOUND_UNITS="vesselstack-signalk.service vesselstack-socketcan.service" run_ctl start > "$TEST_ROOT/cv-start.out" 2>&1 || { cat "$TEST_ROOT/cv-start.out" >&2; echo 'vesselstackctl start failed in the inherited-environment check' >&2; exit 1; }
+    test -s "$FAKE_BIN/compose-grafana-env.log"
+    if grep -vqx '<unset>' "$FAKE_BIN/compose-grafana-env.log"; then
+        echo "vesselstackctl start passed an inherited GRAFANA_VERSION to compose (file value: '$file_value')" >&2
+        cat "$FAKE_BIN/compose-grafana-env.log" >&2
+        exit 1
+    fi
+done
+sed -i '/^GRAFANA_VERSION=/d' "$APP_ROOT/config/vesselstack.env"
+
+# A hand-edited value that cannot be used is refused before anything is started or stopped; reading commands still work.
+printf 'INFLUXDB_VERSION=latest\n' >> "$APP_ROOT/config/vesselstack.env"
+: > "$FAKE_BIN/calls.log"
+for refused in start restart "component add grafana"; do
+    # shellcheck disable=SC2086  # the command and its arguments are words on purpose
+    if refusal=$(run_ctl $refused 2>&1); then echo "vesselstackctl $refused accepted INFLUXDB_VERSION=latest" >&2; exit 1; fi
+    grep -qF "INFLUXDB_VERSION" <<<"$refusal"
+    grep -qF "Nothing was started. Fix or empty INFLUXDB_VERSION in $APP_ROOT/config/vesselstack.env, then run the command again." <<<"$refusal"
+done
+if grep -Eq 'docker compose.* (up|down|stop|rm)( |$)' "$FAKE_BIN/calls.log"; then
+    echo 'a refused command still changed containers' >&2; cat "$FAKE_BIN/calls.log" >&2; exit 1
+fi
+bad_table=$(run_ctl component versions)
+grep -q 'invalid: nothing will start until fixed' <<<"$bad_table"
+grep -q 'InfluxDB.*latest' <<<"$bad_table"
+bad_doctor=$(run_ctl doctor 2>&1 || true)
+grep -qF "WARN INFLUXDB_VERSION is set to 'latest', which cannot be used:" <<<"$bad_doctor"
+run_ctl status >/dev/null 2>&1 || true
+run_ctl stop >/dev/null
+sed -i '/^INFLUXDB_VERSION=/d' "$APP_ROOT/config/vesselstack.env"
 
 # An unfinished installation (config/install-in-progress) is reported by doctor, status and version.
 MARKER_SRC="$TEST_ROOT/marker-source"

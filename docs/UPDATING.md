@@ -393,7 +393,16 @@ with the new release. Check with `sudo vesselstackctl component versions`. To fo
 again, empty the setting and run the installer (a backup first, because a component that holds data
 may have upgraded it one way). The first update to a release that has these settings clears a
 Signal K or AIS-catcher version that an older installer wrote down, so they follow the release from
-then on; a value you chose yourself is kept. See "Component versions" in the README.
+then on; a value you chose yourself is kept. The old forms still work: a `SIGNALK_VERSION` such as
+`2.27.0` or `v2.28.0-beta.1`, and any plain `AIS_IMAGE` reference (a moving tag or no tag too, which
+`doctor` warns about). The update is refused before anything changes only for a value that
+cannot work: a `SIGNALK_VERSION` that is not a 2.x version, an `AIS_IMAGE` or component version
+with spaces, quotes, `$` or other unusual characters, an image name with uppercase letters or one
+that starts with `-`, and any of the eight newer settings set to a floating name such as `latest`.
+Each message names the setting; fix or empty it and run the installer again.
+The Control Panel and `vesselstackctl` read these settings from the file only, so a value left over
+in the environment of a running Control Panel cannot put a container back on an older image.
+See "Component versions" in the README.
 
 ## Rollback
 

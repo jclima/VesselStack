@@ -81,6 +81,13 @@ config_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }
 # Set below when an interactive run may offer to fix the value instead of stopping.
 FIX_BOAT_UNITS=0
 FIX_TOKEN_KEY=
+# The ten component version settings come from the settings file (and explicit installer options) only. An
+# exported variable would win over --env-file in Docker Compose and would also hide that a file predates the
+# feature, so a value inherited from the caller (for example the Control Panel) is dropped before sourcing.
+COMPONENT_VERSION_KEYS=(SIGNALK_VERSION AIS_IMAGE NODERED_VERSION HOMEASSISTANT_VERSION INFLUXDB_VERSION GRAFANA_VERSION
+                        PROMETHEUS_VERSION NODE_EXPORTER_VERSION MOSQUITTO_VERSION HOMEPAGE_VERSION)
+for component_key in "${COMPONENT_VERSION_KEYS[@]}"; do unset "$component_key"; done
+unset component_key
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
@@ -199,9 +206,8 @@ fi
 # settings never moved forward. An environment that does not carry the new settings yet predates
 # this behaviour: a value equal to a default that was ever shipped (v2.27.0, and
 # ghcr.io/jvde-github/ais-catcher:v0.70) is an old default, not a choice, and is cleared once.
-COMPONENT_VERSION_KEYS=(SIGNALK_VERSION AIS_IMAGE NODERED_VERSION HOMEASSISTANT_VERSION INFLUXDB_VERSION GRAFANA_VERSION
-                        PROMETHEUS_VERSION NODE_EXPORTER_VERSION MOSQUITTO_VERSION HOMEPAGE_VERSION)
-if [ -z "${HOMEPAGE_VERSION+x}" ]; then
+# The test is on the FILE (does it define HOMEPAGE_VERSION?), never on a variable that may be inherited.
+if ! config_key_assigned HOMEPAGE_VERSION; then
     if [ "${SIGNALK_VERSION:-}" = v2.27.0 ]; then
         echo "Signal K now follows the release default (was pinned at v2.27.0 by an older installer)." >&2
         SIGNALK_VERSION=""

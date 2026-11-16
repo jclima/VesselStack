@@ -1921,6 +1921,9 @@ printf 'SIGNALK_VERSION="v2.27.0"\n' >> "$CV_CONFIG"
 cv_install "$CV_CONFIG" --dry-run > "$TEST_ROOT/cv-old.out" 2>&1
 grep -qF 'Signal K now follows the release default (was pinned at v2.27.0 by an older installer)' "$TEST_ROOT/cv-old.out"
 grep -qF 'AIS-catcher now follows the release default' "$TEST_ROOT/cv-old.out"
+# The decision is made from the FILE: a version setting inherited from the caller (the Control Panel's environment) does not hide it.
+HOMEPAGE_VERSION=v2.7.1 GRAFANA_VERSION=13.9.9 cv_install "$CV_CONFIG" --dry-run > "$TEST_ROOT/cv-old-inherited.out" 2>&1
+grep -qF 'Signal K now follows the release default (was pinned at v2.27.0 by an older installer)' "$TEST_ROOT/cv-old-inherited.out"
 sed -i '/^SIGNALK_VERSION=/d;/^AIS_IMAGE=/d' "$CV_CONFIG"
 printf 'SIGNALK_VERSION="v2.30.1"\nGRAFANA_VERSION="13.1.0"\n' >> "$CV_CONFIG"
 cv_install "$CV_CONFIG" > "$TEST_ROOT/cv-custom.out" 2>&1
@@ -1936,7 +1939,7 @@ test "$(cv_value "$CV_ENV" SIGNALK_VERSION)" = v2.27.0
 test "$(cv_value "$CV_ENV" GRAFANA_VERSION)" = ""
 # An invalid value is refused before anything changes, also in a dry run, with the module's message.
 before=$(cksum < "$CV_ENV")
-for bad in 'GRAFANA_VERSION=latest' 'NODERED_VERSION=5.0.9' 'MOSQUITTO_VERSION=2.0.1-alpine' 'HOMEPAGE_VERSION=evil/x:v2.7.0' 'AIS_IMAGE=ghcr.io/x/y:latest'; do
+for bad in 'GRAFANA_VERSION=latest' 'NODERED_VERSION=5.0.9' 'MOSQUITTO_VERSION=2.0.1-alpine' 'HOMEPAGE_VERSION=evil/x:v2.7.0' 'AIS_IMAGE=ghcr.io/x/y v1' 'AIS_IMAGE=-v/x:1'; do
     cp "$CV_CONFIG" "$CV_CONFIG.bad"
     printf '%s\n' "${bad%%=*}=\"${bad#*=}\"" >> "$CV_CONFIG.bad"
     for flag in --dry-run ""; do

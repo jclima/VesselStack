@@ -32,7 +32,7 @@ class Component:
 
 COMPONENTS: tuple[Component, ...] = (
     Component("signalk", "Signal K", "SIGNALK_VERSION", "cr.signalk.io/signalk/signalk-server", "v2.27.0", "v2.28.0",
-              r"v2\.[0-9]+\.[0-9]+", True, "signalk"),
+              r"v?2\.[0-9]+\.[0-9]+(?:[.-][A-Za-z0-9.]+)?", True, "signalk"),
     Component("ais-catcher", "AIS-catcher", "AIS_IMAGE", "ghcr.io/jvde-github/ais-catcher", "ghcr.io/jvde-github/ais-catcher:v0.70",
               "ghcr.io/jvde-github/ais-catcher:v0.71", r".*[0-9].*", False, "ais"),
     Component("nodered", "Node-RED", "NODERED_VERSION", "nodered/node-red", "5.0.9-debian", "5.0.10-debian",
@@ -58,13 +58,35 @@ BY_ID = {c.id: c for c in COMPONENTS}
 BY_SETTING = {c.setting: c for c in COMPONENTS}
 FLOATING = frozenset({"latest", "stable", "main", "master", "edge", "nightly", "dev", "beta", "alpha", "rc"})
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
-TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}")
-REPOSITORY_RE = re.compile(r"(?:[a-z0-9.-]+(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*")
+TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+# An image name: an optional registry host (with an optional :port), then lowercase path parts. Every host
+# label and path part starts and ends with a letter or digit; none is empty (so nothing can look like an option).
+_PART = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_HOST = r"[a-z0-9]+(?:(?:\.|-+)[a-z0-9]+)*"
+REPOSITORY_RE = re.compile(rf"(?:{_HOST}(?::[0-9]{{1,5}})?/)?{_PART}(?:/{_PART})*")
+MAX_REFERENCE = 255
 STATES = ("default", "newer", "older", "different")
 
 
 def components() -> list[str]:
     return [c.id for c in COMPONENTS]
+
+
+def settings() -> list[str]:
+    """The names of the ten settings, in component order."""
+    return [c.setting for c in COMPONENTS]
+
+
+def scrub_environment(env: dict | None = None) -> dict:
+    """A copy of ``env`` (default: the process environment) without the ten settings.
+
+    Docker Compose lets an exported variable win over --env-file. A long-running process (the Control Panel)
+    holds the values it started with, so every child that may run Compose gets this copy and the settings
+    file stays the only source.
+    """
+    import os
+    names = set(settings())
+    return {k: v for k, v in (os.environ if env is None else env).items() if k not in names}
 
 
 def _get(component_id: str) -> Component:
@@ -100,8 +122,18 @@ def _version_numbers(tag: str) -> tuple[int, ...] | None:
     return tuple(int(x) for x in match.group(1).split(".")) if match else None
 
 
+def is_moving(tag: str) -> bool:
+    """True when a tag is empty, a floating name such as latest, or has no digit: it can change without notice."""
+    return not tag or tag.lower() in FLOATING or not re.search(r"[0-9]", tag)
+
+
 def validate(component_id: str, value: str) -> str | None:
-    """None when the value is acceptable (empty follows the release), else a plain-language message."""
+    """None when the value is acceptable (empty follows the release), else a plain-language message.
+
+    The eight settings added in 0.9.0 take a fixed version only. SIGNALK_VERSION and AIS_IMAGE keep the
+    forms that earlier releases accepted: a Signal K tag with or without a leading v and with a suffix, and
+    any safe image reference for AIS-catcher, a moving tag or no tag included (the report warns about those).
+    """
     comp = _get(component_id)
     text = str(value if value is not None else "")
     if text == "":
@@ -116,19 +148,20 @@ def validate(component_id: str, value: str) -> str | None:
     if digest and not DIGEST_RE.fullmatch(digest):
         return f"{name}: the part after @ must be sha256: followed by 64 hexadecimal characters." + hint
     if comp.id == "ais-catcher":
-        if not tag:
-            return f"{name} must be a full image reference with a version, such as {example}."
+        full = f"Use a full image reference such as {example}, or leave {name} empty to follow the release (default {comp.default})."
+        if len(text) > MAX_REFERENCE:
+            return f"{name} is too long (at most {MAX_REFERENCE} characters). " + full
         if not REPOSITORY_RE.fullmatch(repository):
-            return f"{name}: '{repository}' is not a valid image name. Use a full reference such as {example}."
-    else:
-        if "/" in tag or ":" in tag:
-            return f"{name} is a version only, such as {example}. It cannot name another image or registry."
-    if not TAG_RE.fullmatch(tag):
-        return f"{name}: '{tag}' is not a valid version." + hint
-    if tag.lower() in FLOATING or not re.search(r"[0-9]", tag):
-        return f"{name}: '{tag}' is not a fixed version. Floating names such as latest are not accepted; use a numbered version." + hint
-    if comp.id == "ais-catcher":
+            return f"{name}: '{repository[:80]}' is not a valid image name. Names use lowercase letters, digits and . _ - / only, each part starting and ending with a letter or digit. " + full
+        if tag and not TAG_RE.fullmatch(tag):
+            return f"{name}: '{tag[:80]}' is not a valid image tag. " + full
         return None
+    if "/" in tag or ":" in tag:
+        return f"{name} is a version only, such as {example}. It cannot name another image or registry."
+    if not TAG_RE.fullmatch(tag):
+        return f"{name}: '{tag[:80]}' is not a valid version." + hint
+    if comp.id != "signalk" and is_moving(tag):
+        return f"{name}: '{tag}' is not a fixed version. Floating names such as latest are not accepted; use a numbered version." + hint
     if not re.fullmatch(comp.pattern, tag):
         if comp.id == "nodered" and not tag.endswith("-debian"):
             return f"{name}: '{tag}' must end in -debian, such as {example}."
@@ -140,6 +173,21 @@ def validate(component_id: str, value: str) -> str | None:
         if nums is None or len(nums) < 2 or nums[1] < comp.min_minor:
             return f"{name}: {comp.label} {tag} is older than the release default {comp.default}, which this release needs at least." + hint
     return None
+
+
+def notes(component_id: str, value: str) -> list[str]:
+    """Plain-language warnings about a valid AIS_IMAGE value (a moving tag, or an image that is not the release's)."""
+    comp = _get(component_id)
+    text = str(value or "")
+    if comp.id != "ais-catcher" or not text or validate(component_id, text):
+        return []
+    repository, tag, _digest = _split_reference(comp, text)
+    found = []
+    if is_moving(tag):
+        found.append(f"AIS-catcher uses a moving version ({tag or 'no tag, which means latest'}): it can change without notice whenever the image is downloaded.")
+    if repository != comp.repository:
+        found.append(f"AIS-catcher runs an image from {repository}, not the one this release uses.")
+    return found
 
 
 def effective(component_id: str, value: str = "") -> str:
@@ -190,7 +238,8 @@ _ENV_LINE = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)")
 
 
 def read_env_setting(path: str, key: str) -> str | None:
-    """The value of KEY in an env file (the last assignment), or None. No shell evaluation."""
+    """The value of KEY in an env file (the last assignment), or None when it has none. No shell evaluation.
+    A value that is not one word is returned as written, so that validation refuses it."""
     import shlex
     found = None
     try:
@@ -201,8 +250,9 @@ def read_env_setting(path: str, key: str) -> str | None:
                     try:
                         tokens = shlex.split(match.group(2), comments=True, posix=True)
                     except ValueError:
-                        return None
-                    found = tokens[0] if len(tokens) == 1 else ("" if not tokens else None)
+                        found = match.group(2).strip() or "?"   # unreadable quoting: kept as written so validation refuses it
+                        continue
+                    found = tokens[0] if len(tokens) == 1 else ("" if not tokens else match.group(2).strip())
     except OSError:
         return None
     return found
@@ -250,7 +300,31 @@ def docker_inspect(name: str) -> dict | None:
     return {"image": parts[0], "image_id": parts[1], "running": parts[2] == "true"}
 
 
-def report(settings: dict, inspect=docker_inspect) -> list[dict]:
+def docker_image_present(reference: str) -> bool:
+    """True when the image is on this computer, False when it is not; DockerUnavailable when Docker did not answer."""
+    import subprocess
+    try:
+        proc = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", reference],
+                              capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        raise DockerUnavailable() from None
+    if proc.returncode == 0:
+        return True
+    if "No such" in proc.stderr:
+        return False
+    raise DockerUnavailable()
+
+
+def check_all(settings: dict) -> str | None:
+    """The first problem among the ten settings (the module's message), or None. Used before anything is started."""
+    for c in COMPONENTS:
+        problem = validate(c.id, str(settings.get(c.setting) or ""))
+        if problem:
+            return problem
+    return None
+
+
+def report(settings: dict, inspect=docker_inspect, image_present=docker_image_present) -> list[dict]:
     """One row per component. A setting that fails validation is reported as such, never run."""
     rows = []
     docker_ok = True
@@ -261,10 +335,17 @@ def report(settings: dict, inspect=docker_inspect) -> list[dict]:
         row = {"id": c.id, "label": c.label, "setting": c.setting, "release_default": c.default, "chosen": chosen,
                "enabled": enabled, "one_way": c.one_way, "effective_image": None, "running_image": None,
                "running_image_id": None, "running": None, "container": container_name(c.id, settings)}
-        row["effective_image"] = effective(c.id, "") if problem else effective(c.id, chosen)
+        row["effective_image"] = None if problem else effective(c.id, chosen)
         relation = "different" if problem else compare(c.id, chosen)
         row["relation"] = relation
         row["invalid"] = problem
+        row["notes"] = notes(c.id, chosen)
+        row["image_present"] = None
+        if chosen and not problem and relation != "default" and docker_ok:
+            try:
+                row["image_present"] = image_present(row["effective_image"])
+            except DockerUnavailable:
+                docker_ok = False
         if not enabled:
             row["running_state"] = "not enabled"
         elif not docker_ok:
@@ -282,9 +363,11 @@ def report(settings: dict, inspect=docker_inspect) -> list[dict]:
                 else:
                     row.update(running_image=found["image"], running_image_id=found["image_id"], running=found["running"])
                     row["running_state"] = "running" if found["running"] else "stopped"
-        drift = row["running_image"] is not None and row["running_image"] != row["effective_image"]
+        drift = bool(row["effective_image"]) and row["running_image"] is not None and row["running_image"] != row["effective_image"]
         row["drift"] = drift
-        if drift:
+        if problem:
+            row["state"] = "invalid"
+        elif drift:
             row["state"] = "drift"
         elif relation == "default":
             row["state"] = "release default"
@@ -294,7 +377,8 @@ def report(settings: dict, inspect=docker_inspect) -> list[dict]:
     return rows
 
 
-STATE_TEXT = {"drift": "running a different image than configured"}
+INSTALLER_COMMAND = "/opt/vesselstack/installer/install.sh --config /opt/vesselstack/config/vesselstack.env --start"
+STATE_TEXT = {"drift": "running a different image than configured", "invalid": "invalid: nothing will start until fixed"}
 
 
 def _short(value: str) -> str:
@@ -315,6 +399,14 @@ def format_table(rows: list[dict]) -> str:
     out += ["", "* holds data that a newer version may upgrade one way: make a backup before using a different version."]
     if any(r["running_state"] == "unknown" for r in rows):
         out.append("Docker did not answer, so what is running is unknown. The configured side above is still correct.")
+    for r in rows:
+        if r["invalid"]:
+            out.append(f"{r['setting']} is set to '{_short(r['chosen'])[:80]}', which cannot be used: {r['invalid']} Nothing will start until it is fixed. Fix or empty {r['setting']} in the settings file, then run the command again.")
+        if r.get("image_present") is False:
+            out.append(f"{r['label']} {_short(r['chosen'])} is set but that image is not on this computer; it must be downloaded before it can start.")
+        if r["relation"] == "older" and r["one_way"] and r["chosen"] and not r["invalid"]:
+            out.append(f"{r['label']} {_short(r['chosen'])} is older than the release default {_short(r['release_default'])}. Its data may already have been upgraded by a newer version; an older version may not start or may damage it. Restore a backup made with that version if you need to go back.")
+        out.extend(r.get("notes") or [])
     if any(r["state"] != "release default" for r in rows):
         out.append("A version other than the release default is not tested with this release. To go back, empty its setting in the settings file and run the installer again.")
     return "\n".join(out)
@@ -330,13 +422,24 @@ def lines_for(rows: list[dict], kind: str) -> tuple[list[str], list[str]]:
         return out, err
     for r in rows:
         if r["invalid"]:
-            out.append(f"WARN {r['setting']} is not a usable version ({r['invalid']}) The release default {r['release_default']} is used by the installer only after you fix or empty it.")
+            out.append(f"WARN {r['setting']} is set to '{_short(r['chosen'])[:80]}', which cannot be used: {r['invalid']} "
+                       f"Nothing will start until it is fixed. Fix or empty {r['setting']} in the settings file, then run the command again.")
         elif r["chosen"] and r["relation"] != "default":
             shown = _short(r["chosen"])
-            out.append(f"WARN {r['label']} {shown} is set; the release default is {_short(r['release_default'])}. This version is not tested with this release.")
+            if r["relation"] == "older" and r["one_way"]:
+                out.append(f"WARN {r['label']} {shown} is older than the release default {_short(r['release_default'])}. "
+                           "Its data may already have been upgraded by a newer version; an older version may not start or may damage it. "
+                           "Restore a backup made with that version if you need to go back.")
+            else:
+                out.append(f"WARN {r['label']} {shown} is set; the release default is {_short(r['release_default'])}. This version is not tested with this release.")
+            for note in r.get("notes") or []:
+                out.append("WARN " + note)
+            if r.get("image_present") is False:
+                out.append(f"WARN {r['label']} {shown} is set but that image is not on this computer; it must be downloaded before it can start.")
         if r["drift"]:
             line = (f"{r['label']} is running {r['running_image']} but {r['effective_image']} is configured. "
-                    "Fix: sudo vesselstackctl restart, or rerun the installer.")
+                    f"Fix: rerun the installer, which checks the setting first: sudo {INSTALLER_COMMAND}. "
+                    "Do not use 'vesselstackctl restart': it stops everything before the image is looked for.")
             if r["enabled"] and r["running"]:
                 err.append("FAIL " + line)
             else:
@@ -370,6 +473,8 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--list", action="store_true")
+    group.add_argument("--settings", action="store_true", help="the ten setting names, one per line")
+    group.add_argument("--check-env", metavar="FILE", help="exit 1 and print the message when a setting in FILE is not usable")
     group.add_argument("--json", action="store_true")
     group.add_argument("--validate", nargs=2, metavar=("ID", "VALUE"))
     group.add_argument("--effective", nargs=2, metavar=("ID", "VALUE"))
@@ -383,6 +488,22 @@ def _main(argv: list[str] | None = None) -> int:
         if not args.env_file:
             parser.error("--report needs --env-file")
         return _report_main(args)
+    if args.settings:
+        print("\n".join(settings()))
+        return 0
+    if args.check_env:
+        found = {}
+        for key in settings():
+            value = read_env_setting(args.check_env, key)
+            if value is not None:
+                found[key] = value
+        for c in COMPONENTS:
+            problem = validate(c.id, found.get(c.setting, ""))
+            if problem:
+                print(problem)
+                print(f"Nothing was started. Fix or empty {c.setting} in {args.check_env}, then run the command again.")
+                return 1
+        return 0
     if args.list:
         for c in COMPONENTS:
             print(f"{c.id}\t{c.setting}\t{c.default}")

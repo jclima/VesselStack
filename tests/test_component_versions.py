@@ -85,12 +85,14 @@ class ValidateTests(unittest.TestCase):
                 self.assertIsNone(cv.validate(cid, value))
 
     def test_floating_tags_are_refused(self):
+        # The eight settings added in 0.9.0 take a fixed version only. SIGNALK_VERSION and AIS_IMAGE keep
+        # what earlier releases accepted (see test_ais_image_forms_that_earlier_releases_accepted).
         for cid in cv.components():
+            if cid == "ais-catcher":
+                continue
             for tag in ("latest", "stable", "main", "edge", "nightly"):
-                value = f"ghcr.io/x/y:{tag}" if cid == "ais-catcher" else tag
                 with self.subTest(cid=cid, tag=tag):
-                    self.bad(cid, value)
-        self.bad("ais-catcher", "ghcr.io/x/y:abc")  # no digit at all
+                    self.bad(cid, tag)
 
     def test_another_repository_or_registry_or_whitespace(self):
         for cid in cv.components():
@@ -100,12 +102,13 @@ class ValidateTests(unittest.TestCase):
                 with self.subTest(cid=cid, value=value):
                     self.bad(cid, value)
         self.bad("ais-catcher", "ghcr.io/x/y:v1 --privileged")
-        self.bad("ais-catcher", "ghcr.io/x/y")
         self.bad("ais-catcher", "GHCR.IO/X/y:v1")
 
     def test_rules_per_component(self):
         self.bad("signalk", "v3.0.0")
-        self.bad("signalk", "2.28.0")
+        self.bad("signalk", "3.0.0")
+        self.bad("signalk", "v1.46.3")
+        self.bad("signalk", "latest")
         self.bad("grafana", "12.4.0")
         self.bad("grafana", "14.0.0")
         self.bad("influxdb", "3.0.0")
@@ -121,6 +124,86 @@ class ValidateTests(unittest.TestCase):
         self.bad("homepage", "v3.0.0")
         self.bad("grafana", "13.1.0@sha256:abc")
         self.bad("grafana", "13.1.0@" + DIGEST.upper())
+
+    def test_signalk_forms_that_earlier_releases_accepted(self):
+        # 0.8.0 wizard pattern: v?[0-9]+.[0-9]+.[0-9]+([.-][A-Za-z0-9.]+)? (the tag is kept exactly as written).
+        for value in ("2.27.0", "v2.27.0", "v2.28.0-beta.1", "2.28.0-beta.1", "v2.28.0.rc2", "v2.9.10"):
+            with self.subTest(value=value):
+                self.assertIsNone(cv.validate("signalk", value))
+                self.assertEqual(cv.effective("signalk", value), "cr.signalk.io/signalk/signalk-server:" + value)
+        self.assertEqual(cv.compare("signalk", "v2.28.0-beta.1"), "newer")
+        self.assertEqual(cv.compare("signalk", "2.9.0"), "older")
+        for value in ("v2.27.0 ", "v2.27.0 --privileged", "v2.27.0$", "${X}", "v2.27.0'", "v2.27.0\n", "v2.27.0/x", "-v2.27.0", "v2.27", "v2"):
+            with self.subTest(refused=value):
+                self.bad("signalk", value)
+
+    AIS = "ghcr.io/jvde-github/ais-catcher"
+
+    def test_ais_image_forms_that_earlier_releases_accepted(self):
+        # 0.8.0 wizard pattern: any reference of letters, digits and _ . / : - . A moving tag or no tag is
+        # accepted for this setting only, and reported by notes().
+        for value in (self.AIS + ":v0.70", self.AIS + ":edge", self.AIS + ":latest", self.AIS, "localhost:5000/x:1", "localhost:5000/x",
+                      "registry.example.net:5000/team/ais:1.2@" + DIGEST, "x@" + DIGEST, "x:v1@" + DIGEST, "ais-catcher", "a/b_c/d.e:1"):
+            with self.subTest(value=value):
+                self.assertIsNone(cv.validate("ais-catcher", value))
+                self.assertEqual(cv.effective("ais-catcher", value), value)
+
+    def test_ais_image_hostile_values_are_refused(self):
+        for value in ("-v/x:1", "--privileged/x:1", "--privileged:1", "-.-/x:1", "/x:1", "x:-1", "...:1", "a..b/x:1", "a/-b:1", "a/b-:1",
+                      "a" * 5000 + ":1", "a" * 253 + "/x:1", self.AIS + ":" + "1" * 129, "${X}", "${A}:1", "x:1:2", "ghcr.io:x/y:1",
+                      "x'y:1", 'x"y:1', "x\\y:1", "x#y:1", "x$y:1", "x:1\nx", "x y:1", " x:1", "x:1 ", "x\ty:1", "x:1\x00", "x:1\x07", "X/y:1", "x//y:1", "x/:1"):
+            with self.subTest(value=value):
+                self.bad("ais-catcher", value)
+
+    def test_ais_image_notes(self):
+        self.assertEqual(cv.notes("ais-catcher", ""), [])
+        self.assertEqual(cv.notes("ais-catcher", self.AIS + ":v0.71"), [])
+        for value, tag in ((self.AIS + ":edge", "edge"), (self.AIS + ":latest", "latest"), (self.AIS + ":nightly", "nightly"),
+                           (self.AIS + ":main", "main"), (self.AIS + ":stable", "stable"), (self.AIS + ":abc", "abc")):
+            with self.subTest(value=value):
+                self.assertEqual(cv.notes("ais-catcher", value),
+                                 [f"AIS-catcher uses a moving version ({tag}): it can change without notice whenever the image is downloaded."])
+        self.assertIn("no tag", cv.notes("ais-catcher", self.AIS)[0])
+        other = cv.notes("ais-catcher", "ghcr.io/other/ais:v1.2")
+        self.assertEqual(other, ["AIS-catcher runs an image from ghcr.io/other/ais, not the one this release uses."])
+        self.assertEqual(len(cv.notes("ais-catcher", "other/ais:latest")), 2)
+        self.assertEqual(cv.notes("ais-catcher", "-v/x:1"), [])  # invalid values have no notes: they are refused
+        self.assertEqual(cv.notes("grafana", "13.1.0"), [])
+
+    def test_the_ten_settings_come_from_the_module(self):
+        self.assertEqual(len(cv.settings()), 10)
+        self.assertEqual(cv.scrub_environment({"GRAFANA_VERSION": "13.9.9", "PATH": "/bin", "AIS_IMAGE": "x:1"}), {"PATH": "/bin"})
+
+    def test_the_built_in_name_lists_equal_the_module(self):
+        # vesselstackctl and install.sh keep their own copy of the ten names so that they still clear inherited
+        # values when the helper is missing; the copies must not drift from `--settings`.
+        out = subprocess.run([sys.executable, "-I", str(ROOT / "common" / "component_versions.py"), "--settings"],
+                             capture_output=True, text=True, check=True).stdout.split()
+        self.assertEqual(out, list(cv.settings()))
+        ctl = (ROOT / "scripts" / "vesselstackctl").read_text()
+        match = re.search(r"local version_settings=\(([^)]*)\)", ctl)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1).split(), out)
+        installer = (ROOT / "install.sh").read_text()
+        match = re.search(r"^COMPONENT_VERSION_KEYS=\(([^)]*)\)", installer, re.M)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1).split(), out)
+
+    def test_check_all_and_check_env(self):
+        self.assertIsNone(cv.check_all({"GRAFANA_VERSION": "13.1.0", "INFLUXDB_VERSION": ""}))
+        self.assertIn("INFLUXDB_VERSION", cv.check_all({"INFLUXDB_VERSION": "latest"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "vesselstack.env"
+            for text, bad in (("INFLUXDB_VERSION=latest\n", "INFLUXDB_VERSION"), ("GRAFANA_VERSION='13.1.0 --privileged'\n", "GRAFANA_VERSION"),
+                              ("GRAFANA_VERSION='unterminated\n", "GRAFANA_VERSION"), ("GRAFANA_VERSION=''\nAIS_IMAGE=\n", None)):
+                env.write_text(text)
+                out = subprocess.run([sys.executable, "-I", str(ROOT / "common" / "component_versions.py"), "--check-env", str(env)], capture_output=True, text=True)
+                with self.subTest(text=text):
+                    if bad:
+                        self.assertEqual(out.returncode, 1)
+                        self.assertIn(f"Nothing was started. Fix or empty {bad} in {env}, then run the command again.", out.stdout)
+                    else:
+                        self.assertEqual((out.returncode, out.stdout), (0, ""))
 
     def test_messages_name_the_setting_and_an_example(self):
         message = cv.validate("grafana", "latest")
@@ -183,7 +266,7 @@ class RegistryAndWizardTests(unittest.TestCase):
             good = "ghcr.io/jvde-github/ais-catcher:v0.71" if cid == "ais-catcher" else comp.example
             self.assertEqual(registry.validate_value(comp.setting, good), good)
             with self.assertRaises(ValueError):
-                registry.validate_value(comp.setting, "latest")
+                registry.validate_value(comp.setting, "bad value")
 
     def test_installer_and_example_env_carry_the_keys(self):
         installer = (ROOT / "install.sh").read_text()
@@ -201,8 +284,65 @@ class RegistryAndWizardTests(unittest.TestCase):
         for comp in cv.COMPONENTS:
             self.assertIn(comp.setting, wizard.FIELD_INDEX)
             with self.assertRaises(ValueError):
-                wizard.validate({comp.setting: "latest"})
+                wizard.validate({comp.setting: "bad value"})
             self.assertEqual(wizard.validate({comp.setting: ""})[comp.setting], "")
+
+
+class OneTimeBlankingTests(unittest.TestCase):
+    """install.sh clears an old pinned default once, decided from the settings FILE, never from the environment."""
+
+    def run_guard(self, file_text, inherited):
+        source = (ROOT / "install.sh").read_text()
+        first = source[source.index("COMPONENT_VERSION_KEYS=("):source.index('source "$CONFIG_FILE"')]
+        second = source[source.index("if ! config_key_assigned HOMEPAGE_VERSION"):]
+        second = second[:second.index("unset component_key") + len("unset component_key")]
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "vesselstack.env"
+            config.write_text(file_text)
+            script = ('CONFIG_FILE="$1"\nconfig_key_assigned() { grep -Eq "^(export )?$1=" "$CONFIG_FILE"; }\n'
+                      + first + '. "$CONFIG_FILE"\n' + second + '\nprintf "S=%s|A=%s|H=%s|G=%s\\n" "$SIGNALK_VERSION" "$AIS_IMAGE" "${HOMEPAGE_VERSION-unset}" "${GRAFANA_VERSION-unset}"\n')
+            env = dict(os.environ, **inherited)
+            return subprocess.run(["bash", "-c", script, "bash", str(config)], capture_output=True, text=True, env=env)
+
+    OLD = "SIGNALK_VERSION=v2.27.0\nAIS_IMAGE=ghcr.io/jvde-github/ais-catcher:v0.70\n"
+
+    def test_old_file_is_blanked_even_when_the_environment_carries_homepage_version(self):
+        for inherited in ({}, {"HOMEPAGE_VERSION": "v2.7.1", "SIGNALK_VERSION": "v2.99.0", "GRAFANA_VERSION": "13.9.9"}):
+            with self.subTest(inherited=inherited):
+                out = self.run_guard(self.OLD, inherited)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertEqual(out.stdout.strip(), "S=|A=|H=|G=")  # the file defines no Grafana setting: the inherited 13.9.9 is gone
+
+    def test_inherited_values_never_survive_into_the_installer(self):
+        out = self.run_guard(self.OLD + "GRAFANA_VERSION=''\n", {"GRAFANA_VERSION": "13.9.9"})
+        self.assertEqual(out.stdout.strip(), "S=|A=|H=|G=")  # an EMPTY value in the file overrides an inherited one
+
+    def test_the_files_value_wins_over_an_inherited_one(self):
+        out = self.run_guard(self.OLD + "GRAFANA_VERSION='13.1.0'\nHOMEPAGE_VERSION=''\n", {"GRAFANA_VERSION": "13.9.9"})
+        self.assertEqual(out.stdout.strip().split("|")[-1], "G=13.1.0")
+
+    def test_a_file_that_has_the_new_keys_keeps_its_values(self):
+        out = self.run_guard(self.OLD + "HOMEPAGE_VERSION=''\n", {})
+        self.assertEqual(out.stdout.strip(), "S=v2.27.0|A=ghcr.io/jvde-github/ais-catcher:v0.70|H=|G=")
+
+    def test_wizard_base_file_is_blanked_once_and_keeps_real_choices(self):
+        wizard = ROOT / "vesselstack-wizard.py"
+
+        def run(text):
+            with tempfile.TemporaryDirectory() as tmp:
+                base, out = Path(tmp) / "old.env", Path(tmp) / "out.env"
+                base.write_text(text)
+                done = subprocess.run([sys.executable, str(wizard), "--cli", "--non-interactive", "--base", str(base), "--output", str(out)], capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                return {k: v.strip("'") for k, v in (line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)}, done.stderr
+
+        values, err = run(self.OLD)
+        self.assertEqual((values["SIGNALK_VERSION"], values["AIS_IMAGE"], values["HOMEPAGE_VERSION"]), ("", "", ""))
+        self.assertIn("SIGNALK_VERSION now follows the release default", err)
+        values, _ = run("SIGNALK_VERSION=v2.28.0\nAIS_IMAGE=ghcr.io/jvde-github/ais-catcher:edge\n")
+        self.assertEqual((values["SIGNALK_VERSION"], values["AIS_IMAGE"]), ("v2.28.0", "ghcr.io/jvde-github/ais-catcher:edge"))
+        values, _ = run(self.OLD + "HOMEPAGE_VERSION=''\n")
+        self.assertEqual(values["SIGNALK_VERSION"], "v2.27.0")
 
 
 class ParserTests(unittest.TestCase):
@@ -348,6 +488,59 @@ class ControlCommandTests(unittest.TestCase):
         self.assertIn("INFO Grafana is running", stopped.stdout)
         data = json.loads(self.run_report(env, ["vesselstack-grafana|grafana/grafana:13.0.0|sha256:a|true"], "json").stdout)
         self.assertEqual([r["state"] for r in data["components"] if r["id"] == "grafana"], ["drift"])
+
+    def test_an_invalid_value_is_reported_as_configured_and_nothing_starts(self):
+        env = self.BASE + 'INFLUXDB_VERSION="latest"\n'
+        table = ["vesselstack-influxdb|influxdb:2.9.1|sha256:b|true"]
+        rows = {r["id"]: r for r in json.loads(self.run_report(env, table, "json").stdout)["components"]}
+        row = rows["influxdb"]
+        self.assertEqual((row["chosen"], row["state"], row["effective_image"], row["drift"]), ("latest", "invalid", None, False))
+        doctor = self.run_report(env, table, "doctor").stdout
+        self.assertIn("WARN INFLUXDB_VERSION is set to 'latest', which cannot be used:", doctor)
+        self.assertIn("Nothing will start until it is fixed. Fix or empty INFLUXDB_VERSION in the settings file", doctor)
+        self.assertNotIn("used by the installer only after", doctor)
+        text = self.run_report(env, table).stdout
+        self.assertRegex(text, r"InfluxDB \*\s+2\.9\.1\s+latest\s+.*invalid: nothing will start until fixed")
+        self.assertIn("Nothing will start until it is fixed", text)
+
+    def test_older_override_of_a_one_way_component_gets_the_stronger_line(self):
+        env = self.BASE + 'INFLUXDB_VERSION="2.8.0"\nPROMETHEUS_VERSION="v2.50.0"\n'
+        doctor = self.run_report(env, ["vesselstack-influxdb|influxdb:2.8.0|sha256:b|true"], "doctor").stdout
+        self.assertIn("WARN InfluxDB 2.8.0 is older than the release default 2.9.1. Its data may already have been upgraded by a newer version; "
+                      "an older version may not start or may damage it. Restore a backup made with that version if you need to go back.", doctor)
+        self.assertIn("WARN Prometheus v2.50.0 is set; the release default is v2.55.0. This version is not tested with this release.", doctor)
+
+    def test_drift_advice_is_to_rerun_the_installer_not_restart(self):
+        doctor = self.run_report(self.BASE, ["vesselstack-grafana|grafana/grafana:13.0.0|sha256:a|true"], "doctor").stderr
+        self.assertIn("Fix: rerun the installer, which checks the setting first: sudo /opt/vesselstack/installer/install.sh --config /opt/vesselstack/config/vesselstack.env --start.", doctor)
+        self.assertNotIn("Fix: sudo vesselstackctl restart", doctor)
+
+    def test_an_override_whose_image_is_not_on_this_computer_is_said_so(self):
+        env = self.BASE + 'GRAFANA_VERSION="13.0.99"\n'
+        absent = self.run_report(env, ["vesselstack-grafana|grafana/grafana:13.0.99|sha256:a|true"], "doctor").stdout
+        self.assertIn("WARN Grafana 13.0.99 is set but that image is not on this computer; it must be downloaded before it can start.", absent)
+        rows = {r["id"]: r for r in json.loads(self.run_report(env, [], "json").stdout)["components"]}
+        self.assertIs(rows["grafana"]["image_present"], False)
+        self.assertIsNone(rows["influxdb"]["image_present"])  # not overridden: not looked for
+
+    def test_report_function_with_image_presence_and_digest_form(self):
+        # Observed with Docker 29.8.2: a container created from image: alpine:3.20@sha256:... reports
+        # Config.Image as that same string, so a default Homepage install does not drift.
+        home = cv.effective("homepage", "")
+        rows = cv.report({"SIGNALK_MODE": "existing", "GRAFANA_VERSION": "13.1.0"},
+                         inspect=lambda name: {"image": home, "image_id": "sha256:x", "running": True} if name == "vesselstack-homepage" else None,
+                         image_present=lambda ref: ref != "grafana/grafana:13.1.0")
+        by = {r["id"]: r for r in rows}
+        self.assertFalse(by["homepage"]["drift"])
+        self.assertEqual(by["homepage"]["state"], "release default")
+        self.assertIs(by["grafana"]["image_present"], False)
+        self.assertEqual([r["id"] for r in rows if r["image_present"] is not None], ["grafana"])
+        ais = cv.report({"AIS_ENABLE": "true", "AIS_IMAGE": self.AIS_EDGE}, inspect=lambda name: None, image_present=lambda ref: True)
+        self.assertEqual({r["id"]: r for r in ais}["ais-catcher"]["notes"], cv.notes("ais-catcher", self.AIS_EDGE))
+        out, _err = cv.lines_for(ais, "doctor")
+        self.assertIn("WARN AIS-catcher uses a moving version (edge): it can change without notice whenever the image is downloaded.", out)
+
+    AIS_EDGE = "ghcr.io/jvde-github/ais-catcher:edge"
 
     def test_docker_absent_and_component_disabled(self):
         env = self.BASE + 'VESSELSTACK_DISABLED_COMPONENTS="grafana"\nGRAFANA_VERSION="13.1.0"\n'
