@@ -7,6 +7,25 @@ Semantic Versioning.
 
 ### Restore
 
+- While a restore is unfinished, the Control Panel, a browser-started update and the boat profile
+  command now report that VesselStack is busy, as `vesselstackctl` commands already did. The
+  lifecycle lock helper (`common/lifecycle_lock.py`) refuses a new lock until the restore is
+  committed or rolled back; `recover rollback`, `recover abandon` and the recovery at boot are not
+  affected. The helper also gained `run --wait SECONDS`. A restore still runs in your terminal
+  exactly as before.
+
+**Operational impact:** a Control Panel action, a browser update or a boat profile change started
+while a restore is unfinished is refused with "a restore is unfinished" instead of running. Nothing
+changes while no restore is pending. A journal written by 0.9.0 carries the old helper, which does
+not refuse, and keeps working.
+
+**Verify:** with an unfinished restore, `sudo python3 /opt/vesselstack/common/boat_profile_cli.py
+init --root /opt/vesselstack` prints "a restore is unfinished" and exits with status 2; after
+`sudo /var/lib/vesselstack/restore/current/recover rollback` it no longer does.
+
+**Rollback:** reinstall the previous release. The journal format is unchanged, so a journal
+written by this release stays valid for 0.9.0.
+
 - The restore journal now records which boot last wrote it (`boot_id`, read from
   `/proc/sys/kernel/random/boot_id`, left out when that is unavailable) and, after a failed
   rollback, whether trying again can help (`last_error_kind`: retry, manual or previous).

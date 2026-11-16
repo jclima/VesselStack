@@ -503,7 +503,8 @@ documented lab checks pass. The stable release is 0.8.0.
   [Unattended operation and power](#unattended-operation-and-power).
 - **`vesselstackctl status` exits non-zero while an installation or restore is unfinished.** A script of
   your own that checks it sees a failure in that state. While a restore is unfinished, commands that
-  change the system and the installer refuse to run (see [If a restore is interrupted](#if-a-restore-is-interrupted)).
+  change the system and the installer refuse to run, and the Control Panel, a browser-started update and
+  the boat profile command report that VesselStack is busy (see [If a restore is interrupted](#if-a-restore-is-interrupted)).
 - **The first update into 0.9.0 runs on the old Control Panel.** The unfinished-update notice and the
   **Finish this update** button apply from the next update on.
 - **Restoring a backup made before 0.9.0** turns off the features that version does not have, for
@@ -2173,6 +2174,10 @@ then undo it:
 sudo /var/lib/vesselstack/restore/current/recover status
 sudo /var/lib/vesselstack/restore/current/recover rollback
 ```
+
+While the journal is unfinished, the Control Panel, a browser-started update and the boat
+profile command report that VesselStack is busy, as `vesselstackctl` commands already do. The
+recovery itself is not affected.
 
 The same two commands are available as `sudo vesselstackctl restore-recover status` and
 `sudo vesselstackctl restore-recover rollback`, and `sudo vesselstackctl restore --status`

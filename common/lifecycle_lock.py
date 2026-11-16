@@ -14,12 +14,17 @@ import fcntl
 import hashlib
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Iterator, Mapping
 
 
 ENV_FD = "VESSELSTACK_LIFECYCLE_LOCK_FD"
 EXIT_BUSY = 75  # EX_TEMPFAIL, returned by "run" when the lock is held
+RESTORE_ID_ENV = "VESSELSTACK_RESTORE_ID"
+RESTORE_FINISHED_PHASES = ("committed", "rolled-back")
+WAIT_STEP = 0.5  # seconds between attempts of "run --wait"
+MAX_WAIT = 3600
 
 
 class LifecycleLockError(RuntimeError):
@@ -28,6 +33,10 @@ class LifecycleLockError(RuntimeError):
 
 class LifecycleLockBusy(LifecycleLockError):
     """Another process currently owns the lifecycle lock."""
+
+
+class LifecycleLockPending(LifecycleLockBusy):
+    """A restore is unfinished: waiting for the lock would not help."""
 
 
 def _canonical_root(root: os.PathLike[str] | str) -> str:
@@ -110,6 +119,40 @@ def _inherited_fd(value: str | None) -> int | None:
     return fd
 
 
+def _unfinished_restore(system_root: str) -> str | None:
+    """Return the journal directory when an unfinished restore forbids a fresh acquisition, else None.
+
+    The journal state is read directly (plain key=value lines): this helper must not depend on the journal
+    helper, and anything it cannot read with certainty counts as unfinished.  A restore's own processes carry
+    its id in VESSELSTACK_RESTORE_ID and pass.
+    """
+    journal = os.path.join(system_root, "var", "lib", "vesselstack", "restore", "current")
+    if not os.path.lexists(journal):
+        return None
+    values: dict[str, str] = {}
+    try:
+        with open(os.path.join(journal, "state"), encoding="utf-8", errors="surrogateescape", newline="") as handle:
+            text = handle.read()
+        for line in text.split("\n"):
+            if not line:
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not key or key in values:
+                return journal
+            values[key] = value
+    except (OSError, ValueError):
+        return journal
+    phase = values.get("phase")
+    if not phase:
+        return journal
+    if phase in RESTORE_FINISHED_PHASES:
+        return None
+    restore_id = values.get("id")
+    if restore_id and os.environ.get(RESTORE_ID_ENV) == restore_id:
+        return None
+    return journal
+
+
 class LifecycleLock:
     """A context-managed lifecycle lock with safe child-process handoff."""
 
@@ -155,6 +198,13 @@ class LifecycleLock:
             if exc.errno in (errno.EACCES, errno.EAGAIN):
                 raise LifecycleLockBusy("VesselStack lifecycle lock is busy") from exc
             raise LifecycleLockError("could not acquire lifecycle lock") from exc
+        if not inherited_flag:
+            # Looked at only now that the lock is held: the restore that wrote the journal released the lock
+            # after writing it, so nothing can slip in between the check and the acquisition.
+            journal = _unfinished_restore(self.system_root)
+            if journal is not None:
+                os.close(fd)
+                raise LifecycleLockPending(f"a restore is unfinished; see: sudo {journal}/recover status")
         self.fd = fd
         self.inherited = inherited_flag
         return self
@@ -199,6 +249,33 @@ def pass_fds(lock: LifecycleLock) -> tuple[int, ...]:
     return lock.pass_fds()
 
 
+def _wait_seconds(value: str) -> float:
+    import argparse
+    import math
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if not math.isfinite(seconds) or seconds < 0 or seconds > MAX_WAIT:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_WAIT}: {value!r}")
+    return seconds
+
+
+def _acquire_waiting(install_root: str, system_root: str, wait: float) -> LifecycleLock:
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            return LifecycleLock(install_root, system_root).acquire()
+        except LifecycleLockPending:
+            raise
+        except LifecycleLockBusy:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(WAIT_STEP, remaining))
+
+
 def _main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -211,6 +288,8 @@ def _main(argv: list[str] | None = None) -> int:
 
     run_parser = subparsers.add_parser("run", help="run a command under the lifecycle lock")
     add_lock_args(run_parser)
+    run_parser.add_argument("--wait", type=_wait_seconds, default=0.0, metavar="SECONDS",
+                            help="when the lock is busy, retry every 0.5 s for up to SECONDS (0 to 3600) before giving up")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
 
     check_parser = subparsers.add_parser("check", help="validate an inherited lifecycle lock")
@@ -229,7 +308,7 @@ def _main(argv: list[str] | None = None) -> int:
             command = command[1:]
         if not command:
             parser.error("run requires COMMAND after --")
-        handle = LifecycleLock(args.install_root, args.system_root).acquire()
+        handle = _acquire_waiting(args.install_root, args.system_root, args.wait)
         os.execvpe(command[0], command, handle.child_env())
     except LifecycleLockBusy as exc:
         print(f"lifecycle lock: {exc}", file=__import__("sys").stderr)

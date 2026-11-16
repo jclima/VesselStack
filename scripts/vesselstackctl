@@ -3579,14 +3579,14 @@ restore_state_load() {
     local journal=$1 dump line key
     st_format='' st_id='' st_stamp='' st_root='' st_data='' st_system_root='' st_stage='' st_archive='' st_started=''
     st_root_live='' st_data_live='' st_root_new='' st_data_new='' st_phase='' st_rollback_from=''
-    st_last_error='' st_last_error_kind='' st_boot_id='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_keys=$'\n'
+    st_last_error='' st_last_error_kind='' st_boot_id='' st_firewall_enabled='' st_firewall_active='' st_abandoned_from='' st_skip_installer='' st_keys=$'\n'
     dump=$(python3 -I "$journal/restore_journal.py" dump "$journal") || return 1
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         key=${line%%=*}
         st_keys="$st_keys$key"$'\n'
         case "$key" in
-            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|last_error_kind|boot_id|firewall_enabled|firewall_active|abandoned_from)
+            format|id|stamp|root|data|system_root|stage|archive|started|root_live|data_live|root_new|data_new|phase|rollback_from|last_error|last_error_kind|boot_id|firewall_enabled|firewall_active|abandoned_from|skip_installer)
                 printf -v "st_$key" '%s' "${line#*=}" ;;
         esac
     done <<< "$dump"
@@ -3669,6 +3669,11 @@ restore_validate_state() {
             *) restore_validate_error="its record of the firewall state is \"${value//[![:print:]]/?}\", not yes or no"; return 1 ;;
         esac
     done
+    # Whether the installer is run after the restore: 0 or 1 (a journal written by an earlier release may not say).
+    case "${st_skip_installer:-}" in
+        ''|0|1) ;;
+        *) restore_validate_error="its record of --skip-installer is \"${st_skip_installer//[![:print:]]/?}\", not 0 or 1"; return 1 ;;
+    esac
     # The boot id and the failure kind are optional too (a journal written by 0.9.0 has neither).
     if [ -n "${st_boot_id:-}" ] && [[ ! $st_boot_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
         restore_validate_error="its record of the boot is \"${st_boot_id//[![:print:]]/?}\", not a boot id"
@@ -4606,13 +4611,22 @@ restore_load_identity() {
     VESSELSTACK_DATA=$st_data
 }
 # Take the lifecycle lock with the journal's own copy of the helper ($ROOT may be moved aside): re-runs
-# this command under the lock when it is not held yet, and returns once it is.
+# this command under the lock when it is not held yet, and returns once it is. Usage:
+# restore_take_lock JOURNAL [--wait SECONDS] ACTION... (a wait needs a helper of this release or later).
+# The helper refuses a fresh lock while a restore is unfinished unless VESSELSTACK_RESTORE_ID is that
+# restore's id: the recovery is part of the restore, so it carries the id of the journal it works on.
 restore_take_lock() {
-    local journal=$1 lock_helper="$1/lifecycle_lock.py"
+    local journal=$1 lock_helper="$1/lifecycle_lock.py" rid=${st_id:-}
+    local -a wait_args=()
     shift
+    if [ "${1:-}" = --wait ]; then
+        wait_args=(--wait "$2")
+        shift 2
+    fi
     [ -s "$lock_helper" ] || { echo "Missing $lock_helper; the journal is incomplete" >&2; exit 1; }
     if [ -z "${VESSELSTACK_LIFECYCLE_LOCK_FD:-}" ]; then
-        exec python3 -I "$lock_helper" run --root "$ROOT" --system-root "$SYSTEM_ROOT" -- bash "$0" restore-recover "$@"
+        [ -n "$rid" ] || rid=$(restore_state_get "$journal" id)
+        VESSELSTACK_RESTORE_ID=$rid exec python3 -I "$lock_helper" run --root "$ROOT" --system-root "$SYSTEM_ROOT" ${wait_args[@]+"${wait_args[@]}"} -- bash "$0" restore-recover "$@"
     fi
     python3 -I "$lock_helper" check --root "$ROOT" --system-root "$SYSTEM_ROOT" || exit $?
 }
@@ -4731,15 +4745,97 @@ restore_recover_abandon() {
     echo "Next: sudo vesselstackctl doctor"
     echo "      sudo vesselstackctl start"
 }
+# ---- `recover worker ID` (internal; not in the usage text). Runs the forward part of the restore whose
+# journal is pending in phase "prepared", from the journal alone, so that it can run detached from the
+# terminal. Output and result are kept next to the journal, not in it, because the journal is renamed when
+# it is archived: worker-ID.out and .err (stdout and stderr), .pid, and .rc (the exit status, written last).
+# Only the newest three sets of these files are kept.
+
+# Says in one line why the worker has nothing to do, and fails, unless ID is the pending restore in phase "prepared".
+restore_worker_admit() {
+    local id=$1 journal=$2 jid phase
+    if [[ ! $id =~ ^[0-9a-f]{32}$ ]]; then
+        echo "worker: that is not a restore id; nothing was changed" >&2
+        return 1
+    fi
+    if [ ! -f "$journal/state" ]; then
+        echo "worker: no restore is pending; nothing was changed" >&2
+        return 1
+    fi
+    jid=$(restore_state_peek "$journal" id)
+    if [ "$jid" != "$id" ]; then
+        echo "worker: restore $id is not the pending restore; nothing was changed" >&2
+        return 1
+    fi
+    phase=$(restore_state_peek "$journal" phase)
+    if [ "$phase" != prepared ]; then
+        echo "worker: the restore is in phase ${phase:-unknown}, not prepared; nothing was changed" >&2
+        return 1
+    fi
+}
+# Remove the worker files of all but the newest three restores; KEEP (the running one) is never removed.
+restore_worker_prune() {
+    local keep=$1 path name id count=0
+    while IFS= read -r path; do
+        name=${path##*/}
+        id=${name#worker-}
+        id=${id%.pid}
+        [[ $id =~ ^[0-9a-f]{32}$ ]] || continue
+        count=$((count + 1))
+        if [ "$count" -gt 3 ] && [ "$id" != "$keep" ]; then
+            rm -f -- "$RESTORE_DIR/worker-$id.pid" "$RESTORE_DIR/worker-$id.out" "$RESTORE_DIR/worker-$id.err" \
+                "$RESTORE_DIR/worker-$id.rc"
+        fi
+    done < <(ls -1t -- "$RESTORE_DIR"/worker-*.pid 2>/dev/null || true)
+}
+# Records the exit status of the worker (EXIT trap): a temporary file, flushed, renamed, and the directory flushed.
+restore_worker_finish() {
+    local rc=$1 base=$restore_worker_base tmp
+    tmp="$base.rc.tmp.$$"
+    if ! { (umask 077; printf '%s\n' "$rc" > "$tmp") && chmod 0600 "$tmp"; }; then
+        rm -f -- "$tmp"
+        return 0
+    fi
+    python3 -I -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+os.fsync(fd)
+os.close(fd)' "$tmp" 2>/dev/null || true
+    command mv -f -- "$tmp" "$base.rc" || { rm -f -- "$tmp"; return 0; }
+    python3 -I -c 'import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+os.fsync(fd)
+os.close(fd)' "$RESTORE_DIR" 2>/dev/null || true
+}
+restore_recover_worker() {
+    local id=$1 journal=$RESTORE_CURRENT base
+    trap '' INT HUP
+    restore_worker_admit "$id" "$journal" || return 0
+    restore_load_identity "$journal" || return 1
+    # Re-runs this command with the lock held (waiting for it for up to two minutes); returns once it is held.
+    restore_take_lock "$journal" --wait 120 worker "$id"
+    restore_worker_admit "$id" "$journal" || return 0
+    base="$RESTORE_DIR/worker-$id"
+    restore_worker_base=$base
+    (umask 077; : >> "$base.out"; : >> "$base.err"; printf '%s\n' "$$" > "$base.pid") || return 1
+    chmod 0600 "$base.out" "$base.err" "$base.pid" || return 1
+    restore_worker_prune "$id"
+    exec >> "$base.out" 2>> "$base.err"
+    trap 'restore_worker_finish "$?"' EXIT
+    restore_forward "$journal"
+    exit 0
+}
+
 restore_recover_command() {
     local action=${1:-} journal=$RESTORE_CURRENT confirmed=no
     case "$action" in
         status|rollback) [ "$#" -eq 1 ] || { usage >&2; exit 2; } ;;
+        worker) [ "$#" -eq 2 ] || { usage >&2; exit 2; } ;;
         abandon)
             if [ "$#" -eq 2 ] && [ "$2" = --yes ]; then confirmed=yes
             elif [ "$#" -ne 1 ]; then usage >&2; exit 2; fi ;;
         *) usage >&2; exit 2 ;;
     esac
+    if [ "$action" = worker ]; then restore_recover_worker "$2"; return $?; fi
     if [ ! -f "$journal/state" ]; then
         if [ -e "$journal" ] || [ -L "$journal" ]; then
             echo "$journal exists but has no readable state file. Do not delete it while the application or data folder is missing." >&2
@@ -5078,8 +5174,53 @@ restore_create_journal() {
     fi
 }
 
+# The forward part of a restore: everything after the journal exists and was validated, up to the final
+# messages. It takes what it needs from the journal (state and files), never from the caller's variables,
+# so that it can be run by restore_stack or, from the journal alone, by `recover worker`. Returns 0, or
+# restore_exit_status (1, or 3 when the previous system is back but could not be started).
+restore_forward() {
+    local journal=$1 stage root data stamp skip_installer removed_units='' unit label archive_rc
+    restore_exit_status=1
+    if ! restore_state_load "$journal" || ! restore_validate_state; then
+        echo "Refusing to restore: the recovery journal would not be accepted by the recovery (${restore_validate_error:-it cannot be read}). Nothing was changed." >&2
+        return 1
+    fi
+    stage=$st_stage root=$st_root data=$st_data stamp=$st_stamp skip_installer=${st_skip_installer:-}
+    if [ -z "$stage" ]; then
+        echo "Refusing to restore: the recovery journal does not record the staged copy. Nothing was changed." >&2
+        return 1
+    fi
+    case "$skip_installer" in
+        0|1) ;;
+        *) echo "Refusing to restore: the recovery journal does not record whether the installer is run. Nothing was changed." >&2; return 1 ;;
+    esac
+    if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$journal/controller" "$journal/new-controller" "$skip_installer"; then
+        if [ -r "$journal/removed-units" ]; then removed_units=$(cat "$journal/removed-units"); fi
+        # The phase is "committed": remove the stage and archive the journal (nothing is rolled back).
+        restore_reconcile "$journal" && archive_rc=0 || archive_rc=$?
+        echo "Restore completed"
+        echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
+        if [ "$archive_rc" -ne 0 ]; then
+            echo "WARN the restore completed, but its recovery journal could not be archived and is still in $journal (phase committed). Other commands are not blocked." >&2
+            echo "WARN finish the cleanup with: sudo $journal/recover rollback   (in this phase it only removes leftovers; it does not undo the restore)" >&2
+        fi
+        if [ -n "$removed_units" ]; then
+            echo "Turned off because the restored version does not have them:"
+            while IFS= read -r unit; do
+                [ -n "$unit" ] || continue
+                label=$(restore_unit_label "$unit")
+                if [ -n "$label" ]; then echo "  $label ($unit)"; else echo "  $unit"; fi
+            done <<< "$removed_units"
+        fi
+        if [ "$skip_installer" -eq 1 ]; then restore_skip_installer_notice "$root"; fi
+        return 0
+    fi
+    restore_finish_failed_commit "$stage" "$journal"
+    return "${restore_exit_status:-1}"
+}
+
 restore_stack() {
-    local archive='' confirmation='' skip_installer=0 argument pending_phase archive_rc
+    local archive='' confirmation='' skip_installer=0 argument pending_phase
     restore_exit_status=1
     for argument in "$@"; do
         case "$argument" in
@@ -5184,7 +5325,7 @@ PY
     restore_config_identity "$ENV_FILE" "$stage/vesselstack-backup/${root#/}/config/vesselstack.env" || {
         rm -rf -- "$stage"; echo "Restored config does not identify the live root/data trees; nothing was changed" >&2; exit 1;
     }
-    local journal new_controller removed_units='' unit label
+    local journal
     # The staged copy is flushed to disk before the journal exists: after this the first change can follow.
     if [ ! -r "$LIBEXEC_DIR/restore_journal.py" ]; then
         rm -rf -- "$stage"
@@ -5224,36 +5365,13 @@ PY
         exit 1
     }
     journal=$RESTORE_CURRENT
-    new_controller="$journal/new-controller"
     # A journal that exists must be one the recovery accepts: check it now, before anything is stopped.
     if ! restore_state_load "$journal" || ! restore_validate_state; then
         echo "Refusing to restore: the recovery journal would not be accepted by the recovery (${restore_validate_error:-it cannot be read}). Nothing was changed." >&2
         rm -rf -- "$journal" "$stage"
         exit 1
     fi
-    if restore_commit_transaction "$stage" "$journal" "$root" "$data" "$stamp" "$journal/controller" "$new_controller" "$skip_installer"; then
-        if [ -r "$journal/removed-units" ]; then removed_units=$(cat "$journal/removed-units"); fi
-        # The phase is "committed": remove the stage and archive the journal (nothing is rolled back).
-        restore_reconcile "$journal" && archive_rc=0 || archive_rc=$?
-        echo "Restore completed"
-        echo "Previous trees kept as $root.pre-restore-$stamp and $data.pre-restore-$stamp."
-        if [ "$archive_rc" -ne 0 ]; then
-            echo "WARN the restore completed, but its recovery journal could not be archived and is still in $journal (phase committed). Other commands are not blocked." >&2
-            echo "WARN finish the cleanup with: sudo $journal/recover rollback   (in this phase it only removes leftovers; it does not undo the restore)" >&2
-        fi
-        if [ -n "$removed_units" ]; then
-            echo "Turned off because the restored version does not have them:"
-            while IFS= read -r unit; do
-                [ -n "$unit" ] || continue
-                label=$(restore_unit_label "$unit")
-                if [ -n "$label" ]; then echo "  $label ($unit)"; else echo "  $unit"; fi
-            done <<< "$removed_units"
-        fi
-        if [ "$skip_installer" -eq 1 ]; then restore_skip_installer_notice "$root"; fi
-        return 0
-    fi
-    restore_finish_failed_commit "$stage" "$journal"
-    return "${restore_exit_status:-1}"
+    restore_forward "$journal"
 }
 
 # ---------------------------------------------------------------- backup drive (control panel helpers)
