@@ -25,6 +25,38 @@ install -d "$FAKE_BIN"
 cat > "$FAKE_BIN/docker" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >> "$(dirname "$0")/docker.log"
+# Docker Compose behaviour knobs: FAKE_COMPOSE_VERSION (default 2.40.0); FAKE_COMPOSE_OLD=1 behaves like
+# Compose before 2.35 (no `config --no-env-resolution`: "unknown flag", exit 16, and an enabled nodered profile
+# needs $VESSELSTACK_ROOT/config/nodered.env to exist); FAKE_COMPOSE_CONFIG_FAIL=<message> makes every
+# `config` fail with that message.
+if [ "${1:-}" = compose ]; then
+    if [ "${2:-}" = version ]; then
+        if [ "${3:-}" = --short ]; then echo "${FAKE_COMPOSE_VERSION:-2.40.0}"; else echo "Docker Compose version v${FAKE_COMPOSE_VERSION:-2.40.0}"; fi
+        exit 0
+    fi
+    if [ "${2:-}" = config ] && [ "${3:-}" = --help ]; then
+        echo "Usage:  docker compose config [OPTIONS] [SERVICE...]"
+        echo "      --images   Print the image names, one per line."
+        [ -n "${FAKE_COMPOSE_OLD:-}" ] || echo "      --no-env-resolution   Don't resolve service env files"
+        exit 0
+    fi
+    if [[ " $* " == *" config "* ]]; then
+        if [ -n "${FAKE_COMPOSE_OLD:-}" ] && [[ " $* " == *" --no-env-resolution "* ]]; then
+            echo "unknown flag: --no-env-resolution" >&2; exit 16
+        fi
+        if [ -n "${FAKE_COMPOSE_CONFIG_FAIL:-}" ]; then echo "$FAKE_COMPOSE_CONFIG_FAIL" >&2; exit 15; fi
+        if [ -n "${FAKE_COMPOSE_OLD:-}" ] && [[ " $* " == *" --profile nodered "* ]]; then
+            fake_root=${VESSELSTACK_ROOT:-}
+            if [ -z "$fake_root" ]; then
+                fake_args=("$@")
+                for ((fake_i = 0; fake_i < ${#fake_args[@]}; fake_i++)); do
+                    [ "${fake_args[$fake_i]}" = --env-file ] && fake_root=$(sed -n 's/^VESSELSTACK_ROOT="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "${fake_args[$((fake_i + 1))]}")
+                done
+            fi
+            [ -f "$fake_root/config/nodered.env" ] || { echo "env file $fake_root/config/nodered.env not found: stat $fake_root/config/nodered.env: no such file or directory" >&2; exit 14; }
+        fi
+    fi
+fi
 # Knobs for the preflight and failure tests.
 if [ "${1:-}" = image ] && [ "${2:-}" = inspect ] && [ -n "${FAKE_DOCKER_NO_IMAGE:-}" ]; then exit 1; fi
 if [ "${1:-}" = manifest ] && [ -z "${FAKE_DOCKER_REGISTRY_OK:-}" ]; then exit 1; fi
@@ -1843,6 +1875,70 @@ done
 if env PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$DP_REL/install.sh" --config "$TEST_ROOT/nodered.bad.env" --dry-run >/dev/null 2>&1; then
     echo 'a Node-RED port clash was accepted' >&2; exit 1
 fi
+
+# ---- Docker Compose older than 2.35 has no `config --no-env-resolution` (Debian packages Compose 2.26.1).
+# The report this guards against: the dry run failed with "Compose template validation failed ..." and no
+# reason. Own fake Compose behaviour: FAKE_COMPOSE_OLD=1 (see the fake docker above).
+sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="true"/' "$NRCONFIG"
+test ! -e "$NR_ENV"   # Node-RED is enabled before config/nodered.env exists
+OLD_TMP="$TEST_ROOT/old-compose-tmp"
+install -d "$OLD_TMP"
+old_dry() { env TMPDIR="$OLD_TMP" PATH="$FAKE_BIN:$PATH" VESSELSTACK_SYSTEM_ROOT="$SYSTEM5" "$@" "$DP_REL/install.sh" --config "$NRCONFIG" --dry-run 2>&1; }
+# New Compose: the flag is used, and no temporary root is needed.
+: > "$FAKE_BIN/docker.log"
+new_out=$(old_dry FAKE_COMPOSE_VERSION=2.40.0)
+grep -q 'Docker Compose 2.40.0 found' <<<"$new_out"
+grep -q 'Preflight passed' <<<"$new_out"
+grep -q 'config --no-env-resolution --quiet' "$FAKE_BIN/docker.log"
+# Old Compose (Debian's 2.26.1-4), Node-RED enabled, nodered.env missing: the dry run passes.
+: > "$FAKE_BIN/docker.log"
+old_out=$(old_dry FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.26.1-4) || { echo "$old_out" >&2; echo 'dry run failed on old Compose (Node-RED enabled)' >&2; exit 1; }
+grep -q 'Docker Compose 2.26.1-4 found' <<<"$old_out"
+grep -q 'Preflight passed' <<<"$old_out"
+if grep -q -- '--no-env-resolution' "$FAKE_BIN/docker.log"; then
+    echo 'old Compose was given --no-env-resolution to validate' >&2; exit 1
+fi
+grep -q 'config --quiet' "$FAKE_BIN/docker.log"
+test ! -e "$NR_ENV"                         # a dry run created nothing in the installed tree
+test -z "$(ls -A "$OLD_TMP")"               # and left no temporary files behind
+# Old Compose, Node-RED disabled: passes as well.
+sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="false"/' "$NRCONFIG"
+old_out=$(old_dry FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.26.1-4) || { echo "$old_out" >&2; echo 'dry run failed on old Compose (Node-RED disabled)' >&2; exit 1; }
+grep -q 'Preflight passed' <<<"$old_out"
+sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="true"/' "$NRCONFIG"
+# A genuinely invalid configuration is refused and the reason is printed, not just the heading.
+if bad_out=$(old_dry FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.26.1 FAKE_COMPOSE_CONFIG_FAIL='services.grafana.ports.0: invalid port "x"'); then
+    echo 'an invalid Compose configuration was accepted' >&2; exit 1
+fi
+grep -q 'Compose template validation failed for this configuration' <<<"$bad_out"
+grep -qF 'services.grafana.ports.0: invalid port "x"' <<<"$bad_out"
+grep -q 'Nothing was changed' <<<"$bad_out"
+test -z "$(ls -A "$OLD_TMP")"
+# Compose older than the oldest checked version only warns, then the validation decides.
+warn_out=$(old_dry FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.9.0) || { echo "$warn_out" >&2; echo 'Compose 2.9.0 was refused' >&2; exit 1; }
+grep -qF 'WARN: Docker Compose 2.9.0 is older than 2.10.2, the oldest version this release is checked with. The installer continues; if the check below fails, it prints why.' <<<"$warn_out"
+grep -q 'Preflight passed' <<<"$warn_out"
+# 2.26.1 and the oldest checked version itself print no warning.
+for ok_version in 2.26.1-4 2.10.2 2.10.3; do
+    ok_out=$(old_dry FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=$ok_version)
+    grep -q "Docker Compose $ok_version found" <<<"$ok_out"
+    if grep -q 'WARN: Docker Compose' <<<"$ok_out"; then echo "warning printed for Compose $ok_version" >&2; exit 1; fi
+done
+# A too-old Compose that cannot read the template: the warning is followed by the real error.
+if bad_out=$(old_dry FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.9.0 FAKE_COMPOSE_CONFIG_FAIL='services.nodered.env_file.0 must be a string'); then
+    echo 'a Compose that cannot read the template was accepted' >&2; exit 1
+fi
+grep -q 'WARN: Docker Compose 2.9.0 is older than 2.10.2' <<<"$bad_out"
+grep -qF 'services.nodered.env_file.0 must be a string' <<<"$bad_out"
+grep -q 'Nothing was changed' <<<"$bad_out"
+test -z "$(ls -A "$OLD_TMP")"
+# A real install (--start) on old Compose with Node-RED enabled before nodered.env exists.
+test ! -e "$NR_ENV"
+nr_old_out=$(nr_install FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.26.1-4) || { echo "$nr_old_out" >&2; echo 'install failed on old Compose' >&2; exit 1; }
+test -f "$NR_ENV"
+grep -qE 'compose .*up -d' "$FAKE_BIN/docker.log"
+sed -i 's/^NODERED_ENABLE=.*/NODERED_ENABLE="false"/' "$NRCONFIG"
+nr_install >/dev/null
 
 # ---- Install-in-progress marker: written at the first change, cleared when the start
 # phase has succeeded, left behind when a --start run dies. Own root, own config.

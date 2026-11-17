@@ -24,6 +24,17 @@ for from in 0.0.1 0.0.2 0.1.0 0.2.0 0.3.0; do
     grep -qx '0.4.0' "$VERSION_FILE"
 done
 
+# The 0.8.0 -> 0.9.1 and 0.9.0 -> 0.9.1 updates are supported; 0.9.1 -> 0.9.0 is a refused downgrade.
+for from in 0.8.0 0.9.0; do
+    printf '%s\n' "$from" > "$VERSION_FILE"
+    migrate --check "$ENV" 0.9.1
+    grep -qx "$from" "$VERSION_FILE"
+    migrate "$ENV" 0.9.1
+    grep -qx '0.9.1' "$VERSION_FILE"
+done
+if migrate "$ENV" 0.9.0; then echo "0.9.1 -> 0.9.0 accepted" >&2; exit 1; fi
+grep -q 'Downgrade from 0.9.1 to 0.9.0 is not supported' "$TEST_ROOT/stderr"
+
 # --check changes nothing and reports the verdict.
 printf '0.3.0\n' > "$VERSION_FILE"
 migrate --check "$ENV" 0.4.0

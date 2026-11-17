@@ -10,11 +10,20 @@ in the README under [Updating](../README.md#updating). If you are on 0.6.x or ol
 
 ## Upgrading to 0.9.0
 
-0.9.0 is a pre-release. Physical Raspberry Pi acceptance is still pending, so it is not the
-release marked Latest. A boat should stay on 0.8.0 until 0.9.0 is promoted.
+0.9.1 is a pre-release. Physical Raspberry Pi and display acceptance is still pending, so it is not the
+release marked Latest. A boat should stay on 0.8.0 until 0.9.1 is promoted.
 
+0.9.1 is the release to install and update to. 0.9.0 was published as a pre-release on 2026-11-16
+and cannot be installed with Docker Compose older than 2.35.
+
+- 0.9.0 itself fails the installer's Compose check on Docker Compose older than 2.35, including
+  Debian's packaged 2.26.1, with no reason shown. Nothing is changed. Use 0.9.1. Run
+  `docker compose version` to see what you have. 0.9.1 is checked with real Compose from 2.10.2
+  through the current release; with an older one it prints a warning and continues, and the template
+  check prints the reason if that Compose cannot read the template. From 0.9.0 there is nothing
+  extra to do.
 - Run the full installer (the pinned installer below) or `sudo vesselstackctl update <release dir>`.
-  An application-only update is not enough, because 0.9.0 adds settings and units.
+  An application-only update is not enough, because 0.9.0 and 0.9.1 add settings and units.
 - On a Raspberry Pi the hardware watchdog is armed by default (`VESSELSTACK_WATCHDOG=auto`). Set
   `VESSELSTACK_WATCHDOG="false"` and rerun the installer to opt out.
 - While a restore is unfinished (a pending restore journal), commands that change the system and
@@ -51,7 +60,7 @@ Re-run the pinned release installer over `ssh -t`. It finds the installed system
 installs and starts the release:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
 ```
 
 Running it again for the version that is already installed reports "nothing to do". If the
@@ -65,7 +74,7 @@ with no argument fails. To run it by hand once a release is unpacked (the instal
 `/opt/vesselstack-release/<version>`):
 
 ```bash
-sudo vesselstackctl update /opt/vesselstack-release/0.9.0
+sudo vesselstackctl update /opt/vesselstack-release/0.9.1
 ```
 
 If the installer fails part-way, `vesselstackctl update` stops with three lines: that the update
@@ -419,7 +428,7 @@ sudo vesselstackctl restore /path/to/vesselstack-TIMESTAMP.tar.gz --yes
 Prepare a bundle on the home lab or any connected machine, carry it to the
 boat, then install without any network access. The guided installer does the
 checks, `--verify`, `--load` and install for you:
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.9.0.tar.gz`
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.9.1.tar.gz`
 (copy `get-vesselstack.sh`, the tarball with its `.sha256` and the bundle on the
 carry media; the bundle must be root-owned and not group/world-writable, and
 packages and Docker must already be installed). The manual steps follow:
@@ -507,7 +516,7 @@ and `ssh-keygen` (part of OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.9.0
+scripts/verify-release-tag.sh v0.9.1
 ```
 
 The script takes `TAG [ALLOWED_SIGNERS_FILE [EXPECTED_COMMIT]]`. It checks that the tag is

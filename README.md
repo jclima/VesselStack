@@ -14,16 +14,18 @@ the boat's local network when the internet is unavailable.
 > alarms. Never depend on this software as the sole source of safety data.
 
 > [!NOTE]
-> **Status: 0.9.0 is a pre-release.** Automated tests pass; physical Raspberry Pi acceptance is
-> pending. For a boat, install or stay on 0.8.0, the stable release:
+> **Status: 0.9.1 is a pre-release.** Automated tests pass; physical Raspberry Pi and display
+> acceptance is pending. For a boat, install or stay on 0.8.0, the stable release:
 >
 > ```bash
 > curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
 > ```
 >
 > For a lab Pi, use the [quick start](#quick-start-one-command-on-the-raspberry-pi) below to try
-> 0.9.0. The background restore, the recovery at boot after a power loss and the new display
-> firmware have not been run on a real boat computer or display. Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
+> 0.9.1. The background restore, the recovery at boot after a power loss and the new display
+> firmware have not been run on a real boat computer or display. 0.9.0 was published as a
+> pre-release on 2026-11-16 and cannot be installed with Docker Compose older than 2.35: use 0.9.1.
+> Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
 
 ## Contents
 
@@ -290,14 +292,14 @@ session), run the pinned release installer and answer the questions in the same 
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
 ```
 
-The same release is also selected by `VESSELSTACK_VERSION=0.9.0` or `--version 0.9.0`:
+The same release is also selected by `VESSELSTACK_VERSION=0.9.1` or `--version 0.9.1`:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.9.0 bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash -s -- --version 0.9.0
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo VESSELSTACK_VERSION=0.9.1 bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash -s -- --version 0.9.1
 ```
 
 > [!NOTE]
@@ -305,7 +307,7 @@ curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-ve
 > whatever GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a pre-release, so that URL kept serving
-> 0.4.4). While 0.9.0 is a pre-release, the `releases/latest` URL still serves 0.8.0.
+> 0.4.4). While 0.9.1 is a pre-release, the `releases/latest` URL still serves 0.8.0.
 > Use it only when you want exactly that. For a boat, see the status note at the top of this page.
 
 The installer checks the host before changing it. It may install Debian
@@ -341,10 +343,10 @@ Maintainers: how releases are built and signed is in the
 
 ```bash
 # defaults, plus the settings you name (repeat --set; names as in vesselstack.example.env)
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh \
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh \
   | sudo bash -s -- --yes --set BOAT_NAME=Foo --set SOCKETCAN_ENABLE=true
 # every question's own default answer, nothing asked
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash -s -- --defaults
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash -s -- --defaults
 # a ready-made vesselstack.env (optionally with --set overrides)
 sudo bash get-vesselstack.sh --yes --config ./vesselstack.env --set BOAT_NAME=Foo
 ```
@@ -494,8 +496,8 @@ script is wrapped in functions and ends with a single `main "$@"` call, so a
 truncated download cannot half-run. If you prefer to read it first (recommended):
 
 ```bash
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh
-curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh.sha256
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh
+curl -fsSLO https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh.sha256
 sha256sum -c get-vesselstack.sh.sha256
 less get-vesselstack.sh
 sudo bash get-vesselstack.sh
@@ -517,7 +519,7 @@ from the end-to-end guide:
 ```bash
 git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
-git checkout v0.9.0
+git checkout v0.9.1
 python3 vesselstack-wizard.py --cli     # terminal questions (no browser)
 # python3 vesselstack-wizard.py        # or the optional browser wizard
 ```
@@ -565,9 +567,15 @@ before carrying an update to a boat without internet access.
 ## Upgrading to 0.9.0
 
 Read this before updating an installed system. Update from [Updating](#updating) with a backup on a
-mounted external drive, not while underway. The installer takes a verified backup first. 0.9.0 is a
-pre-release and physical Raspberry Pi acceptance is pending: do not deploy it to a boat until the
+mounted external drive, not while underway. The installer takes a verified backup first. 0.9.1 is a
+pre-release and physical Raspberry Pi and display acceptance is pending: do not deploy it to a boat until the
 documented lab checks pass. The stable release is 0.8.0.
+
+0.9.1 is the release to install and to update to. 0.9.0 was published as a pre-release on 2026-11-16
+and cannot be installed with Docker Compose older than 2.35 (Debian's packaged 2.26.1 is one): the
+installer's check stopped with no reason shown and nothing was changed. 0.9.1 fixes that, and everything
+below applies to an update to 0.9.1 from 0.8.0 or earlier; from 0.9.0 there is nothing extra to do. See
+["Compose template validation failed"](#compose-template-validation-failed).
 
 **What you must know or do**
 
@@ -640,7 +648,7 @@ need a local `Host` name: reach Boat Chat through `127.0.0.1` or `localhost`, or
 **Verify after updating**
 
 ```bash
-cat /opt/vesselstack/config/installed-version     # 0.9.0
+cat /opt/vesselstack/config/installed-version     # 0.9.1
 sudo vesselstackctl doctor                        # RESULT healthy
 sudo vesselstackctl status
 ```
@@ -652,7 +660,7 @@ check that the banner says `NO DATA` when you stop the bridge during an alarm (t
 [hardware bring-up checklist](docs/DISPLAYS.md#hardware-bring-up-checklist-waveshare-esp32-s3-touch-lcd-28c)
 has the steps).
 
-**Rollback.** Downgrades are refused (`Downgrade from 0.9.0 to ... is not supported`). Restore the
+**Rollback.** Downgrades are refused (`Downgrade from 0.9.1 to ... is not supported`). Restore the
 verified pre-update backup instead:
 
 ```bash
@@ -722,7 +730,9 @@ firewall policy.
 - Raspberry Pi 4/5 with Raspberry Pi OS 64-bit, or Debian/Ubuntu with systemd
 - At least 4 GB RAM; 8 GB recommended for the full stack
 - SSD or NVMe storage strongly recommended
-- Docker Engine with Docker Compose v2
+- Docker Engine with Docker Compose v2. This release is checked with real Compose from 2.10.2 through the
+  current release, including 2.26.1 (the version Debian packages). The installer prints the version it
+  found and warns, without stopping, about an older one
 - Python 3 with `venv`
 - Existing Signal K server or a selected VesselStack Signal K install mode
 - Dedicated non-root service account
@@ -788,11 +798,11 @@ git clone https://github.com/jclima/VesselStack.git
 cd VesselStack
 ```
 
-To work from the 0.9.0 release, check out its tag:
+To work from the 0.9.1 release, check out its tag:
 
 ```bash
 git fetch --tags
-git checkout v0.9.0
+git checkout v0.9.1
 ```
 
 `v0.9.0` adds the restore recovery journal, unattended-operation settings, Telegram alerts, Tailscale remote access, Node-RED and the marine essentials bundle; see the [CHANGELOG](CHANGELOG.md). Once
@@ -801,12 +811,12 @@ with OpenSSH):
 
 ```bash
 git fetch --tags
-scripts/verify-release-tag.sh v0.9.0
+scripts/verify-release-tag.sh v0.9.1
 # maintainers and owners: also bind the tag to the commit you recorded when it was built
 # (the full 40-character SHA from your release notes, not one read back from the tag itself)
-scripts/verify-release-tag.sh v0.9.0 .github/allowed_signers "$RECORDED_COMMIT"
+scripts/verify-release-tag.sh v0.9.1 .github/allowed_signers "$RECORDED_COMMIT"
 # equivalent plain git command:
-git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.9.0
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v0.9.1
 ```
 
 The script prints the signer and key fingerprint, and exits non-zero for an unsigned,
@@ -920,7 +930,8 @@ sudo ./install.sh --config vesselstack.env --dry-run
 
 The dry run also validates the upgrade path from the installed version (so an
 unsupported upgrade or a downgrade is reported before anything is overwritten)
-and the Compose template. With `--offline` it also checks the wheelhouse and the
+and the Compose template. It prints one line with the Docker Compose version it found, and
+a warning if that is older than 2.10.2, the oldest version this release is checked with. With `--offline` it also checks the wheelhouse and the
 locally loaded container images (see Offline install).
 
 Resolve every error before continuing.
@@ -2565,7 +2576,7 @@ not mounted (see [Backups](#backups)).
 2. **Re-run the pinned release installer.** On the Pi, over `ssh -t`:
 
    ```bash
-   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
+   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
    ```
 
    The installer finds the installed system, never overwrites it silently, and offers
@@ -2578,7 +2589,7 @@ not mounted (see [Backups](#backups)).
    before anything is stopped, whether to mount it, pick a USB drive, check again, or back up
    to the system disk once (see [Backups](#backups)); `--yes` and `--defaults` never choose and
    the update stops with the reason. Plain `sudo vesselstackctl update` with no argument fails: the command needs the release
-   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.9.0`.
+   directory, for example `sudo vesselstackctl update /opt/vesselstack-release/0.9.1`.
    Without internet, use `--offline --bundle ...` as described under
    [Offline install](#offline-install-no-internet-on-the-boat).
 
@@ -2596,8 +2607,9 @@ not mounted (see [Backups](#backups)).
    commands at the same time. Transient updater files under `/var/lib/vesselstack` are not
    backed up; configuration and data are.
 
-| Installed version | Update to 0.9.0 |
+| Installed version | Update to 0.9.1 |
 |---|---|
+| 0.9.0 | Control Panel or the pinned installer (nothing extra; see [Upgrading to 0.9.0](#upgrading-to-090)) |
 | 0.8.0 | Control Panel or the pinned installer |
 | 0.7.0 to 0.7.1 | Control Panel or the pinned installer |
 | 0.6.0 to 0.6.4 | Control Panel or the pinned installer |
@@ -2605,11 +2617,11 @@ not mounted (see [Backups](#backups)).
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older) first |
 
-While 0.9.0 is a pre-release the Control Panel lists it only with **Include early test releases** ticked. The first update into 0.9.0 is run by the previous Control Panel, so **Finish this update** applies from the next update on.
+While 0.9.1 is a pre-release the Control Panel lists it only with **Include early test releases** ticked. The first update into 0.9.0 or 0.9.1 from an older release is run by the previous Control Panel, so **Finish this update** applies from the next update on.
 
-A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.9.0` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
+A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.9.1` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 
-Updating to 0.9.0 uses the full installer and preserves the verified-backup rollback path. The 0.6.4 installer replaced the `vesselstackctl` command atomically; retain that historical note when diagnosing an older upgrade.
+Updating to 0.9.1 uses the full installer and preserves the verified-backup rollback path. The 0.6.4 installer replaced the `vesselstackctl` command atomically; retain that historical note when diagnosing an older upgrade.
 
 **Rollback.** Downgrades are refused. If an update fails, the verified pre-update backup is
 kept. Check it and restore it during a maintenance window:
@@ -2625,7 +2637,7 @@ There is no automatic rollback. To update from a reviewed source checkout with
 ### Offline install (no internet on the boat)
 
 Prepare a bundle on a connected machine, carry it to the boat, and install with
-`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.9.0.tar.gz`.
+`sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle --tarball /path/to/vesselstack-0.9.1.tar.gz`.
 The bundle must be root-owned and not group/world-writable. Steps: [Updating and offline install](docs/UPDATING.md#offline-install-no-internet-on-the-boat).
 The bundle does not include Tailscale: [remote access](#remote-access-with-tailscale) needs internet to install, so run `sudo vesselstackctl remote enable` before going offline.
 
@@ -2670,6 +2682,29 @@ prints how to remove it (`docker volume rm vesselstack-esphome-cache`);
 
 Install the reported command and rerun `--dry-run`. Confirm `docker compose`
 works; the deprecated standalone `docker-compose` command is insufficient.
+
+### "Compose template validation failed"
+
+The installer checks the Compose template with `docker compose config` before it changes
+anything, and prints Docker Compose's own message under that heading, indented. Read that
+message: it names the setting or file at fault. Fix it, then rerun `--dry-run`. If it says
+"Docker Compose printed no message", run `docker compose version` and report both.
+
+- "WARN: Docker Compose ... is older than 2.10.2, the oldest version this release is checked with":
+  the installer continues. If the template check fails afterwards, the message under the heading is the
+  reason. To upgrade, install the Compose plugin from Docker's apt repository
+  (<https://docs.docker.com/engine/install/debian/>), then run
+  `sudo apt-get install --only-upgrade docker-compose-plugin`.
+- Release 0.9.0 only: on Docker Compose older than 2.35 (for example Debian's 2.26.1) the
+  check stopped with the heading and no reason, because 0.9.0 used a `config` option that
+  Compose gained in 2.35 and hid the error. Nothing was changed. 0.9.1 and newer use that option
+  only when the installed Compose has it, and otherwise check the same template with a
+  temporary, empty `nodered.env`. Update with 0.9.1 or newer; `docker compose version` shows
+  what you have.
+
+Continuous integration checks the template with real Docker Compose 2.10.2 and 2.26.1 (Docker's
+official `docker:20.10.17-cli` and `docker:26.0-cli` images, pinned by digest) in
+`tests/test-old-compose.sh`, so a feature newer than the oldest one fails the build.
 
 ### `doctor` shows power, watchdog, journal or scheduled-backup lines
 

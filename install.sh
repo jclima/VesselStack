@@ -573,6 +573,24 @@ for command in curl docker jq openssl python3 sed sha256sum install tar systemct
     command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 1; }
 done
 docker compose version >/dev/null || { echo "Docker Compose v2 is required" >&2; exit 1; }
+# The Compose template is checked with real Docker Compose releases from COMPOSE_OLDEST_CHECKED up to
+# the current one (tests/test-old-compose.sh). An older Compose is not refused: the template check
+# below prints the real reason if that Compose cannot read the template. Debian's own package reports a
+# suffix such as 2.26.1-4; only the leading numbers count.
+COMPOSE_OLDEST_CHECKED=2.10.2
+COMPOSE_VERSION=$(docker compose version --short 2>/dev/null || true)
+COMPOSE_VERSION=${COMPOSE_VERSION#v}
+if [[ "$COMPOSE_VERSION" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+    echo "Docker Compose $COMPOSE_VERSION found"
+    IFS=. read -r oldest_major oldest_minor oldest_patch <<<"$COMPOSE_OLDEST_CHECKED"
+    found_patch=${BASH_REMATCH[4]:-0}
+    if [ "$(printf '%05d%05d%05d' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$found_patch")" \
+        -lt "$(printf '%05d%05d%05d' "$oldest_major" "$oldest_minor" "$oldest_patch")" ]; then
+        echo "WARN: Docker Compose $COMPOSE_VERSION is older than $COMPOSE_OLDEST_CHECKED, the oldest version this release is checked with. The installer continues; if the check below fails, it prints why."
+    fi
+else
+    echo "Docker Compose found (version not recognised: ${COMPOSE_VERSION:-unknown})"
+fi
 id "$VESSELSTACK_USER" >/dev/null 2>&1 || { echo "User does not exist: $VESSELSTACK_USER" >&2; exit 1; }
 python3 - "$VESSELSTACK_ROOT" "$VESSELSTACK_DATA" "$VESSELSTACK_BACKUP" <<'PY'
 import pathlib
@@ -648,17 +666,51 @@ if ! "$SCRIPT_DIR/scripts/migrate.sh" --check "$CONFIG_FILE" "$(<"$SCRIPT_DIR/VE
     echo "Preflight failed: this release cannot be installed over the current installation (see above). Nothing was changed." >&2
     exit 1
 fi
+# `docker compose config --no-env-resolution` (Compose 2.35 and newer) validates without reading
+# `env_file` files. Older Compose has no such flag, so it is used only when `config --help` lists it.
+# Without it the same template and settings are validated with VESSELSTACK_ROOT pointing at a
+# temporary directory that holds an empty config/nodered.env: that file is the only thing the
+# template reads from the installed tree, and it does not exist yet when Node-RED is first enabled.
+# Nothing is created in the installed tree, so this is also safe for --dry-run.
+compose_config_help=$(docker compose config --help 2>&1 || true)
+COMPOSE_HAS_NO_ENV_RESOLUTION=false
+[[ "$compose_config_help" != *--no-env-resolution* ]] || COMPOSE_HAS_NO_ENV_RESOLUTION=true
 compose_template() {
     local -a version_env=()
     local version_key
     for version_key in "${COMPONENT_VERSION_KEYS[@]}"; do version_env+=("$version_key=${!version_key}"); done
+    [ -z "${COMPOSE_STUB_ROOT:-}" ] || version_env+=("VESSELSTACK_ROOT=$COMPOSE_STUB_ROOT")
     env "${version_env[@]}" \
         docker compose "${COMPOSE_PROFILES[@]}" --env-file "$CONFIG_FILE" \
         -f "$SCRIPT_DIR/templates/compose.yml" "$@"
 }
-compose_template config --no-env-resolution --quiet 2>/dev/null || {
-    echo "Compose template validation failed for this configuration:" >&2
-    compose_template config --quiet >&2 || true
+# Runs `config` once with the options given, keeps its stderr and prints it when the command fails:
+# the reason is never thrown away and no different command is run to find it. stdout is printed on
+# success only. Temporary files are removed before returning.
+compose_template_config() {
+    local err stub='' status=0 out
+    local -a flags=()
+    err=$(mktemp "${TMPDIR:-/tmp}/vesselstack-compose-config.XXXXXX") || return 1
+    if [ "$COMPOSE_HAS_NO_ENV_RESOLUTION" = true ]; then
+        flags=(--no-env-resolution)
+    else
+        stub=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-compose-check.XXXXXX") || { rm -f -- "$err"; return 1; }
+        install -d "$stub/config"
+        : > "$stub/config/nodered.env"
+    fi
+    out=$(COMPOSE_STUB_ROOT=$stub compose_template config "${flags[@]}" "$@" 2>"$err") || status=$?
+    if [ "$status" -ne 0 ]; then
+        {
+            echo "Compose template validation failed for this configuration (docker compose config $* exited $status):"
+            if [ -s "$err" ]; then sed 's/^/  /' "$err"; else echo "  Docker Compose printed no message."; fi
+        } >&2
+    fi
+    rm -rf -- "$err" "$stub"
+    [ "$status" -ne 0 ] || [ -z "$out" ] || printf '%s\n' "$out"
+    return "$status"
+}
+compose_template_config --quiet >/dev/null || {
+    echo "Nothing was changed." >&2
     exit 1
 }
 # Python packages are only ever installed from the hash-pinned lock shipped in the
@@ -691,9 +743,16 @@ if [ "$OFFLINE" = true ]; then
         echo "Offline install: the offline bundle did not verify; refusing to install from it. Nothing was changed." >&2
         exit 1
     }
-    mapfile -t required_images < <(
-        compose_template config --no-env-resolution --images | sort -u
-    )
+    # A failing `config --images` must stop the install with its own message, not yield an empty list.
+    required_images_text=$(compose_template_config --images) || {
+        echo "Offline install: the list of required container images could not be read. Nothing was changed." >&2
+        exit 1
+    }
+    mapfile -t required_images < <(printf '%s\n' "$required_images_text" | sort -u)
+    [ "${#required_images[@]}" -gt 0 ] && [ -n "${required_images[0]}" ] || {
+        echo "Offline install: Docker Compose listed no container images for this configuration. Nothing was changed." >&2
+        exit 1
+    }
     missing_images=()
     for image in "${required_images[@]}"; do
         docker image inspect "$image" >/dev/null 2>&1 || missing_images+=("$image")

@@ -71,8 +71,9 @@ Do not build and upload files by hand.
    pre-release and marked Latest after the maintainer's physical Raspberry Pi install passes
    (see the CHANGELOG).
    `v0.7.0`, `v0.7.1` and `v0.8.0` were published as regular releases (`v0.8.0` marked Latest) while
-   physical Raspberry Pi acceptance was still pending. `v0.9.0` is prepared as a pre-release, including the background restore, the recovery at boot and
-   the display alarm changes; physical Raspberry Pi acceptance is pending.
+   physical Raspberry Pi acceptance was still pending. `v0.9.0` was published as a pre-release on 2026-11-16 but cannot be installed with Docker Compose older than 2.35;
+   `v0.9.1` is prepared as the pre-release to test, including the background restore, the recovery at boot and
+   the display alarm changes. Physical Raspberry Pi and display acceptance is pending.
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate
@@ -92,7 +93,7 @@ Do not build and upload files by hand.
    says `arm64`), an upgrade from the previous release, and an offline
    upgrade. The test suites use stubs and cannot cover this. For a pre-release,
    publication may precede physical-Pi acceptance; record that acceptance is pending
-   (as for `0.5.7`, and now for `0.7.0`, `0.7.1`, `0.8.0` and `0.9.0`; see the status note in step 3). Complete the pinned installer
+   (as for `0.5.7`, and now for `0.7.0`, `0.7.1`, `0.8.0`, `0.9.0` and `0.9.1`; see the status note in step 3). Complete the pinned installer
    and component lifecycle recipe in [CONTROL_PANEL_TESTING.md](CONTROL_PANEL_TESTING.md)
    before any stable promotion.
 7. Publish the draft as a **pre-release** (or otherwise not latest) first, so
