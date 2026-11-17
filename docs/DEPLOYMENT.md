@@ -1,6 +1,6 @@
-# Deployment runbook: VesselStack 0.9.0 to a home-lab Pi and the boat Pi
+# Deployment runbook: VesselStack 0.9.1 to a home-lab Pi and the boat Pi
 
-This is an operator runbook for taking release 0.9.0 through two targets:
+This is an operator runbook for taking release 0.9.1 through two targets:
 
 1. **Home lab**: Raspberry Pi 4B, internet-connected, used for staging, a 48 h+
    soak and rehearsals (CAN replay through `vcan0`).
@@ -23,7 +23,7 @@ the scripts in this repository; where a thing does not exist the text says so.
 Related: [INSTALLATION.md](INSTALLATION.md) (hardware and first install),
 [README.md](../README.md) (reference for every variable and command).
 
-0.9.0 release status: this branch prepares `v0.9.0` as a pre-release. It is not Latest and physical Raspberry Pi acceptance is pending; signing, publication and the section 7 acceptance gate remain release-owner steps.
+0.9.1 release status: this branch prepares `v0.9.1` as a pre-release. It is not Latest and physical Raspberry Pi and display acceptance is pending. `v0.9.0` cannot be installed with Docker Compose older than 2.35; use 0.9.1. Signing, publication and the section 7 acceptance gate remain release-owner steps.
 
 History: `v0.5.7` was published as an unsigned lab pre-release that was not marked latest, and
 `v0.4.4` stayed the release GitHub marks Latest through the 0.5.x series. The `v0.5.1` tag is
@@ -45,7 +45,7 @@ carrying bundles, rollback and the acceptance checklist.
 **Home lab (internet-connected Pi).** On the Pi:
 
 ```bash
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
 ```
 
 (`.../releases/latest/download/get-vesselstack.sh` points to whichever release GitHub marks Latest, which may not be 0.9.0; use the pinned URL above.)
@@ -64,7 +64,7 @@ read it, then `sudo bash get-vesselstack.sh`. Without questions (scripts, no ter
 browser wizard instead of the terminal questions.
 
 **Boat (offline Pi).** The boat has no internet, so carry the files in (section 4):
-`get-vesselstack.sh`, `vesselstack-0.9.0.tar.gz` with its `.sha256`, and the
+`get-vesselstack.sh`, `vesselstack-0.9.1.tar.gz` with its `.sha256`, and the
 offline bundle (copy the bundle root-owned, `chmod -R go-w`). Install Docker and
 the apt prerequisites while the Pi still has internet (the script cannot install
 packages offline and tells you what is missing), then:
@@ -75,7 +75,7 @@ offline plugin or bridge-virtualenv installation.
 
 ```bash
 sudo bash get-vesselstack.sh --offline --bundle /path/to/offline-bundle \
-  --tarball /path/to/vesselstack-0.9.0.tar.gz
+  --tarball /path/to/vesselstack-0.9.1.tar.gz
 ```
 
 It verifies the tarball checksum and the bundle (`prepare-offline-bundle.sh
@@ -95,7 +95,7 @@ uname -m                            # must print aarch64
 dpkg --print-architecture           # must print arm64
 python3 --version                   # 3.11+ (the lock covers 3.11-3.13)
 docker --version
-docker compose version              # must be Compose v2
+docker compose version              # Compose v2; this release is checked from 2.10.2 through the current release
 systemctl is-active docker
 id boat                             # service account (VESSELSTACK_USER); create per INSTALLATION.md if absent
 df -h / /opt /var/backups           # >= 1 GiB free for data is the doctor FAIL threshold; plan far more
@@ -237,22 +237,22 @@ hatch; never set it on the boat. The boat has no route to `origin`, so
 `vesselstack-update` is not the boat's update path; leave it unconfigured there
 unless you later add a connection you trust.
 
-Once `v0.9.0` is published, do not recreate or move the tag. On the maintainer
+Once `v0.9.1` is published, do not recreate or move the tag. On the maintainer
 machine, verify that the published tag points at the intended merged commit;
 do not force-fetch or overwrite a published tag:
 
 ```bash
 git fetch origin main --tags
-git show --no-patch --decorate v0.9.0
-git rev-parse v0.9.0^{commit}
-git merge-base --is-ancestor v0.9.0^{commit} origin/main
+git show --no-patch --decorate v0.9.1
+git rev-parse v0.9.1^{commit}
+git merge-base --is-ancestor v0.9.1^{commit} origin/main
 ```
 
-Then verify the signature with `scripts/verify-release-tag.sh v0.9.0` and claim success only
+Then verify the signature with `scripts/verify-release-tag.sh v0.9.1` and claim success only
 for a tag that passes it. When you have the commit recorded from the build output in section 2
 (`commit <sha>`, kept in your notes), bind the tag to it:
-`scripts/verify-release-tag.sh v0.9.0 .github/allowed_signers "$RECORDED_COMMIT"` (full SHA;
-abbreviations are refused). Do not take the value from `git rev-parse v0.9.0^{commit}`, which
+`scripts/verify-release-tag.sh v0.9.1 .github/allowed_signers "$RECORDED_COMMIT"` (full SHA;
+abbreviations are refused). Do not take the value from `git rev-parse v0.9.1^{commit}`, which
 would only compare the tag with itself. Follow the tag-creation and signing gates in
 [DEVELOPMENT.md](DEVELOPMENT.md#release-checklist).
 
@@ -269,29 +269,29 @@ From a clean clone, so no stray files can matter (`build-package.sh` packages
 
 ```bash
 git clone https://github.com/jclima/VesselStack.git vs-release && cd vs-release
-git checkout v0.9.0
-cat VERSION                                  # 0.9.0
+git checkout v0.9.1
+cat VERSION                                  # 0.9.1
 VESSELSTACK_BUILD_REQUIRE_CLEAN=true ./build-package.sh
 ```
 
-It writes `generated/vesselstack-0.9.0.tar.gz` and
-`generated/vesselstack-0.9.0.tar.gz.sha256`, and prints the sha256 and
+It writes `generated/vesselstack-0.9.1.tar.gz` and
+`generated/vesselstack-0.9.1.tar.gz.sha256`, and prints the sha256 and
 `commit <sha>`. **Record both values** in your release notes (out of band from
 the tarball): they are the boat's acceptance check.
 
 ```bash
-git rev-parse v0.9.0^{commit}                # must equal the printed commit
-tar -tzf generated/vesselstack-0.9.0.tar.gz | head -20
-tar -xzOf generated/vesselstack-0.9.0.tar.gz vesselstack-0.9.0/COMMIT
-tar -xzOf generated/vesselstack-0.9.0.tar.gz vesselstack-0.9.0/BUILD_INFO
-tar -tzf generated/vesselstack-0.9.0.tar.gz | grep -E '\.env$|boat_facts|\.venv|memory/|data/' \
+git rev-parse v0.9.1^{commit}                # must equal the printed commit
+tar -tzf generated/vesselstack-0.9.1.tar.gz | head -20
+tar -xzOf generated/vesselstack-0.9.1.tar.gz vesselstack-0.9.1/COMMIT
+tar -xzOf generated/vesselstack-0.9.1.tar.gz vesselstack-0.9.1/BUILD_INFO
+tar -tzf generated/vesselstack-0.9.1.tar.gz | grep -E '\.env$|boat_facts|\.venv|memory/|data/' \
   || echo "no private artifacts"
 python3 scripts/check-public-tree.py
 ```
 
 (`vesselstack.example.env` is expected in the listing; a real `*.env` is not.)
 `scripts/update-requirements-lock.sh` is for maintainers when
-`boat-chat/requirements.txt` changes; for an unchanged 0.9.0 the lock ships in
+`boat-chat/requirements.txt` changes; for an unchanged 0.9.1 the lock ships in
 the tarball and you do not run it.
 
 ## 3. Home lab (Pi 4B, connected)
@@ -301,14 +301,14 @@ the tarball and you do not run it.
 Copy the tarball to the lab Pi, check it, unpack it root-owned:
 
 ```bash
-scp generated/vesselstack-0.9.0.tar.gz* YOUR_USER@LAB_PI:~/
+scp generated/vesselstack-0.9.1.tar.gz* YOUR_USER@LAB_PI:~/
 # on LAB_PI:
-sha256sum -c vesselstack-0.9.0.tar.gz.sha256        # [read-only]
+sha256sum -c vesselstack-0.9.1.tar.gz.sha256        # [read-only]
 sudo install -d -m 0755 /var/lib/vesselstack/releases       # [MUTATES HOST]
-sudo tar -xzf vesselstack-0.9.0.tar.gz -C /var/lib/vesselstack/releases --no-same-owner
-sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-0.9.0
-sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-0.9.0
-cd /var/lib/vesselstack/releases/vesselstack-0.9.0
+sudo tar -xzf vesselstack-0.9.1.tar.gz -C /var/lib/vesselstack/releases --no-same-owner
+sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-0.9.1
+sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-0.9.1
+cd /var/lib/vesselstack/releases/vesselstack-0.9.1
 ```
 
 Configuration: either the terminal wizard (`python3 vesselstack-wizard.py --cli --output ~/vesselstack-lab.env`, over plain
@@ -349,7 +349,7 @@ sudo ./install.sh --config ~/vesselstack-lab.env             # [MUTATES HOST] re
 sudo ./install.sh --config ~/vesselstack-lab.env --start     # [MUTATES HOST] pulls images, starts stack
 sudo vesselstackctl doctor
 sudo vesselstackctl urls
-cat /opt/vesselstack/config/installed-version                # 0.9.0
+cat /opt/vesselstack/config/installed-version                # 0.9.1
 ```
 
 ### 3.2 Replay a private CAN log
@@ -408,7 +408,7 @@ values, and record the `doctor` result and data-directory size each day.
 1. **Update from the previous version.** On a spare lab install (or before the
    soak), install the previous release `v0.8.0` the normal way, with its pinned
    installer (as README [Quick start](../README.md#quick-start-one-command-on-the-raspberry-pi)
-   shows for a pinned version), then update with 0.9.0 from the unpacked release directory.
+   shows for a pinned version), then update with 0.9.1 from the unpacked release directory.
    The update's own verified backup (below) is the one to keep for the restore
    rehearsals in section 7:
 
@@ -419,7 +419,7 @@ values, and record the `doctor` result and data-directory size each day.
    Then:
 
    ```bash
-   sudo vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.0   # [MUTATES HOST]
+   sudo vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.1   # [MUTATES HOST]
    ```
 
    It runs `install.sh --dry-run`, takes a verified backup into
@@ -467,7 +467,7 @@ values, and record the `doctor` result and data-directory size each day.
    sudo chown -R root:root offline-bundle && sudo chmod -R go-w offline-bundle
    sudo scripts/prepare-offline-bundle.sh --load /path/to/offline-bundle   # docker load
    sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/path/to/offline-bundle/wheelhouse \
-     vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.0
+     vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.1
    ```
 
    The bundle path and **every parent** must be root-owned and not
@@ -562,8 +562,8 @@ Assemble one directory on the connected machine; transfer it as a unit:
 
 | File | Source |
 | --- | --- |
-| `vesselstack-0.9.0.tar.gz` | `./build-package.sh` |
-| `vesselstack-0.9.0.tar.gz.sha256` | same run |
+| `vesselstack-0.9.1.tar.gz` | `./build-package.sh` |
+| `vesselstack-0.9.1.tar.gz.sha256` | same run |
 | `offline-bundle/` (`wheelhouse/`, `images/`, `BUNDLE_INFO`, `MANIFEST.sha256`) | `scripts/prepare-offline-bundle.sh --output ./offline-bundle` |
 | Release notes with the recorded sha256 + commit | your notes, **kept separately** |
 
@@ -614,19 +614,19 @@ backup, the recorded sha256 and a console/Ethernet path ready.
    your notes, not with the `.sha256` file that travelled with it):
 
    ```bash
-   sha256sum ~/carry/vesselstack-0.9.0.tar.gz     # must equal the recorded value
+   sha256sum ~/carry/vesselstack-0.9.1.tar.gz     # must equal the recorded value
    ```
 
 3. **Stage root-owned [MUTATES HOST].**
 
    ```bash
    sudo install -d -m 0755 /var/lib/vesselstack/releases
-   sudo tar -xzf ~/carry/vesselstack-0.9.0.tar.gz -C /var/lib/vesselstack/releases --no-same-owner
+   sudo tar -xzf ~/carry/vesselstack-0.9.1.tar.gz -C /var/lib/vesselstack/releases --no-same-owner
    sudo cp -a ~/carry/offline-bundle /var/lib/vesselstack/releases/
-   sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-0.9.0 /var/lib/vesselstack/releases/offline-bundle
-   sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-0.9.0 /var/lib/vesselstack/releases/offline-bundle
-   cat /var/lib/vesselstack/releases/vesselstack-0.9.0/COMMIT       # matches recorded commit
-   sudo /var/lib/vesselstack/releases/vesselstack-0.9.0/scripts/prepare-offline-bundle.sh \
+   sudo chown -R root:root /var/lib/vesselstack/releases/vesselstack-0.9.1 /var/lib/vesselstack/releases/offline-bundle
+   sudo chmod -R go-w /var/lib/vesselstack/releases/vesselstack-0.9.1 /var/lib/vesselstack/releases/offline-bundle
+   cat /var/lib/vesselstack/releases/vesselstack-0.9.1/COMMIT       # matches recorded commit
+   sudo /var/lib/vesselstack/releases/vesselstack-0.9.1/scripts/prepare-offline-bundle.sh \
      --verify /var/lib/vesselstack/releases/offline-bundle           # [read-only]
    ```
 
@@ -635,16 +635,16 @@ backup, the recorded sha256 and a console/Ethernet path ready.
    boat uses:
 
    ```bash
-   sudo /var/lib/vesselstack/releases/vesselstack-0.9.0/scripts/prepare-offline-bundle.sh \
+   sudo /var/lib/vesselstack/releases/vesselstack-0.9.1/scripts/prepare-offline-bundle.sh \
      --load /var/lib/vesselstack/releases/offline-bundle      # verifies, then docker load
    sudo VESSELSTACK_OFFLINE=true VESSELSTACK_WHEELHOUSE=/var/lib/vesselstack/releases/offline-bundle/wheelhouse \
-     vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.0
+     vesselstackctl update /var/lib/vesselstack/releases/vesselstack-0.9.1
    ```
 
 5. **Verify.**
 
    ```bash
-   cat /opt/vesselstack/config/installed-version     # 0.9.0
+   cat /opt/vesselstack/config/installed-version     # 0.9.1
    sudo vesselstackctl doctor                        # RESULT healthy
    sudo reboot
    # after reconnecting:
@@ -723,12 +723,12 @@ the next boot rolls an interrupted restore back by itself (README
 
 ## 7. Acceptance checklist
 
-- [ ] Release `v0.9.0`: tag signature verified (`scripts/verify-release-tag.sh v0.9.0 .github/allowed_signers "$RECORDED_COMMIT"`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
+- [ ] Release `v0.9.1`: tag signature verified (`scripts/verify-release-tag.sh v0.9.1 .github/allowed_signers "$RECORDED_COMMIT"`) and Latest status recorded in the CHANGELOG; CI asset sha256 and commit recorded.
 - [ ] Lab: 48 h+ soak with daily `doctor` healthy; replay data visible in Grafana.
 - [ ] Lab: update from 0.8.0, backup/verify/restore (including a background restore whose SSH client is killed, then `restore --status --follow`; section 3.5.2), and offline install rehearsed.
 - [ ] Boat: sha256 of the carried tarball equals the recorded value.
 - [ ] Boat: verified backup exists on separate media and a copy is off the Pi.
-- [ ] Boat: `installed-version` is `0.9.0`; `doctor` healthy before and after reboot.
+- [ ] Boat: `installed-version` is `0.9.1`; `doctor` healthy before and after reboot.
 - [ ] Boat: `can0` RX counter increases, error/dropped counters flat.
 - [ ] Boat: tokens are per-host; no lab secrets copied; Control Panel reached by tunnel only.
 

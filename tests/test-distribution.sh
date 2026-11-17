@@ -7,7 +7,7 @@ bash -n "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-inf
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
-    "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
+    "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" "$ROOT/tests/test-old-compose.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-nodered-dashboard-auth.sh" \
     "$ROOT/tests/test-displays-envfile-systemd.sh" "$ROOT/scripts/install-displays-venv.sh" \
@@ -35,7 +35,7 @@ shellcheck "$ROOT/install.sh" "$ROOT/build-package.sh" "$ROOT/scripts/bootstrap-
     "$ROOT/scripts/vesselstackctl" "$ROOT/scripts/install-signalk-native.sh" \
     "$ROOT/scripts/configure-hardware.sh" "$ROOT/scripts/vesselstack-firewall" \
     "$ROOT/scripts/migrate.sh" "$ROOT/scripts/memory-index.sh" "$ROOT/tests/test-migrations.sh" \
-    "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" \
+    "$ROOT/tests/test-clean-install.sh" "$ROOT/tests/test-image-manifests.sh" "$ROOT/tests/test-old-compose.sh" \
     "$ROOT/tests/test-service-integration.sh" "$ROOT/tests/test-displays-mosquitto.sh" \
     "$ROOT/tests/test-displays-bridge.sh" "$ROOT/tests/test-lifecycle.sh" "$ROOT/tests/test-remote.sh" "$ROOT/tests/test-nodered-dashboard-auth.sh" \
     "$ROOT/tests/test-mosquitto-upgrade.sh" "$ROOT/tests/test-displays-envfile-systemd.sh" \

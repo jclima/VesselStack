@@ -73,6 +73,8 @@ jobs:
         run: docker compose --env-file vesselstack.example.env -f templates/compose.yml config --quiet
       - name: Validate optional Compose profiles
         run: docker compose --profile signalk --profile ais --profile metrics --profile nodered --env-file vesselstack.example.env -f templates/compose.yml config --quiet --no-env-resolution
+      - name: Validate the Compose template with Docker Compose 2.10.2 and 2.26.1 (official CLI images, pinned)
+        run: tests/test-old-compose.sh
       - name: Validate Linux ARM64 image manifests
         run: tests/test-image-manifests.sh
       - name: Run all Python regressions

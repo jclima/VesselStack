@@ -60,6 +60,39 @@ export FAKE_COMPOSE_UP_FAIL=0
 cat > "$FAKE_BIN/docker" <<'EOF2'
 #!/bin/bash
 echo "$*" >> "$TEST_ROOT/docker.log"
+# Docker Compose behaviour knobs: FAKE_COMPOSE_VERSION (default 2.40.0); FAKE_COMPOSE_OLD=1 behaves like
+# Compose before 2.35 (no `config --no-env-resolution`: "unknown flag", exit 16, and an enabled nodered profile
+# needs $VESSELSTACK_ROOT/config/nodered.env to exist); FAKE_COMPOSE_CONFIG_FAIL=<message> makes every
+# `config` fail with that message.
+if [ "${1:-}" = compose ]; then
+    if [ "${2:-}" = version ]; then
+        if [ "${3:-}" = --short ]; then echo "${FAKE_COMPOSE_VERSION:-2.40.0}"; else echo "Docker Compose version v${FAKE_COMPOSE_VERSION:-2.40.0}"; fi
+        exit 0
+    fi
+    if [ "${2:-}" = config ] && [ "${3:-}" = --help ]; then
+        echo "Usage:  docker compose config [OPTIONS] [SERVICE...]"
+        echo "      --images   Print the image names, one per line."
+        [ -n "${FAKE_COMPOSE_OLD:-}" ] || echo "      --no-env-resolution   Don't resolve service env files"
+        exit 0
+    fi
+    if [[ " $* " == *" config "* ]]; then
+        if [ -n "${FAKE_COMPOSE_OLD:-}" ] && [[ " $* " == *" --no-env-resolution "* ]]; then
+            echo "unknown flag: --no-env-resolution" >&2; exit 16
+        fi
+        if [ -n "${FAKE_COMPOSE_CONFIG_FAIL:-}" ]; then echo "$FAKE_COMPOSE_CONFIG_FAIL" >&2; exit 15; fi
+        if [ -n "${FAKE_COMPOSE_IMAGES_FAIL:-}" ] && [[ " $* " == *" --images "* ]]; then echo "$FAKE_COMPOSE_IMAGES_FAIL" >&2; exit 15; fi
+        if [ -n "${FAKE_COMPOSE_OLD:-}" ] && [[ " $* " == *" --profile nodered "* ]]; then
+            fake_root=${VESSELSTACK_ROOT:-}
+            if [ -z "$fake_root" ]; then
+                fake_args=("$@")
+                for ((fake_i = 0; fake_i < ${#fake_args[@]}; fake_i++)); do
+                    [ "${fake_args[$fake_i]}" = --env-file ] && fake_root=$(sed -n 's/^VESSELSTACK_ROOT="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "${fake_args[$((fake_i + 1))]}")
+                done
+            fi
+            [ -f "$fake_root/config/nodered.env" ] || { echo "env file $fake_root/config/nodered.env not found: stat $fake_root/config/nodered.env: no such file or directory" >&2; exit 14; }
+        fi
+    fi
+fi
 if [ "${FAKE_COMPOSE_UP_FAIL:-0}" = 1 ] && [ "${1:-}" = compose ] && [[ " $* " == *" up "* ]]; then echo "simulated compose up failure" >&2; exit 1; fi
 if [ "${FAKE_PROMETHEUS_RECREATE_FAIL:-0}" = 1 ] && [[ " $* " == *" --force-recreate prometheus "* ]]; then
     exit 42
@@ -309,6 +342,18 @@ grep -q 'Offline mode' "$TEST_ROOT/out"
 grep -q 'eclipse-mosquitto:2.1.2-alpine' "$TEST_ROOT/err"
 grep -q 'prepare-offline-bundle.sh --load' "$TEST_ROOT/err"
 grep -q 'docker load' "$TEST_ROOT/err"
+# Old Compose (no --no-env-resolution, Debian's 2.26.1-4) lists exactly the same images, and the dry run passes.
+sed -n '/not present locally/,/^Load them/p' "$TEST_ROOT/err" > "$TEST_ROOT/images-new-compose"
+test -s "$TEST_ROOT/images-new-compose" || fail "no missing-image list printed"
+FAKE_COMPOSE_OLD=1 FAKE_COMPOSE_VERSION=2.26.1-4 installer --offline --dry-run >"$TEST_ROOT/out" 2>"$TEST_ROOT/err" || { cat "$TEST_ROOT/err" >&2; fail "offline dry run failed on old Compose"; }
+grep -q 'Preflight passed' "$TEST_ROOT/out"
+grep -q 'Docker Compose 2.26.1-4 found' "$TEST_ROOT/out"
+sed -n '/not present locally/,/^Load them/p' "$TEST_ROOT/err" > "$TEST_ROOT/images-old-compose"
+cmp "$TEST_ROOT/images-new-compose" "$TEST_ROOT/images-old-compose" || fail "old and new Compose list different images"
+# A failing `config --images` stops the check with Compose's own message, never an empty list.
+if FAKE_COMPOSE_IMAGES_FAIL='simulated config --images failure' installer --offline --dry-run >"$TEST_ROOT/out" 2>"$TEST_ROOT/err"; then fail "a failing config --images was ignored"; fi
+grep -q 'simulated config --images failure' "$TEST_ROOT/err" || fail "the config --images reason was not printed"
+grep -q 'list of required container images could not be read' "$TEST_ROOT/err"
 # Services cannot start without images: fail before touching anything.
 if installer --offline --start >/dev/null 2>"$TEST_ROOT/err"; then fail "--offline --start accepted missing images"; fi
 grep -q 'influxdb:2.9.1' "$TEST_ROOT/err"

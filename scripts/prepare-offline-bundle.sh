@@ -58,9 +58,33 @@ check_manifest() {
 }
 
 image_list() {
-    # The Mosquitto image that hashes the broker passwords is the compose one.
-    docker compose --profile signalk --profile ais --profile metrics --profile nodered --env-file "$ROOT/vesselstack.example.env" \
-        -f "$ROOT/templates/compose.yml" config --no-env-resolution --images | sort -u
+    # The Mosquitto image that hashes the broker passwords is the compose one. `config --no-env-resolution`
+    # (Docker Compose 2.35 and newer) skips the env_file files; older Compose has no such flag, so the same
+    # template is read with VESSELSTACK_ROOT pointing at a temporary directory holding an empty
+    # config/nodered.env (the only installed file the template reads). This matches install.sh.
+    local help out err stub='' status=0
+    local -a flags=() root_env=()
+    help=$(docker compose config --help 2>&1 || true)
+    if [[ "$help" == *--no-env-resolution* ]]; then
+        flags=(--no-env-resolution)
+    else
+        stub=$(mktemp -d "${TMPDIR:-/tmp}/vesselstack-compose-check.XXXXXX")
+        install -d "$stub/config"
+        : > "$stub/config/nodered.env"
+        root_env=("VESSELSTACK_ROOT=$stub")
+    fi
+    err=$(mktemp "${TMPDIR:-/tmp}/vesselstack-compose-config.XXXXXX")
+    out=$(env "${root_env[@]}" docker compose --profile signalk --profile ais --profile metrics --profile nodered \
+        --env-file "$ROOT/vesselstack.example.env" -f "$ROOT/templates/compose.yml" config "${flags[@]}" --images 2>"$err") || status=$?
+    if [ "$status" -ne 0 ]; then
+        {
+            echo "Could not list the container images (docker compose config --images exited $status):"
+            if [ -s "$err" ]; then sed 's/^/  /' "$err"; else echo "  Docker Compose printed no message."; fi
+        } >&2
+    fi
+    rm -rf -- "$err" "$stub"
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$out" | sort -u
 }
 
 sha256_only() { sha256_of "$1" | cut -d' ' -f1; }

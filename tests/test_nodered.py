@@ -54,8 +54,9 @@ class ComposeTests(unittest.TestCase):
         self.assertIn('"${NODERED_BIND_ADDRESS:-127.0.0.1}:${NODERED_PORT:-1880}:1880"', block)
         self.assertIn('"host.docker.internal:host-gateway"', block)
         self.assertIn("${VESSELSTACK_DATA}/node-red:/data", block)
-        self.assertIn("required: true", block)  # compose refuses to start it unprepared
-        self.assertNotIn("required: false", block)
+        # The short env_file form (read by every Compose 2); the file is required, so compose refuses to start it unprepared.
+        self.assertRegex(block, r"env_file:\n      - \$\{VESSELSTACK_ROOT\}/config/nodered\.env\n")
+        self.assertNotIn("required:", block)
         # Fail closed: root-owned settings mounted read-only and passed explicitly.
         self.assertIn('command: ["--settings", "/vesselstack/settings.js"]', block)
         self.assertIn("source: ${VESSELSTACK_ROOT}/config/node-red/settings.js", block)
@@ -71,7 +72,20 @@ class ComposeTests(unittest.TestCase):
         env = ROOT / "vesselstack.example.env"
         base = ["docker", "compose", "--env-file", str(env), "-f", str(ROOT / "templates" / "compose.yml")]
         off = subprocess.run(base + ["config", "--services"], capture_output=True, text=True)
-        on = subprocess.run(base + ["--profile", "nodered", "config", "--no-env-resolution", "--services"], capture_output=True, text=True)
+        # `--no-env-resolution` needs Docker Compose 2.35; older Compose reads the env_file, so give it a
+        # root that holds an empty config/nodered.env (the same approach as install.sh).
+        helptext = subprocess.run(["docker", "compose", "config", "--help"], capture_output=True, text=True)
+        flags, run_env = [], None
+        stub = tempfile.TemporaryDirectory()
+        self.addCleanup(stub.cleanup)
+        if "--no-env-resolution" in helptext.stdout + helptext.stderr:
+            flags = ["--no-env-resolution"]
+        else:
+            (Path(stub.name) / "config").mkdir()
+            (Path(stub.name) / "config" / "nodered.env").write_text("")
+            run_env = {**os.environ, "VESSELSTACK_ROOT": stub.name}
+        on = subprocess.run(base + ["--profile", "nodered", "config", *flags, "--services"],
+                            capture_output=True, text=True, env=run_env)
         if off.returncode != 0:
             self.skipTest("docker compose is not usable here: " + off.stderr[:80])
         self.assertNotIn("nodered", off.stdout.split())

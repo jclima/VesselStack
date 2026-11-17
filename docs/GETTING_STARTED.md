@@ -41,23 +41,25 @@ installer. `-t` gives the session a terminal so the installer can ask questions:
 
 ```bash
 ssh -t YOUR_USER@raspberrypi.local
-curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
+curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
 ```
 
-The URL pins release `v0.9.0`, so it installs that release whatever GitHub marks as Latest
-(`--version 0.9.0` selects the same release). The form `.../releases/latest/download/get-vesselstack.sh`
+The URL pins release `v0.9.1`, so it installs that release whatever GitHub marks as Latest
+(`--version 0.9.1` selects the same release). The form `.../releases/latest/download/get-vesselstack.sh`
 points to whichever release GitHub marks Latest, which is not necessarily the newest one. For a
 lab Pi and an offline boat, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 
-**0.9.0 is a pre-release.** Physical Raspberry Pi acceptance is still pending, and the stable Latest
-release is 0.8.0. Use the command above on a lab Pi. For a boat, install 0.8.0 until 0.9.0 is promoted:
+**0.9.1 is a pre-release.** Physical Raspberry Pi and display acceptance is still pending, and the stable Latest
+release is 0.8.0. Use the command above on a lab Pi. For a boat, install 0.8.0 until 0.9.1 is promoted.
+0.9.0 cannot be installed with Docker Compose older than 2.35: use 0.9.1.
 
 ```bash
 curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
 ```
 
 The script checks the host first. It asks before installing missing Debian
-packages or Docker Engine and Compose v2 from Docker's official apt repository,
+packages or Docker Engine and Compose v2 from Docker's official apt repository
+(this release is checked with Compose 2.10.2 through the current release),
 then downloads and checksum-verifies VesselStack, asks configuration questions,
 and shows a review before starting. It needs `sudo` because it changes system
 packages, services, and protected directories. Re-running an existing install

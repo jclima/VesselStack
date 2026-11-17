@@ -2,7 +2,7 @@
 # VesselStack guided installer (bootstrap).
 #
 #   curl -fsSL https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh | sudo bash
-#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.0/get-vesselstack.sh | sudo bash
+#   curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
 #
 # Cautious alternative: download it, read it, then run it.
 #   curl -fsSLO https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh
@@ -15,6 +15,7 @@
 # asks its configuration questions in the terminal (works over plain SSH, no browser), and
 # then runs install.sh (--dry-run first). Re-running is safe. Options: see --help.
 # Without a terminal (or to script it): --yes, --defaults, --set KEY=VALUE, --config FILE.
+# This release is checked with real Docker Compose from 2.10.2 through the current release.
 #
 # The whole script is wrapped in functions and ends with a single `main "$@"`
 # line, so a truncated download cannot half-execute.
@@ -24,7 +25,7 @@ set -euo pipefail
 umask 022
 
 # Baked from VERSION by build-package.sh (and checked by tests/test-distribution.sh).
-DEFAULT_VERSION="0.9.0"
+DEFAULT_VERSION="0.9.1"
 GITHUB_RELEASES="https://github.com/jclima/VesselStack/releases/download"
 APT_PACKAGES=(ca-certificates curl jq openssl python3 python3-venv rsync tar gzip)
 

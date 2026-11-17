@@ -3,7 +3,49 @@
 All notable changes to VesselStack are documented here. The project follows
 Semantic Versioning.
 
+## 0.9.1 - 2026-11-16
+
+Fixes an install or update that stopped at the installer's check with no reason shown on Docker
+Compose older than 2.35. It is a pre-release.
+
+- **What was wrong.** 0.9.0 failed to install or update on Docker Compose older than 2.35, which
+  includes Debian's packaged Compose 2.26. The installer's check stopped with "Compose template
+  validation failed for this configuration:" and nothing after it. 0.9.0 used `docker compose
+  config --no-env-resolution`, an option Compose gained in 2.35, and then hid Compose's error
+  message. Nothing was changed on those systems. The option was added so that the check does not
+  need `config/nodered.env`, which does not exist yet when Node-RED is first enabled.
+- **What changed.**
+  - The installer asks Compose whether it has that option and uses it only then. On older Compose
+    it checks the same template and settings with an empty temporary `nodered.env`. Nothing is
+    created in the installed tree, also with `--dry-run`, and the temporary files are removed. The
+    offline image list and `scripts/prepare-offline-bundle.sh` do the same.
+  - If a check fails, the installer prints Compose's own message and no longer runs a different
+    command to find it. A failing image list no longer turns into an empty list.
+  - The Node-RED env file in `templates/compose.yml` uses the short `env_file` form, so Compose 2.10.2
+    and newer can read the template. The file is still required: with the Node-RED profile on and
+    the file missing, Compose refuses to start.
+  - The installer prints the Docker Compose version it found, for example `Docker Compose 2.26.1
+    found`. A Compose older than 2.10.2, the oldest version this release is checked with, only
+    gets a warning; the check that follows prints the reason if that Compose cannot read the
+    template.
+  - Continuous integration now checks the template with real Docker Compose 2.10.2 and 2.26.1
+    (Docker's official CLI images, pinned by digest). It was also run by hand on 2.14.0, 2.16.0,
+    2.17.3, 2.21.0, 2.22.0, 2.23.0, 2.24.2, 2.29.0 and 5.7.1.
+- **Upgrade notes.** From 0.8.0, everything in the 0.9.0 upgrade notes applies; 0.9.1 is the release
+  to install. From 0.9.0, nothing extra: update with the pinned installer or the Control Panel.
+- **Operational impact.** None at runtime and no state change. Systems with Compose older than 2.35
+  that failed at the check can now install or update.
+- **Verify.** Run `docker compose version`, then run the update (or `sudo ./install.sh --config
+  vesselstack.env --dry-run`) and look for the `Docker Compose ... found` line and `Preflight
+  passed`. After the update, `cat /opt/vesselstack/config/installed-version` prints `0.9.1`.
+- **Rollback.** The failed 0.9.0 check changed nothing. To go back after a 0.9.1 update, restore the
+  verified pre-update backup (downgrades are refused); the fix itself changes no setting or data.
+- **Release status.** Pre-release. Physical Raspberry Pi and display acceptance is pending; boats
+  stay on 0.8.0, the stable release.
+
 ## 0.9.0 - 2026-11-15
+
+Superseded by 0.9.1: 0.9.0 cannot be installed with Docker Compose older than 2.35.
 
 This release makes restore recoverable, lets a boat run unattended, and adds Telegram alerts,
 Tailscale remote access, Node-RED and a marine essentials bundle. It also makes the alarm banner

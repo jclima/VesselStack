@@ -3,11 +3,22 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-mapfile -t images < <(
-    docker compose --profile signalk --profile ais --profile metrics --profile nodered \
+# `config --no-env-resolution` exists from Docker Compose 2.35; older Compose reads the Node-RED env_file, so
+# it is pointed at a temporary root with an empty config/nodered.env (same as install.sh).
+compose_flags=(); compose_stub=
+if [[ "$(docker compose config --help 2>&1 || true)" == *--no-env-resolution* ]]; then
+    compose_flags=(--no-env-resolution)
+else
+    compose_stub=$(mktemp -d)
+    install -d "$compose_stub/config"; : > "$compose_stub/config/nodered.env"
+fi
+images_text=$(
+    ${compose_stub:+env VESSELSTACK_ROOT="$compose_stub"} docker compose --profile signalk --profile ais --profile metrics --profile nodered \
         --env-file "$ROOT/vesselstack.example.env" \
-        -f "$ROOT/templates/compose.yml" config --no-env-resolution --images | sort -u
+        -f "$ROOT/templates/compose.yml" config "${compose_flags[@]}" --images
 )
+[ -z "$compose_stub" ] || rm -rf -- "$compose_stub"
+mapfile -t images < <(printf '%s\n' "$images_text" | sort -u)
 # The optional on-host display firmware build runs the ESPHome image pinned (by
 # digest) in displays/esphome/IMAGE; it must also have a Linux ARM64 manifest.
 esphome_image=$(tr -d '[:space:]' < "$ROOT/displays/esphome/IMAGE")
