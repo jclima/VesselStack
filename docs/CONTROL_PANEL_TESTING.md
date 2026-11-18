@@ -5,7 +5,7 @@ evidence of a boat or physical Raspberry Pi test. Use a scratch lab Pi or an
 isolated VM with Docker and a mounted data disk. Keep real vessel identity,
 positions, MMSIs, tokens, logs, and backups out of this repository.
 
-## Fetch and verify the pinned pre-release
+## Fetch and verify the pinned release
 
 Download the pinned bootstrap and the CI-generated checksum from the same
 `v0.9.1` GitHub release. Verify before reading or running it:
@@ -18,10 +18,10 @@ less get-vesselstack.sh
 sudo bash get-vesselstack.sh --help
 ```
 
-0.9.1 release status: `v0.9.1` is prepared as a pre-release. It is not marked Latest and
-physical Raspberry Pi acceptance is pending (see the CHANGELOG and
-[DEPLOYMENT.md](DEPLOYMENT.md) section 7). The Control Panel lists it only with
-**Include early test releases** ticked. Check the tag with
+0.9.1 release status: `v0.9.1` was promoted to the stable release (Latest) on 2026-11-17 after an
+install and update on a physical Raspberry Pi. The background restore, the recovery at boot and the
+new display firmware are still not exercised on a real boat computer or display (see the CHANGELOG
+and [DEPLOYMENT.md](DEPLOYMENT.md) section 7). Check the tag with
 `scripts/verify-release-tag.sh v0.9.1`. The checksum catches a corrupt or
 truncated asset; it does not replace that signature check.
 
@@ -37,8 +37,8 @@ is available. A fresh `0.9.1` install is a CLI install. The supported sources fo
 update to 0.9.1 are in the README table under [Updating](../README.md#updating): `0.5.5` to
 `0.8.0` (including `0.8.0`, the usual lab source) update from the Control Panel or the pinned
 installer, and `0.5.4` or earlier needs the pinned installer from the CLI once. Tick
-**Include early test releases** to see 0.9.1 while it is a pre-release; it is listed as an
-"early test release". The first update into 0.9.0 is run by the previous Control Panel, so
+**Include early test releases** to see a pre-release; it is listed as an
+"early test release". 0.9.1 is stable, so it is listed without that option. The first update into 0.9.0 is run by the previous Control Panel, so
 the "did not finish" notice and **Finish this update** (see the last step of
 "Exercise the interface") apply from the next update on. CI-controlled fixtures exercise the install
 orchestration, and the actual systemd restart is covered by the backend

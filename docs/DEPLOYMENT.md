@@ -23,7 +23,7 @@ the scripts in this repository; where a thing does not exist the text says so.
 Related: [INSTALLATION.md](INSTALLATION.md) (hardware and first install),
 [README.md](../README.md) (reference for every variable and command).
 
-0.9.1 release status: this branch prepares `v0.9.1` as a pre-release. It is not Latest and physical Raspberry Pi and display acceptance is pending. `v0.9.0` cannot be installed with Docker Compose older than 2.35; use 0.9.1. Signing, publication and the section 7 acceptance gate remain release-owner steps.
+0.9.1 release status: `v0.9.1` was promoted to the stable release (Latest) on 2026-11-17 after an install and update on a physical Raspberry Pi. The background restore, the recovery at boot after a power loss and the new display firmware have not yet been run on a real boat computer or display; the section 7 checks for them are still to do. `v0.9.0` is a superseded pre-release that cannot be installed with Docker Compose older than 2.35; use 0.9.1.
 
 History: `v0.5.7` was published as an unsigned lab pre-release that was not marked latest, and
 `v0.4.4` stayed the release GitHub marks Latest through the 0.5.x series. The `v0.5.1` tag is
@@ -48,7 +48,7 @@ carrying bundles, rollback and the acceptance checklist.
 curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-vesselstack.sh | sudo bash
 ```
 
-(`.../releases/latest/download/get-vesselstack.sh` points to whichever release GitHub marks Latest, which may not be 0.9.0; use the pinned URL above.)
+(`.../releases/latest/download/get-vesselstack.sh` points to whichever release GitHub marks Latest, which is 0.9.1 today but may change with a later release; the pinned URL above always installs 0.9.1.)
 Do it over plain SSH (`ssh -t YOUR_USER@LAB_PI`): no screen, browser or tunnel is needed.
 It installs prerequisites, asks before installing Docker, verifies the release
 sha256 (compare it with the value recorded in section 2), asks the configuration
