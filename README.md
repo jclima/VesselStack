@@ -7,6 +7,13 @@ boat data, dashboards, automation, and diagnostics together on a Raspberry Pi
 you control—at home, in the lab, or aboard. It is designed to keep working on
 the boat's local network when the internet is unavailable.
 
+[VesselTwin](https://www.vesseltwin.io/) keeps your long-term boat record: service,
+manuals, parts, photos, and expenses. VesselStack handles the onboard data and
+local tools. The optional [VesselTwin for Signal K plugin](https://github.com/jclima/signalk-vesseltwin)
+connects selected readings to that record. Neither product requires the other.
+See [how the tools fit together](https://www.vesseltwin.io/connected-boat) and the
+[connection guide](docs/VESSELTWIN.md).
+
 > [!WARNING]
 > VesselStack is monitoring and diagnostics software.
 > VesselStack is not certified navigation, collision-avoidance, engine-control,
@@ -241,8 +248,9 @@ These features are off or inert until you deliberately enable them. Neither is n
 
 ### Optional VesselTwin connection
 
-An optional VesselTwin connection uses the `signalk-vesseltwin` plugin, pairing,
-and explicit reading opt-ins. Managed Docker/native Signal K modes preload the pinned
+An optional VesselTwin connection uses the
+[VesselTwin for Signal K plugin](https://github.com/jclima/signalk-vesseltwin),
+pairing, and explicit reading opt-ins. Managed Docker/native Signal K modes preload the pinned
 plugin (version 0.2.3) by default; VesselStack does not enable, pair, or authorize readings for you.
 See the [VesselTwin integration guide](docs/VESSELTWIN.md)
 for setup and [VesselTwin](https://www.vesseltwin.io/) for maintenance documents,
