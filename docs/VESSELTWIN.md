@@ -1,9 +1,11 @@
 # Optional VesselTwin connection
 
 VesselStack is the onboard system for monitoring, automation, local history, and
-Boat Chat. VesselTwin is a separate service for maintenance documents, equipment,
-and logbook records. Managed Docker and native installs preload the separate
-VesselTwin Signal K plugin by default, but the connection remains opt-in.
+Boat Chat. [VesselTwin](https://www.vesseltwin.io/) is a separate service for your
+long-term boat record: service, manuals, parts, photos, and expenses.
+[See how the tools fit together](https://www.vesseltwin.io/connected-boat).
+Managed Docker and native installs preload the separate VesselTwin Signal K
+plugin by default, but the connection remains opt-in.
 
 If you choose to connect them, the supported path is the separate
 [VesselTwin Signal K plugin](https://github.com/jclima/signalk-vesseltwin). It
