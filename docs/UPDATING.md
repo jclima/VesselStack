@@ -10,8 +10,10 @@ in the README under [Updating](../README.md#updating). If you are on 0.6.x or ol
 
 ## Upgrading to 0.9.0
 
-0.9.1 is a pre-release. Physical Raspberry Pi and display acceptance is still pending, so it is not the
-release marked Latest. A boat should stay on 0.8.0 until 0.9.1 is promoted.
+0.9.1 is the stable release (Latest since 2026-11-17). It was installed and updated on a physical
+Raspberry Pi. The background restore, the recovery at boot after a power loss and the new display
+firmware have not yet been run on a real boat computer or display: keep the pre-update backup and try a
+restore in harbour before you rely on it.
 
 0.9.1 is the release to install and update to. 0.9.0 was published as a pre-release on 2026-11-16
 and cannot be installed with Docker Compose older than 2.35.

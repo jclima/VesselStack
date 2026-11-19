@@ -21,16 +21,11 @@ See [how the tools fit together](https://www.vesseltwin.io/connected-boat) and t
 > alarms. Never depend on this software as the sole source of safety data.
 
 > [!NOTE]
-> **Status: 0.9.1 is a pre-release.** Automated tests pass; physical Raspberry Pi and display
-> acceptance is pending. For a boat, install or stay on 0.8.0, the stable release:
->
-> ```bash
-> curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash
-> ```
->
-> For a lab Pi, use the [quick start](#quick-start-one-command-on-the-raspberry-pi) below to try
-> 0.9.1. The background restore, the recovery at boot after a power loss and the new display
-> firmware have not been run on a real boat computer or display. 0.9.0 was published as a
+> **Status: 0.9.1 is the stable release** (promoted on 2026-11-17). It was installed, and updated
+> from 0.8.0, on a physical Raspberry Pi running Debian's Docker Compose 2.26.1. Three parts have
+> automated tests only and have not yet been run on a real boat computer or display: the background
+> restore, the recovery at boot after a power loss, and the new display firmware. Before you rely on
+> them, take the pre-update backup and try a restore in harbour. 0.9.0 was published as a
 > pre-release on 2026-11-16 and cannot be installed with Docker Compose older than 2.35: use 0.9.1.
 > Read [Upgrading to 0.9.0](#upgrading-to-090) before you update an installed system.
 
@@ -315,8 +310,8 @@ curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.9.1/get-ve
 > whatever GitHub marks as Latest. The form `https://github.com/jclima/VesselStack/releases/latest/download/get-vesselstack.sh`
 > points to whichever release GitHub marks Latest, which is not necessarily the newest
 > one (every 0.5.x release was published as a pre-release, so that URL kept serving
-> 0.4.4). While 0.9.1 is a pre-release, the `releases/latest` URL still serves 0.8.0.
-> Use it only when you want exactly that. For a boat, see the status note at the top of this page.
+> 0.4.4). Since 2026-11-17 the `releases/latest` URL serves 0.9.1, the stable release.
+> For a boat, see the status note at the top of this page.
 
 The installer checks the host before changing it. It may install Debian
 prerequisites and, after asking, Docker Engine and Compose v2 from Docker's
@@ -575,9 +570,10 @@ before carrying an update to a boat without internet access.
 ## Upgrading to 0.9.0
 
 Read this before updating an installed system. Update from [Updating](#updating) with a backup on a
-mounted external drive, not while underway. The installer takes a verified backup first. 0.9.1 is a
-pre-release and physical Raspberry Pi and display acceptance is pending: do not deploy it to a boat until the
-documented lab checks pass. The stable release is 0.8.0.
+mounted external drive, not while underway. The installer takes a verified backup first. 0.9.1 is the
+stable release. The background restore, the recovery at boot after a power loss and the new display
+firmware have not yet been run on a real boat computer or display: keep the pre-update backup and try a
+restore in harbour before you rely on it.
 
 0.9.1 is the release to install and to update to. 0.9.0 was published as a pre-release on 2026-11-16
 and cannot be installed with Docker Compose older than 2.35 (Debian's packaged 2.26.1 is one): the
@@ -2625,7 +2621,7 @@ not mounted (see [Backups](#backups)).
 | 0.5.5, 0.5.6 | Same as 0.5.7: the browser updater was introduced in 0.5.5 |
 | 0.5.4 or earlier, including 0.4.x | Run the pinned installer from the CLI once (these versions cannot update from the browser); read [Upgrading from 0.6.x or older](docs/UPDATING.md#upgrading-from-06x-or-older) first |
 
-While 0.9.1 is a pre-release the Control Panel lists it only with **Include early test releases** ticked. The first update into 0.9.0 or 0.9.1 from an older release is run by the previous Control Panel, so **Finish this update** applies from the next update on.
+0.9.1 is a stable release, so the Control Panel lists it without **Include early test releases**. The first update into 0.9.0 or 0.9.1 from an older release is run by the previous Control Panel, so **Finish this update** applies from the next update on.
 
 A checksum shows a download is intact; it is not signed provenance. The signature on the `v0.9.1` tag (see [Download VesselStack](#3-download-vesselstack)) is the provenance check, and the installer does not perform it for you.
 

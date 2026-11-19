@@ -72,8 +72,9 @@ Do not build and upload files by hand.
    (see the CHANGELOG).
    `v0.7.0`, `v0.7.1` and `v0.8.0` were published as regular releases (`v0.8.0` marked Latest) while
    physical Raspberry Pi acceptance was still pending. `v0.9.0` was published as a pre-release on 2026-11-16 but cannot be installed with Docker Compose older than 2.35;
-   `v0.9.1` is prepared as the pre-release to test, including the background restore, the recovery at boot and
-   the display alarm changes. Physical Raspberry Pi and display acceptance is pending.
+   `v0.9.1` was published as a pre-release on 2026-11-16 and promoted to Latest on 2026-11-17 after an
+   install and update on a physical Raspberry Pi. The background restore, the recovery at boot and
+   the display alarm changes have not yet been run on a real boat computer or display.
 4. `.github/workflows/release.yml` then (a) reruns the whole CI workflow on the
    tagged commit, (b) builds with `VESSELSTACK_BUILD_REQUIRE_CLEAN=true` in a
    read-only job and uploads the files as workflow artifacts, and (c) in a separate

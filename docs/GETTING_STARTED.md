@@ -49,9 +49,10 @@ The URL pins release `v0.9.1`, so it installs that release whatever GitHub marks
 points to whichever release GitHub marks Latest, which is not necessarily the newest one. For a
 lab Pi and an offline boat, follow [DEPLOYMENT.md](DEPLOYMENT.md).
 
-**0.9.1 is a pre-release.** Physical Raspberry Pi and display acceptance is still pending, and the stable Latest
-release is 0.8.0. Use the command above on a lab Pi. For a boat, install 0.8.0 until 0.9.1 is promoted.
-0.9.0 cannot be installed with Docker Compose older than 2.35: use 0.9.1.
+**0.9.1 is the stable release** (Latest since 2026-11-17). It was installed and updated on a physical
+Raspberry Pi. The background restore, the recovery at boot after a power loss and the new display
+firmware have not yet been run on a real boat computer or display: take the pre-update backup and try a
+restore in harbour before you rely on it. 0.9.0 cannot be installed with Docker Compose older than 2.35: use 0.9.1.
 
 ```bash
 curl -fsSL https://github.com/jclima/VesselStack/releases/download/v0.8.0/get-vesselstack.sh | sudo bash

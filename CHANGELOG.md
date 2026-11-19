@@ -6,7 +6,8 @@ Semantic Versioning.
 ## 0.9.1 - 2026-11-16
 
 Fixes an install or update that stopped at the installer's check with no reason shown on Docker
-Compose older than 2.35. It is a pre-release.
+Compose older than 2.35. It was published as a pre-release and promoted to the stable release on
+2026-11-17.
 
 - **What was wrong.** 0.9.0 failed to install or update on Docker Compose older than 2.35, which
   includes Debian's packaged Compose 2.26. The installer's check stopped with "Compose template
@@ -40,8 +41,11 @@ Compose older than 2.35. It is a pre-release.
   passed`. After the update, `cat /opt/vesselstack/config/installed-version` prints `0.9.1`.
 - **Rollback.** The failed 0.9.0 check changed nothing. To go back after a 0.9.1 update, restore the
   verified pre-update backup (downgrades are refused); the fix itself changes no setting or data.
-- **Release status.** Pre-release. Physical Raspberry Pi and display acceptance is pending; boats
-  stay on 0.8.0, the stable release.
+- **Release status.** Published as a pre-release on 2026-11-16 and promoted to the stable release
+  (GitHub Latest) on 2026-11-17, after an install and an update (0.8.0 to 0.9.1) on a physical
+  Raspberry Pi with Debian's Docker Compose 2.26.1. Still not exercised on hardware: the background
+  restore, the recovery at boot after a power loss and the new display firmware. They have automated
+  tests only. Take the pre-update backup and try a restore in harbour before you rely on them.
 
 ## 0.9.0 - 2026-11-15
 

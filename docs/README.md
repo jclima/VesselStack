@@ -40,7 +40,7 @@ Boat Chat provider that sends data elsewhere.
 | Connect selected readings to VesselTwin | [Optional VesselTwin connection](VESSELTWIN.md) |
 | Develop, test, or cut a release | [Development](DEVELOPMENT.md) |
 | Know how the installer and Control Panel share settings | [Development: Shared configuration contract](DEVELOPMENT.md#shared-configuration-contract) |
-| Upgrade to 0.9.1 (pre-release; see 0.9.0) | [README: Upgrading to 0.9.0](../README.md#upgrading-to-090), [Updating](UPDATING.md#upgrading-to-090) |
+| Upgrade to 0.9.1 (stable; see 0.9.0) | [README: Upgrading to 0.9.0](../README.md#upgrading-to-090), [Updating](UPDATING.md#upgrading-to-090) |
 | Upgrade from 0.6.x or older | [Updating: upgrading from 0.6.x or older](UPDATING.md#upgrading-from-06x-or-older) |
 | Get alerts on Telegram (off by default) | [README: Alerts](../README.md#alerts) |
 | Reach the Control Panel from anywhere with Tailscale (off by default) | [README: Remote access with Tailscale](../README.md#remote-access-with-tailscale) |
